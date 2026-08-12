@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { Link } from "react-router-dom";
 import { api } from "../api/client";
 import { useWorkerStatuses } from "../api/useWorkerStatus";
@@ -208,6 +208,17 @@ export function NewRun() {
   // anywhere, just fetched once for the picker's "Updated X ago" / "update?"
   // hints. See server/src/routes/models.ts's /api/models/hf-updates.
   const [hfUpdates, setHfUpdates] = useState<Record<string, string | null>>({});
+  // Live "which worker(s) have this model's file" map, same endpoint Models.tsx
+  // uses to hide deleted-from-disk models. null (not yet loaded, or the fetch
+  // failed) means "don't filter" -- falling back to the unfiltered registry is
+  // safer than briefly (or permanently, on a failed fetch) showing an empty
+  // picker and blocking the whole New Run form over a transient hiccup.
+  const [locations, setLocations] = useState<Record<string, string[]> | null>(null);
+  // Workers the locations scan couldn't reach -- if any exist, its models
+  // can't be told apart from genuinely-deleted ones (see the route's comment
+  // in server/src/routes/models.ts), so presentModels below skips filtering
+  // entirely rather than hiding a model that's actually still there.
+  const [unreachableLocationWorkers, setUnreachableLocationWorkers] = useState<string[]>([]);
 
   useEffect(() => {
     (async () => {
@@ -220,7 +231,29 @@ export function NewRun() {
         /* best-effort -- the picker just shows no "Updated"/"update?" hints */
       }
     })();
+    (async () => {
+      try {
+        const res = await api.getModelLocations();
+        setLocations(res.locations);
+        setUnreachableLocationWorkers(res.unreachable);
+      } catch {
+        /* best-effort -- picker falls back to the unfiltered registry, see above */
+      }
+    })();
   }, []);
+
+  // Only offer models that actually have a file on some configured worker
+  // right now -- a registered model whose file was deleted from disk
+  // shouldn't still show up as pickable for a new run. Skipped while any
+  // worker is unreachable (see above) so a transient outage never hides a
+  // model that's actually still on disk.
+  const presentModels = useMemo(
+    () =>
+      locations && unreachableLocationWorkers.length === 0
+        ? models.filter((m) => (locations[m.id]?.length ?? 0) > 0)
+        : models,
+    [models, locations, unreachableLocationWorkers]
+  );
 
   // Prefer whichever worker was picked last time (if it's still configured);
   // only fall back to auto-picking the sole worker when there's nothing
@@ -267,16 +300,18 @@ export function NewRun() {
   // picked something for it in this session.
   const restoredModelForRef = useRef<string | null>(null);
   useEffect(() => {
-    if (!workerName || models.length === 0) return;
+    if (!workerName || presentModels.length === 0) return;
     if (restoredModelForRef.current === workerName) return;
     restoredModelForRef.current = workerName;
     if (modelId) return;
     const remembered = loadLastModel(workerName);
-    if (!remembered || !models.some((m) => m.id === remembered.modelId)) return;
+    if (!remembered || !presentModels.some((m) => m.id === remembered.modelId)) return;
     const draftId =
-      remembered.mtpModelId && models.some((m) => m.id === remembered.mtpModelId) ? remembered.mtpModelId : undefined;
+      remembered.mtpModelId && presentModels.some((m) => m.id === remembered.mtpModelId)
+        ? remembered.mtpModelId
+        : undefined;
     handleModelSelect(remembered.modelId, draftId);
-  }, [workerName, models, modelId]);
+  }, [workerName, presentModels, modelId]);
 
   useEffect(() => {
     if (!workerName || !modelId) return;
@@ -323,7 +358,7 @@ export function NewRun() {
     }
     return null;
   }
-  const mtpDraftCandidates = models.filter((m) => isMtpDraftModel(m));
+  const mtpDraftCandidates = presentModels.filter((m) => isMtpDraftModel(m));
   const showMtpModelPicker = Boolean(modelId);
 
   const selectedWorker = workerName ? workerStatus[workerName] : undefined;
@@ -499,7 +534,7 @@ export function NewRun() {
             </select>
           </label>
           <ModelPicker
-            models={models}
+            models={presentModels}
             value={modelId}
             mtpValue={mtpModelId}
             onSelect={handleModelSelect}
