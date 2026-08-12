@@ -112,11 +112,15 @@ if (-not (Test-Path $PackageJsonPath)) {
 
 Push-Location $Dir
 Write-Host "Installing dependencies (npm install)..."
-npm install
+# --ignore-scripts: skips better-sqlite3's install step, which always compiles
+# from source via node-gyp (it has no prebuilt-binary fallback) and needs the
+# full Visual Studio C++ Build Tools workload. The worker never imports
+# better-sqlite3 (server-only), so there's nothing to build here.
+npm install --ignore-scripts
 $installExit = $LASTEXITCODE
 Pop-Location
 if ($installExit -ne 0) {
-    Write-Error "npm install failed (exit $installExit). If this is a native-module build error for better-sqlite3, either install the 'Desktop development with C++' workload via the Visual Studio Build Tools installer, or use a Node.js version with a published prebuilt binary (Node 22 LTS is a safe bet), then re-run this script."
+    Write-Error "npm install failed (exit $installExit)."
     exit 1
 }
 
