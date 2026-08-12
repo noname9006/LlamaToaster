@@ -163,3 +163,32 @@ input[type="range"] {
     transform: translateY(-2px);
   }
 }
+
+/* Download progress bar before the worker has reported a byte total yet
+   (Models.tsx). A full-width pulsing block here reads as "100%, then it
+   drops" once real progress replaces it -- an indeterminate sliding stripe
+   at partial width avoids implying either 0% or 100% while data is
+   unknown. */
+.progress-indeterminate {
+  position: relative;
+  overflow: hidden;
+}
+.progress-indeterminate::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  width: 40%;
+  background: var(--color-accent);
+  opacity: 0.6;
+  border-radius: 9999px;
+  animation: progress-indeterminate-slide 1.4s ease-in-out infinite;
+}
+
+@keyframes progress-indeterminate-slide {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(350%);
+  }
+}
