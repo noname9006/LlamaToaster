@@ -15,12 +15,20 @@ const MAX_RESULT_ROWS = 150;
 // runtime shape rather than an import.
 interface ExportRow {
   worker_name: string;
+  // Denormalized from the parent run in the export route's own JOIN -- see
+  // shared/types.ts's ResultRow doc comment.
+  backend_type: string;
+  backend_device_name: string | null;
   model_filename: string;
   test_type: string;
   n_prompt: number;
   n_gen: number;
   n_threads: number;
   n_gpu_layers: number;
+  // Read from llama.cpp's own runtime output, never inferred -- see
+  // worker/src/index.ts's parseOffloadLayers.
+  gpu_layers_loaded: number | null;
+  total_model_layers: number | null;
   batch_size: number;
   ubatch_size: number;
   cache_type_k: string;
@@ -29,6 +37,10 @@ interface ExportRow {
   avg_tps: number;
   ram_peak_mib: number;
   vram_peak_mib: number | null;
+  // accuracy/source metadata (8 fields on the real export) deliberately
+  // omitted here -- too verbose for a token-budget-conscious chat context;
+  // reach for the CSV/JSON export directly for full provenance detail.
+  gpu_memory_total_mib: number | null;
   created_at: number;
 }
 
@@ -73,12 +85,12 @@ async function resultsSummary(): Promise<string> {
     const sorted = [...rows].sort((a, b) => b.created_at - a.created_at);
     const capped = sorted.slice(0, MAX_RESULT_ROWS);
     const header =
-      "worker | model | test | n_prompt | n_gen | threads | ngl | batch | ubatch | ctk | ctv | fa | avg_tps | ram_peak_mib | vram_peak_mib";
+      "worker | backend | model | test | n_prompt | n_gen | threads | ngl (loaded/total) | batch | ubatch | ctk | ctv | fa | avg_tps | ram_peak_mib | vram_peak_mib | vram_total_mib";
     const lines = capped.map(
       (r) =>
-        `${r.worker_name} | ${r.model_filename} | ${r.test_type} | ${r.n_prompt} | ${r.n_gen} | ${r.n_threads} | ` +
-        `${r.n_gpu_layers} | ${r.batch_size} | ${r.ubatch_size} | ${r.cache_type_k} | ${r.cache_type_v} | ${formatFlashAttn(r.flash_attn)} | ` +
-        `${r.avg_tps.toFixed(2)} | ${r.ram_peak_mib} | ${r.vram_peak_mib ?? "n/a"}`
+        `${r.worker_name} | ${r.backend_type}${r.backend_device_name ? ` (${r.backend_device_name})` : ""} | ${r.model_filename} | ${r.test_type} | ${r.n_prompt} | ${r.n_gen} | ${r.n_threads} | ` +
+        `${r.n_gpu_layers} (${r.gpu_layers_loaded ?? "?"}/${r.total_model_layers ?? "?"}) | ${r.batch_size} | ${r.ubatch_size} | ${r.cache_type_k} | ${r.cache_type_v} | ${formatFlashAttn(r.flash_attn)} | ` +
+        `${r.avg_tps.toFixed(2)} | ${r.ram_peak_mib} | ${r.vram_peak_mib ?? "n/a"} | ${r.gpu_memory_total_mib ?? "n/a"}`
     );
     const scope = rows.length > capped.length ? `most recent ${capped.length} of ${rows.length} total` : `${rows.length} total`;
     return `(${scope})\n${header}\n${lines.join("\n")}`;

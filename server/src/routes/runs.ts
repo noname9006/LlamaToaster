@@ -10,7 +10,12 @@ import type {
   InstalledBuild,
   Model,
 } from "../../../shared/types.js";
-import { isTerminalRunItemInput, isMtpDraftModel } from "../../../shared/types.js";
+import {
+  isTerminalRunItemInput,
+  isMtpDraftModel,
+  GPU_MEMORY_ACCURACY_LEVELS,
+  GPU_MEMORY_MEASUREMENT_SOURCES,
+} from "../../../shared/types.js";
 import { expandSweep } from "../../../shared/sweep.js";
 import { getWorkerForRun, getDefaultWorker, type WorkerDef } from "../config.js";
 import { describeWorkerError } from "../worker-errors.js";
@@ -115,6 +120,44 @@ function validateIngestResult(value: unknown): string | null {
       return `${field} must be an array of numbers`;
     }
   }
+  for (const field of [
+    "system_memory_total_mb",
+    "gpu_memory_total_mb",
+    "gpu_layers_loaded",
+    "total_model_layers",
+  ] as const) {
+    if (row[field] !== null && (typeof row[field] !== "number" || !Number.isFinite(row[field] as number))) {
+      return `${field} must be a number or null`;
+    }
+  }
+  // accuracy is always a concrete level, never null/absent -- "unavailable"
+  // is itself the valid value for "couldn't be determined", see
+  // shared/types.ts's GpuMemoryAccuracyLevel doc comment.
+  for (const field of [
+    "gpu_memory_total_accuracy",
+    "gpu_memory_free_start_accuracy",
+    "gpu_memory_model_avg_accuracy",
+    "gpu_memory_model_peak_accuracy",
+  ] as const) {
+    if (!GPU_MEMORY_ACCURACY_LEVELS.includes(row[field] as (typeof GPU_MEMORY_ACCURACY_LEVELS)[number])) {
+      return `${field} must be one of ${GPU_MEMORY_ACCURACY_LEVELS.join("/")}`;
+    }
+  }
+  // source, unlike accuracy, is null exactly when its paired value is null
+  // (accuracy "unavailable").
+  for (const field of [
+    "gpu_memory_total_source",
+    "gpu_memory_free_start_source",
+    "gpu_memory_model_avg_source",
+    "gpu_memory_model_peak_source",
+  ] as const) {
+    if (
+      row[field] !== null &&
+      !GPU_MEMORY_MEASUREMENT_SOURCES.includes(row[field] as (typeof GPU_MEMORY_MEASUREMENT_SOURCES)[number])
+    ) {
+      return `${field} must be one of ${GPU_MEMORY_MEASUREMENT_SOURCES.join("/")} or null`;
+    }
+  }
   return null;
 }
 
@@ -167,6 +210,9 @@ function validateRunItemUpdate(payload: unknown): string | null {
       return `${field} must be a number or null`;
     }
   }
+  if (p.backend_device_name !== undefined && typeof p.backend_device_name !== "string") {
+    return "backend_device_name must be a string";
+  }
   if (status === "done" && p.results !== undefined) {
     if (!Array.isArray(p.results)) return "results must be an array";
     for (const [i, entry] of p.results.entries()) {
@@ -184,7 +230,11 @@ const BUILD_ACTIVATE_TIMEOUT_MS = 15_000;
 // archive download+extract can legitimately take minutes.
 const BUILD_INSTALL_TIMEOUT_MS = 10 * 60 * 1000;
 
-type BuildResolution = { build: string; backend: Backend } | { error: string };
+// deviceName is the Tier-1 backend_device_name fallback (see shared/types.ts's
+// Run.backend_device_name) -- always sourced from the one /health fetch at
+// the top of ensureActiveBuild below, which runs before any of its 3 return
+// paths branch, so all 3 carry it through rather than just the fast path.
+type BuildResolution = { build: string; backend: Backend; deviceName?: string } | { error: string };
 
 async function activateOnWorker(worker: WorkerDef, tag: string): Promise<{ ok: true } | { error: string }> {
   try {
@@ -215,7 +265,7 @@ async function activateOnWorker(worker: WorkerDef, tag: string): Promise<{ ok: t
 // a genuinely unreachable worker, a busy worker with no active build, or a
 // worker with no installable release at all should still fail the trigger.
 async function ensureActiveBuild(worker: WorkerDef): Promise<BuildResolution> {
-  let health: { busy?: boolean; active_build?: unknown; backend?: unknown };
+  let health: { busy?: boolean; active_build?: unknown; backend?: unknown; backend_device_name?: unknown };
   try {
     const res = await fetch(`${worker.url}/health`, { signal: AbortSignal.timeout(WORKER_HEALTH_TIMEOUT_MS) });
     if (!res.ok) throw new Error(`worker responded ${res.status}`);
@@ -223,8 +273,9 @@ async function ensureActiveBuild(worker: WorkerDef): Promise<BuildResolution> {
   } catch (err) {
     return { error: describeWorkerError(err) };
   }
+  const deviceName = typeof health.backend_device_name === "string" ? health.backend_device_name : undefined;
   if (typeof health.active_build === "string" && typeof health.backend === "string") {
-    return { build: health.active_build, backend: health.backend as Backend };
+    return { build: health.active_build, backend: health.backend as Backend, deviceName };
   }
   if (health.busy) {
     return { error: "worker is busy running another benchmark and has no active llama.cpp build" };
@@ -246,7 +297,7 @@ async function ensureActiveBuild(worker: WorkerDef): Promise<BuildResolution> {
     const latest = info.installed[0];
     const activated = await activateOnWorker(worker, latest.tag);
     if ("error" in activated) return activated;
-    return { build: latest.tag, backend: info.backend };
+    return { build: latest.tag, backend: info.backend, deviceName };
   }
 
   // Nothing installed at all -- find the latest release with an asset that
@@ -291,7 +342,7 @@ async function ensureActiveBuild(worker: WorkerDef): Promise<BuildResolution> {
 
   const activated = await activateOnWorker(worker, release.tag);
   if ("error" in activated) return activated;
-  return { build: release.tag, backend: info.backend };
+  return { build: release.tag, backend: info.backend, deviceName };
 }
 
 type SendRunResult =
@@ -378,6 +429,7 @@ async function dispatchScheduledRun(app: FastifyInstance, workerName: string): P
   repo.markRunRunning(next.id, {
     llama_cpp_build: live.build,
     llama_cpp_backend: live.backend,
+    backend_device_name: live.deviceName,
     started_at: Date.now(),
   });
   app.log.info({ run_id: next.id, worker: workerName, build: live.build }, "queued run dispatching");
@@ -582,6 +634,7 @@ export async function runsRoutes(app: FastifyInstance): Promise<void> {
         worker_name: worker.name,
         llama_cpp_build: live.build,
         llama_cpp_backend: live.backend,
+        backend_device_name: live.deviceName,
         model_id: body.model_id,
         config: {
           model_id: body.model_id,

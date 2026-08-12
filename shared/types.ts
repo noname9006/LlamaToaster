@@ -23,6 +23,31 @@ export const KNOWN_BACKENDS = [
 
 export type Backend = string;
 
+// How a GPU memory figure was obtained, and how much to trust it -- see
+// worker/src/vram.ts's per-backend readGpuMemory dispatcher, which is the
+// only thing that ever assigns these. "unavailable" is a real, valid state
+// (not an absence): whenever a GPU memory value is null, its accuracy is
+// always "unavailable" and its source always null, never the other way
+// around. Never fabricate a value to avoid reporting "unavailable" -- that's
+// the one hard rule every backend's collection code follows.
+export const GPU_MEMORY_ACCURACY_LEVELS = ["exact", "high", "estimated", "unavailable"] as const;
+export type GpuMemoryAccuracyLevel = (typeof GPU_MEMORY_ACCURACY_LEVELS)[number];
+
+// "exact" = a first-party vendor tool's per-process reading (e.g. nvidia-smi
+// --query-compute-apps matched against the benchmark's own PID). "high" = a
+// real driver/kernel reading that exists but isn't process-isolated (whole-
+// adapter usage, e.g. Windows' GPU Adapter Memory perf counter or Linux's
+// amdgpu sysfs vram_used). "estimated"/"budget"/"unified" sources are for
+// backends with no direct usage reading at all (Metal's unified memory).
+export const GPU_MEMORY_MEASUREMENT_SOURCES = [
+  "process_gpu_usage",
+  "driver_reported_memory",
+  "backend_allocation_tracking",
+  "memory_budget_estimate",
+  "unified_memory_estimate",
+] as const;
+export type GpuMemoryMeasurementSource = (typeof GPU_MEMORY_MEASUREMENT_SOURCES)[number];
+
 export type TestType = "pp" | "tg" | "pg";
 
 export type ModelSource = "local" | "huggingface";
@@ -162,6 +187,17 @@ export interface Run {
   worker_name: string;
   llama_cpp_build: string;
   llama_cpp_backend: Backend;
+  // The specific GPU/CPU model llama.cpp itself reported (e.g. "AMD Radeon
+  // RX 6600 XT", "NVIDIA RTX 4090", "Apple M4 Max", "CPU") -- distinct from
+  // llama_cpp_backend above, which is only the backend *kind*. Two-tier: set
+  // from the worker's own hardware detection as soon as the run starts
+  // (always available), then upgraded once the first non-MTP item's
+  // llama-bench JSON output reports its exact gpu_info string (see
+  // worker/src/bench.ts) -- a run made entirely of MTP items never gets the
+  // upgrade and keeps the first-tier value, since llama-server never prints
+  // an equivalent device-enumeration line at any verbosity (confirmed live).
+  // Undefined only for a run predating this field.
+  backend_device_name?: string;
   model_id: string;
   model_filename?: string;
   config: RunConfig;
@@ -190,10 +226,21 @@ export interface ResultRow {
   // the worker payload.
   idx: number;
   model_id: string;
+  // The backend/device that actually produced this result -- denormalized
+  // from the parent run (runs.llama_cpp_backend/backend_device_name, see
+  // Run's own doc comments) via a JOIN in server/src/db/repo.ts's
+  // getResultsForRun, not stored per-row: a run's backend can't vary between
+  // its own items. backend_device_name is null exactly when the run's
+  // two-tier detection (see Run) hasn't captured one at all.
+  backend_type: Backend;
+  backend_device_name: string | null;
   test_type: TestType;
   n_prompt: number;
   n_gen: number;
   n_threads: number;
+  // The requested -ngl value for this combination -- already equivalent to
+  // the spec's "gpu_layers_requested", so that's not a separate field. See
+  // gpu_layers_loaded/total_model_layers below for what actually happened.
   n_gpu_layers: number;
   batch_size: number;
   ubatch_size: number;
@@ -203,12 +250,56 @@ export interface ResultRow {
   mtp: string;
   avg_tps: number;
   stddev_tps: number;
+  // Already equivalent to the spec's system_memory_model_peak_mb --
+  // sampled RAM of the benchmark process, not renamed/duplicated since
+  // that would touch 6+ files for zero functional gain.
   ram_peak_mib: number;
+  // Already equivalent to the spec's gpu_memory_model_peak_mb, minus the
+  // accuracy_level/measurement_source metadata -- see
+  // gpu_memory_model_peak_accuracy/_source below for that.
   vram_peak_mib: number | null;
+  // Already equivalent to the spec's system_memory_model_avg_mb.
   ram_avg_mib: number;
+  // Already equivalent to the spec's gpu_memory_model_avg_mb -- see
+  // gpu_memory_model_avg_accuracy/_source below for its metadata.
   vram_avg_mib: number | null;
+  // Already equivalent to the spec's system_memory_free_start_mb.
   ram_free_before_mib: number | null;
+  // Already equivalent to the spec's gpu_memory_free_start_mb -- see
+  // gpu_memory_free_start_accuracy/_source below for its metadata.
   vram_free_before_mib: number | null;
+  // Total system RAM (on Apple Silicon, total unified memory) -- a static
+  // hardware fact, not sampled, so unlike the pairs above it has no
+  // avg/peak/free_start variants and no accuracy/source metadata (the spec
+  // scopes accuracy/provenance to GPU memory metrics only).
+  system_memory_total_mb: number | null;
+  // Total VRAM capacity (Metal: total unified memory, per the spec's
+  // explicit "use total unified memory" instruction for that backend) --
+  // see worker/src/vram.ts's per-backend readGpuMemory. Null + accuracy
+  // "unavailable" on a cpu-backend run.
+  gpu_memory_total_mb: number | null;
+  // accuracy is always one of the 4 concrete levels, never absent -- it's
+  // "unavailable" (not null) when the paired _mb value is null. Only source
+  // (and the value itself) can genuinely be null.
+  gpu_memory_total_accuracy: GpuMemoryAccuracyLevel;
+  gpu_memory_total_source: GpuMemoryMeasurementSource | null;
+  gpu_memory_free_start_accuracy: GpuMemoryAccuracyLevel;
+  gpu_memory_free_start_source: GpuMemoryMeasurementSource | null;
+  gpu_memory_model_avg_accuracy: GpuMemoryAccuracyLevel;
+  gpu_memory_model_avg_source: GpuMemoryMeasurementSource | null;
+  gpu_memory_model_peak_accuracy: GpuMemoryAccuracyLevel;
+  gpu_memory_model_peak_source: GpuMemoryMeasurementSource | null;
+  // Actual GPU layers loaded and the model's real total layer count, both
+  // read from llama.cpp's own runtime output (worker/src/index.ts's
+  // parseOffloadLayers, scraping "load_tensors: offloaded X/Y layers to
+  // GPU") -- never inferred/calculated. total_model_layers is deliberately
+  // NOT sourced from models.metadata.n_layer: confirmed live that llama.cpp's
+  // runtime Y equals the GGUF's real layer count + 1 (the output layer), a
+  // different number under a different counting convention. Both null when
+  // the model failed to load before this line was ever printed, or on a
+  // build too old to support the verbosity flag this requires.
+  gpu_layers_loaded: number | null;
+  total_model_layers: number | null;
   // Only ever populated by the llama-server/MTP path (worker/src/serverBench.ts)
   // -- the llama-bench-CLI path (bench.ts) does its own internal repeat
   // averaging and never sees individual readings, so these stay undefined
@@ -266,7 +357,22 @@ export interface IngestResultInput {
   vram_avg_mib: number | null;
   ram_free_before_mib: number | null;
   vram_free_before_mib: number | null;
-  // See the matching fields on ResultRow above.
+  // See the matching fields on ResultRow above -- backend_type/
+  // backend_device_name are deliberately NOT here, since the server derives
+  // both from the parent run (a JOIN, see repo.ts's getResultsForRun) rather
+  // than trusting a per-item copy the worker would have to keep in sync.
+  system_memory_total_mb: number | null;
+  gpu_memory_total_mb: number | null;
+  gpu_memory_total_accuracy: GpuMemoryAccuracyLevel;
+  gpu_memory_total_source: GpuMemoryMeasurementSource | null;
+  gpu_memory_free_start_accuracy: GpuMemoryAccuracyLevel;
+  gpu_memory_free_start_source: GpuMemoryMeasurementSource | null;
+  gpu_memory_model_avg_accuracy: GpuMemoryAccuracyLevel;
+  gpu_memory_model_avg_source: GpuMemoryMeasurementSource | null;
+  gpu_memory_model_peak_accuracy: GpuMemoryAccuracyLevel;
+  gpu_memory_model_peak_source: GpuMemoryMeasurementSource | null;
+  gpu_layers_loaded: number | null;
+  total_model_layers: number | null;
   sample_count?: number;
   suspect_count?: number;
   suspect_samples?: number[];
@@ -352,6 +458,12 @@ export interface RunItemTickInput {
 export interface RunItemTerminalInput {
   status: "done" | "failed" | "failed_oom" | "cancelled";
   error?: string;
+  // Tier-2 device-name upgrade (see Run.backend_device_name) -- only ever
+  // sent alongside status "done" from the llama-bench path, when that item's
+  // llama-bench JSON output included a gpu_info string (worker/src/index.ts's
+  // runSweepItem). Absent on every other item; the server applies it as a
+  // plain UPDATE onto the parent run, not per-item.
+  backend_device_name?: string;
   // Peaks are worth recording even on a failure -- "climbed to 3.8GB then
   // died" is the whole story for an OOM. `results` (the tps metrics that
   // become `results` rows) only applies when status is "done" -- an array

@@ -197,6 +197,15 @@ function buildArgs(input: ServerBenchRunInput): string[] {
     // failing to load while the base model still starts fine, etc) -- see
     // fetchSpecDecodeMetrics below.
     "--metrics",
+    // Unconditional, not probed like bench.ts's supportsVerboseFlag: default
+    // verbosity (confirmed live: 3) prints none of the "load_tensors:
+    // offloaded X/Y layers to GPU" detail worker/src/index.ts's
+    // parseOffloadLayers needs, and -lv 999 is confirmed live to surface it.
+    // The minimum threshold between 3 and 999 that would also work is
+    // unknown and not worth guessing at -- this file has no existing
+    // capability-probe infrastructure to extend the way bench.ts does.
+    "--verbosity",
+    "999",
   ];
   if (input.mtpModelPath) {
     args.push("--model-draft", input.mtpModelPath);
@@ -204,15 +213,38 @@ function buildArgs(input: ServerBenchRunInput): string[] {
   return args;
 }
 
-async function waitForReady(port: number, deadlineAt: number): Promise<void> {
+// `exited` is the same `closed` promise runServerBench already builds from
+// proc's own "close" event -- raced against each poll wait so a server that
+// dies almost immediately (e.g. a context-creation error at startup) is
+// reported within a poll interval instead of only after the full
+// READY_TIMEOUT_MS. Previously this looped on a plain timer with no way to
+// notice the process was already gone, so a near-instant crash still burned
+// the whole 120s before failing with a misleading "did not become ready"
+// message -- confirmed live: a quantized-V-cache-without-flash-attn context
+// error killed llama-server in ~3s, but the item still took 2 minutes to
+// report failure.
+async function waitForReady(
+  port: number,
+  deadlineAt: number,
+  exited: Promise<{ code: number | null; signal: NodeJS.Signals | null }>
+): Promise<void> {
+  const STILL_WAITING = Symbol("still-waiting");
   while (Date.now() < deadlineAt) {
     try {
       const res = await fetch(`http://127.0.0.1:${port}/health`, { signal: AbortSignal.timeout(2000) });
       if (res.ok) return;
     } catch {
-      /* not up yet -- keep polling */
+      /* not up yet -- keep polling, unless the process itself already died */
     }
-    await new Promise((r) => setTimeout(r, READY_POLL_INTERVAL_MS));
+    const raced = await Promise.race([
+      exited,
+      new Promise<typeof STILL_WAITING>((r) => setTimeout(() => r(STILL_WAITING), READY_POLL_INTERVAL_MS)),
+    ]);
+    if (raced !== STILL_WAITING) {
+      throw new Error(
+        `llama-server exited before becoming ready (code ${raced.code}, signal ${raced.signal ?? "none"})`
+      );
+    }
   }
   throw new Error(`llama-server did not become ready on port ${port} within ${READY_TIMEOUT_MS}ms`);
 }
@@ -498,7 +530,7 @@ export async function runServerBench(input: ServerBenchRunInput): Promise<BenchR
 
   try {
     input.onProgress?.("loading", "starting llama-server");
-    await waitForReady(input.port, Date.now() + READY_TIMEOUT_MS);
+    await waitForReady(input.port, Date.now() + READY_TIMEOUT_MS, closed);
 
     const offsetStorePath = input.offsetStorePath ?? DEFAULT_OFFSET_STORE_PATH;
     const offsetKey = offsetStoreKey(input.modelPath, input.mtpModelPath);
@@ -664,6 +696,22 @@ export async function runServerBench(input: ServerBenchRunInput): Promise<BenchR
       vram_avg_mib: null,
       ram_free_before_mib: null,
       vram_free_before_mib: null,
+      // Memory/offload fields are filled in by the caller
+      // (worker/src/index.ts's finalizeSweepItemResult), same as the ram/
+      // vram placeholders above -- see worker/src/bench.ts's parseLlamaBench
+      // for the identical pattern on the non-MTP path.
+      system_memory_total_mb: null,
+      gpu_memory_total_mb: null,
+      gpu_memory_total_accuracy: "unavailable" as const,
+      gpu_memory_total_source: null,
+      gpu_memory_free_start_accuracy: "unavailable" as const,
+      gpu_memory_free_start_source: null,
+      gpu_memory_model_avg_accuracy: "unavailable" as const,
+      gpu_memory_model_avg_source: null,
+      gpu_memory_model_peak_accuracy: "unavailable" as const,
+      gpu_memory_model_peak_source: null,
+      gpu_layers_loaded: null,
+      total_model_layers: null,
     };
     const results: IngestResultInput[] = [];
     const warnings: string[] = [];
