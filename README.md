@@ -62,7 +62,39 @@ npm run dev:client
 
 ## Running the worker (GPU box)
 
-Edit `worker/config.json`:
+**Brand-new machine, nothing downloaded yet?** One command fetches the repo,
+installs dependencies, and starts the worker (needs PowerShell/bash +
+Node.js 22+; uses `git` if present, otherwise falls back to a zip/tarball
+download). It asks which drive/volume to use — showing free space, since
+models are often tens of GB each — and a folder name, then creates it:
+
+```powershell
+# Windows
+iex "& { $(irm https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.ps1) }"
+```
+
+```bash
+# macOS / Linux
+curl -fsSL https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.sh | bash
+```
+
+Pass a folder explicitly to skip the prompts (e.g. for unattended/scripted
+use): `-Dir F:\LlamaToaster` / `-- --dir ~/LlamaToaster`.
+
+It's safe to re-run: if the folder already has a checkout, the download step
+is skipped, and [`worker/setup-worker.ps1`](worker/setup-worker.ps1) /
+[`.sh`](worker/setup-worker.sh) underneath only write `config.json` once —
+after that, the exact same command just (re)starts the worker (no prompt,
+since there's nothing left to configure). Pass `-Force` / `--force` to redo
+config generation (e.g. to pick a different drive or bind IP), and see
+either script's header comment for the full set of overrides
+(`-WorkerName`, `-Backend`, `-VpsUrl`, `-BindHost`, `-Port`).
+
+Already have the repo checked out? Skip straight to
+`.\worker\setup-worker.ps1` (or the `.sh` equivalent) — same idempotent
+behavior and folder prompt, no download step.
+
+To configure by hand instead, edit `worker/config.json`:
 
 ```json
 {
