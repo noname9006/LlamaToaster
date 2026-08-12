@@ -70,6 +70,40 @@ export function shortId(id: string, len = 12): string {
   return id.slice(0, len);
 }
 
+// navigator.clipboard is only available in a "secure context" (HTTPS, or
+// localhost) -- this app is normally reached over plain HTTP on a Tailscale
+// IP (see README's "Tailscale-only orchestrator" / BIND_HOST notes), where
+// it's simply undefined, so a bare `navigator.clipboard?.writeText(...)`
+// silently no-ops instead of copying anything. Falls back to the older
+// execCommand("copy") technique (via a temporary offscreen textarea), which
+// still works without a secure context.
+export async function copyToClipboard(text: string): Promise<boolean> {
+  if (window.isSecureContext && navigator.clipboard) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch {
+      // fall through to the legacy fallback below
+    }
+  }
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.style.position = "fixed";
+  textarea.style.top = "-1000px";
+  textarea.style.opacity = "0";
+  document.body.appendChild(textarea);
+  textarea.focus();
+  textarea.select();
+  let ok = false;
+  try {
+    ok = document.execCommand("copy");
+  } catch {
+    ok = false;
+  }
+  document.body.removeChild(textarea);
+  return ok;
+}
+
 // flash_attn has been stored as "on"/"off" (the toggle's real options),
 // "true" (a past seeding bug -- see NewRun.tsx's sanitizeSweep), and
 // possibly a bare boolean echoed back by llama-bench's own JSON output --
