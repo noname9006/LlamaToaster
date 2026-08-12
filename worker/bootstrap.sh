@@ -116,8 +116,13 @@ fi
 
 cd "$DIR"
 echo "Installing dependencies (npm install)..."
-if ! npm install; then
-  echo "npm install failed. If this is a native-module build error for better-sqlite3, make sure build tools are installed (Xcode Command Line Tools on macOS, build-essential/python3 on Linux) or use a Node.js version with a published prebuilt binary (Node 22 LTS is a safe bet), then re-run this script." >&2
+# --ignore-scripts: skips better-sqlite3's install step, which always compiles
+# from source via node-gyp (it has no prebuilt-binary fallback) and needs a
+# real C++ toolchain (Xcode Command Line Tools on macOS, build-essential on
+# Linux). The worker never imports better-sqlite3 (server-only), so there's
+# nothing to build here.
+if ! npm install --ignore-scripts; then
+  echo "npm install failed." >&2
   exit 1
 fi
 
