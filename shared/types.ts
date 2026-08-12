@@ -463,3 +463,22 @@ export interface DownloadProgress {
   total: number | null;
   started_at: number;
 }
+
+// Worker -> server callback reporting a model download's terminal outcome --
+// mirrors RunItemTerminalInput's role for /run (see worker/src/index.ts's
+// POST /models/download, which now acks fast and runs the actual transfer in
+// the background rather than blocking the whole HTTP round trip on it).
+// Retried with backoff by the worker (safeReportDownloadResult), so
+// repo.registerModel's upsert-on-id semantics matter: a retried "ok" payload
+// must be safe to apply twice.
+export interface ModelDownloadCallbackInput {
+  worker: string;
+  hf_repo: string;
+  hf_file: string;
+  ok: boolean;
+  error?: string;
+  sha256?: string;
+  size_bytes?: number;
+  n_layer?: number | null;
+  mtp_layers?: number | null;
+}

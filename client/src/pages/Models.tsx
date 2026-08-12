@@ -180,11 +180,6 @@ export function Models() {
   const [progress, setProgress] = useState<Record<string, DownloadProgress>>({});
   const [speeds, setSpeeds] = useState<Record<string, number>>({});
   const prevSampleRef = useRef<Record<string, { bytes: number; time: number }>>({});
-  // Paths this tab's own handleDownload call is actively awaiting -- its own
-  // try/finally already owns cleanup + loadModels() for those, so the poll
-  // effect's orphan-reconciliation below only needs to act on entries that
-  // were restored from localStorage (started in a since-refreshed tab).
-  const ownedRef = useRef<Set<string>>(new Set());
   const seenRef = useRef<Record<string, boolean>>({});
   const missesRef = useRef<Record<string, number>>({});
 
@@ -384,13 +379,17 @@ export function Models() {
     });
   }, [hfQuery, hfResults, expandedRepo, filesByRepo, hfParamsLoIndex, hfParamsHiIndex, hfSortField, hfSortDir]);
 
-  // Cleans up a download this tab isn't itself awaiting (see ownedRef above)
-  // once the worker stops reporting progress for it -- the only signal
-  // available that it's done, since the worker doesn't distinguish "finished"
-  // from "failed" here, only "no longer in flight". Refreshing the model
+  // Cleans up a download once the worker stops reporting progress for it --
+  // the only signal available that it's done, since the worker's download
+  // now runs fully in the background (see worker/src/index.ts's POST
+  // /models/download) and doesn't distinguish "finished" from "failed" via
+  // this progress endpoint, only "no longer in flight". Refreshing the model
   // list either way is harmless: it either surfaces the newly-registered
-  // model or changes nothing.
-  function finalizeOrphanedDownload(path: string) {
+  // model or changes nothing. This is the *only* completion path now -- the
+  // POST that starts a download resolves as soon as the worker acks it, long
+  // before the transfer itself finishes, so there's no blocking call left to
+  // hang cleanup off of.
+  function finalizeDownload(path: string) {
     setDownloading((d) => {
       const next = { ...d };
       delete next[path];
@@ -413,10 +412,10 @@ export function Models() {
     void loadModels();
     // Safety net: the worker's progress entry disappearing only means the
     // byte transfer is done, not that the server has finished registering
-    // the model (that still needs the worker's response to arrive, get
-    // parsed, and hit repo.registerModel -- see worker/src/index.ts's
-    // /models/download handler). The loadModels() above can race ahead of
-    // that and miss the new row; this second pass catches it.
+    // the model (that still needs the worker's callback to reach
+    // POST /api/models/download-callback and hit repo.registerModel -- see
+    // worker/src/index.ts's runModelDownload). The loadModels() above can
+    // race ahead of that and miss the new row; this second pass catches it.
     setTimeout(() => void loadModels(), 2000);
   }
 
@@ -441,11 +440,10 @@ export function Models() {
             prevSampleRef.current[path] = { bytes: p.bytes, time: now };
           } catch {
             // Worker has no progress entry for this file -- either it just
-            // finished (success or failure), or (only possible for a
-            // restored entry) it hasn't started reporting yet. A download
-            // this tab's own handleDownload call is awaiting handles its own
-            // completion there, so leave it alone here.
-            if (ownedRef.current.has(path)) return;
+            // finished (success or failure), or it hasn't started reporting
+            // yet (a small window right after the start POST acked, or --
+            // for an entry restored from localStorage after a refresh -- for
+            // as long as its owning tab is gone).
             const misses = (missesRef.current[path] ?? 0) + 1;
             missesRef.current[path] = misses;
             // A grace period even once already seen (not an immediate
@@ -457,7 +455,7 @@ export function Models() {
             const SEEN_GRACE_MISSES = 2;
             const NEVER_SEEN_TIMEOUT_MISSES = 4;
             if ((seenRef.current[path] && misses >= SEEN_GRACE_MISSES) || misses >= NEVER_SEEN_TIMEOUT_MISSES) {
-              finalizeOrphanedDownload(path);
+              finalizeDownload(path);
             }
           }
         })
@@ -542,34 +540,17 @@ export function Models() {
     const worker = downloadWorker;
     setPickWorkerWarning(false);
     setHfMsg("");
-    ownedRef.current.add(file.path);
-    setDownloading((d) => ({ ...d, [file.path]: { repoId, worker, startedAt: Date.now(), file } }));
     try {
+      // Resolves once the worker has acked the download, not once it's done
+      // -- the actual transfer runs in the background on the worker (see
+      // worker/src/index.ts's POST /models/download), so completion is only
+      // observable via the progress-poll effect below, same as an entry
+      // restored from localStorage after a refresh. finalizeDownload is the
+      // one place that ever clears `downloading` now.
       await api.downloadHfFile(worker, repoId, file.path);
-      setHfMsg(`Downloaded ${file.path} ✓`);
-      await Promise.all([loadModels(), loadLocations()]);
+      setDownloading((d) => ({ ...d, [file.path]: { repoId, worker, startedAt: Date.now(), file } }));
     } catch (err) {
       setHfMsg(`Error: ${err instanceof Error ? err.message : String(err)}`);
-    } finally {
-      ownedRef.current.delete(file.path);
-      setDownloading((d) => {
-        const next = { ...d };
-        delete next[file.path];
-        return next;
-      });
-      setProgress((p) => {
-        const next = { ...p };
-        delete next[file.path];
-        return next;
-      });
-      setSpeeds((s) => {
-        const next = { ...s };
-        delete next[file.path];
-        return next;
-      });
-      delete prevSampleRef.current[file.path];
-      delete seenRef.current[file.path];
-      delete missesRef.current[file.path];
     }
   }
 
