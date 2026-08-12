@@ -3,14 +3,14 @@ import { api, type WorkerListEntry } from "../api/client";
 import type { WorkerStatus } from "../api/useWorkerStatus";
 import { StatusPill, WorkerStatusPill, ElapsedSince } from "./StatusPill";
 import { IconCheck, IconChevronDown, IconDownload, IconTrash } from "./icons";
-import { formatBytes, formatDate } from "../utils";
+import { copyToClipboard, formatBytes, formatDate } from "../utils";
 
 type SetupOS = "windows" | "macos" | "linux";
 
-const SETUP_OS_LABELS: Array<{ key: SetupOS; label: string }> = [
-  { key: "windows", label: "Windows" },
-  { key: "macos", label: "macOS" },
-  { key: "linux", label: "Linux" },
+const SETUP_OS_LABELS: Array<{ key: SetupOS; label: string; badgeClass: string }> = [
+  { key: "windows", label: "WIN", badgeClass: "text-[#8fc6e8] bg-[#8fc6e8]/15" },
+  { key: "macos", label: "MACOS", badgeClass: "text-[#c9a6e8] bg-[#c9a6e8]/15" },
+  { key: "linux", label: "LINUX", badgeClass: "text-[#f0b86e] bg-[#f0b86e]/15" },
 ];
 
 // Kept in sync with worker/bootstrap.ps1, worker/bootstrap.sh,
@@ -54,11 +54,11 @@ function CopyCommandButton({ text }: { text: string }) {
   return (
     <button
       type="button"
-      onClick={() => {
-        navigator.clipboard?.writeText(text).then(() => {
+      onClick={async () => {
+        if (await copyToClipboard(text)) {
           setCopied(true);
           setTimeout(() => setCopied(false), 1500);
-        });
+        }
       }}
       className="flex flex-none items-center gap-1 self-start rounded-md border border-border px-2 py-1 text-[11px] font-medium text-muted hover:border-accent/40 hover:text-accent"
     >
@@ -142,10 +142,12 @@ export function WorkerCard({
                   </div>
                   <p className="mt-1.5 text-xs leading-relaxed text-muted">{scenario.desc}</p>
                 </div>
-                {SETUP_OS_LABELS.map(({ key, label }) => (
-                  <div key={key} className="flex items-start gap-2.5 border-t border-border px-3 py-2">
-                    <span className="mt-0.5 flex-none">
-                      <StatusPill label={label} tone="muted" />
+                {SETUP_OS_LABELS.map(({ key, label, badgeClass }) => (
+                  <div key={key} className="flex items-start gap-3 border-t border-border bg-bg px-3 py-2.5">
+                    <span
+                      className={`mt-0.5 w-16 flex-none rounded py-[3px] text-center text-[10.5px] font-semibold tracking-wide ${badgeClass}`}
+                    >
+                      {label}
                     </span>
                     <code className="flex-1 whitespace-pre-wrap break-all font-mono text-xs text-fg">
                       {scenario.cmd[key]}
