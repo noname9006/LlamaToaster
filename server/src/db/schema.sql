@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS runs (
   worker_name TEXT,              -- just a label, e.g. 'Local' — no registration needed
   llama_cpp_build TEXT,          -- pinned build tag, e.g. 'b10068'
   llama_cpp_backend TEXT,        -- 'vulkan' | 'cpu' | 'cuda'
+  backend_device_name TEXT,      -- e.g. 'AMD Radeon RX 6600 XT' -- see shared/types.ts's Run.backend_device_name
   model_id TEXT,
   config TEXT,                   -- JSON: the exact sweep passed to llama-bench
   status TEXT,                   -- 'running' | 'done' | 'failed'
@@ -48,6 +49,26 @@ CREATE TABLE IF NOT EXISTS results (
   vram_avg_mib INTEGER,           -- best-effort
   ram_free_before_mib INTEGER,    -- free host RAM sampled right before the process spawned
   vram_free_before_mib INTEGER,   -- best-effort
+  system_memory_total_mib INTEGER,   -- total system RAM (Apple Silicon: total unified memory)
+  gpu_memory_total_mib INTEGER,      -- total VRAM capacity (Metal: total unified memory) -- see worker/src/vram.ts
+  -- Accuracy/provenance metadata for the four GPU-memory figures above/below
+  -- (gpu_memory_total_mib and the existing vram_free_before_mib/vram_avg_mib/
+  -- vram_peak_mib) -- see shared/types.ts's GpuMemoryAccuracyLevel/
+  -- GpuMemoryMeasurementSource for the enum values. Null iff the paired
+  -- value is null.
+  gpu_memory_total_accuracy TEXT,
+  gpu_memory_total_source TEXT,
+  gpu_memory_free_start_accuracy TEXT,   -- pairs with vram_free_before_mib above
+  gpu_memory_free_start_source TEXT,
+  gpu_memory_model_avg_accuracy TEXT,    -- pairs with vram_avg_mib above
+  gpu_memory_model_avg_source TEXT,
+  gpu_memory_model_peak_accuracy TEXT,   -- pairs with vram_peak_mib above
+  gpu_memory_model_peak_source TEXT,
+  -- Read from llama.cpp's own runtime output, never inferred -- see
+  -- worker/src/index.ts's parseOffloadLayers. n_gpu_layers above is already
+  -- the *requested* value; these are what actually happened.
+  gpu_layers_loaded INTEGER,
+  total_model_layers INTEGER,
   raw_json_path TEXT,             -- full llama-bench JSON output for this run
   created_at INTEGER
 );
