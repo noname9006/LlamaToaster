@@ -239,6 +239,26 @@ export function buildRepeatUnits(item: RunItem, repeats: number): StatusCircleUn
   return units;
 }
 
+// Mirrors shared/sweep.ts's deriveTestType (also inlined in RunDetail.tsx's
+// testTypeLabel) -- kept local per the boundary note there.
+function deriveTestType(nPrompt: number, nGen: number): "pp" | "tg" | "pg" {
+  if (nGen === 0) return "pp";
+  if (nPrompt === 0) return "tg";
+  return "pg";
+}
+
+// A pg item (both n_prompt and n_gen set) actually runs as two sequential
+// sub-benchmarks under llama-bench's -r N -- every repeat's pp phase
+// completes before any repeat's tg phase starts (confirmed against the
+// "benchmark N/2: prompt run x/y" / "generation run x/y" stderr markers
+// parsed below, see worker/src/index.ts's PP_RUN_RE/TG_RUN_RE), i.e. 2N
+// benchmark iterations, not N. So this item's own "runs" count (and dot
+// strip) is doubled to match -- see totalRuns in RunDetail.tsx, which sums
+// this same per-item doubling instead of a flat items.length * repeats.
+export function itemRunMultiplier(item: Pick<RunItem, "n_prompt" | "n_gen">): 1 | 2 {
+  return deriveTestType(item.n_prompt, item.n_gen) === "pg" ? 2 : 1;
+}
+
 // Builds a single sweep item's repeat-progress strip for every status, not
 // just while running -- unlike buildRepeatUnits (which returns null outside
 // the running state, so RunDetail's per-item table always has *a* strip to
@@ -247,21 +267,63 @@ export function buildRepeatUnits(item: RunItem, repeats: number): StatusCircleUn
 // own tone, and a running item shows the same live per-repeat progress as
 // buildRepeatUnits. No per-repeat failure detail is tracked, so a failed
 // item's dots are uniform rather than pinpointing which repeat broke.
+//
+// For a pg item (see itemRunMultiplier above), the strip is doubled into a
+// pp block followed by a tg block -- N dots each, matching llama-bench's
+// actual execution order. While the current phase is known (status
+// "processing" or "generating"), the two blocks track independently: e.g.
+// once tg starts, every pp dot is already solid regardless of the live
+// repeat counter, since that counter now belongs to the tg phase. Outside
+// that live+attributable window (queued/done/failed/cancelled, still
+// loading, or the older-llama-bench fallback "benchmarking" status with no
+// per-phase marker to key off), both blocks just mirror the same
+// (non-phase-specific) progress -- there's no way to tell pp and tg apart
+// in those states.
 export function buildItemRepeatUnits(item: RunItem, repeats: number): StatusCircleUnit[] {
   const n = Math.max(repeats, 1);
+  const doubled = itemRunMultiplier(item) === 2;
+
+  if (doubled && (item.status === "processing" || item.status === "generating")) {
+    const match = REPEAT_PROGRESS_RE.exec(item.detail ?? "");
+    const currentRep = match ? Number(match[1]) : 1;
+    const inTgPhase = item.status === "generating";
+    const block = (active: boolean, done: boolean, label: string): StatusCircleUnit[] =>
+      Array.from({ length: n }, (_, i) => {
+        const r = i + 1;
+        const tone: CircleTone = done
+          ? "solid"
+          : !active
+            ? "grey"
+            : r < currentRep
+              ? "solid"
+              : r === currentRep
+                ? "running"
+                : "grey";
+        return { tone, label: `${label} repeat ${r}/${n}` };
+      });
+    return [...block(!inTgPhase, inTgPhase, "pp"), ...block(inTgPhase, false, "tg")];
+  }
+
+  let units: StatusCircleUnit[];
   if (comboIsRunning(item.status)) {
     const match = REPEAT_PROGRESS_RE.exec(item.detail ?? "");
     const currentRep = match ? Number(match[1]) : 1;
-    return Array.from({ length: n }, (_, i) => {
+    units = Array.from({ length: n }, (_, i) => {
       const r = i + 1;
       return {
         tone: r < currentRep ? "solid" : r === currentRep ? "running" : "grey",
         label: `repeat ${r}/${n}`,
-      } as StatusCircleUnit;
+      };
     });
+  } else {
+    const tone = comboTone(item.status);
+    units = Array.from({ length: n }, (_, i) => ({ tone, label: `repeat ${i + 1}/${n}` }));
   }
-  const tone = comboTone(item.status);
-  return Array.from({ length: n }, (_, i) => ({ tone, label: `repeat ${i + 1}/${n}` }));
+  if (!doubled) return units;
+  return [
+    ...units.map((u) => ({ ...u, label: `pp ${u.label}` })),
+    ...units.map((u) => ({ ...u, label: `tg ${u.label}` })),
+  ];
 }
 
 export function WorkerStatusPill({ inaccessible, loading }: { inaccessible: boolean; loading?: boolean }) {
