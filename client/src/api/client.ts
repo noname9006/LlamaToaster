@@ -134,11 +134,15 @@ export const api = {
       `/api/hf/repo/${repo.split("/").map(encodeURIComponent).join("/")}`
     ).then((d) => d.files),
 
-  downloadHfFile: (workerName: string, hfRepo: string, hfFile: string): Promise<Model> =>
-    request<{ model: Model }>(
+  // Resolves once the worker acks that it has started the download, not
+  // once the download finishes -- that now happens in the background and is
+  // only observable by polling getDownloadProgress until it stops reporting
+  // (see Models.tsx's poll effect).
+  downloadHfFile: (workerName: string, hfRepo: string, hfFile: string): Promise<void> =>
+    request<void>(
       `/api/workers/${encodeURIComponent(workerName)}/models/download`,
       postJson({ hf_repo: hfRepo, hf_file: hfFile })
-    ).then((d) => d.model),
+    ),
 
   getDownloadProgress: (workerName: string, hfRepo: string, hfFile: string): Promise<DownloadProgress> =>
     request(
