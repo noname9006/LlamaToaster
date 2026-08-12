@@ -242,18 +242,28 @@ export function NewRun() {
     })();
   }, []);
 
-  // Only offer models that actually have a file on some configured worker
-  // right now -- a registered model whose file was deleted from disk
-  // shouldn't still show up as pickable for a new run. Skipped while any
-  // worker is unreachable (see above) so a transient outage never hides a
-  // model that's actually still on disk.
-  const presentModels = useMemo(
-    () =>
-      locations && unreachableLocationWorkers.length === 0
-        ? models.filter((m) => (locations[m.id]?.length ?? 0) > 0)
-        : models,
-    [models, locations, unreachableLocationWorkers]
-  );
+  // Only offer models that actually have a file on the currently selected
+  // worker -- mirrors Models.tsx's own per-worker grouping (locations[id]
+  // .includes(worker.name)), so New Run never shows a model as pickable for
+  // a worker whose section on the Models page would say "No models on this
+  // worker." Before a worker is chosen there's nothing to scope against yet,
+  // so it falls back to "present on any worker" instead. Skipped entirely
+  // (falls back to the full unfiltered registry) whenever we can't trust the
+  // scan: `locations` hasn't loaded/failed to load, or -- once a worker is
+  // picked -- that specific worker came back unreachable (see above); a
+  // *different* worker being briefly unreachable doesn't matter once one is
+  // selected.
+  const presentModels = useMemo(() => {
+    if (!locations) return models;
+    if (workerName) {
+      return unreachableLocationWorkers.includes(workerName)
+        ? models
+        : models.filter((m) => locations[m.id]?.includes(workerName));
+    }
+    return unreachableLocationWorkers.length === 0
+      ? models.filter((m) => (locations[m.id]?.length ?? 0) > 0)
+      : models;
+  }, [models, locations, unreachableLocationWorkers, workerName]);
 
   // Prefer whichever worker was picked last time (if it's still configured);
   // only fall back to auto-picking the sole worker when there's nothing
@@ -563,6 +573,13 @@ export function NewRun() {
             </label>
           )}
         </div>
+
+        {workerName && locations && unreachableLocationWorkers.includes(workerName) && (
+          <p className="-mt-2 text-xs text-warning">
+            Couldn't check what's on {workerName} -- showing every registered model rather than just this
+            worker's, so a pick here may not actually be present until that's confirmed.
+          </p>
+        )}
 
         {!modelId && (
           <p className="-mt-2 text-sm text-muted">Select a model to configure sweep parameters.</p>
