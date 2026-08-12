@@ -1,4 +1,5 @@
 import si from "systeminformation";
+import { WindowsGpuMemoryReader, readAdapterDedicatedUsageMib } from "./gpuMemoryWin.js";
 
 export interface SampleStats {
   ram_peak_mib: number;
@@ -43,7 +44,22 @@ export async function captureFreeMemoryBaseline(): Promise<FreeMemoryBaseline> {
       usedMib += controller.memoryUsed;
       measured = true;
     }
-    if (measured) vramFreeMib = Math.max(0, Math.round(totalMib - usedMib));
+    if (measured) {
+      vramFreeMib = Math.max(0, Math.round(totalMib - usedMib));
+    } else if (process.platform === "win32") {
+      // si only populates memoryTotal/memoryUsed from nvidia-smi -- on
+      // AMD/Intel it has neither, but does report a static total (`vram`,
+      // from WMI) reliably. Pair that with the OS-level dedicated-usage
+      // counter (see gpuMemoryWin.ts) for a real free-VRAM figure instead of
+      // leaving this null on non-NVIDIA Windows boxes.
+      const totalFromSi = graphics.controllers.reduce((sum, c) => sum + (c.vram ?? 0), 0);
+      if (totalFromSi > 0) {
+        const usedFromCounters = await readAdapterDedicatedUsageMib();
+        if (usedFromCounters != null) {
+          vramFreeMib = Math.max(0, totalFromSi - usedFromCounters);
+        }
+      }
+    }
   } catch {
     /* VRAM visibility on Vulkan/AMD is best-effort; ignore */
   }
@@ -63,6 +79,7 @@ export class MemorySampler {
   private vramSampleCount = 0;
   private vramMeasured = false;
   private pid: number | undefined;
+  private winVram: WindowsGpuMemoryReader | null = null;
 
   start(pid: number | undefined, intervalMs = 2000): void {
     this.pid = pid;
@@ -75,6 +92,12 @@ export class MemorySampler {
     this.vramSumBytes = 0;
     this.vramSampleCount = 0;
     this.vramMeasured = false;
+    this.winVram?.stop();
+    this.winVram = null;
+    if (process.platform === "win32" && pid != null) {
+      this.winVram = new WindowsGpuMemoryReader();
+      this.winVram.start(pid);
+    }
     this.sample();
     this.timer = setInterval(() => this.sample(), intervalMs);
   }
@@ -84,6 +107,8 @@ export class MemorySampler {
       clearInterval(this.timer);
       this.timer = null;
     }
+    this.winVram?.stop();
+    this.winVram = null;
     return this.stats;
   }
 
@@ -130,24 +155,54 @@ export class MemorySampler {
       this.ramSumBytes += ramBytes;
       this.ramSampleCount++;
 
-      try {
-        const graphics = await si.graphics();
-        let vramBytes = 0;
-        for (const controller of graphics.controllers) {
-          if (controller.memoryUsed == null) continue;
-          // systeminformation reports memoryUsed in MiB.
-          const used = controller.memoryUsed * BYTES_PER_MIB;
-          if (used > vramBytes) vramBytes = used;
-        }
-        if (vramBytes > 0) {
+      if (this.winVram) {
+        // Windows: per-process dedicated VRAM from the OS's own counters --
+        // vendor-neutral, works for AMD/Intel/NVIDIA under any backend (see
+        // gpuMemoryWin.ts). Null just means the background PowerShell loop
+        // hasn't produced its first reading yet (~1-1.5s after start()); skip
+        // this tick rather than falling through to si.graphics() below,
+        // which measures whole-machine usage, not this process's.
+        const vramBytes = this.winVram.currentBytes;
+        if (vramBytes != null) {
           this.vramMeasured = true;
           this.vramCurrentBytes = vramBytes;
           if (vramBytes > this.vramPeakBytes) this.vramPeakBytes = vramBytes;
           this.vramSumBytes += vramBytes;
           this.vramSampleCount++;
         }
-      } catch {
-        /* VRAM visibility on Vulkan/AMD is best-effort; ignore */
+      } else {
+        try {
+          const graphics = await si.graphics();
+          // Sum across every measured controller, not just the busiest one --
+          // matches captureFreeMemoryBaseline's own methodology above (which
+          // also sums), so a multi-GPU box's free-before and peak-during
+          // figures describe the same aggregate pool instead of one being a
+          // whole-box total and the other a single card's usage. This also
+          // matters for genuine multi-GPU tensor-split benchmarking (layers
+          // split across cards), where the real total is additive, not
+          // whichever card happens to be busiest at one sample tick. Like the
+          // baseline, this measures whole-machine usage per card (si has no
+          // per-process breakdown outside the win32 path above), so on a
+          // hybrid iGPU+dGPU box it'll include other processes' usage too --
+          // best-effort, same as it's always been.
+          let vramBytes = 0;
+          let measured = false;
+          for (const controller of graphics.controllers) {
+            if (controller.memoryUsed == null) continue;
+            // systeminformation reports memoryUsed in MiB.
+            vramBytes += controller.memoryUsed * BYTES_PER_MIB;
+            measured = true;
+          }
+          if (measured) {
+            this.vramMeasured = true;
+            this.vramCurrentBytes = vramBytes;
+            if (vramBytes > this.vramPeakBytes) this.vramPeakBytes = vramBytes;
+            this.vramSumBytes += vramBytes;
+            this.vramSampleCount++;
+          }
+        } catch {
+          /* VRAM visibility on Vulkan/AMD is best-effort; ignore */
+        }
       }
     } catch {
       /* sampler is non-fatal */

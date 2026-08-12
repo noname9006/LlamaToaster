@@ -276,5 +276,9 @@ curl http://<vps-public-ip>:4010/api/runs   # should hang or refuse
 
 ## Known limitations
 
-- VRAM peak is best-effort via `systeminformation.graphics()` (no clean AMD/Vulkan
-  equivalent of `nvidia-smi`). RAM peak is the trustworthy number.
+- VRAM peak on **Windows** workers is read from the OS's own "GPU Process
+  Memory" performance counter (per-process, vendor-neutral — works the same
+  for AMD/Intel/NVIDIA under any backend). On **Linux/macOS** it still falls
+  back to `systeminformation.graphics()`, which only gets real numbers from
+  `nvidia-smi` — non-NVIDIA GPUs there report VRAM as `n/a`. RAM peak is
+  always the trustworthy number regardless of platform.
