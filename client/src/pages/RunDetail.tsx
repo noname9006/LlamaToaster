@@ -6,6 +6,7 @@ import {
   RunStatusPill,
   StatusCircleStrip,
   buildItemRepeatUnits,
+  itemRunMultiplier,
   describeItemPhase,
   REPEAT_PROGRESS_RE,
 } from "../components/StatusPill";
@@ -429,9 +430,13 @@ export function RunDetail() {
 
   // "Runs" in this app's own vocabulary means repeats (-r), not sweep
   // combinations -- see buildProgressUnits' comment in StatusPill.tsx. One
-  // test item is one combination executed `repeats` times.
+  // test item is one combination executed `repeats` times -- except a pg
+  // item (both pp and tg measured), which llama-bench actually executes as
+  // 2x repeats benchmark iterations (see itemRunMultiplier in StatusPill.tsx),
+  // so this sums each item's own multiplier rather than a flat
+  // items.length * repeats.
   const repeats = run?.config.sweep.repeats ?? 1;
-  const totalRuns = items.length * repeats;
+  const totalRuns = items.reduce((sum, it) => sum + repeats * itemRunMultiplier(it), 0);
 
   // Estimated time to finish every remaining run, recalculated on every
   // poll. Preferably sourced from a stable pp/tg tok/s reading (from
