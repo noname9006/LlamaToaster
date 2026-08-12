@@ -82,6 +82,20 @@ input[type="range"] {
 .status-dot--cancelled {
   background: var(--color-muted);
 }
+/* Split repeat-progress circle (StatusPill.tsx's StatusSplitCircle) -- same
+   footprint as .status-dot, but its background is a hard-stop gradient set
+   inline per-instance (left half = pp tone, right half = tg tone) instead of
+   a flat color, so a single pg (pp+tg) repeat can show both phases at once. */
+.status-split-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 9999px;
+  flex: none;
+}
+.status-split-dot--blink {
+  animation: status-blink 1.8s ease-in-out infinite;
+}
 /* Two-handle range filter (ParamsRangeSlider.tsx) -- two native <input
    type=range> stacked on top of a custom visual track. Each input's own
    track is made invisible/non-interactive so only its thumb can be grabbed;
