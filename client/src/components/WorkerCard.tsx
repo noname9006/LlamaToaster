@@ -5,6 +5,74 @@ import { StatusPill, WorkerStatusPill, ElapsedSince } from "./StatusPill";
 import { IconCheck, IconChevronDown, IconDownload, IconTrash } from "./icons";
 import { formatBytes, formatDate } from "../utils";
 
+type SetupOS = "windows" | "macos" | "linux";
+
+const SETUP_OS_LABELS: Array<{ key: SetupOS; label: string }> = [
+  { key: "windows", label: "Windows" },
+  { key: "macos", label: "macOS" },
+  { key: "linux", label: "Linux" },
+];
+
+// Kept in sync with worker/bootstrap.ps1, worker/bootstrap.sh,
+// worker/setup-worker.ps1, worker/setup-worker.sh, and README.md's "Running
+// the worker (GPU box)" section -- all four describe the same three
+// scenarios.
+const SETUP_SCENARIOS: Array<{ title: string; desc: string; cmd: Record<SetupOS, string> }> = [
+  {
+    title: "Fresh install",
+    desc: "Brand-new machine, nothing downloaded yet (no repo, no config, no llama.cpp) -- one command fetches the repo, installs dependencies, and starts the worker. It'll ask which drive/volume to use (showing free space -- models are often tens of GB each) and a folder name, then create it.",
+    cmd: {
+      windows:
+        'iex "& { $(irm https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.ps1) }"',
+      macos: "curl -fsSL https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.sh | bash",
+      linux: "curl -fsSL https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.sh | bash",
+    },
+  },
+  {
+    title: "Already cloned",
+    desc: "Already have the repo checked out -- same command for first setup (still asks where, unless you pass a folder) and every restart after. Run from the repo root.",
+    cmd: {
+      windows: ".\\worker\\setup-worker.ps1",
+      macos: "bash worker/setup-worker.sh",
+      linux: "bash worker/setup-worker.sh",
+    },
+  },
+  {
+    title: "Restart",
+    desc: "Once it's already set up, a plain restart.",
+    cmd: {
+      windows: "worker\\start.bat",
+      macos: "npm run worker",
+      linux: "npm run worker",
+    },
+  },
+];
+
+function CopyCommandButton({ text }: { text: string }) {
+  const [copied, setCopied] = useState(false);
+
+  return (
+    <button
+      type="button"
+      onClick={() => {
+        navigator.clipboard?.writeText(text).then(() => {
+          setCopied(true);
+          setTimeout(() => setCopied(false), 1500);
+        });
+      }}
+      className="flex flex-none items-center gap-1 self-start rounded-md border border-border px-2 py-1 text-[11px] font-medium text-muted hover:border-accent/40 hover:text-accent"
+    >
+      {copied ? (
+        <>
+          <IconCheck width={12} height={12} /> Copied
+        </>
+      ) : (
+        "Copy"
+      )}
+    </button>
+  );
+}
+
 export function WorkerCard({
   worker,
   status,
@@ -62,42 +130,31 @@ export function WorkerCard({
             Setup / restart commands
             <IconChevronDown width={14} height={14} className="transition-transform group-open:rotate-180" />
           </summary>
-          <div className="border-t border-border px-2.5 py-2">
-            <p className="text-xs text-muted">
-              Brand-new machine, nothing downloaded yet (no repo, no config, no llama.cpp) --
-              one command fetches the repo, installs dependencies, and starts the worker. It'll
-              ask which drive/volume to use (showing free space -- models are often tens of GB
-              each) and a folder name, then create it:
-            </p>
-            <p className="mt-1 text-xs text-muted">Windows:</p>
-            <code className="block whitespace-pre-wrap break-all font-mono text-xs text-fg">
-              {'iex "& { $(irm https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.ps1) }"'}
-            </code>
-            <p className="mt-1 text-xs text-muted">macOS:</p>
-            <code className="block whitespace-pre-wrap break-all font-mono text-xs text-fg">
-              curl -fsSL https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.sh | bash
-            </code>
-            <p className="mt-1 text-xs text-muted">Linux:</p>
-            <code className="block whitespace-pre-wrap break-all font-mono text-xs text-fg">
-              curl -fsSL https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.sh | bash
-            </code>
-            <p className="mt-2 text-xs text-muted">
-              Already have the repo checked out -- same command for first setup (still asks
-              where, unless you pass a folder) and every restart after, run from the repo root:
-            </p>
-            <p className="mt-1 text-xs text-muted">Windows:</p>
-            <code className="block font-mono text-xs text-fg">.\worker\setup-worker.ps1</code>
-            <p className="mt-1 text-xs text-muted">macOS:</p>
-            <code className="block font-mono text-xs text-fg">bash worker/setup-worker.sh</code>
-            <p className="mt-1 text-xs text-muted">Linux:</p>
-            <code className="block font-mono text-xs text-fg">bash worker/setup-worker.sh</code>
-            <p className="mt-2 text-xs text-muted">Or, once it's already set up, a plain restart:</p>
-            <p className="mt-1 text-xs text-muted">Windows:</p>
-            <code className="block font-mono text-xs text-fg">worker\start.bat</code>
-            <p className="mt-1 text-xs text-muted">macOS:</p>
-            <code className="block font-mono text-xs text-fg">npm run worker</code>
-            <p className="mt-1 text-xs text-muted">Linux:</p>
-            <code className="block font-mono text-xs text-fg">npm run worker</code>
+          <div className="flex flex-col gap-3 border-t border-border p-3">
+            {SETUP_SCENARIOS.map((scenario, i) => (
+              <div key={scenario.title} className="overflow-hidden rounded-lg border border-border">
+                <div className="bg-surface-raised px-3 py-2.5">
+                  <div className="flex items-center gap-2">
+                    <span className="flex h-5 w-5 flex-none items-center justify-center rounded-md bg-accent/15 font-mono text-[11px] font-bold text-accent">
+                      {i + 1}
+                    </span>
+                    <span className="text-sm font-semibold text-fg">{scenario.title}</span>
+                  </div>
+                  <p className="mt-1.5 text-xs leading-relaxed text-muted">{scenario.desc}</p>
+                </div>
+                {SETUP_OS_LABELS.map(({ key, label }) => (
+                  <div key={key} className="flex items-start gap-2.5 border-t border-border px-3 py-2">
+                    <span className="mt-0.5 flex-none">
+                      <StatusPill label={label} tone="muted" />
+                    </span>
+                    <code className="flex-1 whitespace-pre-wrap break-all font-mono text-xs text-fg">
+                      {scenario.cmd[key]}
+                    </code>
+                    <CopyCommandButton text={scenario.cmd[key]} />
+                  </div>
+                ))}
+              </div>
+            ))}
           </div>
         </details>
       )}
