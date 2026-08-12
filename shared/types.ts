@@ -1,0 +1,465 @@
+// Sentinel error message the server uses whenever it can't reach a worker at
+// all (connection refused, DNS failure, timeout, ...) -- shared so the
+// client can recognize it and render a clean "Inaccessible" state instead of
+// displaying it as a generic error string. See server/src/worker-errors.ts
+// for where this gets produced.
+export const WORKER_INACCESSIBLE_MESSAGE = "worker is inaccessible";
+
+// Well-known values used for auto-detection's own guess (see
+// worker/src/hardware.ts's detectBackend) and as UI suggestions -- NOT an
+// exhaustive allowlist. Backend itself is a plain string (below): any value
+// is accepted end-to-end, matched against release asset names generically
+// (see server/src/github-releases.ts), so a future llama.cpp release adding
+// a new backend variant works without a code change here.
+export const KNOWN_BACKENDS = [
+  "cpu",
+  "vulkan",
+  "cuda",
+  "rocm",
+  "sycl",
+  "opencl-adreno",
+  "openvino",
+] as const;
+
+export type Backend = string;
+
+export type TestType = "pp" | "tg" | "pg";
+
+export type ModelSource = "local" | "huggingface";
+
+export interface ModelMetadata {
+  arch?: string;
+  quant?: string;
+  trained_ctx?: number;
+  // Transformer layer count (GGUF's <architecture>.block_count), read from
+  // the file header on download -- see worker/src/gguf.ts. Undefined for
+  // models registered before this existed, or for manually-registered
+  // "local" models the app never had file bytes to parse.
+  n_layer?: number;
+  // Total parameter count (raw element count across every tensor in the
+  // GGUF, as Hugging Face itself computes it from the file's tensor shapes)
+  // -- fetched from HF's model API at download time, see
+  // server/src/hf.ts's getHfGgufMeta. Deliberately NOT derived from repo/
+  // filename naming: some families (e.g. Gemma 3n's "E2B"/"E4B") name
+  // themselves after an "effective"/marketing parameter count that's much
+  // smaller than the real total. Undefined for models registered before
+  // this existed, local models with no hf_repo, or repos HF hasn't computed
+  // gguf metadata for.
+  param_count?: number;
+  // Nextn/MTP (multi-token-prediction) layer count, GGUF's
+  // <architecture>.nextn_predict_layers, read at the same time as n_layer --
+  // see worker/src/gguf.ts. >0 means this file has a usable MTP head:
+  // either baked into a normal base model (Qwen/DeepSeek/GLM-style, this
+  // file is directly benchmarkable with --spec-type draft-mtp and no
+  // companion), or -- when mtp_role below is "draft" -- this *is* the
+  // companion file itself (Gemma-4-style), meant to be paired with a base
+  // model via --model-draft rather than run standalone.
+  mtp_layers?: number;
+  // Set to "draft" when this model was registered from a path/filename
+  // containing "mtp" (the real-world convention for standalone MTP/drafter
+  // downloads, e.g. unsloth's "MTP/mtp-gemma-4-12B-it.gguf") -- see
+  // server/src/routes/workers.ts's download route. Such a model isn't
+  // directly benchmarkable on its own; the client excludes it from the main
+  // model picker and offers it only as an MTP-model companion choice.
+  mtp_role?: "draft";
+  [key: string]: unknown;
+}
+
+export interface Model {
+  id: string;
+  filename: string;
+  size_bytes: number;
+  source: ModelSource;
+  hf_repo?: string;
+  hf_file?: string;
+  metadata: ModelMetadata;
+  created_at: number;
+}
+
+// Real-world unsloth convention for a standalone MTP/drafter file: either at
+// repo root ("mtp-gemma-4-E2B-it.gguf") or inside an "MTP/" folder
+// ("MTP/mtp-gemma-4-E2B-it-Q4_0.gguf") -- "mtp" as its own path segment /
+// filename-prefix token, not merely a substring, so a legitimately
+// self-sufficient base model that happens to advertise MTP support in its
+// own name (e.g. a real "Qwen3.6-27B-MTP-Q4_K_M.gguf") doesn't false-positive.
+const MTP_FILENAME_PATTERN = /(^|\/)mtp[-_.]/i;
+
+// Re-derives whether a model is a standalone MTP/draft companion file (not
+// directly benchmarkable on its own) from its own stored metadata + filename,
+// rather than trusting a persisted metadata.mtp_role flag alone. This keeps
+// models registered before a detection-logic fix (or that otherwise ended up
+// with stale/missing metadata.mtp_role) correctly classified everywhere --
+// grouping, the New Run model picker, and the trigger route's run-eligibility
+// check -- with no backfill migration needed, since n_layer/mtp_layers/
+// filename are the only real inputs metadata.mtp_role was ever derived from
+// in the first place. See worker/src/gguf.ts and server/src/routes/
+// workers.ts's download route for where these fields come from.
+//
+// Unlike the content-based check below, the filename check does NOT require
+// n_layer to be absent: a real drafter file can still report a small nonzero
+// n_layer of its own (observed live -- Gemma-4's MTP file reports n_layer 4,
+// not absent -- which is exactly why that file wasn't being detected before
+// this function existed).
+export function isMtpDraftModel(m: { metadata: ModelMetadata; hf_file?: string; filename: string }): boolean {
+  if (m.metadata.mtp_role === "draft") return true;
+  const { n_layer, mtp_layers } = m.metadata;
+  if (typeof mtp_layers === "number" && mtp_layers > 0 && typeof n_layer !== "number") return true;
+  return MTP_FILENAME_PATTERN.test(m.hf_file ?? m.filename);
+}
+
+export interface RegisterModelInput {
+  id?: string;
+  filename?: string;
+  size_bytes?: number;
+  source: ModelSource;
+  hf_repo?: string;
+  hf_file?: string;
+  metadata?: ModelMetadata;
+}
+
+export interface SweepConfig {
+  model_id: string;
+  n_prompt: number[];
+  n_gen: number[];
+  threads: number[];
+  n_gpu_layers: number[];
+  batch_size: number[];
+  ubatch_size: number[];
+  cache_type_k: string[];
+  cache_type_v: string[];
+  flash_attn: string[];
+  // "on"/"off" -- whether to run this combo's benchmark via llama-server
+  // with --spec-type draft-mtp instead of the normal llama-bench path. See
+  // worker/src/serverBench.ts; llama-bench itself has no MTP support at all.
+  mtp: string[];
+  repeats: number;
+}
+
+export interface RunConfig {
+  model_id: string;
+  // Which registered model to pass as llama-server's --model-draft when any
+  // sweep item has mtp "on" and the base model's own mtp_layers isn't set
+  // (i.e. a Gemma-4-style base model that needs a separate companion file
+  // rather than Qwen-style in-file MTP). A single fixed choice for the whole
+  // run, not swept -- unlike flash_attn, "which draft model" isn't something
+  // that makes sense to toggle per combination.
+  mtp_model_id?: string;
+  sweep: Omit<SweepConfig, "model_id">;
+}
+
+// "partial" -- some sweep items succeeded and some failed, distinct from a
+// wholesale "failed" (nothing at all completed) or unstarted "running".
+// "cancelled" -- the user stopped the run before every item finished,
+// distinct from "failed" (which means something actually went wrong).
+// "scheduled" -- triggered while its worker already had another run
+// running (or queued) against it; sits in that worker's FIFO queue and
+// flips to "running" on its own once the run ahead of it finalizes (see
+// server/src/routes/runs.ts's dispatchScheduledRun).
+export type RunStatus = "running" | "scheduled" | "done" | "partial" | "failed" | "cancelled";
+
+export interface Run {
+  id: string;
+  worker_name: string;
+  llama_cpp_build: string;
+  llama_cpp_backend: Backend;
+  model_id: string;
+  model_filename?: string;
+  config: RunConfig;
+  status: RunStatus;
+  error?: string;
+  started_at: number;
+  completed_at?: number;
+  // Cheap aggregate counts over this run's run_items, for list views that
+  // want a live "x/y done" chip without fetching the full item list.
+  // items_total is 0 (not undefined) for runs predating run_items -- treat
+  // 0 the same as "nothing to show a chip for".
+  items_total?: number;
+  items_done?: number;
+  items_failed?: number;
+  items_cancelled?: number;
+}
+
+export interface ResultRow {
+  id: string;
+  run_id: string;
+  // Matches the run_item this result came from, so a merged live/final table
+  // in the client can join a result back to its item without relying on
+  // sweep-parameter matching (a degenerate sweep could contain duplicate
+  // parameter tuples). Not part of IngestResultInput -- the server already
+  // knows idx as a route/repo parameter, no need to round-trip it through
+  // the worker payload.
+  idx: number;
+  model_id: string;
+  test_type: TestType;
+  n_prompt: number;
+  n_gen: number;
+  n_threads: number;
+  n_gpu_layers: number;
+  batch_size: number;
+  ubatch_size: number;
+  cache_type_k: string;
+  cache_type_v: string;
+  flash_attn: string;
+  mtp: string;
+  avg_tps: number;
+  stddev_tps: number;
+  ram_peak_mib: number;
+  vram_peak_mib: number | null;
+  ram_avg_mib: number;
+  vram_avg_mib: number | null;
+  ram_free_before_mib: number | null;
+  vram_free_before_mib: number | null;
+  // Only ever populated by the llama-server/MTP path (worker/src/serverBench.ts)
+  // -- the llama-bench-CLI path (bench.ts) does its own internal repeat
+  // averaging and never sees individual readings, so these stay undefined
+  // there. sample_count is every repeat that produced a computable reading
+  // for this test_type (clean + suspect); suspect_count is the subset of
+  // those flagged implausible (see MAX_PLAUSIBLE_*_TOKENS_PER_SECOND in
+  // serverBench.ts) and excluded from avg_tps/stddev_tps *unless* every
+  // single reading was suspect, in which case avg_tps/stddev_tps falls back
+  // to averaging the suspect readings anyway rather than silently omitting
+  // this test_type's row entirely -- suspect_samples holds their raw values
+  // either way, so a real number is always visible instead of vanishing.
+  sample_count?: number;
+  suspect_count?: number;
+  suspect_samples?: number[];
+  // Every individual repeat's computable reading (clean + suspect, in repeat
+  // order) for this test_type -- only populated by the llama-server/MTP path,
+  // same as sample_count/suspect_count/suspect_samples above. avg_tps/
+  // stddev_tps are still the single number most call sites want; this is for
+  // seeing per-run variance directly (e.g. in the CSV/JSON export) instead of
+  // only the aggregate. suspect_samples is a subset of this array (the
+  // flagged-implausible ones specifically); this array has no such flag per
+  // element, just the raw per-repeat values in the order they were measured.
+  repeat_samples?: number[];
+  // Only populated on the tg row of an MTP item (worker/src/serverBench.ts) --
+  // llama-server's own /metrics speculative-decoding counters, the only
+  // direct evidence the --spec-type draft-mtp draft head actually contributed
+  // accepted tokens to this item's tg number rather than silently no-opping
+  // (e.g. a bad/incompatible --model-draft file). Both undefined when
+  // /metrics was unreachable or reported no counters at all -- a distinct,
+  // worse condition than a present-but-zero spec_drafted, which means the
+  // draft head loaded but never actually drafted anything.
+  spec_drafted?: number;
+  spec_accepted?: number;
+  raw_json_path?: string;
+  created_at: number;
+}
+
+export interface IngestResultInput {
+  test_type: TestType;
+  n_prompt: number;
+  n_gen: number;
+  n_threads: number;
+  n_gpu_layers: number;
+  batch_size: number;
+  ubatch_size: number;
+  cache_type_k: string;
+  cache_type_v: string;
+  flash_attn: string;
+  mtp: string;
+  avg_tps: number;
+  stddev_tps: number;
+  ram_peak_mib: number;
+  vram_peak_mib: number | null;
+  ram_avg_mib: number;
+  vram_avg_mib: number | null;
+  ram_free_before_mib: number | null;
+  vram_free_before_mib: number | null;
+  // See the matching fields on ResultRow above.
+  sample_count?: number;
+  suspect_count?: number;
+  suspect_samples?: number[];
+  repeat_samples?: number[];
+  spec_drafted?: number;
+  spec_accepted?: number;
+}
+
+// --- Per-item live progress (one llama-bench process per sweep combo) ---
+
+export type RunItemStatus =
+  | "queued"
+  | "loading"
+  | "processing"
+  | "generating"
+  | "benchmarking"
+  | "done"
+  | "failed"
+  | "failed_oom"
+  | "cancelled";
+
+const TERMINAL_RUN_ITEM_STATUSES = ["done", "failed", "failed_oom", "cancelled"] as const;
+export type TerminalRunItemStatus = (typeof TERMINAL_RUN_ITEM_STATUSES)[number];
+
+export function isTerminalRunItemStatus(status: RunItemStatus): status is TerminalRunItemStatus {
+  return (TERMINAL_RUN_ITEM_STATUSES as readonly string[]).includes(status);
+}
+
+export interface RunItem {
+  id: string;
+  run_id: string;
+  idx: number;
+  n_prompt: number;
+  n_gen: number;
+  n_threads: number;
+  n_gpu_layers: number;
+  batch_size: number;
+  ubatch_size: number;
+  cache_type_k: string;
+  cache_type_v: string;
+  flash_attn: string;
+  mtp: string;
+  status: RunItemStatus;
+  detail?: string;
+  ram_mib?: number | null;
+  vram_mib?: number | null;
+  ram_peak_mib?: number | null;
+  vram_peak_mib?: number | null;
+  ram_avg_mib?: number | null;
+  vram_avg_mib?: number | null;
+  ram_free_before_mib?: number | null;
+  vram_free_before_mib?: number | null;
+  // Measured per-repeat throughput from the most recently completed repeat
+  // (see worker/src/index.ts's repeat-marker parsing) -- refined every
+  // repeat, undefined until the first repeat of the current phase finishes.
+  live_tps?: number | null;
+  error?: string;
+  started_at?: number;
+  completed_at?: number;
+}
+
+// Fire-and-forget progress ticks -- worker sends these best-effort with a
+// short timeout while an item is loading/running; losing one is harmless
+// since the next tick or the terminal update below catches the DB up.
+export interface RunItemTickInput {
+  status: "loading" | "processing" | "generating" | "benchmarking";
+  detail?: string;
+  ram_mib?: number;
+  vram_mib?: number | null;
+  live_tps?: number | null;
+  // Free-memory baseline, captured once right before the process spawns --
+  // only meaningful on the very first tick for an item. The server persists
+  // it with COALESCE-on-existing-value (same pattern as started_at) so later
+  // ticks that omit it don't clobber it.
+  ram_free_before_mib?: number;
+  vram_free_before_mib?: number | null;
+}
+
+// Terminal per-item outcome -- worker sends these with retry-with-backoff
+// (same posture as the old whole-run ingest they replace), since they're
+// what permanently records history: a "done" result becomes a `results` row,
+// a failure closes out that item with no result.
+export interface RunItemTerminalInput {
+  status: "done" | "failed" | "failed_oom" | "cancelled";
+  error?: string;
+  // Peaks are worth recording even on a failure -- "climbed to 3.8GB then
+  // died" is the whole story for an OOM. `results` (the tps metrics that
+  // become `results` rows) only applies when status is "done" -- an array
+  // since one llama-bench process can produce up to two rows for a single
+  // sweep item (a pp row and a tg row) when both n_prompt and n_gen are set
+  // without -pg, see worker/src/bench.ts's parseLlamaBench.
+  ram_peak_mib?: number;
+  vram_peak_mib?: number | null;
+  ram_avg_mib?: number;
+  vram_avg_mib?: number | null;
+  results?: IngestResultInput[];
+}
+
+export type RunItemUpdateInput = RunItemTickInput | RunItemTerminalInput;
+
+export function isTerminalRunItemInput(input: RunItemUpdateInput): input is RunItemTerminalInput {
+  return isTerminalRunItemStatus(input.status);
+}
+
+export interface TriggerPayload {
+  model_id: string;
+  worker_name: string;
+  // See RunConfig.mtp_model_id -- same field, forwarded through the trigger
+  // request rather than looked up server-side from anything else.
+  mtp_model_id?: string;
+  sweep: Omit<SweepConfig, "model_id">;
+}
+
+// --- llama.cpp build management ---
+
+export interface LlamaCppAsset {
+  name: string;
+  download_url: string;
+  size_bytes: number;
+}
+
+export interface LlamaCppRelease {
+  tag: string;
+  published_at: string;
+  assets: LlamaCppAsset[];
+}
+
+export interface InstalledBuild {
+  tag: string;
+  asset_name: string;
+  installed_at: number;
+  active: boolean;
+}
+
+export interface HardwareInfo {
+  platform: string;
+  arch: string;
+  cpu: { manufacturer: string; brand: string; flags: string[]; cores: number };
+  gpu: { vendor: string; model: string }[];
+}
+
+export interface WorkerCurrentRun {
+  run_id: string;
+  model_filename: string;
+  started_at: number;
+}
+
+export interface WorkerLlamaCppInfo {
+  worker_name: string;
+  platform: string;
+  arch: string;
+  backend: Backend;
+  installed: InstalledBuild[];
+  active_tag: string | null;
+  available: LlamaCppRelease[];
+  update_available: boolean;
+  // Best-effort, diagnostic only -- undefined if the worker predates this
+  // field or /hardware couldn't be reached. Nothing here gates the
+  // "available" list above; that's still filtered by platform/arch/backend
+  // alone (see github-releases.ts) since current llama.cpp releases don't
+  // ship CPU-tiered variants for these flags to choose between anyway.
+  hardware?: HardwareInfo;
+  // Same best-effort story as hardware above, sourced from the worker's
+  // /health instead: undefined if that fetch failed rather than the main
+  // /llama-cpp one, rather than failing the whole response over it.
+  busy?: boolean;
+  current_run?: WorkerCurrentRun | null;
+  // True while the worker has finished its current sweep item and is
+  // holding before starting the next one (see worker/src/index.ts's
+  // /run/pause) -- only meaningful while busy is true.
+  paused?: boolean;
+}
+
+// --- Hugging Face model search ---
+
+export interface HfRepoSearchResult {
+  id: string;
+  downloads: number;
+  likes: number;
+  // Repo creation date reported by HF's search API (ISO string), null if
+  // that field was missing from the response -- powers the "Newest" sort in
+  // the client's HF search UI.
+  created_at: string | null;
+}
+
+export interface HfFileEntry {
+  path: string;
+  size_bytes: number;
+  quant: string | null;
+}
+
+export interface DownloadProgress {
+  bytes: number;
+  total: number | null;
+  started_at: number;
+}
