@@ -64,20 +64,39 @@ export function WorkerCard({
           </summary>
           <div className="border-t border-border px-2.5 py-2">
             <p className="text-xs text-muted">
-              Setting it up fresh on a machine with nothing downloaded yet:
+              Brand-new machine, nothing downloaded yet (no repo, no config, no llama.cpp) --
+              one command fetches the repo, installs dependencies, and starts the worker. It'll
+              ask which drive/volume to use (showing free space -- models are often tens of GB
+              each) and a folder name, then create it:
             </p>
             <p className="mt-1 text-xs text-muted">Windows:</p>
-            <code className="block font-mono text-xs text-fg">
-              .\worker\setup-worker.ps1 -Dir F:\LlamaToaster
+            <code className="block whitespace-pre-wrap break-all font-mono text-xs text-fg">
+              {'iex "& { $(irm https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.ps1) }"'}
             </code>
-            <p className="mt-1 text-xs text-muted">macOS / Ubuntu:</p>
-            <code className="block font-mono text-xs text-fg">
-              bash worker/setup-worker.sh --dir ~/llama-data
+            <p className="mt-1 text-xs text-muted">macOS:</p>
+            <code className="block whitespace-pre-wrap break-all font-mono text-xs text-fg">
+              curl -fsSL https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.sh | bash
             </code>
-            <p className="mt-2 text-xs text-muted">To (re)start it, run from the repo root:</p>
+            <p className="mt-1 text-xs text-muted">Linux:</p>
+            <code className="block whitespace-pre-wrap break-all font-mono text-xs text-fg">
+              curl -fsSL https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.sh | bash
+            </code>
+            <p className="mt-2 text-xs text-muted">
+              Already have the repo checked out -- same command for first setup (still asks
+              where, unless you pass a folder) and every restart after, run from the repo root:
+            </p>
+            <p className="mt-1 text-xs text-muted">Windows:</p>
+            <code className="block font-mono text-xs text-fg">.\worker\setup-worker.ps1</code>
+            <p className="mt-1 text-xs text-muted">macOS:</p>
+            <code className="block font-mono text-xs text-fg">bash worker/setup-worker.sh</code>
+            <p className="mt-1 text-xs text-muted">Linux:</p>
+            <code className="block font-mono text-xs text-fg">bash worker/setup-worker.sh</code>
+            <p className="mt-2 text-xs text-muted">Or, once it's already set up, a plain restart:</p>
             <p className="mt-1 text-xs text-muted">Windows:</p>
             <code className="block font-mono text-xs text-fg">worker\start.bat</code>
-            <p className="mt-1 text-xs text-muted">macOS / Ubuntu:</p>
+            <p className="mt-1 text-xs text-muted">macOS:</p>
+            <code className="block font-mono text-xs text-fg">npm run worker</code>
+            <p className="mt-1 text-xs text-muted">Linux:</p>
             <code className="block font-mono text-xs text-fg">npm run worker</code>
           </div>
         </details>

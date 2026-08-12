@@ -6,8 +6,14 @@
 # download one from the Models page) into <dir>/llama and <dir>/models. This
 # script itself never downloads llama.cpp or a model.
 #
-# Usage (from anywhere), defaults to ~/LlamaToaster if --dir is omitted:
+# Usage (from anywhere). Safe to run every time, first setup or a plain
+# restart -- if config.json already exists, setup (and the --dir prompt) is
+# skipped entirely and this just starts the worker:
 #   ./worker/setup-worker.sh
+#
+# On first run (no config.json yet), omitting --dir shows `df -h` (models
+# are often tens of GB each) and asks for a base folder and a name. Pass
+# --dir to skip that prompt, e.g. for unattended/scripted use:
 #   ./worker/setup-worker.sh --dir ~/LlamaToaster
 #
 # No IP needed either: bind_host auto-detects via `tailscale ip -4` unless
@@ -28,13 +34,16 @@
 #   --port <n>                default 8080
 #   --force                   overwrite an existing worker/config.json
 #
-# Safe by default: refuses to touch an existing worker/config.json unless
+# Safe by default: refuses to overwrite an existing worker/config.json unless
 # --force is passed (no git in this repo checkout, so an overwritten
-# config.json has no recovery path).
+# config.json has no recovery path). Idempotent otherwise: if config.json
+# already exists, setup is skipped and this just (re)starts the worker with
+# it as-is -- so the exact same command works both for first-time setup and
+# every restart after.
 
 set -euo pipefail
 
-DIR="$HOME/LlamaToaster"
+DIR=""
 WORKER_NAME="Local"
 BACKEND=""
 VPS_URL="http://100.122.1.111:4010"
@@ -77,32 +86,58 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 CONFIG_PATH="$REPO_ROOT/worker/config.json"
 
-if [ -f "$CONFIG_PATH" ] && [ "$FORCE" -ne 1 ]; then
-  echo "worker/config.json already exists -- not touching it. Current contents:"
-  cat "$CONFIG_PATH"
-  echo
-  echo "Re-run with --force to overwrite it."
-  exit 1
-fi
-
-if [ -z "$BIND_HOST" ]; then
-  echo "No --bind-host given, trying 'tailscale ip -4'..."
-  BIND_HOST="$(tailscale ip -4 2>/dev/null | head -n1 || true)"
-  if [ -z "$BIND_HOST" ]; then
-    echo "Could not auto-detect a Tailscale IP. Pass --bind-host <this machine's tailnet IP> explicitly." >&2
+select_install_dir() {
+  if { exec 3</dev/tty; } 2>/dev/null; then
+    exec 3<&-
+  else
+    echo "No terminal available to prompt for an install folder (running non-interactively?). Pass --dir explicitly, e.g. --dir ~/LlamaToaster." >&2
     exit 1
   fi
-  echo "Using detected Tailscale IP: $BIND_HOST"
-fi
 
-LLAMA_DIR="$DIR/llama"
-MODELS_DIR="$DIR/models"
-RAW_DIR="$MODELS_DIR/raw"
-mkdir -p "$LLAMA_DIR" "$MODELS_DIR" "$RAW_DIR"
+  echo "" >&2
+  echo "Where should LlamaToaster live?" >&2
+  echo "Downloaded models are often tens of GB each -- pick a volume with room to spare." >&2
+  echo "" >&2
+  df -h >&2
+  echo "" >&2
+  local base_dir folder_name
+  read -r -p "Base folder to install into [default: $HOME]: " base_dir < /dev/tty
+  base_dir="${base_dir:-$HOME}"
+  read -r -p "Folder name to create inside it [default: LlamaToaster]: " folder_name < /dev/tty
+  folder_name="${folder_name:-LlamaToaster}"
+  echo "" >&2
+  echo "${base_dir%/}/$folder_name"
+}
 
-# backend is left out entirely when not given (not even a null/empty value)
-# so the worker's own startup logic auto-detects it from live hardware.
-cat > "$CONFIG_PATH" <<EOF
+SKIPPED_SETUP=0
+if [ -f "$CONFIG_PATH" ] && [ "$FORCE" -ne 1 ]; then
+  SKIPPED_SETUP=1
+  echo "worker/config.json already exists -- skipping setup, starting the worker with it as-is."
+  echo "(Re-run with --force to redo setup, e.g. after changing --dir or --bind-host.)"
+else
+  if [ -z "$DIR" ]; then
+    DIR="$(select_install_dir)"
+    echo "Using $DIR"
+  fi
+
+  if [ -z "$BIND_HOST" ]; then
+    echo "No --bind-host given, trying 'tailscale ip -4'..."
+    BIND_HOST="$(tailscale ip -4 2>/dev/null | head -n1 || true)"
+    if [ -z "$BIND_HOST" ]; then
+      echo "Could not auto-detect a Tailscale IP. Pass --bind-host <this machine's tailnet IP> explicitly." >&2
+      exit 1
+    fi
+    echo "Using detected Tailscale IP: $BIND_HOST"
+  fi
+
+  LLAMA_DIR="$DIR/llama"
+  MODELS_DIR="$DIR/models"
+  RAW_DIR="$MODELS_DIR/raw"
+  mkdir -p "$LLAMA_DIR" "$MODELS_DIR" "$RAW_DIR"
+
+  # backend is left out entirely when not given (not even a null/empty value)
+  # so the worker's own startup logic auto-detects it from live hardware.
+  cat > "$CONFIG_PATH" <<EOF
 {
   "worker_name": "$WORKER_NAME",
 $( [ -n "$BACKEND" ] && printf '  "backend": "%s",\n' "$BACKEND" )
@@ -116,7 +151,8 @@ $( [ -n "$BACKEND" ] && printf '  "backend": "%s",\n' "$BACKEND" )
   "llama_cpp_builds_dir": "$LLAMA_DIR"
 }
 EOF
-echo "Wrote $CONFIG_PATH"
+  echo "Wrote $CONFIG_PATH"
+fi
 
 cd "$REPO_ROOT"
 if [ ! -e node_modules/.bin/tsx ]; then
@@ -124,6 +160,10 @@ if [ ! -e node_modules/.bin/tsx ]; then
   npm install
 fi
 
-BACKEND_LABEL="${BACKEND:-auto-detected from hardware}"
-echo "Starting worker '$WORKER_NAME' ($BACKEND_LABEL) -- llama.cpp builds will install to $LLAMA_DIR on first run, models download to $MODELS_DIR from the Models page."
+if [ "$SKIPPED_SETUP" -eq 1 ]; then
+  echo "Starting worker with existing $CONFIG_PATH"
+else
+  BACKEND_LABEL="${BACKEND:-auto-detected from hardware}"
+  echo "Starting worker '$WORKER_NAME' ($BACKEND_LABEL) -- llama.cpp builds will install to $LLAMA_DIR on first run, models download to $MODELS_DIR from the Models page."
+fi
 npm run worker
