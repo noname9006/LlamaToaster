@@ -1,0 +1,37 @@
+[Unit]
+Description=LlamaToaster worker (CPU)
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/LlamaToaster
+Environment=WORKER_CONFIG=worker/config.vps.json
+ExecStart=/usr/bin/npm run worker
+Restart=on-failure
+RestartSec=5
+
+# Resource contention mitigation (see the plan's "Resource contention"
+# section): llama-bench pegs every CPU core it's given while a benchmark
+# runs, and the orchestrator (a separate service, see
+# llamatoaster-server.service) needs to stay responsive on the same box
+# while that happens. Nice + CPUWeight both lower this service's scheduling
+# priority relative to everything else -- they don't cap it outright, so a
+# benchmark still gets full use of otherwise-idle cores.
+Nice=10
+CPUWeight=50
+
+# Defense in depth alongside the app's own bind_host-to-loopback choice
+# (see worker/config.vps.json.example) -- this service has no legitimate
+# reason to write outside its own directory tree or listen as root.
+# The whole worker/ dir needs to stay writable, not just llama-builds/:
+# activating a build (POST /llama-cpp/activate) rewrites config.vps.json
+# itself, in place, via a write-temp-then-rename in the same directory.
+NoNewPrivileges=true
+ProtectSystem=strict
+PrivateTmp=true
+ReadWritePaths=/home/ubuntu/LlamaToaster/models /home/ubuntu/LlamaToaster/worker
+
+[Install]
+WantedBy=multi-user.target

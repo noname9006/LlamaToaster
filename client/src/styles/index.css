@@ -1,0 +1,165 @@
+@import "tailwindcss";
+
+@theme {
+  --color-bg: #0b0d12;
+  --color-surface: #12151c;
+  --color-surface-raised: #171b24;
+  --color-border: #262b36;
+  --color-fg: #e8e9ec;
+  --color-muted: #8b92a3;
+  --color-accent: #6ea8fe;
+  --color-accent-fg: #0b0e14;
+  --color-success: #86ef9e;
+  --color-success-bg: #143323;
+  --color-danger: #ff9b9b;
+  --color-danger-bg: #3a1f1f;
+  --color-warning: #ffd479;
+  --color-warning-bg: #3a2f13;
+  --font-sans:
+    system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+html {
+  color-scheme: dark;
+}
+
+body {
+  @apply bg-bg text-fg antialiased;
+  font-family: var(--font-sans);
+}
+
+#root {
+  min-height: 100vh;
+}
+
+/* Native range inputs (used by ChipInput/stepper controls) don't pick up
+   Tailwind's accent-color utility consistently across browsers -- set it
+   directly so sliders match the accent token instead of the OS default. */
+input[type="range"] {
+  accent-color: var(--color-accent);
+}
+
+/* Per-test-row status indicator (StatusPill.tsx's StatusDot) -- deliberately
+   a slower fade than Tailwind's built-in animate-pulse (which cycles in
+   ~1s and reads as "urgent"); this is meant to read as "in progress", not
+   an alert. */
+.status-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 9999px;
+  flex: none;
+}
+.status-dot--grey {
+  background: var(--color-muted);
+  opacity: 0.45;
+}
+.status-dot--solid {
+  background: var(--color-success);
+}
+.status-dot--red {
+  background: var(--color-danger);
+}
+.status-dot--blink {
+  background: var(--color-success);
+  animation: status-blink 1.8s ease-in-out infinite;
+}
+/* Running sweep combination: yellow with the same slow "in progress" breathing
+   fade as --blink, but keyed to the warning token so it reads as running rather
+   than done (green). Used by the per-settings-set circle strip on RunDetail. */
+.status-dot--running {
+  background: var(--color-warning);
+  animation: status-blink 1.8s ease-in-out infinite;
+}
+/* Batched circle covering a mix of done + failed combos ("partial fails") --
+   static yellow, deliberately not animated, so it reads as a settled outcome
+   rather than something still in progress (that's --running's job). */
+.status-dot--warn {
+  background: var(--color-warning);
+}
+/* User-stopped item -- full-opacity muted grey, distinct from --grey's dim
+   0.45 opacity (queued/not-started-yet) at a glance. */
+.status-dot--cancelled {
+  background: var(--color-muted);
+}
+/* Two-handle range filter (ParamsRangeSlider.tsx) -- two native <input
+   type=range> stacked on top of a custom visual track. Each input's own
+   track is made invisible/non-interactive so only its thumb can be grabbed;
+   the div underneath (rendered by the component) draws the bar. */
+.params-range-slider input[type="range"] {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  margin: 0;
+  background: none;
+  pointer-events: none;
+  -webkit-appearance: none;
+  appearance: none;
+}
+.params-range-slider input[type="range"]::-webkit-slider-runnable-track {
+  -webkit-appearance: none;
+  background: transparent;
+}
+.params-range-slider input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  pointer-events: auto;
+  width: 14px;
+  height: 14px;
+  border-radius: 9999px;
+  background: var(--color-fg);
+  border: 2px solid var(--color-bg);
+  cursor: pointer;
+}
+.params-range-slider input[type="range"]::-moz-range-track {
+  background: transparent;
+  border: none;
+}
+.params-range-slider input[type="range"]::-moz-range-thumb {
+  pointer-events: auto;
+  width: 14px;
+  height: 14px;
+  border-radius: 9999px;
+  background: var(--color-fg);
+  border: 2px solid var(--color-bg);
+  cursor: pointer;
+}
+
+@keyframes status-blink {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.25;
+  }
+}
+
+/* AI assistant "typing" indicator -- three dots while a reply is being
+   processed/thought about, before the first token of real content arrives. */
+.ai-typing-dot {
+  display: inline-block;
+  width: 5px;
+  height: 5px;
+  border-radius: 9999px;
+  background: currentColor;
+  animation: ai-typing-bounce 1.2s ease-in-out infinite;
+}
+.ai-typing-dot:nth-child(2) {
+  animation-delay: 0.15s;
+}
+.ai-typing-dot:nth-child(3) {
+  animation-delay: 0.3s;
+}
+
+@keyframes ai-typing-bounce {
+  0%,
+  60%,
+  100% {
+    opacity: 0.3;
+    transform: translateY(0);
+  }
+  30% {
+    opacity: 1;
+    transform: translateY(-2px);
+  }
+}

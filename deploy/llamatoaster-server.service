@@ -1,0 +1,26 @@
+[Unit]
+Description=LlamaToaster orchestrator (VPS dashboard + API)
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/LlamaToaster
+EnvironmentFile=/home/ubuntu/LlamaToaster/deploy/orchestrator.env
+ExecStart=/usr/bin/npm run server
+Restart=on-failure
+RestartSec=5
+
+# No Nice/CPUWeight adjustment here on purpose -- this is the process that
+# needs to stay responsive while llamatoaster-worker.service pegs CPU cores
+# during a run (see that unit's comments).
+# Only data/ needs to be writable (DB_PATH in orchestrator.env points here)
+# -- the app code itself has no business being writable by its own process.
+NoNewPrivileges=true
+ProtectSystem=strict
+PrivateTmp=true
+ReadWritePaths=/home/ubuntu/LlamaToaster/data
+
+[Install]
+WantedBy=multi-user.target
