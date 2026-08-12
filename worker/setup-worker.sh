@@ -157,7 +157,12 @@ fi
 cd "$REPO_ROOT"
 if [ ! -e node_modules/.bin/tsx ]; then
   echo "Installing dependencies (npm install)..."
-  npm install
+  # --ignore-scripts: skips better-sqlite3's install step, which always
+  # compiles from source via node-gyp (it has no prebuilt-binary fallback)
+  # and needs a real C++ toolchain (Xcode Command Line Tools on macOS,
+  # build-essential on Linux). The worker never imports better-sqlite3
+  # (server-only), so there's nothing to build here.
+  npm install --ignore-scripts
 fi
 
 if [ "$SKIPPED_SETUP" -eq 1 ]; then
