@@ -18,7 +18,7 @@ import { Readable, Transform } from "node:stream";
 import { runBench, type BenchResult } from "./bench.js";
 import { runServerBench } from "./serverBench.js";
 import { MemorySampler, captureFreeMemoryBaseline, type SampleStats, type FreeMemoryBaseline } from "./sampler.js";
-import { writeRawJson, postRunItemUpdate } from "./vps-client.js";
+import { writeRawJson, postRunItemUpdate, postModelDownloadResult } from "./vps-client.js";
 import { log, configureLogging } from "./log.js";
 import {
   detectPlatform,
@@ -38,6 +38,7 @@ import type {
   InstalledBuild,
   RunItemTickInput,
   RunItemTerminalInput,
+  ModelDownloadCallbackInput,
 } from "../../shared/types.js";
 import { expandSweep, deriveTestType, type SweepItem } from "../../shared/sweep.js";
 
@@ -688,85 +689,57 @@ const server = createServer(async (req, res) => {
   }
 
   if (req.method === "POST" && url.pathname === "/models/download") {
+    let body: { hf_repo?: string; hf_file?: string };
     try {
-      const body = JSON.parse(await readBody(req, MAX_ADMIN_BODY_BYTES)) as {
-        hf_repo?: string;
-        hf_file?: string;
-      };
+      body = JSON.parse(await readBody(req, MAX_ADMIN_BODY_BYTES));
       if (!body.hf_repo || !body.hf_file) {
         return send(res, 400, { error: "hf_repo and hf_file are required" });
       }
       validateHfRepo(body.hf_repo);
       validateHfFile(body.hf_file);
-      const target = resolveDownloadTarget(body.hf_file);
-      mkdirSync(dirname(target), { recursive: true });
-
-      const progressKey = `${body.hf_repo}/${body.hf_file}`;
-      log.info(`downloading ${progressKey} -> ${target}`);
-      const downloadStartedAt = Date.now();
-      const sourceUrl = hfResolveUrl(body.hf_repo, body.hf_file);
-      const upstream = await fetch(sourceUrl, {
-        headers: { "user-agent": "llamatoaster-worker" },
-        redirect: "follow",
-      });
-      if (!upstream.ok || !upstream.body) {
-        log.error(`download failed for ${progressKey}: ${upstream.status} ${upstream.statusText}`);
-        return send(res, 502, {
-          error: `download failed: ${upstream.status} ${upstream.statusText}`,
-        });
-      }
-
-      const contentLength = Number(upstream.headers.get("content-length"));
-      const progress: DownloadProgress = {
-        bytes: 0,
-        total: Number.isFinite(contentLength) && contentLength > 0 ? contentLength : null,
-        started_at: downloadStartedAt,
-      };
-      downloadProgress.set(progressKey, progress);
-      const tracker = new Transform({
-        transform(chunk: Buffer, _enc, cb) {
-          progress.bytes += chunk.length;
-          cb(null, chunk);
-        },
-      });
-
-      const hasher = new HashingPassThrough();
-      // Deliberately keeps the progress-map entry alive through the gguf
-      // parse and response construction below, not just the byte transfer --
-      // the orchestrator's client polls this file's progress to know when to
-      // stop watching it, and only registers the model in its DB after this
-      // whole response arrives. Clearing the entry right after the pipeline
-      // finishes (the old behavior) opened a window where a poll could see
-      // "no longer downloading" and refresh the model list before the model
-      // was actually registered, so a freshly-completed download would
-      // briefly (or, if that poll was the last one, permanently) not show up
-      // anywhere. See client/src/pages/Models.tsx's finalizeOrphanedDownload
-      // for the other half of this fix.
-      try {
-        await pipeline(Readable.fromWeb(upstream.body as any), tracker, hasher, createWriteStream(target));
-        const elapsedMs = Date.now() - downloadStartedAt;
-        log.info(`downloaded ${progressKey}: ${hasher.byteLength}B in ${elapsedMs}ms`);
-
-        const { n_layer, mtp_layers } = await readGgufInfo(target);
-        log.info(
-          `gguf metadata for ${progressKey}: n_layer=${n_layer ?? "unknown"} mtp_layers=${mtp_layers ?? "unknown"}`
-        );
-
-        return send(res, 201, {
-          ok: true,
-          filename: body.hf_file,
-          size_bytes: hasher.byteLength,
-          sha256: hasher.digestHex(),
-          n_layer,
-          mtp_layers,
-        });
-      } finally {
-        downloadProgress.delete(progressKey);
-      }
     } catch (err) {
-      log.error(`model download failed: ${err instanceof Error ? err.message : String(err)}`);
       return sendError(res, err);
     }
+    const hfRepo = body.hf_repo!;
+    const hfFile = body.hf_file!;
+    const progressKey = `${hfRepo}/${hfFile}`;
+    if (downloadProgress.has(progressKey)) {
+      return send(res, 409, { error: "download already in progress for that file" });
+    }
+
+    let target: string;
+    try {
+      target = resolveDownloadTarget(hfFile);
+      mkdirSync(dirname(target), { recursive: true });
+    } catch (err) {
+      return sendError(res, err);
+    }
+
+    // Ack immediately and run the actual transfer in the background -- see
+    // the /run handler above for the same fire-and-forget shape and why:
+    // this used to block the whole HTTP response on the entire
+    // download+hash+gguf-parse, which for a multi-GB file routinely outlived
+    // not just this app's own configured MODEL_DOWNLOAD_TIMEOUT_MS but also
+    // Node's undici default per-request timeout (5 minutes, independent of
+    // any AbortSignal the caller passes) -- the orchestrator would then
+    // report this worker as "inaccessible" and never register the model,
+    // even though the file kept downloading here the whole time. The
+    // outcome is now reported back explicitly via postModelDownloadResult
+    // once it's known, success or failure, same pattern /run's per-item
+    // terminal updates use.
+    const downloadStartedAt = Date.now();
+    // Seeded before the ack goes out, not after the upstream HF fetch
+    // resolves like the old blocking handler did -- the orchestrator starts
+    // polling /models/download/progress as soon as it sees this response,
+    // so the entry needs to already exist to avoid a spurious "not found"
+    // on the very first poll.
+    const progress: DownloadProgress = { bytes: 0, total: null, started_at: downloadStartedAt };
+    downloadProgress.set(progressKey, progress);
+    log.info(`downloading ${progressKey} -> ${target}`);
+    send(res, 202, { ok: true, hf_repo: hfRepo, hf_file: hfFile, status: "started" });
+
+    void runModelDownload(hfRepo, hfFile, target, progressKey, progress, downloadStartedAt);
+    return;
   }
 
   if (req.method === "GET" && url.pathname === "/models/download/progress") {
@@ -896,6 +869,103 @@ function sendTick(runId: string, idx: number, tick: RunItemTickInput): void {
       `tick failed for run ${runId} item ${idx} (non-fatal): ${err instanceof Error ? err.message : String(err)}`
     );
   });
+}
+
+// Same retry-with-backoff posture as safeItemTerminal above -- this is the
+// only thing that gets a completed download registered as a Model
+// server-side, so losing it silently would leave a fully downloaded file on
+// disk the app never learns about.
+async function safeReportDownloadResult(payload: ModelDownloadCallbackInput): Promise<void> {
+  const key = `${payload.hf_repo}/${payload.hf_file}`;
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await postModelDownloadResult(config.vps_url, payload, 10_000);
+      log.info(`download callback ok for ${key} (ok=${payload.ok}, attempt ${attempt + 1})`);
+      return;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (attempt >= ITEM_RETRY_DELAYS_MS.length) {
+        log.error(`download callback failed for ${key} after ${attempt + 1} attempts, giving up: ${message}`);
+        return;
+      }
+      const delay = ITEM_RETRY_DELAYS_MS[attempt];
+      log.warn(`download callback attempt ${attempt + 1} failed for ${key}, retrying in ${delay}ms: ${message}`);
+      await sleep(delay);
+    }
+  }
+}
+
+// Runs the actual transfer+hash+gguf-parse in the background after
+// POST /models/download has already acked -- see that handler for why.
+// Deliberately keeps the progress-map entry alive through the gguf parse and
+// the callback POST below, not just the byte transfer: the orchestrator's
+// client polls this file's progress to know when to stop watching it and
+// only registers the model in its DB once the callback arrives, so clearing
+// the entry any earlier would let a poll see "no longer downloading" and
+// refresh the model list before the model actually exists there. See
+// client/src/pages/Models.tsx's finalizeDownload for the other half.
+async function runModelDownload(
+  hfRepo: string,
+  hfFile: string,
+  target: string,
+  progressKey: string,
+  progress: DownloadProgress,
+  downloadStartedAt: number
+): Promise<void> {
+  try {
+    const sourceUrl = hfResolveUrl(hfRepo, hfFile);
+    const upstream = await fetch(sourceUrl, {
+      headers: { "user-agent": "llamatoaster-worker" },
+      redirect: "follow",
+    });
+    if (!upstream.ok || !upstream.body) {
+      throw new Error(`download failed: ${upstream.status} ${upstream.statusText}`);
+    }
+
+    const contentLength = Number(upstream.headers.get("content-length"));
+    if (Number.isFinite(contentLength) && contentLength > 0) {
+      progress.total = contentLength;
+    }
+    const tracker = new Transform({
+      transform(chunk: Buffer, _enc, cb) {
+        progress.bytes += chunk.length;
+        cb(null, chunk);
+      },
+    });
+
+    const hasher = new HashingPassThrough();
+    await pipeline(Readable.fromWeb(upstream.body as any), tracker, hasher, createWriteStream(target));
+    const elapsedMs = Date.now() - downloadStartedAt;
+    log.info(`downloaded ${progressKey}: ${hasher.byteLength}B in ${elapsedMs}ms`);
+
+    const { n_layer, mtp_layers } = await readGgufInfo(target);
+    log.info(
+      `gguf metadata for ${progressKey}: n_layer=${n_layer ?? "unknown"} mtp_layers=${mtp_layers ?? "unknown"}`
+    );
+
+    await safeReportDownloadResult({
+      worker: config.worker_name,
+      hf_repo: hfRepo,
+      hf_file: hfFile,
+      ok: true,
+      sha256: hasher.digestHex(),
+      size_bytes: hasher.byteLength,
+      n_layer,
+      mtp_layers,
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    log.error(`model download failed for ${progressKey}: ${message}`);
+    await safeReportDownloadResult({
+      worker: config.worker_name,
+      hf_repo: hfRepo,
+      hf_file: hfFile,
+      ok: false,
+      error: message,
+    });
+  } finally {
+    downloadProgress.delete(progressKey);
+  }
 }
 
 interface RunSweepItemInput {

@@ -13,14 +13,28 @@ import type {
   DownloadProgress,
   WorkerCurrentRun,
   ModelMetadata,
+  ModelDownloadCallbackInput,
 } from "../../../shared/types.js";
 import { HF_REPO_PATTERN, searchHfGgufModels, listHfGgufFiles, getHfGgufMeta } from "../hf.js";
 
 const WORKER_READ_TIMEOUT_MS = 15_000;
 const WORKER_INSTALL_TIMEOUT_MS = 10 * 60 * 1000;
-const MODEL_DOWNLOAD_TIMEOUT_MS = Number(
-  process.env.MODEL_DOWNLOAD_TIMEOUT_MS ?? 60 * 60 * 1000
-);
+
+function validateModelDownloadCallback(payload: unknown): string | null {
+  if (!payload || typeof payload !== "object") return "payload must be an object";
+  const p = payload as Record<string, unknown>;
+  if (typeof p.worker !== "string" || !p.worker) return "worker must be a non-empty string";
+  if (typeof p.hf_repo !== "string" || !p.hf_repo) return "hf_repo must be a non-empty string";
+  if (typeof p.hf_file !== "string" || !p.hf_file) return "hf_file must be a non-empty string";
+  if (typeof p.ok !== "boolean") return "ok must be a boolean";
+  if (p.ok) {
+    if (typeof p.sha256 !== "string" || !p.sha256) return "sha256 is required when ok is true";
+    if (p.size_bytes !== undefined && typeof p.size_bytes !== "number") return "size_bytes must be a number";
+  } else if (p.error !== undefined && typeof p.error !== "string") {
+    return "error must be a string";
+  }
+  return null;
+}
 
 function findWorker(name: string) {
   return listWorkers().find((w) => w.name === name);
@@ -335,6 +349,16 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
     }
   });
 
+  // Just triggers the download and returns as soon as the worker acks --
+  // see worker/src/index.ts's POST /models/download for why this no longer
+  // waits out the (potentially tens-of-minutes) file transfer itself: doing
+  // so here too would still be bounded by Node's undici default per-request
+  // timeout (5 minutes) regardless of any timeout this route configured,
+  // silently reporting a healthy worker as "inaccessible" on any download
+  // slower than that. The actual completion (success or failure) arrives
+  // later via the worker's own callback to POST /api/models/download-callback
+  // below, mirroring how /run's per-item results are reported rather than
+  // returned on the trigger response.
   app.post<{ Params: { name: string }; Body: { hf_repo?: string; hf_file?: string } }>(
     "/api/workers/:name/models/download",
     async (request, reply) => {
@@ -346,10 +370,6 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
       }
       request.log.info({ worker: worker.name, hf_repo, hf_file }, "model download requested");
       try {
-        // Kicked off alongside the (potentially very long) file transfer below
-        // rather than after it -- a fast HF API call has no business adding
-        // latency to a multi-GB download.
-        const ggufMetaPromise = getHfGgufMeta(hf_repo, WORKER_READ_TIMEOUT_MS);
         const res = await fetchWorker(
           `${worker.url}/models/download`,
           {
@@ -357,20 +377,45 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
             headers: { "content-type": "application/json" },
             body: JSON.stringify({ hf_repo, hf_file }),
           },
-          MODEL_DOWNLOAD_TIMEOUT_MS
+          WORKER_READ_TIMEOUT_MS
         );
-        const data = (await res.json()) as {
-          sha256?: string;
-          size_bytes?: number;
-          n_layer?: number | null;
-          mtp_layers?: number | null;
-          error?: string;
-        };
+        const data = await res.json();
         if (!res.ok) {
-          request.log.error({ worker: worker.name, hf_repo, hf_file, error: data.error }, "model download failed");
-          return reply.code(res.status).send(data);
+          request.log.warn(
+            { worker: worker.name, hf_repo, hf_file, error: (data as { error?: string }).error },
+            "model download rejected"
+          );
         }
-        const { param_count } = await ggufMetaPromise;
+        return reply.code(res.status).send(data);
+      } catch (err) {
+        request.log.error({ worker: worker.name, hf_repo, hf_file, err: describeWorkerError(err) }, "model download error");
+        return reply.code(502).send({ error: describeWorkerError(err) });
+      }
+    }
+  );
+
+  // Worker -> server callback reporting a download's terminal outcome (see
+  // the trigger route above). Retried by the worker with backoff
+  // (safeReportDownloadResult), so this must stay safe to receive more than
+  // once for the same download -- repo.registerModel's upsert-on-id
+  // semantics already guarantee that for the success path.
+  app.post<{ Body: ModelDownloadCallbackInput }>(
+    "/api/models/download-callback",
+    // Same rationale as /api/runs/:id/items/:idx's logLevel below -- this
+    // isn't a user-facing request, no need for Fastify's automatic pair.
+    { logLevel: "silent" },
+    async (request, reply) => {
+      const validationError = validateModelDownloadCallback(request.body);
+      if (validationError) {
+        app.log.warn({ error: validationError }, "model download callback rejected: invalid payload");
+        return reply.code(400).send({ error: validationError });
+      }
+      const { worker, hf_repo, hf_file, ok, error, sha256, size_bytes, n_layer, mtp_layers } = request.body;
+      if (!ok) {
+        app.log.error({ worker, hf_repo, hf_file, error }, "model download failed");
+        return reply.code(200).send({ ok: true });
+      }
+      try {
         // See shared/types.ts's isMtpDraftModel for the full detection story
         // (content-based: has an MTP head but no real transformer stack of
         // its own; filename-based: the real-world "MTP/"-folder or
@@ -378,41 +423,33 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
         // own metadata so it can be persisted, but every *read* site
         // recomputes it live from stored metadata too rather than trusting
         // this stored flag alone.
+        const { param_count } = await getHfGgufMeta(hf_repo, WORKER_READ_TIMEOUT_MS);
         const metadata: ModelMetadata = {
-          ...(typeof data.n_layer === "number" ? { n_layer: data.n_layer } : {}),
+          ...(typeof n_layer === "number" ? { n_layer } : {}),
           ...(typeof param_count === "number" ? { param_count } : {}),
-          ...(typeof data.mtp_layers === "number" && data.mtp_layers > 0 ? { mtp_layers: data.mtp_layers } : {}),
+          ...(typeof mtp_layers === "number" && mtp_layers > 0 ? { mtp_layers } : {}),
         };
         if (isMtpDraftModel({ metadata, hf_file, filename: hf_file })) {
           metadata.mtp_role = "draft";
         }
-        request.log.info(
-          {
-            worker: worker.name,
-            hf_repo,
-            hf_file,
-            size_bytes: data.size_bytes,
-            n_layer: data.n_layer,
-            param_count,
-            mtp_layers: data.mtp_layers,
-            mtp_role: metadata.mtp_role,
-          },
+        app.log.info(
+          { worker, hf_repo, hf_file, size_bytes, n_layer, param_count, mtp_layers, mtp_role: metadata.mtp_role },
           "model download complete"
         );
-
-        const model = repo.registerModel({
-          id: data.sha256,
+        repo.registerModel({
+          id: sha256,
           filename: hf_file,
-          size_bytes: data.size_bytes ?? 0,
+          size_bytes: size_bytes ?? 0,
           source: "huggingface",
           hf_repo,
           hf_file,
           metadata,
         });
-        return reply.code(201).send({ model });
+        return reply.code(200).send({ ok: true });
       } catch (err) {
-        request.log.error({ worker: worker.name, hf_repo, hf_file, err: describeWorkerError(err) }, "model download error");
-        return reply.code(502).send({ error: describeWorkerError(err) });
+        const message = err instanceof Error ? err.message : String(err);
+        app.log.error({ worker, hf_repo, hf_file, err: message }, "model registration failed after download");
+        return reply.code(500).send({ error: message });
       }
     }
   );

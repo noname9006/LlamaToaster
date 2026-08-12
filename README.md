@@ -252,7 +252,9 @@ combination's live status individually as it runs (see the API table below).
 | DELETE | `/api/workers/:name/llama-cpp/:tag` | remove an installed build (not the active one) |
 | GET | `/api/hf/search?q=` | search Hugging Face repos tagged gguf |
 | GET | `/api/hf/repo/:repo` | list `.gguf` files + sizes in a repo |
-| POST | `/api/workers/:name/models/download` | download a file to a worker + register it |
+| POST | `/api/workers/:name/models/download` | start a download on a worker (returns as soon as it's accepted, not once it finishes) |
+| GET | `/api/workers/:name/models/download/progress` | poll an in-flight download's byte progress |
+| POST | `/api/models/download-callback` | worker posts a download's outcome once it finishes; registers the model |
 | GET | `/api/results/export` | json \| csv \| md |
 
 ## Security / Networking
