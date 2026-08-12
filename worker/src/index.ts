@@ -98,15 +98,31 @@ const buildsDir = resolve(config.llama_cpp_builds_dir ?? join(__dirname, "..", "
 
 configureLogging(resolve(config.log_dir ?? join(__dirname, "..", "logs")), process.env.LOG_LEVEL);
 
+// Always detected now (previously only ran when config.backend was unset,
+// which on a worker with an explicit config.json value -- the common case --
+// meant this never ran at all) since Run.backend_device_name's Tier-1
+// fallback (see below) needs it regardless of whether backend itself came
+// from config.json or auto-detection.
+const detectedHardware = await detectHardware();
+
 // backend is optional in config.json -- when unset, detect it live from
 // this machine's actual GPU rather than requiring it be hardcoded. An
 // explicit value in config.json always wins (e.g. to force `cpu` on a box
 // that does have a GPU).
-const backend: Backend =
-  config.backend ?? (await detectHardware().then((hw) => detectBackend(hw.platform, hw.gpu)));
+const backend: Backend = config.backend ?? detectBackend(detectedHardware.platform, detectedHardware.gpu);
 if (!config.backend) {
   log.info(`no backend set in config.json -- auto-detected "${backend}" from hardware`);
 }
+
+// Tier-1 backend_device_name fallback (see shared/types.ts's
+// Run.backend_device_name) -- always available, reported via /health below.
+// Upgraded opportunistically once the first non-MTP sweep item completes
+// (see worker/src/index.ts's runSweepItem, which sends bench.gpu_info --
+// llama-bench's own exact device-name string -- as a Tier-2 upgrade).
+const backendDeviceNameFallback: string | undefined =
+  backend === "cpu"
+    ? "CPU"
+    : (detectedHardware.gpu[0]?.model || detectedHardware.gpu[0]?.vendor || undefined);
 
 log.info(
   `[worker ${config.worker_name}] starting (backend=${backend}, build=${config.llama_cpp_build}, log level=${
@@ -537,6 +553,7 @@ const server = createServer(async (req, res) => {
               mtpModelPath,
               llamaServerPath: activeBuild!.serverPath,
               port: config.mtp_server_port ?? DEFAULT_MTP_SERVER_PORT,
+              backend,
               timeoutMs: config.bench_timeout_ms,
               rawJsonDir: rawDir,
             });
@@ -598,6 +615,7 @@ const server = createServer(async (req, res) => {
       paused: pauseRequested,
       current_run: currentRun,
       backend,
+      backend_device_name: backendDeviceNameFallback ?? null,
       active_build: activeBuild?.tag ?? null,
     });
   }
@@ -991,6 +1009,30 @@ const TG_RUN_RE = /benchmark\s+\d+\/\d+:\s+generation run\s+(\d+)\/(\d+)/i;
 const WARMUP_RE = /benchmark\s+\d+\/\d+:\s+warmup prompt run/i;
 const STARTING_RE = /benchmark\s+\d+\/\d+:\s+starting/i;
 
+// llama.cpp's own one-line model-load summary, printed exactly once by
+// either binary once tensor loading finishes -- confirmed live against the
+// real binaries across -ngl 0 ("0/43"), a partial value ("10/43", matching
+// the per-layer "layer N assigned to device" lines it also prints at this
+// same verbosity), and full offload ("43/43"). X = gpu_layers_loaded, Y =
+// total_model_layers -- Y is the GGUF's real transformer layer count + 1
+// (the output layer), not the same number as models.metadata.n_layer, so
+// this is the only correct source for either value. Requires -v (llama-bench,
+// see worker/src/bench.ts's supportsVerboseFlag) or -lv 999
+// (llama-server, see worker/src/serverBench.ts's buildArgs) -- absent at
+// default verbosity on both binaries, confirmed live.
+const OFFLOAD_LAYERS_RE = /load_tensors: offloaded (\d+)\/(\d+) layers to GPU/;
+
+interface OffloadInfo {
+  gpu_layers_loaded: number;
+  total_model_layers: number;
+}
+
+function parseOffloadLayers(stderr: string): OffloadInfo | null {
+  const match = OFFLOAD_LAYERS_RE.exec(stderr);
+  if (!match) return null;
+  return { gpu_layers_loaded: Number(match[1]), total_model_layers: Number(match[2]) };
+}
+
 // Maps a finished BenchResult into a terminal run-item report -- shared by
 // both the llama-bench path (runSweepItem) and the llama-server/MTP path
 // (runSweepItemViaServer below) since both produce the same BenchResult
@@ -1003,13 +1045,21 @@ async function finalizeSweepItemResult(
   processName: string,
   bench: BenchResult,
   stats: SampleStats,
-  baseline: FreeMemoryBaseline
+  baseline: FreeMemoryBaseline,
+  // Read from llama.cpp's own runtime output (see parseOffloadLayers above),
+  // null when the line was never seen at all (item failed before model load
+  // finished, or a build too old to support the required verbosity flag).
+  offload: OffloadInfo | null
 ): Promise<void> {
   if (bench.code === 0 && bench.results.length > 0) {
     // A single sweep item with both n_prompt and n_gen set (and no -pg)
     // produces two rows -- a pp-only row and a tg-only row -- both kept here
     // (previously only bench.results[0] was, silently discarding whichever
-    // of pp/tg came second).
+    // of pp/tg came second). GPU-memory fields inherit whatever
+    // captureFreeMemoryBaseline/MemorySampler already resolved -- both
+    // already collapse to null/"unavailable" on the cpu backend via
+    // vram.ts's own readGpuMemory short-circuit, so no separate check is
+    // needed here.
     const results: IngestResultInput[] = bench.results.map((r) => ({
       ...r,
       ram_peak_mib: stats.ram_peak_mib,
@@ -1018,6 +1068,18 @@ async function finalizeSweepItemResult(
       vram_avg_mib: stats.vram_avg_mib,
       ram_free_before_mib: baseline.ram_free_before_mib,
       vram_free_before_mib: baseline.vram_free_before_mib,
+      system_memory_total_mb: baseline.system_memory_total_mib,
+      gpu_memory_total_mb: baseline.gpu_memory_total_mib,
+      gpu_memory_total_accuracy: baseline.gpu_memory_total_accuracy,
+      gpu_memory_total_source: baseline.gpu_memory_total_source,
+      gpu_memory_free_start_accuracy: baseline.vram_free_before_accuracy,
+      gpu_memory_free_start_source: baseline.vram_free_before_source,
+      gpu_memory_model_avg_accuracy: stats.vram_avg_accuracy,
+      gpu_memory_model_avg_source: stats.vram_avg_source,
+      gpu_memory_model_peak_accuracy: stats.vram_peak_accuracy,
+      gpu_memory_model_peak_source: stats.vram_peak_source,
+      gpu_layers_loaded: offload?.gpu_layers_loaded ?? null,
+      total_model_layers: offload?.total_model_layers ?? null,
     }));
     log.info(
       `${label} done: ${results.map((r) => `${r.test_type}=${r.avg_tps.toFixed(2)}tok/s`).join(" ")} ` +
@@ -1041,6 +1103,12 @@ async function finalizeSweepItemResult(
       ram_avg_mib: stats.ram_avg_mib,
       vram_avg_mib: stats.vram_avg_mib,
       results,
+      // Tier-2 backend_device_name upgrade (see shared/types.ts's
+      // Run.backend_device_name) -- undefined on the llama-server/MTP path,
+      // which never sets bench.gpu_info (confirmed live: llama-server prints
+      // no device-enumeration line at any verbosity), so this naturally
+      // no-ops there without any extra branching.
+      backend_device_name: bench.gpu_info,
     });
     return;
   }
@@ -1077,7 +1145,7 @@ async function runSweepItem(input: RunSweepItemInput): Promise<void> {
   const benchmarkingPhase: RunItemTickInput["status"] =
     testType === "pp" ? "processing" : testType === "tg" ? "generating" : "benchmarking";
 
-  const baseline = await captureFreeMemoryBaseline();
+  const baseline = await captureFreeMemoryBaseline(backend);
   log.info(
     `${label}: free memory before start: ram=${baseline.ram_free_before_mib}MiB` +
       (baseline.vram_free_before_mib != null ? ` vram=${baseline.vram_free_before_mib}MiB` : "")
@@ -1112,7 +1180,7 @@ async function runSweepItem(input: RunSweepItemInput): Promise<void> {
       timeoutMs: input.timeoutMs,
       onSpawn: (proc) => {
         activeBenchProc = proc;
-        sampler.start(proc.pid, TICK_INTERVAL_MS);
+        sampler.start(proc.pid, backend, TICK_INTERVAL_MS);
         let tickCount = 0;
         tickTimer = setInterval(() => {
           if (!usedProgressMarkers && phase === "loading" && sawStderr && Date.now() - lastStderrAt > QUIET_PERIOD_MS) {
@@ -1195,12 +1263,13 @@ async function runSweepItem(input: RunSweepItemInput): Promise<void> {
     if (tickTimer) clearInterval(tickTimer);
     activeBenchProc = null;
     const stats = sampler.stop();
+    const offload = parseOffloadLayers(bench.stderr);
     const outcome = bench.code === 0 && bench.results.length > 0 ? "ok" : "failed";
     writeRawJson(rawJsonSubdir(input.rawJsonDir, outcome), `${runId}-${item.idx}`, {
       stdout: bench.stdout,
       stderr: bench.stderr,
     });
-    await finalizeSweepItemResult(runId, item, label, "llama-bench", bench, stats, baseline);
+    await finalizeSweepItemResult(runId, item, label, "llama-bench", bench, stats, baseline, offload);
   } catch (err) {
     if (tickTimer) clearInterval(tickTimer);
     activeBenchProc = null;
@@ -1226,6 +1295,7 @@ interface RunSweepItemViaServerInput {
   mtpModelPath: string | undefined;
   llamaServerPath: string;
   port: number;
+  backend: Backend;
   timeoutMs: number | undefined;
   rawJsonDir: string;
 }
@@ -1239,10 +1309,10 @@ interface RunSweepItemViaServerInput {
 // directly, so ticks come from a plain callback rather than regex-scraped
 // subprocess stderr.
 async function runSweepItemViaServer(input: RunSweepItemViaServerInput): Promise<void> {
-  const { runId, item } = input;
+  const { runId, item, backend } = input;
   const label = `run ${runId} item ${item.idx} (mtp)`;
 
-  const baseline = await captureFreeMemoryBaseline();
+  const baseline = await captureFreeMemoryBaseline(backend);
   log.info(
     `${label}: free memory before start: ram=${baseline.ram_free_before_mib}MiB` +
       (baseline.vram_free_before_mib != null ? ` vram=${baseline.vram_free_before_mib}MiB` : "")
@@ -1265,7 +1335,7 @@ async function runSweepItemViaServer(input: RunSweepItemViaServerInput): Promise
       timeoutMs: input.timeoutMs,
       onSpawn: (proc) => {
         activeBenchProc = proc;
-        sampler.start(proc.pid, TICK_INTERVAL_MS);
+        sampler.start(proc.pid, backend, TICK_INTERVAL_MS);
       },
       onProgress: (phase, detail, liveTps) => {
         log.info(`${label}: ${phase} (${detail})${liveTps != null ? ` (${liveTps.toFixed(1)} t/s)` : ""}`);
@@ -1282,12 +1352,13 @@ async function runSweepItemViaServer(input: RunSweepItemViaServerInput): Promise
     });
     activeBenchProc = null;
     const stats = sampler.stop();
+    const offload = parseOffloadLayers(bench.stderr);
     const outcome = bench.code === 0 && bench.results.length > 0 ? "ok" : "failed";
     writeRawJson(rawJsonSubdir(input.rawJsonDir, outcome), `${runId}-${item.idx}`, {
       stdout: bench.stdout,
       stderr: bench.stderr,
     });
-    await finalizeSweepItemResult(runId, item, label, "llama-server", bench, stats, baseline);
+    await finalizeSweepItemResult(runId, item, label, "llama-server", bench, stats, baseline, offload);
   } catch (err) {
     activeBenchProc = null;
     const stats = sampler.stop();

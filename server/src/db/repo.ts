@@ -13,6 +13,7 @@ import type {
   RunItem,
   RunItemTickInput,
   RunItemTerminalInput,
+  GpuMemoryAccuracyLevel,
 } from "../../../shared/types.js";
 import type { SweepItem } from "../../../shared/sweep.js";
 
@@ -32,6 +33,7 @@ interface RunRow {
   worker_name: string;
   llama_cpp_build: string;
   llama_cpp_backend: string;
+  backend_device_name: string | null;
   model_id: string;
   config: string;
   status: string;
@@ -80,6 +82,10 @@ interface ResultRowRaw {
   run_id: string;
   idx: number | null;
   model_id: string;
+  // Denormalized from the parent run via getResultsForRun's JOIN, not a
+  // physical column on `results` itself -- see ResultRow's own doc comment.
+  backend_type: string;
+  backend_device_name: string | null;
   test_type: string;
   n_prompt: number;
   n_gen: number;
@@ -99,6 +105,23 @@ interface ResultRowRaw {
   vram_avg_mib: number | null;
   ram_free_before_mib: number | null;
   vram_free_before_mib: number | null;
+  // Raw storage is nullable regardless of shared/types.ts's ResultRow
+  // typing accuracy fields as non-nullable strings: NULL here means this row
+  // predates the migration that added these columns, not "unavailable" as a
+  // deliberate measurement -- mapResult below coalesces that distinction
+  // away for anything reading through the public type.
+  system_memory_total_mib: number | null;
+  gpu_memory_total_mib: number | null;
+  gpu_memory_total_accuracy: string | null;
+  gpu_memory_total_source: string | null;
+  gpu_memory_free_start_accuracy: string | null;
+  gpu_memory_free_start_source: string | null;
+  gpu_memory_model_avg_accuracy: string | null;
+  gpu_memory_model_avg_source: string | null;
+  gpu_memory_model_peak_accuracy: string | null;
+  gpu_memory_model_peak_source: string | null;
+  gpu_layers_loaded: number | null;
+  total_model_layers: number | null;
   sample_count: number | null;
   suspect_count: number | null;
   suspect_samples: string | null;
@@ -128,6 +151,7 @@ function mapRun(row: RunRow): Run {
     worker_name: row.worker_name,
     llama_cpp_build: row.llama_cpp_build,
     llama_cpp_backend: row.llama_cpp_backend as Run["llama_cpp_backend"],
+    backend_device_name: row.backend_device_name ?? undefined,
     model_id: row.model_id,
     model_filename: row.model_filename ?? undefined,
     config: JSON.parse(row.config),
@@ -183,6 +207,15 @@ function safeParseNumberArray(json: string): number[] | undefined {
   }
 }
 
+// A raw DB NULL here means this row predates the migration that added these
+// columns -- reads the same as a deliberate "unavailable" measurement to
+// anything consuming the public ResultRow type, per shared/types.ts's
+// GpuMemoryAccuracyLevel doc comment (accuracy is always a concrete level,
+// never absent).
+function coalesceAccuracy(raw: string | null): GpuMemoryAccuracyLevel {
+  return (raw as GpuMemoryAccuracyLevel | null) ?? "unavailable";
+}
+
 function mapResult(row: ResultRowRaw): ResultRow {
   return {
     id: row.id,
@@ -211,6 +244,20 @@ function mapResult(row: ResultRowRaw): ResultRow {
     vram_avg_mib: row.vram_avg_mib,
     ram_free_before_mib: row.ram_free_before_mib,
     vram_free_before_mib: row.vram_free_before_mib,
+    backend_type: row.backend_type,
+    backend_device_name: row.backend_device_name,
+    system_memory_total_mb: row.system_memory_total_mib,
+    gpu_memory_total_mb: row.gpu_memory_total_mib,
+    gpu_memory_total_accuracy: coalesceAccuracy(row.gpu_memory_total_accuracy),
+    gpu_memory_total_source: row.gpu_memory_total_source as ResultRow["gpu_memory_total_source"],
+    gpu_memory_free_start_accuracy: coalesceAccuracy(row.gpu_memory_free_start_accuracy),
+    gpu_memory_free_start_source: row.gpu_memory_free_start_source as ResultRow["gpu_memory_free_start_source"],
+    gpu_memory_model_avg_accuracy: coalesceAccuracy(row.gpu_memory_model_avg_accuracy),
+    gpu_memory_model_avg_source: row.gpu_memory_model_avg_source as ResultRow["gpu_memory_model_avg_source"],
+    gpu_memory_model_peak_accuracy: coalesceAccuracy(row.gpu_memory_model_peak_accuracy),
+    gpu_memory_model_peak_source: row.gpu_memory_model_peak_source as ResultRow["gpu_memory_model_peak_source"],
+    gpu_layers_loaded: row.gpu_layers_loaded,
+    total_model_layers: row.total_model_layers,
     sample_count: row.sample_count ?? undefined,
     suspect_count: row.suspect_count ?? undefined,
     // Stored as JSON text (SQLite has no array column type) -- tolerate a
@@ -367,9 +414,21 @@ export const repo = {
     return { run, results, items };
   },
 
+  // backend_type/backend_device_name are denormalized from the parent run
+  // here, not physical columns on `results` itself -- see ResultRow's own
+  // doc comment for why (backend can't vary between one run's own items,
+  // so repeating an identical string on every row would be pure noise).
+  // Mirrors worker_name's own existing JOIN in the CSV/MD export
+  // (server/src/routes/results.ts).
   getResultsForRun(runId: string): ResultRow[] {
     const rows = getDb()
-      .prepare("SELECT * FROM results WHERE run_id = ? ORDER BY created_at ASC")
+      .prepare(
+        `SELECT r.*, runs.llama_cpp_backend AS backend_type, runs.backend_device_name AS backend_device_name
+         FROM results r
+         JOIN runs ON runs.id = r.run_id
+         WHERE r.run_id = ?
+         ORDER BY r.created_at ASC`
+      )
       .all(runId) as ResultRowRaw[];
     return rows.map(mapResult);
   },
@@ -377,14 +436,15 @@ export const repo = {
   createRun(run: Run): void {
     getDb()
       .prepare(
-        `INSERT INTO runs (id, worker_name, llama_cpp_build, llama_cpp_backend, model_id, config, status, error, started_at, completed_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        `INSERT INTO runs (id, worker_name, llama_cpp_build, llama_cpp_backend, backend_device_name, model_id, config, status, error, started_at, completed_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         run.id,
         run.worker_name,
         run.llama_cpp_build,
         run.llama_cpp_backend,
+        run.backend_device_name ?? null,
         run.model_id,
         JSON.stringify(run.config),
         run.status,
@@ -509,9 +569,15 @@ export const repo = {
               batch_size, ubatch_size, cache_type_k, cache_type_v, flash_attn, mtp,
               avg_tps, stddev_tps, ram_peak_mib, vram_peak_mib,
               ram_avg_mib, vram_avg_mib, ram_free_before_mib, vram_free_before_mib,
+              system_memory_total_mib, gpu_memory_total_mib,
+              gpu_memory_total_accuracy, gpu_memory_total_source,
+              gpu_memory_free_start_accuracy, gpu_memory_free_start_source,
+              gpu_memory_model_avg_accuracy, gpu_memory_model_avg_source,
+              gpu_memory_model_peak_accuracy, gpu_memory_model_peak_source,
+              gpu_layers_loaded, total_model_layers,
               sample_count, suspect_count, suspect_samples, repeat_samples, spec_drafted, spec_accepted,
               raw_json_path, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         );
         // Up to two rows for one idx (a pp row and a tg row from the same
         // benchmark process) -- distinguished by test_type, see
@@ -542,6 +608,18 @@ export const repo = {
             row.vram_avg_mib,
             row.ram_free_before_mib,
             row.vram_free_before_mib,
+            row.system_memory_total_mb,
+            row.gpu_memory_total_mb,
+            row.gpu_memory_total_accuracy,
+            row.gpu_memory_total_source,
+            row.gpu_memory_free_start_accuracy,
+            row.gpu_memory_free_start_source,
+            row.gpu_memory_model_avg_accuracy,
+            row.gpu_memory_model_avg_source,
+            row.gpu_memory_model_peak_accuracy,
+            row.gpu_memory_model_peak_source,
+            row.gpu_layers_loaded,
+            row.total_model_layers,
             row.sample_count ?? null,
             row.suspect_count ?? null,
             row.suspect_samples ? JSON.stringify(row.suspect_samples) : null,
@@ -552,6 +630,15 @@ export const repo = {
             row.created_at
           );
         }
+      }
+
+      // Tier-2 backend_device_name upgrade (see shared/types.ts's
+      // Run.backend_device_name) -- a plain UPDATE, not COALESCE: the Tier-1
+      // fallback is always written first at dispatch time (markRunRunning/
+      // createRun), strictly before any item can go terminal, so this write
+      // is always the intended upgrade, never a downgrade.
+      if (input.backend_device_name) {
+        database.prepare(`UPDATE runs SET backend_device_name = ? WHERE id = ?`).run(input.backend_device_name, runId);
       }
 
       if (this.countUnfinishedItems(runId) === 0) {
@@ -680,12 +767,15 @@ export const repo = {
   // while a run sits queued, and "started" should mean "began executing",
   // not "was queued" (see Run.started_at's use elsewhere as "when
   // triggered", which for a queued run this now supersedes).
-  markRunRunning(runId: string, patch: { llama_cpp_build: string; llama_cpp_backend: string; started_at: number }): void {
+  markRunRunning(
+    runId: string,
+    patch: { llama_cpp_build: string; llama_cpp_backend: string; backend_device_name?: string; started_at: number }
+  ): void {
     getDb()
       .prepare(
-        `UPDATE runs SET status = 'running', llama_cpp_build = ?, llama_cpp_backend = ?, started_at = ? WHERE id = ?`
+        `UPDATE runs SET status = 'running', llama_cpp_build = ?, llama_cpp_backend = ?, backend_device_name = ?, started_at = ? WHERE id = ?`
       )
-      .run(patch.llama_cpp_build, patch.llama_cpp_backend, patch.started_at, runId);
+      .run(patch.llama_cpp_build, patch.llama_cpp_backend, patch.backend_device_name ?? null, patch.started_at, runId);
   },
 
   // Marks a run's still-unfinished items 'cancelled' (not 'failed' --
@@ -709,7 +799,17 @@ export const repo = {
   },
 };
 
-function buildResultRow(runId: string, modelId: string, idx: number, r: IngestResultInput): ResultRow {
+// Builds the *physical-column* subset of ResultRow -- deliberately excludes
+// backend_type/backend_device_name, which aren't physical columns on
+// `results` at all (see ResultRow's own doc comment: they're a JOIN done in
+// getResultsForRun, only known once a row is read back with its parent run,
+// never at insert time here).
+function buildResultRow(
+  runId: string,
+  modelId: string,
+  idx: number,
+  r: IngestResultInput
+): Omit<ResultRow, "backend_type" | "backend_device_name"> {
   return {
     id: uuid(),
     run_id: runId,
@@ -734,6 +834,18 @@ function buildResultRow(runId: string, modelId: string, idx: number, r: IngestRe
     vram_avg_mib: r.vram_avg_mib,
     ram_free_before_mib: r.ram_free_before_mib,
     vram_free_before_mib: r.vram_free_before_mib,
+    system_memory_total_mb: r.system_memory_total_mb,
+    gpu_memory_total_mb: r.gpu_memory_total_mb,
+    gpu_memory_total_accuracy: r.gpu_memory_total_accuracy,
+    gpu_memory_total_source: r.gpu_memory_total_source,
+    gpu_memory_free_start_accuracy: r.gpu_memory_free_start_accuracy,
+    gpu_memory_free_start_source: r.gpu_memory_free_start_source,
+    gpu_memory_model_avg_accuracy: r.gpu_memory_model_avg_accuracy,
+    gpu_memory_model_avg_source: r.gpu_memory_model_avg_source,
+    gpu_memory_model_peak_accuracy: r.gpu_memory_model_peak_accuracy,
+    gpu_memory_model_peak_source: r.gpu_memory_model_peak_source,
+    gpu_layers_loaded: r.gpu_layers_loaded,
+    total_model_layers: r.total_model_layers,
     sample_count: r.sample_count,
     suspect_count: r.suspect_count,
     suspect_samples: r.suspect_samples,

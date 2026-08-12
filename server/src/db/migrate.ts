@@ -72,6 +72,24 @@ const COLUMN_MIGRATIONS: ColumnSpec[] = [
   // item only) -- see shared/types.ts's ResultRow doc comment.
   { table: "results", column: "spec_drafted", ddlType: "INTEGER" },
   { table: "results", column: "spec_accepted", ddlType: "INTEGER" },
+  // Cross-backend RAM/VRAM/offload metrics -- see shared/types.ts's
+  // ResultRow doc comments and worker/src/vram.ts's per-backend
+  // readGpuMemory for what populates these. NULL on every row inserted
+  // before this migration, which correctly reads as "unavailable" (this
+  // data genuinely didn't exist yet, not lost).
+  { table: "runs", column: "backend_device_name", ddlType: "TEXT" },
+  { table: "results", column: "system_memory_total_mib", ddlType: "INTEGER" },
+  { table: "results", column: "gpu_memory_total_mib", ddlType: "INTEGER" },
+  { table: "results", column: "gpu_memory_total_accuracy", ddlType: "TEXT" },
+  { table: "results", column: "gpu_memory_total_source", ddlType: "TEXT" },
+  { table: "results", column: "gpu_memory_free_start_accuracy", ddlType: "TEXT" },
+  { table: "results", column: "gpu_memory_free_start_source", ddlType: "TEXT" },
+  { table: "results", column: "gpu_memory_model_avg_accuracy", ddlType: "TEXT" },
+  { table: "results", column: "gpu_memory_model_avg_source", ddlType: "TEXT" },
+  { table: "results", column: "gpu_memory_model_peak_accuracy", ddlType: "TEXT" },
+  { table: "results", column: "gpu_memory_model_peak_source", ddlType: "TEXT" },
+  { table: "results", column: "gpu_layers_loaded", ddlType: "INTEGER" },
+  { table: "results", column: "total_model_layers", ddlType: "INTEGER" },
 ];
 
 function applyColumnMigrations(database: Database.Database): void {

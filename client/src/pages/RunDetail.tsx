@@ -11,7 +11,7 @@ import {
 } from "../components/StatusPill";
 import { Chart } from "../components/Chart";
 import { Th, toggleSort, type SortState } from "../components/Th";
-import type { Run, ResultRow, RunItem } from "../types";
+import type { Run, ResultRow, RunItem, GpuMemoryAccuracyLevel, GpuMemoryMeasurementSource } from "../types";
 import { shortId, formatElapsed, formatFlashAttn } from "../utils";
 
 interface ColDef {
@@ -42,7 +42,13 @@ const MERGED_COLUMN_DEFS: ColDef[] = [
   { label: "n_prompt", description: "-p — prompt tokens processed before generating.", sortKey: "n_prompt", padX: "!pl-2 !pr-0.5" },
   { label: "n_gen", description: "-n — tokens generated after the prompt.", sortKey: "n_gen", padX: "!pl-0.5 !pr-2" },
   { label: "threads", description: "-t — CPU threads used for compute.", sortKey: "threads", padX: "!pl-2 !pr-0.5" },
-  { label: "ngl", description: "-ngl — model layers offloaded to GPU (999 = all).", sortKey: "ngl", padX: "!pl-0.5 !pr-2" },
+  { label: "ngl", description: "-ngl — model layers offloaded to GPU (999 = all, i.e. the requested value).", sortKey: "ngl", padX: "!pl-0.5 !pr-2" },
+  {
+    label: "loaded",
+    description: "Layers actually loaded onto the GPU, read from llama.cpp's own runtime output (not calculated) — may be less than ngl if the model has fewer layers than requested.",
+    sortKey: "layers_loaded",
+  },
+  { label: "layers", description: "Total transformer layer count for this model, as loaded by llama.cpp.", sortKey: "layers_total" },
   { label: "batch", description: "-b — logical batch size for prompt processing.", sortKey: "batch" },
   { label: "ubatch", description: "-ub — physical batch size (must be ≤ batch size).", sortKey: "ubatch" },
   { label: "ctk", description: "-ctk — K cache quantization type.", sortKey: "ctk" },
@@ -75,6 +81,7 @@ const MERGED_COLUMN_DEFS: ColDef[] = [
   { label: "ram free", description: "Free system RAM immediately before this test started.", sortKey: "ram_free" },
   { label: "ram avg", description: "Average RAM used by the process while this test ran.", sortKey: "ram_avg" },
   { label: "ram max", description: "Peak RAM used by the process during this test.", sortKey: "ram_max" },
+  { label: "vram total", description: "Total GPU memory (VRAM) capacity reported by the backend.", sortKey: "vram_total" },
   { label: "vram free", description: "Free GPU memory immediately before this test started (best-effort).", sortKey: "vram_free" },
   { label: "vram avg", description: "Average GPU memory used while this test ran (best-effort).", sortKey: "vram_avg" },
   { label: "vram max", description: "Peak GPU memory used during this test (best-effort).", sortKey: "vram_max" },
@@ -155,10 +162,37 @@ function resultSuspectTitle(r: ResultRow): string | undefined {
     `(raw flagged values: ${raw} tok/s) -- likely the known llama-server MTP timing bug`;
 }
 
+// Keyed off measurement_source (never backend_type) so the UI is driven
+// entirely by the API's own accuracy metadata rather than hardcoding
+// per-backend rules -- the same value/source pair means the same tooltip
+// regardless of which backend produced it. Returns undefined for "exact"
+// (no tooltip needed) and whenever source is missing (nothing measured at
+// all -- the cell itself already reads "n/a"/"—", a tooltip would be noise).
+const ACCURACY_SOURCE_EXPLANATIONS: Record<GpuMemoryMeasurementSource, string> = {
+  process_gpu_usage: "This value is based on direct process GPU memory reporting.",
+  driver_reported_memory:
+    "This value is a whole-GPU driver-reported reading (not isolated to this benchmark process) and may include memory used by other running programs.",
+  backend_allocation_tracking:
+    "This value is estimated from the backend's own internal allocation tracking, not a direct OS/driver measurement.",
+  memory_budget_estimate:
+    "This value is estimated using the backend's memory budget/heap information and may differ from actual process GPU memory usage.",
+  unified_memory_estimate:
+    "This value is estimated using unified memory allocation information and may not represent GPU-only memory usage.",
+};
+
+function gpuMemoryAccuracyTitle(
+  accuracy: GpuMemoryAccuracyLevel | undefined,
+  source: GpuMemoryMeasurementSource | null | undefined
+): string | undefined {
+  if (!accuracy || accuracy === "exact" || !source) return undefined;
+  return ACCURACY_SOURCE_EXPLANATIONS[source];
+}
+
 interface MemoryCells {
   ramFree: string;
   ramAvg: string;
   ramMax: string;
+  vramTotal: string;
   vramFree: string;
   vramAvg: string;
   vramMax: string;
@@ -168,11 +202,16 @@ interface MemoryCells {
 // final avg/peak/free-before figures. While still running, the ram/vram
 // "avg" column shows the sampler's current live reading as a live-updating
 // proxy instead -- ram/vram "max" isn't known until the item finishes.
+// vram total has no run_items live-tick column at all (it's a static
+// hardware fact, not something that needs sampling over time) -- it behaves
+// like ram/vram "max" here (dash while running, real value once terminal),
+// not like "free" (which run_items *does* track from the item's first tick).
 function memoryCells(item: RunItem, result: ResultRow | undefined): MemoryCells {
   const terminal = TERMINAL_ITEM_STATUSES.has(item.status);
   const ramFree = result?.ram_free_before_mib ?? item.ram_free_before_mib;
   const ramAvg = terminal ? result?.ram_avg_mib ?? item.ram_avg_mib : item.ram_mib;
   const ramMax = result?.ram_peak_mib ?? item.ram_peak_mib;
+  const vramTotal = result?.gpu_memory_total_mb;
   const vramFree = result?.vram_free_before_mib ?? item.vram_free_before_mib;
   const vramAvg = terminal ? result?.vram_avg_mib ?? item.vram_avg_mib : item.vram_mib;
   const vramMax = result?.vram_peak_mib ?? item.vram_peak_mib;
@@ -187,6 +226,7 @@ function memoryCells(item: RunItem, result: ResultRow | undefined): MemoryCells 
     ramFree: dash(ramFree),
     ramAvg: dash(ramAvg),
     ramMax: dash(ramMax),
+    vramTotal: vramCell(vramTotal),
     vramFree: vramCell(vramFree),
     vramAvg: vramCell(vramAvg),
     vramMax: vramCell(vramMax),
@@ -215,6 +255,10 @@ function mergedSortValue(item: RunItem, results: ResultRow[] | undefined, key: s
       return item.n_threads;
     case "ngl":
       return item.n_gpu_layers;
+    case "layers_loaded":
+      return anyResult?.gpu_layers_loaded ?? -1;
+    case "layers_total":
+      return anyResult?.total_model_layers ?? -1;
     case "batch":
       return item.batch_size;
     case "ubatch":
@@ -239,6 +283,8 @@ function mergedSortValue(item: RunItem, results: ResultRow[] | undefined, key: s
       return anyResult?.ram_avg_mib ?? item.ram_avg_mib ?? item.ram_mib ?? -1;
     case "ram_max":
       return anyResult?.ram_peak_mib ?? item.ram_peak_mib ?? -1;
+    case "vram_total":
+      return anyResult?.gpu_memory_total_mb ?? -1;
     case "vram_free":
       return anyResult?.vram_free_before_mib ?? item.vram_free_before_mib ?? -1;
     case "vram_avg":
@@ -549,7 +595,10 @@ export function RunDetail() {
       {run && (
         <p className="mt-2 flex flex-wrap items-center gap-2 text-sm text-muted">
           Worker <b className="text-fg">{run.worker_name}</b>
-          <span>· {run.llama_cpp_backend}</span>
+          <span>
+            · {run.llama_cpp_backend}
+            {run.backend_device_name ? ` (${run.backend_device_name})` : ""}
+          </span>
           <span>· {run.llama_cpp_build}</span>
           <span>· model {run.model_filename || `${shortId(run.model_id)}…`}</span>
           <RunStatusPill status={run.status} />
@@ -693,6 +742,12 @@ export function RunDetail() {
                       <td className="pl-0.5 pr-2 py-1.5 text-muted">{it.n_gen}</td>
                       <td className="pl-2 pr-0.5 py-1.5 text-muted">{it.n_threads}</td>
                       <td className="pl-0.5 pr-2 py-1.5 text-muted">{it.n_gpu_layers}</td>
+                      <td className="px-2 py-1.5 text-muted">
+                        {anyResult?.gpu_layers_loaded ?? (isTerminal ? "n/a" : "—")}
+                      </td>
+                      <td className="px-2 py-1.5 text-muted">
+                        {anyResult?.total_model_layers ?? (isTerminal ? "n/a" : "—")}
+                      </td>
                       <td className="px-2 py-1.5 text-muted">{it.batch_size}</td>
                       <td className="px-2 py-1.5 text-muted">{it.ubatch_size}</td>
                       <td className="px-2 py-1.5 text-muted">{it.cache_type_k}</td>
@@ -758,9 +813,34 @@ export function RunDetail() {
                       <td className="px-2 py-1.5 text-muted">{mem.ramFree}</td>
                       <td className="px-2 py-1.5 text-muted">{mem.ramAvg}</td>
                       <td className="px-2 py-1.5 text-muted">{mem.ramMax}</td>
-                      <td className="px-2 py-1.5 text-muted">{mem.vramFree}</td>
-                      <td className="px-2 py-1.5 text-muted">{mem.vramAvg}</td>
-                      <td className="px-2 py-1.5 text-muted">{mem.vramMax}</td>
+                      <td
+                        className="px-2 py-1.5 text-muted"
+                        title={gpuMemoryAccuracyTitle(anyResult?.gpu_memory_total_accuracy, anyResult?.gpu_memory_total_source)}
+                      >
+                        {mem.vramTotal}
+                        {gpuMemoryAccuracyTitle(anyResult?.gpu_memory_total_accuracy, anyResult?.gpu_memory_total_source) ? " ⓘ" : ""}
+                      </td>
+                      <td
+                        className="px-2 py-1.5 text-muted"
+                        title={gpuMemoryAccuracyTitle(anyResult?.gpu_memory_free_start_accuracy, anyResult?.gpu_memory_free_start_source)}
+                      >
+                        {mem.vramFree}
+                        {gpuMemoryAccuracyTitle(anyResult?.gpu_memory_free_start_accuracy, anyResult?.gpu_memory_free_start_source) ? " ⓘ" : ""}
+                      </td>
+                      <td
+                        className="px-2 py-1.5 text-muted"
+                        title={gpuMemoryAccuracyTitle(anyResult?.gpu_memory_model_avg_accuracy, anyResult?.gpu_memory_model_avg_source)}
+                      >
+                        {mem.vramAvg}
+                        {gpuMemoryAccuracyTitle(anyResult?.gpu_memory_model_avg_accuracy, anyResult?.gpu_memory_model_avg_source) ? " ⓘ" : ""}
+                      </td>
+                      <td
+                        className="px-2 py-1.5 text-muted"
+                        title={gpuMemoryAccuracyTitle(anyResult?.gpu_memory_model_peak_accuracy, anyResult?.gpu_memory_model_peak_source)}
+                      >
+                        {mem.vramMax}
+                        {gpuMemoryAccuracyTitle(anyResult?.gpu_memory_model_peak_accuracy, anyResult?.gpu_memory_model_peak_source) ? " ⓘ" : ""}
+                      </td>
                     </tr>
                     <tr>
                       <td colSpan={MERGED_COLUMN_DEFS.length} className="px-2 pb-1.5 pt-0">
