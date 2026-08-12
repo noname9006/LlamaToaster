@@ -180,6 +180,14 @@ export function Models() {
   const [progress, setProgress] = useState<Record<string, DownloadProgress>>({});
   const [speeds, setSpeeds] = useState<Record<string, number>>({});
   const prevSampleRef = useRef<Record<string, { bytes: number; time: number }>>({});
+  // Exponential moving average of each download's speed, keyed by path --
+  // the raw poll-to-poll delta (see the effect below) is noisy on its own:
+  // a 750ms sampling window is short enough that normal jitter in when the
+  // worker's event loop gets to flush a chunk (worse with multiple downloads
+  // competing for the same worker's bandwidth/CPU) shows up as visible
+  // spikes. Smoothing the *displayed* rate instead of widening the sampling
+  // window keeps the number responsive while damping single-sample noise.
+  const smoothedSpeedRef = useRef<Record<string, number>>({});
   const seenRef = useRef<Record<string, boolean>>({});
   const missesRef = useRef<Record<string, number>>({});
 
@@ -406,6 +414,7 @@ export function Models() {
       return next;
     });
     delete prevSampleRef.current[path];
+    delete smoothedSpeedRef.current[path];
     delete seenRef.current[path];
     delete missesRef.current[path];
     setHfMsg(`${path} is no longer downloading -- refreshed the model list.`);
@@ -434,8 +443,21 @@ export function Models() {
             const prevSample = prevSampleRef.current[path];
             const now = Date.now();
             if (prevSample && now > prevSample.time) {
-              const bytesPerSec = ((p.bytes - prevSample.bytes) / (now - prevSample.time)) * 1000;
-              setSpeeds((s) => ({ ...s, [path]: Math.max(0, bytesPerSec) }));
+              const instantBytesPerSec = Math.max(
+                0,
+                ((p.bytes - prevSample.bytes) / (now - prevSample.time)) * 1000
+              );
+              // EMA with alpha ~0.25 -- settles to within ~5% of a step change
+              // in about 4 samples (~3s at the 750ms poll interval) while
+              // flattening single-sample spikes.
+              const SPEED_SMOOTHING_ALPHA = 0.25;
+              const prevSmoothed = smoothedSpeedRef.current[path];
+              const smoothed =
+                prevSmoothed == null
+                  ? instantBytesPerSec
+                  : prevSmoothed + SPEED_SMOOTHING_ALPHA * (instantBytesPerSec - prevSmoothed);
+              smoothedSpeedRef.current[path] = smoothed;
+              setSpeeds((s) => ({ ...s, [path]: smoothed }));
             }
             prevSampleRef.current[path] = { bytes: p.bytes, time: now };
           } catch {
@@ -794,7 +816,7 @@ export function Models() {
                         style={{ width: `${pct}%` }}
                       />
                     ) : (
-                      <div className="h-full w-full animate-pulse rounded-full bg-accent/40" />
+                      <div className="progress-indeterminate h-full w-full rounded-full" />
                     )}
                   </div>
                   <div className="flex items-center gap-2 text-xs text-muted">
@@ -996,7 +1018,7 @@ export function Models() {
                                         style={{ width: `${pct}%` }}
                                       />
                                     ) : (
-                                      <div className="h-full w-full animate-pulse rounded-full bg-accent/40" />
+                                      <div className="progress-indeterminate h-full w-full rounded-full" />
                                     )}
                                   </div>
                                   <div className="flex items-center gap-2 text-xs text-muted">
