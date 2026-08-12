@@ -140,6 +140,44 @@ export function StatusCircle({ tone, title }: { tone: CircleTone; title?: string
   return <span className={cls} title={title} aria-label={title} />;
 }
 
+// Background for one half of a StatusSplitCircle, matching StatusCircle's
+// per-tone coloring above (including --grey's dimmed opacity, replicated via
+// color-mix since a CSS gradient can't apply per-half opacity on its own).
+const SPLIT_TONE_BG: Record<CircleTone, string> = {
+  running: "var(--color-warning)",
+  red: "var(--color-danger)",
+  warn: "var(--color-warning)",
+  cancelled: "var(--color-muted)",
+  grey: "color-mix(in srgb, var(--color-muted) 45%, transparent)",
+  solid: "var(--color-success)",
+};
+
+// A repeat dot split down the middle -- left half tracks a pg (pp+tg) sweep
+// item's prompt-processing progress for that repeat, right half tracks text-
+// generation. Only meaningful while genuinely split (see buildItemRepeatUnits);
+// used because llama-bench runs every repeat's pp phase to completion before
+// starting any repeat's tg phase, so the two halves can be at very different
+// points at once and a single dot's tone can't represent both.
+export function StatusSplitCircle({
+  ppTone,
+  tgTone,
+  title,
+}: {
+  ppTone: CircleTone;
+  tgTone: CircleTone;
+  title?: string;
+}) {
+  const animated = ppTone === "running" || tgTone === "running";
+  return (
+    <span
+      className={`status-split-dot${animated ? " status-split-dot--blink" : ""}`}
+      style={{ background: `linear-gradient(90deg, ${SPLIT_TONE_BG[ppTone]} 50%, ${SPLIT_TONE_BG[tgTone]} 50%)` }}
+      title={title}
+      aria-label={title}
+    />
+  );
+}
+
 const RUNNING_ITEM_STATUSES = new Set<RunItemStatus>(["loading", "processing", "generating", "benchmarking"]);
 
 function comboIsRunning(status: RunItemStatus): boolean {
@@ -168,21 +206,53 @@ export interface StatusCircleUnit {
   label: string;
 }
 
+// A repeat unit split into independent pp/tg halves -- see buildItemRepeatUnits.
+export interface SplitCircleUnit {
+  ppTone: CircleTone;
+  tgTone: CircleTone;
+  label: string;
+}
+
+export type RepeatUnit = StatusCircleUnit | SplitCircleUnit;
+
+function isSplitUnit(u: RepeatUnit): u is SplitCircleUnit {
+  return "ppTone" in u;
+}
+
+// A split unit's overall tone for bucketing/precedence purposes (see
+// bucketToneOf) -- its two halves collapsed via the same "running beats all"
+// rule used across halves of a single unit as across whole units.
+function unitTone(u: RepeatUnit): CircleTone {
+  return isSplitUnit(u) ? bucketToneOf([u.ppTone, u.tgTone]) : u.tone;
+}
+
 // Collapses many progress units into a compact circle strip. <=49 units get
 // one circle each; larger counts bucket sequentially so the strip stays
 // readable (x5 at 50-99 units, x10 at 100+). Each rendered circle's tone is
 // derived from the units it covers via the "running beats all" precedence.
-// What a "unit" represents is up to the caller -- see buildProgressUnits.
-export function StatusCircleStrip({ units }: { units: StatusCircleUnit[] }) {
+// A split unit only renders as an actual split circle when shown on its own
+// (bucket size 1) -- once bucketed with neighbors it collapses to one tone
+// like any other unit, since a 5-or-10-wide bucket has no room to show two
+// phases per neighbor anyway. What a unit represents is up to the caller --
+// see buildProgressUnits and buildItemRepeatUnits.
+export function StatusCircleStrip({ units }: { units: RepeatUnit[] }) {
   const count = units.length;
   const size = count <= 49 ? 1 : count <= 99 ? 5 : 10;
-  const buckets: StatusCircleUnit[][] = [];
+  const buckets: RepeatUnit[][] = [];
   for (let i = 0; i < count; i += size) buckets.push(units.slice(i, i + size));
   return (
     <div className="mt-1.5 flex max-w-2xl flex-wrap gap-1.5">
       {buckets.map((bucket, bi) => {
-        const tone = size === 1 ? bucket[0].tone : bucketToneOf(bucket.map((u) => u.tone));
-        const label = size === 1 ? bucket[0].label : `${bucket[0].label} .. ${bucket[bucket.length - 1].label}`;
+        if (size === 1) {
+          const u = bucket[0];
+          return isSplitUnit(u) ? (
+            <StatusSplitCircle key={bi} ppTone={u.ppTone} tgTone={u.tgTone} title={u.label} />
+          ) : (
+            <StatusCircle key={bi} tone={u.tone} title={u.label} />
+          );
+        }
+        const tone = bucketToneOf(bucket.map(unitTone));
+        const label = `${bucket[0].label} .. ${bucket[bucket.length - 1].label}`;
         return <StatusCircle key={bi} tone={tone} title={label} />;
       })}
     </div>
@@ -247,18 +317,6 @@ function deriveTestType(nPrompt: number, nGen: number): "pp" | "tg" | "pg" {
   return "pg";
 }
 
-// A pg item (both n_prompt and n_gen set) actually runs as two sequential
-// sub-benchmarks under llama-bench's -r N -- every repeat's pp phase
-// completes before any repeat's tg phase starts (confirmed against the
-// "benchmark N/2: prompt run x/y" / "generation run x/y" stderr markers
-// parsed below, see worker/src/index.ts's PP_RUN_RE/TG_RUN_RE), i.e. 2N
-// benchmark iterations, not N. So this item's own "runs" count (and dot
-// strip) is doubled to match -- see totalRuns in RunDetail.tsx, which sums
-// this same per-item doubling instead of a flat items.length * repeats.
-export function itemRunMultiplier(item: Pick<RunItem, "n_prompt" | "n_gen">): 1 | 2 {
-  return deriveTestType(item.n_prompt, item.n_gen) === "pg" ? 2 : 1;
-}
-
 // Builds a single sweep item's repeat-progress strip for every status, not
 // just while running -- unlike buildRepeatUnits (which returns null outside
 // the running state, so RunDetail's per-item table always has *a* strip to
@@ -268,62 +326,49 @@ export function itemRunMultiplier(item: Pick<RunItem, "n_prompt" | "n_gen">): 1 
 // buildRepeatUnits. No per-repeat failure detail is tracked, so a failed
 // item's dots are uniform rather than pinpointing which repeat broke.
 //
-// For a pg item (see itemRunMultiplier above), the strip is doubled into a
-// pp block followed by a tg block -- N dots each, matching llama-bench's
-// actual execution order. While the current phase is known (status
-// "processing" or "generating"), the two blocks track independently: e.g.
-// once tg starts, every pp dot is already solid regardless of the live
-// repeat counter, since that counter now belongs to the tg phase. Outside
-// that live+attributable window (queued/done/failed/cancelled, still
-// loading, or the older-llama-bench fallback "benchmarking" status with no
-// per-phase marker to key off), both blocks just mirror the same
-// (non-phase-specific) progress -- there's no way to tell pp and tg apart
-// in those states.
-export function buildItemRepeatUnits(item: RunItem, repeats: number): StatusCircleUnit[] {
+// A pg item (both n_prompt and n_gen set) actually runs as two sequential
+// sub-benchmarks under llama-bench -- every repeat's pp phase completes
+// before any repeat's tg phase starts (confirmed against the "benchmark N/2:
+// prompt run x/y" / "generation run x/y" stderr markers this parses, see
+// worker/src/index.ts's PP_RUN_RE/TG_RUN_RE). So while a pg item is live and
+// its current phase is known (status "processing" or "generating"), each
+// repeat's dot is split into independent pp/tg halves instead of one tone --
+// a single tone can't represent "pp done, tg 2/5" for the same repeat.
+// Outside that live+attributable window (queued/done/failed/cancelled, or
+// the older-llama-bench fallback "benchmarking" status with no per-phase
+// marker to key off), falls back to the old single-tone-per-repeat dots.
+export function buildItemRepeatUnits(item: RunItem, repeats: number): RepeatUnit[] {
   const n = Math.max(repeats, 1);
-  const doubled = itemRunMultiplier(item) === 2;
-
-  if (doubled && (item.status === "processing" || item.status === "generating")) {
+  const testType = deriveTestType(item.n_prompt, item.n_gen);
+  if (testType === "pg" && (item.status === "processing" || item.status === "generating")) {
     const match = REPEAT_PROGRESS_RE.exec(item.detail ?? "");
     const currentRep = match ? Number(match[1]) : 1;
     const inTgPhase = item.status === "generating";
-    const block = (active: boolean, done: boolean, label: string): StatusCircleUnit[] =>
-      Array.from({ length: n }, (_, i) => {
-        const r = i + 1;
-        const tone: CircleTone = done
-          ? "solid"
-          : !active
-            ? "grey"
-            : r < currentRep
-              ? "solid"
-              : r === currentRep
-                ? "running"
-                : "grey";
-        return { tone, label: `${label} repeat ${r}/${n}` };
-      });
-    return [...block(!inTgPhase, inTgPhase, "pp"), ...block(inTgPhase, false, "tg")];
+    return Array.from({ length: n }, (_, i) => {
+      const r = i + 1;
+      const ppTone: CircleTone = inTgPhase || r < currentRep ? "solid" : r === currentRep ? "running" : "grey";
+      const tgTone: CircleTone = !inTgPhase ? "grey" : r < currentRep ? "solid" : r === currentRep ? "running" : "grey";
+      const phaseWord = (t: CircleTone) => (t === "solid" ? "done" : t === "running" ? "running" : "queued");
+      return {
+        ppTone,
+        tgTone,
+        label: `repeat ${r}/${n} -- pp ${phaseWord(ppTone)}, tg ${phaseWord(tgTone)}`,
+      } as SplitCircleUnit;
+    });
   }
-
-  let units: StatusCircleUnit[];
   if (comboIsRunning(item.status)) {
     const match = REPEAT_PROGRESS_RE.exec(item.detail ?? "");
     const currentRep = match ? Number(match[1]) : 1;
-    units = Array.from({ length: n }, (_, i) => {
+    return Array.from({ length: n }, (_, i) => {
       const r = i + 1;
       return {
         tone: r < currentRep ? "solid" : r === currentRep ? "running" : "grey",
         label: `repeat ${r}/${n}`,
-      };
+      } as StatusCircleUnit;
     });
-  } else {
-    const tone = comboTone(item.status);
-    units = Array.from({ length: n }, (_, i) => ({ tone, label: `repeat ${i + 1}/${n}` }));
   }
-  if (!doubled) return units;
-  return [
-    ...units.map((u) => ({ ...u, label: `pp ${u.label}` })),
-    ...units.map((u) => ({ ...u, label: `tg ${u.label}` })),
-  ];
+  const tone = comboTone(item.status);
+  return Array.from({ length: n }, (_, i) => ({ tone, label: `repeat ${i + 1}/${n}` }));
 }
 
 export function WorkerStatusPill({ inaccessible, loading }: { inaccessible: boolean; loading?: boolean }) {
