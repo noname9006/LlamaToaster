@@ -247,10 +247,7 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
             { worker: worker.name, run_id: stale.id },
             "stop hit a worker that wasn't busy -- reconciling stale run"
           );
-          repo.reconcileStaleRun(
-            stale.id,
-            "worker reported it was not running a benchmark when stop was requested -- marked cancelled"
-          );
+          repo.reconcileStaleRun(stale.id, "worker lost track of run");
           return reply.code(200).send({ ok: true, stopping: true, reconciled: true });
         }
       }

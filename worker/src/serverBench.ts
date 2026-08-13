@@ -209,6 +209,13 @@ function buildArgs(input: ServerBenchRunInput): string[] {
   ];
   if (input.mtpModelPath) {
     args.push("--model-draft", input.mtpModelPath);
+    // Confirmed live against the installed build's own --help: llama-server
+    // exposes -ngld/--n-gpu-layers-draft as an independent offload count for
+    // the draft model (default "auto" when omitted, which is what every run
+    // before this field existed effectively got). Only meaningful alongside
+    // an actual --model-draft -- pushing it with no draft model loaded has
+    // nothing to apply to.
+    args.push("-ngld", String(item.n_gpu_layers_draft));
   }
   return args;
 }
@@ -690,6 +697,7 @@ export async function runServerBench(input: ServerBenchRunInput): Promise<BenchR
       cache_type_v: item.cache_type_v,
       flash_attn: item.flash_attn,
       mtp: item.mtp,
+      n_gpu_layers_draft: item.n_gpu_layers_draft,
       ram_peak_mib: 0,
       vram_peak_mib: 0,
       ram_avg_mib: 0,
