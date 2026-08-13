@@ -37,6 +37,7 @@ const NUMERIC_SWEEP_FIELDS = [
   "n_gpu_layers",
   "batch_size",
   "ubatch_size",
+  "n_gpu_layers_draft",
 ] as const;
 const STRING_SWEEP_FIELDS = ["cache_type_k", "cache_type_v", "flash_attn", "mtp"] as const;
 
@@ -113,6 +114,17 @@ function validateIngestResult(value: unknown): string | null {
     if (row[field] !== undefined && (typeof row[field] !== "number" || !Number.isFinite(row[field] as number))) {
       return `${field} must be a number`;
     }
+  }
+  // Also optional (unlike the rest of NUMERIC_RESULT_FIELDS above): a worker
+  // running a version that predates this column won't send it at all. A
+  // whole item's real, already-computed results shouldn't be thrown away
+  // just because one newer, defaultable field is missing -- see
+  // shared/types.ts's IngestResultInput.n_gpu_layers_draft doc comment.
+  if (
+    row.n_gpu_layers_draft !== undefined &&
+    (typeof row.n_gpu_layers_draft !== "number" || !Number.isFinite(row.n_gpu_layers_draft as number))
+  ) {
+    return "n_gpu_layers_draft must be a number";
   }
   for (const field of ["suspect_samples", "repeat_samples"] as const) {
     const v = row[field];
@@ -487,7 +499,7 @@ export async function runsRoutes(app: FastifyInstance): Promise<void> {
               const staleAgainstWorker =
                 health.busy === false || (typeof workerRunId === "string" && workerRunId !== data.run.id);
               if (staleAgainstWorker) {
-                const reconciled = repo.reconcileStaleRun(data.run.id, "Cancelled");
+                const reconciled = repo.reconcileStaleRun(data.run.id, "worker lost track of run");
                 if (reconciled) {
                   data.run = reconciled;
                   data.items = repo.getRunItems(data.run.id);

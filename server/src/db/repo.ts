@@ -61,6 +61,7 @@ interface RunItemRow {
   cache_type_v: string;
   flash_attn: string;
   mtp: string;
+  n_gpu_layers_draft: number;
   status: string;
   detail: string | null;
   ram_mib: number | null;
@@ -97,6 +98,7 @@ interface ResultRowRaw {
   cache_type_v: string;
   flash_attn: string;
   mtp: string;
+  n_gpu_layers_draft: number;
   avg_tps: number;
   stddev_tps: number;
   ram_peak_mib: number;
@@ -181,6 +183,7 @@ function mapRunItem(row: RunItemRow): RunItem {
     cache_type_v: row.cache_type_v,
     flash_attn: row.flash_attn,
     mtp: row.mtp,
+    n_gpu_layers_draft: row.n_gpu_layers_draft,
     status: row.status as RunItem["status"],
     detail: row.detail ?? undefined,
     ram_mib: row.ram_mib,
@@ -236,6 +239,7 @@ function mapResult(row: ResultRowRaw): ResultRow {
     cache_type_v: row.cache_type_v,
     flash_attn: row.flash_attn,
     mtp: row.mtp,
+    n_gpu_layers_draft: row.n_gpu_layers_draft,
     avg_tps: row.avg_tps,
     stddev_tps: row.stddev_tps,
     ram_peak_mib: row.ram_peak_mib,
@@ -465,8 +469,8 @@ export const repo = {
     const insert = database.prepare(
       `INSERT INTO run_items
          (id, run_id, idx, n_prompt, n_gen, n_threads, n_gpu_layers,
-          batch_size, ubatch_size, cache_type_k, cache_type_v, flash_attn, mtp, status)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued')`
+          batch_size, ubatch_size, cache_type_k, cache_type_v, flash_attn, mtp, n_gpu_layers_draft, status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued')`
     );
     const tx = database.transaction((rows: SweepItem[]) => {
       for (const item of rows) {
@@ -483,7 +487,8 @@ export const repo = {
           item.cache_type_k,
           item.cache_type_v,
           item.flash_attn,
-          item.mtp
+          item.mtp,
+          item.n_gpu_layers_draft
         );
       }
     });
@@ -566,7 +571,7 @@ export const repo = {
         const insertResult = database.prepare(
           `INSERT INTO results
              (id, run_id, idx, model_id, test_type, n_prompt, n_gen, n_threads, n_gpu_layers,
-              batch_size, ubatch_size, cache_type_k, cache_type_v, flash_attn, mtp,
+              batch_size, ubatch_size, cache_type_k, cache_type_v, flash_attn, mtp, n_gpu_layers_draft,
               avg_tps, stddev_tps, ram_peak_mib, vram_peak_mib,
               ram_avg_mib, vram_avg_mib, ram_free_before_mib, vram_free_before_mib,
               system_memory_total_mib, gpu_memory_total_mib,
@@ -577,7 +582,7 @@ export const repo = {
               gpu_layers_loaded, total_model_layers,
               sample_count, suspect_count, suspect_samples, repeat_samples, spec_drafted, spec_accepted,
               raw_json_path, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         );
         // Up to two rows for one idx (a pp row and a tg row from the same
         // benchmark process) -- distinguished by test_type, see
@@ -600,6 +605,7 @@ export const repo = {
             row.cache_type_v,
             row.flash_attn,
             row.mtp,
+            row.n_gpu_layers_draft,
             row.avg_tps,
             row.stddev_tps,
             row.ram_peak_mib,
@@ -665,7 +671,18 @@ export const repo = {
   // responsible for that check (recordRunItemTerminal does it after every
   // terminal write; failAllRunItems calls it directly since it just made
   // that true itself).
-  finalizeRun(runId: string, completedAt: number = Date.now()): void {
+  //
+  // cancelReason distinguishes *why* items ended up 'cancelled': omitted
+  // (the default) means a genuine per-item user stop (worker/src/index.ts's
+  // stopRequested loop, reported one item at a time through the normal
+  // recordRunItemTerminal path) -- "stopped by user" is accurate there.
+  // reconcileStaleRun passes an explicit reason instead, since its
+  // 'cancelled' items were never actually confirmed stopped by anyone --
+  // the DB just lost track of a run the worker itself had already moved on
+  // from (its own terminal report may have been rejected or never arrived).
+  // Labelling that "stopped by user" too would be a lie the user has no way
+  // to tell apart from a real stop.
+  finalizeRun(runId: string, completedAt: number = Date.now(), cancelReason?: string): void {
     const counts = getDb()
       .prepare(
         `SELECT
@@ -680,11 +697,15 @@ export const repo = {
     let status: RunStatus;
     let error: string | null = null;
     if (counts.cancelled > 0) {
-      // Stopped by the user -- distinct from "failed" (something actually
-      // went wrong) even if some other items happened to fail before the
-      // stop reached them.
-      status = "cancelled";
-      error = `stopped by user after ${counts.done} of ${counts.total} test${counts.total === 1 ? "" : "s"} completed`;
+      // A genuine user stop always reads "cancelled" regardless of how much
+      // finished first -- that's the outcome the user asked for. An
+      // unconfirmed/reconciled stop (cancelReason set) is different: if some
+      // combinations *did* complete and are saved, "partial" reflects that
+      // there's real, usable data here rather than implying the whole run
+      // is worthless.
+      status = cancelReason && counts.done > 0 ? "partial" : "cancelled";
+      const reason = cancelReason ?? "stopped by user";
+      error = `${reason} after ${counts.done} of ${counts.total} test${counts.total === 1 ? "" : "s"} completed`;
     } else if (counts.total === 0 || counts.done === 0) {
       status = "failed";
     } else if (counts.done === counts.total) {
@@ -693,7 +714,11 @@ export const repo = {
       status = "partial";
     }
 
-    if (status !== "cancelled") {
+    // Guards on counts.cancelled (not status) -- a reconciled run with some
+    // completions now reads status "partial" too (see above), but its error
+    // was already set from cancelReason and must not be overwritten with a
+    // "tests failed" message; nothing here was a bench failure.
+    if (counts.cancelled === 0) {
       const failedCount = counts.total - counts.done;
       if (failedCount > 0) {
         error = `${failedCount} of ${counts.total} test${counts.total === 1 ? "" : "s"} failed`;
@@ -780,8 +805,10 @@ export const repo = {
 
   // Marks a run's still-unfinished items 'cancelled' (not 'failed' --
   // nothing here indicates an actual bench failure, just that the worker
-  // isn't tracking this run anymore) and finalizes it, same as a genuine
-  // user-requested stop landing on the last item.
+  // isn't tracking this run anymore) and finalizes it. `note` is both the
+  // per-item error text and finalizeRun's cancelReason, so the run-level
+  // message stays honest about this being an unconfirmed/lost run, not a
+  // genuine user stop (see finalizeRun's own doc comment).
   reconcileStaleRun(runId: string, note: string): Run | undefined {
     const database = getDb();
     const now = Date.now();
@@ -792,7 +819,7 @@ export const repo = {
            WHERE run_id = ? AND status NOT IN ('done','failed','failed_oom','cancelled')`
         )
         .run(note, now, runId);
-      this.finalizeRun(runId, now);
+      this.finalizeRun(runId, now, note);
     });
     tx();
     return this.getRun(runId);
@@ -826,6 +853,10 @@ function buildResultRow(
     cache_type_v: r.cache_type_v,
     flash_attn: r.flash_attn,
     mtp: r.mtp,
+    // Defaults to 0 for a version-skewed worker that predates this field --
+    // see shared/types.ts's IngestResultInput.n_gpu_layers_draft and
+    // schema.sql's matching column default.
+    n_gpu_layers_draft: r.n_gpu_layers_draft ?? 0,
     avg_tps: r.avg_tps,
     stddev_tps: r.stddev_tps,
     ram_peak_mib: r.ram_peak_mib,

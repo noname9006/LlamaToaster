@@ -18,7 +18,7 @@ const COLUMN_DESCRIPTIONS: Record<string, string> = {
     "Every value swept per flag — p=n_prompt, n=n_gen, t=threads, ngl=n_gpu_layers, b=batch_size, " +
     "ub=ubatch_size, ctk/ctv=K/V cache type, fa=flash attention — × repeats per combination.",
   status:
-    "running / scheduled (queued behind another run on the same worker, starts automatically once it's free) / done / partial (some sweep combinations failed) / failed / cancelled (stopped by user), plus how many of the sweep's tests have completed.",
+    "running / scheduled (queued behind another run on the same worker, starts automatically once it's free) / done / partial (some sweep combinations failed, or the run was lost/reconciled after some completed) / failed / cancelled (stopped by user, or lost with nothing completed), plus how many of the sweep's tests have completed.",
   started: "When this run was triggered.",
 };
 

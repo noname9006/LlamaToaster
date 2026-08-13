@@ -89,6 +89,18 @@ export function IconX(props: SVGProps<SVGSVGElement>) {
   );
 }
 
+// Real vector circle+"i" -- used in place of the Unicode "ⓘ" glyph (U+24D8),
+// which renders as a distorted/non-circular blob in several UI fonts.
+export function IconInfo(props: SVGProps<SVGSVGElement>) {
+  return (
+    <Icon {...props}>
+      <circle cx="12" cy="12" r="9" />
+      <path d="M12 11v5.5" />
+      <circle cx="12" cy="7.75" r="1" fill="currentColor" stroke="none" />
+    </Icon>
+  );
+}
+
 export function IconDownload(props: SVGProps<SVGSVGElement>) {
   return (
     <Icon {...props}>

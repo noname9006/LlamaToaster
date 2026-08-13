@@ -90,6 +90,14 @@ const COLUMN_MIGRATIONS: ColumnSpec[] = [
   { table: "results", column: "gpu_memory_model_peak_source", ddlType: "TEXT" },
   { table: "results", column: "gpu_layers_loaded", ddlType: "INTEGER" },
   { table: "results", column: "total_model_layers", ddlType: "INTEGER" },
+  // -ngld for the MTP/draft companion model -- see shared/sweep.ts's
+  // SweepItem.n_gpu_layers_draft. DEFAULT 0 (not NULL) so a row/item
+  // predating this column reads the same as "not applicable", matching
+  // every other value on that row -- there's no way to recover what would
+  // have been requested, and 0 is what worker/src/serverBench.ts's buildArgs
+  // already treats as "don't offload the draft model".
+  { table: "run_items", column: "n_gpu_layers_draft", ddlType: "INTEGER DEFAULT 0" },
+  { table: "results", column: "n_gpu_layers_draft", ddlType: "INTEGER DEFAULT 0" },
 ];
 
 function applyColumnMigrations(database: Database.Database): void {

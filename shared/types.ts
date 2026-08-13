@@ -157,6 +157,11 @@ export interface SweepConfig {
   // with --spec-type draft-mtp instead of the normal llama-bench path. See
   // worker/src/serverBench.ts; llama-bench itself has no MTP support at all.
   mtp: string[];
+  // GPU layers offloaded for the MTP/draft companion model -- llama-server's
+  // -ngld/--n-gpu-layers-draft, swept independently of the base model's own
+  // -ngl. See shared/sweep.ts's SweepItem.n_gpu_layers_draft for why it's
+  // still a required field even on combos where it's a no-op.
+  n_gpu_layers_draft: number[];
   repeats: number;
 }
 
@@ -248,6 +253,14 @@ export interface ResultRow {
   cache_type_v: string;
   flash_attn: string;
   mtp: string;
+  // See SweepConfig.n_gpu_layers_draft -- the requested value for this
+  // combination's MTP/draft companion model, 0 on every row where it wasn't
+  // applicable (mtp "off", a Qwen-style self-sufficient model, or a row
+  // predating this column). Not narrowed further here since -- unlike
+  // gpu_layers_loaded/total_model_layers below -- llama-server prints no
+  // equivalent "draft offloaded X/Y" runtime line to confirm what actually
+  // happened.
+  n_gpu_layers_draft: number;
   avg_tps: number;
   stddev_tps: number;
   // Already equivalent to the spec's system_memory_model_peak_mb --
@@ -349,6 +362,12 @@ export interface IngestResultInput {
   cache_type_v: string;
   flash_attn: string;
   mtp: string;
+  // Optional (unlike every other field here): an older worker that predates
+  // this column simply won't send it. Defaulted to 0 server-side (see
+  // server/src/db/repo.ts's buildResultRow) rather than required, so a
+  // version-skewed worker's real results still get saved instead of the
+  // whole item being rejected over one missing/new metric.
+  n_gpu_layers_draft?: number;
   avg_tps: number;
   stddev_tps: number;
   ram_peak_mib: number;
@@ -415,6 +434,7 @@ export interface RunItem {
   cache_type_v: string;
   flash_attn: string;
   mtp: string;
+  n_gpu_layers_draft: number;
   status: RunItemStatus;
   detail?: string;
   ram_mib?: number | null;
