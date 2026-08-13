@@ -1,7 +1,9 @@
 node_modules/
 
-# Claude Code session runtime state, not project source.
-.claude/scheduled_tasks.lock
+# Claude Code session runtime state (e.g. launch.json, scheduled_tasks.lock)
+# -- created by the Claude Code app itself when used against this folder,
+# not project source.
+.claude/
 *.db
 *.db-journal
 *.db-wal
