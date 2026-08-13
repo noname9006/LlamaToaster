@@ -18,6 +18,7 @@ import { Readable, Transform } from "node:stream";
 import { runBench, type BenchResult } from "./bench.js";
 import { runServerBench } from "./serverBench.js";
 import { MemorySampler, captureFreeMemoryBaseline, type SampleStats, type FreeMemoryBaseline } from "./sampler.js";
+import { readGpuMemory } from "./vram.js";
 import { writeRawJson, postRunItemUpdate, postModelDownloadResult } from "./vps-client.js";
 import { log, configureLogging } from "./log.js";
 import {
@@ -129,6 +130,24 @@ log.info(
     process.env.LOG_LEVEL ?? "info"
   })`
 );
+
+// Best-effort warm-up of the VRAM-reading path (worker/src/vram.ts). On
+// Windows the generic backend's free/used reading spawns `powershell.exe`
+// running Get-Counter against the "GPU Adapter Memory" category -- confirmed
+// live that the *very first* invocation of that pipeline in a freshly
+// started worker process pays real PowerShell-startup + performance-counter
+// -provider cold-start cost that reliably exceeds vram.ts's own
+// EXEC_TIMEOUT_MS (5s), silently returning "unavailable" for that one call
+// only (a run's item 0's vram_free_before, specifically -- every later item
+// succeeds instantly once the provider is warm). Firing this once here,
+// before any real run can plausibly be triggered, means the first genuine
+// captureFreeMemoryBaseline call (sampler.ts, used by runSweepItem/
+// runSweepItemViaServer below) already hits a warm path instead of paying
+// that cost itself. Fire-and-forget and swallow all errors: this must never
+// delay /health or /run from becoming available, and a failed warm-up just
+// means the first real call pays the same cost this was trying to avoid --
+// no worse than before this existed.
+void readGpuMemory(backend, undefined).catch(() => {});
 
 // The active build is mutable at runtime (via /llama-cpp/activate) so a
 // version switch from the web UI takes effect on the next /run without
@@ -1009,28 +1028,108 @@ const TG_RUN_RE = /benchmark\s+\d+\/\d+:\s+generation run\s+(\d+)\/(\d+)/i;
 const WARMUP_RE = /benchmark\s+\d+\/\d+:\s+warmup prompt run/i;
 const STARTING_RE = /benchmark\s+\d+\/\d+:\s+starting/i;
 
-// llama.cpp's own one-line model-load summary, printed exactly once by
-// either binary once tensor loading finishes -- confirmed live against the
-// real binaries across -ngl 0 ("0/43"), a partial value ("10/43", matching
-// the per-layer "layer N assigned to device" lines it also prints at this
-// same verbosity), and full offload ("43/43"). X = gpu_layers_loaded, Y =
-// total_model_layers -- Y is the GGUF's real transformer layer count + 1
-// (the output layer), not the same number as models.metadata.n_layer, so
-// this is the only correct source for either value. Requires -v (llama-bench,
-// see worker/src/bench.ts's supportsVerboseFlag) or -lv 999
-// (llama-server, see worker/src/serverBench.ts's buildArgs) -- absent at
-// default verbosity on both binaries, confirmed live.
-const OFFLOAD_LAYERS_RE = /load_tensors: offloaded (\d+)\/(\d+) layers to GPU/;
+// llama.cpp's own one-line model-load summary, printed once *per model
+// loaded* by either binary once that model's tensor loading finishes --
+// confirmed live against the real binaries across -ngl 0 ("0/43"), a partial
+// value ("10/43", matching the per-layer "layer N assigned to device" lines
+// it also prints at this same verbosity), and full offload ("43/43"). X =
+// gpu_layers_loaded, Y = total_model_layers -- Y is the GGUF's real
+// transformer layer count + 1 (the output layer), not the same number as
+// models.metadata.n_layer, so this is the only correct source for either
+// value. Requires -v (llama-bench, see worker/src/bench.ts's
+// supportsVerboseFlag) or -lv 999 (llama-server, see
+// worker/src/serverBench.ts's buildArgs) -- absent at default verbosity on
+// both binaries, confirmed live. `g` flag so parseOffloadLayers below can
+// collect every occurrence, not just the first -- an MTP item loads TWO
+// models (base + --model-draft companion) via llama-server, each printing
+// its own line.
+const OFFLOAD_LAYERS_RE = /load_tensors: offloaded (\d+)\/(\d+) layers to GPU/g;
 
 interface OffloadInfo {
   gpu_layers_loaded: number;
   total_model_layers: number;
 }
 
-function parseOffloadLayers(stderr: string): OffloadInfo | null {
-  const match = OFFLOAD_LAYERS_RE.exec(stderr);
-  if (!match) return null;
-  return { gpu_layers_loaded: Number(match[1]), total_model_layers: Number(match[2]) };
+interface OffloadResult {
+  // The base/target model's offload -- always the model at `modelPath`, and
+  // (for a non-MTP item) the only model loaded at all.
+  main: OffloadInfo | null;
+  // The MTP/--model-draft companion's own offload, only meaningful when
+  // hasMtpDraft is true. Null when hasMtpDraft is false, or when only one
+  // "load_tensors: offloaded" line was actually captured (e.g. a build that
+  // doesn't log the draft model's own load at this verbosity) -- there's
+  // nothing to disambiguate from in that case, so the single match is
+  // attributed to main and draft is left unset rather than guessed.
+  draft: OffloadInfo | null;
+}
+
+// A plain llama-bench item (bench.ts's path) always loads exactly one model,
+// so a single "offloaded X/Y" line is unambiguous. An MTP item run through
+// llama-server (serverBench.ts's path, hasMtpDraft true) loads two: the base
+// model and its --model-draft companion, each printing its own line. Simply
+// taking the first match here (the previous behavior) silently reported
+// whichever model's line happened to print first as if it were the base
+// model's -- confirmed live against real MTP run output that this is
+// actually the *draft* model's line, not the base model's, so
+// gpu_layers_loaded/total_model_layers on every MTP row previously showed
+// the tiny draft head's own e.g. "5/5" instead of the real base model's e.g.
+// "43/43". Disambiguated here by total layer count instead of match
+// position, which is robust regardless of which model's line prints first:
+// an MTP draft/companion model is, by definition and by how much smaller
+// speculative-decoding heads are than the base models they're paired with,
+// always the one with far fewer transformer layers -- so of at most two
+// matches, the larger total_model_layers is always the base model's line and
+// the smaller is always the draft's.
+function parseOffloadLayers(stderr: string, hasMtpDraft: boolean): OffloadResult {
+  const matches: OffloadInfo[] = [...stderr.matchAll(OFFLOAD_LAYERS_RE)].map((m) => ({
+    gpu_layers_loaded: Number(m[1]),
+    total_model_layers: Number(m[2]),
+  }));
+  if (matches.length === 0) return { main: null, draft: null };
+  if (!hasMtpDraft || matches.length < 2) {
+    const main = matches.reduce((a, b) => (b.total_model_layers > a.total_model_layers ? b : a));
+    return { main, draft: null };
+  }
+  const [main, draft] = [...matches].sort((a, b) => b.total_model_layers - a.total_model_layers);
+  return { main, draft };
+}
+
+// llama.cpp's own diagnostic stderr (device detection, model metadata,
+// tensor-offload lines, timing breakdown) was previously only ever saved to
+// the per-item raw JSON dump (writeRawJson below) -- nothing mirrored it
+// into the worker's own text log, so following along live (pm2 logs, the
+// daily log file under logs/) only ever showed this app's own progress
+// lines, never llama.cpp's. logDiagnosticOutput mirrors it in, filtered
+// defensively: llama-server's MTP path runs at -lv 999 (see
+// serverBench.ts's buildArgs), verbose enough that a request/response body
+// -- including this app's own synthetic filler-token prompts and the
+// model's generated text -- could plausibly appear verbatim in a line at
+// that verbosity. Genuine llama.cpp diagnostic lines are short, structured,
+// human-authored strings; a dumped prompt/response array or generated-text
+// blob is not, so any line past a generous length threshold is elided
+// rather than printed in full -- this trades away logging an unusually long
+// *legitimate* diagnostic line (none observed live against either binary)
+// for never printing raw prompt/reply content into the log.
+const MAX_LOGGED_LINE_CHARS = 300;
+
+function filterDiagnosticOutput(stderr: string): string {
+  return stderr
+    .split("\n")
+    .map((line) =>
+      line.length > MAX_LOGGED_LINE_CHARS
+        ? `${line.slice(0, MAX_LOGGED_LINE_CHARS)} …[${
+            line.length - MAX_LOGGED_LINE_CHARS
+          } more chars elided -- see the raw JSON dump for the full line]`
+        : line
+    )
+    .filter((line) => line.trim().length > 0)
+    .join("\n");
+}
+
+function logDiagnosticOutput(label: string, processName: string, stderr: string): void {
+  const filtered = filterDiagnosticOutput(stderr);
+  if (!filtered) return;
+  log.info(`${label}: ${processName} output:\n${filtered}`);
 }
 
 // Maps a finished BenchResult into a terminal run-item report -- shared by
@@ -1047,9 +1146,10 @@ async function finalizeSweepItemResult(
   stats: SampleStats,
   baseline: FreeMemoryBaseline,
   // Read from llama.cpp's own runtime output (see parseOffloadLayers above),
-  // null when the line was never seen at all (item failed before model load
-  // finished, or a build too old to support the required verbosity flag).
-  offload: OffloadInfo | null
+  // both null when the line was never seen at all (item failed before model
+  // load finished, or a build too old to support the required verbosity
+  // flag).
+  offload: OffloadResult
 ): Promise<void> {
   if (bench.code === 0 && bench.results.length > 0) {
     // A single sweep item with both n_prompt and n_gen set (and no -pg)
@@ -1078,8 +1178,10 @@ async function finalizeSweepItemResult(
       gpu_memory_model_avg_source: stats.vram_avg_source,
       gpu_memory_model_peak_accuracy: stats.vram_peak_accuracy,
       gpu_memory_model_peak_source: stats.vram_peak_source,
-      gpu_layers_loaded: offload?.gpu_layers_loaded ?? null,
-      total_model_layers: offload?.total_model_layers ?? null,
+      gpu_layers_loaded: offload.main?.gpu_layers_loaded ?? null,
+      total_model_layers: offload.main?.total_model_layers ?? null,
+      gpu_layers_loaded_draft: offload.draft?.gpu_layers_loaded ?? null,
+      total_model_layers_draft: offload.draft?.total_model_layers ?? null,
     }));
     log.info(
       `${label} done: ${results.map((r) => `${r.test_type}=${r.avg_tps.toFixed(2)}tok/s`).join(" ")} ` +
@@ -1263,12 +1365,14 @@ async function runSweepItem(input: RunSweepItemInput): Promise<void> {
     if (tickTimer) clearInterval(tickTimer);
     activeBenchProc = null;
     const stats = sampler.stop();
-    const offload = parseOffloadLayers(bench.stderr);
+    // false: this is the non-MTP path, which only ever loads one model.
+    const offload = parseOffloadLayers(bench.stderr, false);
     const outcome = bench.code === 0 && bench.results.length > 0 ? "ok" : "failed";
     writeRawJson(rawJsonSubdir(input.rawJsonDir, outcome), `${runId}-${item.idx}`, {
       stdout: bench.stdout,
       stderr: bench.stderr,
     });
+    logDiagnosticOutput(label, "llama-bench", bench.stderr);
     await finalizeSweepItemResult(runId, item, label, "llama-bench", bench, stats, baseline, offload);
   } catch (err) {
     if (tickTimer) clearInterval(tickTimer);
@@ -1352,12 +1456,16 @@ async function runSweepItemViaServer(input: RunSweepItemViaServerInput): Promise
     });
     activeBenchProc = null;
     const stats = sampler.stop();
-    const offload = parseOffloadLayers(bench.stderr);
+    // Only true for a Gemma-4-style base model with a separate --model-draft
+    // companion file -- a Qwen-style in-file MTP model loads just the one
+    // model, same as the non-MTP path (see ServerBenchRunInput.mtpModelPath).
+    const offload = parseOffloadLayers(bench.stderr, Boolean(input.mtpModelPath));
     const outcome = bench.code === 0 && bench.results.length > 0 ? "ok" : "failed";
     writeRawJson(rawJsonSubdir(input.rawJsonDir, outcome), `${runId}-${item.idx}`, {
       stdout: bench.stdout,
       stderr: bench.stderr,
     });
+    logDiagnosticOutput(label, "llama-server", bench.stderr);
     await finalizeSweepItemResult(runId, item, label, "llama-server", bench, stats, baseline, offload);
   } catch (err) {
     activeBenchProc = null;

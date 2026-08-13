@@ -313,6 +313,22 @@ export interface ResultRow {
   // build too old to support the verbosity flag this requires.
   gpu_layers_loaded: number | null;
   total_model_layers: number | null;
+  // The MTP/draft companion model's OWN actual offload, read from its own
+  // separate "load_tensors: offloaded X/Y layers to GPU" line -- llama-server
+  // prints one such line per model it loads, and an MTP item loads two (the
+  // base model and its --model-draft companion). Only ever populated by the
+  // llama-server/MTP path (worker/src/serverBench.ts via
+  // worker/src/index.ts's parseOffloadLayers, which disambiguates the two
+  // lines by total layer count -- a draft/companion model is always far
+  // smaller than the base model it's paired with). Both undefined on every
+  // non-MTP row (nothing to report) and on an MTP row where the draft
+  // model's own line wasn't captured (e.g. a Qwen-style in-file MTP model
+  // with no separate --model-draft load at all). gpu_layers_loaded/
+  // total_model_layers above are always the *base* model's figures on an MTP
+  // row, never the draft's -- these are the draft's own, so the two aren't
+  // interchangeable.
+  gpu_layers_loaded_draft?: number | null;
+  total_model_layers_draft?: number | null;
   // Only ever populated by the llama-server/MTP path (worker/src/serverBench.ts)
   // -- the llama-bench-CLI path (bench.ts) does its own internal repeat
   // averaging and never sees individual readings, so these stay undefined
@@ -392,6 +408,11 @@ export interface IngestResultInput {
   gpu_memory_model_peak_source: GpuMemoryMeasurementSource | null;
   gpu_layers_loaded: number | null;
   total_model_layers: number | null;
+  // See the matching fields on ResultRow above -- the MTP/draft companion
+  // model's own actual offload, distinct from gpu_layers_loaded/
+  // total_model_layers above (always the base model's).
+  gpu_layers_loaded_draft?: number | null;
+  total_model_layers_draft?: number | null;
   sample_count?: number;
   suspect_count?: number;
   suspect_samples?: number[];
