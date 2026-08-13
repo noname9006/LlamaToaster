@@ -15,7 +15,7 @@ import {
 import { createHash } from "node:crypto";
 import { pipeline } from "node:stream/promises";
 import { Readable, Transform } from "node:stream";
-import { runBench, type BenchResult } from "./bench.js";
+import { runBench, matchOffloadLine, type BenchResult, type OffloadResult } from "./bench.js";
 import { runServerBench } from "./serverBench.js";
 import { MemorySampler, captureFreeMemoryBaseline, type SampleStats, type FreeMemoryBaseline } from "./sampler.js";
 import { readGpuMemory } from "./vram.js";
@@ -40,6 +40,7 @@ import type {
   RunItemTickInput,
   RunItemTerminalInput,
   ModelDownloadCallbackInput,
+  TerminalRunItemStatus,
 } from "../../shared/types.js";
 import { expandSweep, deriveTestType, type SweepItem } from "../../shared/sweep.js";
 
@@ -537,6 +538,14 @@ const server = createServer(async (req, res) => {
 
       log.info(`run ${reqBody.run_id}: ${items.length} test(s) to run`);
       const rawDir = config.raw_json_dir ?? join(config.model_dir, "raw");
+      // Tallied across every item regardless of which path handled it, so
+      // the run's own finish line can report a success/fail breakdown
+      // instead of just "finished all N test(s)" with no indication of how
+      // many of those actually succeeded.
+      const statusCounts: Partial<Record<TerminalRunItemStatus, number>> = {};
+      const tally = (status: TerminalRunItemStatus): void => {
+        statusCounts[status] = (statusCounts[status] ?? 0) + 1;
+      };
       try {
         for (const item of items) {
           // Checked before *every* item (not just once) since pausing can
@@ -545,6 +554,7 @@ const server = createServer(async (req, res) => {
           if (stopRequested) {
             log.info(`run ${reqBody.run_id}: stopped, cancelling item ${item.idx} (not started)`);
             await safeItemTerminal(reqBody.run_id, item.idx, { status: "cancelled", error: "cancelled by user" });
+            tally("cancelled");
             continue;
           }
           while (pauseRequested && !stopRequested) {
@@ -553,6 +563,7 @@ const server = createServer(async (req, res) => {
           if (stopRequested) {
             log.info(`run ${reqBody.run_id}: stopped while paused, cancelling item ${item.idx} (not started)`);
             await safeItemTerminal(reqBody.run_id, item.idx, { status: "cancelled", error: "cancelled by user" });
+            tally("cancelled");
             continue;
           }
           if (item.mtp === "on") {
@@ -562,35 +573,47 @@ const server = createServer(async (req, res) => {
                 status: "failed",
                 error: "active llama.cpp build has no llama-server binary -- reinstall the build to pick one up",
               });
+              tally("failed");
               continue;
             }
-            await runSweepItemViaServer({
-              runId: reqBody.run_id,
-              item,
-              repeats: reqBody.sweep.repeats,
-              modelPath,
-              mtpModelPath,
-              llamaServerPath: activeBuild!.serverPath,
-              port: config.mtp_server_port ?? DEFAULT_MTP_SERVER_PORT,
-              backend,
-              timeoutMs: config.bench_timeout_ms,
-              rawJsonDir: rawDir,
-            });
+            tally(
+              await runSweepItemViaServer({
+                runId: reqBody.run_id,
+                item,
+                repeats: reqBody.sweep.repeats,
+                modelPath,
+                mtpModelPath,
+                llamaServerPath: activeBuild!.serverPath,
+                port: config.mtp_server_port ?? DEFAULT_MTP_SERVER_PORT,
+                backend,
+                timeoutMs: config.bench_timeout_ms,
+                rawJsonDir: rawDir,
+              })
+            );
           } else {
-            await runSweepItem({
-              runId: reqBody.run_id,
-              item,
-              repeats: reqBody.sweep.repeats,
-              modelPath,
-              llamaBenchPath: activeBuild!.path,
-              backend,
-              timeoutMs: config.bench_timeout_ms,
-              vpsUrl: config.vps_url,
-              rawJsonDir: rawDir,
-            });
+            tally(
+              await runSweepItem({
+                runId: reqBody.run_id,
+                item,
+                repeats: reqBody.sweep.repeats,
+                modelPath,
+                llamaBenchPath: activeBuild!.path,
+                backend,
+                timeoutMs: config.bench_timeout_ms,
+                vpsUrl: config.vps_url,
+                rawJsonDir: rawDir,
+              })
+            );
           }
         }
-        log.info(`run ${reqBody.run_id} finished all ${items.length} test(s)${stopRequested ? " (stopped early)" : ""}`);
+        const breakdown =
+          (["done", "failed", "failed_oom", "cancelled"] as const)
+            .filter((s) => statusCounts[s])
+            .map((s) => `${s}=${statusCounts[s]}`)
+            .join(" ") || "no items processed";
+        log.info(
+          `run ${reqBody.run_id} finished all ${items.length} test(s)${stopRequested ? " (stopped early)" : ""}: ${breakdown}`
+        );
       } finally {
         busy = false;
         currentRun = null;
@@ -1028,86 +1051,125 @@ const TG_RUN_RE = /benchmark\s+\d+\/\d+:\s+generation run\s+(\d+)\/(\d+)/i;
 const WARMUP_RE = /benchmark\s+\d+\/\d+:\s+warmup prompt run/i;
 const STARTING_RE = /benchmark\s+\d+\/\d+:\s+starting/i;
 
-// llama.cpp's own one-line model-load summary, printed once *per model
-// loaded* by either binary once that model's tensor loading finishes --
-// confirmed live against the real binaries across -ngl 0 ("0/43"), a partial
-// value ("10/43", matching the per-layer "layer N assigned to device" lines
-// it also prints at this same verbosity), and full offload ("43/43"). X =
-// gpu_layers_loaded, Y = total_model_layers -- Y is the GGUF's real
-// transformer layer count + 1 (the output layer), not the same number as
-// models.metadata.n_layer, so this is the only correct source for either
-// value. Requires -v (llama-bench, see worker/src/bench.ts's
-// supportsVerboseFlag) or -lv 4 (llama-server, see worker/src/serverBench.ts's
-// buildArgs) -- absent at default verbosity on both binaries, confirmed live.
-// `g` flag so parseOffloadLayers below can
-// collect every occurrence, not just the first -- an MTP item loads TWO
-// models (base + --model-draft companion) via llama-server, each printing
-// its own line.
-const OFFLOAD_LAYERS_RE = /load_tensors: offloaded (\d+)\/(\d+) layers to GPU/g;
+// Offload detail (which model got how many layers on the GPU) is now parsed
+// once by whichever module actually ran the process -- bench.ts's runBench
+// for the llama-bench path, serverBench.ts's runServerBench for the MTP/
+// llama-server path -- and arrives here pre-parsed on BenchResult.offload
+// (see bench.ts's parseOffloadLayers/OffloadResult). matchOffloadLine is the
+// one piece still used directly in this file: a live, single-line version
+// for surfacing offload as soon as it's seen while streaming llama-bench's
+// stderr (see runSweepItem's onStderrLine below), well before that item's
+// process has actually exited.
 
-interface OffloadInfo {
-  gpu_layers_loaded: number;
-  total_model_layers: number;
+// One line per sweep item's actual parameters, used both when a test starts
+// (before anything is known about the run yet) and in its end-of-test
+// summary -- the same string either way, so a log reader can match the two
+// up at a glance. ngld is only meaningful for an "on" mtp item (see
+// shared/sweep.ts's SweepItem doc comment), so it's omitted otherwise rather
+// than printing a value nobody asked for and nothing used.
+function formatItemParams(item: SweepItem): string {
+  const base =
+    `n_prompt=${item.n_prompt} n_gen=${item.n_gen} threads=${item.threads} ngl=${item.n_gpu_layers} ` +
+    `batch=${item.batch_size} ubatch=${item.ubatch_size} ctk=${item.cache_type_k} ctv=${item.cache_type_v} ` +
+    `fa=${item.flash_attn} mtp=${item.mtp}`;
+  return item.mtp === "on" ? `${base} ngld=${item.n_gpu_layers_draft}` : base;
 }
 
-interface OffloadResult {
-  // The base/target model's offload -- always the model at `modelPath`, and
-  // (for a non-MTP item) the only model loaded at all.
-  main: OffloadInfo | null;
-  // The MTP/--model-draft companion's own offload, only meaningful when
-  // hasMtpDraft is true. Null when hasMtpDraft is false, or when only one
-  // "load_tensors: offloaded" line was actually captured (e.g. a build that
-  // doesn't log the draft model's own load at this verbosity) -- there's
-  // nothing to disambiguate from in that case, so the single match is
-  // attributed to main and draft is left unset rather than guessed.
-  draft: OffloadInfo | null;
+function formatOffloadLine(offload: OffloadResult): string {
+  if (!offload.main) return "offload: unknown (no offload line seen in output)";
+  const main = `main=${offload.main.gpu_layers_loaded}/${offload.main.total_model_layers}`;
+  const draft = offload.draft ? ` draft=${offload.draft.gpu_layers_loaded}/${offload.draft.total_model_layers}` : "";
+  return `offload: ${main}${draft}`;
 }
 
-// A plain llama-bench item (bench.ts's path) always loads exactly one model,
-// so a single "offloaded X/Y" line is unambiguous. An MTP item run through
-// llama-server (serverBench.ts's path, hasMtpDraft true) loads two: the base
-// model and its --model-draft companion, each printing its own line. Simply
-// taking the first match here (the previous behavior) silently reported
-// whichever model's line happened to print first as if it were the base
-// model's -- confirmed live against real MTP run output that this is
-// actually the *draft* model's line, not the base model's, so
-// gpu_layers_loaded/total_model_layers on every MTP row previously showed
-// the tiny draft head's own e.g. "5/5" instead of the real base model's e.g.
-// "43/43". Disambiguated here by total layer count instead of match
-// position, which is robust regardless of which model's line prints first:
-// an MTP draft/companion model is, by definition and by how much smaller
-// speculative-decoding heads are than the base models they're paired with,
-// always the one with far fewer transformer layers -- so of at most two
-// matches, the larger total_model_layers is always the base model's line and
-// the smaller is always the draft's.
-function parseOffloadLayers(stderr: string, hasMtpDraft: boolean): OffloadResult {
-  const matches: OffloadInfo[] = [...stderr.matchAll(OFFLOAD_LAYERS_RE)].map((m) => ({
-    gpu_layers_loaded: Number(m[1]),
-    total_model_layers: Number(m[2]),
-  }));
-  if (matches.length === 0) return { main: null, draft: null };
-  if (!hasMtpDraft || matches.length < 2) {
-    const main = matches.reduce((a, b) => (b.total_model_layers > a.total_model_layers ? b : a));
-    return { main, draft: null };
-  }
-  const [main, draft] = [...matches].sort((a, b) => b.total_model_layers - a.total_model_layers);
-  return { main, draft };
+// Mirrors the ram/vram columns RunDetail.tsx's results table shows (free,
+// avg, max, total, plus the accuracy/source tag behind the little info icon
+// next to each vram figure -- see AccuracyIcon in that file) so the same
+// numbers a person would see in the UI are visible directly in this log.
+// vram's accuracy/source also covers what a unified-memory system (Metal --
+// see vram.ts's readDarwinGpuMemory) reports through this same field: there's
+// no separate "unified memory" number to show, since on that backend vram
+// *is* system RAM up to a dynamic ceiling -- the "unified_memory_estimate"
+// source tag makes that explicit instead of silently labeling it as
+// dedicated VRAM.
+function formatMemoryLines(stats: SampleStats, baseline: FreeMemoryBaseline): string[] {
+  const ramParts = [
+    `free_before=${baseline.ram_free_before_mib}MiB`,
+    `avg=${stats.ram_avg_mib}MiB`,
+    `peak=${stats.ram_peak_mib}MiB`,
+  ];
+  if (baseline.system_memory_total_mib != null) ramParts.push(`total=${baseline.system_memory_total_mib}MiB`);
+  const ramLine = `ram: ${ramParts.join(" ")}`;
+
+  const vramParts: string[] = [];
+  if (baseline.gpu_memory_total_mib != null) vramParts.push(`total=${baseline.gpu_memory_total_mib}MiB`);
+  if (baseline.vram_free_before_mib != null) vramParts.push(`free_before=${baseline.vram_free_before_mib}MiB`);
+  if (stats.vram_avg_mib != null) vramParts.push(`avg=${stats.vram_avg_mib}MiB`);
+  if (stats.vram_peak_mib != null) vramParts.push(`peak=${stats.vram_peak_mib}MiB`);
+  if (vramParts.length === 0) return [ramLine, "vram: unavailable"];
+  const accuracy = stats.vram_peak_mib != null ? stats.vram_peak_accuracy : baseline.gpu_memory_total_accuracy;
+  const source = stats.vram_peak_source ?? baseline.gpu_memory_total_source;
+  const vramLine = `vram: ${vramParts.join(" ")} (${accuracy}${source ? `/${source}` : ""})`;
+  return [ramLine, vramLine];
+}
+
+// pp/tg avg+stddev, same numbers RunDetail.tsx's "PP tok/s"/"TG tok/s"
+// columns show once a test finishes (hover-for-stddev there, always-shown
+// here). sample_count/suspect_count are only ever set by the llama-server/
+// MTP path (see serverBench.ts's buildPhaseSummary) -- undefined on the
+// llama-bench path, so the "(n=...)" suffix is naturally omitted there.
+function formatResultsLine(results: IngestResultInput[]): string {
+  return results
+    .map((r) => {
+      const suspect = r.suspect_count ? `, ${r.suspect_count} suspect` : "";
+      const n = r.sample_count != null ? ` (n=${r.sample_count}${suspect})` : "";
+      return `${r.test_type}=${r.avg_tps.toFixed(2)}tok/s ±${r.stddev_tps.toFixed(2)}${n}`;
+    })
+    .join("  ");
+}
+
+// Same estimate RunDetail.tsx's TTFT column derives (n_prompt ÷ PP speed) --
+// not a directly measured request latency, see that column's own tooltip.
+function formatTtftLine(results: IngestResultInput[]): string | null {
+  const pp = results.find((r) => r.test_type === "pp" || r.test_type === "pg");
+  if (!pp || pp.n_prompt <= 0 || pp.avg_tps <= 0) return null;
+  const ttftMs = (pp.n_prompt / pp.avg_tps) * 1000;
+  return `ttft: ~${ttftMs.toFixed(0)}ms (est. n_prompt÷pp avg)`;
+}
+
+// Draft-model acceptance rate for an MTP item's tg row, same figure
+// RunDetail.tsx's "mtp" column shows on hover (see serverBench.ts's
+// checkSpecDecodeMetrics, which is what actually populates spec_drafted/
+// spec_accepted). Absent on every non-MTP row, and on an MTP row whose
+// /metrics call never confirmed anything at all (see that function's own
+// warning path).
+function formatSpecDecodeLine(results: IngestResultInput[]): string | null {
+  const tg = results.find((r) => r.test_type === "tg");
+  if (!tg || tg.spec_drafted == null || tg.spec_accepted == null) return null;
+  const rate = tg.spec_drafted > 0 ? (tg.spec_accepted / tg.spec_drafted) * 100 : 0;
+  return `mtp accept: ${tg.spec_accepted}/${tg.spec_drafted} (${rate.toFixed(1)}%)`;
 }
 
 // llama.cpp's own diagnostic stderr (device detection, model metadata,
-// tensor-offload lines, timing breakdown) was previously only ever saved to
-// the per-item raw JSON dump (writeRawJson below) -- nothing mirrored it
-// into the worker's own text log, so following along live (pm2 logs, the
-// daily log file under logs/) only ever showed this app's own progress
-// lines, never llama.cpp's. logDiagnosticOutput mirrors it in, filtered
-// defensively: llama-server's MTP path runs at -lv 4 (see serverBench.ts's
-// buildArgs) rather than the max level 5 ("debug", which prints a
-// per-token/per-draft-candidate trace -- confirmed live to be unnecessary
-// noise for anything this app reads), but level 4 ("trace") is still verbose
-// enough that a request/response body -- including this app's own synthetic
-// filler-token prompts and the model's generated text -- could plausibly
-// appear verbatim in a line at that verbosity. Genuine llama.cpp diagnostic
-// lines are short, structured,
+// hundreds of per-tensor "loading tensor blk.N...." lines, timing breakdown)
+// is always saved in full to the per-item raw JSON dump (writeRawJson below)
+// regardless of log level, so nothing is lost by keeping it out of the
+// worker's own info-level text log -- confirmed live that mirroring it there
+// unfiltered (the previous behavior) buried the structured
+// params/offload/per-run/summary lines this file now logs for every test
+// (see formatItemParams and friends above) under tens of thousands of
+// characters of tensor-by-tensor noise for a single MTP item alone.
+// logDiagnosticOutput below still mirrors it into the log file, just at
+// debug level (see LOG_LEVEL) so it's there on demand for troubleshooting
+// without being what a normal `pm2 logs`/daily-log read has to scroll past.
+// Filtered defensively regardless of level: llama-server's MTP path runs at
+// -lv 4 (see serverBench.ts's buildArgs) rather than the max level 5
+// ("debug", which prints a per-token/per-draft-candidate trace -- confirmed
+// live to be unnecessary noise for anything this app reads), but level 4
+// ("trace") is still verbose enough that a request/response body --
+// including this app's own synthetic filler-token prompts and the model's
+// generated text -- could plausibly appear verbatim in a line at that
+// verbosity. Genuine llama.cpp diagnostic lines are short, structured,
 // human-authored strings; a dumped prompt/response array or generated-text
 // blob is not, so any line past a generous length threshold is elided
 // rather than printed in full -- this trades away logging an unusually long
@@ -1132,7 +1194,7 @@ function filterDiagnosticOutput(stderr: string): string {
 function logDiagnosticOutput(label: string, processName: string, stderr: string): void {
   const filtered = filterDiagnosticOutput(stderr);
   if (!filtered) return;
-  log.info(`${label}: ${processName} output:\n${filtered}`);
+  log.debug(`${label}: ${processName} raw output:\n${filtered}`);
 }
 
 // Maps a finished BenchResult into a terminal run-item report -- shared by
@@ -1147,13 +1209,13 @@ async function finalizeSweepItemResult(
   processName: string,
   bench: BenchResult,
   stats: SampleStats,
-  baseline: FreeMemoryBaseline,
-  // Read from llama.cpp's own runtime output (see parseOffloadLayers above),
-  // both null when the line was never seen at all (item failed before model
-  // load finished, or a build too old to support the required verbosity
-  // flag).
-  offload: OffloadResult
-): Promise<void> {
+  baseline: FreeMemoryBaseline
+): Promise<TerminalRunItemStatus> {
+  // Read from llama.cpp's own runtime output (see bench.ts's
+  // parseOffloadLayers) -- both null when the line was never seen at all
+  // (item failed before model load finished, or a build too old to support
+  // the required verbosity flag).
+  const offload: OffloadResult = bench.offload ?? { main: null, draft: null };
   if (bench.code === 0 && bench.results.length > 0) {
     // A single sweep item with both n_prompt and n_gen set (and no -pg)
     // produces two rows -- a pp-only row and a tg-only row -- both kept here
@@ -1186,11 +1248,19 @@ async function finalizeSweepItemResult(
       gpu_layers_loaded_draft: offload.draft?.gpu_layers_loaded ?? null,
       total_model_layers_draft: offload.draft?.total_model_layers ?? null,
     }));
-    log.info(
-      `${label} done: ${results.map((r) => `${r.test_type}=${r.avg_tps.toFixed(2)}tok/s`).join(" ")} ` +
-        `ram_peak=${stats.ram_peak_mib}MiB ram_avg=${stats.ram_avg_mib}MiB` +
-        (stats.vram_peak_mib != null ? ` vram_peak=${stats.vram_peak_mib}MiB vram_avg=${stats.vram_avg_mib}MiB` : "")
-    );
+    // One structured block per test, covering everything RunDetail.tsx's
+    // results table shows for this row (params, actual offload, pp/tg
+    // avg+stddev, TTFT estimate, ram/vram free/avg/peak, MTP acceptance rate)
+    // plus which engine produced it -- see the format* helpers above. This
+    // replaces the previous single-line "done: pp=...tok/s ram_peak=..."
+    // summary, which dropped most of that detail on the floor.
+    const summaryLines = [`${label}: TEST SUMMARY -- engine=${processName} status=done`, `  params: ${formatItemParams(item)}`, `  ${formatOffloadLine(offload)}`, `  results: ${formatResultsLine(results)}`];
+    const ttftLine = formatTtftLine(results);
+    if (ttftLine) summaryLines.push(`  ${ttftLine}`);
+    for (const line of formatMemoryLines(stats, baseline)) summaryLines.push(`  ${line}`);
+    const specLine = formatSpecDecodeLine(results);
+    if (specLine) summaryLines.push(`  ${specLine}`);
+    log.info(summaryLines.join("\n"));
     // bench.warning (only ever set by the llama-server/MTP path) flags a
     // successful item that still had some readings rejected as implausible
     // -- surfaced via the same `error` field a failed item uses, since
@@ -1215,18 +1285,25 @@ async function finalizeSweepItemResult(
       // no-ops there without any extra branching.
       backend_device_name: bench.gpu_info,
     });
-    return;
+    return "done";
   }
   // A user-requested stop kills this exact process (SIGKILL, via /run/stop)
   // -- report it as "cancelled", not a genuine failure, so it doesn't read
   // as something having gone wrong.
-  const status: "failed_oom" | "failed" | "cancelled" = stopRequested ? "cancelled" : classifyFailure(bench);
+  const status: TerminalRunItemStatus = stopRequested ? "cancelled" : classifyFailure(bench);
   const errorMessage = stopRequested
     ? "cancelled by user"
     : bench.code === 0
       ? `${processName} exited cleanly but produced no parseable result`
       : bench.stderr || `${processName} exited with code ${bench.code}`;
-  log.error(`${label} ${status} (code ${bench.code}, signal ${bench.signal ?? "none"}): ${errorMessage}`);
+  const failureLines = [
+    `${label}: TEST SUMMARY -- engine=${processName} status=${status}`,
+    `  params: ${formatItemParams(item)}`,
+    `  ${formatOffloadLine(offload)}`,
+    ...formatMemoryLines(stats, baseline).map((line) => `  ${line}`),
+    `  error (code ${bench.code}, signal ${bench.signal ?? "none"}): ${errorMessage}`,
+  ];
+  log.error(failureLines.join("\n"));
   await safeItemTerminal(runId, item.idx, {
     status,
     error: errorMessage,
@@ -1235,13 +1312,14 @@ async function finalizeSweepItemResult(
     ram_avg_mib: stats.ram_avg_mib,
     vram_avg_mib: stats.vram_avg_mib,
   });
+  return status;
 }
 
 // Runs exactly one sweep combination as its own llama-bench process, reports
 // its progress live, and always resolves (never throws) regardless of
 // outcome -- so the caller's loop over every item in the sweep can continue
 // unconditionally instead of one bad combination aborting the rest.
-async function runSweepItem(input: RunSweepItemInput): Promise<void> {
+async function runSweepItem(input: RunSweepItemInput): Promise<TerminalRunItemStatus> {
   const { runId, item, backend } = input;
   const label = `run ${runId} item ${item.idx}`;
   const itemStartedAt = Date.now();
@@ -1250,6 +1328,7 @@ async function runSweepItem(input: RunSweepItemInput): Promise<void> {
   const benchmarkingPhase: RunItemTickInput["status"] =
     testType === "pp" ? "processing" : testType === "tg" ? "generating" : "benchmarking";
 
+  log.info(`${label}: starting test -- engine=llama-bench params: ${formatItemParams(item)}`);
   const baseline = await captureFreeMemoryBaseline(backend);
   log.info(
     `${label}: free memory before start: ram=${baseline.ram_free_before_mib}MiB` +
@@ -1274,6 +1353,12 @@ async function runSweepItem(input: RunSweepItemInput): Promise<void> {
   let usedProgressMarkers = false;
   let liveTps: number | undefined;
   let lastRepMarker: { kind: "pp" | "tg"; rep: number; at: number } | null = null;
+  // Logged once, live, the first time llama-bench's own "offloaded X/Y
+  // layers to GPU" line streams by (see matchOffloadLine) -- right when
+  // model loading finishes, well before the first benchmark repeat, so
+  // offload is visible without waiting for the item's TEST SUMMARY at the
+  // very end.
+  let loggedLiveOffload = false;
 
   try {
     const bench = await runBench({
@@ -1297,11 +1382,17 @@ async function runSweepItem(input: RunSweepItemInput): Promise<void> {
           }
           const current = sampler.current;
           tickCount++;
-          if (tickCount % HEARTBEAT_EVERY_N === 0) {
+          // Only mirrored to the info log while still loading -- once
+          // repeats start, each one already logs its own speed+memory line
+          // below (see the PP_RUN_RE/TG_RUN_RE handling), so a heartbeat on
+          // top of that would just repeat the same info every ~20s for the
+          // rest of the item. Loading has no repeat markers at all, so this
+          // remains the only visibility into a long model load.
+          if (tickCount % HEARTBEAT_EVERY_N === 0 && phase === "loading") {
             const elapsedS = Math.round((Date.now() - itemStartedAt) / 1000);
             log.info(
-              `${label}: ${phase}${detail ? ` (${detail})` : ""} ram=${current.ram_mib ?? "?"}MiB ` +
-                `elapsed=${elapsedS}s`
+              `${label}: loading${detail ? ` (${detail})` : ""} ram=${current.ram_mib ?? "?"}MiB` +
+                `${current.vram_mib != null ? ` vram=${current.vram_mib}MiB` : ""} elapsed=${elapsedS}s`
             );
           }
           sendTick(runId, item.idx, {
@@ -1316,6 +1407,14 @@ async function runSweepItem(input: RunSweepItemInput): Promise<void> {
       onStderrLine: (line) => {
         sawStderr = true;
         lastStderrAt = Date.now();
+
+        if (!loggedLiveOffload) {
+          const offloadHit = matchOffloadLine(line);
+          if (offloadHit) {
+            loggedLiveOffload = true;
+            log.info(`${label}: offload: main=${offloadHit.gpu_layers_loaded}/${offloadHit.total_model_layers}`);
+          }
+        }
 
         const ppMatch = PP_RUN_RE.exec(line);
         const tgMatch = TG_RUN_RE.exec(line);
@@ -1342,7 +1441,9 @@ async function runSweepItem(input: RunSweepItemInput): Promise<void> {
           phase = kind === "pp" ? "processing" : "generating";
           detail = `run ${rep}/${reps}`;
           const tpsSuffix = liveTps != null ? ` (${liveTps.toFixed(1)} t/s measured last repeat)` : "";
-          log.info(`${label}: ${phase} run ${rep}/${reps}${tpsSuffix}`);
+          const current = sampler.current;
+          const memSuffix = ` ram=${current.ram_mib}MiB${current.vram_mib != null ? ` vram=${current.vram_mib}MiB` : ""}`;
+          log.info(`${label}: ${phase} run ${rep}/${reps}${tpsSuffix}${memSuffix}`);
           return;
         }
 
@@ -1368,21 +1469,19 @@ async function runSweepItem(input: RunSweepItemInput): Promise<void> {
     if (tickTimer) clearInterval(tickTimer);
     activeBenchProc = null;
     const stats = sampler.stop();
-    // false: this is the non-MTP path, which only ever loads one model.
-    const offload = parseOffloadLayers(bench.stderr, false);
     const outcome = bench.code === 0 && bench.results.length > 0 ? "ok" : "failed";
     writeRawJson(rawJsonSubdir(input.rawJsonDir, outcome), `${runId}-${item.idx}`, {
       stdout: bench.stdout,
       stderr: bench.stderr,
     });
     logDiagnosticOutput(label, "llama-bench", bench.stderr);
-    await finalizeSweepItemResult(runId, item, label, "llama-bench", bench, stats, baseline, offload);
+    return await finalizeSweepItemResult(runId, item, label, "llama-bench", bench, stats, baseline);
   } catch (err) {
     if (tickTimer) clearInterval(tickTimer);
     activeBenchProc = null;
     const stats = sampler.stop();
     const message = err instanceof Error ? err.message : String(err);
-    log.error(`${label} handler threw: ${message}`);
+    log.error(`${label}: TEST SUMMARY -- engine=llama-bench status=failed\n  params: ${formatItemParams(item)}\n  error: ${message}`);
     await safeItemTerminal(runId, item.idx, {
       status: "failed",
       error: message,
@@ -1391,6 +1490,7 @@ async function runSweepItem(input: RunSweepItemInput): Promise<void> {
       ram_avg_mib: stats.ram_avg_mib,
       vram_avg_mib: stats.vram_avg_mib,
     });
+    return "failed";
   }
 }
 
@@ -1415,10 +1515,11 @@ interface RunSweepItemViaServerInput {
 // reporting is simpler here: serverBench.ts drives its own repeat loop
 // directly, so ticks come from a plain callback rather than regex-scraped
 // subprocess stderr.
-async function runSweepItemViaServer(input: RunSweepItemViaServerInput): Promise<void> {
+async function runSweepItemViaServer(input: RunSweepItemViaServerInput): Promise<TerminalRunItemStatus> {
   const { runId, item, backend } = input;
   const label = `run ${runId} item ${item.idx} (mtp)`;
 
+  log.info(`${label}: starting test -- engine=llama-server params: ${formatItemParams(item)}`);
   const baseline = await captureFreeMemoryBaseline(backend);
   log.info(
     `${label}: free memory before start: ram=${baseline.ram_free_before_mib}MiB` +
@@ -1445,8 +1546,9 @@ async function runSweepItemViaServer(input: RunSweepItemViaServerInput): Promise
         sampler.start(proc.pid, backend, TICK_INTERVAL_MS);
       },
       onProgress: (phase, detail, liveTps) => {
-        log.info(`${label}: ${phase} (${detail})${liveTps != null ? ` (${liveTps.toFixed(1)} t/s)` : ""}`);
         const current = sampler.current;
+        const memSuffix = ` ram=${current.ram_mib}MiB${current.vram_mib != null ? ` vram=${current.vram_mib}MiB` : ""}`;
+        log.info(`${label}: ${phase} (${detail})${liveTps != null ? ` (${liveTps.toFixed(1)} t/s)` : ""}${memSuffix}`);
         sendTick(runId, item.idx, {
           status: phase,
           detail,
@@ -1459,22 +1561,18 @@ async function runSweepItemViaServer(input: RunSweepItemViaServerInput): Promise
     });
     activeBenchProc = null;
     const stats = sampler.stop();
-    // Only true for a Gemma-4-style base model with a separate --model-draft
-    // companion file -- a Qwen-style in-file MTP model loads just the one
-    // model, same as the non-MTP path (see ServerBenchRunInput.mtpModelPath).
-    const offload = parseOffloadLayers(bench.stderr, Boolean(input.mtpModelPath));
     const outcome = bench.code === 0 && bench.results.length > 0 ? "ok" : "failed";
     writeRawJson(rawJsonSubdir(input.rawJsonDir, outcome), `${runId}-${item.idx}`, {
       stdout: bench.stdout,
       stderr: bench.stderr,
     });
     logDiagnosticOutput(label, "llama-server", bench.stderr);
-    await finalizeSweepItemResult(runId, item, label, "llama-server", bench, stats, baseline, offload);
+    return await finalizeSweepItemResult(runId, item, label, "llama-server", bench, stats, baseline);
   } catch (err) {
     activeBenchProc = null;
     const stats = sampler.stop();
     const message = err instanceof Error ? err.message : String(err);
-    log.error(`${label} handler threw: ${message}`);
+    log.error(`${label}: TEST SUMMARY -- engine=llama-server status=failed\n  params: ${formatItemParams(item)}\n  error: ${message}`);
     await safeItemTerminal(runId, item.idx, {
       status: "failed",
       error: message,
@@ -1483,6 +1581,7 @@ async function runSweepItemViaServer(input: RunSweepItemViaServerInput): Promise
       ram_avg_mib: stats.ram_avg_mib,
       vram_avg_mib: stats.vram_avg_mib,
     });
+    return "failed";
   }
 }
 

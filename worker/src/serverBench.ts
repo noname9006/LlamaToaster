@@ -4,7 +4,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { IngestResultInput } from "../../shared/types.js";
 import type { SweepItem } from "../../shared/sweep.js";
-import type { BenchLogger, BenchResult } from "./bench.js";
+import { parseOffloadLayers, type BenchLogger, type BenchResult, type OffloadResult } from "./bench.js";
 
 // Drives llama-server over HTTP to benchmark MTP (multi-token-prediction)
 // speculative decoding -- llama-bench itself has no --spec-type/--model-draft
@@ -99,6 +99,13 @@ const RETRY_PROMPT_SHIFT = 137;
 
 function isRetryableServerParseFailure(err: unknown): boolean {
   return err instanceof Error && RETRYABLE_SERVER_PARSE_FAILURE.test(err.message);
+}
+
+function formatOffloadForLog(offload: OffloadResult): string {
+  if (!offload.main) return "unknown (no offload line seen)";
+  const main = `main=${offload.main.gpu_layers_loaded}/${offload.main.total_model_layers}`;
+  const draft = offload.draft ? ` draft=${offload.draft.gpu_layers_loaded}/${offload.draft.total_model_layers}` : "";
+  return `${main}${draft}`;
 }
 
 // Per-(model, draft-model) "working" prompt offset, persisted across items,
@@ -544,6 +551,17 @@ export async function runServerBench(input: ServerBenchRunInput): Promise<BenchR
     input.onProgress?.("loading", "starting llama-server");
     await waitForReady(input.port, Date.now() + READY_TIMEOUT_MS, closed);
 
+    // Both the base model and (when present) its --model-draft companion
+    // have finished loading by the time /health reports ready -- so this is
+    // the earliest point their "load_tensors: offloaded X/Y layers to GPU"
+    // lines (see parseOffloadLayers) can possibly have been printed, same
+    // timing bench.ts's llama-bench path gets its own offload detail at.
+    // Parsed once here rather than re-parsed from the (larger, still-growing)
+    // final stderr at the end -- offload lines only ever appear during model
+    // load, so nothing later in this run could add or change a match.
+    const offload = parseOffloadLayers(stderr, Boolean(input.mtpModelPath));
+    log?.info(`${label}: offload: ${formatOffloadForLog(offload)}`);
+
     const offsetStorePath = input.offsetStorePath ?? DEFAULT_OFFSET_STORE_PATH;
     const offsetKey = offsetStoreKey(input.modelPath, input.mtpModelPath);
     // Updated in place whenever a non-preferred offset succeeds, so later
@@ -791,6 +809,7 @@ export async function runServerBench(input: ServerBenchRunInput): Promise<BenchR
       timedOut,
       results,
       warning,
+      offload,
     };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
