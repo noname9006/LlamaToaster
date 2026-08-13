@@ -155,6 +155,96 @@ export interface BenchResult {
   // undefined here too if stdout failed to parse.
   gpu_info?: string;
   cpu_info?: string;
+  // Read from llama.cpp's own runtime output (see parseOffloadLayers below)
+  // -- undefined when the line was never seen at all (item failed before
+  // model load finished, or a build too old to support the required
+  // verbosity flag). Populated here (rather than left to the caller) so both
+  // the llama-bench path (this file) and the llama-server/MTP path
+  // (serverBench.ts) share one parser and one BenchResult shape.
+  offload?: OffloadResult;
+}
+
+// llama.cpp's own one-line model-load summary, printed once *per model
+// loaded* by either binary once that model's tensor loading finishes --
+// confirmed live against the real binaries across -ngl 0 ("0/43"), a partial
+// value ("10/43", matching the per-layer "layer N assigned to device" lines
+// it also prints at this same verbosity), and full offload ("43/43"). X =
+// gpu_layers_loaded, Y = total_model_layers -- Y is the GGUF's real
+// transformer layer count + 1 (the output layer), not the same number as
+// models.metadata.n_layer, so this is the only correct source for either
+// value. Requires -v (llama-bench, see supportsVerboseFlag above) or -lv 4
+// (llama-server, see serverBench.ts's buildArgs) -- absent at default
+// verbosity on both binaries, confirmed live. `g` flag so parseOffloadLayers
+// below can collect every occurrence, not just the first -- an MTP item
+// loads TWO models (base + --model-draft companion) via llama-server, each
+// printing its own line.
+const OFFLOAD_LAYERS_RE = /load_tensors: offloaded (\d+)\/(\d+) layers to GPU/g;
+// Non-global sibling of the above, for matching a single already-isolated
+// line (e.g. worker/src/index.ts's live onStderrLine scan) without having to
+// worry about a shared regex's lastIndex state across repeated .exec calls.
+const OFFLOAD_LAYERS_LINE_RE = /load_tensors: offloaded (\d+)\/(\d+) layers to GPU/;
+
+export interface OffloadInfo {
+  gpu_layers_loaded: number;
+  total_model_layers: number;
+}
+
+export interface OffloadResult {
+  // The base/target model's offload -- always the model at `modelPath`, and
+  // (for a non-MTP item) the only model loaded at all.
+  main: OffloadInfo | null;
+  // The MTP/--model-draft companion's own offload, only meaningful when
+  // hasMtpDraft is true. Null when hasMtpDraft is false, or when only one
+  // "load_tensors: offloaded" line was actually captured (e.g. a build that
+  // doesn't log the draft model's own load at this verbosity) -- there's
+  // nothing to disambiguate from in that case, so the single match is
+  // attributed to main and draft is left unset rather than guessed.
+  draft: OffloadInfo | null;
+}
+
+// A plain llama-bench item (this file's own path) always loads exactly one
+// model, so a single "offloaded X/Y" line is unambiguous. An MTP item run
+// through llama-server (serverBench.ts's path, hasMtpDraft true) loads two:
+// the base model and its --model-draft companion, each printing its own
+// line. Simply taking the first match here (a previous behavior) silently
+// reported whichever model's line happened to print first as if it were the
+// base model's -- confirmed live against real MTP run output that this is
+// actually the *draft* model's line, not the base model's, so
+// gpu_layers_loaded/total_model_layers on every MTP row previously showed
+// the tiny draft head's own e.g. "5/5" instead of the real base model's e.g.
+// "43/43". Disambiguated here by total layer count instead of match
+// position, which is robust regardless of which model's line prints first:
+// an MTP draft/companion model is, by definition and by how much smaller
+// speculative-decoding heads are than the base models they're paired with,
+// always the one with far fewer transformer layers -- so of at most two
+// matches, the larger total_model_layers is always the base model's line and
+// the smaller is always the draft's.
+export function parseOffloadLayers(stderr: string, hasMtpDraft: boolean): OffloadResult {
+  const matches: OffloadInfo[] = [...stderr.matchAll(OFFLOAD_LAYERS_RE)].map((m) => ({
+    gpu_layers_loaded: Number(m[1]),
+    total_model_layers: Number(m[2]),
+  }));
+  if (matches.length === 0) return { main: null, draft: null };
+  if (!hasMtpDraft || matches.length < 2) {
+    const main = matches.reduce((a, b) => (b.total_model_layers > a.total_model_layers ? b : a));
+    return { main, draft: null };
+  }
+  const [main, draft] = [...matches].sort((a, b) => b.total_model_layers - a.total_model_layers);
+  return { main, draft };
+}
+
+// Live sibling of parseOffloadLayers, for a caller streaming stderr one line
+// at a time (worker/src/index.ts's onStderrLine) that wants to surface
+// offload as soon as it's known -- right when model loading finishes, well
+// before the first benchmark repeat -- rather than only after the whole
+// process has exited. Only ever finds the *first* model's own line this way
+// (a non-MTP llama-bench item has only one anyway); the authoritative,
+// disambiguated-against-a-draft-model result still comes from
+// parseOffloadLayers over the full captured stderr once the process closes.
+export function matchOffloadLine(line: string): OffloadInfo | null {
+  const m = OFFLOAD_LAYERS_LINE_RE.exec(line);
+  if (!m) return null;
+  return { gpu_layers_loaded: Number(m[1]), total_model_layers: Number(m[2]) };
 }
 
 export async function runBench(input: BenchRunInput): Promise<BenchResult> {
@@ -228,7 +318,10 @@ export async function runBench(input: BenchRunInput): Promise<BenchResult> {
         log?.warn(`failed to parse llama-bench output: ${message}`);
         stderr += `\n${message} (raw stdout: ${stdout.slice(0, 500)})`;
       }
-      resolve({ stdout, stderr, code, signal, timedOut, results, gpu_info, cpu_info });
+      // false: llama-bench has no --model-draft/MTP support at all, so this
+      // path only ever loads one model.
+      const offload = parseOffloadLayers(stderr, false);
+      resolve({ stdout, stderr, code, signal, timedOut, results, gpu_info, cpu_info, offload });
     });
   });
 }

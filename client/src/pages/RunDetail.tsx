@@ -73,8 +73,14 @@ const MERGED_COLUMN_DEFS: ColDef[] = [
   {
     label: "ngld",
     description:
-      "-ngld — MTP draft model's own layers offloaded to GPU, independent of ngl above. Only meaningful for an \"on\" mtp combination with a separate --model-draft file. Parenthesized figure (when shown) is what was actually loaded / the draft model's total layer count, read from llama.cpp's own runtime output.",
+      "-ngld — MTP draft model's own layers offloaded to GPU, independent of ngl above (the requested value). Only meaningful for an \"on\" mtp combination with a separate --model-draft file — see the offload d column for what was actually loaded.",
     sortKey: "ngld",
+  },
+  {
+    label: "offload d",
+    description:
+      "Draft model: layers actually loaded onto the GPU / this model's total transformer layer count, both read from llama.cpp's own runtime output (not calculated) — loaded may be less than ngld if the draft model has fewer layers than requested. Only meaningful for an \"on\" mtp combination with a separate --model-draft file.",
+    sortKey: "layers_loaded_draft",
   },
   {
     label: "PP tok/s",
@@ -314,6 +320,8 @@ function mergedSortValue(item: RunItem, results: ResultRow[] | undefined, key: s
       return item.mtp;
     case "ngld":
       return item.n_gpu_layers_draft;
+    case "layers_loaded_draft":
+      return anyResult?.gpu_layers_loaded_draft ?? -1;
     case "pp_tps":
       return ppResult?.avg_tps ?? -1;
     case "tg_tps":
@@ -912,14 +920,15 @@ export function RunDetail() {
                           "—"
                         )}
                       </td>
+                      <td className="px-1 py-1.5 text-muted">{it.mtp === "on" ? it.n_gpu_layers_draft : "—"}</td>
                       <td className="px-1 py-1.5 text-muted">
-                        {it.mtp === "on"
-                          ? `${it.n_gpu_layers_draft}${
-                              anyResult?.gpu_layers_loaded_draft != null && anyResult?.total_model_layers_draft != null
-                                ? ` (${anyResult.gpu_layers_loaded_draft}/${anyResult.total_model_layers_draft})`
-                                : ""
-                            }`
-                          : "—"}
+                        {it.mtp !== "on"
+                          ? "—"
+                          : anyResult?.gpu_layers_loaded_draft != null && anyResult?.total_model_layers_draft != null
+                            ? `${anyResult.gpu_layers_loaded_draft}/${anyResult.total_model_layers_draft}`
+                            : isTerminal
+                              ? "n/a"
+                              : "—"}
                       </td>
                       <td className="px-1 py-1.5">
                         {showLivePp ? (
