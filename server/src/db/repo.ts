@@ -124,6 +124,8 @@ interface ResultRowRaw {
   gpu_memory_model_peak_source: string | null;
   gpu_layers_loaded: number | null;
   total_model_layers: number | null;
+  gpu_layers_loaded_draft: number | null;
+  total_model_layers_draft: number | null;
   sample_count: number | null;
   suspect_count: number | null;
   suspect_samples: string | null;
@@ -262,6 +264,8 @@ function mapResult(row: ResultRowRaw): ResultRow {
     gpu_memory_model_peak_source: row.gpu_memory_model_peak_source as ResultRow["gpu_memory_model_peak_source"],
     gpu_layers_loaded: row.gpu_layers_loaded,
     total_model_layers: row.total_model_layers,
+    gpu_layers_loaded_draft: row.gpu_layers_loaded_draft ?? undefined,
+    total_model_layers_draft: row.total_model_layers_draft ?? undefined,
     sample_count: row.sample_count ?? undefined,
     suspect_count: row.suspect_count ?? undefined,
     // Stored as JSON text (SQLite has no array column type) -- tolerate a
@@ -579,10 +583,10 @@ export const repo = {
               gpu_memory_free_start_accuracy, gpu_memory_free_start_source,
               gpu_memory_model_avg_accuracy, gpu_memory_model_avg_source,
               gpu_memory_model_peak_accuracy, gpu_memory_model_peak_source,
-              gpu_layers_loaded, total_model_layers,
+              gpu_layers_loaded, total_model_layers, gpu_layers_loaded_draft, total_model_layers_draft,
               sample_count, suspect_count, suspect_samples, repeat_samples, spec_drafted, spec_accepted,
               raw_json_path, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         );
         // Up to two rows for one idx (a pp row and a tg row from the same
         // benchmark process) -- distinguished by test_type, see
@@ -626,6 +630,8 @@ export const repo = {
             row.gpu_memory_model_peak_source,
             row.gpu_layers_loaded,
             row.total_model_layers,
+            row.gpu_layers_loaded_draft ?? null,
+            row.total_model_layers_draft ?? null,
             row.sample_count ?? null,
             row.suspect_count ?? null,
             row.suspect_samples ? JSON.stringify(row.suspect_samples) : null,
@@ -877,6 +883,8 @@ function buildResultRow(
     gpu_memory_model_peak_source: r.gpu_memory_model_peak_source,
     gpu_layers_loaded: r.gpu_layers_loaded,
     total_model_layers: r.total_model_layers,
+    gpu_layers_loaded_draft: r.gpu_layers_loaded_draft ?? null,
+    total_model_layers_draft: r.total_model_layers_draft ?? null,
     sample_count: r.sample_count,
     suspect_count: r.suspect_count,
     suspect_samples: r.suspect_samples,
