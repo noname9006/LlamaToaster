@@ -11,7 +11,16 @@ import {
 } from "../components/StatusPill";
 import { Chart } from "../components/Chart";
 import { Th, toggleSort, type SortState } from "../components/Th";
-import type { Run, ResultRow, RunItem, GpuMemoryAccuracyLevel, GpuMemoryMeasurementSource } from "../types";
+import { IconInfo } from "../components/icons";
+import type {
+  Run,
+  ResultRow,
+  RunItem,
+  GpuMemoryAccuracyLevel,
+  GpuMemoryMeasurementSource,
+  Model,
+  WorkerLlamaCppInfo,
+} from "../types";
 import { shortId, formatElapsed, formatFlashAttn } from "../utils";
 
 interface ColDef {
@@ -39,16 +48,16 @@ const MERGED_COLUMN_DEFS: ColDef[] = [
   { label: "#", description: "Position of this combination within the sweep.", sortKey: "idx" },
   { label: "detail", description: "Current action / progress text, or the error message if this test failed." },
   { label: "test", description: "pp = prompt processing, tg = text generation, pg = both in one llama-bench call.", sortKey: "test" },
-  { label: "n_prompt", description: "-p — prompt tokens processed before generating.", sortKey: "n_prompt", padX: "!pl-2 !pr-0.5" },
-  { label: "n_gen", description: "-n — tokens generated after the prompt.", sortKey: "n_gen", padX: "!pl-0.5 !pr-2" },
-  { label: "threads", description: "-t — CPU threads used for compute.", sortKey: "threads", padX: "!pl-2 !pr-0.5" },
-  { label: "ngl", description: "-ngl — model layers offloaded to GPU (999 = all, i.e. the requested value).", sortKey: "ngl", padX: "!pl-0.5 !pr-2" },
+  { label: "n_prompt", description: "-p — prompt tokens processed before generating.", sortKey: "n_prompt", padX: "!pl-1 !pr-0.5" },
+  { label: "n_gen", description: "-n — tokens generated after the prompt.", sortKey: "n_gen", padX: "!pl-0.5 !pr-1" },
+  { label: "threads", description: "-t — CPU threads used for compute.", sortKey: "threads", padX: "!pl-1 !pr-0.5" },
+  { label: "ngl", description: "-ngl — model layers offloaded to GPU (999 = all, i.e. the requested value).", sortKey: "ngl", padX: "!pl-0.5 !pr-1" },
   {
-    label: "loaded",
-    description: "Layers actually loaded onto the GPU, read from llama.cpp's own runtime output (not calculated) — may be less than ngl if the model has fewer layers than requested.",
+    label: "offload",
+    description:
+      "Layers actually loaded onto the GPU / this model's total transformer layer count, both read from llama.cpp's own runtime output (not calculated) — loaded may be less than ngl if the model has fewer layers than requested.",
     sortKey: "layers_loaded",
   },
-  { label: "layers", description: "Total transformer layer count for this model, as loaded by llama.cpp.", sortKey: "layers_total" },
   { label: "batch", description: "-b — logical batch size for prompt processing.", sortKey: "batch" },
   { label: "ubatch", description: "-ub — physical batch size (must be ≤ batch size).", sortKey: "ubatch" },
   { label: "ctk", description: "-ctk — K cache quantization type.", sortKey: "ctk" },
@@ -57,8 +66,15 @@ const MERGED_COLUMN_DEFS: ColDef[] = [
   {
     label: "mtp",
     description:
-      "Multi-token-prediction speculative decoding, on or off. An \"on\" combination runs via llama-server instead of llama-bench, since llama-bench itself has no MTP support.",
+      "Multi-token-prediction speculative decoding, on or off. An \"on\" combination runs via llama-server instead of llama-bench, since llama-bench itself has no MTP support. " +
+      "When on, also shows the draft head's acceptance rate (accepted/drafted tokens from llama-server's /metrics, tg test only) -- hover for the raw counts.",
     sortKey: "mtp",
+  },
+  {
+    label: "ngld",
+    description:
+      "-ngld — MTP draft model's own layers offloaded to GPU, independent of ngl above. Only meaningful for an \"on\" mtp combination with a separate --model-draft file.",
+    sortKey: "ngld",
   },
   {
     label: "PP tok/s",
@@ -73,7 +89,7 @@ const MERGED_COLUMN_DEFS: ColDef[] = [
     sortKey: "tg_tps",
   },
   {
-    label: "TTFT (est.)",
+    label: "TTFT",
     description:
       "Estimated time to first token, derived as prompt tokens ÷ PP speed. Not a directly measured request latency — this app benchmarks locally via llama-bench, not through a live serving request.",
     sortKey: "ttft",
@@ -145,6 +161,19 @@ function testTypeLabel(nPrompt: number, nGen: number): string {
   return "pg";
 }
 
+// Mirrors server/src/routes/results.ts's fmtSpecDecode (the CSV export's own
+// formatting for this same pair of counters) -- kept as a tiny local inline
+// for the same client/shared-boundary reason as testTypeLabel above.
+// undefined means /metrics never confirmed anything (unreachable, or no
+// counters at all); drafted: 0 renders as "0/0" with no percentage -- the
+// draft head loaded but drafted nothing, a distinct, worse condition than a
+// missing reading.
+function fmtSpecDecode(drafted: number | null | undefined, accepted: number | null | undefined): string | undefined {
+  if (drafted == null || accepted == null) return undefined;
+  const rate = drafted > 0 ? ` (${((accepted / drafted) * 100).toFixed(1)}%)` : "";
+  return `${accepted}/${drafted}${rate}`;
+}
+
 // suspect_count/suspect_samples are only ever populated by the llama-server/
 // MTP path (worker/src/serverBench.ts) -- a nonzero count means at least one
 // repeat's reading was computable but outside plausible bounds (see
@@ -186,6 +215,20 @@ function gpuMemoryAccuracyTitle(
 ): string | undefined {
   if (!accuracy || accuracy === "exact" || !source) return undefined;
   return ACCURACY_SOURCE_EXPLANATIONS[source];
+}
+
+// Real SVG circle+"i" (see icons.tsx) in place of the old literal " ⓘ"
+// Unicode glyph, which renders as a distorted/non-circular blob in several
+// UI fonts. The tooltip lives on the wrapping <span>, not the <svg> itself --
+// a bare `title` attribute on an inline SVG root isn't reliably honored as a
+// hover tooltip across browsers the way it is on ordinary HTML elements.
+function AccuracyIcon({ title }: { title: string | undefined }) {
+  if (!title) return null;
+  return (
+    <span title={title} className="inline-flex flex-none translate-y-[1px] text-muted/70">
+      <IconInfo width={11} height={11} />
+    </span>
+  );
 }
 
 interface MemoryCells {
@@ -257,8 +300,6 @@ function mergedSortValue(item: RunItem, results: ResultRow[] | undefined, key: s
       return item.n_gpu_layers;
     case "layers_loaded":
       return anyResult?.gpu_layers_loaded ?? -1;
-    case "layers_total":
-      return anyResult?.total_model_layers ?? -1;
     case "batch":
       return item.batch_size;
     case "ubatch":
@@ -271,6 +312,8 @@ function mergedSortValue(item: RunItem, results: ResultRow[] | undefined, key: s
       return item.flash_attn;
     case "mtp":
       return item.mtp;
+    case "ngld":
+      return item.n_gpu_layers_draft;
     case "pp_tps":
       return ppResult?.avg_tps ?? -1;
     case "tg_tps":
@@ -305,6 +348,17 @@ export function RunDetail() {
   const [paused, setPaused] = useState(false);
   const [controlPending, setControlPending] = useState(false);
   const [controlError, setControlError] = useState("");
+  // Subheader hardware line (arch/cpu/gpu/os) -- not on Run itself, so
+  // fetched separately from the same per-worker endpoint WorkerCard/NewRun
+  // already use. Best-effort: stays undefined (line just omits those bits)
+  // if the worker's unreachable, same as everywhere else this is fetched.
+  const [workerInfo, setWorkerInfo] = useState<WorkerLlamaCppInfo | undefined>(undefined);
+  // Only fetched when a run actually named an MTP draft model -- resolves
+  // config.mtp_model_id (an id, not a filename) for the subheader's "draft
+  // model: X" bit. The full registry is more than this needs, but there's no
+  // get-one-model-by-id endpoint and this list is already fetched the same
+  // way by Models.tsx/NewRun.tsx.
+  const [models, setModels] = useState<Model[]>([]);
   const timerRef = useRef<number | null>(null);
   // null = natural idx order (the sweep's own ordering) -- a running sweep's
   // default view shouldn't reshuffle mid-run; sorting only kicks in once the
@@ -354,6 +408,34 @@ export function RunDetail() {
     };
   }, [id]);
 
+  useEffect(() => {
+    if (!run?.worker_name) return;
+    let cancelled = false;
+    api
+      .getWorkerLlamaCpp(run.worker_name)
+      .then((info) => {
+        if (!cancelled) setWorkerInfo(info);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [run?.worker_name]);
+
+  useEffect(() => {
+    if (!run?.config.mtp_model_id) return;
+    let cancelled = false;
+    api
+      .listModels()
+      .then((list) => {
+        if (!cancelled) setModels(list);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [run?.config.mtp_model_id]);
+
   async function handlePauseToggle() {
     if (!run) return;
     setControlPending(true);
@@ -395,6 +477,22 @@ export function RunDetail() {
     const tickId = window.setInterval(() => setNow(Date.now()), 1000);
     return () => window.clearInterval(tickId);
   }, [run?.status]);
+
+  // Every distinct reason any VRAM figure in this run is approximate rather
+  // than an exact per-process reading -- surfaced as a standing banner above
+  // the table (see below) rather than relying solely on each cell's hover
+  // tooltip, which is easy to miss entirely.
+  const vramAccuracyNotes = new Set<string>();
+  for (const r of results) {
+    for (const t of [
+      gpuMemoryAccuracyTitle(r.gpu_memory_total_accuracy, r.gpu_memory_total_source),
+      gpuMemoryAccuracyTitle(r.gpu_memory_free_start_accuracy, r.gpu_memory_free_start_source),
+      gpuMemoryAccuracyTitle(r.gpu_memory_model_avg_accuracy, r.gpu_memory_model_avg_source),
+      gpuMemoryAccuracyTitle(r.gpu_memory_model_peak_accuracy, r.gpu_memory_model_peak_source),
+    ]) {
+      if (t) vramAccuracyNotes.add(t);
+    }
+  }
 
   // A single sweep item can now yield up to two results (a pp row and a tg
   // row from one llama-bench process, see worker/src/index.ts's
@@ -587,25 +685,56 @@ export function RunDetail() {
     });
   }, [items, statusFilter, sort, resultByIdx]);
 
+  // Subheader hardware line: architecture/OS come from the worker's own
+  // /llama-cpp+/hardware fetch (workerInfo, best-effort -- omitted if that
+  // worker's unreachable); VRAM/RAM totals come from this run's own results
+  // instead (system_memory_total_mb/gpu_memory_total_mb are static hardware
+  // facts sampled once per test, see ResultRow's own doc comments) since
+  // WorkerLlamaCppInfo's HardwareInfo has no memory-size fields at all.
+  // backend_device_name is preferred over hw.gpu for the GPU label since
+  // it's Run's own two-tier-detected value for whatever actually ran this
+  // benchmark, not just whatever's currently in the box.
+  const hw = workerInfo?.hardware;
+  const cpuLabel = hw?.cpu.brand || hw?.cpu.manufacturer || undefined;
+  const gpuDeviceLabel =
+    run?.backend_device_name || (hw?.gpu.length ? hw.gpu.map((g) => g.model).join(", ") : undefined);
+  const gpuLabel = gpuDeviceLabel && run ? `${gpuDeviceLabel} (${run.llama_cpp_backend})` : gpuDeviceLabel;
+  const vramTotalMib = results.find((r) => r.gpu_memory_total_mb != null)?.gpu_memory_total_mb;
+  const ramTotalMib = results.find((r) => r.system_memory_total_mb != null)?.system_memory_total_mb;
+  const hardwareBits = [
+    workerInfo?.arch,
+    cpuLabel ? `${cpuLabel}${hw?.cpu.cores ? ` (${hw.cpu.cores} threads)` : ""}` : undefined,
+    gpuLabel,
+    vramTotalMib != null ? `${(vramTotalMib / 1024).toFixed(1)} GB VRAM` : undefined,
+    ramTotalMib != null ? `${(ramTotalMib / 1024).toFixed(1)} GB RAM` : undefined,
+    workerInfo?.platform,
+  ].filter((v): v is string => Boolean(v));
+
+  const draftModel = run?.config.mtp_model_id ? models.find((m) => m.id === run.config.mtp_model_id) : undefined;
+
   return (
     <div>
       <h1 className="text-2xl font-semibold text-fg">
         Run <code className="text-lg text-muted">{shortId(id)}</code>
       </h1>
       {run && (
-        <p className="mt-2 flex flex-wrap items-center gap-2 text-sm text-muted">
-          Worker <b className="text-fg">{run.worker_name}</b>
-          <span>
-            · {run.llama_cpp_backend}
-            {run.backend_device_name ? ` (${run.backend_device_name})` : ""}
-          </span>
-          <span>· {run.llama_cpp_build}</span>
-          <span>· model {run.model_filename || `${shortId(run.model_id)}…`}</span>
-          <RunStatusPill status={run.status} />
-          {run.status === "running" && <span>· {formatElapsed(now - run.started_at)} elapsed</span>}
-          {run.status === "running" && paused && <span className="text-warning">· paused</span>}
-          {run.error && <span className="text-danger">· {run.error}</span>}
-        </p>
+        <div className="mt-2 flex flex-col gap-1 text-sm text-muted">
+          <p>
+            Worker: <b className="text-fg">{run.worker_name}</b>
+            {hardwareBits.length > 0 && ` · ${hardwareBits.join(", ")}`}
+          </p>
+          <p>Llama.cpp version: {run.llama_cpp_build}</p>
+          <p>
+            Model: <span className="text-fg">{run.model_filename || `${shortId(run.model_id)}…`}</span>
+            {draftModel && ` (draft model: ${draftModel.filename})`}
+          </p>
+          <p className="flex flex-wrap items-center gap-2">
+            <RunStatusPill status={run.status} />
+            {run.status === "running" && <span>· {formatElapsed(now - run.started_at)} elapsed</span>}
+            {run.status === "running" && paused && <span className="text-warning">· paused</span>}
+            {run.error && <span className="text-danger">· {run.error}</span>}
+          </p>
+        </div>
       )}
 
       {run?.status === "running" && (
@@ -677,6 +806,15 @@ export function RunDetail() {
               </button>
             ))}
           </div>
+          {vramAccuracyNotes.size > 0 && (
+            <div className="mt-2 flex items-start gap-1.5 rounded-lg border border-border bg-surface-raised px-3 py-2 text-xs text-muted">
+              <IconInfo width={13} height={13} className="mt-0.5 flex-none" />
+              <p>
+                VRAM columns marked <IconInfo width={11} height={11} className="inline -translate-y-px" /> are
+                approximate: {[...vramAccuracyNotes].join(" ")}
+              </p>
+            </div>
+          )}
           {visibleItems.length === 0 ? (
             <p className="mt-3 text-sm text-muted">No tests match the current filter.</p>
           ) : (
@@ -692,7 +830,7 @@ export function RunDetail() {
                       sortKey={c.sortKey}
                       sort={sort}
                       onSort={c.sortKey ? (k) => setSort((s) => toggleSort(s, k)) : undefined}
-                      className={`${c.padX ?? "!px-2"} !py-1.5`}
+                      className={`${c.padX ?? "!px-1"} !py-1.5`}
                     />
                   ))}
                 </tr>
@@ -716,6 +854,17 @@ export function RunDetail() {
                   const frozenTg = lastLiveRef.current[it.idx]?.tg;
                   const ttftSeconds =
                     ppResult && ppResult.n_prompt > 0 ? ppResult.n_prompt / ppResult.avg_tps : null;
+                  // spec_drafted/spec_accepted only ever live on the tg row of
+                  // an MTP item (see fmtSpecDecode's own comment) -- the full
+                  // "accepted/drafted (rate%)" string goes in the tooltip,
+                  // the bare percentage in the cell itself to keep the column
+                  // narrow across the (much more common) non-MTP rows.
+                  const mtpAcceptTitle =
+                    it.mtp === "on" ? fmtSpecDecode(tgResult?.spec_drafted, tgResult?.spec_accepted) : undefined;
+                  const mtpAcceptPct =
+                    tgResult?.spec_drafted && tgResult?.spec_accepted != null
+                      ? (tgResult.spec_accepted / tgResult.spec_drafted) * 100
+                      : null;
                   // Repeat-progress dots for this specific set of parameters,
                   // one per repeat regardless of the item's own status --
                   // see buildItemRepeatUnits (queued = all grey, done = all
@@ -724,8 +873,8 @@ export function RunDetail() {
                   return (
                     <Fragment key={it.id}>
                     <tr className="!border-b-0">
-                      <td className="px-2 py-1.5 align-top text-muted">{it.idx + 1}</td>
-                      <td className={`px-2 py-1.5 align-top ${it.error ? "text-danger" : "text-muted"}`}>
+                      <td className="px-1 py-1.5 align-top text-muted">{it.idx + 1}</td>
+                      <td className={`px-1 py-1.5 align-top ${it.error ? "text-danger" : "text-muted"}`}>
                         {/* Fixed to fit "processing" (the longest single word ever
                             shown here) plus a hair of rendering buffer -- multi-word
                             phrases like "generating tokens" wrap onto a second line
@@ -737,24 +886,34 @@ export function RunDetail() {
                           {detailText.length > 120 ? `${detailText.slice(0, 120)}…` : detailText}
                         </div>
                       </td>
-                      <td className="px-2 py-1.5 text-fg">{testTypeLabel(it.n_prompt, it.n_gen)}</td>
-                      <td className="pl-2 pr-0.5 py-1.5 text-muted">{it.n_prompt}</td>
-                      <td className="pl-0.5 pr-2 py-1.5 text-muted">{it.n_gen}</td>
-                      <td className="pl-2 pr-0.5 py-1.5 text-muted">{it.n_threads}</td>
-                      <td className="pl-0.5 pr-2 py-1.5 text-muted">{it.n_gpu_layers}</td>
-                      <td className="px-2 py-1.5 text-muted">
-                        {anyResult?.gpu_layers_loaded ?? (isTerminal ? "n/a" : "—")}
+                      <td className="px-1 py-1.5 text-fg">{testTypeLabel(it.n_prompt, it.n_gen)}</td>
+                      <td className="pl-1 pr-0.5 py-1.5 text-muted">{it.n_prompt}</td>
+                      <td className="pl-0.5 pr-1 py-1.5 text-muted">{it.n_gen}</td>
+                      <td className="pl-1 pr-0.5 py-1.5 text-muted">{it.n_threads}</td>
+                      <td className="pl-0.5 pr-1 py-1.5 text-muted">{it.n_gpu_layers}</td>
+                      <td className="px-1 py-1.5 text-muted">
+                        {anyResult?.gpu_layers_loaded != null && anyResult?.total_model_layers != null
+                          ? `${anyResult.gpu_layers_loaded}/${anyResult.total_model_layers}`
+                          : isTerminal
+                            ? "n/a"
+                            : "—"}
                       </td>
-                      <td className="px-2 py-1.5 text-muted">
-                        {anyResult?.total_model_layers ?? (isTerminal ? "n/a" : "—")}
+                      <td className="px-1 py-1.5 text-muted">{it.batch_size}</td>
+                      <td className="px-1 py-1.5 text-muted">{it.ubatch_size}</td>
+                      <td className="px-1 py-1.5 text-muted">{it.cache_type_k}</td>
+                      <td className="px-1 py-1.5 text-muted">{it.cache_type_v}</td>
+                      <td className="px-1 py-1.5 text-muted">{formatFlashAttn(it.flash_attn)}</td>
+                      <td className="px-1 py-1.5 text-muted">
+                        {it.mtp === "on" ? (
+                          <span title={mtpAcceptTitle}>
+                            MTP{mtpAcceptPct != null ? ` ${mtpAcceptPct.toFixed(1)}%` : ""}
+                          </span>
+                        ) : (
+                          "—"
+                        )}
                       </td>
-                      <td className="px-2 py-1.5 text-muted">{it.batch_size}</td>
-                      <td className="px-2 py-1.5 text-muted">{it.ubatch_size}</td>
-                      <td className="px-2 py-1.5 text-muted">{it.cache_type_k}</td>
-                      <td className="px-2 py-1.5 text-muted">{it.cache_type_v}</td>
-                      <td className="px-2 py-1.5 text-muted">{formatFlashAttn(it.flash_attn)}</td>
-                      <td className="px-2 py-1.5 text-muted">{it.mtp === "on" ? "MTP" : "—"}</td>
-                      <td className="px-2 py-1.5">
+                      <td className="px-1 py-1.5 text-muted">{it.mtp === "on" ? it.n_gpu_layers_draft : "—"}</td>
+                      <td className="px-1 py-1.5">
                         {showLivePp ? (
                           <span className="text-accent">{it.live_tps!.toFixed(1)}</span>
                         ) : ppResult ? (
@@ -779,7 +938,7 @@ export function RunDetail() {
                           "—"
                         )}
                       </td>
-                      <td className="px-2 py-1.5">
+                      <td className="px-1 py-1.5">
                         {showLiveTg ? (
                           <span className="text-accent">{it.live_tps!.toFixed(1)}</span>
                         ) : tgResult ? (
@@ -805,41 +964,45 @@ export function RunDetail() {
                         )}
                       </td>
                       <td
-                        className="px-2 py-1.5 text-muted"
+                        className="px-1 py-1.5 text-muted"
                         title="Derived: prompt tokens ÷ PP speed -- not a directly measured request latency"
                       >
                         {ttftSeconds != null ? `${ttftSeconds.toFixed(2)}s` : "—"}
                       </td>
-                      <td className="px-2 py-1.5 text-muted">{mem.ramFree}</td>
-                      <td className="px-2 py-1.5 text-muted">{mem.ramAvg}</td>
-                      <td className="px-2 py-1.5 text-muted">{mem.ramMax}</td>
-                      <td
-                        className="px-2 py-1.5 text-muted"
-                        title={gpuMemoryAccuracyTitle(anyResult?.gpu_memory_total_accuracy, anyResult?.gpu_memory_total_source)}
-                      >
-                        {mem.vramTotal}
-                        {gpuMemoryAccuracyTitle(anyResult?.gpu_memory_total_accuracy, anyResult?.gpu_memory_total_source) ? " ⓘ" : ""}
+                      <td className="px-1 py-1.5 text-muted">{mem.ramFree}</td>
+                      <td className="px-1 py-1.5 text-muted">{mem.ramAvg}</td>
+                      <td className="px-1 py-1.5 text-muted">{mem.ramMax}</td>
+                      <td className="px-1 py-1.5 text-muted">
+                        <span className="inline-flex items-center gap-0.5">
+                          {mem.vramTotal}
+                          <AccuracyIcon
+                            title={gpuMemoryAccuracyTitle(anyResult?.gpu_memory_total_accuracy, anyResult?.gpu_memory_total_source)}
+                          />
+                        </span>
                       </td>
-                      <td
-                        className="px-2 py-1.5 text-muted"
-                        title={gpuMemoryAccuracyTitle(anyResult?.gpu_memory_free_start_accuracy, anyResult?.gpu_memory_free_start_source)}
-                      >
-                        {mem.vramFree}
-                        {gpuMemoryAccuracyTitle(anyResult?.gpu_memory_free_start_accuracy, anyResult?.gpu_memory_free_start_source) ? " ⓘ" : ""}
+                      <td className="px-1 py-1.5 text-muted">
+                        <span className="inline-flex items-center gap-0.5">
+                          {mem.vramFree}
+                          <AccuracyIcon
+                            title={gpuMemoryAccuracyTitle(anyResult?.gpu_memory_free_start_accuracy, anyResult?.gpu_memory_free_start_source)}
+                          />
+                        </span>
                       </td>
-                      <td
-                        className="px-2 py-1.5 text-muted"
-                        title={gpuMemoryAccuracyTitle(anyResult?.gpu_memory_model_avg_accuracy, anyResult?.gpu_memory_model_avg_source)}
-                      >
-                        {mem.vramAvg}
-                        {gpuMemoryAccuracyTitle(anyResult?.gpu_memory_model_avg_accuracy, anyResult?.gpu_memory_model_avg_source) ? " ⓘ" : ""}
+                      <td className="px-1 py-1.5 text-muted">
+                        <span className="inline-flex items-center gap-0.5">
+                          {mem.vramAvg}
+                          <AccuracyIcon
+                            title={gpuMemoryAccuracyTitle(anyResult?.gpu_memory_model_avg_accuracy, anyResult?.gpu_memory_model_avg_source)}
+                          />
+                        </span>
                       </td>
-                      <td
-                        className="px-2 py-1.5 text-muted"
-                        title={gpuMemoryAccuracyTitle(anyResult?.gpu_memory_model_peak_accuracy, anyResult?.gpu_memory_model_peak_source)}
-                      >
-                        {mem.vramMax}
-                        {gpuMemoryAccuracyTitle(anyResult?.gpu_memory_model_peak_accuracy, anyResult?.gpu_memory_model_peak_source) ? " ⓘ" : ""}
+                      <td className="px-1 py-1.5 text-muted">
+                        <span className="inline-flex items-center gap-0.5">
+                          {mem.vramMax}
+                          <AccuracyIcon
+                            title={gpuMemoryAccuracyTitle(anyResult?.gpu_memory_model_peak_accuracy, anyResult?.gpu_memory_model_peak_source)}
+                          />
+                        </span>
                       </td>
                     </tr>
                     <tr>

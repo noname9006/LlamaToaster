@@ -28,7 +28,7 @@ export function Th({ label, description, sortKey, sort, onSort, className }: ThP
 
   const content = (
     <span
-      className={`inline-flex items-center gap-1 ${
+      className={`inline-flex items-center gap-0.5 ${
         sortable ? "cursor-pointer select-none hover:text-fg" : ""
       } ${active ? "text-fg" : ""}`}
       onClick={sortable ? () => onSort!(sortKey!) : undefined}

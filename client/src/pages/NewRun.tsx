@@ -28,6 +28,7 @@ const EMPTY_SWEEP: Sweep = {
   cache_type_v: [],
   flash_attn: [],
   mtp: [],
+  n_gpu_layers_draft: [],
   repeats: 1,
 };
 
@@ -130,6 +131,13 @@ function sanitizeSweep(sweep: Sweep): Sweep {
     const filtered = (cleaned[field] ?? []).filter((v) => validOptions.includes(v));
     cleaned[field] = filtered.length > 0 ? filtered : [validOptions[0]];
   }
+  // Same missing-key issue as "mtp" above, but for a numeric field a remembered
+  // sweep predating it -- falls back to the same [0] "not applicable yet"
+  // placeholder the initial-seed effect below uses, which the draftLayerCount
+  // effect then upgrades once a draft model is actually picked.
+  if (!cleaned.n_gpu_layers_draft || cleaned.n_gpu_layers_draft.length === 0) {
+    cleaned.n_gpu_layers_draft = [0];
+  }
   return cleaned;
 }
 
@@ -148,7 +156,15 @@ const UBATCH_SIZE_PRESETS = [32, 64, 128, 256, 512, 1024, 2048];
 const NGL_FALLBACK_MAX = 999;
 const THREADS_FALLBACK_MAX = 64;
 
-const NUMERIC_FIELDS = ["n_prompt", "n_gen", "threads", "n_gpu_layers", "batch_size", "ubatch_size"] as const;
+const NUMERIC_FIELDS = [
+  "n_prompt",
+  "n_gen",
+  "threads",
+  "n_gpu_layers",
+  "batch_size",
+  "ubatch_size",
+  "n_gpu_layers_draft",
+] as const;
 const STRING_FIELDS = ["cache_type_k", "cache_type_v", "flash_attn", "mtp"] as const;
 
 // Quick client-side shape check so a bad "Apply JSON" fails fast with a
@@ -209,15 +225,14 @@ export function NewRun() {
   // hints. See server/src/routes/models.ts's /api/models/hf-updates.
   const [hfUpdates, setHfUpdates] = useState<Record<string, string | null>>({});
   // Live "which worker(s) have this model's file" map, same endpoint Models.tsx
-  // uses to hide deleted-from-disk models. null (not yet loaded, or the fetch
-  // failed) means "don't filter" -- falling back to the unfiltered registry is
-  // safer than briefly (or permanently, on a failed fetch) showing an empty
-  // picker and blocking the whole New Run form over a transient hiccup.
+  // uses to hide deleted-from-disk models. null until the fetch resolves --
+  // see presentModels below, which treats "no data yet" the same as "nothing
+  // confirmed present" rather than guessing.
   const [locations, setLocations] = useState<Record<string, string[]> | null>(null);
-  // Workers the locations scan couldn't reach -- if any exist, its models
-  // can't be told apart from genuinely-deleted ones (see the route's comment
-  // in server/src/routes/models.ts), so presentModels below skips filtering
-  // entirely rather than hiding a model that's actually still there.
+  // Workers the locations scan couldn't reach right now -- purely informational
+  // here (presentModels below already treats an unreachable worker as having
+  // nothing confirmed, same as Models.tsx's per-worker grouping does), used
+  // only to explain *why* the picker looks empty for that worker.
   const [unreachableLocationWorkers, setUnreachableLocationWorkers] = useState<string[]>([]);
 
   useEffect(() => {
@@ -242,28 +257,20 @@ export function NewRun() {
     })();
   }, []);
 
-  // Only offer models that actually have a file on the currently selected
-  // worker -- mirrors Models.tsx's own per-worker grouping (locations[id]
-  // .includes(worker.name)), so New Run never shows a model as pickable for
-  // a worker whose section on the Models page would say "No models on this
-  // worker." Before a worker is chosen there's nothing to scope against yet,
-  // so it falls back to "present on any worker" instead. Skipped entirely
-  // (falls back to the full unfiltered registry) whenever we can't trust the
-  // scan: `locations` hasn't loaded/failed to load, or -- once a worker is
-  // picked -- that specific worker came back unreachable (see above); a
-  // *different* worker being briefly unreachable doesn't matter once one is
-  // selected.
+  // Only offer models actually confirmed present -- on the currently
+  // selected worker once one's picked, or on any worker before that.
+  // Deliberately strict, per the user's explicit call: no remembered model
+  // for an offline worker, only ones actually there right now. So unlike an
+  // earlier version of this filter, there's no "unreachable/not-loaded-yet
+  // -> fall back to the unfiltered registry" escape hatch -- no confirmed
+  // data means nothing is offered, exactly mirroring Models.tsx's own
+  // per-worker `locations[id].includes(worker.name)` gating (which likewise
+  // shows nothing for a worker it couldn't reach).
   const presentModels = useMemo(() => {
-    if (!locations) return models;
-    if (workerName) {
-      return unreachableLocationWorkers.includes(workerName)
-        ? models
-        : models.filter((m) => locations[m.id]?.includes(workerName));
-    }
-    return unreachableLocationWorkers.length === 0
-      ? models.filter((m) => (locations[m.id]?.length ?? 0) > 0)
-      : models;
-  }, [models, locations, unreachableLocationWorkers, workerName]);
+    if (!locations) return [];
+    if (workerName) return models.filter((m) => locations[m.id]?.includes(workerName));
+    return models.filter((m) => (locations[m.id]?.length ?? 0) > 0);
+  }, [models, locations, workerName]);
 
   // Prefer whichever worker was picked last time (if it's still configured);
   // only fall back to auto-picking the sole worker when there's nothing
@@ -379,12 +386,44 @@ export function NewRun() {
   // of what's physically in the box.
   const noGpu = workerHardware ? workerHardware.gpu.length === 0 : selectedWorker?.worker.backend === "cpu";
 
-  const nglMax = noGpu ? 0 : modelLayerCount ?? NGL_FALLBACK_MAX;
-  const nglSuggested = noGpu ? 0 : modelLayerCount ?? NGL_FALLBACK_MAX;
+  // llama.cpp's own runtime layer accounting is n_layer + 1 -- it counts the
+  // output layer separately from the transformer stack (confirmed live, see
+  // shared/types.ts's ResultRow.total_model_layers comment) -- so the
+  // slider's max has to match that, or a fully-offloaded run's own "X/43"
+  // result can look like it silently undershot a request that was actually
+  // correct (see -- the exact confusion this fixes).
+  const OUTPUT_LAYER = 1;
+  const baseLayerCount = modelLayerCount != null ? modelLayerCount + OUTPUT_LAYER : null;
+
+  // The draft/MTP model's own layers ride alongside -ngl but are offloaded
+  // independently of it, via llama-server's own -ngld/--n-gpu-layers-draft
+  // (confirmed live against the installed build's --help -- see
+  // worker/src/serverBench.ts's buildArgs) -- hence its own slider below
+  // rather than folding it into the base model's -ngl range. Qwen-style
+  // self-sufficient models (modelMtpCapable) fold their MTP head into the
+  // same file's own n_layer already, so there's no separate draft model or
+  // slider for them at all.
+  const selectedMtpDraftModel = mtpModelId ? presentModels.find((m) => m.id === mtpModelId) : undefined;
+  const draftLayerCount =
+    typeof selectedMtpDraftModel?.metadata.n_layer === "number"
+      ? selectedMtpDraftModel.metadata.n_layer + OUTPUT_LAYER
+      : null;
+  const mtpSelected = sweep.mtp.includes("on") && (modelMtpCapable || Boolean(mtpModelId));
+  const showDraftNglSlider = mtpSelected && !modelMtpCapable && Boolean(mtpModelId);
+  const draftNglMax = noGpu ? 0 : draftLayerCount ?? NGL_FALLBACK_MAX;
+  const draftNglSuggested = noGpu ? 0 : draftLayerCount ?? NGL_FALLBACK_MAX;
+  const draftNglSuggestedLabel = noGpu
+    ? "Suggested: 0 -- this worker has no GPU backend"
+    : draftLayerCount != null
+      ? `Suggested: ${draftLayerCount} -- offload every layer (this draft model has ${draftLayerCount}, including the output layer)`
+      : `Suggested: ${NGL_FALLBACK_MAX} -- draft model's layer count isn't known yet, showing the "offload everything" default`;
+
+  const nglMax = noGpu ? 0 : baseLayerCount ?? NGL_FALLBACK_MAX;
+  const nglSuggested = noGpu ? 0 : baseLayerCount ?? NGL_FALLBACK_MAX;
   const nglSuggestedLabel = noGpu
     ? "Suggested: 0 -- this worker has no GPU backend"
-    : modelLayerCount != null
-      ? `Suggested: ${modelLayerCount} -- offload every layer (this model has ${modelLayerCount})`
+    : baseLayerCount != null
+      ? `Suggested: ${baseLayerCount} -- offload every layer (this model has ${baseLayerCount}, including the output layer)`
       : `Suggested: ${NGL_FALLBACK_MAX} -- model's layer count isn't known yet, showing the "offload everything" default`;
 
   const threadsMax = workerHardware?.cpu.cores || THREADS_FALLBACK_MAX;
@@ -428,8 +467,30 @@ export function NewRun() {
     } else {
       baseSweep.n_gpu_layers = [0, nglMax];
     }
+    // Placeholder until a draft model is actually picked (mtpModelId isn't
+    // known yet at this point -- it's reset separately, see the effect
+    // above) -- the draftLayerCount effect below upgrades this to a real
+    // "offload everything" default once one is. [0] rather than [] so the
+    // form stays submittable even if MTP/draft never gets touched at all.
+    baseSweep.n_gpu_layers_draft = [0];
     setSweep(baseSweep);
   }, [modelId, workerName, noGpu, nglMax]);
+
+  // Mirrors lookupLayerCount's "only fill in if the user hasn't customized
+  // it yet" posture, but automatic rather than button-triggered: fires the
+  // moment a draft model's layer count becomes known (picked just now, or
+  // already known when a remembered sweep restored mtpModelId). Only
+  // replaces the untouched [0] placeholder from baseSweep/sanitizeSweep
+  // above -- never overwrites a value the user (or a remembered sweep) has
+  // actually set.
+  useEffect(() => {
+    if (draftLayerCount == null) return;
+    setSweep((s) =>
+      s.n_gpu_layers_draft.length === 1 && s.n_gpu_layers_draft[0] === 0
+        ? { ...s, n_gpu_layers_draft: [draftLayerCount] }
+        : s
+    );
+  }, [draftLayerCount]);
 
   function setField<K extends keyof Sweep>(key: K, value: Sweep[K]) {
     setSweep((s) => ({ ...s, [key]: value }));
@@ -574,10 +635,10 @@ export function NewRun() {
           )}
         </div>
 
-        {workerName && locations && unreachableLocationWorkers.includes(workerName) && (
+        {workerName && unreachableLocationWorkers.includes(workerName) && (
           <p className="-mt-2 text-xs text-warning">
-            Couldn't check what's on {workerName} -- showing every registered model rather than just this
-            worker's, so a pick here may not actually be present until that's confirmed.
+            Couldn't check what's on {workerName} -- its models aren't shown below until that's confirmed,
+            even if they're actually still there.
           </p>
         )}
 
@@ -686,6 +747,19 @@ export function NewRun() {
             options={MTP_OPTIONS}
             {...field(sweep, setSweep, "mtp")}
           />
+          {showDraftNglSlider && (
+            <SliderChipInput
+              label="Draft GPU layers (-ngld)"
+              hint="MTP draft model's own layers offloaded to GPU, independent of the base model's -ngl above."
+              min={0}
+              max={draftNglMax}
+              suggested={draftNglSuggested}
+              suggestedLabel={draftNglSuggestedLabel}
+              disabled={noGpu}
+              disabledNote="This worker's build has no GPU backend, so offload is forced to 0."
+              {...field(sweep, setSweep, "n_gpu_layers_draft")}
+            />
+          )}
         </div>
 
         <div className="rounded-lg border border-warning/30 bg-warning-bg px-3.5 py-2.5 text-xs text-warning">

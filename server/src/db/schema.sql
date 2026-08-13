@@ -41,6 +41,7 @@ CREATE TABLE IF NOT EXISTS results (
   cache_type_v TEXT,
   flash_attn TEXT,                -- store as string ('on'/'off'/'auto')
   mtp TEXT DEFAULT 'off',         -- 'on'/'off' -- see worker/src/serverBench.ts
+  n_gpu_layers_draft INTEGER DEFAULT 0,  -- -ngld for the MTP/draft companion model, 0 where not applicable
   avg_tps REAL,                   -- from llama-bench's own averaged output
   stddev_tps REAL,                -- from llama-bench's own stddev output
   ram_peak_mib INTEGER,           -- from external sampling — llama-bench doesn't report memory
@@ -95,6 +96,7 @@ CREATE TABLE IF NOT EXISTS run_items (
   cache_type_v TEXT,
   flash_attn TEXT,
   mtp TEXT DEFAULT 'off',    -- 'on'/'off' -- see worker/src/serverBench.ts
+  n_gpu_layers_draft INTEGER DEFAULT 0,  -- -ngld for the MTP/draft companion model, 0 where not applicable
   status TEXT,              -- queued|loading|processing|generating|benchmarking|done|failed|failed_oom
   detail TEXT,               -- best-effort human text, e.g. a stderr progress line
   ram_mib INTEGER,           -- live/current, updated by best-effort ticks

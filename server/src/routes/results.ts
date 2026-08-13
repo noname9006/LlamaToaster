@@ -27,6 +27,7 @@ interface ResultExportRow {
   cache_type_v: string;
   flash_attn: string;
   mtp: string;
+  n_gpu_layers_draft: number;
   avg_tps: number;
   stddev_tps: number;
   ram_peak_mib: number;
@@ -154,7 +155,7 @@ export async function resultsRoutes(app: FastifyInstance): Promise<void> {
 
       if (format === "csv") {
         const header =
-          "run_id,worker_name,backend_type,backend_device_name,model_id,model_filename,test_type,n_prompt,n_gen,n_threads,n_gpu_layers,gpu_layers_loaded,total_model_layers,batch_size,ubatch_size,cache_type_k,cache_type_v,flash_attn,mtp,avg_tps,stddev_tps,ram_peak_mib,vram_peak_mib,system_memory_total_mib,gpu_memory_total_mib,gpu_memory_total_accuracy,gpu_memory_total_source,gpu_memory_free_start_accuracy,gpu_memory_free_start_source,gpu_memory_model_avg_accuracy,gpu_memory_model_avg_source,gpu_memory_model_peak_accuracy,gpu_memory_model_peak_source,sample_count,suspect_count,suspect_samples,repeat_samples,spec_accepted_drafted";
+          "run_id,worker_name,backend_type,backend_device_name,model_id,model_filename,test_type,n_prompt,n_gen,n_threads,n_gpu_layers,gpu_layers_loaded,total_model_layers,batch_size,ubatch_size,cache_type_k,cache_type_v,flash_attn,mtp,n_gpu_layers_draft,avg_tps,stddev_tps,ram_peak_mib,vram_peak_mib,system_memory_total_mib,gpu_memory_total_mib,gpu_memory_total_accuracy,gpu_memory_total_source,gpu_memory_free_start_accuracy,gpu_memory_free_start_source,gpu_memory_model_avg_accuracy,gpu_memory_model_avg_source,gpu_memory_model_peak_accuracy,gpu_memory_model_peak_source,sample_count,suspect_count,suspect_samples,repeat_samples,spec_accepted_drafted";
         const lines = rows.map((r) =>
           [
             neutralizeFormula(r.run_id),
@@ -176,6 +177,7 @@ export async function resultsRoutes(app: FastifyInstance): Promise<void> {
             r.cache_type_v,
             r.flash_attn,
             r.mtp,
+            r.n_gpu_layers_draft,
             r.avg_tps,
             r.stddev_tps,
             r.ram_peak_mib,
@@ -217,12 +219,12 @@ export async function resultsRoutes(app: FastifyInstance): Promise<void> {
         // (already fewer/combined columns even before this change), not a
         // complete dump; reach for CSV or JSON for full provenance detail.
         const header =
-          "| run | worker | backend | model | test | n_prompt | n_gen | threads | ngls | layers | batch | ubatch | ctk | ctv | fa | mtp | avg_tps | stddev | ram_mib | vram_mib | vram total | suspect | suspect raw | per-run samples | mtp accepted/drafted |";
+          "| run | worker | backend | model | test | n_prompt | n_gen | threads | ngls | layers | batch | ubatch | ctk | ctv | fa | mtp | ngld | avg_tps | stddev | ram_mib | vram_mib | vram total | suspect | suspect raw | per-run samples | mtp accepted/drafted |";
         const sep =
-          "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |";
+          "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |";
         const lines = rows.map(
           (r) =>
-            `| ${neutralizeFormula(r.run_id.slice(0, 8))} | ${neutralizeFormula(r.worker_name)} | ${neutralizeFormula(`${r.backend_type}${r.backend_device_name ? ` (${r.backend_device_name})` : ""}`)} | ${neutralizeFormula(r.model_filename)} | ${r.test_type} | ${r.n_prompt} | ${r.n_gen} | ${r.n_threads} | ${r.n_gpu_layers} | ${fmtNullable(r.gpu_layers_loaded)}/${fmtNullable(r.total_model_layers)} | ${r.batch_size} | ${r.ubatch_size} | ${r.cache_type_k} | ${r.cache_type_v} | ${r.flash_attn} | ${r.mtp} | ${r.avg_tps.toFixed(2)} | ${r.stddev_tps.toFixed(2)} | ${r.ram_peak_mib} | ${fmtNullable(r.vram_peak_mib)} | ${fmtNullable(r.gpu_memory_total_mib)} | ${fmtNullable(r.suspect_count)}/${fmtNullable(r.sample_count)} | ${fmtSampleList(r.suspect_samples)} | ${fmtSampleList(r.repeat_samples)} | ${fmtSpecDecode(r.spec_drafted, r.spec_accepted)} |`
+            `| ${neutralizeFormula(r.run_id.slice(0, 8))} | ${neutralizeFormula(r.worker_name)} | ${neutralizeFormula(`${r.backend_type}${r.backend_device_name ? ` (${r.backend_device_name})` : ""}`)} | ${neutralizeFormula(r.model_filename)} | ${r.test_type} | ${r.n_prompt} | ${r.n_gen} | ${r.n_threads} | ${r.n_gpu_layers} | ${fmtNullable(r.gpu_layers_loaded)}/${fmtNullable(r.total_model_layers)} | ${r.batch_size} | ${r.ubatch_size} | ${r.cache_type_k} | ${r.cache_type_v} | ${r.flash_attn} | ${r.mtp} | ${r.n_gpu_layers_draft} | ${r.avg_tps.toFixed(2)} | ${r.stddev_tps.toFixed(2)} | ${r.ram_peak_mib} | ${fmtNullable(r.vram_peak_mib)} | ${fmtNullable(r.gpu_memory_total_mib)} | ${fmtNullable(r.suspect_count)}/${fmtNullable(r.sample_count)} | ${fmtSampleList(r.suspect_samples)} | ${fmtSampleList(r.repeat_samples)} | ${fmtSpecDecode(r.spec_drafted, r.spec_accepted)} |`
         );
         const md = ["# Benchmark results", "", header, sep, ...lines].join("\n");
         reply.header("content-type", "text/markdown");

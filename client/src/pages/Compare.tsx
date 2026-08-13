@@ -84,6 +84,13 @@ function comboKey(r: ResultRow): string {
     r.cache_type_v,
     formatFlashAttn(r.flash_attn),
     r.mtp,
+    // Only actually varies on an mtp:"on" row (see shared/sweep.ts's
+    // SweepItem.n_gpu_layers_draft), but included unconditionally here same
+    // as every other field -- without it, two rows differing only in draft
+    // offload would collide onto the same map key in render() below and one
+    // would silently disappear from the comparison instead of showing as its
+    // own row.
+    r.n_gpu_layers_draft,
   ].join("|");
 }
 
@@ -91,8 +98,12 @@ function comboLabel(r: ResultRow): string {
   // Unlike the other swept params (already omitted from this deliberately
   // terse label), mtp gets called out when "on" -- it's a different
   // execution path (llama-server, not llama-bench) with a large expected
-  // speed delta, not just another quantization/config knob.
-  return `${r.test_type} p${r.n_prompt} t${r.n_threads} ngl${r.n_gpu_layers}${r.mtp === "on" ? " mtp" : ""}`;
+  // speed delta, not just another quantization/config knob. ngld only
+  // follows mtp itself since it's meaningless without it.
+  return (
+    `${r.test_type} p${r.n_prompt} t${r.n_threads} ngl${r.n_gpu_layers}` +
+    (r.mtp === "on" ? ` mtp ngld${r.n_gpu_layers_draft}` : "")
+  );
 }
 
 export function Compare() {

@@ -289,6 +289,9 @@ export function parseLlamaBench(stdout: string): ParsedLlamaBench {
       // llama-server path instead, see worker/src/index.ts's per-item loop),
       // and llama-bench's own JSON output has no such field to read anyway.
       mtp: "off",
+      // llama-bench has no draft-model concept at all -- always 0 here, same
+      // reasoning as mtp above.
+      n_gpu_layers_draft: 0,
       avg_tps: entry.avg_ts ?? 0,
       stddev_tps: entry.stddev_ts ?? 0,
       // Memory/offload fields are filled in by the caller
