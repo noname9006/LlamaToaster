@@ -84,6 +84,27 @@ if (-not $Dir) {
     $Dir = Select-InstallDir
 }
 
+# $ErrorActionPreference = "Stop" (set above) makes PowerShell treat *any*
+# stderr line from a native command as a terminating error -- and git writes
+# routine progress ("Cloning into ...", "Receiving objects...") to stderr, so
+# a plain `git ...` call here would abort on git's normal chatter, not just
+# real failures, and swallow the actual error text in the process. Run git
+# through this wrapper instead: it drops $ErrorActionPreference to 'Continue'
+# just for the call, captures combined output, and only prints/returns it so
+# real errors are visible instead of silently lost.
+function Invoke-GitCommand {
+    param([string[]]$GitArgs)
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    $output = & git @GitArgs 2>&1
+    $exitCode = $LASTEXITCODE
+    $ErrorActionPreference = $prevEap
+    if ($exitCode -ne 0) {
+        Write-Host ($output | Out-String)
+    }
+    return $exitCode
+}
+
 # Fetches the repo (git clone if available, else a zip download) into a
 # scratch folder, then merges it into $TargetDir with Copy-Item -Force.
 # Cloning to scratch first -- rather than straight into $TargetDir -- means
@@ -98,10 +119,10 @@ function Sync-LlamaToasterCode {
     New-Item -ItemType Directory -Force -Path $scratch | Out-Null
 
     if (Get-Command git -ErrorAction SilentlyContinue) {
-        git clone --depth 1 --branch $RefBranch $RepoUrl $scratch
-        if ($LASTEXITCODE -ne 0) {
+        $cloneExit = Invoke-GitCommand @('clone', '--depth', '1', '--branch', $RefBranch, $RepoUrl, $scratch)
+        if ($cloneExit -ne 0) {
             Remove-Item $scratch -Recurse -Force -ErrorAction SilentlyContinue
-            Write-Error "git clone failed (exit $LASTEXITCODE)."
+            Write-Error "git clone failed (exit $cloneExit) -- see the git output above for the actual reason."
             exit 1
         }
     } else {
@@ -129,12 +150,10 @@ $dirHasContent = (Test-Path $Dir) -and ((Get-ChildItem -Path $Dir -Force -ErrorA
 if (Test-Path $GitDir) {
     Write-Host "$Dir is already a git checkout -- updating to latest $Branch..."
     Push-Location $Dir
-    git fetch origin $Branch
-    $fetchExit = $LASTEXITCODE
+    $fetchExit = Invoke-GitCommand @('fetch', 'origin', $Branch)
     $resetExit = 0
     if ($fetchExit -eq 0) {
-        git reset --hard FETCH_HEAD
-        $resetExit = $LASTEXITCODE
+        $resetExit = Invoke-GitCommand @('reset', '--hard', 'FETCH_HEAD')
     }
     Pop-Location
     if ($fetchExit -ne 0 -or $resetExit -ne 0) {
