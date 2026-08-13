@@ -90,6 +90,11 @@ const COLUMN_MIGRATIONS: ColumnSpec[] = [
   { table: "results", column: "gpu_memory_model_peak_source", ddlType: "TEXT" },
   { table: "results", column: "gpu_layers_loaded", ddlType: "INTEGER" },
   { table: "results", column: "total_model_layers", ddlType: "INTEGER" },
+  // The MTP/draft companion model's own actual offload -- see
+  // shared/types.ts's ResultRow doc comment and worker/src/index.ts's
+  // parseOffloadLayers.
+  { table: "results", column: "gpu_layers_loaded_draft", ddlType: "INTEGER" },
+  { table: "results", column: "total_model_layers_draft", ddlType: "INTEGER" },
   // -ngld for the MTP/draft companion model -- see shared/sweep.ts's
   // SweepItem.n_gpu_layers_draft. DEFAULT 0 (not NULL) so a row/item
   // predating this column reads the same as "not applicable", matching

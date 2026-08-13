@@ -55,7 +55,7 @@ const MERGED_COLUMN_DEFS: ColDef[] = [
   {
     label: "offload",
     description:
-      "Layers actually loaded onto the GPU / this model's total transformer layer count, both read from llama.cpp's own runtime output (not calculated) — loaded may be less than ngl if the model has fewer layers than requested.",
+      "Base model: layers actually loaded onto the GPU / this model's total transformer layer count, both read from llama.cpp's own runtime output (not calculated) — loaded may be less than ngl if the model has fewer layers than requested. On an MTP row this is always the base model's own figures, never the draft model's — see the ngld column for the draft's.",
     sortKey: "layers_loaded",
   },
   { label: "batch", description: "-b — logical batch size for prompt processing.", sortKey: "batch" },
@@ -73,7 +73,7 @@ const MERGED_COLUMN_DEFS: ColDef[] = [
   {
     label: "ngld",
     description:
-      "-ngld — MTP draft model's own layers offloaded to GPU, independent of ngl above. Only meaningful for an \"on\" mtp combination with a separate --model-draft file.",
+      "-ngld — MTP draft model's own layers offloaded to GPU, independent of ngl above. Only meaningful for an \"on\" mtp combination with a separate --model-draft file. Parenthesized figure (when shown) is what was actually loaded / the draft model's total layer count, read from llama.cpp's own runtime output.",
     sortKey: "ngld",
   },
   {
@@ -912,7 +912,15 @@ export function RunDetail() {
                           "—"
                         )}
                       </td>
-                      <td className="px-1 py-1.5 text-muted">{it.mtp === "on" ? it.n_gpu_layers_draft : "—"}</td>
+                      <td className="px-1 py-1.5 text-muted">
+                        {it.mtp === "on"
+                          ? `${it.n_gpu_layers_draft}${
+                              anyResult?.gpu_layers_loaded_draft != null && anyResult?.total_model_layers_draft != null
+                                ? ` (${anyResult.gpu_layers_loaded_draft}/${anyResult.total_model_layers_draft})`
+                                : ""
+                            }`
+                          : "—"}
+                      </td>
                       <td className="px-1 py-1.5">
                         {showLivePp ? (
                           <span className="text-accent">{it.live_tps!.toFixed(1)}</span>

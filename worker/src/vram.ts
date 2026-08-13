@@ -17,7 +17,17 @@ import type { Backend, GpuMemoryAccuracyLevel, GpuMemoryMeasurementSource } from
 // GpuMemoryAccuracyLevel/GpuMemoryMeasurementSource for what the labels mean.
 
 const execFileAsync = promisify(execFile);
-const EXEC_TIMEOUT_MS = 5000;
+// 5000 previously -- raised for headroom around Windows' Get-Counter path
+// (readWindowsUsedMib below), whose cold-start cost (spawning powershell.exe
+// + the "GPU Adapter Memory" performance-counter provider's own first-use
+// init) was confirmed live to occasionally exceed 5s on a freshly started
+// worker process, silently reporting vram_free_before as "unavailable" for
+// that one call. worker/src/index.ts now also fires a warm-up call at
+// startup so this mostly shouldn't matter in practice, but a wider margin
+// here is a cheap second line of defense (every other exec call using this
+// constant normally completes in well under 1s either way, so raising it
+// doesn't meaningfully slow down a genuine "tool isn't installed" failure).
+const EXEC_TIMEOUT_MS = 10_000;
 const BYTES_PER_MIB = 1024 * 1024;
 
 export interface GpuMemoryValue {

@@ -67,9 +67,16 @@ CREATE TABLE IF NOT EXISTS results (
   gpu_memory_model_peak_source TEXT,
   -- Read from llama.cpp's own runtime output, never inferred -- see
   -- worker/src/index.ts's parseOffloadLayers. n_gpu_layers above is already
-  -- the *requested* value; these are what actually happened.
+  -- the *requested* value; these are what actually happened. Always the
+  -- *base* model's figures, even on an MTP row -- see gpu_layers_loaded_draft/
+  -- total_model_layers_draft below for the draft companion's own.
   gpu_layers_loaded INTEGER,
   total_model_layers INTEGER,
+  -- The MTP/draft companion model's own actual offload -- see
+  -- shared/types.ts's ResultRow doc comment. NULL on every non-MTP row and
+  -- on an MTP row where the draft model's own runtime line wasn't captured.
+  gpu_layers_loaded_draft INTEGER,
+  total_model_layers_draft INTEGER,
   raw_json_path TEXT,             -- full llama-bench JSON output for this run
   created_at INTEGER
 );
