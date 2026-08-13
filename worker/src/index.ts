@@ -1037,9 +1037,9 @@ const STARTING_RE = /benchmark\s+\d+\/\d+:\s+starting/i;
 // transformer layer count + 1 (the output layer), not the same number as
 // models.metadata.n_layer, so this is the only correct source for either
 // value. Requires -v (llama-bench, see worker/src/bench.ts's
-// supportsVerboseFlag) or -lv 999 (llama-server, see
-// worker/src/serverBench.ts's buildArgs) -- absent at default verbosity on
-// both binaries, confirmed live. `g` flag so parseOffloadLayers below can
+// supportsVerboseFlag) or -lv 4 (llama-server, see worker/src/serverBench.ts's
+// buildArgs) -- absent at default verbosity on both binaries, confirmed live.
+// `g` flag so parseOffloadLayers below can
 // collect every occurrence, not just the first -- an MTP item loads TWO
 // models (base + --model-draft companion) via llama-server, each printing
 // its own line.
@@ -1100,11 +1100,14 @@ function parseOffloadLayers(stderr: string, hasMtpDraft: boolean): OffloadResult
 // into the worker's own text log, so following along live (pm2 logs, the
 // daily log file under logs/) only ever showed this app's own progress
 // lines, never llama.cpp's. logDiagnosticOutput mirrors it in, filtered
-// defensively: llama-server's MTP path runs at -lv 999 (see
-// serverBench.ts's buildArgs), verbose enough that a request/response body
-// -- including this app's own synthetic filler-token prompts and the
-// model's generated text -- could plausibly appear verbatim in a line at
-// that verbosity. Genuine llama.cpp diagnostic lines are short, structured,
+// defensively: llama-server's MTP path runs at -lv 4 (see serverBench.ts's
+// buildArgs) rather than the max level 5 ("debug", which prints a
+// per-token/per-draft-candidate trace -- confirmed live to be unnecessary
+// noise for anything this app reads), but level 4 ("trace") is still verbose
+// enough that a request/response body -- including this app's own synthetic
+// filler-token prompts and the model's generated text -- could plausibly
+// appear verbatim in a line at that verbosity. Genuine llama.cpp diagnostic
+// lines are short, structured,
 // human-authored strings; a dumped prompt/response array or generated-text
 // blob is not, so any line past a generous length threshold is elided
 // rather than printed in full -- this trades away logging an unusually long

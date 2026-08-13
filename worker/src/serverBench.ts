@@ -198,14 +198,19 @@ function buildArgs(input: ServerBenchRunInput): string[] {
     // fetchSpecDecodeMetrics below.
     "--metrics",
     // Unconditional, not probed like bench.ts's supportsVerboseFlag: default
-    // verbosity (confirmed live: 3) prints none of the "load_tensors:
-    // offloaded X/Y layers to GPU" detail worker/src/index.ts's
-    // parseOffloadLayers needs, and -lv 999 is confirmed live to surface it.
-    // The minimum threshold between 3 and 999 that would also work is
-    // unknown and not worth guessing at -- this file has no existing
-    // capability-probe infrastructure to extend the way bench.ts does.
+    // verbosity (3, "info") prints none of the "load_tensors: offloaded
+    // X/Y layers to GPU" detail worker/src/index.ts's parseOffloadLayers
+    // needs. --help documents the scale as 0=generic, 1=error, 2=warning,
+    // 3=info (default), 4=trace, 5=debug. Confirmed live against the
+    // installed b10405 build (both at model load and mid-generation via a
+    // real /completion request) that 4 already surfaces the offload line
+    // plus every other diagnostic worth keeping (slot lifecycle, context
+    // checkpoints, print_timing) while producing zero of the level-5 "debug"
+    // per-token/per-draft-candidate trace lines that flooded the mirrored
+    // worker log at the previously-used 999 -- see logDiagnosticOutput in
+    // worker/src/index.ts.
     "--verbosity",
-    "999",
+    "4",
   ];
   if (input.mtpModelPath) {
     args.push("--model-draft", input.mtpModelPath);
