@@ -3,8 +3,9 @@
 # supply a base folder: it becomes both the code checkout and (via
 # setup-worker.ps1) the home for the "llama" and "models" subfolders.
 #
-# Usage from a totally fresh machine (only PowerShell + Node.js 22+ needed;
-# git is used if present, otherwise falls back to a plain zip download).
+# Usage from a totally fresh machine (only PowerShell needed -- Node.js is
+# installed automatically via winget if missing; git is used if present,
+# otherwise falls back to a plain zip download).
 # Omit -Dir and it'll ask -- lists your local drives with free space (models
 # are often tens of GB each) and asks which one, then a folder name:
 #
@@ -176,6 +177,40 @@ if (Test-Path $GitDir) {
     Sync-LlamaToasterCode -TargetDir $Dir -RefBranch $Branch
     Write-Host "Downloaded to $Dir"
 }
+
+# npm needs Node.js on PATH. If it's missing, install it via winget rather
+# than just erroring out -- this is meant to work on a totally fresh machine
+# where Node was never set up. winget writes PATH to the registry but this
+# process's own $env:Path doesn't pick that up, so rebuild it from both
+# scopes afterward -- otherwise `npm install` below would still fail even
+# right after a successful install.
+function Ensure-NodeJs {
+    if (Get-Command node -ErrorAction SilentlyContinue) { return }
+
+    Write-Host "Node.js not found -- installing via winget..." -ForegroundColor Cyan
+    if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+        Write-Error "Node.js is required but not installed, and winget isn't available to install it automatically. Install Node.js 22+ from https://nodejs.org and re-run this script."
+        exit 1
+    }
+
+    winget install --id OpenJS.NodeJS.LTS -e --source winget --accept-package-agreements --accept-source-agreements
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "Node.js install via winget failed (exit $LASTEXITCODE). Install it manually from https://nodejs.org and re-run this script."
+        exit 1
+    }
+
+    $machinePath = [System.Environment]::GetEnvironmentVariable('Path', 'Machine')
+    $userPath = [System.Environment]::GetEnvironmentVariable('Path', 'User')
+    $env:Path = "$machinePath;$userPath"
+
+    if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
+        Write-Error "Node.js was installed but isn't on PATH in this session. Close and reopen PowerShell, then re-run this script."
+        exit 1
+    }
+    Write-Host "Node.js installed: $(node --version)" -ForegroundColor Green
+}
+
+Ensure-NodeJs
 
 Push-Location $Dir
 Write-Host "Installing dependencies (npm install)..."
