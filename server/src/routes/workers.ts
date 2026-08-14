@@ -2,7 +2,8 @@ import type { FastifyInstance } from "fastify";
 import { listWorkers } from "../config.js";
 import { repo } from "../db/repo.js";
 import { getReleases, filterReleasesForWorker } from "../github-releases.js";
-import { describeWorkerError } from "../worker-errors.js";
+import { describeWorkerError, WORKER_INACCESSIBLE_MESSAGE } from "../worker-errors.js";
+import { isRecentlyUnreachable, markReachable, markUnreachable } from "../worker-reachability.js";
 import { isMtpDraftModel } from "../../../shared/types.js";
 import type {
   WorkerLlamaCppInfo,
@@ -17,7 +18,7 @@ import type {
 } from "../../../shared/types.js";
 import { HF_REPO_PATTERN, searchHfGgufModels, listHfGgufFiles, getHfGgufMeta } from "../hf.js";
 
-const WORKER_READ_TIMEOUT_MS = 15_000;
+const WORKER_READ_TIMEOUT_MS = 5_000;
 const WORKER_INSTALL_TIMEOUT_MS = 10 * 60 * 1000;
 
 function validateModelDownloadCallback(payload: unknown): string | null {
@@ -61,6 +62,9 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
     async (request, reply) => {
       const worker = await findWorker(request.params.name);
       if (!worker) return reply.code(404).send({ error: "unknown worker" });
+      if (isRecentlyUnreachable(worker.url)) {
+        return reply.code(502).send({ error: WORKER_INACCESSIBLE_MESSAGE });
+      }
 
       let workerInfo: {
         platform: string;
@@ -73,7 +77,9 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
         const res = await fetchWorker(`${worker.url}/llama-cpp`, {}, WORKER_READ_TIMEOUT_MS);
         if (!res.ok) throw new Error(`worker responded ${res.status}`);
         workerInfo = (await res.json()) as typeof workerInfo;
+        markReachable(worker.url);
       } catch (err) {
+        markUnreachable(worker.url);
         return reply.code(502).send({ error: describeWorkerError(err) });
       }
 
