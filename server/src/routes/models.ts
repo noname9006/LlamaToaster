@@ -22,8 +22,9 @@ export interface FileDeletionResult {
 // worker to delete it and letting the ones that don't have it 404
 // harmlessly -- best-effort, never blocks the registry deletion above.
 async function deleteFileFromAllWorkers(filename: string): Promise<FileDeletionResult[]> {
+  const workers = await listWorkers();
   return Promise.all(
-    listWorkers().map(async (worker): Promise<FileDeletionResult> => {
+    workers.map(async (worker): Promise<FileDeletionResult> => {
       try {
         const res = await fetch(`${worker.url}/models?file=${encodeURIComponent(filename)}`, {
           method: "DELETE",
@@ -54,7 +55,7 @@ interface WorkerGgufInfo {
 // see worker/src/gguf.ts) so backfilling one opportunistically backfills the
 // other too, rather than needing two separate worker round trips.
 async function findGgufInfoFromWorkers(filename: string): Promise<WorkerGgufInfo> {
-  for (const worker of listWorkers()) {
+  for (const worker of await listWorkers()) {
     try {
       const res = await fetch(`${worker.url}/models/gguf-info?file=${encodeURIComponent(filename)}`, {
         signal: AbortSignal.timeout(WORKER_GGUF_INFO_TIMEOUT_MS),
@@ -226,7 +227,7 @@ export async function modelsRoutes(app: FastifyInstance): Promise<void> {
   // outside this app (manual copy, disk cleanup), so this always reflects a
   // live check rather than a point-in-time snapshot that could go stale.
   app.get("/api/models/locations", async () => {
-    const workers = listWorkers();
+    const workers = await listWorkers();
     const filesByWorker = await Promise.all(workers.map((w) => listWorkerFiles(w)));
 
     const unreachable: string[] = [];
