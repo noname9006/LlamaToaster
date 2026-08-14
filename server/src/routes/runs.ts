@@ -418,7 +418,7 @@ async function sendRunToWorker(
 async function dispatchScheduledRun(app: FastifyInstance, workerName: string): Promise<void> {
   const next = repo.getNextScheduledRunForWorker(workerName);
   if (!next) return;
-  const worker = getWorkerForRun(workerName);
+  const worker = await getWorkerForRun(workerName);
   if (!worker) {
     app.log.error({ run_id: next.id, worker: workerName }, "queued run's worker is no longer configured");
     repo.failAllRunItems(next.id, `worker "${workerName}" is no longer configured`);
@@ -474,7 +474,7 @@ export async function runsRoutes(app: FastifyInstance): Promise<void> {
       // /health reads.
       let paused: boolean | undefined;
       if (data.run.status === "running") {
-        const worker = getWorkerForRun(data.run.worker_name);
+        const worker = await getWorkerForRun(data.run.worker_name);
         if (worker) {
           try {
             const res = await fetch(`${worker.url}/health`, { signal: AbortSignal.timeout(WORKER_HEALTH_TIMEOUT_MS) });
@@ -581,8 +581,8 @@ export async function runsRoutes(app: FastifyInstance): Promise<void> {
 
       const requestedWorkerName = resolveWorkerName(body.worker_name);
       const worker = requestedWorkerName
-        ? getWorkerForRun(requestedWorkerName)
-        : getDefaultWorker();
+        ? await getWorkerForRun(requestedWorkerName)
+        : await getDefaultWorker();
       if (!worker) {
         request.log.warn(
           { worker_name: requestedWorkerName },

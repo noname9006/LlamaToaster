@@ -55,8 +55,9 @@ npm run dev:client
 
 - `BIND_HOST` — **bind to the VPS's own Tailscale IP, not `0.0.0.0`** (see Security).
 - `DB_PATH` — optional SQLite file location (default `./llamatoaster.db`).
-- `DEFAULT_WORKER_URL` / `DEFAULT_WORKER_NAME` / `DEFAULT_WORKER_BACKEND` / `DEFAULT_WORKER_BUILD` — fallback worker.
-- `WORKERS` — optional JSON array of worker defs `[{name, backend, llama_cpp_build, url}]` for multi-worker labels.
+- `DEFAULT_WORKER_URL` — fallback single worker's URL, used when `WORKERS` isn't set.
+- `DEFAULT_WORKER_NAME` — optional, pins the worker a trigger with no explicit `worker_name` routes to (matched against whatever name that worker reports as its own `worker_name`); without it, triggers default to the first entry in `WORKERS`.
+- `WORKERS` — optional JSON array of worker URLs, e.g. `["http://100.x.x.x:8080", "http://100.y.y.y:8080"]`, one per machine. Each worker's name/backend/active build is discovered live from its own `/health` (see `worker/config.json`'s `worker_name`) rather than declared here, so adding a worker only means adding its URL — no need to hand-copy its backend or build.
 - `LOG_LEVEL` — optional, `debug` | `info` (default) | `warn` | `error`. `debug` adds full sweep/trigger detail to the timestamped request log.
 - `AI_API_KEY` / `AI_BASE_URL` / `AI_MODEL` — optional, enable the dashboard's AI Assistant panel (parameter/model suggestions, informed by your hardware and benchmark results). Unlike the vars above, these are read from a `.env` file at the repo root (copy [`.env.example`](.env.example)) rather than the shell/systemd — it's gitignored and loaded automatically on startup. Without it the panel just reports "not configured."
 
