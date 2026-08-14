@@ -36,8 +36,8 @@ function validateModelDownloadCallback(payload: unknown): string | null {
   return null;
 }
 
-function findWorker(name: string) {
-  return listWorkers().find((w) => w.name === name);
+async function findWorker(name: string) {
+  return (await listWorkers()).find((w) => w.name === name);
 }
 
 async function fetchWorker(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
@@ -46,8 +46,9 @@ async function fetchWorker(url: string, init: RequestInit, timeoutMs: number): P
 
 export async function workersRoutes(app: FastifyInstance): Promise<void> {
   app.get("/api/workers", async () => {
+    const list = await listWorkers();
     return {
-      workers: listWorkers().map((w) => ({
+      workers: list.map((w) => ({
         name: w.name,
         backend: w.backend,
         llama_cpp_build: w.llama_cpp_build,
@@ -58,7 +59,7 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
   app.get<{ Params: { name: string } }>(
     "/api/workers/:name/llama-cpp",
     async (request, reply) => {
-      const worker = findWorker(request.params.name);
+      const worker = await findWorker(request.params.name);
       if (!worker) return reply.code(404).send({ error: "unknown worker" });
 
       let workerInfo: {
@@ -98,7 +99,7 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
       let available: WorkerLlamaCppInfo["available"] = [];
       try {
         const releases = await getReleases();
-        available = filterReleasesForWorker(releases, workerInfo.platform, workerInfo.arch, worker.backend);
+        available = filterReleasesForWorker(releases, workerInfo.platform, workerInfo.arch, workerInfo.backend);
       } catch (err) {
         // GitHub being unreachable shouldn't block viewing installed builds --
         // just report an empty "installable" list.
@@ -116,7 +117,7 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
         worker_name: worker.name,
         platform: workerInfo.platform,
         arch: workerInfo.arch,
-        backend: worker.backend,
+        backend: workerInfo.backend,
         installed: workerInfo.installed,
         active_tag: workerInfo.active_tag,
         available,
@@ -132,7 +133,7 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
   app.post<{ Params: { name: string }; Body: { tag?: string; asset_name?: string } }>(
     "/api/workers/:name/llama-cpp/install",
     async (request, reply) => {
-      const worker = findWorker(request.params.name);
+      const worker = await findWorker(request.params.name);
       if (!worker) return reply.code(404).send({ error: "unknown worker" });
       const { tag, asset_name } = request.body ?? {};
       if (!tag || !asset_name) {
@@ -179,7 +180,7 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
   app.post<{ Params: { name: string }; Body: { tag?: string } }>(
     "/api/workers/:name/llama-cpp/activate",
     async (request, reply) => {
-      const worker = findWorker(request.params.name);
+      const worker = await findWorker(request.params.name);
       if (!worker) return reply.code(404).send({ error: "unknown worker" });
       if (!request.body?.tag) return reply.code(400).send({ error: "tag is required" });
       try {
@@ -206,7 +207,7 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
   // worker itself rather than a specific run id; the worker 409s if it
   // isn't actually busy.
   app.post<{ Params: { name: string } }>("/api/workers/:name/pause", async (request, reply) => {
-    const worker = findWorker(request.params.name);
+    const worker = await findWorker(request.params.name);
     if (!worker) return reply.code(404).send({ error: "unknown worker" });
     try {
       const res = await fetchWorker(`${worker.url}/run/pause`, { method: "POST" }, WORKER_READ_TIMEOUT_MS);
@@ -218,7 +219,7 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
   });
 
   app.post<{ Params: { name: string } }>("/api/workers/:name/resume", async (request, reply) => {
-    const worker = findWorker(request.params.name);
+    const worker = await findWorker(request.params.name);
     if (!worker) return reply.code(404).send({ error: "unknown worker" });
     try {
       const res = await fetchWorker(`${worker.url}/run/resume`, { method: "POST" }, WORKER_READ_TIMEOUT_MS);
@@ -230,7 +231,7 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
   });
 
   app.post<{ Params: { name: string } }>("/api/workers/:name/stop", async (request, reply) => {
-    const worker = findWorker(request.params.name);
+    const worker = await findWorker(request.params.name);
     if (!worker) return reply.code(404).send({ error: "unknown worker" });
     try {
       const res = await fetchWorker(`${worker.url}/run/stop`, { method: "POST" }, WORKER_READ_TIMEOUT_MS);
@@ -260,7 +261,7 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
   app.delete<{ Params: { name: string; tag: string } }>(
     "/api/workers/:name/llama-cpp/:tag",
     async (request, reply) => {
-      const worker = findWorker(request.params.name);
+      const worker = await findWorker(request.params.name);
       if (!worker) return reply.code(404).send({ error: "unknown worker" });
       try {
         const res = await fetchWorker(
@@ -279,7 +280,7 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
   app.get<{ Params: { name: string }; Querystring: { hf_repo?: string; hf_file?: string } }>(
     "/api/workers/:name/models/download/progress",
     async (request, reply) => {
-      const worker = findWorker(request.params.name);
+      const worker = await findWorker(request.params.name);
       if (!worker) return reply.code(404).send({ error: "unknown worker" });
       const { hf_repo, hf_file } = request.query;
       if (!hf_repo || !hf_file) {
@@ -302,7 +303,7 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
   app.delete<{ Params: { name: string }; Querystring: { file?: string } }>(
     "/api/workers/:name/models",
     async (request, reply) => {
-      const worker = findWorker(request.params.name);
+      const worker = await findWorker(request.params.name);
       if (!worker) return reply.code(404).send({ error: "unknown worker" });
       const { file } = request.query;
       if (!file) return reply.code(400).send({ error: "file is required" });
@@ -359,7 +360,7 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
   app.post<{ Params: { name: string }; Body: { hf_repo?: string; hf_file?: string } }>(
     "/api/workers/:name/models/download",
     async (request, reply) => {
-      const worker = findWorker(request.params.name);
+      const worker = await findWorker(request.params.name);
       if (!worker) return reply.code(404).send({ error: "unknown worker" });
       const { hf_repo, hf_file } = request.body ?? {};
       if (!hf_repo || !hf_file) {
