@@ -2,13 +2,14 @@ import type { FastifyInstance } from "fastify";
 import { repo } from "../db/repo.js";
 import { listWorkers } from "../config.js";
 import { describeWorkerError } from "../worker-errors.js";
+import { isRecentlyUnreachable, markReachable, markUnreachable } from "../worker-reachability.js";
 import { getHfGgufMeta } from "../hf.js";
 import { isMtpDraftModel } from "../../../shared/types.js";
 import type { RegisterModelInput } from "../../../shared/types.js";
 
 const WORKER_DELETE_TIMEOUT_MS = 15_000;
 const WORKER_GGUF_INFO_TIMEOUT_MS = 15_000;
-const WORKER_LIST_TIMEOUT_MS = 15_000;
+const WORKER_LIST_TIMEOUT_MS = 5_000;
 const HF_META_TIMEOUT_MS = 15_000;
 
 export interface FileDeletionResult {
@@ -81,12 +82,18 @@ async function findGgufInfoFromWorkers(filename: string): Promise<WorkerGgufInfo
 // out is reported back as unreachable rather than silently treated as "has
 // nothing", so the client never mistakes "couldn't check" for "not there".
 async function listWorkerFiles(worker: { name: string; url: string }): Promise<{ path: string }[] | null> {
+  if (isRecentlyUnreachable(worker.url)) return null;
   try {
     const res = await fetch(`${worker.url}/models`, { signal: AbortSignal.timeout(WORKER_LIST_TIMEOUT_MS) });
-    if (!res.ok) return null;
+    if (!res.ok) {
+      markUnreachable(worker.url);
+      return null;
+    }
     const data = (await res.json()) as { files: { path: string; size_bytes: number }[] };
+    markReachable(worker.url);
     return data.files;
   } catch {
+    markUnreachable(worker.url);
     return null;
   }
 }
