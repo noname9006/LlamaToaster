@@ -677,6 +677,17 @@ export async function runsRoutes(app: FastifyInstance): Promise<void> {
       if (sweepError) {
         return reply.code(400).send({ error: sweepError });
       }
+      // expandSweep silently drops any flash_attn:"off" combo paired with a
+      // quantized cache type (llama.cpp refuses those outright -- see its
+      // own comment) -- a sweep built entirely out of such combos would
+      // otherwise create a Run with zero run_items and nothing to ever mark
+      // it finished, rather than surfacing why upfront.
+      if (expandSweep(body.sweep).length === 0) {
+        return reply.code(400).send({
+          error:
+            "sweep has no valid combinations -- flash_attn:\"off\" can't be paired with a quantized cache_type_k/cache_type_v (llama.cpp requires flash attention for a quantized KV cache); add flash_attn:\"on\" or use cache_type_k/v:\"f16\"",
+        });
+      }
       if (body.main_gpu !== undefined && (!Number.isInteger(body.main_gpu) || body.main_gpu < 0)) {
         return reply.code(400).send({ error: "main_gpu must be a non-negative integer" });
       }
