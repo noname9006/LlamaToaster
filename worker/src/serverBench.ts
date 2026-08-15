@@ -24,6 +24,9 @@ export interface ServerBenchRunInput {
   repeats: number;
   llamaServerPath: string;
   port: number;
+  // See bench.ts's BenchRunInput.mainGpu -- same meaning, same
+  // `-sm none -mg <index>` flags, applied in buildArgs below.
+  mainGpu?: number;
   timeoutMs?: number;
   onSpawn?: (proc: ChildProcess) => void;
   // Called twice per repeat (once right before its /completion request goes
@@ -219,6 +222,9 @@ function buildArgs(input: ServerBenchRunInput): string[] {
     "--verbosity",
     "4",
   ];
+  if (input.mainGpu != null) {
+    args.push("-sm", "none", "-mg", String(input.mainGpu));
+  }
   if (input.mtpModelPath) {
     args.push("--model-draft", input.mtpModelPath);
     // Confirmed live against the installed build's own --help: llama-server

@@ -212,6 +212,11 @@ export function NewRun() {
   const [mtpModelId, setMtpModelId] = useState("");
   const [workerName, setWorkerName] = useState("");
   const { order: workerOrder, status: workerStatus } = useWorkerStatuses();
+  // Index into the selected worker's hardware.gpu array -- undefined means
+  // "let llama.cpp use its own default" (split across every visible GPU on a
+  // multi-GPU worker). Only ever meaningful when that worker's own GPU list
+  // has more than one entry, see showGpuPicker below.
+  const [mainGpu, setMainGpu] = useState<number | undefined>(undefined);
   const [sweep, setSweep] = useState<Sweep>(EMPTY_SWEEP);
   const [jsonText, setJsonText] = useState("");
   const [jsonError, setJsonError] = useState("");
@@ -385,6 +390,17 @@ export function NewRun() {
   // see WorkerListEntry) since a "cpu" backend build ignores -ngl regardless
   // of what's physically in the box.
   const noGpu = workerHardware ? workerHardware.gpu.length === 0 : selectedWorker?.worker.backend === "cpu";
+  // Only worth offering a choice when there's actually more than one GPU to
+  // pick between -- a single-GPU (or cpu-only) worker has nothing to select.
+  const gpuList = workerHardware?.gpu ?? [];
+  const showGpuPicker = gpuList.length > 1;
+
+  // A GPU index picked for one worker doesn't carry over to a different one
+  // -- its hardware.gpu array (and therefore what index N even refers to) is
+  // specific to that worker.
+  useEffect(() => {
+    setMainGpu(undefined);
+  }, [workerName]);
 
   // llama.cpp's own runtime layer accounting is n_layer + 1 -- it counts the
   // output layer separately from the transformer stack (confirmed live, see
@@ -558,6 +574,7 @@ export function NewRun() {
         model_id: modelId,
         worker_name: workerName,
         mtp_model_id: mtpModelId || undefined,
+        main_gpu: mainGpu,
         sweep,
       });
       rememberSweep(modelId, workerName, sweep);
@@ -604,6 +621,23 @@ export function NewRun() {
               ))}
             </select>
           </label>
+          {showGpuPicker && (
+            <label className="flex flex-col gap-1.5 text-sm">
+              <span className="text-muted">GPU</span>
+              <select
+                value={mainGpu ?? ""}
+                onChange={(e) => setMainGpu(e.target.value === "" ? undefined : Number(e.target.value))}
+                className={`${inputCls} w-56`}
+              >
+                <option value="">Auto (split across all GPUs)</option>
+                {gpuList.map((g, i) => (
+                  <option key={i} value={i}>
+                    {i}: {g.model || g.vendor || "unknown"}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
           <ModelPicker
             models={presentModels}
             value={modelId}
