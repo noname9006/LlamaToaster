@@ -63,6 +63,33 @@ export function RunItemStatusPill({ status }: { status: RunItemStatus }) {
   return <StatusPill label={RUN_ITEM_STATUS_LABEL[status]} tone={RUN_ITEM_STATUS_TONE[status]} />;
 }
 
+// Short, constant label for the dense per-row "detail" column (RunDetail.tsx)
+// when an item has something in `error` -- shown instead of the actual error
+// text, which stays available via that cell's title/tooltip. At the
+// column's narrow fixed width ("11ch", sized for the longest normal phase
+// word -- see MERGED_COLUMN_DEFS there), even a single-sentence error wraps
+// across several lines and pushes every other column in that row down with
+// it; a failure's real detail belongs in the worker's own log (now with a
+// "debug log: <path>" line at the end of every test pointing at its full
+// raw dump -- see worker/src/index.ts) or a hover, not baked into the table
+// layout.
+export function shortItemErrorLabel(status: RunItemStatus): string {
+  switch (status) {
+    case "failed":
+      return "stopped with an error";
+    case "failed_oom":
+      return "stopped — out of memory";
+    case "cancelled":
+      return "stopped by user";
+    default:
+      // "done" with a non-empty `error` is a warning on an otherwise-
+      // successful item (e.g. a suspect MTP reading), not a failure -- see
+      // finalizeSweepItemResult in worker/src/index.ts, which stores
+      // bench.warning as `error` regardless of status.
+      return "done — warning";
+  }
+}
+
 // Human-readable phase text for a non-terminal item. Terminal items
 // (done/failed/cancelled) aren't meaningfully described this way -- callers
 // should show their error/result instead.

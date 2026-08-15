@@ -259,6 +259,64 @@ export function matchOffloadLine(line: string): OffloadInfo | null {
   return { gpu_layers_loaded: Number(m[1]), total_model_layers: Number(m[2]) };
 }
 
+// llama-bench's -v/--verbose (see supportsVerboseFlag above) and
+// llama-server's --verbosity 4 (see worker/src/serverBench.ts's buildArgs)
+// both print one line per tensor while a model loads, and (for a
+// CPU_REPACK-eligible quant) a second one per tensor while it repacks --
+// confirmed live against a 541-tensor/402-repackable-tensor model that this
+// alone is >900 near-identical lines. Harmless noise on a successful run
+// (nothing here reads it), but on a *failed* one this raw stderr becomes
+// the item's stored `error` verbatim (see worker/src/index.ts's
+// runSweepItem), so it previously buried the one line that actually
+// explained the failure underneath a tensor-by-tensor transcript. Collapses
+// each contiguous run of 2+ matching lines into a single count-bearing
+// summary line; a lone match, anything else, and the useful diagnostic
+// lines around them (offload counts, the actual llama.cpp error) all pass
+// through untouched.
+const CREATE_TENSOR_LINE_RE = /^create_tensor: loading tensor /;
+// A llama.cpp mmap-loading progress "." has no trailing newline, so it ends
+// up glued to the front of whatever the *next* fprintf writes -- often this
+// exact line -- rather than starting a line of its own; stripped as a
+// leading `\.*` here rather than treated as breaking the batch.
+const REPACK_TENSOR_LINE_RE = /^\.*repack: repack tensor \S+ with (\S+)\s*$/;
+
+export function collapseTensorLoadSpam(text: string): string {
+  const lines = text.split("\n");
+  const out: string[] = [];
+  let i = 0;
+  while (i < lines.length) {
+    if (CREATE_TENSOR_LINE_RE.test(lines[i])) {
+      let j = i + 1;
+      while (j < lines.length && CREATE_TENSOR_LINE_RE.test(lines[j])) j++;
+      const count = j - i;
+      if (count > 1) {
+        out.push(`create_tensor: loading tensor -- ${count} tensors (batched)`);
+        i = j;
+        continue;
+      }
+    }
+    const repackMatch = lines[i].match(REPACK_TENSOR_LINE_RE);
+    if (repackMatch) {
+      const quantType = repackMatch[1];
+      let j = i + 1;
+      while (true) {
+        const m = j < lines.length ? lines[j].match(REPACK_TENSOR_LINE_RE) : null;
+        if (!m || m[1] !== quantType) break;
+        j++;
+      }
+      const count = j - i;
+      if (count > 1) {
+        out.push(`repack: repack tensor -- ${count} tensors with ${quantType} (batched)`);
+        i = j;
+        continue;
+      }
+    }
+    out.push(lines[i]);
+    i++;
+  }
+  return out.join("\n");
+}
+
 export async function runBench(input: BenchRunInput): Promise<BenchResult> {
   const args = await buildArgs(input);
   const timeoutMs = input.timeoutMs ?? DEFAULT_TIMEOUT_MS;
@@ -333,6 +391,10 @@ export async function runBench(input: BenchRunInput): Promise<BenchResult> {
       // false: llama-bench has no --model-draft/MTP support at all, so this
       // path only ever loads one model.
       const offload = parseOffloadLayers(stderr, false);
+      // After offload parsing (which needs the real line-by-line stderr,
+      // unaffected by this anyway) but before returning -- this is the
+      // stderr a failed item's `error` field is built from verbatim.
+      stderr = collapseTensorLoadSpam(stderr);
       resolve({ stdout, stderr, code, signal, timedOut, results, gpu_info, cpu_info, offload });
     });
   });

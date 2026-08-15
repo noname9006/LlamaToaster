@@ -1625,12 +1625,20 @@ async function runSweepItem(input: RunSweepItemInput): Promise<TerminalRunItemSt
     activeBenchProc = null;
     const stats = sampler.stop();
     const outcome = bench.code === 0 && bench.results.length > 0 ? "ok" : "failed";
-    writeRawJson(rawJsonSubdir(input.rawJsonDir, outcome), `${runId}-${item.idx}`, {
+    const rawJsonPath = writeRawJson(rawJsonSubdir(input.rawJsonDir, outcome), `${runId}-${item.idx}`, {
       stdout: bench.stdout,
       stderr: bench.stderr,
     });
     logDiagnosticOutput(label, "llama-bench", bench.stderr);
-    return await finalizeSweepItemResult(runId, item, label, "llama-bench", bench, stats, baseline, input.mainGpu);
+    const result = await finalizeSweepItemResult(runId, item, label, "llama-bench", bench, stats, baseline, input.mainGpu);
+    // Printed last (after the TEST SUMMARY block above, whatever this item's
+    // outcome) so anyone reading the log -- including a stopped/cancelled
+    // item, which still reaches this same path -- has the exact file with
+    // this test's full raw stdout/stderr one line away, instead of having to
+    // scroll back through the (now-collapsed, but still not everything)
+    // console output above to reconstruct it.
+    log.info(`${label}: debug log: ${rawJsonPath}`);
+    return result;
   } catch (err) {
     if (tickTimer) clearInterval(tickTimer);
     activeBenchProc = null;
@@ -1722,12 +1730,16 @@ async function runSweepItemViaServer(input: RunSweepItemViaServerInput): Promise
     activeBenchProc = null;
     const stats = sampler.stop();
     const outcome = bench.code === 0 && bench.results.length > 0 ? "ok" : "failed";
-    writeRawJson(rawJsonSubdir(input.rawJsonDir, outcome), `${runId}-${item.idx}`, {
+    const rawJsonPath = writeRawJson(rawJsonSubdir(input.rawJsonDir, outcome), `${runId}-${item.idx}`, {
       stdout: bench.stdout,
       stderr: bench.stderr,
     });
     logDiagnosticOutput(label, "llama-server", bench.stderr);
-    return await finalizeSweepItemResult(runId, item, label, "llama-server", bench, stats, baseline, input.mainGpu);
+    const result = await finalizeSweepItemResult(runId, item, label, "llama-server", bench, stats, baseline, input.mainGpu);
+    // See runSweepItem's identical line above -- same reasoning, same
+    // "always printed last, cancelled included" behavior.
+    log.info(`${label}: debug log: ${rawJsonPath}`);
+    return result;
   } catch (err) {
     activeBenchProc = null;
     const stats = sampler.stop();

@@ -38,6 +38,27 @@ export interface SweepItem {
 // otherwise. repeats is intentionally not an axis here: it stays an
 // in-process repeat count per item rather than a separate item, since an OOM
 // at context creation fails identically on every repeat of the same combo.
+// llama.cpp hard-refuses to create a context for any combo where flash
+// attention is off but either KV cache side is quantized -- confirmed live
+// (build b10442): "llama_init_from_model: quantized V cache requires
+// flash_attn to be enabled", thrown from both the llama-bench and
+// llama-server paths identically. There's no partial credit for only one
+// side being f16 either -- ctk=f16/ctv=q8_0/fa=off fails the exact same way
+// as ctk=q8_0/ctv=q8_0/fa=off, so both sides are checked. A sweep that
+// cross-products flash_attn:[on,off] against any quantized cache type (a
+// natural thing to do, e.g. comparing fa on vs off at a fixed cache
+// setting) previously still produced these as real items: each one spawned
+// a whole process just to die in a few seconds with a context-creation
+// error, and produced no usable pp/tg row -- see worker/src/bench.ts and
+// worker/src/serverBench.ts, which have no way to know this in advance
+// per-item. Skipped here instead, in the one place both the server (item
+// pre-creation) and worker (item execution) independently call this on the
+// same sweep JSON, so both stay in agreement on the smaller item count
+// without any registration round trip.
+function isValidCombo(cache_type_k: string, cache_type_v: string, flash_attn: string): boolean {
+  return flash_attn !== "off" || (cache_type_k === "f16" && cache_type_v === "f16");
+}
+
 export function expandSweep(sweep: Omit<SweepConfig, "model_id">): SweepItem[] {
   const items: SweepItem[] = [];
   for (const n_prompt of sweep.n_prompt) {
@@ -49,6 +70,7 @@ export function expandSweep(sweep: Omit<SweepConfig, "model_id">): SweepItem[] {
               for (const cache_type_k of sweep.cache_type_k) {
                 for (const cache_type_v of sweep.cache_type_v) {
                   for (const flash_attn of sweep.flash_attn) {
+                    if (!isValidCombo(cache_type_k, cache_type_v, flash_attn)) continue;
                     for (const mtp of sweep.mtp) {
                       for (const n_gpu_layers_draft of sweep.n_gpu_layers_draft) {
                         items.push({

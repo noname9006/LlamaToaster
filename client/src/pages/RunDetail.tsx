@@ -7,6 +7,7 @@ import {
   StatusCircleStrip,
   buildItemRepeatUnits,
   describeItemPhase,
+  shortItemErrorLabel,
   REPEAT_PROGRESS_RE,
 } from "../components/StatusPill";
 import { Chart } from "../components/Chart";
@@ -46,7 +47,11 @@ interface ColDef {
 // see the always-rendered indicator row below the main <tr>.
 const MERGED_COLUMN_DEFS: ColDef[] = [
   { label: "#", description: "Position of this combination within the sweep.", sortKey: "idx" },
-  { label: "detail", description: "Current action / progress text, or the error message if this test failed." },
+  {
+    label: "detail",
+    description:
+      "Current action / progress text, or a short status (\"stopped with an error\", \"done — warning\", ...) if this test hit one -- hover the cell for the actual error/warning message.",
+  },
   { label: "test", description: "pp = prompt processing, tg = text generation, pg = both in one llama-bench call.", sortKey: "test" },
   { label: "n_prompt", description: "-p — prompt tokens processed before generating.", sortKey: "n_prompt", padX: "!pl-1 !pr-0.5" },
   { label: "n_gen", description: "-n — tokens generated after the prompt.", sortKey: "n_gen", padX: "!pl-0.5 !pr-1" },
@@ -857,7 +862,21 @@ export function RunDetail() {
                   const tgResult = itemResults?.find((r) => r.test_type === "tg");
                   const mem = memoryCells(it, anyResult);
                   const isTerminal = TERMINAL_ITEM_STATUSES.has(it.status);
-                  const detailText = it.error || (isTerminal ? it.detail || "" : describeItemPhase(it));
+                  // Full text always goes in the cell's title/tooltip below;
+                  // the visible label is shortened to a constant per-status
+                  // word whenever there's an error/warning to show at all --
+                  // see shortItemErrorLabel's own comment for why (a raw
+                  // stderr tail or MTP warning message, even after
+                  // worker/src/bench.ts's tensor-load-spam collapsing,
+                  // routinely runs well past what this "11ch" column can
+                  // show without wrapping every other cell in the row down
+                  // with it).
+                  const detailTitle = it.error || (isTerminal ? it.detail || "" : describeItemPhase(it));
+                  const detailText = it.error
+                    ? shortItemErrorLabel(it.status)
+                    : detailTitle.length > 120
+                      ? `${detailTitle.slice(0, 120)}…`
+                      : detailTitle;
                   const showLivePp = !isTerminal && it.status === "processing" && it.live_tps != null;
                   const showLiveTg = !isTerminal && it.status === "generating" && it.live_tps != null;
                   // Last live reading seen for a phase that's since moved on
@@ -896,8 +915,8 @@ export function RunDetail() {
                             break-words is just a fallback for the rare longer outlier
                             (an error message, or "benchmarking" on older
                             --progress-less llama-bench builds). */}
-                        <div className="w-[11ch] whitespace-normal break-words" title={detailText}>
-                          {detailText.length > 120 ? `${detailText.slice(0, 120)}…` : detailText}
+                        <div className="w-[11ch] whitespace-normal break-words" title={detailTitle}>
+                          {detailText}
                         </div>
                       </td>
                       <td className="px-1 py-1.5 text-fg">{testTypeLabel(it.n_prompt, it.n_gen)}</td>
