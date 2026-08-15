@@ -379,7 +379,8 @@ async function sendRunToWorker(
   mtpModel: Model | undefined,
   sweep: TriggerPayload["sweep"],
   build: string,
-  backend: Backend
+  backend: Backend,
+  mainGpu: number | undefined
 ): Promise<SendRunResult> {
   try {
     const res = await fetch(`${worker.url}/run`, {
@@ -390,6 +391,7 @@ async function sendRunToWorker(
         model_id: model.id,
         model,
         mtp_model: mtpModel,
+        main_gpu: mainGpu,
         sweep,
         llama_cpp_build: build,
         llama_cpp_backend: backend,
@@ -447,7 +449,16 @@ async function dispatchScheduledRun(app: FastifyInstance, workerName: string): P
   });
   app.log.info({ run_id: next.id, worker: workerName, build: live.build }, "queued run dispatching");
 
-  const sent = await sendRunToWorker(worker, next.id, model, mtpModel, next.config.sweep, live.build, live.backend);
+  const sent = await sendRunToWorker(
+    worker,
+    next.id,
+    model,
+    mtpModel,
+    next.config.sweep,
+    live.build,
+    live.backend,
+    next.config.main_gpu
+  );
   if ("error" in sent) {
     app.log.error({ run_id: next.id, worker: workerName, error: sent.full }, "queued run rejected by worker");
     repo.failAllRunItems(next.id, sent.full);
@@ -536,6 +547,9 @@ export async function runsRoutes(app: FastifyInstance): Promise<void> {
       if (sweepError) {
         return reply.code(400).send({ error: sweepError });
       }
+      if (body.main_gpu !== undefined && (!Number.isInteger(body.main_gpu) || body.main_gpu < 0)) {
+        return reply.code(400).send({ error: "main_gpu must be a non-negative integer" });
+      }
       const model = repo.getModel(body.model_id);
       if (!model) {
         return reply.code(400).send({ error: "unknown model_id" });
@@ -616,6 +630,7 @@ export async function runsRoutes(app: FastifyInstance): Promise<void> {
           config: {
             model_id: body.model_id,
             mtp_model_id: mtpModel?.id,
+            main_gpu: body.main_gpu,
             sweep: body.sweep,
           } as RunConfig,
           status: "scheduled",
@@ -652,6 +667,7 @@ export async function runsRoutes(app: FastifyInstance): Promise<void> {
         config: {
           model_id: body.model_id,
           mtp_model_id: mtpModel?.id,
+          main_gpu: body.main_gpu,
           sweep: body.sweep,
         } as RunConfig,
         status: "running",
@@ -665,7 +681,16 @@ export async function runsRoutes(app: FastifyInstance): Promise<void> {
         "run created"
       );
 
-      const sent = await sendRunToWorker(worker, run.id, model, mtpModel, body.sweep, live.build, live.backend);
+      const sent = await sendRunToWorker(
+        worker,
+        run.id,
+        model,
+        mtpModel,
+        body.sweep,
+        live.build,
+        live.backend,
+        body.main_gpu
+      );
       if ("error" in sent) {
         request.log.error({ run_id: run.id, error: sent.full }, "worker rejected run");
         repo.failAllRunItems(run.id, sent.full);

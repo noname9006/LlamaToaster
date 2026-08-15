@@ -19,6 +19,15 @@ export interface BenchRunInput {
   repeats: number;
   llamaBenchPath: string;
   backend: string;
+  // Index into the worker's detected GPU list (see shared/types.ts's
+  // RunConfig.main_gpu) -- restricts this run to one GPU on a multi-GPU
+  // worker. Applied as `-sm none -mg <index>` in buildArgs below: split-mode
+  // "none" is required alongside --main-gpu, since llama.cpp's default split
+  // mode ("layer") still spreads the model across every visible GPU
+  // regardless of --main-gpu, which only picks the KV-cache/small-tensor
+  // device in that mode. Undefined means "don't pass either flag," same as
+  // every run before this field existed.
+  mainGpu?: number;
   timeoutMs?: number;
   onSpawn?: (proc: ChildProcess) => void;
   // Fired per stderr line as it streams in -- lets the caller drive live
@@ -117,6 +126,9 @@ export async function buildArgs(input: BenchRunInput): Promise<string[]> {
     "-o",
     "json",
   ];
+  if (input.mainGpu != null) {
+    args.push("-sm", "none", "-mg", String(input.mainGpu));
+  }
   if (await supportsProgressFlag(input.llamaBenchPath)) {
     args.push("--progress");
   }

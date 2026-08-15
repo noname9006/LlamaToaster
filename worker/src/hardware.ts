@@ -7,6 +7,10 @@ export interface HardwareInfo {
   arch: string;
   cpu: { manufacturer: string; brand: string; flags: string[]; cores: number };
   gpu: { vendor: string; model: string }[];
+  // Total system RAM in bytes (on Apple Silicon, total unified memory) --
+  // see si.mem().total in detectHardware below. Kept in sync with the
+  // mirrored copy of this interface in shared/types.ts.
+  mem_total_bytes?: number;
 }
 
 // Manually-maintained snapshot of AMD GPU model tokens ROCm officially
@@ -80,7 +84,7 @@ export function detectBackend(platform: string, gpu: HardwareInfo["gpu"]): Backe
 // llama.cpp releases ship exactly one generic CPU build per platform+arch,
 // no AVX-tiered variants to choose between (see github-releases.ts).
 export async function detectHardware(): Promise<HardwareInfo> {
-  const [cpu, graphics] = await Promise.all([si.cpu(), si.graphics()]);
+  const [cpu, graphics, mem] = await Promise.all([si.cpu(), si.graphics(), si.mem()]);
   return {
     platform: osPlatform(),
     arch: osArch(),
@@ -98,5 +102,6 @@ export async function detectHardware(): Promise<HardwareInfo> {
     gpu: graphics.controllers
       .filter((c) => c.vendor)
       .map((c) => ({ vendor: c.vendor ?? "", model: c.model ?? "" })),
+    mem_total_bytes: typeof mem.total === "number" && mem.total > 0 ? mem.total : undefined,
   };
 }
