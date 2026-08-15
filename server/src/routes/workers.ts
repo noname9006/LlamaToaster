@@ -53,6 +53,7 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
         name: w.name,
         backend: w.backend,
         llama_cpp_build: w.llama_cpp_build,
+        is_self: w.is_self,
       })),
     };
   });
