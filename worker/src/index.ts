@@ -117,6 +117,17 @@ if (!config.backend) {
   log.info(`no backend set in config.json -- auto-detected "${backend}" from hardware`);
 }
 
+// "model (4.0 GB)" / "model (1024 MB shared)" for a HardwareInfo.gpu entry --
+// used only in log output (see the startup GPU: line and formatDeviceSelection
+// below), never in backend_device_name itself, which stays just the plain
+// name since that's what feeds RunDetail.tsx's "<name> (<backend>)" label.
+function formatGpuEntry(g: { model: string; vendor: string; vram_mb?: number | null; vram_dynamic?: boolean }): string {
+  const name = g.model || g.vendor || "unknown";
+  if (g.vram_mb == null) return name;
+  const vram = g.vram_mb >= 1024 ? `${(g.vram_mb / 1024).toFixed(1)} GB` : `${g.vram_mb} MB`;
+  return `${name} (${vram}${g.vram_dynamic ? " shared" : ""})`;
+}
+
 // Tier-1 backend_device_name (see shared/types.ts's Run.backend_device_name)
 // -- reported via /health below, optionally scoped to a specific run's
 // --main-gpu selection via that route's ?main_gpu= query param (only ever
@@ -167,7 +178,7 @@ log.info(
 log.info(
   `[worker ${config.worker_name}] GPU: ${
     detectedHardware.gpu.length > 0
-      ? detectedHardware.gpu.map((g) => g.model || g.vendor).join(", ")
+      ? detectedHardware.gpu.map((g) => formatGpuEntry(g)).join(", ")
       : "none detected"
   }`
 );
@@ -541,12 +552,31 @@ const server = createServer(async (req, res) => {
         // See shared/types.ts's RunConfig.main_gpu -- forwarded unchanged
         // into runSweepItem/runSweepItemViaServer below.
         main_gpu?: number;
+        // See shared/types.ts's RunConfig.main_gpu_backend -- when set, this
+        // run uses llama_cpp_build (below) as an explicit tag to look up in
+        // this worker's OWN installed-build registry (see getInstalledBuild)
+        // for just this run, instead of trusting activeBuild the way every
+        // other run does. server/src/routes/runs.ts's ensureBuildForBackend
+        // guarantees that tag is already installed here before this request
+        // is ever sent -- never activated as this worker's persisted
+        // default, so activeBuild/backend (module-level) are left untouched.
+        main_gpu_backend?: Backend;
         sweep: Omit<SweepConfig, "model_id">;
         llama_cpp_build: string;
         llama_cpp_backend: Backend;
       };
       let modelPath: string;
       let mtpModelPath: string | undefined;
+      // For a plain run this is just activeBuild/backend (module-level, the
+      // worker's own persisted default) -- for a main_gpu_backend override
+      // (see reqBody's own field doc comment) it's resolved fresh from this
+      // worker's installed-build registry instead, scoped to this one
+      // request only. Declared here (rather than inline in the sweep loop
+      // below) so a missing/uninstalled override tag fails this request
+      // up front with a clear 400, the same posture as a missing model
+      // file above, instead of failing every single item one at a time.
+      let effectiveBuild: ActiveBuild;
+      let effectiveBackend: Backend;
       try {
         reqBody = JSON.parse(body);
         log.info(
@@ -564,6 +594,24 @@ const server = createServer(async (req, res) => {
           if (!existsSync(mtpModelPath)) {
             throw new Error(`mtp model file not found at ${mtpModelPath} (source=${reqBody.mtp_model.source})`);
           }
+        }
+
+        if (reqBody.main_gpu_backend != null) {
+          const overrideBuild = getInstalledBuild(buildsDir, reqBody.llama_cpp_build);
+          if (!overrideBuild) {
+            throw new Error(
+              `main_gpu_backend=${reqBody.main_gpu_backend} requires build ${reqBody.llama_cpp_build}, which isn't installed on this worker`
+            );
+          }
+          effectiveBuild = { tag: overrideBuild.tag, path: overrideBuild.bench_path, serverPath: overrideBuild.server_path };
+          effectiveBackend = reqBody.main_gpu_backend;
+          log.info(
+            `run ${reqBody.run_id}: using one-off build ${overrideBuild.tag} (backend=${effectiveBackend}) for this run only -- worker default stays ${backend}`
+          );
+        } else {
+          if (!activeBuild) throw new Error("no active llama.cpp build on this worker");
+          effectiveBuild = activeBuild;
+          effectiveBackend = backend;
         }
       } catch (err) {
         release?.();
@@ -625,7 +673,7 @@ const server = createServer(async (req, res) => {
             continue;
           }
           if (item.mtp === "on") {
-            if (!activeBuild!.serverPath) {
+            if (!effectiveBuild.serverPath) {
               log.error(`run ${reqBody.run_id}: item ${item.idx} needs mtp but the active build has no llama-server binary`);
               await safeItemTerminal(reqBody.run_id, item.idx, {
                 status: "failed",
@@ -641,9 +689,9 @@ const server = createServer(async (req, res) => {
                 repeats: reqBody.sweep.repeats,
                 modelPath,
                 mtpModelPath,
-                llamaServerPath: activeBuild!.serverPath,
+                llamaServerPath: effectiveBuild.serverPath,
                 port: config.mtp_server_port ?? DEFAULT_MTP_SERVER_PORT,
-                backend,
+                backend: effectiveBackend,
                 mainGpu: reqBody.main_gpu,
                 timeoutMs: config.bench_timeout_ms,
                 rawJsonDir: rawDir,
@@ -656,8 +704,8 @@ const server = createServer(async (req, res) => {
                 item,
                 repeats: reqBody.sweep.repeats,
                 modelPath,
-                llamaBenchPath: activeBuild!.path,
-                backend,
+                llamaBenchPath: effectiveBuild.path,
+                backend: effectiveBackend,
                 mainGpu: reqBody.main_gpu,
                 timeoutMs: config.bench_timeout_ms,
                 vpsUrl: config.vps_url,
@@ -1154,16 +1202,20 @@ function formatItemParams(item: SweepItem): string {
 // llama-bench/llama-server) since that's exactly the failure mode a raw,
 // unfiltered hardware.gpu index used to produce -- see shared/types.ts's
 // backendVisibleGpus.
-function formatDeviceSelection(mainGpu: number | undefined): string {
+// backend is a parameter (not read from the module-level const) so a
+// main_gpu_backend override run (see the /run handler's effectiveBackend)
+// logs its actual one-off backend here, not this worker's unrelated
+// persisted default.
+function formatDeviceSelection(backend: Backend, mainGpu: number | undefined): string {
   const visible = backendVisibleGpus(detectedHardware.gpu, backend);
   if (mainGpu == null) {
     return visible.length > 0
-      ? `auto -- split across all ${backend}-visible GPU(s): ${visible.map((g) => g.model || g.vendor).join(", ")}`
+      ? `auto -- split across all ${backend}-visible GPU(s): ${visible.map((g) => formatGpuEntry(g)).join(", ")}`
       : `auto (no ${backend}-visible GPU detected)`;
   }
   const picked = visible[mainGpu];
   return picked
-    ? `${picked.model || picked.vendor} (main_gpu=${mainGpu} of ${visible.length} ${backend}-visible GPU(s))`
+    ? `${formatGpuEntry(picked)} (main_gpu=${mainGpu} of ${visible.length} ${backend}-visible GPU(s))`
     : `main_gpu=${mainGpu} is OUT OF RANGE -- only ${visible.length} ${backend}-visible GPU(s) detected`;
 }
 
@@ -1430,7 +1482,7 @@ async function runSweepItem(input: RunSweepItemInput): Promise<TerminalRunItemSt
     testType === "pp" ? "processing" : testType === "tg" ? "generating" : "benchmarking";
 
   log.info(`${label}: starting test -- engine=llama-bench params: ${formatItemParams(item)}`);
-  log.info(`${label}: device: ${formatDeviceSelection(input.mainGpu)}`);
+  log.info(`${label}: device: ${formatDeviceSelection(backend, input.mainGpu)}`);
   const baseline = await captureFreeMemoryBaseline(backend);
   log.info(
     `${label}: free memory before start: ram=${baseline.ram_free_before_mib}MiB` +
@@ -1626,7 +1678,7 @@ async function runSweepItemViaServer(input: RunSweepItemViaServerInput): Promise
   const label = `run ${runId} item ${item.idx} (mtp)`;
 
   log.info(`${label}: starting test -- engine=llama-server params: ${formatItemParams(item)}`);
-  log.info(`${label}: device: ${formatDeviceSelection(input.mainGpu)}`);
+  log.info(`${label}: device: ${formatDeviceSelection(backend, input.mainGpu)}`);
   const baseline = await captureFreeMemoryBaseline(backend);
   log.info(
     `${label}: free memory before start: ram=${baseline.ram_free_before_mib}MiB` +
