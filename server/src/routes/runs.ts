@@ -8,18 +8,20 @@ import type {
   Backend,
   RunItemUpdateInput,
   InstalledBuild,
+  LlamaCppRelease,
   Model,
 } from "../../../shared/types.js";
 import {
   isTerminalRunItemInput,
   isMtpDraftModel,
+  backendVisibleGpus,
   GPU_MEMORY_ACCURACY_LEVELS,
   GPU_MEMORY_MEASUREMENT_SOURCES,
 } from "../../../shared/types.js";
 import { expandSweep } from "../../../shared/sweep.js";
 import { getWorkerForRun, getDefaultWorker, type WorkerDef } from "../config.js";
 import { describeWorkerError } from "../worker-errors.js";
-import { getReleases, filterReleasesForWorker } from "../github-releases.js";
+import { getReleases, filterReleasesForWorker, assetMatchesWorker } from "../github-releases.js";
 
 // The worker now acks /run as soon as it validates the request and kicks the
 // benchmark off in the background (see worker/src/index.ts) rather than
@@ -364,6 +366,120 @@ async function ensureActiveBuild(worker: WorkerDef, mainGpu?: number): Promise<B
   return { build: release.tag, backend: info.backend, deviceName };
 }
 
+// Resolves (installing if necessary) a build for an EXPLICIT backend on a
+// worker, entirely independent of whichever build is that worker's own
+// persisted "active" one -- used only when a run's main_gpu names a GPU the
+// worker's default backend can't see at all (RunConfig.main_gpu_backend,
+// set by client/src/pages/NewRun.tsx's GPU picker once the user confirms
+// the switch). Deliberately never calls activateOnWorker/persists anything:
+// the resolved tag is sent to the worker as a per-run override on the /run
+// payload itself (see sendRunToWorker's main_gpu_build_tag) so this one run
+// can use a different build without touching the worker's own default for
+// every other run -- see ensureActiveBuild's self-heal above for why
+// "activate whatever the worker considers current" is right there but wrong
+// here.
+async function ensureBuildForBackend(
+  worker: WorkerDef,
+  backend: Backend
+): Promise<{ tag: string } | { error: string }> {
+  let info: { platform: string; arch: string; installed: InstalledBuild[] };
+  try {
+    const res = await fetch(`${worker.url}/llama-cpp`, { signal: AbortSignal.timeout(LLAMA_CPP_INFO_TIMEOUT_MS) });
+    if (!res.ok) throw new Error(`worker responded ${res.status}`);
+    info = (await res.json()) as typeof info;
+  } catch (err) {
+    return { error: describeWorkerError(err) };
+  }
+
+  // Already installed under some other tag? Matched the same way the
+  // "Available to install" list itself is filtered (assetMatchesWorker),
+  // just against what's already on disk instead of GitHub's release list --
+  // no need to download again just because it isn't the "active" one.
+  const alreadyInstalled = info.installed.find((b) =>
+    assetMatchesWorker(b.asset_name, info.platform, info.arch, backend)
+  );
+  if (alreadyInstalled) return { tag: alreadyInstalled.tag };
+
+  let releases: LlamaCppRelease[];
+  try {
+    releases = await getReleases();
+  } catch (err) {
+    return {
+      error: `no llama.cpp build installed for backend "${backend}" on this worker, and GitHub releases are unreachable: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    };
+  }
+  const matching = filterReleasesForWorker(releases, info.platform, info.arch, backend).filter(
+    (r) => r.assets.length > 0
+  );
+  if (matching.length === 0) {
+    return { error: `no installable llama.cpp release found for backend "${backend}" on ${info.platform}/${info.arch}` };
+  }
+  const release = matching[0];
+  const asset = release.assets[0];
+
+  try {
+    const res = await fetch(`${worker.url}/llama-cpp/install`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ tag: release.tag, asset_name: asset.name, download_url: asset.download_url }),
+      signal: AbortSignal.timeout(BUILD_INSTALL_TIMEOUT_MS),
+    });
+    if (!res.ok) {
+      const text = await res.text();
+      return { error: `install of llama.cpp ${release.tag} (${backend}) failed: ${res.status} ${text}` };
+    }
+  } catch (err) {
+    return { error: `install of llama.cpp ${release.tag} (${backend}) failed: ${describeWorkerError(err)}` };
+  }
+  return { tag: release.tag };
+}
+
+// Single entry point both trigger paths (immediate + queued) use to resolve
+// which build/backend a run should actually execute against -- branches
+// between the two resolution strategies above based on RunConfig.main_gpu_
+// backend (unset: the normal "whatever this worker's own default currently
+// is" path; set: this run's GPU pick needs a specific different backend, so
+// resolve+install that instead, without touching the worker's default at
+// all -- see ensureBuildForBackend). isOverride tells the caller whether to
+// forward a per-run build tag to the worker (see sendRunToWorker's
+// mainGpuBackend param) instead of just trusting its already-active build.
+async function resolveRunBuild(
+  worker: WorkerDef,
+  mainGpu: number | undefined,
+  mainGpuBackend: Backend | undefined
+): Promise<(BuildResolution & { isOverride: boolean }) | { error: string }> {
+  if (mainGpuBackend == null) {
+    const live = await ensureActiveBuild(worker, mainGpu);
+    return "error" in live ? live : { ...live, isOverride: false };
+  }
+  const resolved = await ensureBuildForBackend(worker, mainGpuBackend);
+  if ("error" in resolved) return resolved;
+  // Tier-1 backend_device_name (see shared/types.ts's Run.backend_device_name)
+  // for an override run -- ensureActiveBuild's own /health?main_gpu= trick
+  // scopes against the worker's *default* backend's device list, which is
+  // exactly wrong here (this run isn't using that backend at all), so this
+  // fetches /hardware directly instead and applies the same backendVisibleGpus
+  // filter client/src/pages/NewRun.tsx's picker itself used to decide this
+  // GPU needed a switch in the first place. Best-effort, same posture as
+  // ensureActiveBuild's own deviceName -- an unreachable /hardware here
+  // shouldn't fail the whole trigger over a display nicety.
+  let deviceName: string | undefined;
+  try {
+    const res = await fetch(`${worker.url}/hardware`, { signal: AbortSignal.timeout(WORKER_HEALTH_TIMEOUT_MS) });
+    if (res.ok) {
+      const hw = (await res.json()) as { gpu: { vendor: string; model: string }[] };
+      const visible = backendVisibleGpus(hw.gpu, mainGpuBackend);
+      const picked = mainGpu != null ? visible[mainGpu] : visible[0];
+      deviceName = picked?.model || picked?.vendor || undefined;
+    }
+  } catch {
+    /* best-effort */
+  }
+  return { build: resolved.tag, backend: mainGpuBackend, deviceName, isOverride: true };
+}
+
 type SendRunResult =
   | { ok: true }
   // `error`/`detail` are the reply shape a route handler sends straight to
@@ -386,7 +502,13 @@ async function sendRunToWorker(
   sweep: TriggerPayload["sweep"],
   build: string,
   backend: Backend,
-  mainGpu: number | undefined
+  mainGpu: number | undefined,
+  // Set only for a resolveRunBuild override (RunConfig.main_gpu_backend) --
+  // tells the worker's /run handler to resolve `build` from its own
+  // installed-build registry for JUST this run, instead of trusting its
+  // persisted "active" build the way it does for every normal run. See
+  // worker/src/index.ts's /run handler.
+  mainGpuBackend: Backend | undefined
 ): Promise<SendRunResult> {
   try {
     const res = await fetch(`${worker.url}/run`, {
@@ -398,6 +520,7 @@ async function sendRunToWorker(
         model,
         mtp_model: mtpModel,
         main_gpu: mainGpu,
+        main_gpu_backend: mainGpuBackend,
         sweep,
         llama_cpp_build: build,
         llama_cpp_backend: backend,
@@ -441,7 +564,7 @@ async function dispatchScheduledRun(app: FastifyInstance, workerName: string): P
   }
   const mtpModel = next.config.mtp_model_id ? repo.getModel(next.config.mtp_model_id) : undefined;
 
-  const live = await ensureActiveBuild(worker, next.config.main_gpu);
+  const live = await resolveRunBuild(worker, next.config.main_gpu, next.config.main_gpu_backend);
   if ("error" in live) {
     app.log.error({ run_id: next.id, worker: workerName, error: live.error }, "queued run dispatch failed");
     repo.failAllRunItems(next.id, live.error);
@@ -463,7 +586,8 @@ async function dispatchScheduledRun(app: FastifyInstance, workerName: string): P
     next.config.sweep,
     live.build,
     live.backend,
-    next.config.main_gpu
+    next.config.main_gpu,
+    live.isOverride ? live.backend : undefined
   );
   if ("error" in sent) {
     app.log.error({ run_id: next.id, worker: workerName, error: sent.full }, "queued run rejected by worker");
@@ -556,6 +680,9 @@ export async function runsRoutes(app: FastifyInstance): Promise<void> {
       if (body.main_gpu !== undefined && (!Number.isInteger(body.main_gpu) || body.main_gpu < 0)) {
         return reply.code(400).send({ error: "main_gpu must be a non-negative integer" });
       }
+      if (body.main_gpu_backend !== undefined && typeof body.main_gpu_backend !== "string") {
+        return reply.code(400).send({ error: "main_gpu_backend must be a string" });
+      }
       const model = repo.getModel(body.model_id);
       if (!model) {
         return reply.code(400).send({ error: "unknown model_id" });
@@ -637,6 +764,7 @@ export async function runsRoutes(app: FastifyInstance): Promise<void> {
             model_id: body.model_id,
             mtp_model_id: mtpModel?.id,
             main_gpu: body.main_gpu,
+            main_gpu_backend: body.main_gpu_backend,
             sweep: body.sweep,
           } as RunConfig,
           status: "scheduled",
@@ -651,7 +779,7 @@ export async function runsRoutes(app: FastifyInstance): Promise<void> {
         return reply.code(201).send({ run: scheduledRun });
       }
 
-      const live = await ensureActiveBuild(worker, body.main_gpu);
+      const live = await resolveRunBuild(worker, body.main_gpu, body.main_gpu_backend);
       if ("error" in live) {
         request.log.warn(
           { worker: worker.name, model_id: body.model_id, error: live.error },
@@ -674,6 +802,7 @@ export async function runsRoutes(app: FastifyInstance): Promise<void> {
           model_id: body.model_id,
           mtp_model_id: mtpModel?.id,
           main_gpu: body.main_gpu,
+          main_gpu_backend: body.main_gpu_backend,
           sweep: body.sweep,
         } as RunConfig,
         status: "running",
@@ -695,7 +824,8 @@ export async function runsRoutes(app: FastifyInstance): Promise<void> {
         body.sweep,
         live.build,
         live.backend,
-        body.main_gpu
+        body.main_gpu,
+        live.isOverride ? live.backend : undefined
       );
       if ("error" in sent) {
         request.log.error({ run_id: run.id, error: sent.full }, "worker rejected run");

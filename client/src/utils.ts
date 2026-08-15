@@ -35,6 +35,21 @@ export function formatBytes(bytes: number): string {
   return `${n.toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
 }
 
+// "model (4 GB)" / "model (1 GB shared)" for a HardwareInfo.gpu entry.
+// vram_dynamic (see shared/types.ts's HardwareInfo) means shared/unified
+// memory, typically an iGPU -- labeled "shared" rather than presented with
+// the same confidence as a discrete GPU's fixed VRAM pool, since the
+// reported number there is an estimate/allocation, not a dedicated
+// capacity. Falls back to just the model name when vram_mb is
+// null/undefined (driver didn't report it, or this is from a worker running
+// old code that predates the field).
+export function formatGpuLabel(g: { model: string; vendor: string; vram_mb?: number | null; vram_dynamic?: boolean }): string {
+  const name = g.model || g.vendor || "unknown";
+  if (g.vram_mb == null) return name;
+  const vram = formatBytes(g.vram_mb * 1024 * 1024);
+  return `${name} (${vram}${g.vram_dynamic ? " shared" : ""})`;
+}
+
 export function formatDate(ms: number): string {
   return new Date(ms).toLocaleString();
 }

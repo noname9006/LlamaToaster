@@ -7,8 +7,9 @@ import { ModelPicker } from "../components/ModelPicker";
 import { SliderChipInput } from "../components/SliderChipInput";
 import { ToggleChipGroup } from "../components/ToggleChipGroup";
 import { IconChevronDown } from "../components/icons";
-import { isMtpDraftModel, backendVisibleGpus } from "../types";
-import type { Model, SweepConfig } from "../types";
+import { isMtpDraftModel, backendVisibleGpus, detectBackend } from "../types";
+import type { Model, SweepConfig, Backend } from "../types";
+import { formatGpuLabel } from "../utils";
 
 type Sweep = Omit<SweepConfig, "model_id">;
 
@@ -212,11 +213,24 @@ export function NewRun() {
   const [mtpModelId, setMtpModelId] = useState("");
   const [workerName, setWorkerName] = useState("");
   const { order: workerOrder, status: workerStatus } = useWorkerStatuses();
-  // Index into the selected worker's hardware.gpu array -- undefined means
-  // "let llama.cpp use its own default" (split across every visible GPU on a
-  // multi-GPU worker). Only ever meaningful when that worker's own GPU list
-  // has more than one entry, see showGpuPicker below.
-  const [mainGpu, setMainGpu] = useState<number | undefined>(undefined);
+  // Raw index into the selected worker's hardware.gpu array (the picker's
+  // own display order) -- undefined means "Auto" (let llama.cpp use its own
+  // default, split across every visible GPU). Distinct from the mainGpu
+  // value actually sent to the server: that one must be relative to
+  // whichever backend will run this request (backendVisibleGpus), which can
+  // differ from this raw index whenever gpuOverrideBackend below is set --
+  // see mainGpuForSubmit/mainGpuBackendForSubmit further down. Only ever
+  // meaningful when that worker's own GPU list has more than one entry, see
+  // showGpuPicker below.
+  const [selectedGpuRawIndex, setSelectedGpuRawIndex] = useState<number | undefined>(undefined);
+  // Set once the user confirms switching backends for a GPU the worker's own
+  // default backend can't see at all (see the GPU <select>'s onChange below)
+  // -- the specific backend confirmed, forwarded as RunConfig.main_gpu_backend
+  // so the server installs (without disturbing the worker's own default) and
+  // the worker runs this one sweep against it. Cleared whenever the
+  // selection changes back to Auto or a GPU the default backend already
+  // covers.
+  const [gpuOverrideBackend, setGpuOverrideBackend] = useState<Backend | undefined>(undefined);
   const [sweep, setSweep] = useState<Sweep>(EMPTY_SWEEP);
   const [jsonText, setJsonText] = useState("");
   const [jsonError, setJsonError] = useState("");
@@ -385,35 +399,41 @@ export function NewRun() {
 
   const selectedWorker = workerName ? workerStatus[workerName] : undefined;
   const workerHardware = selectedWorker?.info?.hardware;
+  const workerPlatform = selectedWorker?.info?.platform;
+  const workerDefaultBackend = selectedWorker?.worker.backend;
   // Prefer the directly-detected GPU list once hardware has loaded; until
   // then fall back to the worker's configured backend (available instantly --
   // see WorkerListEntry) since a "cpu" backend build ignores -ngl regardless
   // of what's physically in the box.
-  const noGpu = workerHardware ? workerHardware.gpu.length === 0 : selectedWorker?.worker.backend === "cpu";
-  // Restricted to whatever this worker's active backend can actually address
-  // via --main-gpu (see shared/types.ts's backendVisibleGpus) -- e.g. an
-  // Intel iGPU alongside an NVIDIA card isn't a valid -mg target on a cuda
-  // build at all, so offering it (or sending its raw hardware.gpu index
-  // through as main_gpu) would silently pick the wrong device or an
-  // out-of-range one. The index used below (i) is this filtered list's own
-  // position, which is what actually gets sent as main_gpu -- not an index
-  // into the unfiltered workerHardware.gpu array.
+  const noGpu = workerHardware ? workerHardware.gpu.length === 0 : workerDefaultBackend === "cpu";
+  // The full, unfiltered picker -- every physically detected GPU is offered,
+  // even ones the worker's current default backend can't see at all (e.g.
+  // an Intel iGPU under a cuda build). Picking one of those triggers a
+  // confirm prompt in the <select>'s onChange below rather than being
+  // silently hidden or silently mis-routed -- see gpuOverrideBackend above.
   const gpuList = workerHardware?.gpu ?? [];
-  const pickableGpus = selectedWorker ? backendVisibleGpus(gpuList, selectedWorker.worker.backend) : gpuList;
-  // Keyed off the box's actual GPU count (gpuList), not the backend-filtered
-  // one -- a worker with 2 physical GPUs where only 1 is backend-visible
-  // (e.g. an Intel iGPU alongside an NVIDIA card under cuda) still has real
-  // information worth surfacing here: which single device this run will
-  // target, and that the other one isn't a valid pick at all. Hiding the
-  // picker entirely in that case (pickableGpus.length > 1) previously made
-  // it disappear on exactly the multi-GPU boxes this control exists for.
   const showGpuPicker = gpuList.length > 1;
 
-  // A GPU index picked for one worker doesn't carry over to a different one
-  // -- its hardware.gpu array (and therefore what index N even refers to) is
-  // specific to that worker.
+  // The backend this run will actually execute under: the confirmed
+  // override if the user picked a GPU the worker's own default backend
+  // can't see, otherwise that default.
+  const effectiveBackend = gpuOverrideBackend ?? workerDefaultBackend;
+  const selectedGpu = selectedGpuRawIndex != null ? gpuList[selectedGpuRawIndex] : undefined;
+  // mainGpu sent to the server must be relative to whichever backend will
+  // actually run this request (see shared/types.ts's backendVisibleGpus'
+  // doc comment on RunConfig.main_gpu) -- not selectedGpuRawIndex above,
+  // which is just this picker's own display order.
+  const mainGpuForSubmitRaw =
+    selectedGpu && effectiveBackend ? backendVisibleGpus(gpuList, effectiveBackend).indexOf(selectedGpu) : -1;
+  const mainGpuForSubmit = mainGpuForSubmitRaw >= 0 ? mainGpuForSubmitRaw : undefined;
+
+  // A GPU picked for one worker doesn't carry over to a different one --
+  // its hardware.gpu array (and therefore what index N even refers to) is
+  // specific to that worker, and any pending backend-switch confirmation
+  // was about that worker's own build, not the new one.
   useEffect(() => {
-    setMainGpu(undefined);
+    setSelectedGpuRawIndex(undefined);
+    setGpuOverrideBackend(undefined);
   }, [workerName]);
 
   // llama.cpp's own runtime layer accounting is n_layer + 1 -- it counts the
@@ -588,7 +608,8 @@ export function NewRun() {
         model_id: modelId,
         worker_name: workerName,
         mtp_model_id: mtpModelId || undefined,
-        main_gpu: mainGpu,
+        main_gpu: mainGpuForSubmit,
+        main_gpu_backend: gpuOverrideBackend,
         sweep,
       });
       rememberSweep(modelId, workerName, sweep);
@@ -639,17 +660,59 @@ export function NewRun() {
             <label className="flex flex-col gap-1.5 text-sm">
               <span className="text-muted">GPU</span>
               <select
-                value={mainGpu ?? ""}
-                onChange={(e) => setMainGpu(e.target.value === "" ? undefined : Number(e.target.value))}
+                value={selectedGpuRawIndex ?? ""}
+                onChange={(e) => {
+                  const raw = e.target.value === "" ? undefined : Number(e.target.value);
+                  if (raw == null) {
+                    setSelectedGpuRawIndex(undefined);
+                    setGpuOverrideBackend(undefined);
+                    return;
+                  }
+                  const gpu = gpuList[raw];
+                  const required = workerPlatform ? detectBackend(workerPlatform, [gpu]) : workerDefaultBackend;
+                  // Only a real mismatch (both known, and different) needs
+                  // confirming -- an unreachable/unknown worker backend
+                  // falls back to "assume it matches," same as noGpu above,
+                  // rather than blocking every selection on missing data.
+                  if (workerDefaultBackend && required && required !== workerDefaultBackend) {
+                    const proceed = window.confirm(
+                      `${formatGpuLabel(gpu)} needs the "${required}" llama.cpp backend -- this worker's build is ` +
+                        `currently "${workerDefaultBackend}".\n\n` +
+                        `Install and activate a ${required} build for just this run? (The worker's own default ` +
+                        `stays ${workerDefaultBackend} for every other run.)\n\n` +
+                        `Choose Cancel to pick a different GPU instead.`
+                    );
+                    if (!proceed) {
+                      // The native <select> already jumped to the clicked
+                      // option before this handler ran; since state (and
+                      // therefore the controlled `value` prop) isn't
+                      // changing on a cancel, nothing would otherwise force
+                      // the DOM back in sync with React's model -- revert it
+                      // imperatively instead of leaving the visible
+                      // selection out of sync with selectedGpuRawIndex.
+                      e.target.value = selectedGpuRawIndex != null ? String(selectedGpuRawIndex) : "";
+                      return;
+                    }
+                    setGpuOverrideBackend(required);
+                  } else {
+                    setGpuOverrideBackend(undefined);
+                  }
+                  setSelectedGpuRawIndex(raw);
+                }}
                 className={`${inputCls} w-56`}
               >
                 <option value="">Auto (split across all GPUs)</option>
-                {pickableGpus.map((g, i) => (
+                {gpuList.map((g, i) => (
                   <option key={i} value={i}>
-                    {i}: {g.model || g.vendor || "unknown"}
+                    {i}: {formatGpuLabel(g)}
                   </option>
                 ))}
               </select>
+              {gpuOverrideBackend && (
+                <span className="text-xs text-muted">
+                  Will install/activate a {gpuOverrideBackend} build for this run only.
+                </span>
+              )}
             </label>
           )}
           <ModelPicker
