@@ -261,6 +261,21 @@ function listModelDirFiles(): ModelDirFile[] {
   return results;
 }
 
+// Cache for listModelDirFiles(), populated once at startup and then on a
+// timer (see refreshModelDirFilesCache below) rather than re-walked on every
+// /models request -- mirrors the /hardware snapshot above, though unlike
+// hardware this data *can* change while the process is up (downloads,
+// manual file drops), hence the periodic refresh instead of a one-shot.
+let modelDirFilesCache: ModelDirFile[] = [];
+
+function refreshModelDirFilesCache(): void {
+  try {
+    modelDirFilesCache = listModelDirFiles();
+  } catch (err) {
+    log.error(`model dir listing refresh failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
 // Where writeRawJson (worker/src/vps-client.ts) actually lands a given raw
 // dump -- bucketed by outcome so pruneRawJson below can apply a different
 // retention window to each without needing to ask the VPS "was this item a
@@ -663,12 +678,13 @@ const server = createServer(async (req, res) => {
   }
 
   if (req.method === "GET" && url.pathname === "/hardware") {
-    try {
-      const hw = await detectHardware();
-      return send(res, 200, hw);
-    } catch (err) {
-      return send(res, 500, { error: err instanceof Error ? err.message : String(err) });
-    }
+    // Serves the snapshot taken once at process startup (see detectedHardware
+    // above) rather than re-probing live -- on some machines (e.g. bachika1980)
+    // systeminformation's cpu()/graphics() calls are slow enough that hitting
+    // this on every orchestrator poll made the Workers page noticeably laggy
+    // for no benefit, since hardware doesn't change while the process is up.
+    // Restart the worker to pick up real hardware changes.
+    return send(res, 200, detectedHardware);
   }
 
   if (req.method === "GET" && url.pathname === "/llama-cpp") {
@@ -812,12 +828,7 @@ const server = createServer(async (req, res) => {
   }
 
   if (req.method === "GET" && url.pathname === "/models") {
-    try {
-      return send(res, 200, { files: listModelDirFiles() });
-    } catch (err) {
-      log.error(`models listing failed: ${err instanceof Error ? err.message : String(err)}`);
-      return sendError(res, err);
-    }
+    return send(res, 200, { files: modelDirFilesCache });
   }
 
   if (req.method === "DELETE" && url.pathname === "/models") {
@@ -831,6 +842,7 @@ const server = createServer(async (req, res) => {
       }
       unlinkSync(target);
       log.info(`deleted model file ${filename}`);
+      refreshModelDirFilesCache();
       return send(res, 200, { ok: true });
     } catch (err) {
       log.error(`model file delete failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -1002,6 +1014,10 @@ async function runModelDownload(
     log.info(
       `gguf metadata for ${progressKey}: n_layer=${n_layer ?? "unknown"} mtp_layers=${mtp_layers ?? "unknown"}`
     );
+
+    // Reflect the new file immediately rather than waiting for the periodic
+    // refresh -- see refreshModelDirFilesCache above.
+    refreshModelDirFilesCache();
 
     await safeReportDownloadResult({
       worker: config.worker_name,
@@ -1608,6 +1624,13 @@ server.listen(PORT, config.bind_host, () => {
 const RAW_JSON_PRUNE_INTERVAL_MS = 24 * 60 * 60 * 1000;
 pruneRawJson();
 setInterval(pruneRawJson, RAW_JSON_PRUNE_INTERVAL_MS).unref();
+
+// Populate the /models cache right away so the first request after startup
+// doesn't race an empty cache, then keep it fresh on a timer -- see
+// refreshModelDirFilesCache above.
+const MODEL_LIST_REFRESH_INTERVAL_MS = 2 * 60 * 1000;
+refreshModelDirFilesCache();
+setInterval(refreshModelDirFilesCache, MODEL_LIST_REFRESH_INTERVAL_MS).unref();
 
 function shutdown(signal: string): void {
   log.info(`received ${signal}, shutting down...`);
