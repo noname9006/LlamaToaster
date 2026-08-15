@@ -578,6 +578,41 @@ export interface HardwareInfo {
   mem_total_bytes?: number;
 }
 
+// Which of a worker's detected GPUs (HardwareInfo.gpu) a given backend build
+// can actually address as a --main-gpu/-mg target (see worker/src/bench.ts's
+// buildArgs, which forwards a picked index straight through as `-mg
+// <index>`). CUDA only ever enumerates NVIDIA devices and ROCm only AMD --
+// so on a mixed-vendor box (e.g. an Intel iGPU alongside an NVIDIA card),
+// HardwareInfo.gpu's raw index (whatever order systeminformation happens to
+// enumerate controllers in) does NOT correspond to what the backend itself
+// calls index 0/1/2..., and blindly forwarding it can silently select the
+// wrong physical device or an out-of-range one entirely. Every other backend
+// string (vulkan, sycl, openvino, ... or anything future/unrecognized -- see
+// KNOWN_BACKENDS above, Backend accepts any string) is left unfiltered since
+// this app has no specific vendor-visibility mapping for it and wrongly
+// hiding a real device would be worse than not filtering at all. Used by
+// both client/src/pages/NewRun.tsx (building the GPU picker and the index it
+// sends as main_gpu) and worker/src/index.ts (resolving backend_device_name
+// for whatever main_gpu a run actually picked) so both sides agree on what
+// index N means.
+export function backendVisibleGpus<T extends { vendor: string; model: string }>(
+  gpu: T[],
+  backend: Backend
+): T[] {
+  let filtered: T[];
+  if (backend === "cuda") {
+    filtered = gpu.filter((g) => /nvidia/i.test(g.vendor));
+  } else if (backend === "rocm") {
+    filtered = gpu.filter((g) => /amd|advanced micro devices/i.test(g.vendor));
+  } else {
+    return gpu;
+  }
+  // Defensive fallback -- e.g. a GPU whose vendor string systeminformation
+  // reports unexpectedly shouldn't leave a picker (or backend_device_name)
+  // with zero options; better to show/target something than nothing.
+  return filtered.length > 0 ? filtered : gpu;
+}
+
 export interface WorkerCurrentRun {
   run_id: string;
   model_filename: string;
