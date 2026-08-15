@@ -238,6 +238,13 @@ still average within that one process, same as before) -- one crashing
 combination doesn't cost the rest of the sweep, and the worker reports each
 combination's live status individually as it runs (see the API table below).
 
+`expandSweep` also silently drops any `flash_attn:"off"` combination paired
+with a quantized `cache_type_k`/`cache_type_v` -- llama.cpp refuses to create
+a context for that combination outright ("quantized V cache requires
+flash_attn to be enabled"), so it can never produce a result. A sweep made
+up entirely of such combinations is rejected at trigger time instead of
+creating a run with nothing to do.
+
 ## API
 
 | Method | Path | Purpose |

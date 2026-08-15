@@ -4,7 +4,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { IngestResultInput } from "../../shared/types.js";
 import type { SweepItem } from "../../shared/sweep.js";
-import { parseOffloadLayers, type BenchLogger, type BenchResult, type OffloadResult } from "./bench.js";
+import { collapseTensorLoadSpam, parseOffloadLayers, type BenchLogger, type BenchResult, type OffloadResult } from "./bench.js";
 
 // Drives llama-server over HTTP to benchmark MTP (multi-token-prediction)
 // speculative decoding -- llama-bench itself has no --spec-type/--model-draft
@@ -807,6 +807,11 @@ export async function runServerBench(input: ServerBenchRunInput): Promise<BenchR
     // timedOut: true after the fact.
     clearTimeout(timer);
     const exitResult = await stopServer(proc, closed);
+    // See bench.ts's collapseTensorLoadSpam -- --verbosity 4 (buildArgs
+    // above) prints the same one-line-per-tensor load/repack spam
+    // llama-bench's -v does, and this stderr becomes a failed item's
+    // stored `error` verbatim just the same.
+    stderr = collapseTensorLoadSpam(stderr);
     return {
       stdout,
       stderr,
@@ -846,6 +851,7 @@ export async function runServerBench(input: ServerBenchRunInput): Promise<BenchR
       closed,
       new Promise<{ code: null; signal: null }>((r) => setTimeout(() => r({ code: null, signal: null }), STOP_GRACE_MS)),
     ]);
+    stderr = collapseTensorLoadSpam(stderr);
     return {
       stdout,
       stderr,
