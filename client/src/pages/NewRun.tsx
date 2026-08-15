@@ -400,9 +400,14 @@ export function NewRun() {
   // into the unfiltered workerHardware.gpu array.
   const gpuList = workerHardware?.gpu ?? [];
   const pickableGpus = selectedWorker ? backendVisibleGpus(gpuList, selectedWorker.worker.backend) : gpuList;
-  // Only worth offering a choice when there's actually more than one GPU to
-  // pick between -- a single-GPU (or cpu-only) worker has nothing to select.
-  const showGpuPicker = pickableGpus.length > 1;
+  // Keyed off the box's actual GPU count (gpuList), not the backend-filtered
+  // one -- a worker with 2 physical GPUs where only 1 is backend-visible
+  // (e.g. an Intel iGPU alongside an NVIDIA card under cuda) still has real
+  // information worth surfacing here: which single device this run will
+  // target, and that the other one isn't a valid pick at all. Hiding the
+  // picker entirely in that case (pickableGpus.length > 1) previously made
+  // it disappear on exactly the multi-GPU boxes this control exists for.
+  const showGpuPicker = gpuList.length > 1;
 
   // A GPU index picked for one worker doesn't carry over to a different one
   // -- its hardware.gpu array (and therefore what index N even refers to) is
