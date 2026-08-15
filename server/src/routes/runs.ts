@@ -266,16 +266,17 @@ async function activateOnWorker(worker: WorkerDef, tag: string): Promise<{ ok: t
   }
 }
 
-// The orchestrator's WORKERS env var declares a static llama_cpp_build per
-// worker, but the Workers page can switch a worker's active build at runtime
-// (see routes/workers.ts), and a worker can also simply have nothing active
-// yet (fresh install, or its "active" build was deleted). Rather than
-// silently falling back to the possibly-stale/placeholder declared value,
-// self-heal at trigger time: activate the most recently installed build if
-// one exists, or download+install+activate the latest available release for
-// this worker's platform/arch/backend if nothing is installed at all. Only
-// a genuinely unreachable worker, a busy worker with no active build, or a
-// worker with no installable release at all should still fail the trigger.
+// A worker's llama_cpp_build (from config.ts's listWorkers, live off its own
+// /health) can be "unknown" (never successfully probed) or "none" (probed
+// fine, nothing active yet -- fresh install, or its "active" build was
+// deleted), and the Workers page can switch a worker's active build at
+// runtime anyway (see routes/workers.ts). Rather than trusting that
+// possibly-stale snapshot, self-heal at trigger time: activate the most
+// recently installed build if one exists, or download+install+activate the
+// latest available release for this worker's platform/arch/backend if
+// nothing is installed at all. Only a genuinely unreachable worker, a busy
+// worker with no active build, or a worker with no installable release at
+// all should still fail the trigger.
 async function ensureActiveBuild(worker: WorkerDef): Promise<BuildResolution> {
   let health: { busy?: boolean; active_build?: unknown; backend?: unknown; backend_device_name?: unknown };
   try {

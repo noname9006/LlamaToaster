@@ -11,14 +11,13 @@ import { aiRoutes } from "./routes/ai.js";
 import { getDb } from "./db/migrate.js";
 
 // Backs the AI assistant's server-side config only (AI_API_KEY/AI_BASE_URL/
-// AI_MODEL, see routes/ai.ts) -- every other env var here (PORT, WORKERS,
-// ...) keeps coming from the shell/systemd as before, so a missing .env
-// (the common case -- it's optional and gitignored) is not an error.
-// process.loadEnvFile is a built-in Node 20.12+/22 API, no dotenv dependency
-// needed. Reading env vars happens inside route handlers at request time
-// (not at module-load time the way config.ts's WORKERS parsing does), so it
-// doesn't matter that this runs after this file's own imports have already
-// evaluated.
+// AI_MODEL, see routes/ai.ts) -- every other env var here (PORT,
+// WORKER_PORT, ...) keeps coming from the shell/systemd as before, so a
+// missing .env (the common case -- it's optional and gitignored) is not an
+// error. process.loadEnvFile is a built-in Node 20.12+/22 API, no dotenv
+// dependency needed. Reading env vars happens inside route handlers/config.ts
+// at request time, not at module-load time, so it doesn't matter that this
+// runs after this file's own imports have already evaluated.
 try {
   process.loadEnvFile();
 } catch {
@@ -108,18 +107,25 @@ app.get("/health", async (_req, reply) => {
 // -- any GET that isn't a static asset or an /api/* route falls through here
 // and gets the same index.html, so the router can take over path matching in
 // the browser. Non-GET or /api/* misses still get a real JSON 404.
-let indexHtml: string | null = null;
-try {
-  indexHtml = readFileSync(join(clientDist, "index.html"), "utf8");
-} catch {
-  app.log.warn(
-    `${join(clientDist, "index.html")} not found -- run "npm run build" to build the frontend before serving it`
-  );
-}
+//
+// index.html is re-read from disk on every fallback request rather than
+// cached at startup: a client-only deploy (new client/dist/ copied in without
+// restarting this process) would otherwise leave this route serving an
+// index.html whose hashed asset filenames no longer exist on disk, which
+// breaks every path except "/" (served fresh by fastifyStatic) -- the app
+// would 200-and-serve-HTML for the missing JS/CSS instead of loading them.
+const indexHtmlPath = join(clientDist, "index.html");
 
 app.setNotFoundHandler((request, reply) => {
-  if (request.method === "GET" && !request.url.startsWith("/api/") && indexHtml) {
-    return reply.type("text/html").send(indexHtml);
+  if (request.method === "GET" && !request.url.startsWith("/api/")) {
+    try {
+      const indexHtml = readFileSync(indexHtmlPath, "utf8");
+      return reply.type("text/html").send(indexHtml);
+    } catch {
+      app.log.warn(
+        `${indexHtmlPath} not found -- run "npm run build" to build the frontend before serving it`
+      );
+    }
   }
   reply.code(404);
   return { error: "not found" };

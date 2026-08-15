@@ -124,7 +124,7 @@ export function WorkerCard({
           the tailnet.
         </p>
       )}
-      {worker.name === "Local" && (
+      {!worker.is_self && (
         <details open={inaccessible} className="group mt-3 rounded-lg border border-border bg-surface-raised">
           <summary className="flex cursor-pointer items-center justify-between px-2.5 py-1.5 text-xs font-semibold uppercase tracking-wide text-muted">
             Setup / restart commands

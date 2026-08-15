@@ -71,6 +71,7 @@ export interface WorkerListEntry {
   name: string;
   backend: Backend;
   llama_cpp_build: string;
+  is_self: boolean;
 }
 
 export const api = {

@@ -1,101 +1,180 @@
 import type { Backend } from "../../shared/types.js";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+
+const execFileAsync = promisify(execFile);
 
 export interface WorkerDef {
   name: string;
   backend: Backend;
   llama_cpp_build: string;
   url: string;
+  // True for the tailnet node this orchestrator process itself runs on
+  // (typically the VPS, with its worker co-located and managed by the
+  // deploy playbook/systemd) -- used to decide which cards get the
+  // copy-paste bootstrap/restart commands, since those only make sense for
+  // a worker you'd manually set up on a *different* box.
+  is_self: boolean;
 }
 
-// Each worker already knows its own name/backend/active build and reports
-// them live via /health (see worker/src/index.ts) -- WORKERS only needs to
-// say *where* a worker is (its Tailscale URL), never what it is. That's
-// discovered here instead of being hand-declared and left to go stale.
+// Every machine on the Tailscale network is a worker candidate: rather than
+// hand-maintaining a list of URLs (which goes stale the moment someone adds
+// or reinstalls a box, and silently duplicates a worker if the same machine
+// ever ends up reachable under two different tailnet identities), the
+// orchestrator asks Tailscale itself who's on the network via `tailscale
+// status --json`, then probes each peer's own /health on WORKER_PORT to see
+// what (if anything) is running there. A peer that isn't running a worker
+// yet still shows up -- as "can't be reached" with setup instructions,
+// same as an offline worker -- rather than being silently omitted.
+const WORKER_PORT = Number(process.env.WORKER_PORT) || 8080;
 const WORKER_DISCOVERY_TIMEOUT_MS = 5_000;
-// How long a discovered (or placeholder) identity is trusted before the next
-// listWorkers() call re-probes it. Without this, every single page load of
-// the Workers/Models/Dashboard pages -- each of which calls listWorkers()
-// one or more times -- re-fetches /health from every configured worker, so
-// one slow/offline worker (up to WORKER_DISCOVERY_TIMEOUT_MS) stalls the
-// whole page every time, not just once. A worker that's actually online
-// still gets re-checked at most once per TTL, so its reported busy/build
-// state can't go stale for more than this long.
+// How long a discovered (or placeholder) worker identity is trusted before
+// the next listWorkers() call re-probes it. Without this, every single page
+// load of the Workers/Models/Dashboard pages -- each of which calls
+// listWorkers() one or more times -- re-fetches /health from every tailnet
+// peer, so one slow/offline peer (up to WORKER_DISCOVERY_TIMEOUT_MS) stalls
+// the whole page every time, not just once.
 const DISCOVERY_TTL_MS = 15_000;
+const TAILSCALE_STATUS_TIMEOUT_MS = 5_000;
+// Separate, shorter-lived cache for the tailnet member list itself -- a
+// peer joining/leaving should show up reasonably promptly, but every page
+// load still shouldn't shell out to `tailscale status` more than once per
+// TTL.
+const TAILSCALE_STATUS_TTL_MS = 15_000;
 
-function loadWorkerUrls(): string[] {
-  const raw = process.env.WORKERS;
-  if (!raw) {
-    const url = process.env.DEFAULT_WORKER_URL;
-    return url ? [url] : [];
-  }
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch (err) {
-    throw new Error(`WORKERS env var is not valid JSON: ${err instanceof Error ? err.message : String(err)}`);
-  }
-  if (!Array.isArray(parsed) || parsed.length === 0 || !parsed.every((v) => typeof v === "string" && v.length > 0)) {
-    throw new Error('WORKERS env var must be a non-empty JSON array of worker URLs, e.g. ["http://100.x.x.x:8080"]');
-  }
-  return parsed;
+interface TailnetNode {
+  id: string;
+  ip: string;
+  hostname: string;
+  loginName: string;
+  isSelf: boolean;
 }
 
-const workerUrls: string[] = loadWorkerUrls();
+interface RawTailscalePeer {
+  ID: string;
+  HostName?: string;
+  UserID?: number;
+  TailscaleIPs?: string[];
+}
 
-// Last discovery per URL, successful or not, plus when it happened. A
-// worker that's offline the moment it's looked up falls back to whatever
-// was last cached (or, if it's never once answered, a placeholder derived
-// from its URL) so it still shows up -- as "Inaccessible", same as today --
-// instead of silently disappearing from the list. Re-probing an offline
-// worker also only happens once per TTL, not on every request, so a
-// persistently-down worker can't single-handedly keep every page load slow.
-interface CacheEntry {
-  def: WorkerDef;
+interface TailscaleStatusJson {
+  Self?: RawTailscalePeer;
+  Peer?: Record<string, RawTailscalePeer>;
+  User?: Record<string, { LoginName?: string }>;
+}
+
+function firstIPv4(ips: string[] | undefined): string | undefined {
+  return ips?.find((ip) => /^\d+\.\d+\.\d+\.\d+$/.test(ip));
+}
+
+// Tailscale login names are full identifiers like "alice@github" or
+// "alice@gmail.com" -- the part before "@" is what `tailscale status`'s own
+// table output shows, so mirror that convention rather than the full string.
+function shortLogin(loginName: string | undefined): string {
+  if (!loginName) return "unknown";
+  const at = loginName.indexOf("@");
+  return at === -1 ? loginName : loginName.slice(0, at);
+}
+
+function parseTailscaleStatus(json: string): TailnetNode[] {
+  const data = JSON.parse(json) as TailscaleStatusJson;
+  const users = data.User ?? {};
+  const raw: Array<{ peer: RawTailscalePeer; isSelf: boolean }> = [
+    ...(data.Self ? [{ peer: data.Self, isSelf: true }] : []),
+    ...Object.values(data.Peer ?? {}).map((peer) => ({ peer, isSelf: false })),
+  ];
+  const nodes: TailnetNode[] = [];
+  for (const { peer, isSelf } of raw) {
+    const ip = firstIPv4(peer.TailscaleIPs);
+    if (!ip || !peer.HostName) continue;
+    const login = peer.UserID !== undefined ? users[String(peer.UserID)]?.LoginName : undefined;
+    nodes.push({ id: peer.ID, ip, hostname: peer.HostName.toLowerCase(), loginName: shortLogin(login), isSelf });
+  }
+  // Self first, then peers alphabetically by hostname -- gives a stable
+  // "first worker" (the default trigger target, see getDefaultWorker) and a
+  // stable Workers-page order, since Go's JSON map iteration order for
+  // "Peer" isn't guaranteed from one `tailscale status` call to the next.
+  nodes.sort((a, b) => (a.isSelf === b.isSelf ? a.hostname.localeCompare(b.hostname) : a.isSelf ? -1 : 1));
+  return nodes;
+}
+
+let tailnetCache: { nodes: TailnetNode[]; fetchedAt: number } | null = null;
+let warnedTailscaleUnavailable = false;
+
+async function fetchTailnetNodes(): Promise<TailnetNode[]> {
+  const { stdout } = await execFileAsync("tailscale", ["status", "--json"], {
+    timeout: TAILSCALE_STATUS_TIMEOUT_MS,
+  });
+  return parseTailscaleStatus(stdout);
+}
+
+async function getTailnetNodes(): Promise<TailnetNode[]> {
+  if (tailnetCache && Date.now() - tailnetCache.fetchedAt < TAILSCALE_STATUS_TTL_MS) {
+    return tailnetCache.nodes;
+  }
+  try {
+    const nodes = await fetchTailnetNodes();
+    tailnetCache = { nodes, fetchedAt: Date.now() };
+    warnedTailscaleUnavailable = false;
+    return nodes;
+  } catch (err) {
+    if (!warnedTailscaleUnavailable) {
+      warnedTailscaleUnavailable = true;
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(
+        `"tailscale status --json" failed (${message}) -- is Tailscale installed, running, and on PATH for this process? Workers list will be empty until it succeeds.`
+      );
+    }
+    // Keep serving whatever we last had (even if stale) rather than having
+    // every worker vanish from the UI over one transient failure.
+    return tailnetCache?.nodes ?? [];
+  }
+}
+
+interface HealthCacheEntry {
+  backend: Backend;
+  llama_cpp_build: string;
   fetchedAt: number;
 }
-const cache = new Map<string, CacheEntry>();
+const healthCache = new Map<string, HealthCacheEntry>();
 
-function placeholderName(url: string): string {
+async function probeHealth(url: string): Promise<{ backend: Backend; llama_cpp_build: string } | undefined> {
   try {
-    return new URL(url).hostname;
-  } catch {
-    return url;
-  }
-}
-
-async function probe(url: string): Promise<WorkerDef> {
-  const res = await fetch(`${url}/health`, { signal: AbortSignal.timeout(WORKER_DISCOVERY_TIMEOUT_MS) });
-  if (!res.ok) throw new Error(`worker responded ${res.status}`);
-  const health = (await res.json()) as { worker?: unknown; backend?: unknown; active_build?: unknown };
-  if (typeof health.worker === "string" && health.worker && typeof health.backend === "string") {
+    const res = await fetch(`${url}/health`, { signal: AbortSignal.timeout(WORKER_DISCOVERY_TIMEOUT_MS) });
+    if (!res.ok) return undefined;
+    const health = (await res.json()) as { backend?: unknown; active_build?: unknown };
+    if (typeof health.backend !== "string") return undefined;
     return {
-      name: health.worker,
       backend: health.backend,
       llama_cpp_build: typeof health.active_build === "string" ? health.active_build : "none",
-      url,
     };
+  } catch {
+    return undefined;
   }
-  throw new Error("worker's /health response is missing worker/backend");
 }
 
-async function discover(url: string): Promise<WorkerDef> {
-  const cached = cache.get(url);
+async function discover(node: TailnetNode): Promise<WorkerDef> {
+  const url = `http://${node.ip}:${WORKER_PORT}`;
+  const name = `${node.loginName}@${node.hostname}`;
+  const cached = healthCache.get(node.id);
   if (cached && Date.now() - cached.fetchedAt < DISCOVERY_TTL_MS) {
-    return cached.def;
+    return { name, backend: cached.backend, llama_cpp_build: cached.llama_cpp_build, url, is_self: node.isSelf };
   }
-  try {
-    const def = await probe(url);
-    cache.set(url, { def, fetchedAt: Date.now() });
-    return def;
-  } catch {
-    const def = cached?.def ?? { name: placeholderName(url), backend: "unknown", llama_cpp_build: "unknown", url };
-    cache.set(url, { def, fetchedAt: Date.now() });
-    return def;
-  }
+  const health = await probeHealth(url);
+  // On a failed probe, fall back to whatever this node last successfully
+  // reported (so a momentary blip doesn't flash "unknown" over real data)
+  // rather than a placeholder -- same as before, just keyed by tailnet node
+  // identity instead of a hand-configured URL. A node that's never once
+  // answered has no such fallback, so it's genuinely "unknown".
+  const backend = health?.backend ?? cached?.backend ?? "unknown";
+  const llama_cpp_build = health?.llama_cpp_build ?? cached?.llama_cpp_build ?? "unknown";
+  healthCache.set(node.id, { backend, llama_cpp_build, fetchedAt: Date.now() });
+  return { name, backend, llama_cpp_build, url, is_self: node.isSelf };
 }
 
 export async function listWorkers(): Promise<WorkerDef[]> {
-  return Promise.all(workerUrls.map(discover));
+  const nodes = await getTailnetNodes();
+  return Promise.all(nodes.map(discover));
 }
 
 export async function getWorkerForRun(name: string): Promise<WorkerDef | undefined> {

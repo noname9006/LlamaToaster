@@ -1,9 +1,12 @@
 # LlamaToaster — LLM Benchmark Web App (Lean MVP, v2)
 
 Benchmark orchestrator: a **VPS** (Fastify API + a React SPA + SQLite) triggers
-runs on one or more workers (typically named **Remote** for a CPU worker on the
-orchestrator box itself, and **Local** for your GPU box) which run
-`llama-bench` and post the averaged results back. Tailscale between them.
+runs on one or more workers (typically a CPU worker on the orchestrator box
+itself, plus one or more GPU boxes) which run `llama-bench` and post the
+averaged results back. Tailscale between them — workers aren't hand-declared;
+the orchestrator discovers every machine on the tailnet via `tailscale status
+--json` and probes each one's own `/health`, labeling each card
+`<tailscale-account>@<hostname>`.
 
 Architecture, schema, security model, and phasing follow
 [`llm-benchmark-plan-v2.md`](./llm-benchmark-plan-v2.md).
@@ -38,9 +41,7 @@ run automatically on `npm run server` startup.
 ## Running the VPS (orchestrator)
 
 ```bash
-PORT=4010 BIND_HOST=<vps-tailscale-ip> \
-DEFAULT_WORKER_URL=http://<worker-tailscale-ip>:8080 \
-npm run server
+PORT=4010 BIND_HOST=<vps-tailscale-ip> npm run server
 ```
 
 For frontend development with hot reload instead of rebuilding on every
@@ -55,9 +56,8 @@ npm run dev:client
 
 - `BIND_HOST` — **bind to the VPS's own Tailscale IP, not `0.0.0.0`** (see Security).
 - `DB_PATH` — optional SQLite file location (default `./llamatoaster.db`).
-- `DEFAULT_WORKER_URL` — fallback single worker's URL, used when `WORKERS` isn't set.
-- `DEFAULT_WORKER_NAME` — optional, pins the worker a trigger with no explicit `worker_name` routes to (matched against whatever name that worker reports as its own `worker_name`); without it, triggers default to the first entry in `WORKERS`.
-- `WORKERS` — optional JSON array of worker URLs, e.g. `["http://100.x.x.x:8080", "http://100.y.y.y:8080"]`, one per machine. Each worker's name/backend/active build is discovered live from its own `/health` (see `worker/config.json`'s `worker_name`) rather than declared here, so adding a worker only means adding its URL — no need to hand-copy its backend or build.
+- `WORKER_PORT` — optional, the port every worker listens on (default `8080`). All workers on the tailnet must share this one port: workers are discovered by asking Tailscale who's on the network, not declared by URL, so there's no per-machine place to say "mine's on a different port."
+- `DEFAULT_WORKER_NAME` — optional, pins the worker a trigger with no explicit `worker_name` routes to (matched against that worker's discovered `<account>@<hostname>` label); without it, triggers default to the first discovered worker (the orchestrator's own tailnet node, if it has one, then the rest alphabetically by hostname).
 - `LOG_LEVEL` — optional, `debug` | `info` (default) | `warn` | `error`. `debug` adds full sweep/trigger detail to the timestamped request log.
 - `AI_API_KEY` / `AI_BASE_URL` / `AI_MODEL` — optional, enable the dashboard's AI Assistant panel (parameter/model suggestions, informed by your hardware and benchmark results). Unlike the vars above, these are read from a `.env` file at the repo root (copy [`.env.example`](.env.example)) rather than the shell/systemd — it's gitignored and loaded automatically on startup. Without it the panel just reports "not configured."
 
@@ -186,14 +186,16 @@ the worker is up.
    — scope port 4010 (and 8080 if you chose the Tailscale-IP option for the
    worker's own `bind_host`) to the tailscale interface, never a bare `allow`.
 5. Open the dashboard from your own machine (`http://<vps-tailscale-ip>:4010`),
-   go to **Workers**, confirm the `Remote` card loads, and install a build
-   from the dropdown — this is the step that replaces manually building
-   llama.cpp on the VPS.
+   go to **Workers**, confirm the VPS's own card loads (labeled
+   `<your-tailscale-account>@<vps-hostname>`), and install a build from the
+   dropdown — this is the step that replaces manually building llama.cpp on
+   the VPS.
 6. Register a small model (search-and-download panel on **Models**, or place
-   a `.gguf` in `/home/ubuntu/LlamaToaster/models` by hand) and trigger a small run
-   against `Remote` from **New Run** before doing a full sweep — the VPS
-   likely has less RAM than your GPU box, and the dashboard may lag while a
-   benchmark is pegging every CPU core on the same machine that's serving it.
+   a `.gguf` in `/home/ubuntu/LlamaToaster/models` by hand) and trigger a
+   small run against that VPS worker from **New Run** before doing a full
+   sweep — the VPS likely has less RAM than your GPU box, and the dashboard
+   may lag while a benchmark is pegging every CPU core on the same machine
+   that's serving it.
 
 ## Using it
 
@@ -268,6 +270,14 @@ No app-level secret. Protection is at the network layer:
    - Worker (Windows Firewall): scope the inbound rule's remote IP to the VPS Tailscale IP or `100.64.0.0/10`.
 3. Check for a provider-level network firewall that can override `ufw`.
 4. No nginx/TLS — Tailscale is already WireGuard-encrypted.
+5. **Every machine on the tailnet is auto-discovered as a worker candidate**
+   (see "Running the VPS" above) — the orchestrator probes each peer's
+   `/health` on `WORKER_PORT` and lists whatever it finds, including
+   machines you don't personally control if your tailnet is shared with
+   other accounts. Discovery alone doesn't let a peer run anything; a run
+   only ever lands on one because a dashboard user (or `DEFAULT_WORKER_NAME`)
+   explicitly targets it. Keep this in mind before adding a shared or
+   organization-wide tailnet as this app's network.
 
 Verify from outside the tailnet (e.g. phone on cellular):
 
