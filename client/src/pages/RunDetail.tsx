@@ -695,10 +695,14 @@ export function RunDetail() {
 
   // Subheader hardware line: architecture/OS come from the worker's own
   // /llama-cpp+/hardware fetch (workerInfo, best-effort -- omitted if that
-  // worker's unreachable); VRAM/RAM totals come from this run's own results
-  // instead (system_memory_total_mb/gpu_memory_total_mb are static hardware
-  // facts sampled once per test, see ResultRow's own doc comments) since
-  // WorkerLlamaCppInfo's HardwareInfo has no memory-size fields at all.
+  // worker's unreachable). VRAM has no static-hardware equivalent (capacity
+  // isn't part of HardwareInfo), so it's only ever available once a result
+  // reports gpu_memory_total_mb -- absent for the whole time a run is still
+  // "running" with no item finished yet. RAM does have a static source (hw
+  // .mem_total_bytes, see worker/src/hardware.ts's detectHardware) and is
+  // shown immediately from that, upgrading to a result's own
+  // system_memory_total_mb once one exists -- same numbers either way (both
+  // ultimately read si.mem().total on that worker), just available sooner.
   // backend_device_name is preferred over hw.gpu for the GPU label since
   // it's Run's own two-tier-detected value for whatever actually ran this
   // benchmark, not just whatever's currently in the box.
@@ -708,7 +712,9 @@ export function RunDetail() {
     run?.backend_device_name || (hw?.gpu.length ? hw.gpu.map((g) => g.model).join(", ") : undefined);
   const gpuLabel = gpuDeviceLabel && run ? `${gpuDeviceLabel} (${run.llama_cpp_backend})` : gpuDeviceLabel;
   const vramTotalMib = results.find((r) => r.gpu_memory_total_mb != null)?.gpu_memory_total_mb;
-  const ramTotalMib = results.find((r) => r.system_memory_total_mb != null)?.system_memory_total_mb;
+  const ramTotalMib =
+    results.find((r) => r.system_memory_total_mb != null)?.system_memory_total_mb ??
+    (hw?.mem_total_bytes != null ? Math.round(hw.mem_total_bytes / (1024 * 1024)) : undefined);
   const hardwareBits = [
     workerInfo?.arch,
     cpuLabel ? `${cpuLabel}${hw?.cpu.cores ? ` (${hw.cpu.cores} threads)` : ""}` : undefined,
