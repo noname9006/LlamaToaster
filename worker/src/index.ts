@@ -498,6 +498,9 @@ const server = createServer(async (req, res) => {
         // sweep has an "mtp: on" item and the server resolved one (see
         // server/src/routes/runs.ts). Absent for Qwen-style in-file MTP.
         mtp_model?: Model;
+        // See shared/types.ts's RunConfig.main_gpu -- forwarded unchanged
+        // into runSweepItem/runSweepItemViaServer below.
+        main_gpu?: number;
         sweep: Omit<SweepConfig, "model_id">;
         llama_cpp_build: string;
         llama_cpp_backend: Backend;
@@ -601,6 +604,7 @@ const server = createServer(async (req, res) => {
                 llamaServerPath: activeBuild!.serverPath,
                 port: config.mtp_server_port ?? DEFAULT_MTP_SERVER_PORT,
                 backend,
+                mainGpu: reqBody.main_gpu,
                 timeoutMs: config.bench_timeout_ms,
                 rawJsonDir: rawDir,
               })
@@ -614,6 +618,7 @@ const server = createServer(async (req, res) => {
                 modelPath,
                 llamaBenchPath: activeBuild!.path,
                 backend,
+                mainGpu: reqBody.main_gpu,
                 timeoutMs: config.bench_timeout_ms,
                 vpsUrl: config.vps_url,
                 rawJsonDir: rawDir,
@@ -1051,6 +1056,9 @@ interface RunSweepItemInput {
   modelPath: string;
   llamaBenchPath: string;
   backend: Backend;
+  // See shared/types.ts's RunConfig.main_gpu -- forwarded to bench.ts's
+  // buildArgs unchanged.
+  mainGpu?: number;
   timeoutMs: number | undefined;
   vpsUrl: string;
   rawJsonDir: string;
@@ -1383,6 +1391,7 @@ async function runSweepItem(input: RunSweepItemInput): Promise<TerminalRunItemSt
       repeats: input.repeats,
       llamaBenchPath: input.llamaBenchPath,
       backend,
+      mainGpu: input.mainGpu,
       timeoutMs: input.timeoutMs,
       onSpawn: (proc) => {
         activeBenchProc = proc;
@@ -1519,6 +1528,9 @@ interface RunSweepItemViaServerInput {
   llamaServerPath: string;
   port: number;
   backend: Backend;
+  // See shared/types.ts's RunConfig.main_gpu -- forwarded to serverBench.ts's
+  // buildArgs unchanged.
+  mainGpu?: number;
   timeoutMs: number | undefined;
   rawJsonDir: string;
 }
@@ -1556,6 +1568,7 @@ async function runSweepItemViaServer(input: RunSweepItemViaServerInput): Promise
       repeats: input.repeats,
       llamaServerPath: input.llamaServerPath,
       port: input.port,
+      mainGpu: input.mainGpu,
       timeoutMs: input.timeoutMs,
       onSpawn: (proc) => {
         activeBenchProc = proc;

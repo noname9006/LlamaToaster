@@ -174,6 +174,14 @@ export interface RunConfig {
   // run, not swept -- unlike flash_attn, "which draft model" isn't something
   // that makes sense to toggle per combination.
   mtp_model_id?: string;
+  // Index into the worker's HardwareInfo.gpu array (see worker/src/index.ts's
+  // /run handler) -- restricts this run to that one GPU on a multi-GPU
+  // worker, forwarded to llama-bench/llama-server as `-sm none -mg <index>`
+  // (see worker/src/bench.ts and worker/src/serverBench.ts's buildArgs).
+  // Undefined means "let llama.cpp use its own default" (split across every
+  // visible GPU) -- same as before this field existed. Meaningless (ignored)
+  // on a single-GPU or cpu-only worker.
+  main_gpu?: number;
   sweep: Omit<SweepConfig, "model_id">;
 }
 
@@ -530,6 +538,8 @@ export interface TriggerPayload {
   // See RunConfig.mtp_model_id -- same field, forwarded through the trigger
   // request rather than looked up server-side from anything else.
   mtp_model_id?: string;
+  // See RunConfig.main_gpu -- same field, forwarded through unchanged.
+  main_gpu?: number;
   sweep: Omit<SweepConfig, "model_id">;
 }
 
@@ -559,6 +569,13 @@ export interface HardwareInfo {
   arch: string;
   cpu: { manufacturer: string; brand: string; flags: string[]; cores: number };
   gpu: { vendor: string; model: string }[];
+  // Total system RAM in bytes (on Apple Silicon, total *unified* memory --
+  // shared with the GPU, not a separate pool) -- see worker/src/hardware.ts's
+  // detectHardware, si.mem().total. Optional so a worker process still
+  // running old code (hasn't been restarted since this field was added)
+  // keeps reporting a valid snapshot, just without this one value -- see
+  // that same file's /hardware handler for why a restart is required at all.
+  mem_total_bytes?: number;
 }
 
 export interface WorkerCurrentRun {

@@ -184,6 +184,14 @@ export function WorkerCard({
                   <span className="text-muted"> · {info.hardware.cpu.cores} threads</span>
                 ) : null}
               </dd>
+              <dt className="text-muted">RAM</dt>
+              <dd className="text-fg">
+                {info.hardware?.mem_total_bytes ? (
+                  formatBytes(info.hardware.mem_total_bytes)
+                ) : (
+                  <span className="text-muted">unknown</span>
+                )}
+              </dd>
               <dt className="text-muted">GPU</dt>
               <dd className="text-fg">
                 {info.hardware ? (
