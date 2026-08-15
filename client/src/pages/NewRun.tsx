@@ -7,7 +7,7 @@ import { ModelPicker } from "../components/ModelPicker";
 import { SliderChipInput } from "../components/SliderChipInput";
 import { ToggleChipGroup } from "../components/ToggleChipGroup";
 import { IconChevronDown } from "../components/icons";
-import { isMtpDraftModel } from "../types";
+import { isMtpDraftModel, backendVisibleGpus } from "../types";
 import type { Model, SweepConfig } from "../types";
 
 type Sweep = Omit<SweepConfig, "model_id">;
@@ -390,10 +390,19 @@ export function NewRun() {
   // see WorkerListEntry) since a "cpu" backend build ignores -ngl regardless
   // of what's physically in the box.
   const noGpu = workerHardware ? workerHardware.gpu.length === 0 : selectedWorker?.worker.backend === "cpu";
+  // Restricted to whatever this worker's active backend can actually address
+  // via --main-gpu (see shared/types.ts's backendVisibleGpus) -- e.g. an
+  // Intel iGPU alongside an NVIDIA card isn't a valid -mg target on a cuda
+  // build at all, so offering it (or sending its raw hardware.gpu index
+  // through as main_gpu) would silently pick the wrong device or an
+  // out-of-range one. The index used below (i) is this filtered list's own
+  // position, which is what actually gets sent as main_gpu -- not an index
+  // into the unfiltered workerHardware.gpu array.
+  const gpuList = workerHardware?.gpu ?? [];
+  const pickableGpus = selectedWorker ? backendVisibleGpus(gpuList, selectedWorker.worker.backend) : gpuList;
   // Only worth offering a choice when there's actually more than one GPU to
   // pick between -- a single-GPU (or cpu-only) worker has nothing to select.
-  const gpuList = workerHardware?.gpu ?? [];
-  const showGpuPicker = gpuList.length > 1;
+  const showGpuPicker = pickableGpus.length > 1;
 
   // A GPU index picked for one worker doesn't carry over to a different one
   // -- its hardware.gpu array (and therefore what index N even refers to) is
@@ -630,7 +639,7 @@ export function NewRun() {
                 className={`${inputCls} w-56`}
               >
                 <option value="">Auto (split across all GPUs)</option>
-                {gpuList.map((g, i) => (
+                {pickableGpus.map((g, i) => (
                   <option key={i} value={i}>
                     {i}: {g.model || g.vendor || "unknown"}
                   </option>

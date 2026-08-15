@@ -31,16 +31,17 @@ import {
 } from "./llama-builds.js";
 import { detectHardware, detectBackend } from "./hardware.js";
 import { readGgufInfo } from "./gguf.js";
-import type {
-  Model,
-  SweepConfig,
-  IngestResultInput,
-  Backend,
-  InstalledBuild,
-  RunItemTickInput,
-  RunItemTerminalInput,
-  ModelDownloadCallbackInput,
-  TerminalRunItemStatus,
+import {
+  backendVisibleGpus,
+  type Model,
+  type SweepConfig,
+  type IngestResultInput,
+  type Backend,
+  type InstalledBuild,
+  type RunItemTickInput,
+  type RunItemTerminalInput,
+  type ModelDownloadCallbackInput,
+  type TerminalRunItemStatus,
 } from "../../shared/types.js";
 import { expandSweep, deriveTestType, type SweepItem } from "../../shared/sweep.js";
 
@@ -116,20 +117,59 @@ if (!config.backend) {
   log.info(`no backend set in config.json -- auto-detected "${backend}" from hardware`);
 }
 
-// Tier-1 backend_device_name fallback (see shared/types.ts's
-// Run.backend_device_name) -- always available, reported via /health below.
-// Upgraded opportunistically once the first non-MTP sweep item completes
-// (see worker/src/index.ts's runSweepItem, which sends bench.gpu_info --
-// llama-bench's own exact device-name string -- as a Tier-2 upgrade).
-const backendDeviceNameFallback: string | undefined =
-  backend === "cpu"
-    ? "CPU"
-    : (detectedHardware.gpu[0]?.model || detectedHardware.gpu[0]?.vendor || undefined);
+// Tier-1 backend_device_name (see shared/types.ts's Run.backend_device_name)
+// -- reported via /health below, optionally scoped to a specific run's
+// --main-gpu selection via that route's ?main_gpu= query param (only ever
+// sent by server/src/routes/runs.ts's ensureActiveBuild, right before
+// dispatching that exact run; every other /health poll -- e.g. the Workers
+// page's generic card fetch -- omits it and gets this backend's first
+// visible device instead). Upgraded opportunistically once the first
+// non-MTP sweep item completes (see runSweepItem below, which sends
+// bench.gpu_info -- llama-bench's own exact device-name string -- as a
+// Tier-2 upgrade) -- Tier-2 has the same "lists every visible device, not
+// just the selected one" caveat as this Tier-1 estimate on a backend that
+// can see multiple GPUs at once (e.g. Vulkan), since that's what llama-bench
+// itself reports regardless of -mg.
+//
+// Filtered through backendVisibleGpus rather than indexing detectedHardware
+// .gpu directly: that array is in whatever order systeminformation happens
+// to enumerate controllers, which has no relationship to which devices this
+// backend can even see (e.g. an Intel iGPU isn't a CUDA device at all) --
+// gpu[0] unfiltered could easily be a device this backend can't use.
+function backendDeviceName(mainGpu: number | undefined): string | undefined {
+  if (backend === "cpu") return "CPU";
+  const visible = backendVisibleGpus(detectedHardware.gpu, backend);
+  if (visible.length === 0) return undefined;
+  const picked = mainGpu != null ? visible[mainGpu] : visible[0];
+  return picked?.model || picked?.vendor || undefined;
+}
 
 log.info(
   `[worker ${config.worker_name}] starting (backend=${backend}, build=${config.llama_cpp_build}, log level=${
     process.env.LOG_LEVEL ?? "info"
   })`
+);
+log.info(
+  `[worker ${config.worker_name}] OS: ${detectedHardware.platform} (${detectedHardware.arch})`
+);
+log.info(
+  `[worker ${config.worker_name}] CPU: ${
+    detectedHardware.cpu.brand || detectedHardware.cpu.manufacturer || "unknown"
+  }${detectedHardware.cpu.cores ? ` (${detectedHardware.cpu.cores} threads)` : ""}`
+);
+log.info(
+  `[worker ${config.worker_name}] RAM: ${
+    detectedHardware.mem_total_bytes != null
+      ? `${Math.round(detectedHardware.mem_total_bytes / (1024 * 1024))}MiB`
+      : "unavailable (systeminformation reported no usable total)"
+  }`
+);
+log.info(
+  `[worker ${config.worker_name}] GPU: ${
+    detectedHardware.gpu.length > 0
+      ? detectedHardware.gpu.map((g) => g.model || g.vendor).join(", ")
+      : "none detected"
+  }`
 );
 
 // Best-effort warm-up of the VRAM-reading path (worker/src/vram.ts). On
@@ -670,6 +710,11 @@ const server = createServer(async (req, res) => {
   }
 
   if (req.method === "GET" && url.pathname === "/health") {
+    // ?main_gpu=<n> scopes backend_device_name to a specific about-to-run
+    // run's --main-gpu selection -- see backendDeviceName above.
+    const mainGpuParam = url.searchParams.get("main_gpu");
+    const mainGpu =
+      mainGpuParam != null && /^\d+$/.test(mainGpuParam) ? Number(mainGpuParam) : undefined;
     return send(res, 200, {
       ok: true,
       worker: config.worker_name,
@@ -677,7 +722,7 @@ const server = createServer(async (req, res) => {
       paused: pauseRequested,
       current_run: currentRun,
       backend,
-      backend_device_name: backendDeviceNameFallback ?? null,
+      backend_device_name: backendDeviceName(mainGpu) ?? null,
       active_build: activeBuild?.tag ?? null,
     });
   }
@@ -1099,6 +1144,29 @@ function formatItemParams(item: SweepItem): string {
   return item.mtp === "on" ? `${base} ngld=${item.n_gpu_layers_draft}` : base;
 }
 
+// Logged once per item at test start (see runSweepItem/runSweepItemViaServer
+// below) so which physical GPU a run is actually targeting is visible
+// immediately, without waiting for llama-bench's own end-of-item JSON (Tier-2
+// backend_device_name, only available on the llama-bench path anyway -- see
+// bench.ts's gpu_info doc comment) or the client's display, which may itself
+// still be showing the Tier-1 estimate. Flags an out-of-range mainGpu
+// explicitly (rather than letting -mg fail silently downstream in
+// llama-bench/llama-server) since that's exactly the failure mode a raw,
+// unfiltered hardware.gpu index used to produce -- see shared/types.ts's
+// backendVisibleGpus.
+function formatDeviceSelection(mainGpu: number | undefined): string {
+  const visible = backendVisibleGpus(detectedHardware.gpu, backend);
+  if (mainGpu == null) {
+    return visible.length > 0
+      ? `auto -- split across all ${backend}-visible GPU(s): ${visible.map((g) => g.model || g.vendor).join(", ")}`
+      : `auto (no ${backend}-visible GPU detected)`;
+  }
+  const picked = visible[mainGpu];
+  return picked
+    ? `${picked.model || picked.vendor} (main_gpu=${mainGpu} of ${visible.length} ${backend}-visible GPU(s))`
+    : `main_gpu=${mainGpu} is OUT OF RANGE -- only ${visible.length} ${backend}-visible GPU(s) detected`;
+}
+
 function formatOffloadLine(offload: OffloadResult): string {
   if (!offload.main) return "offload: unknown (no offload line seen in output)";
   const main = `main=${offload.main.gpu_layers_loaded}/${offload.main.total_model_layers}`;
@@ -1233,7 +1301,8 @@ async function finalizeSweepItemResult(
   processName: string,
   bench: BenchResult,
   stats: SampleStats,
-  baseline: FreeMemoryBaseline
+  baseline: FreeMemoryBaseline,
+  mainGpu: number | undefined
 ): Promise<TerminalRunItemStatus> {
   // Read from llama.cpp's own runtime output (see bench.ts's
   // parseOffloadLayers) -- both null when the line was never seen at all
@@ -1306,8 +1375,16 @@ async function finalizeSweepItemResult(
       // Run.backend_device_name) -- undefined on the llama-server/MTP path,
       // which never sets bench.gpu_info (confirmed live: llama-server prints
       // no device-enumeration line at any verbosity), so this naturally
-      // no-ops there without any extra branching.
-      backend_device_name: bench.gpu_info,
+      // no-ops there without any extra branching. Only applied when this run
+      // didn't pin a specific mainGpu: llama-bench's own gpu_info lists
+      // *every* device this backend can see (confirmed live -- it's built
+      // from the backend's full device enumeration, not what -sm none -mg
+      // actually restricted compute to), which is the right thing to show
+      // for an auto/split-across-all-GPUs run but would silently reintroduce
+      // the "picked one GPU, display shows several" bug this run explicitly
+      // avoided by pinning one -- the already-correct single-device Tier-1
+      // name (see backendDeviceName above) stays authoritative in that case.
+      backend_device_name: mainGpu == null ? bench.gpu_info : undefined,
     });
     return "done";
   }
@@ -1353,6 +1430,7 @@ async function runSweepItem(input: RunSweepItemInput): Promise<TerminalRunItemSt
     testType === "pp" ? "processing" : testType === "tg" ? "generating" : "benchmarking";
 
   log.info(`${label}: starting test -- engine=llama-bench params: ${formatItemParams(item)}`);
+  log.info(`${label}: device: ${formatDeviceSelection(input.mainGpu)}`);
   const baseline = await captureFreeMemoryBaseline(backend);
   log.info(
     `${label}: free memory before start: ram=${baseline.ram_free_before_mib}MiB` +
@@ -1500,7 +1578,7 @@ async function runSweepItem(input: RunSweepItemInput): Promise<TerminalRunItemSt
       stderr: bench.stderr,
     });
     logDiagnosticOutput(label, "llama-bench", bench.stderr);
-    return await finalizeSweepItemResult(runId, item, label, "llama-bench", bench, stats, baseline);
+    return await finalizeSweepItemResult(runId, item, label, "llama-bench", bench, stats, baseline, input.mainGpu);
   } catch (err) {
     if (tickTimer) clearInterval(tickTimer);
     activeBenchProc = null;
@@ -1548,6 +1626,7 @@ async function runSweepItemViaServer(input: RunSweepItemViaServerInput): Promise
   const label = `run ${runId} item ${item.idx} (mtp)`;
 
   log.info(`${label}: starting test -- engine=llama-server params: ${formatItemParams(item)}`);
+  log.info(`${label}: device: ${formatDeviceSelection(input.mainGpu)}`);
   const baseline = await captureFreeMemoryBaseline(backend);
   log.info(
     `${label}: free memory before start: ram=${baseline.ram_free_before_mib}MiB` +
@@ -1596,7 +1675,7 @@ async function runSweepItemViaServer(input: RunSweepItemViaServerInput): Promise
       stderr: bench.stderr,
     });
     logDiagnosticOutput(label, "llama-server", bench.stderr);
-    return await finalizeSweepItemResult(runId, item, label, "llama-server", bench, stats, baseline);
+    return await finalizeSweepItemResult(runId, item, label, "llama-server", bench, stats, baseline, input.mainGpu);
   } catch (err) {
     activeBenchProc = null;
     const stats = sampler.stop();

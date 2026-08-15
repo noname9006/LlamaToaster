@@ -277,10 +277,16 @@ async function activateOnWorker(worker: WorkerDef, tag: string): Promise<{ ok: t
 // nothing is installed at all. Only a genuinely unreachable worker, a busy
 // worker with no active build, or a worker with no installable release at
 // all should still fail the trigger.
-async function ensureActiveBuild(worker: WorkerDef): Promise<BuildResolution> {
+async function ensureActiveBuild(worker: WorkerDef, mainGpu?: number): Promise<BuildResolution> {
   let health: { busy?: boolean; active_build?: unknown; backend?: unknown; backend_device_name?: unknown };
   try {
-    const res = await fetch(`${worker.url}/health`, { signal: AbortSignal.timeout(WORKER_HEALTH_TIMEOUT_MS) });
+    // mainGpu (when this trigger picked a specific GPU) is forwarded as
+    // ?main_gpu= so the worker's own backend_device_name -- see worker/src/
+    // index.ts's backendDeviceName -- is scoped to that exact selection
+    // rather than its generic "first backend-visible device" default.
+    const healthUrl = new URL(`${worker.url}/health`);
+    if (mainGpu != null) healthUrl.searchParams.set("main_gpu", String(mainGpu));
+    const res = await fetch(healthUrl, { signal: AbortSignal.timeout(WORKER_HEALTH_TIMEOUT_MS) });
     if (!res.ok) throw new Error(`worker responded ${res.status}`);
     health = (await res.json()) as typeof health;
   } catch (err) {
@@ -435,7 +441,7 @@ async function dispatchScheduledRun(app: FastifyInstance, workerName: string): P
   }
   const mtpModel = next.config.mtp_model_id ? repo.getModel(next.config.mtp_model_id) : undefined;
 
-  const live = await ensureActiveBuild(worker);
+  const live = await ensureActiveBuild(worker, next.config.main_gpu);
   if ("error" in live) {
     app.log.error({ run_id: next.id, worker: workerName, error: live.error }, "queued run dispatch failed");
     repo.failAllRunItems(next.id, live.error);
@@ -645,7 +651,7 @@ export async function runsRoutes(app: FastifyInstance): Promise<void> {
         return reply.code(201).send({ run: scheduledRun });
       }
 
-      const live = await ensureActiveBuild(worker);
+      const live = await ensureActiveBuild(worker, body.main_gpu);
       if ("error" in live) {
         request.log.warn(
           { worker: worker.name, model_id: body.model_id, error: live.error },
