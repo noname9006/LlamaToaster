@@ -3,7 +3,7 @@ import { api, type WorkerListEntry } from "../api/client";
 import type { WorkerStatus } from "../api/useWorkerStatus";
 import { StatusPill, WorkerStatusPill, ElapsedSince } from "./StatusPill";
 import { IconCheck, IconChevronDown, IconDownload, IconTrash } from "./icons";
-import { copyToClipboard, formatBytes, formatDate } from "../utils";
+import { copyToClipboard, formatBytes, formatDate, formatGpuLabel } from "../utils";
 
 type SetupOS = "windows" | "macos" | "linux";
 
@@ -199,7 +199,7 @@ export function WorkerCard({
                     // systeminformation's GPU model strings already include the
                     // vendor name (e.g. "AMD Radeon RX 6600 XT") -- prefixing
                     // g.vendor too would just repeat it.
-                    info.hardware.gpu.map((g) => g.model).join(", ")
+                    info.hardware.gpu.map((g) => formatGpuLabel(g)).join(", ")
                   ) : (
                     <span className="text-muted">none detected</span>
                   )
