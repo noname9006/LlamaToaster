@@ -12,6 +12,7 @@ import {
 } from "../components/StatusPill";
 import { Chart } from "../components/Chart";
 import { Th, toggleSort, type SortState } from "../components/Th";
+import { Tooltip } from "../components/Tooltip";
 import { IconInfo } from "../components/icons";
 import type {
   Run,
@@ -35,6 +36,15 @@ interface ColDef {
   // touching padding on either column's *other* side. Defaults to the
   // standard px-2 when omitted.
   padX?: string;
+  // Groups this column under a shared "RAM"/"VRAM" super-header (see the
+  // two-row <thead> in the component below) instead of its own full-width
+  // header cell -- lets ram/vram_* columns drop the repeated "ram "/"vram "
+  // prefix from their own label ("free" instead of "ram free"), which is
+  // what keeps this already-26-column table narrow enough to fit a 1920px
+  // window without a horizontal scrollbar (the un-abbreviated labels were
+  // the single biggest contributor to table width, wider than any cell's
+  // actual content).
+  group?: "ram" | "vram";
 }
 
 // One merged table, visible in full as soon as a run is triggered (items are
@@ -105,14 +115,48 @@ const MERGED_COLUMN_DEFS: ColDef[] = [
       "Estimated time to first token, derived as prompt tokens ÷ PP speed. Not a directly measured request latency — this app benchmarks locally via llama-bench, not through a live serving request.",
     sortKey: "ttft",
   },
-  { label: "ram free", description: "Free system RAM immediately before this test started.", sortKey: "ram_free" },
-  { label: "ram avg", description: "Average RAM used by the process while this test ran.", sortKey: "ram_avg" },
-  { label: "ram max", description: "Peak RAM used by the process during this test.", sortKey: "ram_max" },
-  { label: "vram total", description: "Total GPU memory (VRAM) capacity reported by the backend.", sortKey: "vram_total" },
-  { label: "vram free", description: "Free GPU memory immediately before this test started (best-effort).", sortKey: "vram_free" },
-  { label: "vram avg", description: "Average GPU memory used while this test ran (best-effort).", sortKey: "vram_avg" },
-  { label: "vram max", description: "Peak GPU memory used during this test (best-effort).", sortKey: "vram_max" },
+  { label: "free", description: "Free system RAM immediately before this test started.", sortKey: "ram_free", group: "ram" },
+  { label: "avg", description: "Average RAM used by the process while this test ran.", sortKey: "ram_avg", group: "ram" },
+  { label: "max", description: "Peak RAM used by the process during this test.", sortKey: "ram_max", group: "ram" },
+  {
+    label: "total",
+    description: "Total GPU memory (VRAM) capacity reported by the backend.",
+    sortKey: "vram_total",
+    group: "vram",
+  },
+  {
+    label: "free",
+    description: "Free GPU memory immediately before this test started (best-effort).",
+    sortKey: "vram_free",
+    group: "vram",
+  },
+  {
+    label: "avg",
+    description: "Average GPU memory used while this test ran (best-effort).",
+    sortKey: "vram_avg",
+    group: "vram",
+  },
+  {
+    label: "max",
+    description: "Peak GPU memory used during this test (best-effort).",
+    sortKey: "vram_max",
+    group: "vram",
+  },
 ];
+
+// The two grouped super-header cells' own descriptions, shown on hover over
+// "RAM"/"VRAM" themselves -- distinct from each sub-column's own tooltip.
+const MEMORY_GROUP_DESCRIPTIONS: Record<"ram" | "vram", string> = {
+  ram: "System RAM (main memory), sampled around this test.",
+  vram: "GPU memory (VRAM), sampled around this test -- see the individual worker/backend for how directly this is measured.",
+};
+
+// Split once, at module scope, into the plain single-row header cells vs. the
+// two memory groups that share a "RAM"/"VRAM" super-header (see the two-row
+// <thead> below).
+const PRIMARY_COLUMN_DEFS = MERGED_COLUMN_DEFS.filter((c) => !c.group);
+const RAM_COLUMN_DEFS = MERGED_COLUMN_DEFS.filter((c) => c.group === "ram");
+const VRAM_COLUMN_DEFS = MERGED_COLUMN_DEFS.filter((c) => c.group === "vram");
 
 const LEGACY_COLUMN_DESCRIPTIONS: Record<string, string> = {
   test: "pp = prompt processing, tg = text generation, pg = both in one llama-bench call.",
@@ -697,6 +741,13 @@ export function RunDetail() {
     return c;
   }, [items]);
 
+  // Distinct from statusCounts.failed: a "done" item can still carry a
+  // warning in its error field (e.g. an MTP reading flagged suspect -- see
+  // worker/src/index.ts's bench.warning handling), which shows up as red
+  // text in the table below but isn't a failure. The per-run log has real
+  // extra detail in that case too, so the download link should cover it.
+  const hasFlaggedItems = useMemo(() => items.some((it) => !!it.error), [items]);
+
   const visibleItems = useMemo(() => {
     const filtered = items.filter((it) => matchesStatusFilter(it.status, statusFilter));
     if (!sort) return filtered;
@@ -851,10 +902,36 @@ export function RunDetail() {
           <div className="mt-2 overflow-x-auto rounded-xl border border-border bg-surface">
             <table className="w-full text-left text-xs">
               <thead>
-                <tr className="border-b border-border uppercase tracking-wide text-muted">
-                  {MERGED_COLUMN_DEFS.map((c) => (
+                <tr className="uppercase tracking-wide text-muted">
+                  {PRIMARY_COLUMN_DEFS.map((c) => (
                     <Th
                       key={c.label}
+                      label={c.label}
+                      description={c.description}
+                      sortKey={c.sortKey}
+                      sort={sort}
+                      onSort={c.sortKey ? (k) => setSort((s) => toggleSort(s, k)) : undefined}
+                      className={`${c.padX ?? "!px-1"} !py-1.5 border-b border-border`}
+                      rowSpan={2}
+                    />
+                  ))}
+                  <th
+                    colSpan={RAM_COLUMN_DEFS.length}
+                    className="border-b border-border px-1 py-1 text-center font-medium"
+                  >
+                    <Tooltip text={MEMORY_GROUP_DESCRIPTIONS.ram}>RAM</Tooltip>
+                  </th>
+                  <th
+                    colSpan={VRAM_COLUMN_DEFS.length}
+                    className="border-b border-border px-1 py-1 text-center font-medium"
+                  >
+                    <Tooltip text={MEMORY_GROUP_DESCRIPTIONS.vram}>VRAM</Tooltip>
+                  </th>
+                </tr>
+                <tr className="border-b border-border uppercase tracking-wide text-muted">
+                  {[...RAM_COLUMN_DEFS, ...VRAM_COLUMN_DEFS].map((c, i) => (
+                    <Th
+                      key={`${c.group}-${c.label}-${i}`}
                       label={c.label}
                       description={c.description}
                       sortKey={c.sortKey}
@@ -1128,10 +1205,11 @@ export function RunDetail() {
               Export run CSV
             </a>
           )}
-          {/* Only shown once something has actually failed -- a clean run's
-              per-run log file has nothing more to add beyond the results
-              table above. */}
-          {statusCounts.failed > 0 && (
+          {/* Shown once something failed outright, or once any "done" item
+              still has a warning flagged (see hasFlaggedItems above) -- a
+              fully clean run's per-run log has nothing more to add beyond
+              the results table above. */}
+          {(statusCounts.failed > 0 || hasFlaggedItems) && (
             <a href={api.runLogUrl(id)} download className="text-accent hover:underline">
               Download logs
             </a>

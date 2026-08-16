@@ -375,6 +375,16 @@ async function runCompletion(
     body: JSON.stringify({
       prompt: syntheticPrompt(nPrompt, promptOffset),
       n_predict: nGen,
+      // Without this, llama-server stops as soon as it samples an EOS/stop
+      // token instead of decoding all nGen tokens -- confirmed live on an
+      // MTP run where every repeat returned tokens_predicted=1 (the
+      // instruct-tuned model treating the out-of-distribution filler prompt
+      // as already "finished"), which starved the draft model of anything
+      // to speculate on (0 tokens drafted every time) and fed the wall-clock
+      // tg fallback below a near-meaningless 1-token/lots-of-jitter ratio.
+      // llama-bench's own tg loop (used for the non-MTP tests) never checks
+      // for EOS either, so this keeps the two engines comparing like for like.
+      ignore_eos: true,
       // Otherwise a cache hit on a repeated identical synthetic prompt would
       // skew pp timings toward zero on every repeat after the first.
       cache_prompt: false,
