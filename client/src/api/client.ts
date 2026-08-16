@@ -176,6 +176,10 @@ export const api = {
     return `/api/results/export?${params.toString()}`;
   },
 
+  // Proxies to the worker's own dedicated per-run log file -- see
+  // server/src/routes/runs.ts's GET /api/runs/:id/log.
+  runLogUrl: (id: string): string => `/api/runs/${encodeURIComponent(id)}/log`,
+
   getAiStatus: (): Promise<{ configured: boolean; model?: string }> => request("/api/ai/status"),
 
   // Live (not persisted) Hugging Face check, keyed by model id -- powers the

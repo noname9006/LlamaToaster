@@ -283,6 +283,32 @@ interface CompletionTimings {
   predicted_per_second?: number;
 }
 
+// One /completion call's full outcome -- timings plus the two independent
+// cross-checks used by computeWallClockTgFallback below when timings itself
+// is caught by the MTP timer bug (see MAX_PLAUSIBLE_TG_TOKENS_PER_SECOND).
+interface CompletionOutcome {
+  timings: CompletionTimings;
+  // llama-server's top-level response field (sibling of `timings`, NOT
+  // `timings.predicted_n`) -- populated from the completion loop's own
+  // n_decoded counter, a different code path than the corrupted
+  // timings.predicted_n/predicted_ms pair. Observed live alongside a
+  // predicted_n:1 / predicted_ms:0.001 garbage reading for an actual
+  // 128-token generation, so it is NOT assumed trustworthy by construction --
+  // callers still sanity-check it (see computeWallClockTgFallback) -- but
+  // it's a genuinely separate measurement, not just a rename of the same
+  // broken field.
+  tokensPredicted?: number;
+  // Wall-clock ms for the whole HTTP round trip (performance.now() spanning
+  // the fetch call through the response body being parsed), measured on
+  // this side of the connection -- entirely independent of any timer inside
+  // llama-server itself, so it can't be corrupted by the same bug. Covers
+  // the *whole* request (prompt processing + generation combined, since a
+  // single /completion call does both); computeWallClockTgFallback isolates
+  // the generation-only portion by subtracting the (separately trusted)
+  // prompt_ms back out.
+  wallClockMs: number;
+}
+
 // llama-server's own pre-divided *_per_second timings have been observed
 // live to report wildly implausible values under MTP speculative decoding
 // -- e.g. predicted_per_second: 1000000.00 for a 128-token generation on
@@ -341,7 +367,8 @@ async function runCompletion(
   nGen: number,
   timeoutMs: number,
   promptOffset = 0
-): Promise<CompletionTimings> {
+): Promise<CompletionOutcome> {
+  const startedAt = performance.now();
   const res = await fetch(`http://127.0.0.1:${port}/completion`, {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -375,9 +402,47 @@ async function runCompletion(
     const text = await res.text().catch(() => "");
     throw new Error(`llama-server /completion failed: ${res.status} ${text.slice(0, 500)}`);
   }
-  const data = (await res.json()) as { timings?: CompletionTimings };
+  const data = (await res.json()) as { timings?: CompletionTimings; tokens_predicted?: number };
+  // Measured after the body is fully parsed, not right after fetch() resolves
+  // (which only means headers arrived) -- stream:false above means the whole
+  // response is one JSON blob, so this is genuinely "request fully done."
+  const wallClockMs = performance.now() - startedAt;
   if (!data.timings) throw new Error("llama-server /completion response had no timings");
-  return data.timings;
+  return { timings: data.timings, tokensPredicted: data.tokens_predicted, wallClockMs };
+}
+
+// Fallback tg measurement used only when llama-server's own predicted_n/
+// predicted_ms pair is flagged suspect (see MAX_PLAUSIBLE_TG_TOKENS_PER_SECOND
+// and evaluateRate) -- independent of that internal timer entirely, built
+// from this module's own wall-clock measurement of the /completion request
+// (CompletionOutcome.wallClockMs) plus the top-level tokens_predicted count.
+// "Ignoring prompt processing": a single /completion call measures pp+tg
+// together, so the raw wall-clock span alone would conflate a slow/fast
+// prompt phase into the reported tg rate -- this subtracts the *trusted*
+// prompt_ms (pp has not been observed live to hit the same timer bug) back
+// out first, isolating a generation-only duration, before dividing by the
+// token count. Deliberately conservative: returns undefined (caller keeps
+// reporting the original suspect reading) unless every input needed is
+// actually usable -- a real token count, a positive isolated duration, and
+// (via the ceiling check below) a result that itself looks plausible. This
+// is a prototype cross-check, not a guarantee: tokensPredicted comes from a
+// different llama-server code path than the broken timings.predicted_n, but
+// hasn't been proven immune to the same bug class, hence the ceiling check.
+function computeWallClockTgFallback(
+  timings: CompletionTimings,
+  tokensPredicted: number | undefined,
+  wallClockMs: number,
+  ppSuspect: boolean
+): RateReading | undefined {
+  if (typeof tokensPredicted !== "number" || !Number.isFinite(tokensPredicted) || tokensPredicted <= 0) {
+    return undefined;
+  }
+  const trustedPromptMs = !ppSuspect && typeof timings.prompt_ms === "number" ? timings.prompt_ms : 0;
+  const genOnlyMs = wallClockMs - trustedPromptMs;
+  if (!Number.isFinite(genOnlyMs) || genOnlyMs <= 0) return undefined;
+  const value = (tokensPredicted / genOnlyMs) * 1000;
+  if (!Number.isFinite(value)) return undefined;
+  return { value, suspect: value <= 0 || value > MAX_PLAUSIBLE_TG_TOKENS_PER_SECOND };
 }
 
 interface SpecDecodeMetrics {
@@ -452,10 +517,24 @@ async function checkSpecDecodeMetrics(port: number, label: string, repeats: numb
   return { metrics };
 }
 
+// Sample standard deviation (n-1 denominator, Bessel's correction) --
+// deliberately matches llama-bench's own stdev() (confirmed against its
+// actual upstream source, tools/llama-bench/llama-bench.cpp: `sq_sum /
+// (n - 1) - mean*mean*n/(n - 1)`), not population variance (n denominator).
+// This function's result is the ONLY stddev source for the llama-server/MTP
+// path -- the llama-bench-CLI path (bench.ts) instead trusts llama-bench's
+// own reported stddev_ts verbatim -- so the two paths must use the identical
+// formula or "stddev" would silently mean two different things depending on
+// which engine produced a given row, even though both feed the same
+// RunDetail/Compare.tsx columns side by side. n<2 has no well-defined sample
+// variance (0/0) -- returns 0 rather than NaN/Infinity, since "not enough
+// data to measure spread" is a more honest zero-cost default than surfacing
+// not-a-number to the UI.
 function average(values: number[]): { avg: number; stddev: number } {
   const avg = values.reduce((a, b) => a + b, 0) / values.length;
-  const variance = values.reduce((a, b) => a + (b - avg) ** 2, 0) / values.length;
-  return { avg, stddev: Math.sqrt(variance) };
+  if (values.length < 2) return { avg, stddev: 0 };
+  const sumSquares = values.reduce((a, b) => a + (b - avg) ** 2, 0);
+  return { avg, stddev: Math.sqrt(sumSquares / (values.length - 1)) };
 }
 
 interface PhaseSummary {
@@ -620,12 +699,12 @@ export async function runServerBench(input: ServerBenchRunInput): Promise<BenchR
     const bothPhasesPresent = item.n_prompt > 0 && item.n_gen > 0;
     for (let rep = 1; rep <= input.repeats; rep++) {
       input.onProgress?.(waitPhase, `run ${rep}/${input.repeats}`, waitPhase === "processing" ? lastPpLive : lastTgLive);
-      let timings: CompletionTimings | undefined;
+      let outcome: CompletionOutcome | undefined;
       const candidates = buildOffsetCandidates(preferredOffset, MAX_COMPLETION_ATTEMPTS);
       for (let attempt = 1; ; attempt++) {
         const promptOffset = candidates[attempt - 1];
         try {
-          timings = await runCompletion(input.port, item.n_prompt, item.n_gen, timeoutMs, promptOffset);
+          outcome = await runCompletion(input.port, item.n_prompt, item.n_gen, timeoutMs, promptOffset);
           if (promptOffset !== preferredOffset) {
             preferredOffset = promptOffset;
             saveWorkingOffset(offsetStorePath, offsetKey, preferredOffset, log);
@@ -641,6 +720,7 @@ export async function runServerBench(input: ServerBenchRunInput): Promise<BenchR
           );
         }
       }
+      const { timings, tokensPredicted, wallClockMs } = outcome;
       // Logged unconditionally (not just when something looks wrong) so a
       // run's logs always have enough raw material to judge whether MTP is
       // actually accelerating decode -- not just whether the reported number
@@ -648,16 +728,24 @@ export async function runServerBench(input: ServerBenchRunInput): Promise<BenchR
       log?.debug(
         `${label}: run ${rep}/${input.repeats} raw timings: ` +
           `prompt(n=${timings.prompt_n ?? "?"} ms=${timings.prompt_ms ?? "?"} per_second=${timings.prompt_per_second ?? "?"}) ` +
-          `predicted(n=${timings.predicted_n ?? "?"} ms=${timings.predicted_ms ?? "?"} per_second=${timings.predicted_per_second ?? "?"})`
+          `predicted(n=${timings.predicted_n ?? "?"} ms=${timings.predicted_ms ?? "?"} per_second=${timings.predicted_per_second ?? "?"}) ` +
+          `wall_clock_ms=${wallClockMs.toFixed(1)} tokens_predicted=${tokensPredicted ?? "?"}`
       );
+      let ppSuspectThisRep = false;
       if (item.n_prompt > 0) {
         const pp = evaluateRate(timings.prompt_n, timings.prompt_ms, timings.prompt_per_second, MAX_PLAUSIBLE_PP_TOKENS_PER_SECOND);
         if (pp == null) {
+          // Not computable at all -- prompt_ms itself can't be trusted for
+          // the wall-clock fallback's subtraction below either (see
+          // ppSuspectThisRep's use in computeWallClockTgFallback), same as
+          // the explicitly-flagged-suspect case just below.
+          ppSuspectThisRep = true;
           log?.warn(
             `${label}: run ${rep}/${input.repeats} produced no computable pp reading at all (raw: n=${timings.prompt_n ?? "?"} ` +
               `ms=${timings.prompt_ms ?? "?"} per_second=${timings.prompt_per_second ?? "?"})`
           );
         } else if (pp.suspect) {
+          ppSuspectThisRep = true;
           ppSuspectSamples.push(pp.value);
           ppRepeatSamples.push(pp.value);
           log?.warn(
@@ -673,24 +761,41 @@ export async function runServerBench(input: ServerBenchRunInput): Promise<BenchR
       }
       if (item.n_gen > 0) {
         const tg = evaluateRate(timings.predicted_n, timings.predicted_ms, timings.predicted_per_second, MAX_PLAUSIBLE_TG_TOKENS_PER_SECOND);
-        if (tg == null) {
+        // Server-side reading missing or caught by the known timer bug --
+        // try the wall-clock cross-check before falling back to reporting
+        // the suspect/absent value as-is. Only ever *replaces* a bad
+        // reading with a better one; never overrides an already-clean tg.
+        const fallback =
+          tg == null || tg.suspect
+            ? computeWallClockTgFallback(timings, tokensPredicted, wallClockMs, ppSuspectThisRep)
+            : undefined;
+        const effective = fallback && !fallback.suspect ? fallback : tg;
+        if (fallback && !fallback.suspect) {
+          log?.info(
+            `${label}: run ${rep}/${input.repeats} tg reading recovered via wall-clock fallback (${fallback.value.toFixed(2)} tok/s -- ` +
+              `tokens_predicted=${tokensPredicted}, wall_clock_ms=${wallClockMs.toFixed(1)}` +
+              `${ppSuspectThisRep ? "" : `, minus trusted prompt_ms=${(timings.prompt_ms ?? 0).toFixed(1)}`}) ` +
+              `-- server's own reading was: n=${timings.predicted_n ?? "?"} ms=${timings.predicted_ms ?? "?"} per_second=${timings.predicted_per_second ?? "?"}`
+          );
+        }
+        if (effective == null) {
           log?.warn(
             `${label}: run ${rep}/${input.repeats} produced no computable tg reading at all (raw: n=${timings.predicted_n ?? "?"} ` +
               `ms=${timings.predicted_ms ?? "?"} per_second=${timings.predicted_per_second ?? "?"})`
           );
-        } else if (tg.suspect) {
-          tgSuspectSamples.push(tg.value);
-          tgRepeatSamples.push(tg.value);
+        } else if (effective.suspect) {
+          tgSuspectSamples.push(effective.value);
+          tgRepeatSamples.push(effective.value);
           log?.warn(
-            `${label}: run ${rep}/${input.repeats} tg reading flagged implausible (${tg.value.toFixed(2)} tok/s, ` +
+            `${label}: run ${rep}/${input.repeats} tg reading flagged implausible (${effective.value.toFixed(2)} tok/s, ` +
               `ceiling ${MAX_PLAUSIBLE_TG_TOKENS_PER_SECOND}) -- kept for visibility, excluded from the clean average, ` +
               `likely the known llama-server MTP timing bug (raw: n=${timings.predicted_n ?? "?"} ` +
               `ms=${timings.predicted_ms ?? "?"} per_second=${timings.predicted_per_second ?? "?"})`
           );
         } else {
-          tgSamples.push(tg.value);
-          tgRepeatSamples.push(tg.value);
-          lastTgLive = tg.value;
+          tgSamples.push(effective.value);
+          tgRepeatSamples.push(effective.value);
+          lastTgLive = effective.value;
         }
       }
       // Fires right after this repeat's own result is known, so the phase
