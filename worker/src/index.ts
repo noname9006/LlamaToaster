@@ -20,7 +20,7 @@ import { runServerBench } from "./serverBench.js";
 import { MemorySampler, captureFreeMemoryBaseline, type SampleStats, type FreeMemoryBaseline } from "./sampler.js";
 import { readGpuMemory } from "./vram.js";
 import { writeRawJson, postRunItemUpdate, postModelDownloadResult } from "./vps-client.js";
-import { log, configureLogging } from "./log.js";
+import { log, configureLogging, setRunLogFile } from "./log.js";
 import {
   detectPlatform,
   listInstalledBuilds,
@@ -99,7 +99,32 @@ const config = loadConfig();
 const PORT = config.port ?? 8080;
 const buildsDir = resolve(config.llama_cpp_builds_dir ?? join(__dirname, "..", "llama-builds"));
 
-configureLogging(resolve(config.log_dir ?? join(__dirname, "..", "logs")), process.env.LOG_LEVEL);
+const logDir = resolve(config.log_dir ?? join(__dirname, "..", "logs"));
+configureLogging(logDir, process.env.LOG_LEVEL);
+
+// One dedicated, structured log file per run (see setRunLogFile/the /run
+// handler below), separate from the shared daily worker-*.log above --
+// downloadable via GET /logs?run_id=... and the server's proxying
+// GET /api/runs/:id/log, surfaced in the UI next to the CSV export whenever
+// a run has a failed test (see RunDetail.tsx).
+const runLogsDir = join(logDir, "runs");
+try {
+  mkdirSync(runLogsDir, { recursive: true });
+} catch (err) {
+  log.error(
+    `could not create run-logs dir ${runLogsDir}: ${err instanceof Error ? err.message : String(err)} ` +
+      `(per-run log files will be unavailable)`
+  );
+}
+
+// run_id is always a uuid (server/src/routes/runs.ts's uuid()), but this is
+// also used to build a filesystem path from a value that arrives over HTTP
+// (the download route below) -- validated defensively rather than trusted.
+const SAFE_RUN_ID_RE = /^[a-zA-Z0-9_-]+$/;
+
+function runLogFilePath(runId: string): string {
+  return join(runLogsDir, `${runId}.log`);
+}
 
 // Always detected now (previously only ran when config.backend was unset,
 // which on a worker with an explicit config.json value -- the common case --
@@ -642,6 +667,18 @@ const server = createServer(async (req, res) => {
       activeBenchProc = null;
       send(res, 202, { ok: true, run_id: reqBody.run_id, status: "started", items: items.length });
 
+      setRunLogFile(runLogFilePath(reqBody.run_id));
+      log.info(
+        formatRunLogHeader(
+          reqBody.run_id,
+          reqBody.model,
+          reqBody.mtp_model,
+          effectiveBuild,
+          effectiveBackend,
+          items.length,
+          reqBody.sweep.repeats
+        )
+      );
       log.info(`run ${reqBody.run_id}: ${items.length} test(s) to run`);
       const rawDir = config.raw_json_dir ?? join(config.model_dir, "raw");
       // Tallied across every item regardless of which path handled it, so
@@ -722,12 +759,14 @@ const server = createServer(async (req, res) => {
         log.info(
           `run ${reqBody.run_id} finished all ${items.length} test(s)${stopRequested ? " (stopped early)" : ""}: ${breakdown}`
         );
+        log.info(formatRunLogFooter(reqBody.run_id, items.length, reqBody.sweep.repeats, statusCounts, stopRequested));
       } finally {
         busy = false;
         currentRun = null;
         pauseRequested = false;
         stopRequested = false;
         activeBenchProc = null;
+        setRunLogFile(null);
       }
     });
     return;
@@ -969,6 +1008,23 @@ const server = createServer(async (req, res) => {
     }
   }
 
+  if (req.method === "GET" && url.pathname === "/logs") {
+    const runId = url.searchParams.get("run_id");
+    if (!runId) return send(res, 400, { error: "run_id is required" });
+    if (!SAFE_RUN_ID_RE.test(runId)) return send(res, 400, { error: "invalid run_id" });
+    const target = runLogFilePath(runId);
+    if (!existsSync(target)) return send(res, 404, { error: "no log file for this run" });
+    try {
+      const text = readFileSync(target, "utf8");
+      res.statusCode = 200;
+      res.setHeader("content-type", "text/plain; charset=utf-8");
+      res.end(text);
+    } catch (err) {
+      sendError(res, err);
+    }
+    return;
+  }
+
   send(res, 404, { error: "not found" });
 });
 
@@ -1177,6 +1233,93 @@ const STARTING_RE = /benchmark\s+\d+\/\d+:\s+starting/i;
 // for surfacing offload as soon as it's seen while streaming llama-bench's
 // stderr (see runSweepItem's onStderrLine below), well before that item's
 // process has actually exited.
+
+// One-time banner written to a run's own dedicated log file (see
+// setRunLogFile/runLogFilePath) the moment it starts -- everything needed to
+// make sense of the rest of that file without cross-referencing this
+// worker's shared daily log: exactly which llama.cpp build/backend ran it,
+// what hardware/OS it ran on, and how big the sweep is. Mirrors the
+// OS/CPU/RAM/GPU lines this file already logs once at process startup (see
+// detectedHardware above), just scoped to this one run instead of the
+// worker's whole lifetime.
+const RUN_LOG_RULE = "=".repeat(70);
+
+function formatRunLogHeader(
+  runId: string,
+  model: Model,
+  mtpModel: Model | undefined,
+  build: ActiveBuild,
+  runBackend: Backend,
+  itemCount: number,
+  repeats: number
+): string {
+  const installed = getInstalledBuild(buildsDir, build.tag);
+  const buildLine = installed ? `${build.tag} (${installed.asset_name})` : build.tag;
+  const gpuLine =
+    detectedHardware.gpu.length > 0
+      ? detectedHardware.gpu.map((g) => formatGpuEntry(g)).join(", ")
+      : "none detected";
+  const ramLine =
+    detectedHardware.mem_total_bytes != null
+      ? `${Math.round(detectedHardware.mem_total_bytes / (1024 * 1024))}MiB`
+      : "unavailable";
+  const lines = [
+    RUN_LOG_RULE,
+    " LlamaToaster run log",
+    `  run:         ${runId}`,
+    `  worker:      ${config.worker_name}`,
+    `  started:     ${new Date().toISOString()}`,
+    `  llama.cpp:   ${buildLine} (backend=${runBackend})`,
+    `  os:          ${detectedHardware.platform} (${detectedHardware.arch})`,
+    `  cpu:         ${detectedHardware.cpu.brand || detectedHardware.cpu.manufacturer || "unknown"}${
+      detectedHardware.cpu.cores ? ` (${detectedHardware.cpu.cores} threads)` : ""
+    }`,
+    `  ram:         ${ramLine}`,
+    `  gpu:         ${gpuLine}`,
+    `  model:       ${model.filename}`,
+    ...(mtpModel ? [`  mtp model:   ${mtpModel.filename}`] : []),
+    `  tests:       ${itemCount} sweep combination(s)`,
+    `  repeats:     ${repeats} per test`,
+    `  total runs:  ${itemCount * repeats} (tests x repeats)`,
+    RUN_LOG_RULE,
+  ];
+  return lines.join("\n");
+}
+
+// Closing block for a run's dedicated log file -- "tests" tallies each
+// sweep combination's own outcome (the real unit of success/failure: a
+// single llama-bench/llama-server process covers all of that test's
+// repeats and either produces a usable result or doesn't), "runs" scales
+// that up by the configured repeat count for a figure in the vocabulary the
+// rest of this app uses for -r (see RunDetail.tsx's own "runs means
+// repeats" comment) -- a done test's repeats all completed, a failed one's
+// produced nothing usable, and a cancelled one's never started at all.
+function formatRunLogFooter(
+  runId: string,
+  itemCount: number,
+  repeats: number,
+  statusCounts: Partial<Record<TerminalRunItemStatus, number>>,
+  stoppedEarly: boolean
+): string {
+  const done = statusCounts.done ?? 0;
+  const failed = (statusCounts.failed ?? 0) + (statusCounts.failed_oom ?? 0);
+  const cancelled = statusCounts.cancelled ?? 0;
+  const endReason = stoppedEarly
+    ? "stopped early -- cancelled by user before every test ran"
+    : `performed all ${itemCount} test(s)`;
+  const lines = [
+    RUN_LOG_RULE,
+    ` RUN SUMMARY -- run ${runId}`,
+    `  finished:               ${new Date().toISOString()}`,
+    `  tests:                  ${itemCount} total -- done=${done} failed=${failed} cancelled=${cancelled}`,
+    `  runs (tests x repeats): completed=${done * repeats} failed=${failed * repeats} not run=${
+      cancelled * repeats
+    } (of ${itemCount * repeats} total)`,
+    `  end reason:             ${endReason}`,
+    RUN_LOG_RULE,
+  ];
+  return lines.join("\n");
+}
 
 // One line per sweep item's actual parameters, used both when a test starts
 // (before anything is known about the run yet) and in its end-of-test

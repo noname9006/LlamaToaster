@@ -40,10 +40,16 @@ function cellSuspectTitle(v: CellValue): string | undefined {
   if (!v.suspect_count) return undefined;
   const raw = v.suspect_samples?.map((n) => n.toFixed(1)).join(", ") ?? "unknown";
   const total = v.sample_count ?? v.suspect_count;
-  return (
-    `${v.suspect_count} of ${total} repeat(s) reported an implausible speed and were excluded from this average ` +
-    `(raw flagged values: ${raw} tok/s) -- likely the known llama-server MTP timing bug`
-  );
+  // See RunDetail.tsx's resultSuspectTitle -- an all-suspect result has no
+  // clean reading to fall back on, so the shown average is actually derived
+  // from these flagged values, not excluding them. Kept in sync with that
+  // function's wording rather than the old single unconditional phrasing.
+  return v.suspect_count >= total
+    ? `All ${total} repeat(s) reported an implausible speed -- no clean reading was available, so this average is ` +
+        `derived from those flagged values and should not be trusted (raw: ${raw} tok/s) -- likely the known ` +
+        `llama-server MTP timing bug`
+    : `${v.suspect_count} of ${total} repeat(s) reported an implausible speed and were excluded from this average ` +
+        `(raw flagged values: ${raw} tok/s) -- likely the known llama-server MTP timing bug`;
 }
 
 // Reads the app's actual dark-theme tokens (client/src/styles/index.css)

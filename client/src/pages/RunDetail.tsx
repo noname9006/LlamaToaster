@@ -198,8 +198,19 @@ function resultSuspectTitle(r: ResultRow): string | undefined {
   if (!r.suspect_count) return undefined;
   const raw = r.suspect_samples?.map((v) => v.toFixed(1)).join(", ") ?? "unknown";
   const total = r.sample_count ?? r.suspect_count;
-  return `${r.suspect_count} of ${total} repeat(s) reported an implausible speed and were excluded from this average ` +
-    `(raw flagged values: ${raw} tok/s) -- likely the known llama-server MTP timing bug`;
+  // Mirrors worker/src/serverBench.ts's buildPhaseSummary, which only
+  // excludes suspect readings from the average when at least one clean one
+  // exists -- if every repeat came back suspect, there's nothing clean left
+  // to average, so it falls back to averaging the flagged values anyway
+  // rather than reporting no data at all. The old single-wording tooltip
+  // claimed "excluded from this average" unconditionally, which was simply
+  // false in that all-suspect case -- the shown avg_tps *is* those values.
+  return r.suspect_count >= total
+    ? `All ${total} repeat(s) reported an implausible speed -- no clean reading was available, so this average is ` +
+        `derived from those flagged values and should not be trusted (raw: ${raw} tok/s) -- likely the known ` +
+        `llama-server MTP timing bug`
+    : `${r.suspect_count} of ${total} repeat(s) reported an implausible speed and were excluded from this average ` +
+        `(raw flagged values: ${raw} tok/s) -- likely the known llama-server MTP timing bug`;
 }
 
 // Keyed off measurement_source (never backend_type) so the UI is driven
@@ -1105,16 +1116,27 @@ export function RunDetail() {
       )}
 
       {results.length > 0 && (
-        <>
-          <div className="relative mt-6 h-72 rounded-xl border border-border bg-surface p-4">
-            {chartConfig && <Chart config={chartConfig} />}
-          </div>
-          <p className="mt-3 text-sm">
+        <div className="relative mt-6 h-72 rounded-xl border border-border bg-surface p-4">
+          {chartConfig && <Chart config={chartConfig} />}
+        </div>
+      )}
+
+      {(results.length > 0 || statusCounts.failed > 0) && (
+        <p className="mt-3 space-x-4 text-sm">
+          {results.length > 0 && (
             <a href={api.exportUrl("csv", [id])} download className="text-accent hover:underline">
               Export run CSV
             </a>
-          </p>
-        </>
+          )}
+          {/* Only shown once something has actually failed -- a clean run's
+              per-run log file has nothing more to add beyond the results
+              table above. */}
+          {statusCounts.failed > 0 && (
+            <a href={api.runLogUrl(id)} download className="text-accent hover:underline">
+              Download logs
+            </a>
+          )}
+        </p>
       )}
     </div>
   );
