@@ -666,6 +666,31 @@ export async function runsRoutes(app: FastifyInstance): Promise<void> {
     }
   );
 
+  // Thin proxy to the worker's own dedicated per-run log file (see
+  // worker/src/index.ts's setRunLogFile/GET /logs) -- structured build/
+  // hardware/OS header, one line per test+repeat, and an end-of-run
+  // completed/failed/cancelled summary. Surfaced in RunDetail.tsx next to
+  // the CSV export whenever a run has at least one failed test.
+  app.get<{ Params: { id: string } }>("/api/runs/:id/log", async (request, reply) => {
+    const data = repo.getRunWithResults(request.params.id);
+    if (!data) return reply.code(404).send({ error: "run not found" });
+    const worker = await getWorkerForRun(data.run.worker_name);
+    if (!worker) return reply.code(404).send({ error: "worker not found for this run" });
+    try {
+      const res = await fetch(`${worker.url}/logs?run_id=${encodeURIComponent(data.run.id)}`, {
+        signal: AbortSignal.timeout(WORKER_HEALTH_TIMEOUT_MS),
+      });
+      if (res.status === 404) return reply.code(404).send({ error: "no log file for this run" });
+      if (!res.ok) throw new Error(`worker responded ${res.status}`);
+      const text = await res.text();
+      reply.header("content-type", "text/plain; charset=utf-8");
+      reply.header("content-disposition", `attachment; filename="run-${data.run.id}.log"`);
+      return text;
+    } catch (err) {
+      return reply.code(502).send({ error: describeWorkerError(err) });
+    }
+  });
+
   app.post<{ Body: TriggerPayload }>(
     "/api/runs/trigger",
     async (request, reply) => {

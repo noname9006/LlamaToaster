@@ -135,6 +135,15 @@ started hidden (`start-hidden.vbs`) or as a background service still leaves a
 trail to inspect after the fact. Set `LOG_LEVEL=debug` (env var) for full
 sweep/command-line detail on top of the default lifecycle logging.
 
+Every run also gets its own structured log file under `logs/runs/<run_id>.log`
+— a header (llama.cpp build/backend, OS, CPU, RAM, GPU, model, total
+tests/runs), one line per test and per repeat as it happens, and an
+end-of-run summary (tests/runs completed vs. failed vs. cancelled, and
+whether the run finished on its own or was stopped early). Downloadable from
+the Run page next to the CSV export whenever a run has at least one failed
+test (`GET /api/runs/:id/log`, proxied from this worker's own
+`GET /logs?run_id=...`).
+
 Then:
 
 ```bash

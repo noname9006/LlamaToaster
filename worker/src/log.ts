@@ -18,6 +18,19 @@ function isLogLevel(v: string | undefined): v is LogLevel {
 let logDir: string | null = null;
 let minLevel: LogLevel = isLogLevel(process.env.LOG_LEVEL) ? process.env.LOG_LEVEL : "info";
 
+// Optional extra sink, active only while a run is in flight (see
+// worker/src/index.ts's /run handler) -- every line that clears the level
+// filter below is *also* appended here, in addition to the console and the
+// shared daily file, so each run gets its own dedicated, human-readable log
+// file rather than requiring someone to dig it out of the shared stream.
+// Only one run executes per worker at a time (the existing `busy` flag), so
+// a single module-level path is enough -- no stack/queue needed.
+let runLogPath: string | null = null;
+
+export function setRunLogFile(path: string | null): void {
+  runLogPath = path;
+}
+
 export function configureLogging(dir: string, level?: string): void {
   logDir = dir;
   try {
@@ -55,6 +68,13 @@ function write(level: LogLevel, parts: unknown[]): void {
       appendFileSync(logFilePath(logDir), line + "\n", "utf8");
     } catch {
       /* best-effort -- logging must never be why a run fails */
+    }
+  }
+  if (runLogPath) {
+    try {
+      appendFileSync(runLogPath, line + "\n", "utf8");
+    } catch {
+      /* best-effort, same reasoning as above */
     }
   }
 }
