@@ -129,6 +129,13 @@ export async function buildArgs(input: BenchRunInput): Promise<string[]> {
   if (input.mainGpu != null) {
     args.push("-sm", "none", "-mg", String(input.mainGpu));
   }
+  // Keeps this many of the model's MoE (Mixture-of-Experts) layers' expert
+  // weights on CPU RAM instead of GPU VRAM -- see shared/sweep.ts's
+  // SweepItem.n_cpu_moe. 0 omits the flag entirely, same as every run before
+  // this axis existed.
+  if (item.n_cpu_moe > 0) {
+    args.push("--n-cpu-moe", String(item.n_cpu_moe));
+  }
   if (await supportsProgressFlag(input.llamaBenchPath)) {
     args.push("--progress");
   }
@@ -378,7 +385,7 @@ export async function runBench(input: BenchRunInput): Promise<BenchResult> {
       let gpu_info: string | undefined;
       let cpu_info: string | undefined;
       try {
-        const parsed = parseLlamaBench(stdout);
+        const parsed = parseLlamaBench(stdout, input.item.n_cpu_moe);
         results = parsed.results;
         gpu_info = parsed.gpu_info;
         cpu_info = parsed.cpu_info;
@@ -432,7 +439,7 @@ export interface ParsedLlamaBench {
   cpu_info?: string;
 }
 
-export function parseLlamaBench(stdout: string): ParsedLlamaBench {
+export function parseLlamaBench(stdout: string, nCpuMoe: number): ParsedLlamaBench {
   const arr = extractJsonArray(stdout);
   if (!Array.isArray(arr)) {
     throw new Error("llama-bench did not emit a JSON array");
@@ -459,6 +466,10 @@ export function parseLlamaBench(stdout: string): ParsedLlamaBench {
       // llama-bench has no draft-model concept at all -- always 0 here, same
       // reasoning as mtp above.
       n_gpu_layers_draft: 0,
+      // Unlike mtp/n_gpu_layers_draft above, this genuinely applies on the
+      // llama-bench path too (see buildArgs) -- passed in from the real
+      // sweep item by the caller (runBench), not hardcoded.
+      n_cpu_moe: nCpuMoe,
       avg_tps: entry.avg_ts ?? 0,
       stddev_tps: entry.stddev_ts ?? 0,
       // Memory/offload fields are filled in by the caller
