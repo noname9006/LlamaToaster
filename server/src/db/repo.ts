@@ -62,6 +62,7 @@ interface RunItemRow {
   flash_attn: string;
   mtp: string;
   n_gpu_layers_draft: number;
+  n_cpu_moe: number;
   status: string;
   detail: string | null;
   ram_mib: number | null;
@@ -99,6 +100,7 @@ interface ResultRowRaw {
   flash_attn: string;
   mtp: string;
   n_gpu_layers_draft: number;
+  n_cpu_moe: number;
   avg_tps: number;
   stddev_tps: number;
   ram_peak_mib: number;
@@ -186,6 +188,7 @@ function mapRunItem(row: RunItemRow): RunItem {
     flash_attn: row.flash_attn,
     mtp: row.mtp,
     n_gpu_layers_draft: row.n_gpu_layers_draft,
+    n_cpu_moe: row.n_cpu_moe,
     status: row.status as RunItem["status"],
     detail: row.detail ?? undefined,
     ram_mib: row.ram_mib,
@@ -242,6 +245,7 @@ function mapResult(row: ResultRowRaw): ResultRow {
     flash_attn: row.flash_attn,
     mtp: row.mtp,
     n_gpu_layers_draft: row.n_gpu_layers_draft,
+    n_cpu_moe: row.n_cpu_moe,
     avg_tps: row.avg_tps,
     stddev_tps: row.stddev_tps,
     ram_peak_mib: row.ram_peak_mib,
@@ -473,8 +477,8 @@ export const repo = {
     const insert = database.prepare(
       `INSERT INTO run_items
          (id, run_id, idx, n_prompt, n_gen, n_threads, n_gpu_layers,
-          batch_size, ubatch_size, cache_type_k, cache_type_v, flash_attn, mtp, n_gpu_layers_draft, status)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued')`
+          batch_size, ubatch_size, cache_type_k, cache_type_v, flash_attn, mtp, n_gpu_layers_draft, n_cpu_moe, status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued')`
     );
     const tx = database.transaction((rows: SweepItem[]) => {
       for (const item of rows) {
@@ -492,7 +496,8 @@ export const repo = {
           item.cache_type_v,
           item.flash_attn,
           item.mtp,
-          item.n_gpu_layers_draft
+          item.n_gpu_layers_draft,
+          item.n_cpu_moe
         );
       }
     });
@@ -575,7 +580,7 @@ export const repo = {
         const insertResult = database.prepare(
           `INSERT INTO results
              (id, run_id, idx, model_id, test_type, n_prompt, n_gen, n_threads, n_gpu_layers,
-              batch_size, ubatch_size, cache_type_k, cache_type_v, flash_attn, mtp, n_gpu_layers_draft,
+              batch_size, ubatch_size, cache_type_k, cache_type_v, flash_attn, mtp, n_gpu_layers_draft, n_cpu_moe,
               avg_tps, stddev_tps, ram_peak_mib, vram_peak_mib,
               ram_avg_mib, vram_avg_mib, ram_free_before_mib, vram_free_before_mib,
               system_memory_total_mib, gpu_memory_total_mib,
@@ -586,7 +591,7 @@ export const repo = {
               gpu_layers_loaded, total_model_layers, gpu_layers_loaded_draft, total_model_layers_draft,
               sample_count, suspect_count, suspect_samples, repeat_samples, spec_drafted, spec_accepted,
               raw_json_path, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         );
         // Up to two rows for one idx (a pp row and a tg row from the same
         // benchmark process) -- distinguished by test_type, see
@@ -610,6 +615,7 @@ export const repo = {
             row.flash_attn,
             row.mtp,
             row.n_gpu_layers_draft,
+            row.n_cpu_moe,
             row.avg_tps,
             row.stddev_tps,
             row.ram_peak_mib,
@@ -863,6 +869,8 @@ function buildResultRow(
     // see shared/types.ts's IngestResultInput.n_gpu_layers_draft and
     // schema.sql's matching column default.
     n_gpu_layers_draft: r.n_gpu_layers_draft ?? 0,
+    // Same reasoning as n_gpu_layers_draft above.
+    n_cpu_moe: r.n_cpu_moe ?? 0,
     avg_tps: r.avg_tps,
     stddev_tps: r.stddev_tps,
     ram_peak_mib: r.ram_peak_mib,

@@ -46,15 +46,16 @@ async function deleteFileFromAllWorkers(filename: string): Promise<FileDeletionR
 interface WorkerGgufInfo {
   n_layer: number | null;
   mtp_layers: number | null;
+  expert_count: number | null;
 }
 
 // Same "any worker's model_dir might have it" reasoning as
 // deleteFileFromAllWorkers above, but stops at the first worker that
 // actually has the file and can read metadata out of it -- one answer is
-// enough, unlike delete where every worker's copy matters. Reads n_layer and
-// mtp_layers together (same underlying GGUF header scan on the worker side,
-// see worker/src/gguf.ts) so backfilling one opportunistically backfills the
-// other too, rather than needing two separate worker round trips.
+// enough, unlike delete where every worker's copy matters. Reads n_layer,
+// mtp_layers, and expert_count together (same underlying GGUF header scan on
+// the worker side, see worker/src/gguf.ts) so backfilling one opportunistically
+// backfills the others too, rather than needing separate worker round trips.
 async function findGgufInfoFromWorkers(filename: string): Promise<WorkerGgufInfo> {
   for (const worker of await listWorkers()) {
     try {
@@ -62,18 +63,27 @@ async function findGgufInfoFromWorkers(filename: string): Promise<WorkerGgufInfo
         signal: AbortSignal.timeout(WORKER_GGUF_INFO_TIMEOUT_MS),
       });
       if (!res.ok) continue; // not on this worker, or it couldn't read it -- try the next one
-      const data = (await res.json()) as { n_layer?: number | null; mtp_layers?: number | null };
-      if (typeof data.n_layer === "number" || typeof data.mtp_layers === "number") {
+      const data = (await res.json()) as {
+        n_layer?: number | null;
+        mtp_layers?: number | null;
+        expert_count?: number | null;
+      };
+      if (
+        typeof data.n_layer === "number" ||
+        typeof data.mtp_layers === "number" ||
+        typeof data.expert_count === "number"
+      ) {
         return {
           n_layer: typeof data.n_layer === "number" ? data.n_layer : null,
           mtp_layers: typeof data.mtp_layers === "number" ? data.mtp_layers : null,
+          expert_count: typeof data.expert_count === "number" ? data.expert_count : null,
         };
       }
     } catch {
       // worker unreachable -- try the next one
     }
   }
-  return { n_layer: null, mtp_layers: null };
+  return { n_layer: null, mtp_layers: null, expert_count: null };
 }
 
 // One call per worker (its own recursive model_dir listing, see worker/src/
@@ -154,14 +164,17 @@ export async function modelsRoutes(app: FastifyInstance): Promise<void> {
     const model = repo.getModel(request.params.id);
     if (!model) return reply.code(404).send({ error: "model not found" });
 
-    // Both must already be known to skip the worker round trip -- an
+    // All three must already be known to skip the worker round trip -- an
     // earlier version of this check only looked at n_layer, which meant a
     // model that already had n_layer (true for every model registered
     // before mtp_layers detection existed) could never get mtp_layers
-    // backfilled at all, since the request never got this far.
+    // backfilled at all, since the request never got this far. expert_count
+    // joins the same gate for the same reason (a model registered before
+    // MoE detection existed must still get a chance to pick it up).
     const hasLayerCount = typeof model.metadata.n_layer === "number";
     const hasMtpLayers = typeof model.metadata.mtp_layers === "number";
-    if (hasLayerCount && hasMtpLayers) {
+    const hasExpertCount = typeof model.metadata.expert_count === "number";
+    if (hasLayerCount && hasMtpLayers && hasExpertCount) {
       return reply.code(200).send({ ok: true, n_layer: model.metadata.n_layer });
     }
 
@@ -170,24 +183,26 @@ export async function modelsRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(400).send({ error: "model has no filename to look up" });
     }
 
-    const { n_layer, mtp_layers } = await findGgufInfoFromWorkers(filename);
+    const { n_layer, mtp_layers, expert_count } = await findGgufInfoFromWorkers(filename);
     // Fall back to the already-known value rather than letting a worker
     // that's temporarily unreachable (or no longer has the file) regress an
     // n_layer this model already had, just because this call's real purpose
-    // this time was picking up mtp_layers.
+    // this time was picking up mtp_layers/expert_count.
     const resolvedNLayer = n_layer ?? (hasLayerCount ? (model.metadata.n_layer as number) : null);
     if (resolvedNLayer == null) {
       return reply.code(200).send({ ok: true, n_layer: null });
     }
-    // mtp_layers comes along for free from the same worker round trip --
-    // only worth persisting when actually present (>0), same "don't clobber
-    // with a meaningless 0" posture the download route already uses. Also
-    // recompute mtp_role from the now-complete metadata (see shared/types.ts's
-    // isMtpDraftModel) -- every read site recomputes this live regardless, but
-    // keeping the persisted flag correct too avoids a misleading raw DB row.
+    // mtp_layers/expert_count come along for free from the same worker round
+    // trip -- only worth persisting when actually present (>0), same "don't
+    // clobber with a meaningless 0" posture the download route already uses.
+    // Also recompute mtp_role from the now-complete metadata (see
+    // shared/types.ts's isMtpDraftModel) -- every read site recomputes this
+    // live regardless, but keeping the persisted flag correct too avoids a
+    // misleading raw DB row.
     const patch = {
       n_layer: resolvedNLayer,
       ...(typeof mtp_layers === "number" && mtp_layers > 0 ? { mtp_layers } : {}),
+      ...(typeof expert_count === "number" && expert_count > 0 ? { expert_count } : {}),
     };
     const mergedMetadata = { ...model.metadata, ...patch };
     repo.updateModelMetadata(model.id, {
@@ -197,7 +212,7 @@ export async function modelsRoutes(app: FastifyInstance): Promise<void> {
         : {}),
     });
     request.log.info(
-      { model_id: model.id, filename, n_layer: resolvedNLayer, mtp_layers },
+      { model_id: model.id, filename, n_layer: resolvedNLayer, mtp_layers, expert_count },
       "backfilled model layer count"
     );
     return reply.code(200).send({ ok: true, n_layer: resolvedNLayer });

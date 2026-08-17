@@ -48,6 +48,25 @@ $ErrorActionPreference = "Stop"
 $RepoUrl = "https://github.com/noname9006/LlamaToaster.git"
 $RepoOwnerSlash = "noname9006/LlamaToaster"
 
+# Fresh/default Windows machines ship with the PowerShell execution policy
+# set to Restricted (or AllSigned in some orgs), which blocks running *any*
+# .ps1 script -- including npm.ps1, the wrapper npm installs so PowerShell
+# can invoke it. That makes `npm install` below fail immediately with a
+# "выполнение сценариев отключено" / "running scripts is disabled" error,
+# even though this bootstrap script itself runs fine (it's piped into iex as
+# a string, not executed as a .ps1 file, so it never hits the policy check).
+# Relax it for just this process -- not the user's persistent CurrentUser or
+# LocalMachine policy -- so it self-heals without touching anything that
+# outlives this run. A GPO-enforced policy can still override this; if so,
+# the npm install failure message below tells the user what to do.
+try {
+    if ((Get-ExecutionPolicy -Scope Process) -eq 'Undefined') {
+        Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process -Force
+    }
+} catch {
+    Write-Warning "Could not relax the PowerShell execution policy for this session: $($_.Exception.Message)"
+}
+
 function Select-InstallDir {
     Write-Host ""
     Write-Host "Which drive should LlamaToaster use?" -ForegroundColor Cyan
@@ -222,7 +241,7 @@ npm install --ignore-scripts
 $installExit = $LASTEXITCODE
 Pop-Location
 if ($installExit -ne 0) {
-    Write-Error "npm install failed (exit $installExit)."
+    Write-Error "npm install failed (exit $installExit). If the error above mentions script execution being disabled, an org policy (GPO) is forcing a restrictive PowerShell execution policy that this script's own workaround can't override -- run 'Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser' yourself (or ask whoever manages this machine's Group Policy), then re-run this bootstrap script."
     exit 1
 }
 

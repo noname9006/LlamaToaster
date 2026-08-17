@@ -103,6 +103,10 @@ const COLUMN_MIGRATIONS: ColumnSpec[] = [
   // already treats as "don't offload the draft model".
   { table: "run_items", column: "n_gpu_layers_draft", ddlType: "INTEGER DEFAULT 0" },
   { table: "results", column: "n_gpu_layers_draft", ddlType: "INTEGER DEFAULT 0" },
+  // --n-cpu-moe -- see shared/sweep.ts's SweepItem.n_cpu_moe. Same DEFAULT 0
+  // reasoning as n_gpu_layers_draft above.
+  { table: "run_items", column: "n_cpu_moe", ddlType: "INTEGER DEFAULT 0" },
+  { table: "results", column: "n_cpu_moe", ddlType: "INTEGER DEFAULT 0" },
 ];
 
 function applyColumnMigrations(database: Database.Database): void {

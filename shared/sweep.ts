@@ -19,6 +19,14 @@ export interface SweepItem {
   // alongside an actual --model-draft). Ignored (but still present, since
   // every SweepItem is a full cross-product) on every other item.
   n_gpu_layers_draft: number;
+  // llama.cpp's --n-cpu-moe N -- keeps the MoE (Mixture-of-Experts) weights
+  // of the first N layers on CPU RAM instead of GPU VRAM, independent of
+  // both mtp above and the base model's own -ngl (see worker/src/bench.ts
+  // and worker/src/serverBench.ts's buildArgs, which push this on either
+  // path regardless of MTP). 0 omits the flag entirely -- today's behavior.
+  // Only meaningful for a model detected as MoE (see shared/types.ts's
+  // ModelMetadata.expert_count); NewRun.tsx disables the control otherwise.
+  n_cpu_moe: number;
 }
 
 // Fixed field order matches the -p -n -t -ngl -b -ub -ctk -ctv -fa argument
@@ -31,7 +39,12 @@ export interface SweepItem {
 // MTP is off or unused) produces no duplicate items -- only a sweep that
 // deliberately adds multiple draft-ngl values pays the full cross-product,
 // including pointless duplicates of every mtp:"off" item that differ only in
-// an ignored field. The server (pre-creating run_items at trigger time) and
+// an ignored field. n_cpu_moe nests innermost of everything, even after
+// n_gpu_layers_draft -- unlike that field it isn't MTP-only (--n-cpu-moe
+// applies on both the llama-bench and llama-server paths regardless of mtp),
+// but it's still only ever meaningful for a MoE model, so grouping it last
+// keeps the same "a sweep that leaves it at a single value adds no duplicate
+// items" property for the common (non-MoE) case. The server (pre-creating run_items at trigger time) and
 // the worker (spawning one process per item) both call this on the exact
 // same sweep JSON, so they must independently produce the identical ordered
 // list -- there's no registration round trip to reconcile the two
@@ -73,20 +86,23 @@ export function expandSweep(sweep: Omit<SweepConfig, "model_id">): SweepItem[] {
                     if (!isValidCombo(cache_type_k, cache_type_v, flash_attn)) continue;
                     for (const mtp of sweep.mtp) {
                       for (const n_gpu_layers_draft of sweep.n_gpu_layers_draft) {
-                        items.push({
-                          idx: items.length,
-                          n_prompt,
-                          n_gen,
-                          threads,
-                          n_gpu_layers,
-                          batch_size,
-                          ubatch_size,
-                          cache_type_k,
-                          cache_type_v,
-                          flash_attn,
-                          mtp,
-                          n_gpu_layers_draft,
-                        });
+                        for (const n_cpu_moe of sweep.n_cpu_moe) {
+                          items.push({
+                            idx: items.length,
+                            n_prompt,
+                            n_gen,
+                            threads,
+                            n_gpu_layers,
+                            batch_size,
+                            ubatch_size,
+                            cache_type_k,
+                            cache_type_v,
+                            flash_attn,
+                            mtp,
+                            n_gpu_layers_draft,
+                            n_cpu_moe,
+                          });
+                        }
                       }
                     }
                   }

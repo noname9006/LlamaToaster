@@ -225,6 +225,13 @@ function buildArgs(input: ServerBenchRunInput): string[] {
   if (input.mainGpu != null) {
     args.push("-sm", "none", "-mg", String(input.mainGpu));
   }
+  // See bench.ts's identical block -- applies regardless of MTP (unlike
+  // -ngld just below, which only makes sense alongside an actual
+  // --model-draft), so this is its own condition, not nested inside the
+  // mtpModelPath branch.
+  if (item.n_cpu_moe > 0) {
+    args.push("--n-cpu-moe", String(item.n_cpu_moe));
+  }
   if (input.mtpModelPath) {
     args.push("--model-draft", input.mtpModelPath);
     // Confirmed live against the installed build's own --help: llama-server
@@ -375,6 +382,16 @@ async function runCompletion(
     body: JSON.stringify({
       prompt: syntheticPrompt(nPrompt, promptOffset),
       n_predict: nGen,
+      // Without this, llama-server stops as soon as it samples an EOS/stop
+      // token instead of decoding all nGen tokens -- confirmed live on an
+      // MTP run where every repeat returned tokens_predicted=1 (the
+      // instruct-tuned model treating the out-of-distribution filler prompt
+      // as already "finished"), which starved the draft model of anything
+      // to speculate on (0 tokens drafted every time) and fed the wall-clock
+      // tg fallback below a near-meaningless 1-token/lots-of-jitter ratio.
+      // llama-bench's own tg loop (used for the non-MTP tests) never checks
+      // for EOS either, so this keeps the two engines comparing like for like.
+      ignore_eos: true,
       // Otherwise a cache hit on a repeated identical synthetic prompt would
       // skew pp timings toward zero on every repeat after the first.
       cache_prompt: false,
@@ -832,6 +849,7 @@ export async function runServerBench(input: ServerBenchRunInput): Promise<BenchR
       flash_attn: item.flash_attn,
       mtp: item.mtp,
       n_gpu_layers_draft: item.n_gpu_layers_draft,
+      n_cpu_moe: item.n_cpu_moe,
       ram_peak_mib: 0,
       vram_peak_mib: 0,
       ram_avg_mib: 0,

@@ -169,9 +169,14 @@ export interface GgufInfo {
   // server/src/routes/workers.ts), this key describes the drafter itself.
   // See shared/types.ts's ModelMetadata.mtp_layers/mtp_role.
   mtp_layers: number | null;
+  // GGUF's <architecture>.expert_count -- present and >0 only for a
+  // Mixture-of-Experts architecture (absent entirely for a dense model, same
+  // "absent means unknown/not applicable" convention as mtp_layers above).
+  // See shared/types.ts's ModelMetadata.expert_count.
+  expert_count: number | null;
 }
 
-const EMPTY_GGUF_INFO: GgufInfo = { n_layer: null, mtp_layers: null };
+const EMPTY_GGUF_INFO: GgufInfo = { n_layer: null, mtp_layers: null, expert_count: null };
 
 // Reads a GGUF file's metadata header to find the model's transformer layer
 // count and (if present) its MTP/nextn layer count. Returns nulls on any
@@ -196,6 +201,7 @@ export async function readGgufInfo(filePath: string): Promise<GgufInfo> {
     let architecture: string | undefined;
     const blockCounts = new Map<string, number>();
     const mtpLayerCounts = new Map<string, number>();
+    const expertCounts = new Map<string, number>();
 
     for (let i = 0; i < kvCount; i++) {
       const key = await reader.string();
@@ -219,6 +225,8 @@ export async function readGgufInfo(filePath: string): Promise<GgufInfo> {
         valueType !== GGUF_TYPE.STRING
       ) {
         mtpLayerCounts.set(key, await reader.numeric(valueType));
+      } else if (key.endsWith(".expert_count") && valueType !== GGUF_TYPE.ARRAY && valueType !== GGUF_TYPE.STRING) {
+        expertCounts.set(key, await reader.numeric(valueType));
       } else {
         await reader.skip(valueType);
       }
@@ -226,6 +234,7 @@ export async function readGgufInfo(filePath: string): Promise<GgufInfo> {
     return {
       n_layer: architecture ? blockCounts.get(`${architecture}.block_count`) ?? null : null,
       mtp_layers: architecture ? mtpLayerCounts.get(`${architecture}.nextn_predict_layers`) ?? null : null,
+      expert_count: architecture ? expertCounts.get(`${architecture}.expert_count`) ?? null : null,
     };
   } catch {
     return EMPTY_GGUF_INFO;

@@ -40,6 +40,7 @@ const NUMERIC_SWEEP_FIELDS = [
   "batch_size",
   "ubatch_size",
   "n_gpu_layers_draft",
+  "n_cpu_moe",
 ] as const;
 const STRING_SWEEP_FIELDS = ["cache_type_k", "cache_type_v", "flash_attn", "mtp"] as const;
 
@@ -127,6 +128,10 @@ function validateIngestResult(value: unknown): string | null {
     (typeof row.n_gpu_layers_draft !== "number" || !Number.isFinite(row.n_gpu_layers_draft as number))
   ) {
     return "n_gpu_layers_draft must be a number";
+  }
+  // Same optional-field reasoning as n_gpu_layers_draft above.
+  if (row.n_cpu_moe !== undefined && (typeof row.n_cpu_moe !== "number" || !Number.isFinite(row.n_cpu_moe as number))) {
+    return "n_cpu_moe must be a number";
   }
   for (const field of ["suspect_samples", "repeat_samples"] as const) {
     const v = row[field];
@@ -760,6 +765,22 @@ export async function runsRoutes(app: FastifyInstance): Promise<void> {
           if (!isMtpDraftModel(mtpModel)) {
             return reply.code(400).send({ error: "mtp_model_id does not refer to a registered MTP/draft model" });
           }
+        }
+      }
+
+      // --n-cpu-moe only has anything to offload on a Mixture-of-Experts
+      // model (see shared/types.ts's ModelMetadata.expert_count) -- checked
+      // here for the same reason as the MTP guard above: NewRun.tsx's
+      // slider is disabled for a non-MoE model, but that's a UX nicety, not
+      // a guarantee, so a direct API call needs the same rejection
+      // server-side rather than every item in the run silently no-opping
+      // the flag against a model with no experts to keep on CPU.
+      if (body.sweep.n_cpu_moe.some((n) => n > 0)) {
+        const modelIsMoe = typeof model.metadata.expert_count === "number" && model.metadata.expert_count > 0;
+        if (!modelIsMoe) {
+          return reply.code(400).send({
+            error: 'sweep includes n_cpu_moe > 0 but this model isn\'t detected as a Mixture-of-Experts model',
+          });
         }
       }
 
