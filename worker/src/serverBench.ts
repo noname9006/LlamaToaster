@@ -225,6 +225,13 @@ function buildArgs(input: ServerBenchRunInput): string[] {
   if (input.mainGpu != null) {
     args.push("-sm", "none", "-mg", String(input.mainGpu));
   }
+  // See bench.ts's identical block -- applies regardless of MTP (unlike
+  // -ngld just below, which only makes sense alongside an actual
+  // --model-draft), so this is its own condition, not nested inside the
+  // mtpModelPath branch.
+  if (item.n_cpu_moe > 0) {
+    args.push("--n-cpu-moe", String(item.n_cpu_moe));
+  }
   if (input.mtpModelPath) {
     args.push("--model-draft", input.mtpModelPath);
     // Confirmed live against the installed build's own --help: llama-server
@@ -842,6 +849,7 @@ export async function runServerBench(input: ServerBenchRunInput): Promise<BenchR
       flash_attn: item.flash_attn,
       mtp: item.mtp,
       n_gpu_layers_draft: item.n_gpu_layers_draft,
+      n_cpu_moe: item.n_cpu_moe,
       ram_peak_mib: 0,
       vram_peak_mib: 0,
       ram_avg_mib: 0,
