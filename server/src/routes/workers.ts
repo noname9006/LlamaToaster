@@ -15,11 +15,17 @@ import type {
   WorkerCurrentRun,
   ModelMetadata,
   ModelDownloadCallbackInput,
+  WorkerVramInfo,
 } from "../../../shared/types.js";
 import { HF_REPO_PATTERN, searchHfGgufModels, listHfGgufFiles, getHfGgufMeta } from "../hf.js";
 
 const WORKER_READ_TIMEOUT_MS = 5_000;
 const WORKER_INSTALL_TIMEOUT_MS = 10 * 60 * 1000;
+// Longer than WORKER_READ_TIMEOUT_MS: worker/src/vram.ts's Windows PDH path
+// (the generic/vulkan GPU-memory reading) can itself take up to its own
+// internal 10s EXEC_TIMEOUT_MS -- this proxy's timeout must exceed that or
+// it would abort a request the worker was still legitimately servicing.
+const WORKER_VRAM_TIMEOUT_MS = 12_000;
 
 function validateModelDownloadCallback(payload: unknown): string | null {
   if (!payload || typeof payload !== "object") return "payload must be an object";
@@ -265,6 +271,23 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
     }
   });
 
+  // Live, on-demand free-VRAM reading -- thin proxy to the worker's own
+  // GET /vram (worker/src/index.ts), consumed by NewRun.tsx's pre-flight
+  // VRAM-fit banner (see shared/vramEstimate.ts). Unlike /llama-cpp's
+  // hardware field, this re-probes every call rather than serving a
+  // once-at-startup snapshot -- safe to call even while the worker is busy.
+  app.get<{ Params: { name: string } }>("/api/workers/:name/vram", async (request, reply) => {
+    const worker = await findWorker(request.params.name);
+    if (!worker) return reply.code(404).send({ error: "unknown worker" });
+    try {
+      const res = await fetchWorker(`${worker.url}/vram`, {}, WORKER_VRAM_TIMEOUT_MS);
+      const data = (await res.json()) as WorkerVramInfo;
+      return reply.code(res.status).send(data);
+    } catch (err) {
+      return reply.code(502).send({ error: describeWorkerError(err) });
+    }
+  });
+
   app.delete<{ Params: { name: string; tag: string } }>(
     "/api/workers/:name/llama-cpp/:tag",
     async (request, reply) => {
@@ -415,7 +438,8 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
         app.log.warn({ error: validationError }, "model download callback rejected: invalid payload");
         return reply.code(400).send({ error: validationError });
       }
-      const { worker, hf_repo, hf_file, ok, error, sha256, size_bytes, n_layer, mtp_layers } = request.body;
+      const { worker, hf_repo, hf_file, ok, error, sha256, size_bytes, n_layer, mtp_layers, expert_count } =
+        request.body;
       if (!ok) {
         app.log.error({ worker, hf_repo, hf_file, error }, "model download failed");
         return reply.code(200).send({ ok: true });
@@ -433,12 +457,23 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
           ...(typeof n_layer === "number" ? { n_layer } : {}),
           ...(typeof param_count === "number" ? { param_count } : {}),
           ...(typeof mtp_layers === "number" && mtp_layers > 0 ? { mtp_layers } : {}),
+          ...(typeof expert_count === "number" && expert_count > 0 ? { expert_count } : {}),
         };
         if (isMtpDraftModel({ metadata, hf_file, filename: hf_file })) {
           metadata.mtp_role = "draft";
         }
         app.log.info(
-          { worker, hf_repo, hf_file, size_bytes, n_layer, param_count, mtp_layers, mtp_role: metadata.mtp_role },
+          {
+            worker,
+            hf_repo,
+            hf_file,
+            size_bytes,
+            n_layer,
+            param_count,
+            mtp_layers,
+            expert_count,
+            mtp_role: metadata.mtp_role,
+          },
           "model download complete"
         );
         repo.registerModel({

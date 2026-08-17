@@ -73,6 +73,12 @@ const MERGED_COLUMN_DEFS: ColDef[] = [
       "Base model: layers actually loaded onto the GPU / this model's total transformer layer count, both read from llama.cpp's own runtime output (not calculated) — loaded may be less than ngl if the model has fewer layers than requested. On an MTP row this is always the base model's own figures, never the draft model's — see the ngld column for the draft's.",
     sortKey: "layers_loaded",
   },
+  {
+    label: "cpu_moe",
+    description:
+      "--n-cpu-moe — Mixture-of-Experts layers whose expert weights were kept on CPU RAM instead of GPU VRAM, independent of ngl above. 0 = flag omitted entirely. Request-only: llama.cpp prints no runtime confirmation line for this the way it does for the offload column.",
+    sortKey: "cpu_moe",
+  },
   { label: "batch", description: "-b — logical batch size for prompt processing.", sortKey: "batch" },
   { label: "ubatch", description: "-ub — physical batch size (must be ≤ batch size).", sortKey: "ubatch" },
   { label: "ctk", description: "-ctk — K cache quantization type.", sortKey: "ctk" },
@@ -366,6 +372,8 @@ function mergedSortValue(item: RunItem, results: ResultRow[] | undefined, key: s
       return item.n_gpu_layers;
     case "layers_loaded":
       return anyResult?.gpu_layers_loaded ?? -1;
+    case "cpu_moe":
+      return item.n_cpu_moe;
     case "batch":
       return item.batch_size;
     case "ubatch":
@@ -1019,6 +1027,7 @@ export function RunDetail() {
                             ? "n/a"
                             : "—"}
                       </td>
+                      <td className="px-1 py-1.5 text-muted">{it.n_cpu_moe > 0 ? it.n_cpu_moe : "—"}</td>
                       <td className="px-1 py-1.5 text-muted">{it.batch_size}</td>
                       <td className="px-1 py-1.5 text-muted">{it.ubatch_size}</td>
                       <td className="px-1 py-1.5 text-muted">{it.cache_type_k}</td>

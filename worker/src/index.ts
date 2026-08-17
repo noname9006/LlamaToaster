@@ -19,6 +19,7 @@ import { runBench, matchOffloadLine, type BenchResult, type OffloadResult } from
 import { runServerBench } from "./serverBench.js";
 import { MemorySampler, captureFreeMemoryBaseline, type SampleStats, type FreeMemoryBaseline } from "./sampler.js";
 import { readGpuMemory } from "./vram.js";
+import { estimateVramNeededMib, isVramDiscrepancy } from "../../shared/vramEstimate.js";
 import { writeRawJson, postRunItemUpdate, postModelDownloadResult } from "./vps-client.js";
 import { log, configureLogging, setRunLogFile } from "./log.js";
 import {
@@ -42,6 +43,7 @@ import {
   type RunItemTerminalInput,
   type ModelDownloadCallbackInput,
   type TerminalRunItemStatus,
+  type WorkerVramInfo,
 } from "../../shared/types.js";
 import { expandSweep, deriveTestType, type SweepItem } from "../../shared/sweep.js";
 
@@ -725,6 +727,7 @@ const server = createServer(async (req, res) => {
                 item,
                 repeats: reqBody.sweep.repeats,
                 modelPath,
+                modelSizeBytes: reqBody.model.size_bytes,
                 mtpModelPath,
                 llamaServerPath: effectiveBuild.serverPath,
                 port: config.mtp_server_port ?? DEFAULT_MTP_SERVER_PORT,
@@ -741,6 +744,7 @@ const server = createServer(async (req, res) => {
                 item,
                 repeats: reqBody.sweep.repeats,
                 modelPath,
+                modelSizeBytes: reqBody.model.size_bytes,
                 llamaBenchPath: effectiveBuild.path,
                 backend: effectiveBackend,
                 mainGpu: reqBody.main_gpu,
@@ -822,6 +826,21 @@ const server = createServer(async (req, res) => {
     // for no benefit, since hardware doesn't change while the process is up.
     // Restart the worker to pick up real hardware changes.
     return send(res, 200, detectedHardware);
+  }
+
+  if (req.method === "GET" && url.pathname === "/vram") {
+    // Live, on-demand free-VRAM reading -- unlike /hardware above, this
+    // re-probes every call rather than serving a startup snapshot, since a
+    // pre-flight VRAM-fit check (see shared/vramEstimate.ts) needs the
+    // current figure, not what was free when the process started. Safe to
+    // call while busy: captureFreeMemoryBaseline's own readGpuMemory call has
+    // no locking and is already invoked concurrently with an in-flight
+    // benchmark by MemorySampler.
+    const backendParam = url.searchParams.get("backend");
+    const effectiveBackend: Backend = backendParam || backend;
+    const baseline = await captureFreeMemoryBaseline(effectiveBackend);
+    const info: WorkerVramInfo = { ok: true, backend: effectiveBackend, ...baseline };
+    return send(res, 200, info);
   }
 
   if (req.method === "GET" && url.pathname === "/llama-cpp") {
@@ -1000,8 +1019,8 @@ const server = createServer(async (req, res) => {
       if (!existsSync(target)) {
         return send(res, 404, { error: `file not found: ${filename}` });
       }
-      const { n_layer, mtp_layers } = await readGgufInfo(target);
-      return send(res, 200, { ok: true, n_layer, mtp_layers });
+      const { n_layer, mtp_layers, expert_count } = await readGgufInfo(target);
+      return send(res, 200, { ok: true, n_layer, mtp_layers, expert_count });
     } catch (err) {
       log.error(`gguf-info failed: ${err instanceof Error ? err.message : String(err)}`);
       return sendError(res, err);
@@ -1164,9 +1183,10 @@ async function runModelDownload(
     const elapsedMs = Date.now() - downloadStartedAt;
     log.info(`downloaded ${progressKey}: ${hasher.byteLength}B in ${elapsedMs}ms`);
 
-    const { n_layer, mtp_layers } = await readGgufInfo(target);
+    const { n_layer, mtp_layers, expert_count } = await readGgufInfo(target);
     log.info(
-      `gguf metadata for ${progressKey}: n_layer=${n_layer ?? "unknown"} mtp_layers=${mtp_layers ?? "unknown"}`
+      `gguf metadata for ${progressKey}: n_layer=${n_layer ?? "unknown"} mtp_layers=${mtp_layers ?? "unknown"} ` +
+        `expert_count=${expert_count ?? "unknown"}`
     );
 
     // Reflect the new file immediately rather than waiting for the periodic
@@ -1182,6 +1202,7 @@ async function runModelDownload(
       size_bytes: hasher.byteLength,
       n_layer,
       mtp_layers,
+      expert_count,
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -1203,6 +1224,10 @@ interface RunSweepItemInput {
   item: SweepItem;
   repeats: number;
   modelPath: string;
+  // On-disk byte size of the model at modelPath -- forwarded to
+  // finalizeSweepItemResult's VRAM-discrepancy check (see
+  // shared/vramEstimate.ts), not used for anything else here.
+  modelSizeBytes: number;
   llamaBenchPath: string;
   backend: Backend;
   // See shared/types.ts's RunConfig.main_gpu -- forwarded to bench.ts's
@@ -1497,13 +1522,42 @@ async function finalizeSweepItemResult(
   bench: BenchResult,
   stats: SampleStats,
   baseline: FreeMemoryBaseline,
-  mainGpu: number | undefined
+  mainGpu: number | undefined,
+  modelSizeBytes: number
 ): Promise<TerminalRunItemStatus> {
   // Read from llama.cpp's own runtime output (see bench.ts's
   // parseOffloadLayers) -- both null when the line was never seen at all
   // (item failed before model load finished, or a build too old to support
   // the required verbosity flag).
   const offload: OffloadResult = bench.offload ?? { main: null, draft: null };
+  // llama.cpp's own "offloaded X/Y layers to GPU" line only ever reflects
+  // buffer *assignment*, never actual VRAM residency (see
+  // shared/vramEstimate.ts's top comment) -- so a claimed-full offload with
+  // an implausibly low observed vram_peak_mib means the model likely never
+  // really left system RAM (Windows CUDA sysmem fallback), regardless of
+  // what llama.cpp itself believes happened. Only checked once there's
+  // something real to compare: a positive offload claim and an actual VRAM
+  // sample (both null/0 on a cpu-backend or -ngl 0 run -- nothing to flag).
+  // Also skipped whenever item.n_cpu_moe > 0: a deliberate partial MoE-to-CPU
+  // placement *correctly* produces lower VRAM than this estimate expects
+  // (that's the whole point of --n-cpu-moe, see shared/sweep.ts's
+  // SweepItem.n_cpu_moe) -- without this guard, every legitimate cpu-moe run
+  // would false-positive against the exact warning built to catch the
+  // opposite problem.
+  let vramDiscrepancyWarning: string | undefined;
+  if (item.n_cpu_moe === 0 && offload.main && offload.main.gpu_layers_loaded > 0 && stats.vram_peak_mib != null) {
+    const estimatedMib = estimateVramNeededMib({
+      modelSizeBytes,
+      totalModelLayers: offload.main.total_model_layers,
+      requestedNgl: offload.main.gpu_layers_loaded,
+    });
+    if (estimatedMib != null && isVramDiscrepancy(estimatedMib, stats.vram_peak_mib)) {
+      vramDiscrepancyWarning =
+        `claimed offload ${offload.main.gpu_layers_loaded}/${offload.main.total_model_layers} layers to GPU ` +
+        `(~${estimatedMib}MiB expected) but observed VRAM peaked at only ${stats.vram_peak_mib}MiB -- likely ` +
+        `silently running from system RAM (Windows CUDA sysmem fallback), not actual GPU offload`;
+    }
+  }
   if (bench.code === 0 && bench.results.length > 0) {
     // A single sweep item with both n_prompt and n_gen set (and no -pg)
     // produces two rows -- a pp-only row and a tg-only row -- both kept here
@@ -1549,18 +1603,21 @@ async function finalizeSweepItemResult(
     const specLine = formatSpecDecodeLine(results);
     if (specLine) summaryLines.push(`  ${specLine}`);
     log.info(summaryLines.join("\n"));
-    // bench.warning (only ever set by the llama-server/MTP path) flags a
-    // successful item that still had some readings rejected as implausible
-    // -- surfaced via the same `error` field a failed item uses, since
-    // recordRunItemTerminal stores it unconditionally regardless of status,
-    // and RunDetail.tsx already prefers item.error over the normal detail
-    // text for any status. Without this, a "done" item with a silently
-    // dropped tg reading (the original bug report) looked identical to a
-    // clean run.
-    if (bench.warning) log.warn(`${label} completed with warnings: ${bench.warning}`);
+    // bench.warning (previously only ever set by the llama-server/MTP path,
+    // e.g. a reading rejected as implausible) and vramDiscrepancyWarning
+    // above (either path -- computed once, up front, from data both engines
+    // already produce) are combined here into one string -- surfaced via the
+    // same `error` field a failed item uses, since recordRunItemTerminal
+    // stores it unconditionally regardless of status, and RunDetail.tsx
+    // already prefers item.error over the normal detail text for any status.
+    // Without this, a "done" item with a silently dropped tg reading (the
+    // original MTP bug report) or a silently-not-really-offloaded model (the
+    // sysmem-fallback bug report) both looked identical to a clean run.
+    const combinedWarning = [bench.warning, vramDiscrepancyWarning].filter(Boolean).join(" | ") || undefined;
+    if (combinedWarning) log.warn(`${label} completed with warnings: ${combinedWarning}`);
     await safeItemTerminal(runId, item.idx, {
       status: "done",
-      error: bench.warning,
+      error: combinedWarning,
       ram_peak_mib: stats.ram_peak_mib,
       vram_peak_mib: stats.vram_peak_mib,
       ram_avg_mib: stats.ram_avg_mib,
@@ -1773,7 +1830,17 @@ async function runSweepItem(input: RunSweepItemInput): Promise<TerminalRunItemSt
       stderr: bench.stderr,
     });
     logDiagnosticOutput(label, "llama-bench", bench.stderr);
-    const result = await finalizeSweepItemResult(runId, item, label, "llama-bench", bench, stats, baseline, input.mainGpu);
+    const result = await finalizeSweepItemResult(
+      runId,
+      item,
+      label,
+      "llama-bench",
+      bench,
+      stats,
+      baseline,
+      input.mainGpu,
+      input.modelSizeBytes
+    );
     // Printed last (after the TEST SUMMARY block above, whatever this item's
     // outcome) so anyone reading the log -- including a stopped/cancelled
     // item, which still reaches this same path -- has the exact file with
@@ -1805,6 +1872,8 @@ interface RunSweepItemViaServerInput {
   item: SweepItem;
   repeats: number;
   modelPath: string;
+  // See RunSweepItemInput.modelSizeBytes above -- same purpose.
+  modelSizeBytes: number;
   mtpModelPath: string | undefined;
   llamaServerPath: string;
   port: number;
@@ -1878,7 +1947,17 @@ async function runSweepItemViaServer(input: RunSweepItemViaServerInput): Promise
       stderr: bench.stderr,
     });
     logDiagnosticOutput(label, "llama-server", bench.stderr);
-    const result = await finalizeSweepItemResult(runId, item, label, "llama-server", bench, stats, baseline, input.mainGpu);
+    const result = await finalizeSweepItemResult(
+      runId,
+      item,
+      label,
+      "llama-server",
+      bench,
+      stats,
+      baseline,
+      input.mainGpu,
+      input.modelSizeBytes
+    );
     // See runSweepItem's identical line above -- same reasoning, same
     // "always printed last, cancelled included" behavior.
     log.info(`${label}: debug log: ${rawJsonPath}`);
