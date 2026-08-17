@@ -8,8 +8,9 @@ import { SliderChipInput } from "../components/SliderChipInput";
 import { ToggleChipGroup } from "../components/ToggleChipGroup";
 import { IconChevronDown } from "../components/icons";
 import { isMtpDraftModel, backendVisibleGpus, detectBackend } from "../types";
-import type { Model, SweepConfig, Backend } from "../types";
-import { formatGpuLabel } from "../utils";
+import type { Model, SweepConfig, Backend, WorkerVramInfo } from "../types";
+import { formatGpuLabel, formatBytes } from "../utils";
+import { estimateVramNeededMib, estimateSafeNgl } from "../vramEstimate";
 
 type Sweep = Omit<SweepConfig, "model_id">;
 
@@ -30,6 +31,7 @@ const EMPTY_SWEEP: Sweep = {
   flash_attn: [],
   mtp: [],
   n_gpu_layers_draft: [],
+  n_cpu_moe: [],
   repeats: 1,
 };
 
@@ -139,6 +141,11 @@ function sanitizeSweep(sweep: Sweep): Sweep {
   if (!cleaned.n_gpu_layers_draft || cleaned.n_gpu_layers_draft.length === 0) {
     cleaned.n_gpu_layers_draft = [0];
   }
+  // Same "not applicable yet" placeholder story as n_gpu_layers_draft above,
+  // for a remembered sweep predating this field.
+  if (!cleaned.n_cpu_moe || cleaned.n_cpu_moe.length === 0) {
+    cleaned.n_cpu_moe = [0];
+  }
   return cleaned;
 }
 
@@ -165,6 +172,7 @@ const NUMERIC_FIELDS = [
   "batch_size",
   "ubatch_size",
   "n_gpu_layers_draft",
+  "n_cpu_moe",
 ] as const;
 const STRING_FIELDS = ["cache_type_k", "cache_type_v", "flash_attn", "mtp"] as const;
 
@@ -362,6 +370,31 @@ export function NewRun() {
   const selectedModel = models.find((m) => m.id === modelId);
   const modelLayerCount = typeof selectedModel?.metadata.n_layer === "number" ? selectedModel.metadata.n_layer : null;
 
+  // Live free-VRAM reading for the pre-flight VRAM-fit banner below (see
+  // shared/vramEstimate.ts) -- fetched once per worker pick, not polled, so
+  // it stays cheap and non-intrusive. null while unfetched, while no worker
+  // is picked yet, or if the fetch failed (e.g. a cpu-backend worker with
+  // nothing meaningful to report) -- vramFitEstimate below treats null the
+  // same "don't guess" way every other unknown-context value in this file
+  // does (see nglMax's NGL_FALLBACK_MAX fallback).
+  const [liveVram, setLiveVram] = useState<WorkerVramInfo | null>(null);
+  useEffect(() => {
+    setLiveVram(null);
+    if (!workerName) return;
+    let cancelled = false;
+    api
+      .getWorkerVram(workerName)
+      .then((info) => {
+        if (!cancelled) setLiveVram(info);
+      })
+      .catch(() => {
+        if (!cancelled) setLiveVram(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [workerName]);
+
   // MTP context -- see shared/types.ts's ModelMetadata for what these mean.
   // A model with its own mtp_layers is self-sufficient (Qwen-style); one
   // without needs an explicit --model-draft companion picked from a draft
@@ -373,6 +406,14 @@ export function NewRun() {
   // MTP-capable) since that detection is best-effort -- see the warning
   // notice next to the toggle.
   const modelMtpCapable = typeof selectedModel?.metadata.mtp_layers === "number" && selectedModel.metadata.mtp_layers > 0;
+  // Gates the --n-cpu-moe control below -- unlike modelMtpCapable above,
+  // this DOES disable its control (SliderChipInput's disabled prop) rather
+  // than just changing hint text, a deliberate stricter posture for this
+  // specific control: MTP detection stays best-effort/advisory because a
+  // false negative there just means an extra manual pick, but a MoE-CPU-
+  // offload control enabled against a model with no experts to offload has
+  // nothing to do at all. See shared/types.ts's ModelMetadata.expert_count.
+  const modelIsMoe = typeof selectedModel?.metadata.expert_count === "number" && selectedModel.metadata.expert_count > 0;
   // Every registered draft is listed (not hidden) so the user can see the
   // full set that exists, but only ones sharing the base model's own
   // hf_repo -- the real HF folder-structure signal a drafter file is
@@ -476,6 +517,50 @@ export function NewRun() {
       ? `Suggested: ${baseLayerCount} -- offload every layer (this model has ${baseLayerCount}, including the output layer)`
       : `Suggested: ${NGL_FALLBACK_MAX} -- model's layer count isn't known yet, showing the "offload everything" default`;
 
+  // --n-cpu-moe's own N counts transformer blocks the same way llama.cpp's
+  // -ngl does at the low end (0 = off), but its ceiling is modelLayerCount
+  // itself, NOT baseLayerCount (+1) above -- the output layer has no MoE
+  // experts of its own to keep on CPU, so it isn't part of what --n-cpu-moe
+  // counts. Suggested starts at 0 regardless of context (inert by default,
+  // per the feature's own "greyed out/disabled until deliberately raised"
+  // intent) rather than mirroring nglSuggested's "default to max" posture.
+  const cpuMoeMax = noGpu ? 0 : modelLayerCount ?? NGL_FALLBACK_MAX;
+  const cpuMoeSuggested = 0;
+  const cpuMoeSuggestedLabel = noGpu
+    ? "Suggested: 0 -- this worker has no GPU backend"
+    : !modelIsMoe
+      ? "Suggested: 0 -- this model isn't detected as Mixture-of-Experts"
+      : modelLayerCount != null
+        ? `Suggested: 0 -- raise to keep some of this model's ${modelLayerCount} MoE layers' experts on CPU RAM instead of GPU VRAM`
+        : `Suggested: 0 -- model's layer count isn't known yet`;
+
+  // Pre-flight VRAM-fit estimate -- null (no banner) whenever any input is
+  // unknown (model size, layer count, or a live VRAM reading), same "don't
+  // guess" posture as nglSuggestedLabel's own NGL_FALLBACK_MAX fallback
+  // above. Uses the highest -ngl value currently in the sweep, since that's
+  // the one that would actually risk overcommitting VRAM. See
+  // shared/vramEstimate.ts for the formula and its known limitations
+  // (a flat per-layer average, weakest for MoE models).
+  const vramFitEstimate = useMemo(() => {
+    if (!selectedModel || baseLayerCount == null || liveVram?.vram_free_before_mib == null) return null;
+    const requestedNgl = sweep.n_gpu_layers.length > 0 ? Math.max(...sweep.n_gpu_layers) : 0;
+    if (requestedNgl <= 0) return null;
+    const neededMib = estimateVramNeededMib({
+      modelSizeBytes: selectedModel.size_bytes,
+      totalModelLayers: baseLayerCount,
+      requestedNgl,
+    });
+    if (neededMib == null) return null;
+    const freeMib = liveVram.vram_free_before_mib;
+    return {
+      modelSizeBytes: selectedModel.size_bytes,
+      neededMib,
+      freeMib,
+      safeNgl: estimateSafeNgl(selectedModel.size_bytes, baseLayerCount, freeMib),
+      fits: neededMib <= freeMib,
+    };
+  }, [selectedModel, baseLayerCount, sweep.n_gpu_layers, liveVram]);
+
   const threadsMax = workerHardware?.cpu.cores || THREADS_FALLBACK_MAX;
   const threadsSuggested = Math.max(1, threadsMax - 1);
   const threadsSuggestedLabel = workerHardware?.cpu.cores
@@ -517,6 +602,12 @@ export function NewRun() {
     } else {
       baseSweep.n_gpu_layers = [0, nglMax];
     }
+    // Always seeded inert (0), never a "try both" [0, max] pair like
+    // n_gpu_layers above -- unlike full GPU offload, there's no sensible
+    // universal "on" default for MoE-CPU-offload to suggest trying, and the
+    // control stays disabled anyway until a MoE model is picked (see
+    // modelIsMoe).
+    baseSweep.n_cpu_moe = [0];
     // Placeholder until a draft model is actually picked (mtpModelId isn't
     // known yet at this point -- it's reset separately, see the effect
     // above) -- the draftLayerCount effect below upgrades this to a real
@@ -813,6 +904,21 @@ export function NewRun() {
             }
             {...field(sweep, setSweep, "n_gpu_layers")}
           />
+          <SliderChipInput
+            label="MoE CPU layers (--n-cpu-moe)"
+            hint="Keeps this many of the model's Mixture-of-Experts layers' expert weights on CPU RAM instead of GPU VRAM -- lets a MoE model too big for VRAM still get GPU-accelerated attention. 0 omits the flag entirely."
+            min={0}
+            max={cpuMoeMax}
+            suggested={cpuMoeSuggested}
+            suggestedLabel={cpuMoeSuggestedLabel}
+            disabled={!modelIsMoe || noGpu}
+            disabledNote={
+              noGpu
+                ? "This worker's build has no GPU backend, so there's nothing to keep on CPU vs GPU."
+                : "This model isn't detected as a Mixture-of-Experts model, so --n-cpu-moe has nothing to offload."
+            }
+            {...field(sweep, setSweep, "n_cpu_moe")}
+          />
           <ChipInput
             label="Batch size (-b)"
             hint="Logical batch size — max tokens grouped per prompt-eval step."
@@ -826,6 +932,38 @@ export function NewRun() {
             {...field(sweep, setSweep, "ubatch_size")}
           />
         </div>
+
+        {vramFitEstimate && !vramFitEstimate.fits && (
+          <div className="rounded-lg border border-warning/30 bg-warning-bg px-3.5 py-2.5 text-xs text-warning">
+            <span className="font-semibold">May not fit in free VRAM.</span> This model
+            (~{formatBytes(vramFitEstimate.modelSizeBytes)}) at the GPU-layers value(s) you've set needs an estimated
+            ~{formatBytes(vramFitEstimate.neededMib * 1024 * 1024)}, but this worker currently has only
+            ~{formatBytes(vramFitEstimate.freeMib * 1024 * 1024)} free. If it doesn't fit, llama.cpp may still
+            report success while silently falling back to system RAM -- results would then reflect CPU, not GPU,
+            performance (see the run's "Download logs" output for a warning if that happens). This is a rough
+            estimate based on average layer size, not an exact calculation, and doesn't account for which GPU a
+            multi-GPU worker actually uses.
+            <div className="mt-2 flex flex-wrap items-center gap-2 border-t border-warning/30 pt-2">
+              <button
+                type="button"
+                onClick={() =>
+                  setSweep((s) => ({
+                    ...s,
+                    n_gpu_layers: [...new Set(s.n_gpu_layers.map((v) => Math.min(v, vramFitEstimate.safeNgl)))],
+                  }))
+                }
+                className="rounded-md border border-warning/50 px-2.5 py-1 text-xs font-semibold text-warning hover:bg-warning/10"
+              >
+                Cap GPU layers to ~{vramFitEstimate.safeNgl} (estimated safe)
+              </button>
+              <span className="text-warning/80">
+                Lowers every GPU-layers value in your sweep to fit the estimate above. Still approximate -- your run
+                could fail with an out-of-memory error, especially for Mixture-of-Experts models where layer sizes
+                vary.
+              </span>
+            </div>
+          </div>
+        )}
 
         <div className="grid grid-cols-[repeat(auto-fit,minmax(220px,1fr))] gap-5 rounded-xl border border-border bg-surface p-5">
           <ToggleChipGroup
