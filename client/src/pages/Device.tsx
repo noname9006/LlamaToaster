@@ -1,7 +1,7 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { api } from "../api/client";
 import type { DeviceStatusResponse } from "../types";
-import { CopyCommandButton, SETUP_OS_LABELS, FRESH_INSTALL_CMD, type SetupOS } from "../components/WorkerCard";
+import { CopyCommandButton, SETUP_OS_LABELS, buildSetupScenarios, type SetupOS } from "../components/WorkerCard";
 import { IconServer, IconInfo, IconCheck } from "../components/icons";
 
 // Matches server/src/session.ts's generateUserCode (4 chars, a dash, 4 more,
@@ -40,6 +40,11 @@ export function Device() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [approvedHost, setApprovedHost] = useState<string | null>(null);
+
+  // This page's own origin IS the server's public URL (see
+  // WorkerCard.tsx's buildSetupScenarios doc comment) -- stable for the
+  // life of the page, so computed once rather than on every render.
+  const setupScenarios = useMemo(() => buildSetupScenarios(window.location.origin), []);
 
   useEffect(() => {
     api
@@ -129,8 +134,9 @@ export function Device() {
     <div className="max-w-2xl">
       <h1 className="text-2xl font-semibold text-fg">Add a machine</h1>
       <p className="mt-2 text-sm text-muted">
-        Run this on the GPU box you want to connect — it's the same command every time, for every
-        machine. It prints a one-time code; enter that code below once it appears.
+        Run whichever of these matches the GPU box you want to connect. Setting it up for the
+        first time (or reconnecting a machine whose session was revoked) prints a one-time code —
+        enter that code below once it appears. A plain restart doesn't need this page at all.
       </p>
 
       <div className="mt-6 flex gap-1.5">
@@ -147,11 +153,30 @@ export function Device() {
           </button>
         ))}
       </div>
-      <div className="mt-2 flex items-start gap-3 rounded-lg border border-border bg-surface-raised px-3 py-2.5">
-        <code className="flex-1 whitespace-pre-wrap break-all font-mono text-xs text-fg">
-          {FRESH_INSTALL_CMD[os]}
-        </code>
-        <CopyCommandButton text={FRESH_INSTALL_CMD[os]} />
+      {/* First-run command has this page's own origin baked in as -VpsUrl/
+          --vps-url (see WorkerCard.tsx's buildSetupScenarios) -- copy-paste
+          runs as-is instead of erroring "-VpsUrl is required". Already-
+          installed/restart need no URL: config.json has it saved by then. */}
+      <div className="mt-2 flex flex-col gap-3">
+        {setupScenarios.map((scenario, i) => (
+          <div key={scenario.title} className="overflow-hidden rounded-lg border border-border">
+            <div className="bg-surface-raised px-3 py-2">
+              <div className="flex items-center gap-2">
+                <span className="flex h-5 w-5 flex-none items-center justify-center rounded-md bg-accent/15 font-mono text-[11px] font-bold text-accent">
+                  {i + 1}
+                </span>
+                <span className="text-sm font-semibold text-fg">{scenario.title}</span>
+              </div>
+              <p className="mt-1 text-xs leading-relaxed text-muted">{scenario.desc}</p>
+            </div>
+            <div className="flex items-start gap-3 border-t border-border bg-bg px-3 py-2.5">
+              <code className="flex-1 whitespace-pre-wrap break-all font-mono text-xs text-fg">
+                {scenario.cmd[os]}
+              </code>
+              <CopyCommandButton text={scenario.cmd[os]} />
+            </div>
+          </div>
+        ))}
       </div>
 
       {approvedHost ? (
