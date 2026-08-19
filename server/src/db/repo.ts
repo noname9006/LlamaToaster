@@ -29,6 +29,7 @@ import type {
   CommunityAggregateRow,
   CommunityAggregateFilters,
   CommunityFacets,
+  PossibleDuplicateWorker,
 } from "../../../shared/types.js";
 import type { SweepItem } from "../../../shared/sweep.js";
 
@@ -1351,6 +1352,36 @@ export const repo = {
         )
         .run(opts.hostname, opts.platform, opts.arch, hashToken(opts.deviceCode), opts.userCode, opts.expiresAt, Date.now(), workerId);
       return this.getEnrolmentById(workerId)!;
+    },
+
+    // Bug fix: worker/config.json's machine_id (worker/src/index.ts) is
+    // generated once with randomUUID() and lives ONLY in that file -- there's
+    // no other on-disk or OS-level trace of it. So a user who deletes a
+    // worker's install folder and re-runs setup gets a fresh machine_id;
+    // getByMachineId above always misses, and createPending would otherwise
+    // silently insert a second, indistinguishable `workers` row (same
+    // hostname/platform/arch/owner) with no history and no link to the old
+    // one. This is the best signal available for "looks like a machine this
+    // user already has" -- scoped to their OWN already-approved machines
+    // (never another user's, and never a still-pending one) and matched on
+    // self-reported hostname, since that's the one detail a human would
+    // actually recognize on the approval screen. A soft signal, not a
+    // uniqueness constraint: used by GET /api/device/status and
+    // POST /api/device/approve to ask before creating the duplicate, never to
+    // block it outright (a genuine second machine can share a hostname, e.g.
+    // an unconfigured "DESKTOP-XXXXXXX" default).
+    findPossibleDuplicate(userId: string, hostname: string | null, excludeWorkerId: string): PossibleDuplicateWorker | undefined {
+      if (!hostname) return undefined;
+      const row = getDb()
+        .prepare(
+          `SELECT id, display_name, last_heartbeat_at FROM workers
+           WHERE user_id = ? AND approved_at IS NOT NULL AND hostname = ? AND id != ?
+           ORDER BY last_heartbeat_at DESC LIMIT 1`
+        )
+        .get(userId, hostname, excludeWorkerId) as
+        | { id: string; display_name: string; last_heartbeat_at: number | null }
+        | undefined;
+      return row ? { id: row.id, displayName: row.display_name, lastHeartbeatAt: row.last_heartbeat_at } : undefined;
     },
 
     // The ONLY place workers.user_id is ever set (§3.1 step 5) -- the

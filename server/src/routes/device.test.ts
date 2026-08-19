@@ -217,6 +217,87 @@ describe("POST /api/device/approve", () => {
   });
 });
 
+describe("duplicate-machine detection (bug fix: deleted worker folder loses machine_id)", () => {
+  it("GET /status reports possibleDuplicate:null when the user has no other approved machine with this hostname", async () => {
+    const { user_code } = await startDevice("dupfix-status-none", { hostname: "dupfix-box-a" });
+    const user = repo.userRepo.upsertByIdentity("github", { providerUserId: "dupfix-viewer-1", login: "v1", avatarUrl: null });
+    const { token } = repo.sessionRepo.create(user.id, { label: "v1" });
+
+    const res = await fetch(`${baseUrl}/api/device/status?user_code=${user_code}`, { headers: authed(token) });
+    const body = (await res.json()) as { state: string; possibleDuplicate: unknown };
+    expect(body.state).toBe("pending");
+    expect(body.possibleDuplicate).toBeNull();
+  });
+
+  it("GET /status reports possibleDuplicate once the user already owns an approved machine with the same hostname", async () => {
+    const user = repo.userRepo.upsertByIdentity("github", { providerUserId: "dupfix-owner-1", login: "owner1", avatarUrl: null });
+    const { token } = repo.sessionRepo.create(user.id, { label: "owner1" });
+
+    // First machine, enrolled and approved normally.
+    const first = await startDevice("dupfix-original-machine", { hostname: "dupfix-box-b" });
+    await postJson("/api/device/approve", { user_code: first.user_code }, authed(token));
+
+    // Same physical box, but its worker/config.json (and machine_id) was
+    // wiped -- a brand-new machine_id enrols under the identical hostname.
+    const second = await startDevice("dupfix-rebuilt-machine", { hostname: "dupfix-box-b" });
+    const statusRes = await fetch(`${baseUrl}/api/device/status?user_code=${second.user_code}`, { headers: authed(token) });
+    const body = (await statusRes.json()) as { possibleDuplicate: { id: string; displayName: string } | null };
+    expect(body.possibleDuplicate).not.toBeNull();
+    expect(body.possibleDuplicate?.displayName).toBe("dupfix-box-b");
+  });
+
+  it("POST /approve holds off (needsConfirmation) on a likely duplicate until confirm_duplicate is passed", async () => {
+    const user = repo.userRepo.upsertByIdentity("github", { providerUserId: "dupfix-owner-2", login: "owner2", avatarUrl: null });
+    const { token } = repo.sessionRepo.create(user.id, { label: "owner2" });
+
+    const first = await startDevice("dupfix-original-2", { hostname: "dupfix-box-c" });
+    await postJson("/api/device/approve", { user_code: first.user_code }, authed(token));
+
+    const second = await startDevice("dupfix-rebuilt-2", { hostname: "dupfix-box-c" });
+
+    // First attempt, no confirmation -- must NOT approve.
+    const held = await postJson("/api/device/approve", { user_code: second.user_code }, authed(token));
+    expect(held.status).toBe(200);
+    const heldBody = (await held.json()) as { ok: boolean; needsConfirmation?: boolean; duplicateOf?: { displayName: string } };
+    expect(heldBody).toMatchObject({ ok: false, needsConfirmation: true });
+    expect(heldBody.duplicateOf?.displayName).toBe("dupfix-box-c");
+    expect(repo.workerRepo.getByUserCode(second.user_code)?.approvedAt).toBeNull();
+
+    // Explicit "add it anyway" -- now it goes through.
+    const confirmed = await postJson(
+      "/api/device/approve",
+      { user_code: second.user_code, confirm_duplicate: true },
+      authed(token)
+    );
+    expect(confirmed.status).toBe(200);
+    expect((await confirmed.json()) as { ok: boolean }).toMatchObject({ ok: true });
+
+    // Both machines now exist as separate, independently-owned rows -- this
+    // IS the intended outcome once a human explicitly says "add it anyway";
+    // there's no merge/history-carryover, just an honest second worker.
+    const originalWorker = repo.workerRepo.getByEnrolmentCodeHash(hashToken(first.device_code))!;
+    const rebuiltWorker = repo.workerRepo.getByEnrolmentCodeHash(hashToken(second.device_code))!;
+    expect(rebuiltWorker.id).not.toBe(originalWorker.id);
+    expect(rebuiltWorker.approvedAt).not.toBeNull();
+    expect(rebuiltWorker.userId).toBe(user.id);
+  });
+
+  it("never flags a duplicate against a DIFFERENT user's machine with the same hostname", async () => {
+    const userA = repo.userRepo.upsertByIdentity("github", { providerUserId: "dupfix-a", login: "dupfix-a", avatarUrl: null });
+    const userB = repo.userRepo.upsertByIdentity("github", { providerUserId: "dupfix-b", login: "dupfix-b", avatarUrl: null });
+    const tokenA = repo.sessionRepo.create(userA.id, { label: "a" }).token;
+    const tokenB = repo.sessionRepo.create(userB.id, { label: "b" }).token;
+
+    const first = await startDevice("dupfix-cross-user-1", { hostname: "DESKTOP-SAME" });
+    await postJson("/api/device/approve", { user_code: first.user_code }, authed(tokenA));
+
+    const second = await startDevice("dupfix-cross-user-2", { hostname: "DESKTOP-SAME" });
+    const res = await postJson("/api/device/approve", { user_code: second.user_code }, authed(tokenB));
+    expect(res.status).toBe(200);
+    expect((await res.json()) as { ok: boolean }).toMatchObject({ ok: true });
+  });
+});
+
 describe("full enrolment flow, start to finish", () => {
   it("start -> status(pending) -> approve -> status(approved) -> token(success) -> token(consumed)", async () => {
     const { device_code, user_code } = await startDevice("full-flow-machine", { hostname: "full-flow-box" });
