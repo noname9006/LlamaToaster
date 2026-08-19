@@ -1,0 +1,36 @@
+@import "tailwindcss";
+
+/* Same palette as client/src/styles/index.css, so the admin surface reads
+   as the same product -- but only the tokens, none of that file's
+   component-specific CSS (status dots, sliders, chat typing indicator, ...)
+   since this SPA has none of those components (§5.1: "deliberately small"). */
+@theme {
+  --color-bg: #0b0d12;
+  --color-surface: #12151c;
+  --color-surface-raised: #171b24;
+  --color-border: #262b36;
+  --color-fg: #e8e9ec;
+  --color-muted: #8b92a3;
+  --color-accent: #6ea8fe;
+  --color-accent-fg: #0b0e14;
+  --color-success: #86ef9e;
+  --color-success-bg: #143323;
+  --color-danger: #ff9b9b;
+  --color-danger-bg: #3a1f1f;
+  --color-warning: #ffd479;
+  --color-warning-bg: #3a2f13;
+  --font-sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+html {
+  color-scheme: dark;
+}
+
+body {
+  @apply bg-bg text-fg antialiased;
+  font-family: var(--font-sans);
+}
+
+#root {
+  min-height: 100vh;
+}
