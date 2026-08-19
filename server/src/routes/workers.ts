@@ -146,6 +146,24 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
     return reply.code(202).send({ ok: true, queued: true });
   });
 
+  // Permanently forgets this machine -- distinct from a session revoke
+  // (Settings' "Active sessions"), which only kicks the machine off and
+  // leaves the workers row (and its Workers-page card) in place forever
+  // (schema.sql: rows are otherwise never deleted). Refuses a busy machine
+  // (worker_jobs is ON DELETE CASCADE -- deleting mid-job would silently
+  // orphan whatever's running) but allows idle/offline, unlike
+  // requireOnlineWorker's routes above which need the opposite.
+  app.delete<{ Params: { id: string } }>("/api/workers/:id", async (request, reply) => {
+    const worker = repo.workerRepo.getWorker(request.params.id);
+    if (!worker) throw new NotFoundError("unknown machine");
+    assertOwnsWorker(resolveAuthUser(request)?.user.id, worker.id);
+    if (worker.status === "busy") {
+      throw new ConflictError("that machine is busy -- wait for it to finish, or cancel the run first");
+    }
+    repo.workerRepo.deleteWorker(worker.id);
+    return reply.code(200).send({ ok: true });
+  });
+
   app.delete<{ Params: { id: string }; Querystring: { file?: string } }>(
     "/api/workers/:id/models",
     async (request, reply) => {
