@@ -57,6 +57,18 @@ function persistDownloads(downloads: Record<string, DownloadState>): void {
   }
 }
 
+// `downloading`/`progress`/`speeds` below used to be keyed by bare filename
+// alone, which collided whenever two downloads shared a filename -- common
+// for GGUF quants, since many uploaders reuse fixed names like
+// "model.Q4_K_M.gguf" across different repos -- or when the same repo/file
+// was sent to two different workers at once. Either case silently merged two
+// unrelated transfers into one dictionary slot. Matches the worker's own
+// `${hf_repo}/${hf_file}` progressKey (see worker/src/index.ts's
+// executeDownloadModelJob), prefixed with the worker id.
+function downloadKey(workerId: string, repoId: string, path: string): string {
+  return `${workerId}::${repoId}/${path}`;
+}
+
 type SortField = "created" | "author" | "family" | "params" | "size";
 type SortDir = "asc" | "desc";
 
@@ -403,27 +415,28 @@ export function Models() {
   // POST that starts a download resolves as soon as the worker acks it, long
   // before the transfer itself finishes, so there's no blocking call left to
   // hang cleanup off of.
-  function finalizeDownload(path: string) {
+  function finalizeDownload(key: string) {
+    const label = downloading[key]?.file.path ?? key;
     setDownloading((d) => {
       const next = { ...d };
-      delete next[path];
+      delete next[key];
       return next;
     });
     setProgress((p) => {
       const next = { ...p };
-      delete next[path];
+      delete next[key];
       return next;
     });
     setSpeeds((s) => {
       const next = { ...s };
-      delete next[path];
+      delete next[key];
       return next;
     });
-    delete prevSampleRef.current[path];
-    delete smoothedSpeedRef.current[path];
-    delete seenRef.current[path];
-    delete missesRef.current[path];
-    setHfMsg(`${path} is no longer downloading -- refreshed the model list.`);
+    delete prevSampleRef.current[key];
+    delete smoothedSpeedRef.current[key];
+    delete seenRef.current[key];
+    delete missesRef.current[key];
+    setHfMsg(`${label} is no longer downloading -- refreshed the model list.`);
     void loadModels();
     // Safety net: the worker's progress entry disappearing only means the
     // byte transfer is done, not that the server has finished registering
@@ -445,9 +458,9 @@ export function Models() {
   // Known limitation: since a worker now runs exactly one job at a time, if
   // two downloads are queued on the SAME worker back to back, only the
   // first one's progress is visible (the worker hasn't started the second
-  // at all yet) -- its entry may look stalled until the first finishes and
-  // it actually becomes the active job. Downloads on different workers are
-  // unaffected; each worker's own activeJobProgress is independent.
+  // at all yet) -- its entry stays at "Starting…" until the first finishes
+  // and it actually becomes the active job. Downloads on different workers
+  // are unaffected; each worker's own activeJobProgress is independent.
   useEffect(() => {
     const entries = Object.entries(downloading);
     if (entries.length === 0) return;
@@ -461,45 +474,59 @@ export function Models() {
       }
       const byId = new Map(workerList.map((w) => [w.id, w]));
 
-      for (const [path, state] of entries) {
+      for (const [key, state] of entries) {
         const worker = byId.get(state.workerId);
         const active = worker?.activeJobProgress;
-        const stillDownloadingThis = worker?.status === "busy" && active?.phase === "downloading";
+        const workerIsDownloading = worker?.status === "busy" && active?.phase === "downloading";
+        // A worker's activeJobProgress only ever describes ONE job -- match
+        // it against `detail`, which executeDownloadModelJob sets to the
+        // same "<hf_repo>/<hf_file>" it downloads (see worker/src/index.ts).
+        // Without this check, every entry queued for this worker read the
+        // same activeJobProgress and rendered identical bytes/speed, no
+        // matter which file it actually belonged to.
+        const isThisDownload = workerIsDownloading && active?.detail === `${state.repoId}/${state.file.path}`;
 
-        if (stillDownloadingThis && active) {
-          seenRef.current[path] = true;
-          missesRef.current[path] = 0;
+        if (isThisDownload && active) {
+          seenRef.current[key] = true;
+          missesRef.current[key] = 0;
           const bytes = active.bytes ?? 0;
           const total = active.total_bytes ?? null;
-          setProgress((prev) => ({ ...prev, [path]: { bytes, total } }));
-          const prevSample = prevSampleRef.current[path];
+          setProgress((prev) => ({ ...prev, [key]: { bytes, total } }));
+          const prevSample = prevSampleRef.current[key];
           const now = Date.now();
           if (prevSample && now > prevSample.time) {
             const instantBytesPerSec = Math.max(0, ((bytes - prevSample.bytes) / (now - prevSample.time)) * 1000);
             // EMA with alpha ~0.25 -- smooths poll-to-poll jitter without
             // lagging too far behind a real step change.
             const SPEED_SMOOTHING_ALPHA = 0.25;
-            const prevSmoothed = smoothedSpeedRef.current[path];
+            const prevSmoothed = smoothedSpeedRef.current[key];
             const smoothed =
               prevSmoothed == null
                 ? instantBytesPerSec
                 : prevSmoothed + SPEED_SMOOTHING_ALPHA * (instantBytesPerSec - prevSmoothed);
-            smoothedSpeedRef.current[path] = smoothed;
-            setSpeeds((s) => ({ ...s, [path]: smoothed }));
+            smoothedSpeedRef.current[key] = smoothed;
+            setSpeeds((s) => ({ ...s, [key]: smoothed }));
           }
-          prevSampleRef.current[path] = { bytes, time: now };
+          prevSampleRef.current[key] = { bytes, time: now };
+        } else if (workerIsDownloading) {
+          // The worker is busy, but downloading a *different* job right now
+          // -- this entry is still queued behind it, neither done nor
+          // failed. Don't count this toward the miss-based finalize
+          // timeout below, or a long first download would cause everything
+          // queued behind it on the same worker to be wrongly finalized
+          // long before it even started.
         } else {
           // No longer this worker's active job -- either it just finished
           // (success or failure), or it hasn't started yet (still queued
           // behind another job). A grace period before finalizing either
           // way, since the worker's heartbeat cadence means "just changed"
           // and "genuinely done" look identical for a few ticks.
-          const misses = (missesRef.current[path] ?? 0) + 1;
-          missesRef.current[path] = misses;
+          const misses = (missesRef.current[key] ?? 0) + 1;
+          missesRef.current[key] = misses;
           const SEEN_GRACE_MISSES = 3;
           const NEVER_SEEN_TIMEOUT_MISSES = 6;
-          if ((seenRef.current[path] && misses >= SEEN_GRACE_MISSES) || misses >= NEVER_SEEN_TIMEOUT_MISSES) {
-            finalizeDownload(path);
+          if ((seenRef.current[key] && misses >= SEEN_GRACE_MISSES) || misses >= NEVER_SEEN_TIMEOUT_MISSES) {
+            finalizeDownload(key);
           }
         }
       }
@@ -591,7 +618,10 @@ export function Models() {
       // entry restored from localStorage after a refresh. finalizeDownload
       // is the one place that ever clears `downloading` now.
       await api.downloadHfFile(workerId, repoId, file.path);
-      setDownloading((d) => ({ ...d, [file.path]: { repoId, workerId, startedAt: Date.now(), file } }));
+      setDownloading((d) => ({
+        ...d,
+        [downloadKey(workerId, repoId, file.path)]: { repoId, workerId, startedAt: Date.now(), file },
+      }));
     } catch (err) {
       setHfMsg(`Error: ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -818,20 +848,20 @@ export function Models() {
         <section className="mt-8">
           <h2 className="text-sm font-semibold uppercase tracking-wide text-muted">Active downloads</h2>
           <div className="mt-3 flex flex-col gap-2">
-            {Object.entries(downloading).map(([path, state]) => {
-              const prog = progress[path];
-              const speed = speeds[path];
+            {Object.entries(downloading).map(([key, state]) => {
+              const prog = progress[key];
+              const speed = speeds[key];
               const pct = prog?.total != null ? Math.min(100, Math.round((prog.bytes / prog.total) * 100)) : null;
               const totalBytes = prog?.total ?? state.file.size_bytes ?? null;
               return (
                 <div
-                  key={path}
+                  key={key}
                   className="flex flex-col gap-2 rounded-lg border border-border bg-surface px-4 py-2.5 text-sm"
                 >
                   <div className="flex flex-wrap items-center justify-between gap-2">
                     <div className="flex items-center gap-2">
                       <IconDownload width={14} height={14} className="text-accent" />
-                      <span className="text-fg">{path}</span>
+                      <span className="text-fg">{state.file.path}</span>
                       <span className="text-xs text-muted">
                         {state.repoId} · {workers.find((w) => w.id === state.workerId)?.displayName ?? state.workerId}
                       </span>
@@ -1008,9 +1038,10 @@ export function Models() {
                     ) : (
                       <ul className="divide-y divide-border">
                         {filesByRepo[r.id].map((f) => {
-                          const dl = downloading[f.path];
-                          const prog = progress[f.path];
-                          const speed = speeds[f.path];
+                          const dlKey = downloadKey(downloadWorker, r.id, f.path);
+                          const dl = downloading[dlKey];
+                          const prog = progress[dlKey];
+                          const speed = speeds[dlKey];
                           const pct =
                             prog?.total != null ? Math.min(100, Math.round((prog.bytes / prog.total) * 100)) : null;
                           return (
