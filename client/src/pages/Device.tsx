@@ -3,6 +3,7 @@ import { api } from "../api/client";
 import type { DeviceStatusResponse } from "../types";
 import { CopyCommandButton, SETUP_OS_LABELS, buildSetupScenarios, type SetupOS } from "../components/WorkerCard";
 import { IconServer, IconInfo, IconCheck } from "../components/icons";
+import { formatRelativeTime } from "../utils";
 
 // Matches server/src/session.ts's generateUserCode (4 chars, a dash, 4 more,
 // drawn from Crockford base32 minus ambiguous characters) -- used both to
@@ -96,7 +97,21 @@ export function Device() {
     setBusy(true);
     setError(null);
     try {
-      const res = await api.approveDevice(codeInput);
+      // confirm_duplicate reflects what the last status poll already showed
+      // -- see server/src/routes/device.ts's POST /api/device/approve and
+      // workerRepo.findPossibleDuplicate's doc comment for why this exists:
+      // deleting a worker's install folder wipes its persisted machine_id,
+      // so re-running setup looks like a brand-new machine to the server,
+      // and without this check would silently create an indistinguishable
+      // duplicate of a machine the user already has.
+      const res = await api.approveDevice(codeInput, status?.state === "pending" && status.possibleDuplicate != null);
+      if (!res.ok) {
+        // Race: the duplicate was only detected server-side just now (this
+        // poll hadn't caught up yet) -- the next poll tick will pick up
+        // possibleDuplicate and relabel the button; nothing was approved.
+        setError('This machine looks like one you already have -- click "Add as new machine" once it appears below.');
+        return;
+      }
       setApprovedHost(res.machine.hostname ?? "This machine");
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -232,10 +247,23 @@ export function Device() {
                   .filter(Boolean)
                   .join(" · ") || "no machine details reported"}
               </div>
-              <div className="mt-3 flex items-start gap-2 rounded-md bg-warning-bg px-2.5 py-2 text-xs text-warning">
-                <IconInfo width={14} height={14} className="mt-0.5 flex-none" />
-                Only approve a code you generated, on a machine you trust.
-              </div>
+              {status.possibleDuplicate ? (
+                <div className="mt-3 flex items-start gap-2 rounded-md bg-warning-bg px-2.5 py-2 text-xs text-warning">
+                  <IconInfo width={14} height={14} className="mt-0.5 flex-none" />
+                  <span>
+                    This looks like a machine you already have -- "{status.possibleDuplicate.displayName}"
+                    {status.possibleDuplicate.lastHeartbeatAt != null
+                      ? `, last seen ${formatRelativeTime(new Date(status.possibleDuplicate.lastHeartbeatAt).toISOString())}`
+                      : ", never connected"}
+                    . Adding it won't carry over that history -- they'll show up as two separate workers.
+                  </span>
+                </div>
+              ) : (
+                <div className="mt-3 flex items-start gap-2 rounded-md bg-warning-bg px-2.5 py-2 text-xs text-warning">
+                  <IconInfo width={14} height={14} className="mt-0.5 flex-none" />
+                  Only approve a code you generated, on a machine you trust.
+                </div>
+              )}
               <div className="mt-3 flex gap-2">
                 <button
                   type="button"
@@ -243,7 +271,7 @@ export function Device() {
                   disabled={busy}
                   className="rounded-lg bg-accent px-4 py-1.5 text-sm font-semibold text-accent-fg disabled:opacity-50"
                 >
-                  Approve
+                  {status.possibleDuplicate ? "Add as new machine" : "Approve"}
                 </button>
                 <button
                   type="button"

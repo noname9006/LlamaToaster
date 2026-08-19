@@ -175,6 +175,52 @@ describe("workerRepo.reissueEnrolment", () => {
   });
 });
 
+describe("workerRepo.findPossibleDuplicate", () => {
+  it("returns undefined when the hostname is null (never reported)", () => {
+    const user = repo.userRepo.upsertByIdentity("github", { providerUserId: "dup-null-host", login: "dup1", avatarUrl: null });
+    expect(repo.workerRepo.findPossibleDuplicate(user.id, null, "irrelevant")).toBeUndefined();
+  });
+
+  it("finds an already-approved machine the same user owns with a matching hostname", () => {
+    const user = repo.userRepo.upsertByIdentity("github", { providerUserId: "dup-match-1", login: "dup2", avatarUrl: null });
+    const old = repo.workerRepo.createPending(pendingOpts({ machineId: "m-dup-old", hostname: "dup-tower", userCode: "DUP1-CODE" }));
+    repo.workerRepo.approve(old.id, user.id);
+
+    const found = repo.workerRepo.findPossibleDuplicate(user.id, "dup-tower", "some-new-pending-id");
+    expect(found).toMatchObject({ id: old.id, displayName: "dup-tower" });
+  });
+
+  it("excludes the row itself (so a machine never flags as a duplicate of its own row)", () => {
+    const user = repo.userRepo.upsertByIdentity("github", { providerUserId: "dup-self", login: "dup3", avatarUrl: null });
+    const w = repo.workerRepo.createPending(pendingOpts({ machineId: "m-dup-self", hostname: "self-tower", userCode: "DUP2-CODE" }));
+    repo.workerRepo.approve(w.id, user.id);
+
+    expect(repo.workerRepo.findPossibleDuplicate(user.id, "self-tower", w.id)).toBeUndefined();
+  });
+
+  it("never matches another user's machine, even with the identical hostname", () => {
+    const owner = repo.userRepo.upsertByIdentity("github", { providerUserId: "dup-owner", login: "dup-owner", avatarUrl: null });
+    const other = repo.userRepo.upsertByIdentity("github", { providerUserId: "dup-other", login: "dup-other", avatarUrl: null });
+    const w = repo.workerRepo.createPending(pendingOpts({ machineId: "m-dup-cross-user", hostname: "shared-name", userCode: "DUP3-CODE" }));
+    repo.workerRepo.approve(w.id, owner.id);
+
+    expect(repo.workerRepo.findPossibleDuplicate(other.id, "shared-name", "irrelevant")).toBeUndefined();
+  });
+
+  it("ignores a row that has a user_id but hasn't actually been approved", async () => {
+    const user = repo.userRepo.upsertByIdentity("github", { providerUserId: "dup-pending", login: "dup4", avatarUrl: null });
+    const w = repo.workerRepo.createPending(pendingOpts({ machineId: "m-dup-pending-1", hostname: "pending-tower", userCode: "DUP4-CODE" }));
+    // approve() always sets user_id and approved_at together -- there's no
+    // real code path that sets one without the other. Simulate it anyway to
+    // confirm findPossibleDuplicate's approved_at check is load-bearing,
+    // not just incidentally redundant with the user_id filter.
+    const { getDb } = await import("./migrate.js");
+    getDb().prepare(`UPDATE workers SET user_id = ? WHERE id = ?`).run(user.id, w.id);
+
+    expect(repo.workerRepo.findPossibleDuplicate(user.id, "pending-tower", "some-other-id")).toBeUndefined();
+  });
+});
+
 describe("sessionRepo.revokeWorkerSessions", () => {
   it("revokes only the given worker's own sessions, leaving user browser sessions and other workers alone", () => {
     const user = repo.userRepo.upsertByIdentity("github", { providerUserId: "revoke-worker-1", login: "revoke-user", avatarUrl: null });

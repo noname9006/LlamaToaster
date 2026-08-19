@@ -15,6 +15,7 @@ import {
   type SessionInfo,
   type IdentityInfo,
   type DeviceStatusResponse,
+  type DeviceApproveResponse,
 } from "../types";
 
 export class ApiError extends Error {
@@ -231,8 +232,8 @@ export const api = {
   getDeviceStatus: (userCode: string): Promise<DeviceStatusResponse> =>
     request(`/api/device/status?user_code=${encodeURIComponent(userCode)}`),
 
-  approveDevice: (userCode: string): Promise<{ ok: true; machine: { hostname: string | null } }> =>
-    request("/api/device/approve", postJson({ user_code: userCode })),
+  approveDevice: (userCode: string, confirmDuplicate = false): Promise<DeviceApproveResponse> =>
+    request("/api/device/approve", postJson({ user_code: userCode, confirm_duplicate: confirmDuplicate })),
 
   // Live (not persisted) Hugging Face check, keyed by model id -- powers the
   // New Run model picker's "Updated X ago" label and "possibly newer on HF"
