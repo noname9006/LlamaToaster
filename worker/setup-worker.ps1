@@ -8,15 +8,22 @@
 # Usage (from anywhere). Safe to run every time, first setup or a plain
 # restart -- if config.json already exists, setup (and the -Dir prompt) is
 # skipped entirely and this just starts the worker:
-#   .\worker\setup-worker.ps1
+#   .\worker\setup-worker.ps1 -VpsUrl https://llamatoaster.com
 #
 # On first run (no config.json yet), omitting -Dir asks which drive to use
 # (with free-space info -- models are often tens of GB each) and a folder
 # name. Pass -Dir to skip that prompt, e.g. for unattended/scripted use:
-#   .\worker\setup-worker.ps1 -Dir F:\LlamaToaster
+#   .\worker\setup-worker.ps1 -VpsUrl https://llamatoaster.com -Dir F:\LlamaToaster
 #
-# No IP needed either: bind_host auto-detects via `tailscale ip -4` unless
-# you pass -BindHost explicitly.
+# No IP or port to configure at all -- the worker has no inbound listener
+# (it long-polls the server, MULTIUSER_PLAN.md §1). The FIRST time it runs
+# with no session configured yet, it prints a short code and a URL
+# (https://<vps-url>/device) to approve it from your account -- do that once,
+# in a browser, and it's connected. The saved session survives ordinary
+# restarts and never asks again on its own -- if it needs to reconnect (its
+# session was revoked from Settings, or its refresh token expired), pass
+# -Reconnect (see below) rather than re-running plain setup, which is a
+# total no-op once config.json already exists.
 #
 # Other optional overrides:
 #   -WorkerName <name>   default "Local"
@@ -28,27 +35,48 @@
 #                        actual GPU on startup. Pass this only to pin/override
 #                        that, e.g. for hardware the auto-detect heuristic
 #                        doesn't specifically know about.
-#   -VpsUrl <url>        default the orchestrator's known Tailscale address
-#   -Port <n>            default 8080
-#   -Force               overwrite an existing worker/config.json
+#   -Reconnect            clear this machine's saved session (keeping
+#                        machine_id and every other setting) so it goes
+#                        through device-flow approval again on the same
+#                        machine identity -- the server recognizes it as the
+#                        SAME machine (same history/display_name), unlike
+#                        -Force below. Requires config.json to already exist.
+#   -Force               overwrite an existing worker/config.json from
+#                        scratch, INCLUDING machine_id -- the server will
+#                        treat this as a brand-new machine with no history.
+#                        Use -Reconnect instead unless that's actually what
+#                        you want.
+#   -AllowInsecureUrl     allow a plain http:// -VpsUrl other than
+#                        localhost/127.0.0.1 (see below). Only for a
+#                        deployment you've secured another way -- e.g. this
+#                        app's own tailnet-only mode, where Tailscale's own
+#                        WireGuard tunnel is the encryption, not TLS.
 #
 # Safe by default: refuses to overwrite an existing worker/config.json unless
-# -Force is passed (no git in this repo checkout, so an overwritten config.json
-# has no recovery path). Idempotent otherwise: if config.json already exists,
-# setup is skipped and this just (re)starts the worker with it as-is -- so the
-# exact same command works both for first-time setup and every restart after.
+# -Force (or -Reconnect, which only ever touches the session fields) is
+# passed -- no git in this repo checkout, so an overwritten config.json has
+# no recovery path. Idempotent otherwise: if config.json already exists and
+# neither switch is given, setup is skipped and this just (re)starts the
+# worker with it as-is -- so the exact same command works both for
+# first-time setup and every restart after.
 
 param(
     [string]$Dir,
     [string]$WorkerName = "Local",
     [string]$Backend,
-    [string]$VpsUrl = "http://100.122.1.111:4010",
-    [string]$BindHost,
-    [int]$Port = 8080,
-    [switch]$Force
+    [string]$VpsUrl,
+    [switch]$Reconnect,
+    [switch]$Force,
+    [switch]$AllowInsecureUrl
 )
 
 $ErrorActionPreference = "Stop"
+
+if ($Force -and $Reconnect) {
+    Write-Error "-Force and -Reconnect are mutually exclusive (-Force wipes machine_id, -Reconnect preserves it)."
+    exit 1
+}
+
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 $ConfigPath = Join-Path $RepoRoot "worker\config.json"
 
@@ -85,30 +113,61 @@ function Select-InstallDir {
     return $resolved
 }
 
-$SkippedSetup = (Test-Path $ConfigPath) -and -not $Force
-if ($SkippedSetup) {
+if ($Reconnect) {
+    if (-not (Test-Path $ConfigPath)) {
+        Write-Error "-Reconnect needs an existing $ConfigPath -- nothing to reconnect. Run without -Reconnect first."
+        exit 1
+    }
+    # ConvertFrom-Json / ConvertTo-Json, not a text edit -- real JSON parsing,
+    # same reasoning as setup-worker.sh's node one-liner. Every other field
+    # -- machine_id above all -- passes through untouched; only these two
+    # are ever removed.
+    $existing = Get-Content $ConfigPath -Raw | ConvertFrom-Json
+    $existing.PSObject.Properties.Remove('session_token')
+    $existing.PSObject.Properties.Remove('refresh_token')
+    $json = $existing | ConvertTo-Json
+    [System.IO.File]::WriteAllText($ConfigPath, $json, (New-Object System.Text.UTF8Encoding($false)))
+    Write-Host "Cleared the saved session in $ConfigPath -- this machine will go through device-flow approval again on startup, same identity." -ForegroundColor Yellow
+}
+
+$SkippedSetup = ((Test-Path $ConfigPath) -and -not $Force -and -not $Reconnect) -or $Reconnect
+if ($Reconnect) {
+    # config.json already handled above -- nothing else to do before starting.
+} elseif ($SkippedSetup) {
     Write-Host "worker\config.json already exists -- skipping setup, starting the worker with it as-is." -ForegroundColor Yellow
-    Write-Host "(Re-run with -Force to redo setup, e.g. after changing -Dir or -BindHost.)" -ForegroundColor Yellow
+    Write-Host "(Re-run with -Force to redo setup from scratch, or -Reconnect to just re-approve this machine.)" -ForegroundColor Yellow
 } else {
+    if (-not $VpsUrl) {
+        Write-Error "-VpsUrl is required on first setup, e.g. -VpsUrl https://llamatoaster.com"
+        exit 1
+    }
+    # This ends up in config.json and gets a real 90-day bearer token sent to
+    # it on every heartbeat/queue-poll (MULTIUSER_PLAN.md §3.5's own "the
+    # installer refuses http://") -- plaintext HTTP would put that credential
+    # on the wire in the clear. localhost/127.0.0.1/::1 are exempted, same
+    # convention browsers use for "secure context" -- needed for local
+    # dev/testing against a server that isn't fronted by TLS yet. Anything
+    # else over http:// needs -AllowInsecureUrl (e.g. this app's own
+    # tailnet-only mode, where Tailscale's own tunnel is the encryption, not
+    # TLS).
+    $isLocalHttp = $VpsUrl -match '^http://(localhost|127\.0\.0\.1|\[::1\])'
+    if (-not $VpsUrl.StartsWith("https://") -and -not $isLocalHttp) {
+        if ($VpsUrl.StartsWith("http://") -and $AllowInsecureUrl) {
+            # explicitly accepted
+        } elseif ($VpsUrl.StartsWith("http://")) {
+            Write-Error "-VpsUrl is http:// ($VpsUrl) -- that sends a real bearer credential in the clear. Use https://, or pass -AllowInsecureUrl if this connection is secured another way (e.g. a Tailscale-only deployment)."
+            exit 1
+        } else {
+            Write-Error "-VpsUrl must start with https:// or http://, got: $VpsUrl"
+            exit 1
+        }
+    }
+
     if (-not $Dir) {
         $Dir = Select-InstallDir
     }
     $LlamaCppDir = Join-Path $Dir "llama"
     $ModelsDir = Join-Path $Dir "models"
-
-    if (-not $BindHost) {
-        Write-Host "No -BindHost given, trying 'tailscale ip -4'..."
-        try {
-            $BindHost = (& tailscale ip -4 2>$null | Select-Object -First 1).Trim()
-        } catch {
-            $BindHost = $null
-        }
-        if (-not $BindHost) {
-            Write-Error "Could not auto-detect a Tailscale IP. Pass -BindHost <this machine's tailnet IP> explicitly."
-            exit 1
-        }
-        Write-Host "Using detected Tailscale IP: $BindHost"
-    }
 
     foreach ($dir in @($LlamaCppDir, $ModelsDir)) {
         if (-not (Test-Path $dir)) {
@@ -127,8 +186,6 @@ if ($SkippedSetup) {
         llama_bench_path     = (Join-Path $LlamaCppDir "llama-bench.exe")
         model_dir            = $ModelsDir
         vps_url              = $VpsUrl
-        bind_host            = $BindHost
-        port                 = $Port
         raw_json_dir         = $RawJsonDir
         llama_cpp_builds_dir = $LlamaCppDir
     }
@@ -159,11 +216,14 @@ if (-not (Test-Path "node_modules\.bin\tsx.cmd") -and -not (Test-Path "node_modu
     }
 }
 
-if ($SkippedSetup) {
+if ($Reconnect) {
+    Write-Host "Starting worker -- watch the console for a short code and a link to re-approve this machine."
+} elseif ($SkippedSetup) {
     Write-Host "Starting worker with existing $ConfigPath"
 } else {
     $backendLabel = if ($Backend) { $Backend } else { "auto-detected from hardware" }
     Write-Host "Starting worker '$WorkerName' ($backendLabel) -- llama.cpp builds will install to $LlamaCppDir on first run, models download to $ModelsDir from the Models page."
+    Write-Host "First run only: watch the console for a short code and a link to approve this machine."
 }
 npm run worker
 Pop-Location

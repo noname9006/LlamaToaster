@@ -5,24 +5,26 @@
 # setup-worker.sh) the home for the "llama" and "models" subfolders.
 #
 # Usage from a totally fresh machine (only bash + Node.js 22+ needed; git is
-# used if present, otherwise falls back to a plain tarball download). Omit
-# --dir and it'll ask -- shows `df -h` (models are often tens of GB each) and
-# asks for a base folder and a name:
+# used if present, otherwise falls back to a plain tarball download). --vps-url
+# is required. Omit --dir and it'll ask -- shows `df -h` (models are often
+# tens of GB each) and asks for a base folder and a name:
 #
-#   curl -fsSL https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.sh | bash -s -- --vps-url https://llamatoaster.com
 #
 # Pass --dir to skip the prompts (e.g. for unattended/scripted use):
 #
-#   curl -fsSL https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.sh | bash -s -- --dir ~/LlamaToaster
+#   curl -fsSL https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.sh | bash -s -- --vps-url https://llamatoaster.com --dir ~/LlamaToaster
 #
 # Safe to re-run: if --dir already has a checkout, the download step is
 # skipped; setup-worker.sh underneath is itself idempotent (skips writing
 # config.json if one already exists). So the same command works for first
-# setup, picking up code updates, and every plain restart after.
+# setup, picking up code updates, and every plain restart after. To
+# re-approve a machine whose session was revoked, add --reconnect (needs an
+# existing --dir checkout with a config.json already in it).
 #
 # All setup-worker.sh overrides are forwarded -- see that script's own
 # header for what each one does: --worker-name --backend --vps-url
-# --bind-host --port --force. Plus one bootstrap-only option:
+# --reconnect --force --allow-insecure-url. Plus one bootstrap-only option:
 #   --branch <name>   git branch/ref to fetch, default "main"
 
 set -euo pipefail
@@ -33,10 +35,10 @@ DIR=""
 BRANCH="main"
 WORKER_NAME="Local"
 BACKEND=""
-VPS_URL="http://100.122.1.111:4010"
-BIND_HOST=""
-PORT=8080
+VPS_URL=""
 FORCE=0
+RECONNECT=0
+ALLOW_INSECURE_URL=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -45,12 +47,19 @@ while [ $# -gt 0 ]; do
     --worker-name) WORKER_NAME="$2"; shift 2 ;;
     --backend) BACKEND="$2"; shift 2 ;;
     --vps-url) VPS_URL="$2"; shift 2 ;;
-    --bind-host) BIND_HOST="$2"; shift 2 ;;
-    --port) PORT="$2"; shift 2 ;;
     --force) FORCE=1; shift ;;
+    --reconnect) RECONNECT=1; shift ;;
+    --allow-insecure-url) ALLOW_INSECURE_URL=1; shift ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
 done
+
+# Not required for --reconnect: it only clears the session fields in an
+# EXISTING config.json, which already has its own vps_url saved.
+if [ -z "$VPS_URL" ] && [ "$RECONNECT" -ne 1 ]; then
+  echo "--vps-url is required, e.g. --vps-url https://llamatoaster.com" >&2
+  exit 1
+fi
 
 # Same Git Bash/MSYS/Cygwin footgun setup-worker.sh guards against -- paths
 # written on Windows under those shells get silently misinterpreted by the
@@ -126,9 +135,11 @@ if ! npm install --ignore-scripts; then
   exit 1
 fi
 
-SETUP_ARGS=(--dir "$DIR" --worker-name "$WORKER_NAME" --vps-url "$VPS_URL" --port "$PORT")
+SETUP_ARGS=(--dir "$DIR" --worker-name "$WORKER_NAME")
+[ -n "$VPS_URL" ] && SETUP_ARGS+=(--vps-url "$VPS_URL")
 [ -n "$BACKEND" ] && SETUP_ARGS+=(--backend "$BACKEND")
-[ -n "$BIND_HOST" ] && SETUP_ARGS+=(--bind-host "$BIND_HOST")
 [ "$FORCE" -eq 1 ] && SETUP_ARGS+=(--force)
+[ "$RECONNECT" -eq 1 ] && SETUP_ARGS+=(--reconnect)
+[ "$ALLOW_INSECURE_URL" -eq 1 ] && SETUP_ARGS+=(--allow-insecure-url)
 
 exec "$DIR/worker/setup-worker.sh" "${SETUP_ARGS[@]}"
