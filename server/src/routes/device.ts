@@ -5,7 +5,13 @@ import { parseDeviceStart, parseDeviceToken } from "../validate-worker-state.js"
 import { NotFoundError, ConflictError } from "../errors.js";
 import type { AuthenticatedRequest } from "../auth-middleware.js";
 import { userOrIpKeyGenerator } from "../auth-middleware.js";
-import type { DeviceStartResponse, DeviceTokenSuccess, DeviceTokenError, DeviceStatusResponse } from "../../../shared/types.js";
+import type {
+  DeviceStartResponse,
+  DeviceTokenSuccess,
+  DeviceTokenError,
+  DeviceStatusResponse,
+  DeviceApproveResponse,
+} from "../../../shared/types.js";
 
 const ENROLMENT_TTL_MS = 15 * 60 * 1000;
 
@@ -95,16 +101,23 @@ export async function deviceApprovalRoutes(app: FastifyInstance): Promise<void> 
     if (worker.enrolmentExpiresAt == null || worker.enrolmentExpiresAt < Date.now()) {
       return { state: "not_found" as const };
     }
+    // Surfaced here (not just at approve time) so the approval card can show
+    // the "looks like a machine you already have" warning up front, before
+    // the human even reaches for the Approve button -- see
+    // workerRepo.findPossibleDuplicate's own doc comment for why this exists.
+    const userId = (req as AuthenticatedRequest).user.id;
+    const possibleDuplicate = repo.workerRepo.findPossibleDuplicate(userId, worker.hostname, worker.id) ?? null;
     return {
       state: "pending" as const,
       machine: { hostname: worker.hostname, platform: worker.platform, arch: worker.arch, gpu: worker.gpuModel },
+      possibleDuplicate,
     };
   });
 
-  app.post<{ Body: { user_code?: string } }>(
+  app.post<{ Body: { user_code?: string; confirm_duplicate?: boolean } }>(
     "/api/device/approve",
     { config: { rateLimit: { max: 20, timeWindow: "1 minute", keyGenerator: userOrIpKeyGenerator } } },
-    async (req) => {
+    async (req): Promise<DeviceApproveResponse> => {
       const worker = repo.workerRepo.getByUserCode(req.body.user_code ?? "");
       if (!worker) throw new NotFoundError("invalid or expired code");
       // Same ordering fix as GET /api/device/status above, for the same
@@ -115,7 +128,18 @@ export async function deviceApprovalRoutes(app: FastifyInstance): Promise<void> 
       if (worker.enrolmentExpiresAt == null || worker.enrolmentExpiresAt < Date.now()) {
         throw new NotFoundError("invalid or expired code");
       }
-      repo.workerRepo.approve(worker.id, (req as AuthenticatedRequest).user.id);
+      const userId = (req as AuthenticatedRequest).user.id;
+      // Re-checked here (not just trusted from a prior GET /status) since
+      // that's a separate, unauthoritative poll -- this is the actual
+      // decision point. A caller that already got the human's explicit
+      // "add it anyway" (confirm_duplicate) skips straight to approving.
+      if (!req.body.confirm_duplicate) {
+        const duplicateOf = repo.workerRepo.findPossibleDuplicate(userId, worker.hostname, worker.id);
+        if (duplicateOf) {
+          return { ok: false, needsConfirmation: true, duplicateOf };
+        }
+      }
+      repo.workerRepo.approve(worker.id, userId);
       return { ok: true, machine: { hostname: worker.hostname } };
     }
   );
