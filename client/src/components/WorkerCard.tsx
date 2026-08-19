@@ -13,43 +13,56 @@ export const SETUP_OS_LABELS: Array<{ key: SetupOS; label: string; badgeClass: s
   { key: "linux", label: "LINUX", badgeClass: "text-[#f0b86e] bg-[#f0b86e]/15" },
 ];
 
+export interface SetupScenario {
+  title: string;
+  desc: string;
+  cmd: Record<SetupOS, string>;
+}
+
+// vpsUrl is this server's own public origin (pass window.location.origin --
+// the page showing this command IS served from PUBLIC_URL, see
+// deploy/orchestrator.env.example) -- baked into the fresh-install command
+// so it's copy-paste-runnable as-is instead of erroring with "-VpsUrl is
+// required" (bootstrap.ps1/bootstrap.sh both require it on first setup).
+// Already-cloned/restart need no URL: by then config.json has it saved.
+//
 // Exported for client/src/pages/Device.tsx's own install-command display
 // (MULTIUSER_PLAN.md §3.1) -- single source of truth so an existing worker's
 // restart/reinstall reference panel here and the "Add machine" onboarding
 // screen there never drift apart. Kept in sync with worker/bootstrap.ps1,
 // worker/bootstrap.sh, worker/setup-worker.ps1, worker/setup-worker.sh, and
 // README.md's "Running the worker (GPU box)" section.
-export const FRESH_INSTALL_CMD: Record<SetupOS, string> = {
-  windows: 'iex "& { $(irm https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.ps1) }"',
-  macos: "curl -fsSL https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.sh | bash",
-  linux: "curl -fsSL https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.sh | bash",
-};
-
-const SETUP_SCENARIOS: Array<{ title: string; desc: string; cmd: Record<SetupOS, string> }> = [
-  {
-    title: "Fresh install",
-    desc: "Brand-new machine, nothing downloaded yet (no repo, no config, no llama.cpp) -- one command fetches the repo, installs dependencies, and starts the worker. It'll ask which drive/volume to use (showing free space -- models are often tens of GB each) and a folder name, then create it.",
-    cmd: FRESH_INSTALL_CMD,
-  },
-  {
-    title: "Already cloned",
-    desc: "Already have the repo checked out -- same command for first setup (still asks where, unless you pass a folder) and every restart after. Run from the repo root.",
-    cmd: {
-      windows: ".\\worker\\setup-worker.ps1",
-      macos: "bash worker/setup-worker.sh",
-      linux: "bash worker/setup-worker.sh",
+export function buildSetupScenarios(vpsUrl: string): SetupScenario[] {
+  return [
+    {
+      title: "Fresh install",
+      desc: "Brand-new machine, nothing downloaded yet (no repo, no config, no llama.cpp) -- one command fetches the repo, installs dependencies, and starts the worker. It'll ask which drive/volume to use (showing free space -- models are often tens of GB each) and a folder name, then create it.",
+      cmd: {
+        windows: `iex "& { $(irm https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.ps1) } -VpsUrl ${vpsUrl}"`,
+        macos: `curl -fsSL https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.sh | bash -s -- --vps-url ${vpsUrl}`,
+        linux: `curl -fsSL https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.sh | bash -s -- --vps-url ${vpsUrl}`,
+      },
     },
-  },
-  {
-    title: "Restart",
-    desc: "Once it's already set up, a plain restart.",
-    cmd: {
-      windows: "worker\\start.bat",
-      macos: "npm run worker",
-      linux: "npm run worker",
+    {
+      title: "Already installed",
+      desc: "Already have the repo checked out -- same command for first setup (still asks where, unless you pass a folder) and every restart after. Run from the repo root.",
+      cmd: {
+        windows: ".\\worker\\setup-worker.ps1",
+        macos: "bash worker/setup-worker.sh",
+        linux: "bash worker/setup-worker.sh",
+      },
     },
-  },
-];
+    {
+      title: "Restart",
+      desc: "Once it's already set up and running, stop it (Ctrl+C, or close the window) and run this to start it again -- reuses the saved config.json as-is, no prompts.",
+      cmd: {
+        windows: "worker\\start.bat",
+        macos: "npm run worker",
+        linux: "npm run worker",
+      },
+    },
+  ];
+}
 
 export function CopyCommandButton({ text }: { text: string }) {
   const [copied, setCopied] = useState(false);
@@ -165,7 +178,7 @@ export function WorkerCard({ worker, onRefresh }: { worker: Worker; onRefresh: (
           <IconChevronDown width={14} height={14} className="transition-transform group-open:rotate-180" />
         </summary>
         <div className="flex flex-col gap-3 border-t border-border p-3">
-          {SETUP_SCENARIOS.map((scenario, i) => (
+          {buildSetupScenarios(window.location.origin).map((scenario, i) => (
             <div key={scenario.title} className="overflow-hidden rounded-lg border border-border">
               <div className="bg-surface-raised px-3 py-2.5">
                 <div className="flex items-center gap-2">
