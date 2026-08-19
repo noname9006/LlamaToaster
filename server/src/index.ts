@@ -1,14 +1,23 @@
 import Fastify, { type FastifyError } from "fastify";
 import fastifyStatic from "@fastify/static";
+import fastifyCookie from "@fastify/cookie";
+import fastifyRateLimit from "@fastify/rate-limit";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { readFileSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 import { runsRoutes } from "./routes/runs.js";
 import { modelsRoutes } from "./routes/models.js";
 import { resultsRoutes } from "./routes/results.js";
 import { workersRoutes } from "./routes/workers.js";
 import { aiRoutes } from "./routes/ai.js";
+import { queueRoutes } from "./routes/queue.js";
+import { authRoutes } from "./routes/auth.js";
+import { sessionRoutes } from "./routes/sessions.js";
+import { deviceRoutes, deviceApprovalRoutes } from "./routes/device.js";
+import { adminRoutes } from "./routes/admin.js";
 import { getDb } from "./db/migrate.js";
+import { runMaintenanceSweep, REAP_INTERVAL_MS } from "./reaper.js";
+import { authMiddleware } from "./auth-middleware.js";
 
 // Backs the AI assistant's server-side config only (AI_API_KEY/AI_BASE_URL/
 // AI_MODEL, see routes/ai.ts) -- every other env var here (PORT,
@@ -26,6 +35,14 @@ try {
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const clientDist = join(__dirname, "..", "..", "client", "dist");
+const adminDist = join(__dirname, "..", "..", "admin", "dist");
+
+// Multi-user Stage 5 (MULTIUSER_PLAN.md §5.1) -- same derivation as
+// routes/admin.ts's own ADMIN_HOSTNAME (re-declared here rather than
+// imported: this is purely about which STATIC ROOT to serve, an unrelated
+// concern from that file's auth/hostname gating, and importing across just
+// for one constant isn't worth the coupling).
+const ADMIN_HOSTNAME = process.env.ADMIN_PUBLIC_URL ? new URL(process.env.ADMIN_PUBLIC_URL).hostname : undefined;
 
 const PORT = Number(process.env.PORT ?? 3000);
 const HOST = process.env.BIND_HOST ?? "127.0.0.1";
@@ -39,6 +56,16 @@ const app = Fastify({
     level: process.env.LOG_LEVEL ?? "info",
     timestamp: () => `,"time":"${new Date().toISOString()}"`,
   },
+  // MULTIUSER_PLAN.md §6.1: once nginx sits in front of this process, req.ip
+  // would otherwise be nginx's own loopback address for every request,
+  // silently collapsing §2.6's per-IP rate limits (auth, device-flow) into
+  // one shared global limit. Scoped to loopback specifically -- not a blanket
+  // `true` -- so a direct connection from anywhere else (e.g. another
+  // tailnet peer, in the still-supported Tailscale-only deployment mode)
+  // can't spoof X-Forwarded-For to fake a different client identity; only a
+  // request that already came from 127.0.0.1/::1 (nginx, by construction --
+  // see BIND_HOST) gets its forwarded headers trusted at all.
+  trustProxy: ["127.0.0.1", "::1"],
 });
 
 app.register(fastifyStatic, {
@@ -46,11 +73,85 @@ app.register(fastifyStatic, {
   prefix: "/",
 });
 
+// Multi-user Stage 5 (MULTIUSER_PLAN.md §5.1): a SECOND static root, active
+// only for requests whose Host matches the admin hostname -- Fastify (via
+// find-my-way's built-in host-constraint strategy) tries constrained routes
+// before the unconstrained one above, so admin. gets admin/dist and every
+// other hostname keeps getting client/dist, with no explicit branching
+// logic needed here. decorateReply: false avoids a "reply.sendFile already
+// exists" clash with the registration above -- nothing here calls it
+// directly. Skipped entirely (with a warning, not a crash) if
+// ADMIN_PUBLIC_URL is set but `npm run build --prefix admin` hasn't been run
+// yet -- registering @fastify/static against a directory that doesn't exist
+// throws at startup otherwise, and this shouldn't take down the main site.
+if (ADMIN_HOSTNAME) {
+  if (existsSync(adminDist)) {
+    app.register(fastifyStatic, {
+      root: adminDist,
+      prefix: "/",
+      decorateReply: false,
+      constraints: { host: ADMIN_HOSTNAME },
+    });
+  } else {
+    app.log.warn(
+      `ADMIN_PUBLIC_URL is set but ${adminDist} doesn't exist -- run "npm run build --prefix admin" first`
+    );
+  }
+}
+
+// Harmless to register unconditionally -- it only parses the Cookie header
+// into req.cookies, which future auth cookies (lt_session, oauth_state) need
+// regardless of whether AUTH_ENABLED is on. secret is only required for
+// *signed* cookies, which nothing here uses.
+app.register(fastifyCookie);
+
+// global:false -- opt in per route via `config: { rateLimit: {...} }`
+// (MULTIUSER_PLAN.md §2.6) rather than a blanket limit on every route,
+// most of which (polled GETs, worker heartbeats) see far higher legitimate
+// traffic than any of the specifically-budgeted routes below.
+app.register(fastifyRateLimit, { global: false });
+
 app.register(runsRoutes);
 app.register(modelsRoutes);
 app.register(resultsRoutes);
 app.register(workersRoutes);
 app.register(aiRoutes);
+app.register(queueRoutes);
+// Registered unconditionally (not gated on AUTH_ENABLED) -- GET
+// /api/auth/status is the SPA's own boot check and needs to answer even when
+// auth is off (MULTIUSER_PLAN.md §2.3's independent-deploy split), and the
+// /auth/:provider* routes are harmless without it (nothing requires being
+// logged in yet, so completing a login just creates an unused session).
+app.register(authRoutes);
+// Same reasoning as authRoutes above -- POST /api/device/start|token are
+// device-initiated and harmless without AUTH_ENABLED (a Stage-1-only
+// deployment's workers never call these at all, they use the old
+// WORKER_SHARED_TOKEN path instead; see routes/device.ts's own header comment).
+app.register(deviceRoutes);
+// Multi-user Stage 5 (MULTIUSER_PLAN.md §5.1): also registered
+// unconditionally -- adminRoutes is entirely self-gated (its own onRequest
+// hook checks ADMIN_HOSTNAME + isSuperadmin via resolveAuthUser directly,
+// never assuming the AUTH_ENABLED-gated authMiddleware below has run) and
+// 404s everything if ADMIN_PUBLIC_URL isn't configured, same "harmless
+// without AUTH_ENABLED" posture as authRoutes/deviceRoutes above.
+app.register(adminRoutes);
+
+// Multi-user Stage 2 (MULTIUSER_PLAN.md §2.3): registered only when
+// AUTH_ENABLED=true, so Stage 1 (still shared-secret worker auth, no user
+// auth at all) and Stage 2 can be deployed independently -- flipping this on
+// without a configured OAuth provider/PUBLIC_URL would lock every route
+// behind a login flow nothing can complete yet.
+const AUTH_ENABLED = process.env.AUTH_ENABLED === "true";
+if (AUTH_ENABLED) {
+  app.addHook("preHandler", authMiddleware);
+  // sessionRoutes (GET/DELETE /api/sessions, POST /api/sessions/revoke-all)
+  // and deviceApprovalRoutes (GET /api/device/status, POST /api/device/approve)
+  // all read req.user, which only authMiddleware ever populates -- registering
+  // them with auth off would crash on the first request.
+  app.register(sessionRoutes);
+  app.register(deviceApprovalRoutes);
+  app.log.info("AUTH_ENABLED=true -- user auth middleware active");
+}
 
 // GET /api/runs/:id and the tick leg of POST /api/runs/:id/items/:idx are
 // polled every ~1-2s by every open Runs/RunDetail tab and by the worker
@@ -89,17 +190,26 @@ app.addHook("onClose", async () => {
   clearInterval(pollingSummaryInterval);
 });
 
+const reapInterval = setInterval(() => runMaintenanceSweep(app.log), REAP_INTERVAL_MS);
+reapInterval.unref();
+
+app.addHook("onClose", async () => {
+  clearInterval(reapInterval);
+});
+
+// Public (MULTIUSER_PLAN.md §6.2): a bare {ok, db} only -- this used to also
+// echo err.message straight into the response, which is a real information
+// leak once the app is Internet-facing (raw DB error text, e.g. a file path,
+// visible to anyone). The detail still needs to reach someone -- it's logged
+// server-side instead.
 app.get("/health", async (_req, reply) => {
   try {
     getDb().prepare("SELECT 1").get();
     return { ok: true, db: true };
   } catch (err) {
+    app.log.error({ err }, "/health: DB check failed");
     reply.code(500);
-    return {
-      ok: false,
-      db: false,
-      error: err instanceof Error ? err.message : String(err),
-    };
+    return { ok: false, db: false };
   }
 });
 
@@ -115,16 +225,20 @@ app.get("/health", async (_req, reply) => {
 // breaks every path except "/" (served fresh by fastifyStatic) -- the app
 // would 200-and-serve-HTML for the missing JS/CSS instead of loading them.
 const indexHtmlPath = join(clientDist, "index.html");
+// Multi-user Stage 5 (MULTIUSER_PLAN.md §5.1): the admin SPA's own
+// client-side routes (a stats page, the runs table, ...) need the exact same
+// index.html fallback treatment, just from admin/dist instead.
+const adminIndexHtmlPath = join(adminDist, "index.html");
 
 app.setNotFoundHandler((request, reply) => {
   if (request.method === "GET" && !request.url.startsWith("/api/")) {
+    const onAdminHost = ADMIN_HOSTNAME !== undefined && request.hostname === ADMIN_HOSTNAME;
+    const path = onAdminHost ? adminIndexHtmlPath : indexHtmlPath;
     try {
-      const indexHtml = readFileSync(indexHtmlPath, "utf8");
+      const indexHtml = readFileSync(path, "utf8");
       return reply.type("text/html").send(indexHtml);
     } catch {
-      app.log.warn(
-        `${indexHtmlPath} not found -- run "npm run build" to build the frontend before serving it`
-      );
+      app.log.warn(`${path} not found -- run "npm run build" to build the frontend before serving it`);
     }
   }
   reply.code(404);
@@ -133,7 +247,13 @@ app.setNotFoundHandler((request, reply) => {
 
 app.setErrorHandler((error: FastifyError, _req, reply) => {
   app.log.error(error);
-  reply.code(error.statusCode ?? 500).send({ error: error.message });
+  const statusCode = error.statusCode ?? 500;
+  // Never leak an internal error's message to the client -- it can contain
+  // file paths, SQL, or other implementation detail. Only errors we
+  // deliberately threw as a 4xx (see errors.ts) have a message meant to be
+  // shown to the caller.
+  const message = statusCode >= 500 ? "internal server error" : error.message;
+  reply.code(statusCode).send({ error: message });
 });
 
 async function start(): Promise<void> {
