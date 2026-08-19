@@ -151,6 +151,13 @@ export interface ModelMetadata {
   // companion file itself (Gemma-4-style), meant to be paired with a base
   // model via --model-draft rather than run standalone.
   mtp_layers?: number;
+  // GGUF's <architecture>.expert_count, read at the same time as n_layer --
+  // see worker/src/gguf.ts. Present and >0 only for a Mixture-of-Experts
+  // architecture; absent for a dense model or a model registered before this
+  // existed, same "absent means unknown/not applicable" convention as
+  // mtp_layers above. Gates NewRun.tsx's --n-cpu-moe control (see
+  // shared/sweep.ts's n_cpu_moe once that axis exists).
+  expert_count?: number;
   // Set to "draft" when this model was registered from a path/filename
   // containing "mtp" (the real-world convention for standalone MTP/drafter
   // downloads, e.g. unsloth's "MTP/mtp-gemma-4-12B-it.gguf") -- see
@@ -241,6 +248,8 @@ export interface SweepConfig {
   // -ngl. See shared/sweep.ts's SweepItem.n_gpu_layers_draft for why it's
   // still a required field even on combos where it's a no-op.
   n_gpu_layers_draft: number[];
+  // llama.cpp's --n-cpu-moe N -- see shared/sweep.ts's SweepItem.n_cpu_moe.
+  n_cpu_moe: number[];
   repeats: number;
 }
 
@@ -367,6 +376,12 @@ export interface ResultRow {
   // equivalent "draft offloaded X/Y" runtime line to confirm what actually
   // happened.
   n_gpu_layers_draft: number;
+  // The requested --n-cpu-moe value -- see shared/sweep.ts's
+  // SweepItem.n_cpu_moe. Request-only, like every other field on this row
+  // except n_gpu_layers/n_gpu_layers_draft: llama.cpp prints no equivalent
+  // confirmation line for how many layers' MoE experts actually landed on
+  // CPU, only the "offloaded X/Y layers to GPU" line those two fields read.
+  n_cpu_moe: number;
   avg_tps: number;
   stddev_tps: number;
   // Already equivalent to the spec's system_memory_model_peak_mb --
@@ -490,6 +505,11 @@ export interface IngestResultInput {
   // version-skewed worker's real results still get saved instead of the
   // whole item being rejected over one missing/new metric.
   n_gpu_layers_draft?: number;
+  // See ResultRow.n_cpu_moe above. Optional like n_gpu_layers_draft above --
+  // an older worker that predates this column simply won't send it,
+  // defaulted to 0 server-side (server/src/db/repo.ts's buildResultRow)
+  // rather than required.
+  n_cpu_moe?: number;
   avg_tps: number;
   stddev_tps: number;
   ram_peak_mib: number;
@@ -562,6 +582,7 @@ export interface RunItem {
   flash_attn: string;
   mtp: string;
   n_gpu_layers_draft: number;
+  n_cpu_moe: number;
   status: RunItemStatus;
   detail?: string;
   ram_mib?: number | null;
@@ -740,6 +761,32 @@ export function backendVisibleGpus<T extends { vendor: string; model: string }>(
   return filtered.length > 0 ? filtered : gpu;
 }
 
+// Cached free-VRAM reading -- worker/src/index.ts's collectState() computes
+// this on every heartbeat/queue poll while idle (skipped while busy: not
+// meaningful for pre-flight fit-checking, and avoids a second concurrent
+// readGpuMemory call alongside MemorySampler's own). Server persists it on
+// the worker row (workers.vram_json) and GET /api/workers/:id/vram just
+// serves that cached value -- no server->worker proxy exists post-Stage-1
+// (MULTIUSER_PLAN.md §1.11), so this can be a poll-cycle stale (up to
+// HEARTBEAT_INTERVAL_MS) rather than truly live. Consumed by NewRun.tsx's
+// pre-flight VRAM-fit banner (see shared/vramEstimate.ts). Deliberately NOT
+// the same type as worker/src/sampler.ts's FreeMemoryBaseline (which this
+// mirrors field-for-field) -- keeping the wire contract independent means
+// sampler.ts itself needs no changes, same reasoning as HardwareInfo above
+// being defined twice rather than shared across the worker/client boundary.
+export interface WorkerVramInfo {
+  ok: true;
+  backend: Backend;
+  ram_free_before_mib: number;
+  vram_free_before_mib: number | null;
+  vram_free_before_accuracy: GpuMemoryAccuracyLevel;
+  vram_free_before_source: GpuMemoryMeasurementSource | null;
+  system_memory_total_mib: number | null;
+  gpu_memory_total_mib: number | null;
+  gpu_memory_total_accuracy: GpuMemoryAccuracyLevel;
+  gpu_memory_total_source: GpuMemoryMeasurementSource | null;
+}
+
 // --- Hugging Face model search ---
 
 export interface HfRepoSearchResult {
@@ -775,6 +822,7 @@ export interface ModelDownloadCallbackInput {
   size_bytes?: number;
   n_layer?: number | null;
   mtp_layers?: number | null;
+  expert_count?: number | null;
 }
 
 // --- Pull queue (MULTIUSER_PLAN.md Stage 1) ---
@@ -796,6 +844,10 @@ export interface Worker {
   hardware: HardwareInfo | null;
   installedBuilds: InstalledBuild[];
   modelFiles: ModelDirFile[];
+  // Last-reported free-VRAM reading (see WorkerVramInfo below) -- null until
+  // the worker's first idle heartbeat, or if it's currently busy (not
+  // recomputed while running a benchmark).
+  vram: WorkerVramInfo | null;
   status: "offline" | "idle" | "busy"; // DERIVED, never stored -- see server/src/liveness.ts
   lastHeartbeatAt: number | null;
   activeJobId: string | null;
@@ -830,6 +882,10 @@ export interface WorkerStatePush {
   installed_builds: InstalledBuild[];
   model_files: (ModelDirFile & { n_layer?: number | null; mtp_layers?: number | null })[];
   status: "idle" | "busy";
+  // See WorkerVramInfo's doc comment -- omitted (not just null) while busy,
+  // since collectState() skips the read entirely rather than reporting a
+  // stale/meaningless-while-busy figure.
+  vram?: WorkerVramInfo | null;
 }
 
 // Reported alongside a heartbeat while a job is active -- the replacement

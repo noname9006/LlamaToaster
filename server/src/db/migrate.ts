@@ -141,6 +141,14 @@ const COLUMN_MIGRATIONS: ColumnSpec[] = [
   // catalog row. No user-deletion feature exists yet, so this is currently
   // untested in practice, just faithful to the plan.
   { table: "models", column: "created_by", ddlType: "TEXT REFERENCES users(id)" },
+  // --n-cpu-moe -- see shared/sweep.ts's SweepItem.n_cpu_moe. Same DEFAULT 0
+  // reasoning as n_gpu_layers_draft above.
+  { table: "run_items", column: "n_cpu_moe", ddlType: "INTEGER DEFAULT 0" },
+  { table: "results", column: "n_cpu_moe", ddlType: "INTEGER DEFAULT 0" },
+  // Cached worker.vram_json -- see shared/types.ts's Worker.vram doc comment
+  // (pull-queue model: this is populated from the worker's own heartbeat,
+  // not a live server->worker proxy read).
+  { table: "workers", column: "vram_json", ddlType: "TEXT" },
 ];
 
 function applyColumnMigrations(database: Database.Database): void {
