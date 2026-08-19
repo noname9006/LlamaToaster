@@ -1147,6 +1147,22 @@ export const repo = {
       return rows.map(mapWorker);
     },
 
+    // Permanently forgets a machine (routes/workers.ts's DELETE
+    // /api/workers/:id -- the ownership + not-busy checks live there, this
+    // is just the row removal). Deliberately NOT the same posture as
+    // pruneExpiredEnrolments' "never delete a row with history" -- this IS
+    // the user asking to delete it. Safe regardless: runs.worker_id is
+    // `ON DELETE SET NULL` and runs.worker_name is a point-in-time snapshot
+    // (COLUMN_MIGRATIONS in migrate.ts), so every past run stays fully
+    // readable, just no longer linked to a live worker row. worker_jobs rows
+    // (`ON DELETE CASCADE`) go with it -- correct, since the caller already
+    // refused to delete a busy machine, so there's nothing queued/in-flight
+    // to lose. If this machine reconnects later, its machine_id is gone from
+    // this table too, so the server treats it as a brand-new enrolment.
+    deleteWorker(id: string): void {
+      getDb().prepare(`DELETE FROM workers WHERE id = ?`).run(id);
+    },
+
     // Multi-user Stage 4 (MULTIUSER_PLAN.md §4.6) -- the caller's own
     // machines only, for the AI context snapshot (routes/ai.ts's
     // hardwareSummary). A separate function rather than listWorkers(userId?)

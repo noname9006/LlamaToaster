@@ -118,6 +118,14 @@ export const api = {
   // separate per-worker fetch (MULTIUSER_PLAN.md §1.16).
   listWorkers: (): Promise<Worker[]> => request<{ workers: Worker[] }>("/api/workers").then((d) => d.workers),
 
+  // Permanently removes a machine from the Workers page -- distinct from
+  // Settings' session revoke, which only kicks it off and leaves the row
+  // (and card) in place. Run history is untouched (see server/src/db/
+  // repo.ts's deleteWorker doc comment); reconnecting afterward re-enrols as
+  // a brand-new machine.
+  deleteWorker: (workerId: string): Promise<{ ok: true }> =>
+    request(`/api/workers/${encodeURIComponent(workerId)}`, { method: "DELETE" }),
+
   // Which llama.cpp releases a specific machine could install, and whether
   // a newer one than what it has exists -- the one piece of per-worker
   // "live" info that's a GitHub lookup, not something the worker itself
