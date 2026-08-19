@@ -1,32 +1,35 @@
-import { useState } from "react";
-import { api, type WorkerListEntry } from "../api/client";
-import type { WorkerStatus } from "../api/useWorkerStatus";
+import { useEffect, useState } from "react";
+import { api } from "../api/client";
+import type { Worker, Run, LlamaCppRelease } from "../types";
 import { StatusPill, WorkerStatusPill, ElapsedSince } from "./StatusPill";
 import { IconCheck, IconChevronDown, IconDownload, IconTrash } from "./icons";
 import { copyToClipboard, formatBytes, formatDate, formatGpuLabel } from "../utils";
 
-type SetupOS = "windows" | "macos" | "linux";
+export type SetupOS = "windows" | "macos" | "linux";
 
-const SETUP_OS_LABELS: Array<{ key: SetupOS; label: string; badgeClass: string }> = [
+export const SETUP_OS_LABELS: Array<{ key: SetupOS; label: string; badgeClass: string }> = [
   { key: "windows", label: "WIN", badgeClass: "text-[#8fc6e8] bg-[#8fc6e8]/15" },
   { key: "macos", label: "MACOS", badgeClass: "text-[#c9a6e8] bg-[#c9a6e8]/15" },
   { key: "linux", label: "LINUX", badgeClass: "text-[#f0b86e] bg-[#f0b86e]/15" },
 ];
 
-// Kept in sync with worker/bootstrap.ps1, worker/bootstrap.sh,
-// worker/setup-worker.ps1, worker/setup-worker.sh, and README.md's "Running
-// the worker (GPU box)" section -- all four describe the same three
-// scenarios.
+// Exported for client/src/pages/Device.tsx's own install-command display
+// (MULTIUSER_PLAN.md §3.1) -- single source of truth so an existing worker's
+// restart/reinstall reference panel here and the "Add machine" onboarding
+// screen there never drift apart. Kept in sync with worker/bootstrap.ps1,
+// worker/bootstrap.sh, worker/setup-worker.ps1, worker/setup-worker.sh, and
+// README.md's "Running the worker (GPU box)" section.
+export const FRESH_INSTALL_CMD: Record<SetupOS, string> = {
+  windows: 'iex "& { $(irm https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.ps1) }"',
+  macos: "curl -fsSL https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.sh | bash",
+  linux: "curl -fsSL https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.sh | bash",
+};
+
 const SETUP_SCENARIOS: Array<{ title: string; desc: string; cmd: Record<SetupOS, string> }> = [
   {
     title: "Fresh install",
     desc: "Brand-new machine, nothing downloaded yet (no repo, no config, no llama.cpp) -- one command fetches the repo, installs dependencies, and starts the worker. It'll ask which drive/volume to use (showing free space -- models are often tens of GB each) and a folder name, then create it.",
-    cmd: {
-      windows:
-        'iex "& { $(irm https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.ps1) }"',
-      macos: "curl -fsSL https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.sh | bash",
-      linux: "curl -fsSL https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.sh | bash",
-    },
+    cmd: FRESH_INSTALL_CMD,
   },
   {
     title: "Already cloned",
@@ -48,7 +51,7 @@ const SETUP_SCENARIOS: Array<{ title: string; desc: string; cmd: Record<SetupOS,
   },
 ];
 
-function CopyCommandButton({ text }: { text: string }) {
+export function CopyCommandButton({ text }: { text: string }) {
   const [copied, setCopied] = useState(false);
 
   return (
@@ -73,21 +76,56 @@ function CopyCommandButton({ text }: { text: string }) {
   );
 }
 
-export function WorkerCard({
-  worker,
-  status,
-  onRefresh,
-}: {
-  worker: WorkerListEntry;
-  status?: WorkerStatus;
-  onRefresh: () => void;
-}) {
+export function WorkerCard({ worker, onRefresh }: { worker: Worker; onRefresh: () => void }) {
   const [busyTag, setBusyTag] = useState<string | null>(null);
   const [msg, setMsg] = useState("");
+  const [available, setAvailable] = useState<LlamaCppRelease[]>([]);
+  const [updateAvailable, setUpdateAvailable] = useState(false);
+  const [activeRun, setActiveRun] = useState<Run | undefined>(undefined);
 
-  const info = status?.info;
-  const loading = status?.loading ?? true;
-  const inaccessible = status?.inaccessible ?? false;
+  const inaccessible = worker.status === "offline";
+
+  // Which releases this machine could install -- a live GitHub lookup
+  // (cached server-side), not something the worker reports about itself, so
+  // it's its own small fetch rather than inline on the Worker object (see
+  // server/src/routes/workers.ts's GET /api/workers/:id/available-builds).
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .getAvailableBuilds(worker.id)
+      .then((d) => {
+        if (cancelled) return;
+        setAvailable(d.available);
+        setUpdateAvailable(d.update_available);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [worker.id]);
+
+  // Worker.activeRunId only names the run (MULTIUSER_PLAN.md §1.16's "no
+  // outbound HTTP" also means no inline model_filename/started_at without
+  // this second small fetch) -- resolved separately so the running-banner
+  // below can show what the old worker-pushed WorkerCurrentRun did.
+  useEffect(() => {
+    if (!worker.activeRunId) {
+      setActiveRun(undefined);
+      return;
+    }
+    let cancelled = false;
+    api
+      .getRun(worker.activeRunId)
+      .then((d) => {
+        if (!cancelled) setActiveRun(d.run);
+      })
+      .catch(() => {
+        if (!cancelled) setActiveRun(undefined);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [worker.activeRunId]);
 
   async function withBusy(tag: string, action: () => Promise<void>, doneMsg: string) {
     setBusyTag(tag);
@@ -103,103 +141,110 @@ export function WorkerCard({
     }
   }
 
-  const installedTags = new Set(info?.installed.map((b) => b.tag) ?? []);
-  const availableToInstall = (info?.available ?? []).filter(
-    (rel) => !installedTags.has(rel.tag) && rel.assets.length > 0
-  );
+  const installedTags = new Set(worker.installedBuilds.map((b) => b.tag));
+  const availableToInstall = available.filter((rel) => !installedTags.has(rel.tag) && rel.assets.length > 0);
 
   return (
     <div className="rounded-xl border border-border bg-surface p-5">
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <h3 className="text-lg font-semibold text-fg">{worker.name}</h3>
+        <h3 className="text-lg font-semibold text-fg">{worker.displayName}</h3>
         <div className="flex items-center gap-2">
-          {info && <StatusPill label={info.backend} tone="muted" />}
-          <WorkerStatusPill inaccessible={inaccessible} loading={loading} />
+          {worker.backend && <StatusPill label={worker.backend} tone="muted" />}
+          <WorkerStatusPill inaccessible={inaccessible} />
         </div>
       </div>
 
       {inaccessible && (
         <p className="mt-3 text-sm text-muted">
-          This worker can't be reached right now. It may be offline, asleep, or not connected to
-          the tailnet.
+          This machine hasn't checked in recently. It may be offline, asleep, or disconnected.
         </p>
       )}
-      {!worker.is_self && (
-        <details open={inaccessible} className="group mt-3 rounded-lg border border-border bg-surface-raised">
-          <summary className="flex cursor-pointer items-center justify-between px-2.5 py-1.5 text-xs font-semibold uppercase tracking-wide text-muted">
-            Setup / restart commands
-            <IconChevronDown width={14} height={14} className="transition-transform group-open:rotate-180" />
-          </summary>
-          <div className="flex flex-col gap-3 border-t border-border p-3">
-            {SETUP_SCENARIOS.map((scenario, i) => (
-              <div key={scenario.title} className="overflow-hidden rounded-lg border border-border">
-                <div className="bg-surface-raised px-3 py-2.5">
-                  <div className="flex items-center gap-2">
-                    <span className="flex h-5 w-5 flex-none items-center justify-center rounded-md bg-accent/15 font-mono text-[11px] font-bold text-accent">
-                      {i + 1}
-                    </span>
-                    <span className="text-sm font-semibold text-fg">{scenario.title}</span>
-                  </div>
-                  <p className="mt-1.5 text-xs leading-relaxed text-muted">{scenario.desc}</p>
+      <details className="group mt-3 rounded-lg border border-border bg-surface-raised">
+        <summary className="flex cursor-pointer items-center justify-between px-2.5 py-1.5 text-xs font-semibold uppercase tracking-wide text-muted">
+          Setup / restart commands
+          <IconChevronDown width={14} height={14} className="transition-transform group-open:rotate-180" />
+        </summary>
+        <div className="flex flex-col gap-3 border-t border-border p-3">
+          {SETUP_SCENARIOS.map((scenario, i) => (
+            <div key={scenario.title} className="overflow-hidden rounded-lg border border-border">
+              <div className="bg-surface-raised px-3 py-2.5">
+                <div className="flex items-center gap-2">
+                  <span className="flex h-5 w-5 flex-none items-center justify-center rounded-md bg-accent/15 font-mono text-[11px] font-bold text-accent">
+                    {i + 1}
+                  </span>
+                  <span className="text-sm font-semibold text-fg">{scenario.title}</span>
                 </div>
-                {SETUP_OS_LABELS.map(({ key, label, badgeClass }) => (
-                  <div key={key} className="flex items-start gap-3 border-t border-border bg-bg px-3 py-2.5">
-                    <span
-                      className={`mt-0.5 w-16 flex-none rounded py-[3px] text-center text-[10.5px] font-semibold tracking-wide ${badgeClass}`}
-                    >
-                      {label}
-                    </span>
-                    <code className="flex-1 whitespace-pre-wrap break-all font-mono text-xs text-fg">
-                      {scenario.cmd[key]}
-                    </code>
-                    <CopyCommandButton text={scenario.cmd[key]} />
-                  </div>
-                ))}
+                <p className="mt-1.5 text-xs leading-relaxed text-muted">{scenario.desc}</p>
               </div>
-            ))}
-          </div>
-        </details>
-      )}
-      {!inaccessible && status?.error && <p className="mt-3 text-sm text-danger">{status.error}</p>}
-      {!inaccessible && info?.current_run && (
+              {SETUP_OS_LABELS.map(({ key, label, badgeClass }) => (
+                <div key={key} className="flex items-start gap-3 border-t border-border bg-bg px-3 py-2.5">
+                  <span
+                    className={`mt-0.5 w-16 flex-none rounded py-[3px] text-center text-[10.5px] font-semibold tracking-wide ${badgeClass}`}
+                  >
+                    {label}
+                  </span>
+                  <code className="flex-1 whitespace-pre-wrap break-all font-mono text-xs text-fg">
+                    {scenario.cmd[key]}
+                  </code>
+                  <CopyCommandButton text={scenario.cmd[key]} />
+                </div>
+              ))}
+            </div>
+          ))}
+        </div>
+      </details>
+      {!inaccessible && worker.status === "busy" && (
         <p className="mt-3 text-sm text-fg">
-          Running <span className="font-medium">{info.current_run.model_filename}</span>{" "}
-          <span className="text-muted">— <ElapsedSince startedAt={info.current_run.started_at} /></span>
+          {activeRun ? (
+            <>
+              Running <span className="font-medium">{activeRun.model_filename ?? activeRun.model_id}</span>{" "}
+              <span className="text-muted">
+                — <ElapsedSince startedAt={activeRun.started_at} />
+              </span>
+            </>
+          ) : worker.activeJobProgress ? (
+            <>
+              {worker.activeJobProgress.phase}
+              {worker.activeJobProgress.detail ? <span className="text-muted"> — {worker.activeJobProgress.detail}</span> : null}
+            </>
+          ) : (
+            <span className="text-muted">Busy</span>
+          )}
         </p>
       )}
 
-      {info && !inaccessible && (
+      {!inaccessible && (
         <>
           <div className="mt-4">
             <h4 className="text-xs font-semibold uppercase tracking-wide text-muted">Hardware &amp; OS</h4>
             <dl className="mt-1.5 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-sm">
               <dt className="text-muted">OS</dt>
               <dd className="text-fg">
-                {info.platform} ({info.arch})
+                {worker.platform} ({worker.arch})
               </dd>
               <dt className="text-muted">CPU</dt>
               <dd className="text-fg">
-                {info.hardware?.cpu.brand || info.hardware?.cpu.manufacturer || "unknown"}
-                {info.hardware?.cpu.cores ? (
-                  <span className="text-muted"> · {info.hardware.cpu.cores} threads</span>
+                {worker.hardware?.cpu.brand || worker.hardware?.cpu.manufacturer || "unknown"}
+                {worker.hardware?.cpu.cores ? (
+                  <span className="text-muted"> · {worker.hardware.cpu.cores} threads</span>
                 ) : null}
               </dd>
               <dt className="text-muted">RAM</dt>
               <dd className="text-fg">
-                {info.hardware?.mem_total_bytes ? (
-                  formatBytes(info.hardware.mem_total_bytes)
+                {worker.hardware?.mem_total_bytes ? (
+                  formatBytes(worker.hardware.mem_total_bytes)
                 ) : (
                   <span className="text-muted">unknown</span>
                 )}
               </dd>
               <dt className="text-muted">GPU</dt>
               <dd className="text-fg">
-                {info.hardware ? (
-                  info.hardware.gpu.length > 0 ? (
+                {worker.hardware ? (
+                  worker.hardware.gpu.length > 0 ? (
                     // systeminformation's GPU model strings already include the
                     // vendor name (e.g. "AMD Radeon RX 6600 XT") -- prefixing
                     // g.vendor too would just repeat it.
-                    info.hardware.gpu.map((g) => formatGpuLabel(g)).join(", ")
+                    worker.hardware.gpu.map((g) => formatGpuLabel(g)).join(", ")
                   ) : (
                     <span className="text-muted">none detected</span>
                   )
@@ -209,7 +254,7 @@ export function WorkerCard({
               </dd>
             </dl>
           </div>
-          {info.update_available && (
+          {updateAvailable && (
             <div className="mt-2">
               <StatusPill label="update available" tone="warning" />
             </div>
@@ -217,11 +262,11 @@ export function WorkerCard({
 
           <div className="mt-4">
             <h4 className="text-xs font-semibold uppercase tracking-wide text-muted">Downloaded</h4>
-            {info.installed.length === 0 ? (
+            {worker.installedBuilds.length === 0 ? (
               <p className="mt-1.5 text-sm text-muted">No builds installed yet.</p>
             ) : (
               <ul className="mt-1.5 flex flex-col gap-1.5">
-                {info.installed.map((b) => (
+                {worker.installedBuilds.map((b) => (
                   <li
                     key={b.tag}
                     className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-border bg-surface-raised px-3 py-2"
@@ -249,8 +294,8 @@ export function WorkerCard({
                             onClick={() =>
                               withBusy(
                                 b.tag,
-                                () => api.activateBuild(worker.name, b.tag).then(() => undefined),
-                                `Active: ${b.tag}`
+                                () => api.activateBuild(worker.id, b.tag).then(() => undefined),
+                                `Queued: activate ${b.tag}`
                               )
                             }
                             className="rounded-md bg-accent px-2.5 py-1 text-xs font-semibold text-accent-fg disabled:opacity-50"
@@ -261,11 +306,11 @@ export function WorkerCard({
                             type="button"
                             disabled={busyTag === b.tag}
                             onClick={() => {
-                              if (!window.confirm(`Delete build ${b.tag} from ${worker.name}?`)) return;
+                              if (!window.confirm(`Delete build ${b.tag} from ${worker.displayName}?`)) return;
                               void withBusy(
                                 b.tag,
-                                () => api.deleteBuild(worker.name, b.tag).then(() => undefined),
-                                `Deleted ${b.tag}`
+                                () => api.deleteBuild(worker.id, b.tag).then(() => undefined),
+                                `Queued: delete ${b.tag}`
                               );
                             }}
                             className="rounded-md border border-border p-1.5 text-muted hover:border-danger/40 hover:text-danger disabled:opacity-50"
@@ -307,14 +352,14 @@ export function WorkerCard({
                         onClick={() =>
                           withBusy(
                             rel.tag,
-                            () => api.installBuild(worker.name, rel.tag, asset.name).then(() => undefined),
-                            `Installed ${rel.tag}`
+                            () => api.installBuild(worker.id, rel.tag, asset.name).then(() => undefined),
+                            `Queued: install ${rel.tag}`
                           )
                         }
                         className="flex items-center gap-1.5 rounded-md border border-border px-2.5 py-1 text-xs font-semibold text-fg hover:border-accent/40 hover:text-accent disabled:opacity-50"
                       >
                         <IconDownload width={14} height={14} />
-                        {busyTag === rel.tag ? "Installing…" : "Install"}
+                        {busyTag === rel.tag ? "Queuing…" : "Install"}
                       </button>
                     </li>
                   );

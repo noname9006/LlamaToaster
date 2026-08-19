@@ -1,4 +1,4 @@
-import { createServer, type IncomingMessage } from "node:http";
+import { createServer } from "node:http";
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve, relative, isAbsolute, sep } from "node:path";
@@ -11,15 +11,30 @@ import {
   unlinkSync,
   readdirSync,
   statSync,
+  chmodSync,
 } from "node:fs";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { gzipSync } from "node:zlib";
+import { hostname as osHostname } from "node:os";
 import { pipeline } from "node:stream/promises";
 import { Readable, Transform } from "node:stream";
 import { runBench, matchOffloadLine, type BenchResult, type OffloadResult } from "./bench.js";
 import { runServerBench } from "./serverBench.js";
 import { MemorySampler, captureFreeMemoryBaseline, type SampleStats, type FreeMemoryBaseline } from "./sampler.js";
 import { readGpuMemory } from "./vram.js";
-import { writeRawJson, postRunItemUpdate, postModelDownloadResult } from "./vps-client.js";
+import {
+  writeRawJson,
+  postRunItemUpdate,
+  postModelDownloadResult,
+  postHeartbeat,
+  pollQueue,
+  reportJobResult,
+  pushRunLog,
+  startDeviceEnrolment,
+  pollDeviceToken,
+  refreshWorkerSession,
+  HttpError,
+} from "./vps-client.js";
 import { log, configureLogging, setRunLogFile } from "./log.js";
 import {
   detectPlatform,
@@ -42,12 +57,28 @@ import {
   type RunItemTerminalInput,
   type ModelDownloadCallbackInput,
   type TerminalRunItemStatus,
+  type ModelDirFile,
+  type WorkerStatePush,
+  type ActiveJobReport,
+  type QueueJob,
+  type BenchmarkJob,
+  type InstallBuildJobPayload,
+  type ActivateBuildJobPayload,
+  type DeleteBuildJobPayload,
+  type DownloadModelJobPayload,
 } from "../../shared/types.js";
 import { expandSweep, deriveTestType, type SweepItem } from "../../shared/sweep.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+// resolve(), not join(): join() concatenates segments literally, so an
+// ABSOLUTE WORKER_CONFIG value (e.g. a device-flow-enrolled config living
+// outside this repo checkout entirely, MULTIUSER_PLAN.md §6.0) got silently
+// nested under process.cwd() instead of used as-is -- resolve() treats a
+// later absolute argument as an override, same as every shell's own path
+// semantics, while still resolving a relative value against cwd() exactly
+// as before.
 const configPath = process.env.WORKER_CONFIG
-  ? join(process.cwd(), process.env.WORKER_CONFIG)
+  ? resolve(process.cwd(), process.env.WORKER_CONFIG)
   : join(__dirname, "..", "config.json");
 
 interface WorkerConfig {
@@ -61,8 +92,27 @@ interface WorkerConfig {
   llama_bench_path: string;
   model_dir: string;
   vps_url: string;
-  bind_host: string;
-  port?: number;
+  // Stable id this worker persists locally, generated once on first boot and
+  // reused across restarts -- this, not worker_name, is what identifies this
+  // machine to the server (MULTIUSER_PLAN.md §1.2). Self-announced: the
+  // first heartbeat/queue-poll carrying a machine_id the server has never
+  // seen creates its `workers` row.
+  machine_id?: string;
+  // Stage 1 (legacy, still supported): a single shared secret authenticating
+  // every worker, checked as a Bearer token on every pull-queue call. Kept
+  // working unchanged for an already-deployed worker whose config.json was
+  // never migrated -- only consulted when session_token below is absent (see
+  // ensureAuthCredential and server/src/worker-auth.ts's dual-mode
+  // authenticateWorker, MULTIUSER_PLAN.md §1.15/§3.5).
+  worker_shared_token?: string;
+  // Stage 3: this worker's own per-worker session, normally obtained once via
+  // device-code enrolment (see ensureAuthCredential below) and persisted back
+  // here so a restart doesn't re-enrol. Takes priority over
+  // worker_shared_token when both happen to be present.
+  session_token?: string;
+  // Rotates alongside session_token (see refreshWorkerSession) -- presented
+  // only to POST /api/auth/refresh, never to any other route.
+  refresh_token?: string;
   raw_json_dir?: string;
   bench_timeout_ms?: number;
   llama_cpp_builds_dir?: string;
@@ -75,9 +125,9 @@ interface WorkerConfig {
   // gets its server_path recorded in that registry directly.
   llama_server_path?: string;
   // Fixed local port the worker binds llama-server to for MTP benchmarking.
-  // Only one benchmark ever runs at a time per worker (the existing `busy`
-  // flag already enforces that), so a fixed port is simpler than allocating
-  // one dynamically and has no collision risk in practice.
+  // Only one job ever runs at a time per worker (the pull loop is strictly
+  // serial), so a fixed port is simpler than allocating one dynamically and
+  // has no collision risk in practice.
   mtp_server_port?: number;
   // How long to keep raw stdout/stderr dumps (see writeRawJson below) before
   // a periodic janitor deletes them -- see pruneRawJson. Split in two since
@@ -88,6 +138,10 @@ interface WorkerConfig {
   raw_json_retention_days?: number;
   // Unset (the default) means "never auto-delete failed items' raw output."
   raw_json_retention_days_failed?: number;
+  // Optional, off by default -- a local-only diagnostic endpoint
+  // (127.0.0.1-bound /health), NOT used for dispatch: the worker needs no
+  // inbound HTTP at all under the pull model (MULTIUSER_PLAN.md §1.11).
+  debug_port?: number;
 }
 
 function loadConfig(): WorkerConfig {
@@ -96,17 +150,53 @@ function loadConfig(): WorkerConfig {
 }
 
 const config = loadConfig();
-const PORT = config.port ?? 8080;
+
+// Best-effort -- chmod is a no-op on Windows (systeminformation-detected
+// platform, not checked here directly) for the POSIX mode bits used, but the
+// call itself doesn't throw for a plain 0o600, so this stays safe to call
+// unconditionally on every platform. config.json holds a 90-day bearer
+// credential once session_token is populated (MULTIUSER_PLAN.md §3.5), same
+// as the shared secret it replaces, so this runs regardless of which auth
+// mode is active.
+function secureConfigFile(): void {
+  try {
+    chmodSync(configPath, 0o600);
+  } catch (err) {
+    log.debug(`could not chmod config.json to 0600: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+function persistConfig(patch: Partial<WorkerConfig>): void {
+  const merged = { ...config, ...patch };
+  const tmp = `${configPath}.tmp`;
+  writeFileSync(tmp, JSON.stringify(merged, null, 2), "utf8");
+  renameSync(tmp, configPath);
+  secureConfigFile();
+  Object.assign(config, patch);
+}
+
+secureConfigFile(); // lock down permissions even if this run never calls persistConfig
+
+if (!config.machine_id) {
+  const generated = randomUUID();
+  persistConfig({ machine_id: generated });
+  log.info(`generated new machine_id: ${generated}`);
+}
+// No hard requirement on worker_shared_token/session_token here anymore --
+// see ensureAuthCredential below, called once hardware detection has run
+// (device enrolment needs platform/arch): neither being set is the normal
+// state for a fresh install and triggers enrolment rather than failing.
+
 const buildsDir = resolve(config.llama_cpp_builds_dir ?? join(__dirname, "..", "llama-builds"));
 
 const logDir = resolve(config.log_dir ?? join(__dirname, "..", "logs"));
 configureLogging(logDir, process.env.LOG_LEVEL);
 
-// One dedicated, structured log file per run (see setRunLogFile/the /run
-// handler below), separate from the shared daily worker-*.log above --
-// downloadable via GET /logs?run_id=... and the server's proxying
-// GET /api/runs/:id/log, surfaced in the UI next to the CSV export whenever
-// a run has a failed test (see RunDetail.tsx).
+// One dedicated, structured log file per run (see setRunLogFile/
+// executeBenchmarkJob below), separate from the shared daily worker-*.log
+// above -- pushed to the server on completion (pushRunLogIfPresent) and
+// served back via GET /api/runs/:id/log, surfaced in the UI next to the CSV
+// export whenever a run has a failed test (see RunDetail.tsx).
 const runLogsDir = join(logDir, "runs");
 try {
   mkdirSync(runLogsDir, { recursive: true });
@@ -118,19 +208,14 @@ try {
 }
 
 // run_id is always a uuid (server/src/routes/runs.ts's uuid()), but this is
-// also used to build a filesystem path from a value that arrives over HTTP
-// (the download route below) -- validated defensively rather than trusted.
+// also used to build a filesystem path -- validated defensively rather than
+// trusted regardless.
 const SAFE_RUN_ID_RE = /^[a-zA-Z0-9_-]+$/;
 
 function runLogFilePath(runId: string): string {
   return join(runLogsDir, `${runId}.log`);
 }
 
-// Always detected now (previously only ran when config.backend was unset,
-// which on a worker with an explicit config.json value -- the common case --
-// meant this never ran at all) since Run.backend_device_name's Tier-1
-// fallback (see below) needs it regardless of whether backend itself came
-// from config.json or auto-detection.
 const detectedHardware = await detectHardware();
 
 // backend is optional in config.json -- when unset, detect it live from
@@ -153,35 +238,8 @@ function formatGpuEntry(g: { model: string; vendor: string; vram_mb?: number | n
   return `${name} (${vram}${g.vram_dynamic ? " shared" : ""})`;
 }
 
-// Tier-1 backend_device_name (see shared/types.ts's Run.backend_device_name)
-// -- reported via /health below, optionally scoped to a specific run's
-// --main-gpu selection via that route's ?main_gpu= query param (only ever
-// sent by server/src/routes/runs.ts's ensureActiveBuild, right before
-// dispatching that exact run; every other /health poll -- e.g. the Workers
-// page's generic card fetch -- omits it and gets this backend's first
-// visible device instead). Upgraded opportunistically once the first
-// non-MTP sweep item completes (see runSweepItem below, which sends
-// bench.gpu_info -- llama-bench's own exact device-name string -- as a
-// Tier-2 upgrade) -- Tier-2 has the same "lists every visible device, not
-// just the selected one" caveat as this Tier-1 estimate on a backend that
-// can see multiple GPUs at once (e.g. Vulkan), since that's what llama-bench
-// itself reports regardless of -mg.
-//
-// Filtered through backendVisibleGpus rather than indexing detectedHardware
-// .gpu directly: that array is in whatever order systeminformation happens
-// to enumerate controllers, which has no relationship to which devices this
-// backend can even see (e.g. an Intel iGPU isn't a CUDA device at all) --
-// gpu[0] unfiltered could easily be a device this backend can't use.
-function backendDeviceName(mainGpu: number | undefined): string | undefined {
-  if (backend === "cpu") return "CPU";
-  const visible = backendVisibleGpus(detectedHardware.gpu, backend);
-  if (visible.length === 0) return undefined;
-  const picked = mainGpu != null ? visible[mainGpu] : visible[0];
-  return picked?.model || picked?.vendor || undefined;
-}
-
 log.info(
-  `[worker ${config.worker_name}] starting (backend=${backend}, build=${config.llama_cpp_build}, log level=${
+  `[worker ${config.worker_name}] starting (machine_id=${config.machine_id}, backend=${backend}, build=${config.llama_cpp_build}, log level=${
     process.env.LOG_LEVEL ?? "info"
   })`
 );
@@ -217,19 +275,17 @@ log.info(
 // EXEC_TIMEOUT_MS (5s), silently returning "unavailable" for that one call
 // only (a run's item 0's vram_free_before, specifically -- every later item
 // succeeds instantly once the provider is warm). Firing this once here,
-// before any real run can plausibly be triggered, means the first genuine
+// before any real job can plausibly be claimed, means the first genuine
 // captureFreeMemoryBaseline call (sampler.ts, used by runSweepItem/
 // runSweepItemViaServer below) already hits a warm path instead of paying
-// that cost itself. Fire-and-forget and swallow all errors: this must never
-// delay /health or /run from becoming available, and a failed warm-up just
-// means the first real call pays the same cost this was trying to avoid --
-// no worse than before this existed.
+// that cost itself. Fire-and-forget and swallow all errors.
 void readGpuMemory(backend, undefined).catch(() => {});
 
-// The active build is mutable at runtime (via /llama-cpp/activate) so a
-// version switch from the web UI takes effect on the next /run without
-// restarting this process. It starts from config.json but is persisted back
-// to config.json on every switch so a restart doesn't revert it.
+// The active build is mutable at runtime (via an activate_build job) so a
+// version switch from the web UI takes effect on the next benchmark job
+// without restarting this process. It starts from config.json but is
+// persisted back to config.json on every switch so a restart doesn't revert
+// it.
 interface ActiveBuild {
   tag: string;
   path: string;
@@ -269,14 +325,6 @@ if (!activeBuild) {
   );
 }
 
-function persistConfig(patch: Partial<WorkerConfig>): void {
-  const merged = { ...config, ...patch };
-  const tmp = `${configPath}.tmp`;
-  writeFileSync(tmp, JSON.stringify(merged, null, 2), "utf8");
-  renameSync(tmp, configPath);
-  Object.assign(config, patch);
-}
-
 function resolveModelPath(model: Model): string {
   const name = model.source === "local" ? model.filename : model.hf_file ?? model.filename;
   if (!name) {
@@ -292,7 +340,7 @@ function resolveModelPath(model: Model): string {
 }
 
 // Same containment rule as resolveModelPath, applied to a raw filename
-// coming from an HF download request rather than a registered Model.
+// coming from a download/delete job rather than a registered Model.
 function resolveDownloadTarget(hfFile: string): string {
   const root = resolve(config.model_dir);
   const resolved = resolve(root, hfFile);
@@ -303,19 +351,13 @@ function resolveDownloadTarget(hfFile: string): string {
   return resolved;
 }
 
-interface ModelDirFile {
-  path: string;
-  size_bytes: number;
-}
-
-// Walks model_dir recursively so the orchestrator can learn "which files does
-// this worker actually have" in one call instead of asking about one
-// filename at a time (see server/src/routes/models.ts's /api/models/locations)
-// -- also how a Gemma-4-style MTP companion sitting in an "MTP/" subfolder
-// (see resolveModelPath's `name` handling) is discovered at all. Skips
-// raw_json_dir when it happens to be nested inside model_dir (not the case
-// in either shipped config, but no reason to list bench output as if it were
-// a model file).
+// Walks model_dir recursively so the server can learn "which files does this
+// worker actually have" from the worker's own heartbeat instead of asking
+// about one filename at a time -- also how a Gemma-4-style MTP companion
+// sitting in an "MTP/" subfolder (see resolveModelPath's `name` handling) is
+// discovered at all. Skips raw_json_dir when it happens to be nested inside
+// model_dir (not the case in either shipped config, but no reason to list
+// bench output as if it were a model file).
 function listModelDirFiles(): ModelDirFile[] {
   const root = resolve(config.model_dir);
   if (!existsSync(root)) return [];
@@ -339,9 +381,11 @@ function listModelDirFiles(): ModelDirFile[] {
 
 // Cache for listModelDirFiles(), populated once at startup and then on a
 // timer (see refreshModelDirFilesCache below) rather than re-walked on every
-// /models request -- mirrors the /hardware snapshot above, though unlike
-// hardware this data *can* change while the process is up (downloads,
-// manual file drops), hence the periodic refresh instead of a one-shot.
+// heartbeat -- mirrors the hardware snapshot above, though unlike hardware
+// this data *can* change while the process is up (downloads, manual file
+// drops), hence the periodic refresh instead of a one-shot. Sent verbatim as
+// WorkerStatePush.model_files on every heartbeat/queue poll -- see
+// collectState below.
 let modelDirFilesCache: ModelDirFile[] = [];
 
 function refreshModelDirFilesCache(): void {
@@ -354,8 +398,8 @@ function refreshModelDirFilesCache(): void {
 
 // Where writeRawJson (worker/src/vps-client.ts) actually lands a given raw
 // dump -- bucketed by outcome so pruneRawJson below can apply a different
-// retention window to each without needing to ask the VPS "was this item a
-// failure" after the fact (the worker keeps no local run history otherwise).
+// retention window to each without needing to ask the server "was this item
+// a failure" after the fact (the worker keeps no local run history otherwise).
 function rawJsonSubdir(rawJsonDir: string, outcome: "ok" | "failed"): string {
   return join(rawJsonDir, outcome);
 }
@@ -440,11 +484,9 @@ class HashingPassThrough extends Transform {
   }
 }
 
-const MAX_RUN_BODY_BYTES = 5 * 1024 * 1024;
-const MAX_ADMIN_BODY_BYTES = 64 * 1024;
 // How often a running item's live progress tick (phase + ram/vram) is sent.
 const TICK_INTERVAL_MS = 2000;
-// Ticks fire every TICK_INTERVAL_MS but only reach the VPS -- a worker log
+// Ticks fire every TICK_INTERVAL_MS but only reach the server -- a worker log
 // watcher (pm2 logs, the daily log file) otherwise sees nothing between
 // "spawning llama-bench" and process-close, which for a long CPU sweep can be
 // tens of minutes of apparent silence. Mirror one tick in HEARTBEAT_EVERY_N
@@ -459,63 +501,37 @@ const HEARTBEAT_EVERY_N = 10; // 10 * TICK_INTERVAL_MS = 20s
 // usedProgressMarkers flag) -- a real signal always wins over the heuristic.
 const QUIET_PERIOD_MS = 1800;
 // Local port the worker binds llama-server to for MTP benchmarking (see
-// worker/src/serverBench.ts). Only one benchmark ever runs at a time per
-// worker (the `busy` flag below enforces that), so a fixed port carries no
-// real collision risk -- config.mtp_server_port overrides it if needed.
+// worker/src/serverBench.ts). Only one job ever runs at a time per worker
+// (the pull loop is strictly serial), so a fixed port carries no real
+// collision risk -- config.mtp_server_port overrides it if needed.
 const DEFAULT_MTP_SERVER_PORT = 8899;
 
+// Whether a job is currently executing -- drives WorkerStatePush.status
+// (collectState below). Set/cleared only by workerMain's own loop.
 let busy = false;
 
-interface CurrentRun {
-  run_id: string;
-  model_filename: string;
-  started_at: number;
-}
-let currentRun: CurrentRun | null = null;
-
-// Run-level pause/stop control -- reset at the start of every /run call
-// (see the run_id.startsWith check in the pause/resume/stop handlers below,
-// which only accept a run_id matching currentRun so a stale request from a
-// previous run can't affect a new one). llama-bench runs every repeat (-r)
-// of one sweep item inside a single process invocation, so there's no safe
-// way to pause mid-item without corrupting that repeat's timing -- pause
-// only takes effect between items (see the /run loop below). Stop kills
-// the in-flight process immediately via the same SIGKILL path bench.ts's
-// own timeout uses.
+// Run-level pause/stop control -- reset at the start of every benchmark job
+// (see executeBenchmarkJob below). llama-bench runs every repeat (-r) of one
+// sweep item inside a single process invocation, so there's no safe way to
+// pause mid-item without corrupting that repeat's timing -- pause only takes
+// effect between items. Stop kills the in-flight process immediately via the
+// same SIGKILL path bench.ts's own timeout uses. Both are now driven by the
+// heartbeat's control response (requestStop/the heartbeat loop below)
+// instead of an inbound HTTP call -- the machinery reacting to them is
+// otherwise unchanged.
 let pauseRequested = false;
 let stopRequested = false;
 let activeBenchProc: import("node:child_process").ChildProcess | null = null;
 
-interface DownloadProgress {
-  bytes: number;
-  total: number | null;
-  started_at: number;
-}
+// What the heartbeat loop reports as ActiveJobReport while a job is running
+// -- job_id is set once when a job is claimed (workerMain) and never
+// undefined while `busy` is true. Phase/detail/item_idx/bytes are updated by
+// whichever job executor is currently running (updateJobReport below).
+let currentJobReport: ActiveJobReport | null = null;
 
-// Keyed by "hf_repo/hf_file" so a concurrent poll from the browser (a
-// separate HTTP connection from the download's own long-lived request) can
-// look up the same in-flight transfer. Entries are removed once the
-// download settles either way, so a stale/finished key just 404s.
-const downloadProgress = new Map<string, DownloadProgress>();
-
-function readBody(req: IncomingMessage, maxBytes: number): Promise<string> {
-  return new Promise((resolvePromise, reject) => {
-    let body = "";
-    let tooLarge = false;
-    req.on("data", (c) => {
-      if (tooLarge) return;
-      body += c;
-      if (Buffer.byteLength(body) > maxBytes) {
-        tooLarge = true;
-        reject(Object.assign(new Error("request body too large"), { statusCode: 413 }));
-        req.destroy();
-      }
-    });
-    req.on("error", (err) => reject(err));
-    req.on("end", () => {
-      if (!tooLarge) resolvePromise(body);
-    });
-  });
+function updateJobReport(patch: Partial<Omit<ActiveJobReport, "job_id">>): void {
+  if (!currentJobReport) return;
+  Object.assign(currentJobReport, patch);
 }
 
 function toInstalledBuildList(): InstalledBuild[] {
@@ -524,509 +540,33 @@ function toInstalledBuildList(): InstalledBuild[] {
     asset_name: b.asset_name,
     installed_at: b.installed_at,
     active: activeBuild?.tag === b.tag,
+    bench_path: b.bench_path,
+    server_path: b.server_path,
   }));
 }
 
-const server = createServer(async (req, res) => {
-  const url = new URL(req.url ?? "/", "http://internal");
-
-  if (req.method === "POST" && url.pathname === "/run") {
-    if (busy) {
-      log.warn("rejected /run: worker is already running a benchmark");
-      return send(res, 409, { error: "worker is already running a benchmark" });
-    }
-    if (!activeBuild) {
-      log.warn("rejected /run: no active llama-bench build installed");
-      return send(res, 400, {
-        error: "no active llama-bench build installed -- install one via the Workers page first",
-      });
-    }
-    busy = true;
-    let release: (() => void) | null = () => {
-      busy = false;
-      release = null;
-    };
-
-    let body = "";
-    let tooLarge = false;
-    req.on("data", (c) => {
-      if (tooLarge) return;
-      body += c;
-      if (Buffer.byteLength(body) > MAX_RUN_BODY_BYTES) {
-        tooLarge = true;
-        release?.();
-        send(res, 413, { error: "request body too large" });
-        req.destroy();
-      }
-    });
-    req.on("error", () => {
-      release?.();
-    });
-    req.on("end", async () => {
-      if (tooLarge) return;
-
-      let reqBody: {
-        run_id: string;
-        model_id: string;
-        model: Model;
-        // Companion --model-draft file for a Gemma-4-style base model whose
-        // MTP head isn't baked into `model` itself -- only present when the
-        // sweep has an "mtp: on" item and the server resolved one (see
-        // server/src/routes/runs.ts). Absent for Qwen-style in-file MTP.
-        mtp_model?: Model;
-        // See shared/types.ts's RunConfig.main_gpu -- forwarded unchanged
-        // into runSweepItem/runSweepItemViaServer below.
-        main_gpu?: number;
-        // See shared/types.ts's RunConfig.main_gpu_backend -- when set, this
-        // run uses llama_cpp_build (below) as an explicit tag to look up in
-        // this worker's OWN installed-build registry (see getInstalledBuild)
-        // for just this run, instead of trusting activeBuild the way every
-        // other run does. server/src/routes/runs.ts's ensureBuildForBackend
-        // guarantees that tag is already installed here before this request
-        // is ever sent -- never activated as this worker's persisted
-        // default, so activeBuild/backend (module-level) are left untouched.
-        main_gpu_backend?: Backend;
-        sweep: Omit<SweepConfig, "model_id">;
-        llama_cpp_build: string;
-        llama_cpp_backend: Backend;
-      };
-      let modelPath: string;
-      let mtpModelPath: string | undefined;
-      // For a plain run this is just activeBuild/backend (module-level, the
-      // worker's own persisted default) -- for a main_gpu_backend override
-      // (see reqBody's own field doc comment) it's resolved fresh from this
-      // worker's installed-build registry instead, scoped to this one
-      // request only. Declared here (rather than inline in the sweep loop
-      // below) so a missing/uninstalled override tag fails this request
-      // up front with a clear 400, the same posture as a missing model
-      // file above, instead of failing every single item one at a time.
-      let effectiveBuild: ActiveBuild;
-      let effectiveBackend: Backend;
-      try {
-        reqBody = JSON.parse(body);
-        log.info(
-          `run ${reqBody.run_id} received: model=${reqBody.model?.filename ?? reqBody.model_id} ` +
-            `build=${reqBody.llama_cpp_build} backend=${reqBody.llama_cpp_backend}`
-        );
-        log.debug(`run ${reqBody.run_id} sweep: ${JSON.stringify(reqBody.sweep)}`);
-
-        modelPath = resolveModelPath(reqBody.model);
-        if (!existsSync(modelPath)) {
-          throw new Error(`model file not found at ${modelPath} (source=${reqBody.model.source})`);
-        }
-        if (reqBody.mtp_model) {
-          mtpModelPath = resolveModelPath(reqBody.mtp_model);
-          if (!existsSync(mtpModelPath)) {
-            throw new Error(`mtp model file not found at ${mtpModelPath} (source=${reqBody.mtp_model.source})`);
-          }
-        }
-
-        if (reqBody.main_gpu_backend != null) {
-          const overrideBuild = getInstalledBuild(buildsDir, reqBody.llama_cpp_build);
-          if (!overrideBuild) {
-            throw new Error(
-              `main_gpu_backend=${reqBody.main_gpu_backend} requires build ${reqBody.llama_cpp_build}, which isn't installed on this worker`
-            );
-          }
-          effectiveBuild = { tag: overrideBuild.tag, path: overrideBuild.bench_path, serverPath: overrideBuild.server_path };
-          effectiveBackend = reqBody.main_gpu_backend;
-          log.info(
-            `run ${reqBody.run_id}: using one-off build ${overrideBuild.tag} (backend=${effectiveBackend}) for this run only -- worker default stays ${backend}`
-          );
-        } else {
-          if (!activeBuild) throw new Error("no active llama.cpp build on this worker");
-          effectiveBuild = activeBuild;
-          effectiveBackend = backend;
-        }
-      } catch (err) {
-        release?.();
-        const message = err instanceof Error ? err.message : String(err);
-        log.warn(`run rejected: ${message}`);
-        return send(res, 400, { error: message });
-      }
-
-      // From here on the request is accepted -- ack immediately and work
-      // through the sweep in the background, one llama-bench process per
-      // parameter combination (see shared/sweep.ts's expandSweep) rather
-      // than one CSV-args call for the whole sweep. The VPS learns each
-      // item's outcome individually via /api/runs/:id/items/:idx as it
-      // happens, not via one final call at the end -- previously this
-      // handler held the connection open for the whole bench (up to
-      // bench_timeout_ms, tens of minutes), so any timeout or network
-      // hiccup on that one long-lived request left the VPS marking the run
-      // "failed" while this worker kept working -- with `busy` still
-      // (correctly) true and no way to reconcile the two, so the next
-      // trigger attempt would 409. Per-item reporting also means a crash on
-      // one combination doesn't cost the rest of the sweep: this loop keeps
-      // going regardless of how any individual item turns out.
-      release = null;
-      const items = expandSweep(reqBody.sweep);
-      currentRun = { run_id: reqBody.run_id, model_filename: reqBody.model.filename, started_at: Date.now() };
-      pauseRequested = false;
-      stopRequested = false;
-      activeBenchProc = null;
-      send(res, 202, { ok: true, run_id: reqBody.run_id, status: "started", items: items.length });
-
-      setRunLogFile(runLogFilePath(reqBody.run_id));
-      log.info(
-        formatRunLogHeader(
-          reqBody.run_id,
-          reqBody.model,
-          reqBody.mtp_model,
-          effectiveBuild,
-          effectiveBackend,
-          items.length,
-          reqBody.sweep.repeats
-        )
-      );
-      log.info(`run ${reqBody.run_id}: ${items.length} test(s) to run`);
-      const rawDir = config.raw_json_dir ?? join(config.model_dir, "raw");
-      // Tallied across every item regardless of which path handled it, so
-      // the run's own finish line can report a success/fail breakdown
-      // instead of just "finished all N test(s)" with no indication of how
-      // many of those actually succeeded.
-      const statusCounts: Partial<Record<TerminalRunItemStatus, number>> = {};
-      const tally = (status: TerminalRunItemStatus): void => {
-        statusCounts[status] = (statusCounts[status] ?? 0) + 1;
-      };
-      try {
-        for (const item of items) {
-          // Checked before *every* item (not just once) since pausing can
-          // hold here for a while -- a stop requested while paused must
-          // still take effect immediately rather than waiting out the pause.
-          if (stopRequested) {
-            log.info(`run ${reqBody.run_id}: stopped, cancelling item ${item.idx} (not started)`);
-            await safeItemTerminal(reqBody.run_id, item.idx, { status: "cancelled", error: "cancelled by user" });
-            tally("cancelled");
-            continue;
-          }
-          while (pauseRequested && !stopRequested) {
-            await sleep(500);
-          }
-          if (stopRequested) {
-            log.info(`run ${reqBody.run_id}: stopped while paused, cancelling item ${item.idx} (not started)`);
-            await safeItemTerminal(reqBody.run_id, item.idx, { status: "cancelled", error: "cancelled by user" });
-            tally("cancelled");
-            continue;
-          }
-          if (item.mtp === "on") {
-            if (!effectiveBuild.serverPath) {
-              log.error(`run ${reqBody.run_id}: item ${item.idx} needs mtp but the active build has no llama-server binary`);
-              await safeItemTerminal(reqBody.run_id, item.idx, {
-                status: "failed",
-                error: "active llama.cpp build has no llama-server binary -- reinstall the build to pick one up",
-              });
-              tally("failed");
-              continue;
-            }
-            tally(
-              await runSweepItemViaServer({
-                runId: reqBody.run_id,
-                item,
-                repeats: reqBody.sweep.repeats,
-                modelPath,
-                mtpModelPath,
-                llamaServerPath: effectiveBuild.serverPath,
-                port: config.mtp_server_port ?? DEFAULT_MTP_SERVER_PORT,
-                backend: effectiveBackend,
-                mainGpu: reqBody.main_gpu,
-                timeoutMs: config.bench_timeout_ms,
-                rawJsonDir: rawDir,
-              })
-            );
-          } else {
-            tally(
-              await runSweepItem({
-                runId: reqBody.run_id,
-                item,
-                repeats: reqBody.sweep.repeats,
-                modelPath,
-                llamaBenchPath: effectiveBuild.path,
-                backend: effectiveBackend,
-                mainGpu: reqBody.main_gpu,
-                timeoutMs: config.bench_timeout_ms,
-                vpsUrl: config.vps_url,
-                rawJsonDir: rawDir,
-              })
-            );
-          }
-        }
-        const breakdown =
-          (["done", "failed", "failed_oom", "cancelled"] as const)
-            .filter((s) => statusCounts[s])
-            .map((s) => `${s}=${statusCounts[s]}`)
-            .join(" ") || "no items processed";
-        log.info(
-          `run ${reqBody.run_id} finished all ${items.length} test(s)${stopRequested ? " (stopped early)" : ""}: ${breakdown}`
-        );
-        log.info(formatRunLogFooter(reqBody.run_id, items.length, reqBody.sweep.repeats, statusCounts, stopRequested));
-      } finally {
-        busy = false;
-        currentRun = null;
-        pauseRequested = false;
-        stopRequested = false;
-        activeBenchProc = null;
-        setRunLogFile(null);
-      }
-    });
-    return;
-  }
-
-  if (req.method === "POST" && url.pathname === "/run/pause") {
-    if (!busy) return send(res, 409, { error: "worker is not running a benchmark" });
-    pauseRequested = true;
-    log.info(`run ${currentRun?.run_id ?? "?"}: pause requested -- takes effect before the next sweep item ` +
-      `(the in-flight one, including all its repeats, runs to completion first)`);
-    return send(res, 200, { ok: true, paused: true });
-  }
-
-  if (req.method === "POST" && url.pathname === "/run/resume") {
-    if (!busy) return send(res, 409, { error: "worker is not running a benchmark" });
-    pauseRequested = false;
-    log.info(`run ${currentRun?.run_id ?? "?"}: resumed`);
-    return send(res, 200, { ok: true, paused: false });
-  }
-
-  if (req.method === "POST" && url.pathname === "/run/stop") {
-    if (!busy) return send(res, 409, { error: "worker is not running a benchmark" });
-    stopRequested = true;
-    pauseRequested = false;
-    log.info(`run ${currentRun?.run_id ?? "?"}: stop requested, killing in-flight process if any`);
-    activeBenchProc?.kill("SIGKILL");
-    return send(res, 200, { ok: true, stopping: true });
-  }
-
-  if (req.method === "GET" && url.pathname === "/health") {
-    // ?main_gpu=<n> scopes backend_device_name to a specific about-to-run
-    // run's --main-gpu selection -- see backendDeviceName above.
-    const mainGpuParam = url.searchParams.get("main_gpu");
-    const mainGpu =
-      mainGpuParam != null && /^\d+$/.test(mainGpuParam) ? Number(mainGpuParam) : undefined;
-    return send(res, 200, {
-      ok: true,
-      worker: config.worker_name,
-      busy,
-      paused: pauseRequested,
-      current_run: currentRun,
-      backend,
-      backend_device_name: backendDeviceName(mainGpu) ?? null,
-      active_build: activeBuild?.tag ?? null,
-    });
-  }
-
-  if (req.method === "GET" && url.pathname === "/hardware") {
-    // Serves the snapshot taken once at process startup (see detectedHardware
-    // above) rather than re-probing live -- on some machines (e.g. bachika1980)
-    // systeminformation's cpu()/graphics() calls are slow enough that hitting
-    // this on every orchestrator poll made the Workers page noticeably laggy
-    // for no benefit, since hardware doesn't change while the process is up.
-    // Restart the worker to pick up real hardware changes.
-    return send(res, 200, detectedHardware);
-  }
-
-  if (req.method === "GET" && url.pathname === "/llama-cpp") {
-    return send(res, 200, {
-      platform: detectPlatform(),
-      arch: process.arch,
-      backend,
-      installed: toInstalledBuildList(),
-      active_tag: activeBuild?.tag ?? null,
-    });
-  }
-
-  if (req.method === "POST" && url.pathname === "/llama-cpp/install") {
-    if (busy) return send(res, 409, { error: "worker is running a benchmark, try again after it finishes" });
-    try {
-      const body = JSON.parse(await readBody(req, MAX_ADMIN_BODY_BYTES)) as {
-        tag?: string;
-        asset_name?: string;
-        download_url?: string;
-      };
-      if (!body.tag || !body.asset_name || !body.download_url) {
-        return send(res, 400, { error: "tag, asset_name, download_url are required" });
-      }
-      log.info(`installing llama.cpp build ${body.tag} (${body.asset_name})`);
-      const installed = await installBuild({
-        buildsDir,
-        tag: body.tag,
-        assetName: body.asset_name,
-        downloadUrl: body.download_url,
-      });
-      log.info(`installed llama.cpp build ${body.tag} -> ${installed.bench_path}`);
-      return send(res, 201, { ok: true, build: installed });
-    } catch (err) {
-      log.error(`llama-cpp install failed: ${err instanceof Error ? err.message : String(err)}`);
-      return sendError(res, err);
-    }
-  }
-
-  if (req.method === "POST" && url.pathname === "/llama-cpp/activate") {
-    if (busy) return send(res, 409, { error: "worker is running a benchmark, try again after it finishes" });
-    try {
-      const body = JSON.parse(await readBody(req, MAX_ADMIN_BODY_BYTES)) as { tag?: string };
-      if (!body.tag) return send(res, 400, { error: "tag is required" });
-      validateTag(body.tag);
-      const build = getInstalledBuild(buildsDir, body.tag);
-      if (!build) return send(res, 404, { error: `build ${body.tag} is not installed` });
-      activeBuild = { tag: build.tag, path: build.bench_path, serverPath: build.server_path };
-      persistConfig({
-        llama_cpp_build: build.tag,
-        llama_bench_path: build.bench_path,
-        llama_server_path: build.server_path,
-      });
-      log.info(`activated llama.cpp build ${activeBuild.tag}`);
-      return send(res, 200, { ok: true, active_tag: activeBuild.tag });
-    } catch (err) {
-      log.error(`llama-cpp activate failed: ${err instanceof Error ? err.message : String(err)}`);
-      return sendError(res, err);
-    }
-  }
-
-  if (req.method === "DELETE" && url.pathname.startsWith("/llama-cpp/")) {
-    if (busy) return send(res, 409, { error: "worker is running a benchmark, try again after it finishes" });
-    const tag = decodeURIComponent(url.pathname.slice("/llama-cpp/".length));
-    try {
-      validateTag(tag);
-      if (activeBuild?.tag === tag) {
-        return send(res, 400, {
-          error: "cannot delete the active build -- activate a different one first",
-        });
-      }
-      deleteBuild(buildsDir, tag);
-      log.info(`deleted llama.cpp build ${tag}`);
-      return send(res, 200, { ok: true });
-    } catch (err) {
-      log.error(`llama-cpp delete failed: ${err instanceof Error ? err.message : String(err)}`);
-      return sendError(res, err);
-    }
-  }
-
-  if (req.method === "POST" && url.pathname === "/models/download") {
-    let body: { hf_repo?: string; hf_file?: string };
-    try {
-      body = JSON.parse(await readBody(req, MAX_ADMIN_BODY_BYTES));
-      if (!body.hf_repo || !body.hf_file) {
-        return send(res, 400, { error: "hf_repo and hf_file are required" });
-      }
-      validateHfRepo(body.hf_repo);
-      validateHfFile(body.hf_file);
-    } catch (err) {
-      return sendError(res, err);
-    }
-    const hfRepo = body.hf_repo!;
-    const hfFile = body.hf_file!;
-    const progressKey = `${hfRepo}/${hfFile}`;
-    if (downloadProgress.has(progressKey)) {
-      return send(res, 409, { error: "download already in progress for that file" });
-    }
-
-    let target: string;
-    try {
-      target = resolveDownloadTarget(hfFile);
-      mkdirSync(dirname(target), { recursive: true });
-    } catch (err) {
-      return sendError(res, err);
-    }
-
-    // Ack immediately and run the actual transfer in the background -- see
-    // the /run handler above for the same fire-and-forget shape and why:
-    // this used to block the whole HTTP response on the entire
-    // download+hash+gguf-parse, which for a multi-GB file routinely outlived
-    // not just this app's own configured MODEL_DOWNLOAD_TIMEOUT_MS but also
-    // Node's undici default per-request timeout (5 minutes, independent of
-    // any AbortSignal the caller passes) -- the orchestrator would then
-    // report this worker as "inaccessible" and never register the model,
-    // even though the file kept downloading here the whole time. The
-    // outcome is now reported back explicitly via postModelDownloadResult
-    // once it's known, success or failure, same pattern /run's per-item
-    // terminal updates use.
-    const downloadStartedAt = Date.now();
-    // Seeded before the ack goes out, not after the upstream HF fetch
-    // resolves like the old blocking handler did -- the orchestrator starts
-    // polling /models/download/progress as soon as it sees this response,
-    // so the entry needs to already exist to avoid a spurious "not found"
-    // on the very first poll.
-    const progress: DownloadProgress = { bytes: 0, total: null, started_at: downloadStartedAt };
-    downloadProgress.set(progressKey, progress);
-    log.info(`downloading ${progressKey} -> ${target}`);
-    send(res, 202, { ok: true, hf_repo: hfRepo, hf_file: hfFile, status: "started" });
-
-    void runModelDownload(hfRepo, hfFile, target, progressKey, progress, downloadStartedAt);
-    return;
-  }
-
-  if (req.method === "GET" && url.pathname === "/models/download/progress") {
-    const hfRepo = url.searchParams.get("hf_repo");
-    const hfFile = url.searchParams.get("hf_file");
-    if (!hfRepo || !hfFile) return send(res, 400, { error: "hf_repo and hf_file are required" });
-    const progress = downloadProgress.get(`${hfRepo}/${hfFile}`);
-    if (!progress) return send(res, 404, { error: "no download in progress for that file" });
-    return send(res, 200, progress);
-  }
-
-  if (req.method === "GET" && url.pathname === "/models") {
-    return send(res, 200, { files: modelDirFilesCache });
-  }
-
-  if (req.method === "DELETE" && url.pathname === "/models") {
-    const filename = url.searchParams.get("file");
-    if (!filename) return send(res, 400, { error: "file is required" });
-    try {
-      validateHfFile(filename);
-      const target = resolveDownloadTarget(filename);
-      if (!existsSync(target)) {
-        return send(res, 404, { error: `file not found: ${filename}` });
-      }
-      unlinkSync(target);
-      log.info(`deleted model file ${filename}`);
-      refreshModelDirFilesCache();
-      return send(res, 200, { ok: true });
-    } catch (err) {
-      log.error(`model file delete failed: ${err instanceof Error ? err.message : String(err)}`);
-      return sendError(res, err);
-    }
-  }
-
-  // Reads GGUF metadata from a file already sitting in model_dir -- lets the
-  // server backfill n_layer/mtp_layers for models that were registered/
-  // downloaded before gguf.ts read one or the other, without re-downloading
-  // anything.
-  if (req.method === "GET" && url.pathname === "/models/gguf-info") {
-    const filename = url.searchParams.get("file");
-    if (!filename) return send(res, 400, { error: "file is required" });
-    try {
-      validateHfFile(filename);
-      const target = resolveDownloadTarget(filename);
-      if (!existsSync(target)) {
-        return send(res, 404, { error: `file not found: ${filename}` });
-      }
-      const { n_layer, mtp_layers } = await readGgufInfo(target);
-      return send(res, 200, { ok: true, n_layer, mtp_layers });
-    } catch (err) {
-      log.error(`gguf-info failed: ${err instanceof Error ? err.message : String(err)}`);
-      return sendError(res, err);
-    }
-  }
-
-  if (req.method === "GET" && url.pathname === "/logs") {
-    const runId = url.searchParams.get("run_id");
-    if (!runId) return send(res, 400, { error: "run_id is required" });
-    if (!SAFE_RUN_ID_RE.test(runId)) return send(res, 400, { error: "invalid run_id" });
-    const target = runLogFilePath(runId);
-    if (!existsSync(target)) return send(res, 404, { error: "no log file for this run" });
-    try {
-      const text = readFileSync(target, "utf8");
-      res.statusCode = 200;
-      res.setHeader("content-type", "text/plain; charset=utf-8");
-      res.end(text);
-    } catch (err) {
-      sendError(res, err);
-    }
-    return;
-  }
-
-  send(res, 404, { error: "not found" });
-});
+// One self-reported snapshot sent on every heartbeat/queue poll -- replaces
+// the old live GET /health + GET /llama-cpp + GET /hardware fan-out
+// (MULTIUSER_PLAN.md §1.5). n_layer/mtp_layers are deliberately NOT read per
+// file here -- that would mean a GGUF header parse for potentially hundreds
+// of files on every 10s heartbeat. The common case (a model downloaded
+// through this app) already has n_layer/mtp_layers on the MODEL's own
+// registered metadata, set once at download time (see
+// executeDownloadModelJob) -- this per-file list is only consulted as a
+// fallback for models registered another way, and for those it correctly
+// reports "unknown" rather than paying that cost on every heartbeat.
+function collectState(): WorkerStatePush {
+  return {
+    machine_id: config.machine_id!,
+    capabilities: ["benchmark"],
+    hostname: osHostname(),
+    backend,
+    hardware: detectedHardware,
+    installed_builds: toInstalledBuildList(),
+    model_files: modelDirFilesCache,
+    status: busy ? "busy" : "idle",
+  };
+}
 
 const ITEM_RETRY_DELAYS_MS = [2000, 4000, 8000, 16000, 32000];
 
@@ -1054,11 +594,11 @@ function classifyFailure(bench: BenchResult): "failed_oom" | "failed" {
   return "failed";
 }
 
-// The worker has no local record of a run once it's dispatched -- the VPS is
-// the only place run/item status lives. If a terminal update can't reach it,
-// retry with backoff rather than silently dropping the outcome and leaving
-// that item (and potentially the whole run) stuck "running" forever with no
-// way to recover it short of manual DB surgery.
+// The worker has no local record of a run once it's dispatched -- the server
+// is the only place run/item status lives. If a terminal update can't reach
+// it, retry with backoff rather than silently dropping the outcome and
+// leaving that item (and potentially the whole run) stuck "running" forever
+// with no way to recover it short of manual DB surgery.
 async function safeItemTerminal(
   runId: string,
   idx: number,
@@ -1066,7 +606,7 @@ async function safeItemTerminal(
 ): Promise<void> {
   for (let attempt = 0; ; attempt++) {
     try {
-      await postRunItemUpdate(config.vps_url, runId, idx, payload, 10_000);
+      await withAuth((token) => postRunItemUpdate(config.vps_url, token, runId, idx, payload, 10_000));
       log.info(`item update ok for run ${runId} item ${idx} (status=${payload.status}, attempt ${attempt + 1})`);
       return;
     } catch (err) {
@@ -1087,10 +627,10 @@ async function safeItemTerminal(
 }
 
 // Fire-and-forget: losing one tick is harmless (the next tick or the
-// terminal update above catches the VPS up), so this deliberately doesn't
+// terminal update above catches the server up), so this deliberately doesn't
 // retry or block the caller on the network round trip.
 function sendTick(runId: string, idx: number, tick: RunItemTickInput): void {
-  postRunItemUpdate(config.vps_url, runId, idx, tick, 3000).catch((err) => {
+  withAuth((token) => postRunItemUpdate(config.vps_url, token, runId, idx, tick, 3000)).catch((err) => {
     log.debug(
       `tick failed for run ${runId} item ${idx} (non-fatal): ${err instanceof Error ? err.message : String(err)}`
     );
@@ -1121,83 +661,6 @@ async function safeReportDownloadResult(payload: ModelDownloadCallbackInput): Pr
   }
 }
 
-// Runs the actual transfer+hash+gguf-parse in the background after
-// POST /models/download has already acked -- see that handler for why.
-// Deliberately keeps the progress-map entry alive through the gguf parse and
-// the callback POST below, not just the byte transfer: the orchestrator's
-// client polls this file's progress to know when to stop watching it and
-// only registers the model in its DB once the callback arrives, so clearing
-// the entry any earlier would let a poll see "no longer downloading" and
-// refresh the model list before the model actually exists there. See
-// client/src/pages/Models.tsx's finalizeDownload for the other half.
-async function runModelDownload(
-  hfRepo: string,
-  hfFile: string,
-  target: string,
-  progressKey: string,
-  progress: DownloadProgress,
-  downloadStartedAt: number
-): Promise<void> {
-  try {
-    const sourceUrl = hfResolveUrl(hfRepo, hfFile);
-    const upstream = await fetch(sourceUrl, {
-      headers: { "user-agent": "llamatoaster-worker" },
-      redirect: "follow",
-    });
-    if (!upstream.ok || !upstream.body) {
-      throw new Error(`download failed: ${upstream.status} ${upstream.statusText}`);
-    }
-
-    const contentLength = Number(upstream.headers.get("content-length"));
-    if (Number.isFinite(contentLength) && contentLength > 0) {
-      progress.total = contentLength;
-    }
-    const tracker = new Transform({
-      transform(chunk: Buffer, _enc, cb) {
-        progress.bytes += chunk.length;
-        cb(null, chunk);
-      },
-    });
-
-    const hasher = new HashingPassThrough();
-    await pipeline(Readable.fromWeb(upstream.body as any), tracker, hasher, createWriteStream(target));
-    const elapsedMs = Date.now() - downloadStartedAt;
-    log.info(`downloaded ${progressKey}: ${hasher.byteLength}B in ${elapsedMs}ms`);
-
-    const { n_layer, mtp_layers } = await readGgufInfo(target);
-    log.info(
-      `gguf metadata for ${progressKey}: n_layer=${n_layer ?? "unknown"} mtp_layers=${mtp_layers ?? "unknown"}`
-    );
-
-    // Reflect the new file immediately rather than waiting for the periodic
-    // refresh -- see refreshModelDirFilesCache above.
-    refreshModelDirFilesCache();
-
-    await safeReportDownloadResult({
-      worker: config.worker_name,
-      hf_repo: hfRepo,
-      hf_file: hfFile,
-      ok: true,
-      sha256: hasher.digestHex(),
-      size_bytes: hasher.byteLength,
-      n_layer,
-      mtp_layers,
-    });
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    log.error(`model download failed for ${progressKey}: ${message}`);
-    await safeReportDownloadResult({
-      worker: config.worker_name,
-      hf_repo: hfRepo,
-      hf_file: hfFile,
-      ok: false,
-      error: message,
-    });
-  } finally {
-    downloadProgress.delete(progressKey);
-  }
-}
-
 interface RunSweepItemInput {
   runId: string;
   item: SweepItem;
@@ -1223,16 +686,6 @@ const PP_RUN_RE = /benchmark\s+\d+\/\d+:\s+prompt run\s+(\d+)\/(\d+)/i;
 const TG_RUN_RE = /benchmark\s+\d+\/\d+:\s+generation run\s+(\d+)\/(\d+)/i;
 const WARMUP_RE = /benchmark\s+\d+\/\d+:\s+warmup prompt run/i;
 const STARTING_RE = /benchmark\s+\d+\/\d+:\s+starting/i;
-
-// Offload detail (which model got how many layers on the GPU) is now parsed
-// once by whichever module actually ran the process -- bench.ts's runBench
-// for the llama-bench path, serverBench.ts's runServerBench for the MTP/
-// llama-server path -- and arrives here pre-parsed on BenchResult.offload
-// (see bench.ts's parseOffloadLayers/OffloadResult). matchOffloadLine is the
-// one piece still used directly in this file: a live, single-line version
-// for surfacing offload as soon as it's seen while streaming llama-bench's
-// stderr (see runSweepItem's onStderrLine below), well before that item's
-// process has actually exited.
 
 // One-time banner written to a run's own dedicated log file (see
 // setRunLogFile/runLogFilePath) the moment it starts -- everything needed to
@@ -1346,9 +799,9 @@ function formatItemParams(item: SweepItem): string {
 // unfiltered hardware.gpu index used to produce -- see shared/types.ts's
 // backendVisibleGpus.
 // backend is a parameter (not read from the module-level const) so a
-// main_gpu_backend override run (see the /run handler's effectiveBackend)
-// logs its actual one-off backend here, not this worker's unrelated
-// persisted default.
+// backend-override job (see executeBenchmarkJob's effectiveBackend) logs its
+// actual one-off backend here, not this worker's unrelated persisted
+// default.
 function formatDeviceSelection(backend: Backend, mainGpu: number | undefined): string {
   const visible = backendVisibleGpus(detectedHardware.gpu, backend);
   if (mainGpu == null) {
@@ -1583,9 +1036,9 @@ async function finalizeSweepItemResult(
     });
     return "done";
   }
-  // A user-requested stop kills this exact process (SIGKILL, via /run/stop)
-  // -- report it as "cancelled", not a genuine failure, so it doesn't read
-  // as something having gone wrong.
+  // A user-requested stop kills this exact process (SIGKILL, via the
+  // heartbeat's cancel_job_ids control) -- report it as "cancelled", not a
+  // genuine failure, so it doesn't read as something having gone wrong.
   const status: TerminalRunItemStatus = stopRequested ? "cancelled" : classifyFailure(bench);
   const errorMessage = stopRequested
     ? "cancelled by user"
@@ -1900,21 +1353,551 @@ async function runSweepItemViaServer(input: RunSweepItemViaServerInput): Promise
   }
 }
 
-function send(res: any, code: number, data: unknown): void {
-  res.statusCode = code;
-  res.setHeader("content-type", "application/json");
-  res.end(JSON.stringify(data));
+// Best-effort push of a completed run's log to the server (MULTIUSER_PLAN.md
+// §1.10) -- gzipped, identified by X-Machine-Id. Called from
+// executeBenchmarkJob's finally block regardless of outcome (stopped/failed
+// runs still get a log). A failure here is logged but never thrown -- losing
+// the log is unfortunate, not a reason to fail the whole job when every item
+// already reported its own outcome individually.
+async function pushRunLogIfPresent(runId: string): Promise<void> {
+  const path = runLogFilePath(runId);
+  if (!existsSync(path)) return;
+  try {
+    const text = readFileSync(path, "utf8");
+    const gzipped = gzipSync(Buffer.from(text, "utf8"));
+    await withAuth((token) => pushRunLog(config.vps_url, token, config.machine_id!, runId, gzipped));
+    log.info(`run ${runId}: log pushed (${gzipped.length}B gzipped)`);
+  } catch (err) {
+    log.warn(`run ${runId}: failed to push log (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+  }
 }
 
-function sendError(res: any, err: unknown): void {
-  const message = err instanceof Error ? err.message : String(err);
-  const statusCode = (err as { statusCode?: number })?.statusCode ?? 400;
-  send(res, statusCode, { error: message });
+// Executes a claimed 'benchmark' job -- one job per run, looping every sweep
+// combination in-process exactly as before (MULTIUSER_PLAN.md §1.1). Always
+// resolves once the whole sweep (or a user stop) has been worked through;
+// individual item failures are reported per-item via safeItemTerminal and
+// never abort the loop. Throws only for a genuine "can't even start"
+// condition (missing model file, requested build not installed) -- caught by
+// workerMain, which reports the job itself failed and reconciles the run.
+async function executeBenchmarkJob(payload: BenchmarkJob): Promise<void> {
+  const modelPath = resolveModelPath(payload.model);
+  if (!existsSync(modelPath)) {
+    throw new Error(`model file not found at ${modelPath} (source=${payload.model.source})`);
+  }
+  let mtpModelPath: string | undefined;
+  if (payload.mtp_model) {
+    mtpModelPath = resolveModelPath(payload.mtp_model);
+    if (!existsSync(mtpModelPath)) {
+      throw new Error(`mtp model file not found at ${mtpModelPath} (source=${payload.mtp_model.source})`);
+    }
+  }
+
+  // The server always resolves the exact tag this run should execute
+  // against (see server/src/routes/runs.ts's resolveBuildForRun) -- look it
+  // up directly in this worker's own registry rather than assuming it
+  // matches activeBuild, which may be a different installed tag for the
+  // same backend.
+  const resolvedBuild = getInstalledBuild(buildsDir, payload.llama_cpp_build);
+  if (!resolvedBuild) {
+    throw new Error(`build ${payload.llama_cpp_build} is not installed on this worker`);
+  }
+  const effectiveBuild: ActiveBuild = {
+    tag: resolvedBuild.tag,
+    path: resolvedBuild.bench_path,
+    serverPath: resolvedBuild.server_path,
+  };
+  const effectiveBackend: Backend = payload.llama_cpp_backend;
+
+  pauseRequested = false;
+  stopRequested = false;
+  activeBenchProc = null;
+
+  const items = expandSweep(payload.sweep);
+  setRunLogFile(runLogFilePath(payload.run_id));
+  log.info(
+    formatRunLogHeader(
+      payload.run_id,
+      payload.model,
+      payload.mtp_model,
+      effectiveBuild,
+      effectiveBackend,
+      items.length,
+      payload.sweep.repeats
+    )
+  );
+  log.info(`run ${payload.run_id}: ${items.length} test(s) to run`);
+  const rawDir = config.raw_json_dir ?? join(config.model_dir, "raw");
+  // Tallied across every item regardless of which path handled it, so the
+  // run's own finish line can report a success/fail breakdown instead of
+  // just "finished all N test(s)" with no indication of how many of those
+  // actually succeeded.
+  const statusCounts: Partial<Record<TerminalRunItemStatus, number>> = {};
+  const tally = (status: TerminalRunItemStatus): void => {
+    statusCounts[status] = (statusCounts[status] ?? 0) + 1;
+  };
+  try {
+    for (const item of items) {
+      updateJobReport({
+        phase: "benchmarking",
+        item_idx: item.idx,
+        items_total: items.length,
+        detail: formatItemParams(item),
+      });
+      // Checked before *every* item (not just once) since pausing can hold
+      // here for a while -- a stop requested while paused must still take
+      // effect immediately rather than waiting out the pause.
+      if (stopRequested) {
+        log.info(`run ${payload.run_id}: stopped, cancelling item ${item.idx} (not started)`);
+        await safeItemTerminal(payload.run_id, item.idx, { status: "cancelled", error: "cancelled by user" });
+        tally("cancelled");
+        continue;
+      }
+      while (pauseRequested && !stopRequested) {
+        await sleep(500);
+      }
+      if (stopRequested) {
+        log.info(`run ${payload.run_id}: stopped while paused, cancelling item ${item.idx} (not started)`);
+        await safeItemTerminal(payload.run_id, item.idx, { status: "cancelled", error: "cancelled by user" });
+        tally("cancelled");
+        continue;
+      }
+      if (item.mtp === "on") {
+        if (!effectiveBuild.serverPath) {
+          log.error(`run ${payload.run_id}: item ${item.idx} needs mtp but the active build has no llama-server binary`);
+          await safeItemTerminal(payload.run_id, item.idx, {
+            status: "failed",
+            error: "active llama.cpp build has no llama-server binary -- reinstall the build to pick one up",
+          });
+          tally("failed");
+          continue;
+        }
+        tally(
+          await runSweepItemViaServer({
+            runId: payload.run_id,
+            item,
+            repeats: payload.sweep.repeats,
+            modelPath,
+            mtpModelPath,
+            llamaServerPath: effectiveBuild.serverPath,
+            port: config.mtp_server_port ?? DEFAULT_MTP_SERVER_PORT,
+            backend: effectiveBackend,
+            mainGpu: payload.main_gpu,
+            timeoutMs: config.bench_timeout_ms,
+            rawJsonDir: rawDir,
+          })
+        );
+      } else {
+        tally(
+          await runSweepItem({
+            runId: payload.run_id,
+            item,
+            repeats: payload.sweep.repeats,
+            modelPath,
+            llamaBenchPath: effectiveBuild.path,
+            backend: effectiveBackend,
+            mainGpu: payload.main_gpu,
+            timeoutMs: config.bench_timeout_ms,
+            vpsUrl: config.vps_url,
+            rawJsonDir: rawDir,
+          })
+        );
+      }
+    }
+    const breakdown =
+      (["done", "failed", "failed_oom", "cancelled"] as const)
+        .filter((s) => statusCounts[s])
+        .map((s) => `${s}=${statusCounts[s]}`)
+        .join(" ") || "no items processed";
+    log.info(
+      `run ${payload.run_id} finished all ${items.length} test(s)${stopRequested ? " (stopped early)" : ""}: ${breakdown}`
+    );
+    log.info(formatRunLogFooter(payload.run_id, items.length, payload.sweep.repeats, statusCounts, stopRequested));
+  } finally {
+    setRunLogFile(null);
+    updateJobReport({ phase: "finalizing", detail: "pushing run log" });
+    await pushRunLogIfPresent(payload.run_id);
+  }
 }
 
-server.listen(PORT, config.bind_host, () => {
-  log.info(`[worker ${config.worker_name}] listening on ${config.bind_host}:${PORT} (tailnet-only)`);
-});
+async function executeInstallBuildJob(payload: InstallBuildJobPayload): Promise<void> {
+  updateJobReport({ phase: "downloading", detail: `${payload.tag} (${payload.asset_name})` });
+  log.info(`installing llama.cpp build ${payload.tag} (${payload.asset_name})`);
+  const installed = await installBuild({
+    buildsDir,
+    tag: payload.tag,
+    assetName: payload.asset_name,
+    downloadUrl: payload.download_url,
+  });
+  log.info(`installed llama.cpp build ${payload.tag} -> ${installed.bench_path}`);
+}
+
+async function executeActivateBuildJob(payload: ActivateBuildJobPayload): Promise<void> {
+  validateTag(payload.tag);
+  const build = getInstalledBuild(buildsDir, payload.tag);
+  if (!build) throw new Error(`build ${payload.tag} is not installed`);
+  activeBuild = { tag: build.tag, path: build.bench_path, serverPath: build.server_path };
+  persistConfig({
+    llama_cpp_build: build.tag,
+    llama_bench_path: build.bench_path,
+    llama_server_path: build.server_path,
+  });
+  log.info(`activated llama.cpp build ${activeBuild.tag}`);
+}
+
+async function executeDeleteBuildJob(payload: DeleteBuildJobPayload): Promise<void> {
+  validateTag(payload.tag);
+  if (activeBuild?.tag === payload.tag) {
+    throw new Error("cannot delete the active build -- activate a different one first");
+  }
+  deleteBuild(buildsDir, payload.tag);
+  log.info(`deleted llama.cpp build ${payload.tag}`);
+}
+
+async function executeDownloadModelJob(payload: DownloadModelJobPayload): Promise<void> {
+  validateHfRepo(payload.hf_repo);
+  validateHfFile(payload.hf_file);
+  const target = resolveDownloadTarget(payload.hf_file);
+  mkdirSync(dirname(target), { recursive: true });
+  const progressKey = `${payload.hf_repo}/${payload.hf_file}`;
+  const downloadStartedAt = Date.now();
+  updateJobReport({ phase: "downloading", bytes: 0, detail: progressKey });
+  log.info(`downloading ${progressKey} -> ${target}`);
+
+  try {
+    const sourceUrl = hfResolveUrl(payload.hf_repo, payload.hf_file);
+    const upstream = await fetch(sourceUrl, {
+      headers: { "user-agent": "llamatoaster-worker" },
+      redirect: "follow",
+    });
+    if (!upstream.ok || !upstream.body) {
+      throw new Error(`download failed: ${upstream.status} ${upstream.statusText}`);
+    }
+    const contentLength = Number(upstream.headers.get("content-length"));
+    if (Number.isFinite(contentLength) && contentLength > 0) {
+      updateJobReport({ total_bytes: contentLength });
+    }
+    const tracker = new Transform({
+      transform(chunk: Buffer, _enc, cb) {
+        updateJobReport({ bytes: (currentJobReport?.bytes ?? 0) + chunk.length });
+        cb(null, chunk);
+      },
+    });
+
+    const hasher = new HashingPassThrough();
+    await pipeline(Readable.fromWeb(upstream.body as any), tracker, hasher, createWriteStream(target));
+    const elapsedMs = Date.now() - downloadStartedAt;
+    log.info(`downloaded ${progressKey}: ${hasher.byteLength}B in ${elapsedMs}ms`);
+
+    updateJobReport({ phase: "finalizing", detail: "reading GGUF metadata" });
+    const { n_layer, mtp_layers } = await readGgufInfo(target);
+    log.info(
+      `gguf metadata for ${progressKey}: n_layer=${n_layer ?? "unknown"} mtp_layers=${mtp_layers ?? "unknown"}`
+    );
+
+    // Reflect the new file immediately rather than waiting for the periodic
+    // refresh -- see refreshModelDirFilesCache above.
+    refreshModelDirFilesCache();
+
+    await safeReportDownloadResult({
+      worker: config.worker_name,
+      hf_repo: payload.hf_repo,
+      hf_file: payload.hf_file,
+      ok: true,
+      sha256: hasher.digestHex(),
+      size_bytes: hasher.byteLength,
+      n_layer,
+      mtp_layers,
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    log.error(`model download failed for ${progressKey}: ${message}`);
+    await safeReportDownloadResult({
+      worker: config.worker_name,
+      hf_repo: payload.hf_repo,
+      hf_file: payload.hf_file,
+      ok: false,
+      error: message,
+    });
+    throw err; // also mark the worker_jobs row itself failed
+  }
+}
+
+async function executeDeleteModelFileJob(payload: { filename: string }): Promise<void> {
+  validateHfFile(payload.filename);
+  const target = resolveDownloadTarget(payload.filename);
+  if (!existsSync(target)) {
+    // Already absent -- the desired end state already holds, so this is
+    // treated as a harmless success (idempotent) rather than a failure.
+    log.warn(`delete_model_file: file already absent, nothing to do: ${payload.filename}`);
+    return;
+  }
+  unlinkSync(target);
+  log.info(`deleted model file ${payload.filename}`);
+  refreshModelDirFilesCache();
+}
+
+async function executeJob(job: QueueJob): Promise<void> {
+  switch (job.type) {
+    case "benchmark":
+      return executeBenchmarkJob(job.payload);
+    case "install_build":
+      return executeInstallBuildJob(job.payload);
+    case "activate_build":
+      return executeActivateBuildJob(job.payload);
+    case "delete_build":
+      return executeDeleteBuildJob(job.payload);
+    case "download_model":
+      return executeDownloadModelJob(job.payload);
+    case "delete_model_file":
+      return executeDeleteModelFileJob(job.payload);
+  }
+}
+
+function jobInitialPhase(type: QueueJob["type"]): ActiveJobReport["phase"] {
+  return type === "download_model" ? "downloading" : "loading";
+}
+
+// Delivered on the heartbeat's control.cancel_job_ids -- ignored unless it
+// names the job actually running right now (a stale or mismatched signal,
+// e.g. one arriving just after this job already finished on its own,
+// naturally no-ops here rather than killing an unrelated process).
+function requestStop(jobId: string): void {
+  if (currentJobReport?.job_id !== jobId) return;
+  stopRequested = true;
+  activeBenchProc?.kill("SIGKILL");
+  log.info(`job ${jobId}: stop requested via heartbeat control`);
+}
+
+// Resolved once by ensureAuthCredential (called near the bottom of this
+// file, after hardware detection) and mutated in place by refreshAuth on a
+// 401 -- every outbound authenticated call reads these fresh via withAuth
+// rather than capturing a value, so a mid-process refresh takes effect on
+// the very next call without restarting anything.
+let authToken: string;
+let refreshToken: string | undefined;
+// True once this worker is authenticating via a per-worker session (Stage
+// 3) rather than the legacy shared secret (Stage 1) -- only a session can be
+// refreshed; a 401 under the shared-secret path just means static
+// misconfiguration (wrong/rotated WORKER_SHARED_TOKEN), nothing to retry.
+let sessionAuth = false;
+
+// Device-code enrolment (MULTIUSER_PLAN.md §3.1 step 2-3, §3.5) -- called
+// only when this worker holds neither a session nor the legacy shared
+// secret, i.e. a genuinely fresh install. Blocks until a human approves the
+// printed code (or it expires), since there is nothing useful this worker
+// can do before it has a credential.
+async function enrolDevice(): Promise<void> {
+  log.info(`[worker ${config.worker_name}] no credential configured -- starting device enrolment`);
+  const start = await startDeviceEnrolment(config.vps_url, {
+    machine_id: config.machine_id!,
+    hostname: osHostname(),
+    platform: detectedHardware.platform,
+    arch: detectedHardware.arch,
+  });
+  log.info(`[worker ${config.worker_name}] to connect this machine, visit ${config.vps_url}${start.verification_uri}`);
+  log.info(`[worker ${config.worker_name}] code: ${start.user_code}  (expires in ${Math.round(start.expires_in / 60)} minutes)`);
+
+  const deadline = Date.now() + start.expires_in * 1000;
+  while (Date.now() < deadline) {
+    await sleep(start.interval * 1000);
+    const poll = await pollDeviceToken(config.vps_url, start.device_code);
+    if (poll.state === "approved") {
+      persistConfig({ session_token: poll.session_token, refresh_token: poll.refresh_token });
+      authToken = poll.session_token;
+      refreshToken = poll.refresh_token;
+      sessionAuth = true;
+      log.info(`[worker ${config.worker_name}] device approved -- connected`);
+      return;
+    }
+    if (poll.state === "expired") {
+      throw new Error("device enrolment code expired before it was approved -- restart the worker to try again");
+    }
+    // pending -- a human hasn't approved it yet, keep polling.
+  }
+  throw new Error("device enrolment timed out waiting for approval -- restart the worker to try again");
+}
+
+// Resolves which credential this worker authenticates with, preferring an
+// existing per-worker session, falling back to the legacy shared secret for
+// an already-deployed Stage 1 worker, and only running the interactive
+// enrolment flow above when neither is configured at all (a fresh install).
+async function ensureAuthCredential(): Promise<void> {
+  if (config.session_token) {
+    authToken = config.session_token;
+    refreshToken = config.refresh_token;
+    sessionAuth = true;
+    return;
+  }
+  if (config.worker_shared_token) {
+    authToken = config.worker_shared_token;
+    sessionAuth = false;
+    log.info(
+      `[worker ${config.worker_name}] using legacy worker_shared_token auth -- remove it from config.json and restart to switch to per-worker device enrolment`
+    );
+    return;
+  }
+  await enrolDevice();
+}
+
+// Shared by every concurrent refreshAuth call (see below) so the heartbeat
+// loop and workerMain's queue loop -- which run concurrently and can both
+// hit a 401 around the same moment, e.g. right after a session is revoked
+// from Settings -- never each present the refresh token independently. A
+// refresh token is single-use (server/src/db/repo.ts's sessionRepo.rotate);
+// the second caller to present an already-rotated-away one would trip the
+// server's replay detection and get the WHOLE session revoked (server/src/
+// routes/sessions.ts) -- worse than either caller just waiting for the
+// other's in-flight refresh to finish.
+let refreshInFlight: Promise<void> | null = null;
+
+// Rotates this worker's session and swaps authToken/refreshToken in place --
+// called reactively on a 401 from any session-authenticated call (see
+// withAuth below), never on a timer (see refreshWorkerSession's own doc
+// comment for why a fixed schedule isn't needed). Persists the rotated pair
+// immediately: the server's refresh-replay detection revokes the whole
+// session if a stale refresh token is ever presented again (server/src/
+// routes/sessions.ts), so a crash between rotating here and persisting would
+// strand this worker on a refresh token the server no longer accepts.
+async function refreshAuth(): Promise<void> {
+  if (!sessionAuth || !refreshToken) throw new Error("session expired and no refresh token is available");
+  if (refreshInFlight) return refreshInFlight;
+  refreshInFlight = (async () => {
+    const rotated = await refreshWorkerSession(config.vps_url, refreshToken!);
+    persistConfig({ session_token: rotated.session_token, refresh_token: rotated.refresh_token });
+    authToken = rotated.session_token;
+    refreshToken = rotated.refresh_token;
+    log.info(`[worker ${config.worker_name}] session refreshed`);
+  })();
+  try {
+    await refreshInFlight;
+  } finally {
+    refreshInFlight = null;
+  }
+}
+
+// Wraps every session-authenticated outbound call with a single transparent
+// retry after refreshing on a 401 -- so a session that went stale while this
+// process was asleep/offline (past its sliding-expiry window, see
+// refreshWorkerSession's doc comment) self-heals on the very next call
+// instead of failing forever. A no-op passthrough under the Stage 1
+// shared-token path (sessionAuth false), where a 401 has nothing to refresh.
+async function withAuth<T>(fn: (token: string) => Promise<T>): Promise<T> {
+  try {
+    return await fn(authToken);
+  } catch (err) {
+    if (sessionAuth && err instanceof HttpError && err.status === 401) {
+      await refreshAuth();
+      return await fn(authToken);
+    }
+    throw err;
+  }
+}
+
+const HEARTBEAT_INTERVAL_MS = 10_000;
+
+// Runs forever, independent of job execution (MULTIUSER_PLAN.md §1.9) --
+// this is what lets the server see this worker as "busy" with live progress
+// for the whole duration of a job, and what delivers cancel/pause control
+// directives with a worst-case ~10s latency.
+function startHeartbeatLoop(): void {
+  setInterval(async () => {
+    try {
+      const state = collectState();
+      const res = await withAuth((token) => postHeartbeat(config.vps_url, token, state, currentJobReport, 10_000));
+      for (const jobId of res.control.cancel_job_ids) requestStop(jobId);
+      pauseRequested = res.control.pause;
+    } catch (err) {
+      // Transient -- the server's lease is 6 heartbeats wide (LEASE_MS), so
+      // one or two missed heartbeats in a row is recoverable without any
+      // action here.
+      log.debug(`heartbeat failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }, HEARTBEAT_INTERVAL_MS).unref();
+}
+
+// Comfortably above the server's own ~25s long-poll window (LONG_POLL_MS,
+// server/src/routes/queue.ts) so this never aborts a poll that was about to
+// return 204 on its own.
+const QUEUE_POLL_TIMEOUT_MS = 35_000;
+
+// The main loop: pull one job at a time, execute it to completion, report
+// the outcome, repeat forever. Only ever polls the queue while idle
+// (MULTIUSER_PLAN.md §1.3) -- heartbeating (busy or idle) is entirely the
+// separate loop above.
+async function workerMain(): Promise<void> {
+  while (true) {
+    try {
+      const job = await withAuth((token) => pollQueue(config.vps_url, token, collectState(), QUEUE_POLL_TIMEOUT_MS));
+      if (!job) continue;
+
+      busy = true;
+      currentJobReport = { job_id: job.job_id, phase: jobInitialPhase(job.type) };
+      pauseRequested = false;
+      stopRequested = false;
+      activeBenchProc = null;
+      log.info(`claimed job ${job.job_id} (${job.type})`);
+      try {
+        await executeJob(job);
+        await withAuth((token) => reportJobResult(config.vps_url, token, config.machine_id!, job.job_id, { ok: true }));
+        log.info(`job ${job.job_id} (${job.type}) completed`);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        log.error(`job ${job.job_id} (${job.type}) failed: ${message}`);
+        try {
+          await withAuth((token) =>
+            reportJobResult(config.vps_url, token, config.machine_id!, job.job_id, {
+              ok: false,
+              error: message,
+            })
+          );
+        } catch (reportErr) {
+          log.error(
+            `could not report job ${job.job_id} failure to server: ${
+              reportErr instanceof Error ? reportErr.message : String(reportErr)
+            }`
+          );
+        }
+      } finally {
+        busy = false;
+        currentJobReport = null;
+        pauseRequested = false;
+        stopRequested = false;
+        activeBenchProc = null;
+      }
+    } catch (err) {
+      log.error(`worker loop error: ${err instanceof Error ? err.message : String(err)}`);
+      await sleep(10_000);
+    }
+  }
+}
+
+// Optional, off by default (config.debug_port unset) -- a purely local
+// diagnostic endpoint, never used for dispatch (MULTIUSER_PLAN.md §1.11).
+if (config.debug_port) {
+  const debugServer = createServer((req, res) => {
+    if (req.url === "/health") {
+      res.setHeader("content-type", "application/json");
+      res.end(
+        JSON.stringify({
+          ok: true,
+          machine_id: config.machine_id,
+          busy,
+          backend,
+          active_build: activeBuild?.tag ?? null,
+          active_job: currentJobReport,
+        })
+      );
+      return;
+    }
+    res.statusCode = 404;
+    res.end(JSON.stringify({ error: "not found" }));
+  });
+  debugServer.listen(config.debug_port, "127.0.0.1", () => {
+    log.info(
+      `[worker ${config.worker_name}] debug endpoint listening on 127.0.0.1:${config.debug_port} (local troubleshooting only)`
+    );
+  });
+}
 
 // Once at startup (covers a worker that's restarted often enough that a
 // periodic timer alone might rarely fire) and then daily -- a long-lived
@@ -1924,18 +1907,21 @@ const RAW_JSON_PRUNE_INTERVAL_MS = 24 * 60 * 60 * 1000;
 pruneRawJson();
 setInterval(pruneRawJson, RAW_JSON_PRUNE_INTERVAL_MS).unref();
 
-// Populate the /models cache right away so the first request after startup
-// doesn't race an empty cache, then keep it fresh on a timer -- see
+// Populate the model-files cache right away so the first heartbeat after
+// startup doesn't report an empty list, then keep it fresh on a timer -- see
 // refreshModelDirFilesCache above.
 const MODEL_LIST_REFRESH_INTERVAL_MS = 2 * 60 * 1000;
 refreshModelDirFilesCache();
 setInterval(refreshModelDirFilesCache, MODEL_LIST_REFRESH_INTERVAL_MS).unref();
 
+log.info(`[worker ${config.worker_name}] no inbound HTTP listener -- pull queue only (tailnet not required)`);
+await ensureAuthCredential();
+startHeartbeatLoop();
+void workerMain();
+
 function shutdown(signal: string): void {
   log.info(`received ${signal}, shutting down...`);
-  server.close(() => process.exit(0));
-  // Force-exit if a benchmark is still in flight and close() hangs.
-  setTimeout(() => process.exit(1), 5000).unref();
+  process.exit(0);
 }
 
 process.on("SIGINT", () => shutdown("SIGINT"));

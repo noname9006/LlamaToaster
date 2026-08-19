@@ -7,7 +7,14 @@ Type=simple
 User=ubuntu
 Group=ubuntu
 WorkingDirectory=/home/ubuntu/LlamaToaster
-Environment=WORKER_CONFIG=worker/config.vps.json
+# MULTIUSER_PLAN.md §6.0: this VPS's own worker is just one more machine
+# enrolled under the operator's own account (§3), not a special-cased local/
+# remote pair -- its config.json comes from actually running
+# worker/bootstrap.sh on this box and approving the resulting device-flow
+# code, not from a bespoke file baked into this repo checkout. Run that
+# first, then point this at wherever it wrote config.json (absolute path --
+# it lives outside this WorkingDirectory).
+Environment=WORKER_CONFIG=/home/ubuntu/.llamatoaster-worker/config.json
 ExecStart=/usr/bin/npm run worker
 Restart=on-failure
 RestartSec=5

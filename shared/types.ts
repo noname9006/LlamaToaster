@@ -211,6 +211,14 @@ export interface RegisterModelInput {
   hf_repo?: string;
   hf_file?: string;
   metadata?: ModelMetadata;
+  // Multi-user Stage 4 (MULTIUSER_PLAN.md §4.4) -- populated by the ROUTE
+  // from req.user.id, never by the caller directly (undefined in
+  // single-tenant mode, matching every other userId in this app). Not a
+  // second positional parameter on registerModel itself -- keeping that
+  // function's signature exactly as-is is the plan's own explicit
+  // requirement (§4.3: "listModels/getModel/registerModel keep their
+  // current signatures -- the catalog is global").
+  created_by?: string;
 }
 
 export interface SweepConfig {
@@ -283,6 +291,11 @@ export type RunStatus = "running" | "scheduled" | "done" | "partial" | "failed" 
 export interface Run {
   id: string;
   worker_name: string;
+  // Which `workers` row dispatched this run -- see MULTIUSER_PLAN.md §1.2.
+  // Undefined for runs predating the workers table, or whose worker was
+  // later deleted (ON DELETE SET NULL). worker_name above stays the
+  // point-in-time snapshot the export reads directly, independent of this.
+  worker_id?: string;
   llama_cpp_build: string;
   llama_cpp_backend: Backend;
   // The specific GPU/CPU model llama.cpp itself reported (e.g. "AMD Radeon
@@ -619,7 +632,10 @@ export function isTerminalRunItemInput(input: RunItemUpdateInput): input is RunI
 
 export interface TriggerPayload {
   model_id: string;
-  worker_name: string;
+  // The `workers.id` (UUID) to run against -- machines are identified by id,
+  // not name, from Stage 1 onward (MULTIUSER_PLAN.md §1.16). A machine's
+  // display name can be renamed without breaking anything that referenced it.
+  worker_id: string;
   // See RunConfig.mtp_model_id -- same field, forwarded through the trigger
   // request rather than looked up server-side from anything else.
   mtp_model_id?: string;
@@ -650,6 +666,26 @@ export interface InstalledBuild {
   asset_name: string;
   installed_at: number;
   active: boolean;
+  // Resolved local paths to the installed build's llama-bench/llama-server
+  // binaries -- see worker/src/llama-builds.ts's InstalledBuildInfo, which
+  // has always had these; they just weren't previously serialized onto the
+  // wire-facing shape. The pull-queue worker (MULTIUSER_PLAN.md §1.9) needs
+  // them to resolve a QueueJob's `llama_cpp_build` tag to an actual binary to
+  // run, without a live round trip back to the server. There is no
+  // `InstalledBuild.backend` field -- matching an installed build to a
+  // requested backend is done by tag/asset_name (see
+  // assetMatchesWorker), never by a stored backend string.
+  bench_path?: string;
+  server_path?: string;
+}
+
+// Walks model_dir recursively -- see worker/src/index.ts's listModelDirFiles.
+// Promoted here (was worker-local) so the server can type the
+// WorkerStatePush.model_files it now receives directly from the worker's own
+// heartbeat/queue poll instead of fetching a worker's file list live.
+export interface ModelDirFile {
+  path: string;
+  size_bytes: number;
 }
 
 export interface HardwareInfo {
@@ -704,38 +740,6 @@ export function backendVisibleGpus<T extends { vendor: string; model: string }>(
   return filtered.length > 0 ? filtered : gpu;
 }
 
-export interface WorkerCurrentRun {
-  run_id: string;
-  model_filename: string;
-  started_at: number;
-}
-
-export interface WorkerLlamaCppInfo {
-  worker_name: string;
-  platform: string;
-  arch: string;
-  backend: Backend;
-  installed: InstalledBuild[];
-  active_tag: string | null;
-  available: LlamaCppRelease[];
-  update_available: boolean;
-  // Best-effort, diagnostic only -- undefined if the worker predates this
-  // field or /hardware couldn't be reached. Nothing here gates the
-  // "available" list above; that's still filtered by platform/arch/backend
-  // alone (see github-releases.ts) since current llama.cpp releases don't
-  // ship CPU-tiered variants for these flags to choose between anyway.
-  hardware?: HardwareInfo;
-  // Same best-effort story as hardware above, sourced from the worker's
-  // /health instead: undefined if that fetch failed rather than the main
-  // /llama-cpp one, rather than failing the whole response over it.
-  busy?: boolean;
-  current_run?: WorkerCurrentRun | null;
-  // True while the worker has finished its current sweep item and is
-  // holding before starting the next one (see worker/src/index.ts's
-  // /run/pause) -- only meaningful while busy is true.
-  paused?: boolean;
-}
-
 // --- Hugging Face model search ---
 
 export interface HfRepoSearchResult {
@@ -752,12 +756,6 @@ export interface HfFileEntry {
   path: string;
   size_bytes: number;
   quant: string | null;
-}
-
-export interface DownloadProgress {
-  bytes: number;
-  total: number | null;
-  started_at: number;
 }
 
 // Worker -> server callback reporting a model download's terminal outcome --
@@ -777,4 +775,297 @@ export interface ModelDownloadCallbackInput {
   size_bytes?: number;
   n_layer?: number | null;
   mtp_layers?: number | null;
+}
+
+// --- Pull queue (MULTIUSER_PLAN.md Stage 1) ---
+//
+// The worker pulls all work over one outbound connection and pushes all
+// state back -- no server->worker HTTP. A machine is identified by a
+// server-assigned `id` (see the `workers` table); Stage 3 layers real
+// enrolment/ownership on top of the same row, so this type only carries what
+// Stage 1 actually populates.
+
+export interface Worker {
+  id: string;
+  machineId: string;
+  displayName: string;
+  hostname: string | null;
+  backend: Backend | null;
+  platform: string | null;
+  arch: string | null;
+  hardware: HardwareInfo | null;
+  installedBuilds: InstalledBuild[];
+  modelFiles: ModelDirFile[];
+  status: "offline" | "idle" | "busy"; // DERIVED, never stored -- see server/src/liveness.ts
+  lastHeartbeatAt: number | null;
+  activeJobId: string | null;
+  // The two pieces of live detail a UI needs while activeJobId is set --
+  // both derived from the SAME worker_jobs row (its run_id and progress_json,
+  // extended on every heartbeat, see repo.ts's queueRepo.extendLeaseAndGetFlags)
+  // so a card/dashboard needs no extra round trip to show "what" and "how
+  // far along". Undefined whenever activeJobId is null. activeRunId is only
+  // ever set for a 'benchmark' job -- an install/download job has no run to
+  // point at, just activeJobProgress's phase/bytes.
+  activeRunId?: string;
+  activeJobProgress?: ActiveJobReport;
+  createdAt: number;
+  updatedAt: number;
+}
+
+// What a worker reports of itself on every heartbeat/queue poll -- replaces
+// the old live `GET /health` + `GET /llama-cpp` + `GET /hardware` fan-out
+// with one self-reported snapshot. Validated and capped server-side (see
+// server/src/validate-worker-state.ts) before being persisted or trusted.
+export interface WorkerStatePush {
+  machine_id: string;
+  capabilities: string[];
+  hostname: string;
+  // The worker's own configured/detected backend (WorkerConfig.backend,
+  // worker/src/index.ts -- explicit override or detectBackend's guess). Not
+  // derivable server-side from `hardware` alone: a box with an NVIDIA GPU
+  // could still be pinned to `cpu`, and this is what `workers.backend`
+  // (schema.sql) actually stores.
+  backend: Backend;
+  hardware: HardwareInfo;
+  installed_builds: InstalledBuild[];
+  model_files: (ModelDirFile & { n_layer?: number | null; mtp_layers?: number | null })[];
+  status: "idle" | "busy";
+}
+
+// Reported alongside a heartbeat while a job is active -- the replacement
+// for the deleted `/models/download/progress` polling route, and for the
+// old worker-side `busy` health flag: this is what actually drives the run
+// page's live phase/progress display now.
+export interface ActiveJobReport {
+  job_id: string;
+  phase: "downloading" | "extracting" | "loading" | "benchmarking" | "finalizing";
+  bytes?: number;
+  total_bytes?: number;
+  item_idx?: number;
+  items_total?: number;
+  detail?: string;
+}
+
+export interface HeartbeatResponse {
+  worker_id: string;
+  control: { cancel_job_ids: string[]; pause: boolean };
+  lease_until: number;
+}
+
+// Multi-user Stage 3 (MULTIUSER_PLAN.md §3.1/§3.4/§3.5) -- RFC 8628-shaped
+// device flow. Shared between server/src/routes/device.ts (producer) and
+// worker/src/vps-client.ts (consumer) so both sides agree on the wire shape.
+export interface DeviceStartResponse {
+  device_code: string;
+  user_code: string;
+  verification_uri: string;
+  interval: number;
+  expires_in: number;
+}
+
+export interface DeviceTokenSuccess {
+  session_token: string;
+  refresh_token: string;
+}
+
+export interface DeviceTokenError {
+  error: "authorization_pending" | "expired_token";
+}
+
+export interface RefreshResponse {
+  session_token: string;
+  refresh_token: string;
+  expires_at: number;
+}
+
+export interface InstallBuildJobPayload {
+  tag: string;
+  asset_name: string;
+  download_url: string;
+}
+
+export interface DownloadModelJobPayload {
+  hf_repo: string;
+  hf_file: string;
+}
+
+export interface BenchmarkJob {
+  run_id: string;
+  model: Model;
+  mtp_model?: Model;
+  // The WHOLE sweep -- the worker loops it (one job per run, MULTIUSER_PLAN.md §1.1).
+  sweep: Omit<SweepConfig, "model_id">;
+  main_gpu?: number;
+  llama_cpp_build: string; // tag; resolved to a path from installed_builds
+  llama_cpp_backend: Backend;
+}
+
+// activate_build/delete_build aren't in the plan's own Appendix A QueueJob
+// union, but WorkerCard.tsx's Activate/Delete build buttons are real,
+// actively-used functionality (not a minor edge feature) -- the worker's
+// inbound HTTP server (the old /llama-cpp/activate, DELETE /llama-cpp/:tag)
+// is gone under the pull model, so these have to become queue jobs like
+// everything else, or the feature silently breaks. Kept minimal on purpose:
+// both payloads are just the tag the worker already knows how to resolve
+// against its own installed-build registry (worker/src/llama-builds.ts).
+export interface ActivateBuildJobPayload {
+  tag: string;
+}
+
+export interface DeleteBuildJobPayload {
+  tag: string;
+}
+
+export type QueueJob =
+  | { job_id: string; type: "benchmark"; payload: BenchmarkJob }
+  | { job_id: string; type: "install_build"; payload: InstallBuildJobPayload }
+  | { job_id: string; type: "activate_build"; payload: ActivateBuildJobPayload }
+  | { job_id: string; type: "delete_build"; payload: DeleteBuildJobPayload }
+  | { job_id: string; type: "download_model"; payload: DownloadModelJobPayload }
+  | { job_id: string; type: "delete_model_file"; payload: { filename: string } };
+
+// --- Multi-user Stage 2: auth (MULTIUSER_PLAN.md §2) ---
+
+// The shape req.user / GET /api/auth/status exposes -- never the raw `users`
+// row (no created_at noise the client doesn't need). isSuperadmin is derived
+// per-request from env + linked identities (§5.1), never a stored/cached
+// column. shareBenchmarks IS exposed (unlike the rest of the raw row) --
+// Settings' own toggle (§5.4) needs to know the caller's current value.
+export interface AuthUser {
+  id: string;
+  displayName: string | null;
+  avatarUrl: string | null;
+  isSuperadmin: boolean;
+  shareBenchmarks: boolean;
+}
+
+export interface AuthStatus {
+  user: AuthUser | null;
+  // Lets the client decide whether to show a login gate at all -- Stage 1
+  // and Stage 2 are independently deployable (MULTIUSER_PLAN.md §2.3), so
+  // these routes exist regardless of AUTH_ENABLED, and `user` alone can't
+  // distinguish "nobody is logged in" from "logins aren't required here."
+  authEnabled: boolean;
+}
+
+// GET /api/sessions -- one row per live session for the caller's own
+// account. token_hash/refresh_hash/prev_refresh_hash never leave the server.
+export interface SessionInfo {
+  id: string;
+  label: string | null;
+  isWorker: boolean;
+  createdAt: number;
+  lastSeenAt: number | null;
+  current: boolean;
+}
+
+// GET /api/auth/identities -- Settings' "Connected accounts" list for the
+// caller's own account (§2.4). provider_user_id is never exposed to the
+// client -- it's an internal key, not display data.
+export interface IdentityInfo {
+  provider: string;
+  providerLogin: string | null;
+  createdAt: number;
+}
+
+// GET /api/device/status?user_code=... -- the browser's own poll while the
+// "Add machine"/"/device" screen (MULTIUSER_PLAN.md §3.1 step 4) waits for a
+// human to look at and approve a code. `machine` is present only in the
+// "pending" state -- there's nothing left to show once approved, and nothing
+// resolved yet for a code that was never issued or already expired.
+export type DeviceStatusResponse =
+  | { state: "not_found" }
+  | { state: "approved" }
+  | { state: "pending"; machine: { hostname: string | null; platform: string | null; arch: string | null; gpu: string | null } };
+
+// Multi-user Stage 5 (MULTIUSER_PLAN.md §5.1) -- the admin surface's own
+// wire shapes, reachable only from the admin origin (supervise.*) by a
+// superadmin-listed identity. Deliberately separate from the main app's
+// Run/Worker types rather than reusing them with optional fields bolted on:
+// this is cross-tenant data (every user's runs, not the caller's own), and a
+// shared shape would risk a field meant only for admin eyes (userDisplayName,
+// workerDisplayName) leaking into a response type the main app also uses.
+export interface AdminStats {
+  users: number;
+  machines: number;
+  runs: number;
+  tests: number;
+  models: number;
+}
+
+export interface AdminRunSummary {
+  id: string;
+  userId: string | null;
+  userDisplayName: string | null;
+  workerId: string | null;
+  workerDisplayName: string | null;
+  modelId: string;
+  modelFilename: string | null;
+  llamaCppBackend: string;
+  status: string;
+  error: string | null;
+  startedAt: number;
+  completedAt: number | null;
+  itemsTotal: number;
+  itemsDone: number;
+  itemsFailed: number;
+}
+
+// GET /api/admin/runs's own filter querystring -- every field optional,
+// unset means "don't filter on this."
+export interface AdminRunFilters {
+  userId?: string;
+  workerId?: string;
+  backend?: string;
+  status?: string;
+}
+
+// GET /api/admin/users
+export interface AdminUserSummary {
+  id: string;
+  displayName: string | null;
+  avatarUrl: string | null;
+  createdAt: number;
+  lastLoginAt: number | null;
+}
+
+// Multi-user Stage 5 (MULTIUSER_PLAN.md §5.4) -- the AI assistant's one
+// cross-tenant read (§5.3). Every row returned by repo.communityRepo already
+// satisfies contributor_count >= 5 (SQL-enforced, see repo.ts) -- there is no
+// field here and no code path that can carry a UUID or per-user identifier.
+export interface CommunityAggregateRow {
+  modelId: string;
+  modelFilename: string | null;
+  backend: string;
+  testType: string;
+  platform: string | null;
+  gpuModel: string | null;
+  contributorCount: number;
+  runCount: number;
+  avgTps: number;
+  avgRamPeakMib: number | null;
+  avgVramPeakMib: number | null;
+}
+
+export interface CommunityAggregateFilters {
+  modelId?: string;
+  backend?: string;
+  platform?: string;
+  gpuModel?: string;
+}
+
+// One (dimension, value) pair that currently clears k=5 on its own -- lets a
+// caller discover valid CommunityAggregateFilters values without being able
+// to fish for one that would turn out to describe fewer than five people
+// (§5.4's own "or it leaks the existence of a single rare GPU").
+export interface CommunityFacetValue {
+  value: string;
+  contributorCount: number;
+}
+
+export interface CommunityFacets {
+  models: (CommunityFacetValue & { modelId: string })[];
+  backends: CommunityFacetValue[];
+  platforms: CommunityFacetValue[];
+  gpuModels: CommunityFacetValue[];
 }
