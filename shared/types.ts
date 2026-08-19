@@ -1024,6 +1024,20 @@ export interface IdentityInfo {
   createdAt: number;
 }
 
+// A candidate machine's `hostname` matches another machine the same user
+// already owns -- surfaced so the approval screen can ask "add it as a new
+// worker anyway?" instead of silently creating an indistinguishable
+// duplicate. This is the common case after a user deletes a worker's install
+// folder and re-runs setup: worker/config.json's machine_id (worker/src/
+// index.ts) is generated once and lives ONLY in that folder, so wiping it
+// makes the next enrolment look like a brand-new machine even though it's
+// the same box -- see server/src/db/repo.ts's workerRepo.findPossibleDuplicate.
+export interface PossibleDuplicateWorker {
+  id: string;
+  displayName: string;
+  lastHeartbeatAt: number | null;
+}
+
 // GET /api/device/status?user_code=... -- the browser's own poll while the
 // "Add machine"/"/device" screen (MULTIUSER_PLAN.md §3.1 step 4) waits for a
 // human to look at and approve a code. `machine` is present only in the
@@ -1032,7 +1046,20 @@ export interface IdentityInfo {
 export type DeviceStatusResponse =
   | { state: "not_found" }
   | { state: "approved" }
-  | { state: "pending"; machine: { hostname: string | null; platform: string | null; arch: string | null; gpu: string | null } };
+  | {
+      state: "pending";
+      machine: { hostname: string | null; platform: string | null; arch: string | null; gpu: string | null };
+      possibleDuplicate: PossibleDuplicateWorker | null;
+    };
+
+// POST /api/device/approve -- normally approves outright. If the candidate
+// machine's hostname matches another machine this user already owns (see
+// PossibleDuplicateWorker above) and the request didn't pass
+// confirm_duplicate, approval is held pending an explicit "yes, add it
+// anyway" from the human instead of silently creating a duplicate.
+export type DeviceApproveResponse =
+  | { ok: true; machine: { hostname: string | null } }
+  | { ok: false; needsConfirmation: true; duplicateOf: PossibleDuplicateWorker };
 
 // Multi-user Stage 5 (MULTIUSER_PLAN.md §5.1) -- the admin surface's own
 // wire shapes, reachable only from the admin origin (supervise.*) by a
