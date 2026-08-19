@@ -140,6 +140,17 @@ export function WorkerCard({ worker, onRefresh }: { worker: Worker; onRefresh: (
     };
   }, [worker.activeRunId]);
 
+  async function handleRemove() {
+    if (
+      !window.confirm(
+        `Remove ${worker.displayName}? This deletes it from the Workers list -- its run history is kept, but if this machine reconnects later it'll need to be re-approved as if it were new.`
+      )
+    ) {
+      return;
+    }
+    await withBusy("remove", () => api.deleteWorker(worker.id).then(() => undefined), "Removed");
+  }
+
   async function withBusy(tag: string, action: () => Promise<void>, doneMsg: string) {
     setBusyTag(tag);
     setMsg("");
@@ -168,9 +179,19 @@ export function WorkerCard({ worker, onRefresh }: { worker: Worker; onRefresh: (
       </div>
 
       {inaccessible && (
-        <p className="mt-3 text-sm text-muted">
-          This machine hasn't checked in recently. It may be offline, asleep, or disconnected.
-        </p>
+        <div className="mt-3 flex flex-wrap items-center justify-between gap-2">
+          <p className="text-sm text-muted">
+            This machine hasn't checked in recently. It may be offline, asleep, or disconnected.
+          </p>
+          <button
+            type="button"
+            onClick={() => void handleRemove()}
+            disabled={busyTag !== null}
+            className="flex-none text-xs font-semibold text-muted hover:text-danger disabled:opacity-50"
+          >
+            {busyTag === "remove" ? "Removing…" : "Remove worker"}
+          </button>
+        </div>
       )}
       <details className="group mt-3 rounded-lg border border-border bg-surface-raised">
         <summary className="flex cursor-pointer items-center justify-between px-2.5 py-1.5 text-xs font-semibold uppercase tracking-wide text-muted">
