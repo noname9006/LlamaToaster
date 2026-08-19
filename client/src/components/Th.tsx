@@ -13,6 +13,10 @@ interface ThProps {
   sort?: SortState | null;
   onSort?: (key: string) => void;
   className?: string;
+  // For a header cell that spans a grouped sub-header row beneath it (see
+  // RunDetail.tsx's RAM/VRAM column group) -- omitted everywhere else, same
+  // as leaving the HTML attribute off entirely.
+  rowSpan?: number;
 }
 
 // One header cell for every sortable/described table in the app (Runs.tsx,
@@ -21,7 +25,7 @@ interface ThProps {
 // `onSort` are plain strings rather than a generic <K> because TSX doesn't
 // support explicit type arguments on JSX tags -- each caller just narrows in
 // its own onSort callback instead.
-export function Th({ label, description, sortKey, sort, onSort, className }: ThProps) {
+export function Th({ label, description, sortKey, sort, onSort, className, rowSpan }: ThProps) {
   const sortable = sortKey !== undefined && !!onSort;
   const active = sortable && sort?.key === sortKey;
   const glyph = active ? (sort!.dir === "asc" ? "▲" : "▼") : "⇅";
@@ -39,7 +43,7 @@ export function Th({ label, description, sortKey, sort, onSort, className }: ThP
   );
 
   return (
-    <th className={`px-3 py-2 font-medium whitespace-nowrap ${className ?? ""}`}>
+    <th rowSpan={rowSpan} className={`px-3 py-2 font-medium whitespace-nowrap ${className ?? ""}`}>
       {description ? <Tooltip text={description}>{content}</Tooltip> : content}
     </th>
   );

@@ -45,6 +45,7 @@ const baseSweep = {
   flash_attn: ["on"],
   mtp: ["off"],
   n_gpu_layers_draft: [0],
+  n_cpu_moe: [0],
   repeats: 1,
 };
 

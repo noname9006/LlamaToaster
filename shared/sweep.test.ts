@@ -14,6 +14,7 @@ const baseSweep: Omit<SweepConfig, "model_id"> = {
   flash_attn: ["on", "off"],
   mtp: ["off"],
   n_gpu_layers_draft: [0],
+  n_cpu_moe: [0],
   repeats: 1,
 };
 

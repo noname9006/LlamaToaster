@@ -11,6 +11,7 @@ import type {
   ModelMetadata,
   ModelDownloadCallbackInput,
   LlamaCppRelease,
+  WorkerVramInfo,
 } from "../../../shared/types.js";
 import { HF_REPO_PATTERN, searchHfGgufModels, listHfGgufFiles, getHfGgufMeta } from "../hf.js";
 
@@ -157,6 +158,21 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
     }
   );
 
+  // Cached free-VRAM reading -- worker/src/index.ts's collectState() reports
+  // this on every idle heartbeat (see shared/types.ts's WorkerVramInfo doc
+  // comment); there's no server->worker proxy to re-probe on demand anymore
+  // (MULTIUSER_PLAN.md §1.11), so this just serves the last-known value.
+  // Consumed by NewRun.tsx's pre-flight VRAM-fit banner (shared/vramEstimate.ts).
+  app.get<{ Params: { id: string } }>("/api/workers/:id/vram", async (request, reply) => {
+    const worker = repo.workerRepo.getWorker(request.params.id);
+    if (!worker) return reply.code(404).send({ error: "unknown machine" });
+    assertOwnsWorker(resolveAuthUser(request)?.user.id, worker.id);
+    if (!worker.vram) {
+      return reply.code(409).send({ error: "no VRAM reading from this machine yet" });
+    }
+    return worker.vram as WorkerVramInfo;
+  });
+
   app.get<{ Querystring: { q?: string } }>("/api/hf/search", async (request, reply) => {
     const q = (request.query.q ?? "").trim();
     if (!q) return { results: [] as HfRepoSearchResult[] };
@@ -219,7 +235,8 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
         app.log.warn({ error: validationError }, "model download callback rejected: invalid payload");
         return reply.code(400).send({ error: validationError });
       }
-      const { worker, hf_repo, hf_file, ok, error, sha256, size_bytes, n_layer, mtp_layers } = request.body;
+      const { worker, hf_repo, hf_file, ok, error, sha256, size_bytes, n_layer, mtp_layers, expert_count } =
+        request.body;
       if (!ok) {
         app.log.error({ worker, hf_repo, hf_file, error }, "model download failed");
         return reply.code(200).send({ ok: true });
@@ -237,12 +254,23 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
           ...(typeof n_layer === "number" ? { n_layer } : {}),
           ...(typeof param_count === "number" ? { param_count } : {}),
           ...(typeof mtp_layers === "number" && mtp_layers > 0 ? { mtp_layers } : {}),
+          ...(typeof expert_count === "number" && expert_count > 0 ? { expert_count } : {}),
         };
         if (isMtpDraftModel({ metadata, hf_file, filename: hf_file })) {
           metadata.mtp_role = "draft";
         }
         app.log.info(
-          { worker, hf_repo, hf_file, size_bytes, n_layer, param_count, mtp_layers, mtp_role: metadata.mtp_role },
+          {
+            worker,
+            hf_repo,
+            hf_file,
+            size_bytes,
+            n_layer,
+            param_count,
+            mtp_layers,
+            expert_count,
+            mtp_role: metadata.mtp_role,
+          },
           "model download complete"
         );
         repo.registerModel({
