@@ -22,6 +22,7 @@ import { runBench, matchOffloadLine, type BenchResult, type OffloadResult } from
 import { runServerBench } from "./serverBench.js";
 import { MemorySampler, captureFreeMemoryBaseline, type SampleStats, type FreeMemoryBaseline } from "./sampler.js";
 import { readGpuMemory } from "./vram.js";
+import { estimateVramNeededMib, isVramDiscrepancy } from "../../shared/vramEstimate.js";
 import {
   writeRawJson,
   postRunItemUpdate,
@@ -66,6 +67,7 @@ import {
   type ActivateBuildJobPayload,
   type DeleteBuildJobPayload,
   type DownloadModelJobPayload,
+  type WorkerVramInfo,
 } from "../../shared/types.js";
 import { expandSweep, deriveTestType, type SweepItem } from "../../shared/sweep.js";
 
@@ -555,7 +557,20 @@ function toInstalledBuildList(): InstalledBuild[] {
 // executeDownloadModelJob) -- this per-file list is only consulted as a
 // fallback for models registered another way, and for those it correctly
 // reports "unknown" rather than paying that cost on every heartbeat.
-function collectState(): WorkerStatePush {
+//
+// vram is read fresh here too (see shared/types.ts's WorkerVramInfo doc
+// comment) -- there's no more server->worker proxy to serve NewRun.tsx's
+// pre-flight VRAM-fit banner on demand (MULTIUSER_PLAN.md §1.11), so this
+// heartbeat is the only place that reading happens. Skipped entirely while
+// busy: not meaningful for pre-flight fit-checking against a machine that's
+// already running something, and avoids a second concurrent readGpuMemory
+// call alongside MemorySampler's own (see captureFreeMemoryBaseline).
+async function collectState(): Promise<WorkerStatePush> {
+  const vram = busy
+    ? undefined
+    : await captureFreeMemoryBaseline(backend)
+        .then((baseline): WorkerVramInfo => ({ ok: true, backend, ...baseline }))
+        .catch(() => null);
   return {
     machine_id: config.machine_id!,
     capabilities: ["benchmark"],
@@ -565,6 +580,7 @@ function collectState(): WorkerStatePush {
     installed_builds: toInstalledBuildList(),
     model_files: modelDirFilesCache,
     status: busy ? "busy" : "idle",
+    vram,
   };
 }
 
@@ -666,6 +682,10 @@ interface RunSweepItemInput {
   item: SweepItem;
   repeats: number;
   modelPath: string;
+  // On-disk byte size of the model at modelPath -- forwarded to
+  // finalizeSweepItemResult's VRAM-discrepancy check (see
+  // shared/vramEstimate.ts), not used for anything else here.
+  modelSizeBytes: number;
   llamaBenchPath: string;
   backend: Backend;
   // See shared/types.ts's RunConfig.main_gpu -- forwarded to bench.ts's
@@ -950,13 +970,42 @@ async function finalizeSweepItemResult(
   bench: BenchResult,
   stats: SampleStats,
   baseline: FreeMemoryBaseline,
-  mainGpu: number | undefined
+  mainGpu: number | undefined,
+  modelSizeBytes: number
 ): Promise<TerminalRunItemStatus> {
   // Read from llama.cpp's own runtime output (see bench.ts's
   // parseOffloadLayers) -- both null when the line was never seen at all
   // (item failed before model load finished, or a build too old to support
   // the required verbosity flag).
   const offload: OffloadResult = bench.offload ?? { main: null, draft: null };
+  // llama.cpp's own "offloaded X/Y layers to GPU" line only ever reflects
+  // buffer *assignment*, never actual VRAM residency (see
+  // shared/vramEstimate.ts's top comment) -- so a claimed-full offload with
+  // an implausibly low observed vram_peak_mib means the model likely never
+  // really left system RAM (Windows CUDA sysmem fallback), regardless of
+  // what llama.cpp itself believes happened. Only checked once there's
+  // something real to compare: a positive offload claim and an actual VRAM
+  // sample (both null/0 on a cpu-backend or -ngl 0 run -- nothing to flag).
+  // Also skipped whenever item.n_cpu_moe > 0: a deliberate partial MoE-to-CPU
+  // placement *correctly* produces lower VRAM than this estimate expects
+  // (that's the whole point of --n-cpu-moe, see shared/sweep.ts's
+  // SweepItem.n_cpu_moe) -- without this guard, every legitimate cpu-moe run
+  // would false-positive against the exact warning built to catch the
+  // opposite problem.
+  let vramDiscrepancyWarning: string | undefined;
+  if (item.n_cpu_moe === 0 && offload.main && offload.main.gpu_layers_loaded > 0 && stats.vram_peak_mib != null) {
+    const estimatedMib = estimateVramNeededMib({
+      modelSizeBytes,
+      totalModelLayers: offload.main.total_model_layers,
+      requestedNgl: offload.main.gpu_layers_loaded,
+    });
+    if (estimatedMib != null && isVramDiscrepancy(estimatedMib, stats.vram_peak_mib)) {
+      vramDiscrepancyWarning =
+        `claimed offload ${offload.main.gpu_layers_loaded}/${offload.main.total_model_layers} layers to GPU ` +
+        `(~${estimatedMib}MiB expected) but observed VRAM peaked at only ${stats.vram_peak_mib}MiB -- likely ` +
+        `silently running from system RAM (Windows CUDA sysmem fallback), not actual GPU offload`;
+    }
+  }
   if (bench.code === 0 && bench.results.length > 0) {
     // A single sweep item with both n_prompt and n_gen set (and no -pg)
     // produces two rows -- a pp-only row and a tg-only row -- both kept here
@@ -1002,18 +1051,21 @@ async function finalizeSweepItemResult(
     const specLine = formatSpecDecodeLine(results);
     if (specLine) summaryLines.push(`  ${specLine}`);
     log.info(summaryLines.join("\n"));
-    // bench.warning (only ever set by the llama-server/MTP path) flags a
-    // successful item that still had some readings rejected as implausible
-    // -- surfaced via the same `error` field a failed item uses, since
-    // recordRunItemTerminal stores it unconditionally regardless of status,
-    // and RunDetail.tsx already prefers item.error over the normal detail
-    // text for any status. Without this, a "done" item with a silently
-    // dropped tg reading (the original bug report) looked identical to a
-    // clean run.
-    if (bench.warning) log.warn(`${label} completed with warnings: ${bench.warning}`);
+    // bench.warning (previously only ever set by the llama-server/MTP path,
+    // e.g. a reading rejected as implausible) and vramDiscrepancyWarning
+    // above (either path -- computed once, up front, from data both engines
+    // already produce) are combined here into one string -- surfaced via the
+    // same `error` field a failed item uses, since recordRunItemTerminal
+    // stores it unconditionally regardless of status, and RunDetail.tsx
+    // already prefers item.error over the normal detail text for any status.
+    // Without this, a "done" item with a silently dropped tg reading (the
+    // original MTP bug report) or a silently-not-really-offloaded model (the
+    // sysmem-fallback bug report) both looked identical to a clean run.
+    const combinedWarning = [bench.warning, vramDiscrepancyWarning].filter(Boolean).join(" | ") || undefined;
+    if (combinedWarning) log.warn(`${label} completed with warnings: ${combinedWarning}`);
     await safeItemTerminal(runId, item.idx, {
       status: "done",
-      error: bench.warning,
+      error: combinedWarning,
       ram_peak_mib: stats.ram_peak_mib,
       vram_peak_mib: stats.vram_peak_mib,
       ram_avg_mib: stats.ram_avg_mib,
@@ -1226,7 +1278,17 @@ async function runSweepItem(input: RunSweepItemInput): Promise<TerminalRunItemSt
       stderr: bench.stderr,
     });
     logDiagnosticOutput(label, "llama-bench", bench.stderr);
-    const result = await finalizeSweepItemResult(runId, item, label, "llama-bench", bench, stats, baseline, input.mainGpu);
+    const result = await finalizeSweepItemResult(
+      runId,
+      item,
+      label,
+      "llama-bench",
+      bench,
+      stats,
+      baseline,
+      input.mainGpu,
+      input.modelSizeBytes
+    );
     // Printed last (after the TEST SUMMARY block above, whatever this item's
     // outcome) so anyone reading the log -- including a stopped/cancelled
     // item, which still reaches this same path -- has the exact file with
@@ -1258,6 +1320,8 @@ interface RunSweepItemViaServerInput {
   item: SweepItem;
   repeats: number;
   modelPath: string;
+  // See RunSweepItemInput.modelSizeBytes above -- same purpose.
+  modelSizeBytes: number;
   mtpModelPath: string | undefined;
   llamaServerPath: string;
   port: number;
@@ -1331,7 +1395,17 @@ async function runSweepItemViaServer(input: RunSweepItemViaServerInput): Promise
       stderr: bench.stderr,
     });
     logDiagnosticOutput(label, "llama-server", bench.stderr);
-    const result = await finalizeSweepItemResult(runId, item, label, "llama-server", bench, stats, baseline, input.mainGpu);
+    const result = await finalizeSweepItemResult(
+      runId,
+      item,
+      label,
+      "llama-server",
+      bench,
+      stats,
+      baseline,
+      input.mainGpu,
+      input.modelSizeBytes
+    );
     // See runSweepItem's identical line above -- same reasoning, same
     // "always printed last, cancelled included" behavior.
     log.info(`${label}: debug log: ${rawJsonPath}`);
@@ -1484,6 +1558,7 @@ async function executeBenchmarkJob(payload: BenchmarkJob): Promise<void> {
             mainGpu: payload.main_gpu,
             timeoutMs: config.bench_timeout_ms,
             rawJsonDir: rawDir,
+            modelSizeBytes: payload.model.size_bytes,
           })
         );
       } else {
@@ -1499,6 +1574,7 @@ async function executeBenchmarkJob(payload: BenchmarkJob): Promise<void> {
             timeoutMs: config.bench_timeout_ms,
             vpsUrl: config.vps_url,
             rawJsonDir: rawDir,
+            modelSizeBytes: payload.model.size_bytes,
           })
         );
       }
@@ -1589,9 +1665,10 @@ async function executeDownloadModelJob(payload: DownloadModelJobPayload): Promis
     log.info(`downloaded ${progressKey}: ${hasher.byteLength}B in ${elapsedMs}ms`);
 
     updateJobReport({ phase: "finalizing", detail: "reading GGUF metadata" });
-    const { n_layer, mtp_layers } = await readGgufInfo(target);
+    const { n_layer, mtp_layers, expert_count } = await readGgufInfo(target);
     log.info(
-      `gguf metadata for ${progressKey}: n_layer=${n_layer ?? "unknown"} mtp_layers=${mtp_layers ?? "unknown"}`
+      `gguf metadata for ${progressKey}: n_layer=${n_layer ?? "unknown"} mtp_layers=${mtp_layers ?? "unknown"} ` +
+        `expert_count=${expert_count ?? "unknown"}`
     );
 
     // Reflect the new file immediately rather than waiting for the periodic
@@ -1607,6 +1684,7 @@ async function executeDownloadModelJob(payload: DownloadModelJobPayload): Promis
       size_bytes: hasher.byteLength,
       n_layer,
       mtp_layers,
+      expert_count,
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -1802,7 +1880,7 @@ const HEARTBEAT_INTERVAL_MS = 10_000;
 function startHeartbeatLoop(): void {
   setInterval(async () => {
     try {
-      const state = collectState();
+      const state = await collectState();
       const res = await withAuth((token) => postHeartbeat(config.vps_url, token, state, currentJobReport, 10_000));
       for (const jobId of res.control.cancel_job_ids) requestStop(jobId);
       pauseRequested = res.control.pause;
@@ -1827,7 +1905,8 @@ const QUEUE_POLL_TIMEOUT_MS = 35_000;
 async function workerMain(): Promise<void> {
   while (true) {
     try {
-      const job = await withAuth((token) => pollQueue(config.vps_url, token, collectState(), QUEUE_POLL_TIMEOUT_MS));
+      const state = await collectState();
+      const job = await withAuth((token) => pollQueue(config.vps_url, token, state, QUEUE_POLL_TIMEOUT_MS));
       if (!job) continue;
 
       busy = true;

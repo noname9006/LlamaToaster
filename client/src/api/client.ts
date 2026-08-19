@@ -7,6 +7,7 @@ import {
   type RunItem,
   type TriggerPayload,
   type Worker,
+  type WorkerVramInfo,
   type HfRepoSearchResult,
   type HfFileEntry,
   type LlamaCppRelease,
@@ -131,6 +132,12 @@ export const api = {
       `/api/workers/${encodeURIComponent(workerId)}/llama-cpp/install`,
       postJson({ tag, asset_name: assetName })
     ),
+
+  // Cached free-VRAM reading (last heartbeat, not a live proxy call -- see
+  // shared/types.ts's WorkerVramInfo doc comment), for NewRun.tsx's
+  // pre-flight VRAM-fit banner (see shared/vramEstimate.ts).
+  getWorkerVram: (workerId: string): Promise<WorkerVramInfo> =>
+    request<WorkerVramInfo>(`/api/workers/${encodeURIComponent(workerId)}/vram`),
 
   activateBuild: (workerId: string, tag: string): Promise<{ ok: true; queued: true }> =>
     request(`/api/workers/${encodeURIComponent(workerId)}/llama-cpp/activate`, postJson({ tag })),
