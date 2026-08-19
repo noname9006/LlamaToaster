@@ -1,54 +1,37 @@
 import { useCallback, useEffect, useState } from "react";
-import { api, ApiError, type WorkerListEntry } from "./client";
-import type { WorkerLlamaCppInfo } from "../types";
+import { api } from "./client";
+import type { Worker } from "../types";
 
-export interface WorkerStatus {
-  worker: WorkerListEntry;
-  loading: boolean;
-  info?: WorkerLlamaCppInfo;
-  error?: string;
-  inaccessible: boolean;
-}
-
-// Shared by the Dashboard (compact per-worker chips) and the Workers page
-// (full cards) so both read the same reachability signal the same way,
-// rather than each page reimplementing its own fetch-and-classify logic.
+// Shared by the Dashboard (compact per-machine chips) and the Workers page
+// (full cards) so both read the same machine list the same way. One
+// GET /api/workers read carries everything -- hardware, installed builds,
+// derived status, and (while a job is active) its run id / live progress --
+// no more separate per-worker fetch (MULTIUSER_PLAN.md §1.16).
 export function useWorkerStatuses() {
-  const [status, setStatus] = useState<Record<string, WorkerStatus>>({});
-  const [order, setOrder] = useState<string[]>([]);
+  const [workers, setWorkers] = useState<Worker[]>([]);
   const [loaded, setLoaded] = useState(false);
 
-  const refresh = useCallback(async (worker: WorkerListEntry) => {
-    setStatus((s) => ({
-      ...s,
-      [worker.name]: { ...s[worker.name], worker, loading: true, inaccessible: false },
-    }));
-    try {
-      const info = await api.getWorkerLlamaCpp(worker.name);
-      setStatus((s) => ({ ...s, [worker.name]: { worker, loading: false, info, inaccessible: false } }));
-    } catch (err) {
-      const inaccessible = err instanceof ApiError && err.inaccessible;
-      const message = err instanceof Error ? err.message : String(err);
-      setStatus((s) => ({ ...s, [worker.name]: { worker, loading: false, error: message, inaccessible } }));
-    }
+  const refresh = useCallback(async () => {
+    const list = await api.listWorkers();
+    setWorkers(list);
+    setLoaded(true);
   }, []);
 
   useEffect(() => {
     let cancelled = false;
     (async () => {
-      const workers = await api.listWorkers();
+      const list = await api.listWorkers();
       if (cancelled) return;
-      setOrder(workers.map((w) => w.name));
-      setStatus(
-        Object.fromEntries(workers.map((w) => [w.name, { worker: w, loading: true, inaccessible: false }]))
-      );
+      setWorkers(list);
       setLoaded(true);
-      await Promise.all(workers.map((w) => refresh(w)));
     })();
     return () => {
       cancelled = true;
     };
-  }, [refresh]);
+  }, []);
 
-  return { order, status, loaded, refresh };
+  const order = workers.map((w) => w.id);
+  const status = Object.fromEntries(workers.map((w) => [w.id, w]));
+
+  return { order, status, workers, loaded, refresh };
 }

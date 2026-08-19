@@ -5,20 +5,20 @@
 #
 # Usage from a totally fresh machine (only PowerShell needed -- Node.js is
 # installed automatically via winget if missing; git is used if present,
-# otherwise falls back to a plain zip download).
+# otherwise falls back to a plain zip download). -VpsUrl is required.
 # Omit -Dir and it'll ask -- lists your local drives with free space (models
 # are often tens of GB each) and asks which one, then a folder name:
 #
-#   iex "& { $(irm https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.ps1) }"
+#   iex "& { $(irm https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.ps1) } -VpsUrl https://llamatoaster.com"
 #
 # Pass -Dir to skip the prompts (e.g. for unattended/scripted use):
 #
-#   iex "& { $(irm https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.ps1) } -Dir F:\LlamaToaster"
+#   iex "& { $(irm https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.ps1) } -VpsUrl https://llamatoaster.com -Dir F:\LlamaToaster"
 #
 # Or download it first and run locally:
 #
 #   irm https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.ps1 -OutFile bootstrap.ps1
-#   .\bootstrap.ps1
+#   .\bootstrap.ps1 -VpsUrl https://llamatoaster.com
 #
 # Safe to re-run: if $Dir is already a git checkout, it's updated in place
 # (git fetch + reset --hard to latest $Branch) instead of re-cloning;
@@ -26,11 +26,13 @@
 # if one already exists). So the same command works for first setup, picking
 # up code updates, and every plain restart after. If $Dir exists with
 # unrelated files in it (no .git), you'll be asked to confirm before repo
-# files get synced in on top.
+# files get synced in on top. To re-approve a machine whose session was
+# revoked, add -Reconnect (needs an existing -Dir checkout with a
+# config.json already in it).
 #
 # All setup-worker.ps1 overrides are forwarded -- see that script's own
-# header for what each one does: -WorkerName -Backend -VpsUrl -BindHost
-# -Port -Force. Plus one bootstrap-only option:
+# header for what each one does: -WorkerName -Backend -VpsUrl -Reconnect
+# -Force -AllowInsecureUrl. Plus one bootstrap-only option:
 #   -Branch <name>   git branch/ref to fetch, default "main"
 
 param(
@@ -38,13 +40,21 @@ param(
     [string]$Branch = "main",
     [string]$WorkerName = "Local",
     [string]$Backend,
-    [string]$VpsUrl = "http://100.122.1.111:4010",
-    [string]$BindHost,
-    [int]$Port = 8080,
-    [switch]$Force
+    [string]$VpsUrl,
+    [switch]$Reconnect,
+    [switch]$Force,
+    [switch]$AllowInsecureUrl
 )
 
 $ErrorActionPreference = "Stop"
+
+# Not required for -Reconnect: it only clears the session fields in an
+# EXISTING config.json, which already has its own vps_url saved.
+if (-not $VpsUrl -and -not $Reconnect) {
+    Write-Error "-VpsUrl is required, e.g. -VpsUrl https://llamatoaster.com"
+    exit 1
+}
+
 $RepoUrl = "https://github.com/noname9006/LlamaToaster.git"
 $RepoOwnerSlash = "noname9006/LlamaToaster"
 
@@ -226,9 +236,11 @@ if ($installExit -ne 0) {
     exit 1
 }
 
-$setupArgs = @{ Dir = $Dir; WorkerName = $WorkerName; VpsUrl = $VpsUrl; Port = $Port }
+$setupArgs = @{ Dir = $Dir; WorkerName = $WorkerName }
+if ($VpsUrl) { $setupArgs.VpsUrl = $VpsUrl }
 if ($Backend) { $setupArgs.Backend = $Backend }
-if ($BindHost) { $setupArgs.BindHost = $BindHost }
 if ($Force) { $setupArgs.Force = $true }
+if ($Reconnect) { $setupArgs.Reconnect = $true }
+if ($AllowInsecureUrl) { $setupArgs.AllowInsecureUrl = $true }
 
 & (Join-Path $Dir "worker\setup-worker.ps1") @setupArgs

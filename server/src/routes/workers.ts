@@ -1,25 +1,20 @@
 import type { FastifyInstance } from "fastify";
-import { listWorkers } from "../config.js";
 import { repo } from "../db/repo.js";
+import { queueEvents } from "../queue-events.js";
 import { getReleases, filterReleasesForWorker } from "../github-releases.js";
-import { describeWorkerError, WORKER_INACCESSIBLE_MESSAGE } from "../worker-errors.js";
-import { isRecentlyUnreachable, markReachable, markUnreachable } from "../worker-reachability.js";
+import { BadRequestError, ConflictError, NotFoundError } from "../errors.js";
+import { resolveAuthUser, assertOwnsWorker } from "../auth-middleware.js";
 import { isMtpDraftModel } from "../../../shared/types.js";
 import type {
-  WorkerLlamaCppInfo,
-  InstalledBuild,
-  HardwareInfo,
   HfRepoSearchResult,
   HfFileEntry,
-  DownloadProgress,
-  WorkerCurrentRun,
   ModelMetadata,
   ModelDownloadCallbackInput,
+  LlamaCppRelease,
 } from "../../../shared/types.js";
 import { HF_REPO_PATTERN, searchHfGgufModels, listHfGgufFiles, getHfGgufMeta } from "../hf.js";
 
 const WORKER_READ_TIMEOUT_MS = 5_000;
-const WORKER_INSTALL_TIMEOUT_MS = 10 * 60 * 1000;
 
 function validateModelDownloadCallback(payload: unknown): string | null {
   if (!payload || typeof payload !== "object") return "payload must be an object";
@@ -37,294 +32,128 @@ function validateModelDownloadCallback(payload: unknown): string | null {
   return null;
 }
 
-async function findWorker(name: string) {
-  return (await listWorkers()).find((w) => w.name === name);
-}
-
-async function fetchWorker(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
-  return fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
+// Every route below that used to proxy an HTTP call to a worker now just
+// enqueues a job and returns 202 -- there is no more outbound HTTP to
+// workers anywhere in the server (MULTIUSER_PLAN.md §1.11). Rejecting an
+// offline machine up front (same policy as /api/runs/trigger) gives the user
+// immediate, clear feedback instead of a job that silently sits in the
+// queue until the machine happens to reconnect.
+//
+// Multi-user Stage 4 (MULTIUSER_PLAN.md §4.4): also the ownership gate for
+// every action route below -- existence (404) is always checked before
+// ownership (403), and ownership before the offline check (409), so an
+// unauthorized caller never learns whether someone else's machine happens to
+// be online.
+function requireOnlineWorker(userId: string | undefined, id: string) {
+  const worker = repo.workerRepo.getWorker(id);
+  if (!worker) throw new NotFoundError("unknown machine");
+  assertOwnsWorker(userId, worker.id);
+  if (worker.status === "offline") {
+    throw new ConflictError("that machine is offline -- start the worker and try again");
+  }
+  return worker;
 }
 
 export async function workersRoutes(app: FastifyInstance): Promise<void> {
-  app.get("/api/workers", async () => {
-    const list = await listWorkers();
-    return {
-      workers: list.map((w) => ({
-        name: w.name,
-        backend: w.backend,
-        llama_cpp_build: w.llama_cpp_build,
-        is_self: w.is_self,
-      })),
-    };
+  // One DB read of every machine's cached last-reported state -- no live
+  // per-worker fan-out. Replaces the old Tailscale-discovery listing AND the
+  // per-worker GET /api/workers/:name/llama-cpp fetch it used to require
+  // (MULTIUSER_PLAN.md §1.16): hardware/installed builds/model files/status
+  // are all already here.
+  //
+  // Multi-user Stage 4 (MULTIUSER_PLAN.md §4.3/§4.4): scoped to the caller's
+  // own machines once authenticated -- every machine in single-tenant mode
+  // (AUTH_ENABLED off), unchanged from before this scoping existed.
+  app.get("/api/workers", async (request) => {
+    const authed = resolveAuthUser(request);
+    return { workers: authed ? repo.workerRepo.listWorkersForUser(authed.user.id) : repo.workerRepo.listWorkers() };
   });
 
-  app.get<{ Params: { name: string } }>(
-    "/api/workers/:name/llama-cpp",
-    async (request, reply) => {
-      const worker = await findWorker(request.params.name);
-      if (!worker) return reply.code(404).send({ error: "unknown worker" });
-      if (isRecentlyUnreachable(worker.url)) {
-        return reply.code(502).send({ error: WORKER_INACCESSIBLE_MESSAGE });
-      }
-
-      let workerInfo: {
-        platform: string;
-        arch: string;
-        backend: string;
-        installed: InstalledBuild[];
-        active_tag: string | null;
-      };
-      try {
-        const res = await fetchWorker(`${worker.url}/llama-cpp`, {}, WORKER_READ_TIMEOUT_MS);
-        if (!res.ok) throw new Error(`worker responded ${res.status}`);
-        workerInfo = (await res.json()) as typeof workerInfo;
-        markReachable(worker.url);
-      } catch (err) {
-        markUnreachable(worker.url);
-        return reply.code(502).send({ error: describeWorkerError(err) });
-      }
-
-      // Best-effort and fetched in parallel with the releases lookup below --
-      // this is diagnostic detail (what CPU/GPU the worker actually has), not
-      // something the "available" list's filtering depends on, so a worker
-      // that's slow or doesn't have this endpoint yet shouldn't block the
-      // rest of the response.
-      let hardware: HardwareInfo | undefined;
-      const hardwarePromise = fetchWorker(`${worker.url}/hardware`, {}, WORKER_READ_TIMEOUT_MS)
-        .then((res) => (res.ok ? (res.json() as Promise<HardwareInfo>) : undefined))
-        .catch(() => undefined);
-
-      // Same best-effort story: lets the Workers page/dashboard show what a
-      // worker is currently busy with without a separate round trip, but a
-      // worker that's slow or predates /health's current_run field shouldn't
-      // block the rest of this response either.
-      let health: { busy: boolean; current_run: WorkerCurrentRun | null } | undefined;
-      const healthPromise = fetchWorker(`${worker.url}/health`, {}, WORKER_READ_TIMEOUT_MS)
-        .then((res) => (res.ok ? (res.json() as Promise<typeof health>) : undefined))
-        .catch(() => undefined);
-
-      let available: WorkerLlamaCppInfo["available"] = [];
-      try {
-        const releases = await getReleases();
-        available = filterReleasesForWorker(releases, workerInfo.platform, workerInfo.arch, workerInfo.backend);
-      } catch (err) {
-        // GitHub being unreachable shouldn't block viewing installed builds --
-        // just report an empty "installable" list.
-        app.log.warn(`github releases fetch failed: ${err instanceof Error ? err.message : err}`);
-      }
-
-      const latestTag = available[0]?.tag;
-      const updateAvailable = Boolean(
-        latestTag && latestTag !== workerInfo.active_tag && !workerInfo.installed.some((b) => b.tag === latestTag)
-      );
-      hardware = await hardwarePromise;
-      health = await healthPromise;
-
-      const info: WorkerLlamaCppInfo = {
-        worker_name: worker.name,
-        platform: workerInfo.platform,
-        arch: workerInfo.arch,
-        backend: workerInfo.backend,
-        installed: workerInfo.installed,
-        active_tag: workerInfo.active_tag,
-        available,
-        update_available: updateAvailable,
-        hardware,
-        busy: health?.busy,
-        current_run: health?.current_run,
-      };
-      return info;
+  // Which llama.cpp releases this specific machine could install (filtered
+  // by its own reported platform/arch/backend) and whether a newer one than
+  // whatever it has installed exists -- the one piece of the old per-worker
+  // GET /api/workers/:name/llama-cpp response that couldn't just move onto
+  // the Worker object itself, since it depends on a live GitHub lookup
+  // (cached 5 minutes, see github-releases.ts) rather than anything the
+  // worker reports about itself.
+  app.get<{ Params: { id: string } }>("/api/workers/:id/available-builds", async (request, reply) => {
+    const worker = repo.workerRepo.getWorker(request.params.id);
+    if (!worker) return reply.code(404).send({ error: "unknown machine" });
+    assertOwnsWorker(resolveAuthUser(request)?.user.id, worker.id);
+    if (!worker.platform || !worker.arch || !worker.backend) {
+      return { available: [] as LlamaCppRelease[], update_available: false };
     }
-  );
+    let available: LlamaCppRelease[] = [];
+    try {
+      const releases = await getReleases();
+      available = filterReleasesForWorker(releases, worker.platform, worker.arch, worker.backend);
+    } catch (err) {
+      // GitHub being unreachable shouldn't block viewing installed builds --
+      // just report an empty "installable" list.
+      app.log.warn(`github releases fetch failed: ${err instanceof Error ? err.message : err}`);
+    }
+    const latestTag = available.find((r) => r.assets.length > 0)?.tag;
+    const activeTag = worker.installedBuilds.find((b) => b.active)?.tag;
+    const updateAvailable = Boolean(
+      latestTag && latestTag !== activeTag && !worker.installedBuilds.some((b) => b.tag === latestTag)
+    );
+    return { available, update_available: updateAvailable };
+  });
 
-  app.post<{ Params: { name: string }; Body: { tag?: string; asset_name?: string } }>(
-    "/api/workers/:name/llama-cpp/install",
+  app.post<{ Params: { id: string }; Body: { tag?: string; asset_name?: string; download_url?: string } }>(
+    "/api/workers/:id/llama-cpp/install",
     async (request, reply) => {
-      const worker = await findWorker(request.params.name);
-      if (!worker) return reply.code(404).send({ error: "unknown worker" });
+      const worker = requireOnlineWorker(resolveAuthUser(request)?.user.id, request.params.id);
       const { tag, asset_name } = request.body ?? {};
-      if (!tag || !asset_name) {
-        return reply.code(400).send({ error: "tag and asset_name are required" });
-      }
+      if (!tag || !asset_name) throw new BadRequestError("tag and asset_name are required");
 
       // Resolve the download URL server-side from the cached GitHub data --
       // never take a URL straight from the request body. The worker will
       // download, extract, and eventually exec whatever's at that URL, so
-      // the orchestrator only ever hands it a URL it fetched from GitHub
-      // itself for this exact tag/asset pair.
-      let downloadUrl: string | undefined;
-      try {
-        const releases = await getReleases();
-        const release = releases.find((r) => r.tag === tag);
-        downloadUrl = release?.assets.find((a) => a.name === asset_name)?.download_url;
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        return reply.code(502).send({ error: `could not fetch release info: ${message}` });
-      }
-      if (!downloadUrl) {
-        return reply.code(400).send({ error: `no matching asset ${asset_name} for tag ${tag}` });
-      }
+      // it only ever gets a URL this server fetched from GitHub itself for
+      // this exact tag/asset pair.
+      const releases = await getReleases();
+      const release = releases.find((r) => r.tag === tag);
+      const downloadUrl = release?.assets.find((a) => a.name === asset_name)?.download_url;
+      if (!downloadUrl) throw new BadRequestError(`no matching asset ${asset_name} for tag ${tag}`);
 
-      request.log.info({ worker: worker.name, tag, asset_name }, "llama-cpp install requested");
-      try {
-        const res = await fetchWorker(
-          `${worker.url}/llama-cpp/install`,
-          {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({ tag, asset_name, download_url: downloadUrl }),
-          },
-          WORKER_INSTALL_TIMEOUT_MS
-        );
-        const data = await res.json();
-        return reply.code(res.status).send(data);
-      } catch (err) {
-        return reply.code(502).send({ error: describeWorkerError(err) });
-      }
+      request.log.info({ worker: worker.id, tag, asset_name }, "llama-cpp install queued");
+      repo.queueRepo.enqueueJob(worker.id, {
+        type: "install_build",
+        payload: { tag, asset_name, download_url: downloadUrl },
+      });
+      queueEvents.emit(worker.id);
+      return reply.code(202).send({ ok: true, queued: true });
     }
   );
 
-  app.post<{ Params: { name: string }; Body: { tag?: string } }>(
-    "/api/workers/:name/llama-cpp/activate",
+  app.post<{ Params: { id: string }; Body: { tag?: string } }>(
+    "/api/workers/:id/llama-cpp/activate",
     async (request, reply) => {
-      const worker = await findWorker(request.params.name);
-      if (!worker) return reply.code(404).send({ error: "unknown worker" });
-      if (!request.body?.tag) return reply.code(400).send({ error: "tag is required" });
-      try {
-        const res = await fetchWorker(
-          `${worker.url}/llama-cpp/activate`,
-          {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({ tag: request.body.tag }),
-          },
-          WORKER_READ_TIMEOUT_MS
-        );
-        const data = await res.json();
-        return reply.code(res.status).send(data);
-      } catch (err) {
-        return reply.code(502).send({ error: describeWorkerError(err) });
-      }
+      const worker = requireOnlineWorker(resolveAuthUser(request)?.user.id, request.params.id);
+      if (!request.body?.tag) throw new BadRequestError("tag is required");
+      repo.queueRepo.enqueueJob(worker.id, { type: "activate_build", payload: { tag: request.body.tag } });
+      queueEvents.emit(worker.id);
+      return reply.code(202).send({ ok: true, queued: true });
     }
   );
 
-  // Pause/resume/stop a worker's in-flight run -- thin proxies to the
-  // worker's own /run/pause, /run/resume, /run/stop (worker/src/index.ts).
-  // A worker only ever runs one benchmark at a time, so these target the
-  // worker itself rather than a specific run id; the worker 409s if it
-  // isn't actually busy.
-  app.post<{ Params: { name: string } }>("/api/workers/:name/pause", async (request, reply) => {
-    const worker = await findWorker(request.params.name);
-    if (!worker) return reply.code(404).send({ error: "unknown worker" });
-    try {
-      const res = await fetchWorker(`${worker.url}/run/pause`, { method: "POST" }, WORKER_READ_TIMEOUT_MS);
-      const data = await res.json();
-      return reply.code(res.status).send(data);
-    } catch (err) {
-      return reply.code(502).send({ error: describeWorkerError(err) });
-    }
+  app.delete<{ Params: { id: string; tag: string } }>("/api/workers/:id/llama-cpp/:tag", async (request, reply) => {
+    const worker = requireOnlineWorker(resolveAuthUser(request)?.user.id, request.params.id);
+    repo.queueRepo.enqueueJob(worker.id, { type: "delete_build", payload: { tag: request.params.tag } });
+    queueEvents.emit(worker.id);
+    return reply.code(202).send({ ok: true, queued: true });
   });
 
-  app.post<{ Params: { name: string } }>("/api/workers/:name/resume", async (request, reply) => {
-    const worker = await findWorker(request.params.name);
-    if (!worker) return reply.code(404).send({ error: "unknown worker" });
-    try {
-      const res = await fetchWorker(`${worker.url}/run/resume`, { method: "POST" }, WORKER_READ_TIMEOUT_MS);
-      const data = await res.json();
-      return reply.code(res.status).send(data);
-    } catch (err) {
-      return reply.code(502).send({ error: describeWorkerError(err) });
-    }
-  });
-
-  app.post<{ Params: { name: string } }>("/api/workers/:name/stop", async (request, reply) => {
-    const worker = await findWorker(request.params.name);
-    if (!worker) return reply.code(404).send({ error: "unknown worker" });
-    try {
-      const res = await fetchWorker(`${worker.url}/run/stop`, { method: "POST" }, WORKER_READ_TIMEOUT_MS);
-      const data = await res.json();
-      if (res.status === 409) {
-        // The worker disagrees it's running anything -- most likely it
-        // already finished or restarted and our DB row never got the memo
-        // (see repo.reconcileStaleRun). Reconcile instead of bubbling the
-        // 409 back to a Stop button the user would otherwise keep clicking
-        // forever with no way to clear the "running" state.
-        const stale = repo.getRunningRunForWorker(worker.name);
-        if (stale) {
-          request.log.warn(
-            { worker: worker.name, run_id: stale.id },
-            "stop hit a worker that wasn't busy -- reconciling stale run"
-          );
-          repo.reconcileStaleRun(stale.id, "worker lost track of run");
-          return reply.code(200).send({ ok: true, stopping: true, reconciled: true });
-        }
-      }
-      return reply.code(res.status).send(data);
-    } catch (err) {
-      return reply.code(502).send({ error: describeWorkerError(err) });
-    }
-  });
-
-  app.delete<{ Params: { name: string; tag: string } }>(
-    "/api/workers/:name/llama-cpp/:tag",
+  app.delete<{ Params: { id: string }; Querystring: { file?: string } }>(
+    "/api/workers/:id/models",
     async (request, reply) => {
-      const worker = await findWorker(request.params.name);
-      if (!worker) return reply.code(404).send({ error: "unknown worker" });
-      try {
-        const res = await fetchWorker(
-          `${worker.url}/llama-cpp/${encodeURIComponent(request.params.tag)}`,
-          { method: "DELETE" },
-          WORKER_READ_TIMEOUT_MS
-        );
-        const data = await res.json();
-        return reply.code(res.status).send(data);
-      } catch (err) {
-        return reply.code(502).send({ error: describeWorkerError(err) });
-      }
-    }
-  );
-
-  app.get<{ Params: { name: string }; Querystring: { hf_repo?: string; hf_file?: string } }>(
-    "/api/workers/:name/models/download/progress",
-    async (request, reply) => {
-      const worker = await findWorker(request.params.name);
-      if (!worker) return reply.code(404).send({ error: "unknown worker" });
-      const { hf_repo, hf_file } = request.query;
-      if (!hf_repo || !hf_file) {
-        return reply.code(400).send({ error: "hf_repo and hf_file are required" });
-      }
-      try {
-        const res = await fetchWorker(
-          `${worker.url}/models/download/progress?hf_repo=${encodeURIComponent(hf_repo)}&hf_file=${encodeURIComponent(hf_file)}`,
-          {},
-          WORKER_READ_TIMEOUT_MS
-        );
-        const data = (await res.json()) as DownloadProgress | { error: string };
-        return reply.code(res.status).send(data);
-      } catch (err) {
-        return reply.code(502).send({ error: describeWorkerError(err) });
-      }
-    }
-  );
-
-  app.delete<{ Params: { name: string }; Querystring: { file?: string } }>(
-    "/api/workers/:name/models",
-    async (request, reply) => {
-      const worker = await findWorker(request.params.name);
-      if (!worker) return reply.code(404).send({ error: "unknown worker" });
+      const worker = requireOnlineWorker(resolveAuthUser(request)?.user.id, request.params.id);
       const { file } = request.query;
-      if (!file) return reply.code(400).send({ error: "file is required" });
-      try {
-        const res = await fetchWorker(
-          `${worker.url}/models?file=${encodeURIComponent(file)}`,
-          { method: "DELETE" },
-          WORKER_READ_TIMEOUT_MS
-        );
-        const data = await res.json();
-        return reply.code(res.status).send(data);
-      } catch (err) {
-        return reply.code(502).send({ error: describeWorkerError(err) });
-      }
+      if (!file) throw new BadRequestError("file is required");
+      repo.queueRepo.enqueueJob(worker.id, { type: "delete_model_file", payload: { filename: file } });
+      queueEvents.emit(worker.id);
+      return reply.code(202).send({ ok: true, queued: true });
     }
   );
 
@@ -354,56 +183,31 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
     }
   });
 
-  // Just triggers the download and returns as soon as the worker acks --
-  // see worker/src/index.ts's POST /models/download for why this no longer
-  // waits out the (potentially tens-of-minutes) file transfer itself: doing
-  // so here too would still be bounded by Node's undici default per-request
-  // timeout (5 minutes) regardless of any timeout this route configured,
-  // silently reporting a healthy worker as "inaccessible" on any download
-  // slower than that. The actual completion (success or failure) arrives
-  // later via the worker's own callback to POST /api/models/download-callback
-  // below, mirroring how /run's per-item results are reported rather than
-  // returned on the trigger response.
-  app.post<{ Params: { name: string }; Body: { hf_repo?: string; hf_file?: string } }>(
-    "/api/workers/:name/models/download",
+  // Queues the download; the worker reports live byte progress via its
+  // heartbeat's ActiveJobReport (phase "downloading") instead of the old
+  // separate GET /models/download/progress polling route, and the terminal
+  // outcome via POST /api/models/download-callback below, same as before.
+  app.post<{ Params: { id: string }; Body: { hf_repo?: string; hf_file?: string } }>(
+    "/api/workers/:id/models/download",
     async (request, reply) => {
-      const worker = await findWorker(request.params.name);
-      if (!worker) return reply.code(404).send({ error: "unknown worker" });
+      const worker = requireOnlineWorker(resolveAuthUser(request)?.user.id, request.params.id);
       const { hf_repo, hf_file } = request.body ?? {};
-      if (!hf_repo || !hf_file) {
-        return reply.code(400).send({ error: "hf_repo and hf_file are required" });
-      }
-      request.log.info({ worker: worker.name, hf_repo, hf_file }, "model download requested");
-      try {
-        const res = await fetchWorker(
-          `${worker.url}/models/download`,
-          {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({ hf_repo, hf_file }),
-          },
-          WORKER_READ_TIMEOUT_MS
-        );
-        const data = await res.json();
-        if (!res.ok) {
-          request.log.warn(
-            { worker: worker.name, hf_repo, hf_file, error: (data as { error?: string }).error },
-            "model download rejected"
-          );
-        }
-        return reply.code(res.status).send(data);
-      } catch (err) {
-        request.log.error({ worker: worker.name, hf_repo, hf_file, err: describeWorkerError(err) }, "model download error");
-        return reply.code(502).send({ error: describeWorkerError(err) });
-      }
+      if (!hf_repo || !hf_file) throw new BadRequestError("hf_repo and hf_file are required");
+      request.log.info({ worker: worker.id, hf_repo, hf_file }, "model download queued");
+      repo.queueRepo.enqueueJob(worker.id, { type: "download_model", payload: { hf_repo, hf_file } });
+      queueEvents.emit(worker.id);
+      return reply.code(202).send({ ok: true, queued: true });
     }
   );
 
-  // Worker -> server callback reporting a download's terminal outcome (see
-  // the trigger route above). Retried by the worker with backoff
-  // (safeReportDownloadResult), so this must stay safe to receive more than
-  // once for the same download -- repo.registerModel's upsert-on-id
-  // semantics already guarantee that for the success path.
+  // Worker -> server callback reporting a download's terminal outcome.
+  // Retried by the worker with backoff (safeReportDownloadResult), so this
+  // must stay safe to receive more than once for the same download --
+  // repo.registerModel's upsert-on-id semantics already guarantee that for
+  // the success path. Separate from the worker's own generic per-job
+  // completion report (POST /api/worker/jobs/:jobId/complete, routes/queue.ts)
+  // -- that one just marks the worker_jobs bookkeeping row done; this one
+  // does the actual model-catalog registration, unchanged from before.
   app.post<{ Body: ModelDownloadCallbackInput }>(
     "/api/models/download-callback",
     // Same rationale as /api/runs/:id/items/:idx's logLevel below -- this

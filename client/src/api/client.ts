@@ -6,12 +6,14 @@ import {
   type ResultRow,
   type RunItem,
   type TriggerPayload,
-  type WorkerLlamaCppInfo,
+  type Worker,
   type HfRepoSearchResult,
   type HfFileEntry,
-  type Backend,
-  type InstalledBuild,
-  type DownloadProgress,
+  type LlamaCppRelease,
+  type AuthStatus,
+  type SessionInfo,
+  type IdentityInfo,
+  type DeviceStatusResponse,
 } from "../types";
 
 export class ApiError extends Error {
@@ -67,27 +69,23 @@ function postJson(body: unknown): RequestInit {
   };
 }
 
-export interface WorkerListEntry {
-  name: string;
-  backend: Backend;
-  llama_cpp_build: string;
-  is_self: boolean;
-}
-
 export const api = {
   listModels: (): Promise<Model[]> => request<{ models: Model[] }>("/api/models").then((d) => d.models),
 
   registerModel: (body: RegisterModelInput): Promise<Model> =>
     request<{ model: Model }>("/api/models", postJson(body)).then((d) => d.model),
 
-  deleteModel: (
-    id: string
-  ): Promise<{ ok: true; file_deletions: { worker: string; ok: boolean; error?: string }[] }> =>
+  // Multi-user Stage 4 (MULTIUSER_PLAN.md §4.4): no more file_deletion_queued_on
+  // -- deleting the catalog row no longer fans out to every worker's
+  // model_dir (most workers aren't even the caller's to touch, once
+  // ownership exists). Freeing a file on a specific machine is
+  // deleteModelFileFromWorker below, a separate, deliberate action.
+  deleteModel: (id: string): Promise<{ ok: true }> =>
     request(`/api/models/${encodeURIComponent(id)}`, { method: "DELETE" }),
 
-  // Asks every configured worker to read the model's GGUF header from
-  // whichever of them already has the file on disk -- backfills n_layer for
-  // models registered before that existed, without re-downloading anything.
+  // Reads n_layer/mtp_layers from whichever worker's cached model_files_json
+  // already has this file (see server/src/db/repo.ts's findModelFileMeta) --
+  // no live worker round trip anymore, just a DB read of the last heartbeat.
   backfillModelLayerCount: (id: string): Promise<{ ok: true; n_layer: number | null }> =>
     request(`/api/models/${encodeURIComponent(id)}/backfill-layer-count`, { method: "POST" }),
 
@@ -98,34 +96,49 @@ export const api = {
   backfillModelParamCount: (id: string): Promise<{ ok: true; param_count: number | null }> =>
     request(`/api/models/${encodeURIComponent(id)}/backfill-param-count`, { method: "POST" }),
 
-  // Which configured worker(s) currently have each model's file on disk --
-  // powers the Models page's Local/Remote split. Live, not cached server-side.
+  // Which machine(s) currently have each model's file, per their last
+  // heartbeat -- powers the Models page's Local/Remote split.
   getModelLocations: (): Promise<{ locations: Record<string, string[]>; unreachable: string[] }> =>
     request("/api/models/locations"),
 
-  // Deletes a model's file from exactly one worker's model_dir -- never
-  // touches the model registry row (see server/src/routes/workers.ts's
-  // DELETE /api/workers/:name/models, unchanged, just not previously called
-  // from the client). Distinct from the old whole-registry deleteModel above.
-  deleteModelFileFromWorker: (workerName: string, filename: string): Promise<{ ok: true }> =>
-    request(`/api/workers/${encodeURIComponent(workerName)}/models?file=${encodeURIComponent(filename)}`, {
+  // Queues deletion of a model's file on one machine's model_dir -- never
+  // touches the model registry row. Fire-and-forget under the pull model:
+  // resolves once the job is queued, not once the worker actually deletes
+  // it (see server/src/routes/workers.ts).
+  deleteModelFileFromWorker: (workerId: string, filename: string): Promise<{ ok: true; queued: true }> =>
+    request(`/api/workers/${encodeURIComponent(workerId)}/models?file=${encodeURIComponent(filename)}`, {
       method: "DELETE",
     }),
 
-  listWorkers: (): Promise<WorkerListEntry[]> =>
-    request<{ workers: WorkerListEntry[] }>("/api/workers").then((d) => d.workers),
+  // One read of every machine's last-reported state -- hardware, installed
+  // builds, model files, derived status, and (while a job is active) its
+  // run id / live progress are all already inline on each Worker. No more
+  // separate per-worker fetch (MULTIUSER_PLAN.md §1.16).
+  listWorkers: (): Promise<Worker[]> => request<{ workers: Worker[] }>("/api/workers").then((d) => d.workers),
 
-  getWorkerLlamaCpp: (name: string): Promise<WorkerLlamaCppInfo> =>
-    request<WorkerLlamaCppInfo>(`/api/workers/${encodeURIComponent(name)}/llama-cpp`),
+  // Which llama.cpp releases a specific machine could install, and whether
+  // a newer one than what it has exists -- the one piece of per-worker
+  // "live" info that's a GitHub lookup, not something the worker itself
+  // reports (see server/src/routes/workers.ts).
+  getAvailableBuilds: (workerId: string): Promise<{ available: LlamaCppRelease[]; update_available: boolean }> =>
+    request(`/api/workers/${encodeURIComponent(workerId)}/available-builds`),
 
-  installBuild: (name: string, tag: string, assetName: string): Promise<{ ok: true; build: InstalledBuild }> =>
-    request(`/api/workers/${encodeURIComponent(name)}/llama-cpp/install`, postJson({ tag, asset_name: assetName })),
+  // Fire-and-forget: queues the install/activate/delete on the machine,
+  // resolves once queued, not once the machine actually does it (no more
+  // outbound HTTP to workers -- MULTIUSER_PLAN.md §1.11).
+  installBuild: (workerId: string, tag: string, assetName: string): Promise<{ ok: true; queued: true }> =>
+    request(
+      `/api/workers/${encodeURIComponent(workerId)}/llama-cpp/install`,
+      postJson({ tag, asset_name: assetName })
+    ),
 
-  activateBuild: (name: string, tag: string): Promise<{ ok: true; active_tag: string }> =>
-    request(`/api/workers/${encodeURIComponent(name)}/llama-cpp/activate`, postJson({ tag })),
+  activateBuild: (workerId: string, tag: string): Promise<{ ok: true; queued: true }> =>
+    request(`/api/workers/${encodeURIComponent(workerId)}/llama-cpp/activate`, postJson({ tag })),
 
-  deleteBuild: (name: string, tag: string): Promise<{ ok: true }> =>
-    request(`/api/workers/${encodeURIComponent(name)}/llama-cpp/${encodeURIComponent(tag)}`, { method: "DELETE" }),
+  deleteBuild: (workerId: string, tag: string): Promise<{ ok: true; queued: true }> =>
+    request(`/api/workers/${encodeURIComponent(workerId)}/llama-cpp/${encodeURIComponent(tag)}`, {
+      method: "DELETE",
+    }),
 
   searchHf: (q: string): Promise<HfRepoSearchResult[]> =>
     request<{ results: HfRepoSearchResult[] }>(`/api/hf/search?q=${encodeURIComponent(q)}`).then((d) => d.results),
@@ -135,20 +148,14 @@ export const api = {
       `/api/hf/repo/${repo.split("/").map(encodeURIComponent).join("/")}`
     ).then((d) => d.files),
 
-  // Resolves once the worker acks that it has started the download, not
-  // once the download finishes -- that now happens in the background and is
-  // only observable by polling getDownloadProgress until it stops reporting
-  // (see Models.tsx's poll effect).
-  downloadHfFile: (workerName: string, hfRepo: string, hfFile: string): Promise<void> =>
-    request<void>(
-      `/api/workers/${encodeURIComponent(workerName)}/models/download`,
+  // Resolves once the download is queued, not once it finishes -- progress
+  // is now read off the matching Worker's activeJobProgress (see
+  // listWorkers above), polled the same way the rest of that machine's live
+  // state already is, instead of a separate per-file progress endpoint.
+  downloadHfFile: (workerId: string, hfRepo: string, hfFile: string): Promise<{ ok: true; queued: true }> =>
+    request<{ ok: true; queued: true }>(
+      `/api/workers/${encodeURIComponent(workerId)}/models/download`,
       postJson({ hf_repo: hfRepo, hf_file: hfFile })
-    ),
-
-  getDownloadProgress: (workerName: string, hfRepo: string, hfFile: string): Promise<DownloadProgress> =>
-    request(
-      `/api/workers/${encodeURIComponent(workerName)}/models/download/progress` +
-        `?hf_repo=${encodeURIComponent(hfRepo)}&hf_file=${encodeURIComponent(hfFile)}`
     ),
 
   listRuns: (): Promise<Run[]> => request<{ runs: Run[] }>("/api/runs").then((d) => d.runs),
@@ -159,16 +166,16 @@ export const api = {
   triggerRun: (payload: TriggerPayload): Promise<Run> =>
     request<{ run: Run }>("/api/runs/trigger", postJson(payload)).then((d) => d.run),
 
-  // Pause/resume/stop target the worker (it only ever runs one benchmark at
-  // a time), not a specific run id -- see server/src/routes/workers.ts.
-  pauseWorker: (workerName: string): Promise<{ ok: true; paused: true }> =>
-    request(`/api/workers/${encodeURIComponent(workerName)}/pause`, postJson({})),
+  // Pause/resume/stop target the RUN now, not a worker-scoped endpoint --
+  // the right shape once one account can own several machines
+  // (MULTIUSER_PLAN.md §1.14). Delivered to the worker on its next
+  // heartbeat (≤10s), not synchronously.
+  pauseRun: (runId: string): Promise<{ ok: true }> => request(`/api/runs/${encodeURIComponent(runId)}/pause`, postJson({})),
 
-  resumeWorker: (workerName: string): Promise<{ ok: true; paused: false }> =>
-    request(`/api/workers/${encodeURIComponent(workerName)}/resume`, postJson({})),
+  resumeRun: (runId: string): Promise<{ ok: true }> =>
+    request(`/api/runs/${encodeURIComponent(runId)}/resume`, postJson({})),
 
-  stopWorker: (workerName: string): Promise<{ ok: true; stopping: true }> =>
-    request(`/api/workers/${encodeURIComponent(workerName)}/stop`, postJson({})),
+  stopRun: (runId: string): Promise<{ run: Run }> => request(`/api/runs/${encodeURIComponent(runId)}/stop`, postJson({})),
 
   exportUrl: (format: "json" | "csv" | "md", runIds?: string[]): string => {
     const params = new URLSearchParams({ format });
@@ -176,11 +183,49 @@ export const api = {
     return `/api/results/export?${params.toString()}`;
   },
 
-  // Proxies to the worker's own dedicated per-run log file -- see
-  // server/src/routes/runs.ts's GET /api/runs/:id/log.
+  // The worker pushes its log on job completion; this just reads it back
+  // off disk (see server/src/routes/runs.ts's GET /api/runs/:id/log).
   runLogUrl: (id: string): string => `/api/runs/${encodeURIComponent(id)}/log`,
 
-  getAiStatus: (): Promise<{ configured: boolean; model?: string }> => request("/api/ai/status"),
+  getAiStatus: (): Promise<{ configured: boolean; model?: string; quota?: { remainingHour: number; remainingDay: number } }> =>
+    request("/api/ai/status"),
+
+  // Multi-user Stage 2 (MULTIUSER_PLAN.md §2) -- always reachable regardless
+  // of AUTH_ENABLED (see routes/auth.ts's own doc comment); `authEnabled`
+  // lets the SPA decide whether to gate on `user` at all.
+  getAuthStatus: (): Promise<AuthStatus> => request("/api/auth/status"),
+
+  listSessions: (): Promise<SessionInfo[]> => request<{ sessions: SessionInfo[] }>("/api/sessions").then((d) => d.sessions),
+
+  revokeSession: (id: string): Promise<void> =>
+    request(`/api/sessions/${encodeURIComponent(id)}`, { method: "DELETE" }),
+
+  revokeAllOtherSessions: (): Promise<void> => request("/api/sessions/revoke-all", postJson({})),
+
+  listIdentities: (): Promise<IdentityInfo[]> =>
+    request<{ identities: IdentityInfo[] }>("/api/auth/identities").then((d) => d.identities),
+
+  // Multi-user Stage 5 (MULTIUSER_PLAN.md §5.4) -- Settings' own toggle for
+  // the community-aggregates consent flag.
+  setShareBenchmarks: (enabled: boolean): Promise<{ shareBenchmarks: boolean }> =>
+    request("/api/auth/share-benchmarks", postJson({ enabled })),
+
+  // Security checklist's own "Account deletion ships in v1" item --
+  // irreversible, so the server itself also requires this exact
+  // {confirm: true} body, not just a bare DELETE. Spread order matters:
+  // method must come AFTER postJson's own (which is "POST") to actually win.
+  deleteAccount: (): Promise<{ ok: true }> => request("/api/auth/account", { ...postJson({ confirm: true }), method: "DELETE" }),
+
+  // Multi-user Stage 3 (MULTIUSER_PLAN.md §3.1) -- the "Add machine"/"/device"
+  // screen's own poll and approve action. Never 404s/errors for an
+  // unknown/expired code (see server/src/routes/device.ts) -- it resolves to
+  // {state: "not_found"}, so this always succeeds; only approveDevice can
+  // reject (unknown code, already approved).
+  getDeviceStatus: (userCode: string): Promise<DeviceStatusResponse> =>
+    request(`/api/device/status?user_code=${encodeURIComponent(userCode)}`),
+
+  approveDevice: (userCode: string): Promise<{ ok: true; machine: { hostname: string | null } }> =>
+    request("/api/device/approve", postJson({ user_code: userCode })),
 
   // Live (not persisted) Hugging Face check, keyed by model id -- powers the
   // New Run model picker's "Updated X ago" label and "possibly newer on HF"

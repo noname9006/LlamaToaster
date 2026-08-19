@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
-import { api, type WorkerListEntry } from "../api/client";
+import { api } from "../api/client";
 import { StatusPill } from "../components/StatusPill";
 import { IconChevronDown, IconDownload, IconRefreshCw, IconTrash } from "../components/icons";
 import { ParamsRangeSlider, PARAMS_STOPS, paramsInRange } from "../components/ParamsRangeSlider";
@@ -23,12 +23,12 @@ import type {
   ModelSource,
   HfRepoSearchResult,
   HfFileEntry,
-  DownloadProgress,
+  Worker,
 } from "../types";
 
 interface DownloadState {
   repoId: string;
-  worker: string;
+  workerId: string;
   startedAt: number;
   file: HfFileEntry;
 }
@@ -160,7 +160,7 @@ function orphanDrafts(subset: Model[], groups: ModelGroup[]): Model[] {
 
 export function Models() {
   const [models, setModels] = useState<Model[]>([]);
-  const [workers, setWorkers] = useState<WorkerListEntry[]>([]);
+  const [workers, setWorkers] = useState<Worker[]>([]);
   const [downloadWorker, setDownloadWorker] = useState("");
   const [pickWorkerWarning, setPickWorkerWarning] = useState(false);
   const workerPickerRef = useRef<HTMLSelectElement>(null);
@@ -177,7 +177,11 @@ export function Models() {
   const [hfMsg, setHfMsg] = useState("");
   const [searching, setSearching] = useState(false);
   const [downloading, setDownloading] = useState<Record<string, DownloadState>>(loadPersistedDownloads);
-  const [progress, setProgress] = useState<Record<string, DownloadProgress>>({});
+  // { bytes, total } -- read off the owning worker's activeJobProgress
+  // (MULTIUSER_PLAN.md §1.5), not a dedicated per-file progress endpoint
+  // (deleted, see the poll effect below). total is null until the worker
+  // reports Content-Length.
+  const [progress, setProgress] = useState<Record<string, { bytes: number; total: number | null }>>({});
   const [speeds, setSpeeds] = useState<Record<string, number>>({});
   const prevSampleRef = useRef<Record<string, { bytes: number; time: number }>>({});
   // Exponential moving average of each download's speed, keyed by path --
@@ -265,7 +269,7 @@ export function Models() {
   const modelsByWorker = useMemo(
     () =>
       workers.map((w) => {
-        const subset = filteredModels.filter((m) => locations[m.id]?.includes(w.name));
+        const subset = filteredModels.filter((m) => locations[m.id]?.includes(w.id));
         const groups = sortModelGroups(buildModelGroups(subset), sortField, sortDir);
         return { worker: w, subset, groups, orphans: orphanDrafts(subset, groups) };
       }),
@@ -317,20 +321,22 @@ export function Models() {
   // (and every other worker's copy) is left untouched, so this never hits
   // the "N run result(s) reference it" conflict the old whole-registry
   // delete could -- there's no DB data being removed here at all.
-  async function handleDeleteModelFile(m: Model, workerName: string) {
+  async function handleDeleteModelFile(m: Model, worker: Worker) {
     const filename = m.source === "local" ? m.filename : m.hf_file;
     if (!filename) return;
     if (
-      !window.confirm(`Delete ${m.filename} from ${workerName}? This only removes the file on that machine -- the model stays registered.`)
+      !window.confirm(
+        `Delete ${m.filename} from ${worker.displayName}? This only removes the file on that machine -- the model stays registered.`
+      )
     ) {
       return;
     }
-    const key = `${m.id}:${workerName}`;
+    const key = `${m.id}:${worker.id}`;
     setDeletingKey(key);
     setModelsMsg("");
     try {
-      await api.deleteModelFileFromWorker(workerName, filename);
-      setModelsMsg(`Deleted ${m.filename} from ${workerName} ✓`);
+      await api.deleteModelFileFromWorker(worker.id, filename);
+      setModelsMsg(`Queued: delete ${m.filename} from ${worker.displayName}`);
       await Promise.all([loadModels(), loadLocations()]);
     } catch (err) {
       setModelsMsg(`Error: ${err instanceof Error ? err.message : String(err)}`);
@@ -366,7 +372,7 @@ export function Models() {
     (async () => {
       const list = await api.listWorkers();
       setWorkers(list);
-      if (list.length === 1) setDownloadWorker(list[0].name);
+      if (list.length === 1) setDownloadWorker(list[0].id);
     })();
   }, []);
 
@@ -428,63 +434,78 @@ export function Models() {
     setTimeout(() => void loadModels(), 2000);
   }
 
+  // Reads progress off the owning worker's activeJobProgress (one
+  // GET /api/workers read per tick, not one call per file) instead of a
+  // dedicated per-file progress endpoint -- that endpoint doesn't exist
+  // anymore (MULTIUSER_PLAN.md §1.5/§1.11: workers push progress via their
+  // heartbeat, roughly every 10s, not continuously). Polling faster than
+  // that heartbeat cadence wouldn't see any new data, so this ticks every 2s
+  // (matching RunDetail's own live-poll interval) rather than the old 750ms.
+  //
+  // Known limitation: since a worker now runs exactly one job at a time, if
+  // two downloads are queued on the SAME worker back to back, only the
+  // first one's progress is visible (the worker hasn't started the second
+  // at all yet) -- its entry may look stalled until the first finishes and
+  // it actually becomes the active job. Downloads on different workers are
+  // unaffected; each worker's own activeJobProgress is independent.
   useEffect(() => {
     const entries = Object.entries(downloading);
     if (entries.length === 0) return;
 
     async function poll() {
-      await Promise.all(
-        entries.map(async ([path, state]) => {
-          try {
-            const p = await api.getDownloadProgress(state.worker, state.repoId, path);
-            seenRef.current[path] = true;
-            missesRef.current[path] = 0;
-            setProgress((prev) => ({ ...prev, [path]: p }));
-            const prevSample = prevSampleRef.current[path];
-            const now = Date.now();
-            if (prevSample && now > prevSample.time) {
-              const instantBytesPerSec = Math.max(
-                0,
-                ((p.bytes - prevSample.bytes) / (now - prevSample.time)) * 1000
-              );
-              // EMA with alpha ~0.25 -- settles to within ~5% of a step change
-              // in about 4 samples (~3s at the 750ms poll interval) while
-              // flattening single-sample spikes.
-              const SPEED_SMOOTHING_ALPHA = 0.25;
-              const prevSmoothed = smoothedSpeedRef.current[path];
-              const smoothed =
-                prevSmoothed == null
-                  ? instantBytesPerSec
-                  : prevSmoothed + SPEED_SMOOTHING_ALPHA * (instantBytesPerSec - prevSmoothed);
-              smoothedSpeedRef.current[path] = smoothed;
-              setSpeeds((s) => ({ ...s, [path]: smoothed }));
-            }
-            prevSampleRef.current[path] = { bytes: p.bytes, time: now };
-          } catch {
-            // Worker has no progress entry for this file -- either it just
-            // finished (success or failure), or it hasn't started reporting
-            // yet (a small window right after the start POST acked, or --
-            // for an entry restored from localStorage after a refresh -- for
-            // as long as its owning tab is gone).
-            const misses = (missesRef.current[path] ?? 0) + 1;
-            missesRef.current[path] = misses;
-            // A grace period even once already seen (not an immediate
-            // finalize on the first miss) -- the worker clears its progress
-            // entry for a file slightly before the model is actually
-            // registered server-side, so finalizing too eagerly here can
-            // refresh the model list before the new row exists. ~1.5s at
-            // this 750ms poll interval is comfortably longer than that gap.
-            const SEEN_GRACE_MISSES = 2;
-            const NEVER_SEEN_TIMEOUT_MISSES = 4;
-            if ((seenRef.current[path] && misses >= SEEN_GRACE_MISSES) || misses >= NEVER_SEEN_TIMEOUT_MISSES) {
-              finalizeDownload(path);
-            }
+      let workerList: Worker[];
+      try {
+        workerList = await api.listWorkers();
+      } catch {
+        return; // transient -- try again next tick
+      }
+      const byId = new Map(workerList.map((w) => [w.id, w]));
+
+      for (const [path, state] of entries) {
+        const worker = byId.get(state.workerId);
+        const active = worker?.activeJobProgress;
+        const stillDownloadingThis = worker?.status === "busy" && active?.phase === "downloading";
+
+        if (stillDownloadingThis && active) {
+          seenRef.current[path] = true;
+          missesRef.current[path] = 0;
+          const bytes = active.bytes ?? 0;
+          const total = active.total_bytes ?? null;
+          setProgress((prev) => ({ ...prev, [path]: { bytes, total } }));
+          const prevSample = prevSampleRef.current[path];
+          const now = Date.now();
+          if (prevSample && now > prevSample.time) {
+            const instantBytesPerSec = Math.max(0, ((bytes - prevSample.bytes) / (now - prevSample.time)) * 1000);
+            // EMA with alpha ~0.25 -- smooths poll-to-poll jitter without
+            // lagging too far behind a real step change.
+            const SPEED_SMOOTHING_ALPHA = 0.25;
+            const prevSmoothed = smoothedSpeedRef.current[path];
+            const smoothed =
+              prevSmoothed == null
+                ? instantBytesPerSec
+                : prevSmoothed + SPEED_SMOOTHING_ALPHA * (instantBytesPerSec - prevSmoothed);
+            smoothedSpeedRef.current[path] = smoothed;
+            setSpeeds((s) => ({ ...s, [path]: smoothed }));
           }
-        })
-      );
+          prevSampleRef.current[path] = { bytes, time: now };
+        } else {
+          // No longer this worker's active job -- either it just finished
+          // (success or failure), or it hasn't started yet (still queued
+          // behind another job). A grace period before finalizing either
+          // way, since the worker's heartbeat cadence means "just changed"
+          // and "genuinely done" look identical for a few ticks.
+          const misses = (missesRef.current[path] ?? 0) + 1;
+          missesRef.current[path] = misses;
+          const SEEN_GRACE_MISSES = 3;
+          const NEVER_SEEN_TIMEOUT_MISSES = 6;
+          if ((seenRef.current[path] && misses >= SEEN_GRACE_MISSES) || misses >= NEVER_SEEN_TIMEOUT_MISSES) {
+            finalizeDownload(path);
+          }
+        }
+      }
     }
     void poll();
-    const id = setInterval(poll, 750);
+    const id = setInterval(poll, 2000);
     return () => clearInterval(id);
   }, [downloading]);
 
@@ -559,26 +580,26 @@ export function Models() {
       workerPickerRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
       return;
     }
-    const worker = downloadWorker;
+    const workerId = downloadWorker;
     setPickWorkerWarning(false);
     setHfMsg("");
     try {
-      // Resolves once the worker has acked the download, not once it's done
-      // -- the actual transfer runs in the background on the worker (see
-      // worker/src/index.ts's POST /models/download), so completion is only
-      // observable via the progress-poll effect below, same as an entry
-      // restored from localStorage after a refresh. finalizeDownload is the
-      // one place that ever clears `downloading` now.
-      await api.downloadHfFile(worker, repoId, file.path);
-      setDownloading((d) => ({ ...d, [file.path]: { repoId, worker, startedAt: Date.now(), file } }));
+      // Resolves once the download is queued, not once it's done -- the
+      // actual transfer happens once the worker claims the job (may take up
+      // to one queue-poll cycle even for an idle machine), so completion is
+      // only observable via the progress-poll effect below, same as an
+      // entry restored from localStorage after a refresh. finalizeDownload
+      // is the one place that ever clears `downloading` now.
+      await api.downloadHfFile(workerId, repoId, file.path);
+      setDownloading((d) => ({ ...d, [file.path]: { repoId, workerId, startedAt: Date.now(), file } }));
     } catch (err) {
       setHfMsg(`Error: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
-  function renderModelRow(m: Model, workerName: string, indent: boolean) {
+  function renderModelRow(m: Model, worker: Worker, indent: boolean) {
     const paramsB = modelParamsB(m);
-    const key = `${m.id}:${workerName}`;
+    const key = `${m.id}:${worker.id}`;
     return (
       <div
         key={key}
@@ -628,10 +649,10 @@ export function Models() {
         <button
           type="button"
           disabled={deletingKey === key}
-          onClick={() => handleDeleteModelFile(m, workerName)}
+          onClick={() => handleDeleteModelFile(m, worker)}
           className="rounded-md border border-border p-1.5 text-muted hover:border-danger/40 hover:text-danger disabled:opacity-50"
-          aria-label={`Delete ${m.filename} from ${workerName}`}
-          title={`Delete this file from ${workerName} only -- the model stays registered`}
+          aria-label={`Delete ${m.filename} from ${worker.displayName}`}
+          title={`Delete this file from ${worker.displayName} only -- the model stays registered`}
         >
           <IconTrash width={14} height={14} />
         </button>
@@ -639,17 +660,17 @@ export function Models() {
     );
   }
 
-  function renderModelGroup(group: ModelGroup, workerName: string) {
+  function renderModelGroup(group: ModelGroup, worker: Worker) {
     return (
-      <div key={`${group.key}:${workerName}`} className="py-1">
+      <div key={`${group.key}:${worker.id}`} className="py-1">
         <div className="px-4 pt-2 pb-1 text-xs font-semibold uppercase tracking-wide text-muted">
           {group.author} · {group.family} · {group.label}
         </div>
         {group.quants.map(({ base }) => (
-          <div key={base.id}>{renderModelRow(base, workerName, false)}</div>
+          <div key={base.id}>{renderModelRow(base, worker, false)}</div>
         ))}
         {group.quants.map(({ drafts }) =>
-          drafts.map((draft) => <div key={draft.id}>{renderModelRow(draft, workerName, true)}</div>)
+          drafts.map((draft) => <div key={draft.id}>{renderModelRow(draft, worker, true)}</div>)
         )}
       </div>
     );
@@ -658,6 +679,11 @@ export function Models() {
   return (
     <div>
       <h1 className="text-2xl font-semibold text-fg">Models</h1>
+      <p className="mt-1 text-sm text-muted">
+        The model catalog (filenames and metadata) is shared across every user, so downloads can be
+        deduplicated — a filename you register or download may be visible to others. Benchmark
+        results themselves are never shared unless you opt in (Settings).
+      </p>
 
       <section className="mt-6">
         <h2 className="text-sm font-semibold uppercase tracking-wide text-muted">My models</h2>
@@ -750,17 +776,20 @@ export function Models() {
 
             {unreachableLocationWorkers.length > 0 && (
               <p className="mt-3 text-xs text-warning">
-                Couldn't check what's on: {unreachableLocationWorkers.join(", ")} -- their models may be missing
-                below even though they actually have them.
+                Couldn't check what's on:{" "}
+                {unreachableLocationWorkers
+                  .map((id) => workers.find((w) => w.id === id)?.displayName ?? id)
+                  .join(", ")}{" "}
+                -- their models may be missing below even though they actually have them.
               </p>
             )}
 
             <div className="mt-3 flex flex-col gap-3">
               {modelsByWorker.map(({ worker, subset, groups, orphans }) => (
-                <details key={worker.name} open className="group rounded-xl border border-border bg-surface">
+                <details key={worker.id} open className="group rounded-xl border border-border bg-surface">
                   <summary className="flex cursor-pointer items-center justify-between px-4 py-2.5 text-sm font-semibold text-fg">
                     <span className="flex items-center gap-2">
-                      {worker.name}
+                      {worker.displayName}
                       <span className="text-xs font-normal text-muted">
                         ({subset.length} file{subset.length === 1 ? "" : "s"})
                       </span>
@@ -772,8 +801,8 @@ export function Models() {
                       <p className="px-4 py-3 text-sm text-muted">No models on this worker.</p>
                     ) : (
                       <>
-                        {groups.map((group) => renderModelGroup(group, worker.name))}
-                        {orphans.map((d) => renderModelRow(d, worker.name, false))}
+                        {groups.map((group) => renderModelGroup(group, worker))}
+                        {orphans.map((d) => renderModelRow(d, worker, false))}
                       </>
                     )}
                   </div>
@@ -804,7 +833,7 @@ export function Models() {
                       <IconDownload width={14} height={14} className="text-accent" />
                       <span className="text-fg">{path}</span>
                       <span className="text-xs text-muted">
-                        {state.repoId} · {state.worker}
+                        {state.repoId} · {workers.find((w) => w.id === state.workerId)?.displayName ?? state.workerId}
                       </span>
                     </div>
                     <span className="text-xs text-muted">{pct !== null ? `${pct}%` : "Starting…"}</span>
@@ -868,8 +897,8 @@ export function Models() {
             >
               <option value="">select…</option>
               {workers.map((w) => (
-                <option key={w.name} value={w.name}>
-                  {w.name}
+                <option key={w.id} value={w.id}>
+                  {w.displayName}
                 </option>
               ))}
             </select>

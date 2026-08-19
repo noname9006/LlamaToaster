@@ -33,22 +33,26 @@ const EMPTY_SWEEP: Sweep = {
   repeats: 1,
 };
 
-function sweepStorageKey(modelId: string, workerName: string): string {
-  return `llamatoaster:sweep:${modelId}:${workerName}`;
+// Keyed by workerId (a server-assigned UUID) since MULTIUSER_PLAN.md's pull
+// queue -- old entries keyed by the previous Tailscale-derived worker name
+// simply go unused and expire naturally; not worth an explicit migration for
+// a device-local convenience cache.
+function sweepStorageKey(modelId: string, workerId: string): string {
+  return `llamatoaster:sweep:${modelId}:${workerId}`;
 }
 
-function loadRememberedSweep(modelId: string, workerName: string): Sweep | null {
+function loadRememberedSweep(modelId: string, workerId: string): Sweep | null {
   try {
-    const raw = localStorage.getItem(sweepStorageKey(modelId, workerName));
+    const raw = localStorage.getItem(sweepStorageKey(modelId, workerId));
     return raw ? sanitizeSweep(JSON.parse(raw) as Sweep) : null;
   } catch {
     return null;
   }
 }
 
-function rememberSweep(modelId: string, workerName: string, sweep: Sweep): void {
+function rememberSweep(modelId: string, workerId: string, sweep: Sweep): void {
   try {
-    localStorage.setItem(sweepStorageKey(modelId, workerName), JSON.stringify(sweep));
+    localStorage.setItem(sweepStorageKey(modelId, workerId), JSON.stringify(sweep));
   } catch {
     /* localStorage unavailable (private browsing, quota) -- not worth failing the run over */
   }
@@ -59,8 +63,8 @@ function rememberSweep(modelId: string, workerName: string, sweep: Sweep): void 
 // worker's registered models differ) last model picked *for that worker*.
 const LAST_WORKER_STORAGE_KEY = "llamatoaster:new-run:last-worker";
 
-function lastModelStorageKey(workerName: string): string {
-  return `llamatoaster:new-run:last-model:${workerName}`;
+function lastModelStorageKey(workerId: string): string {
+  return `llamatoaster:new-run:last-model:${workerId}`;
 }
 
 interface LastModelSelection {
@@ -76,26 +80,26 @@ function loadLastWorker(): string | null {
   }
 }
 
-function rememberLastWorker(workerName: string): void {
+function rememberLastWorker(workerId: string): void {
   try {
-    localStorage.setItem(LAST_WORKER_STORAGE_KEY, workerName);
+    localStorage.setItem(LAST_WORKER_STORAGE_KEY, workerId);
   } catch {
     /* localStorage unavailable -- not worth failing over */
   }
 }
 
-function loadLastModel(workerName: string): LastModelSelection | null {
+function loadLastModel(workerId: string): LastModelSelection | null {
   try {
-    const raw = localStorage.getItem(lastModelStorageKey(workerName));
+    const raw = localStorage.getItem(lastModelStorageKey(workerId));
     return raw ? (JSON.parse(raw) as LastModelSelection) : null;
   } catch {
     return null;
   }
 }
 
-function rememberLastModel(workerName: string, selection: LastModelSelection): void {
+function rememberLastModel(workerId: string, selection: LastModelSelection): void {
   try {
-    localStorage.setItem(lastModelStorageKey(workerName), JSON.stringify(selection));
+    localStorage.setItem(lastModelStorageKey(workerId), JSON.stringify(selection));
   } catch {
     /* localStorage unavailable -- not worth failing over */
   }
@@ -211,7 +215,7 @@ export function NewRun() {
   // Qwen-style model with its own metadata.mtp_layers. See the mtp toggle
   // section below for how the two cases are distinguished in the UI.
   const [mtpModelId, setMtpModelId] = useState("");
-  const [workerName, setWorkerName] = useState("");
+  const [workerId, setWorkerId] = useState("");
   const { order: workerOrder, status: workerStatus } = useWorkerStatuses();
   // Raw index into the selected worker's hardware.gpu array (the picker's
   // own display order) -- undefined means "Auto" (let llama.cpp use its own
@@ -287,26 +291,26 @@ export function NewRun() {
   // shows nothing for a worker it couldn't reach).
   const presentModels = useMemo(() => {
     if (!locations) return [];
-    if (workerName) return models.filter((m) => locations[m.id]?.includes(workerName));
+    if (workerId) return models.filter((m) => locations[m.id]?.includes(workerId));
     return models.filter((m) => (locations[m.id]?.length ?? 0) > 0);
-  }, [models, locations, workerName]);
+  }, [models, locations, workerId]);
 
   // Prefer whichever worker was picked last time (if it's still configured);
   // only fall back to auto-picking the sole worker when there's nothing
   // remembered yet.
   useEffect(() => {
-    if (workerName || workerOrder.length === 0) return;
+    if (workerId || workerOrder.length === 0) return;
     const remembered = loadLastWorker();
     if (remembered && workerOrder.includes(remembered)) {
-      setWorkerName(remembered);
+      setWorkerId(remembered);
     } else if (workerOrder.length === 1) {
-      setWorkerName(workerOrder[0]);
+      setWorkerId(workerOrder[0]);
     }
-  }, [workerOrder, workerName]);
+  }, [workerOrder, workerId]);
 
   useEffect(() => {
-    if (workerName) rememberLastWorker(workerName);
-  }, [workerName]);
+    if (workerId) rememberLastWorker(workerId);
+  }, [workerId]);
 
   // A companion model picked for one base model doesn't carry over to a
   // different one -- reset whenever the base model selection changes.
@@ -336,23 +340,23 @@ export function NewRun() {
   // picked something for it in this session.
   const restoredModelForRef = useRef<string | null>(null);
   useEffect(() => {
-    if (!workerName || presentModels.length === 0) return;
-    if (restoredModelForRef.current === workerName) return;
-    restoredModelForRef.current = workerName;
+    if (!workerId || presentModels.length === 0) return;
+    if (restoredModelForRef.current === workerId) return;
+    restoredModelForRef.current = workerId;
     if (modelId) return;
-    const remembered = loadLastModel(workerName);
+    const remembered = loadLastModel(workerId);
     if (!remembered || !presentModels.some((m) => m.id === remembered.modelId)) return;
     const draftId =
       remembered.mtpModelId && presentModels.some((m) => m.id === remembered.mtpModelId)
         ? remembered.mtpModelId
         : undefined;
     handleModelSelect(remembered.modelId, draftId);
-  }, [workerName, presentModels, modelId]);
+  }, [workerId, presentModels, modelId]);
 
   useEffect(() => {
-    if (!workerName || !modelId) return;
-    rememberLastModel(workerName, { modelId, mtpModelId });
-  }, [workerName, modelId, mtpModelId]);
+    if (!workerId || !modelId) return;
+    rememberLastModel(workerId, { modelId, mtpModelId });
+  }, [workerId, modelId, mtpModelId]);
 
   // Hardware/layer-count context for the selected pairing -- drives the
   // GPU-layers and threads sliders below. Best-effort: hardware is only
@@ -397,14 +401,14 @@ export function NewRun() {
   const mtpDraftCandidates = presentModels.filter((m) => isMtpDraftModel(m));
   const showMtpModelPicker = Boolean(modelId);
 
-  const selectedWorker = workerName ? workerStatus[workerName] : undefined;
-  const workerHardware = selectedWorker?.info?.hardware;
-  const workerPlatform = selectedWorker?.info?.platform;
-  const workerDefaultBackend = selectedWorker?.worker.backend;
+  const selectedWorker = workerId ? workerStatus[workerId] : undefined;
+  const workerHardware = selectedWorker?.hardware ?? undefined;
+  const workerPlatform = selectedWorker?.platform ?? undefined;
+  const workerDefaultBackend = selectedWorker?.backend ?? undefined;
   // Prefer the directly-detected GPU list once hardware has loaded; until
-  // then fall back to the worker's configured backend (available instantly --
-  // see WorkerListEntry) since a "cpu" backend build ignores -ngl regardless
-  // of what's physically in the box.
+  // then fall back to the worker's configured backend (already inline on
+  // every Worker, no separate fetch needed) since a "cpu" backend build
+  // ignores -ngl regardless of what's physically in the box.
   const noGpu = workerHardware ? workerHardware.gpu.length === 0 : workerDefaultBackend === "cpu";
   // The full, unfiltered picker -- every physically detected GPU is offered,
   // even ones the worker's current default backend can't see at all (e.g.
@@ -434,7 +438,7 @@ export function NewRun() {
   useEffect(() => {
     setSelectedGpuRawIndex(undefined);
     setGpuOverrideBackend(undefined);
-  }, [workerName]);
+  }, [workerId]);
 
   // llama.cpp's own runtime layer accounting is n_layer + 1 -- it counts the
   // output layer separately from the transformer stack (confirmed live, see
@@ -490,11 +494,11 @@ export function NewRun() {
   // via their "Suggested: X" label/handle position, but nothing is added to
   // the sweep's actual value chips until the user picks a preset or hits Add.
   useEffect(() => {
-    if (!modelId || !workerName) {
+    if (!modelId || !workerId) {
       setSweep(EMPTY_SWEEP);
       return;
     }
-    const remembered = loadRememberedSweep(modelId, workerName);
+    const remembered = loadRememberedSweep(modelId, workerId);
     if (remembered) {
       setSweep(remembered);
       return;
@@ -524,7 +528,7 @@ export function NewRun() {
     // form stays submittable even if MTP/draft never gets touched at all.
     baseSweep.n_gpu_layers_draft = [0];
     setSweep(baseSweep);
-  }, [modelId, workerName, noGpu, nglMax]);
+  }, [modelId, workerId, noGpu, nglMax]);
 
   // Mirrors lookupLayerCount's "only fill in if the user hasn't customized
   // it yet" posture, but automatic rather than button-triggered: fires the
@@ -593,32 +597,28 @@ export function NewRun() {
 
   async function handleSubmit(e: FormEvent) {
     e.preventDefault();
-    if (!modelId || !workerName) {
+    if (!modelId || !workerId) {
       setMsg("Pick a model and a worker first");
       return;
     }
     setSubmitting(true);
-    // If the worker has no active llama.cpp build, the server activates the
-    // latest installed one or downloads+installs the latest available
-    // release before this resolves -- a fresh worker can take a few minutes
-    // here rather than the usual instant round trip.
-    setMsg("Triggering… (can take a few minutes if a llama.cpp build needs to be installed first)");
+    setMsg("Queuing…");
     try {
       const run = await api.triggerRun({
         model_id: modelId,
-        worker_name: workerName,
+        worker_id: workerId,
         mtp_model_id: mtpModelId || undefined,
         main_gpu: mainGpuForSubmit,
         main_gpu_backend: gpuOverrideBackend,
         sweep,
       });
-      rememberSweep(modelId, workerName, sweep);
+      rememberSweep(modelId, workerId, sweep);
       setLastRunId(run.id);
-      // The server queues a trigger instead of rejecting it when the target
-      // worker already has a run in flight (or already has a queue) -- see
-      // server/src/routes/runs.ts's dispatchScheduledRun -- so this can come
-      // back "scheduled" rather than "running" even on success.
-      setMsg(run.status === "scheduled" ? "Run scheduled ✓" : "Triggered ✓");
+      // Every trigger comes back 'scheduled' now -- it only flips to
+      // 'running' once the worker actually claims the job off its queue
+      // (MULTIUSER_PLAN.md §1.12/§1.13), which can take up to one queue-poll
+      // cycle even for an idle machine.
+      setMsg("Run scheduled ✓");
     } catch (err) {
       setMsg(`Error: ${err instanceof Error ? err.message : String(err)}`);
     } finally {
@@ -642,16 +642,16 @@ export function NewRun() {
           <label className="flex flex-col gap-1.5 text-sm">
             <span className="text-muted">Worker</span>
             <select
-              value={workerName}
-              onChange={(e) => setWorkerName(e.target.value)}
+              value={workerId}
+              onChange={(e) => setWorkerId(e.target.value)}
               className={`${inputCls} w-48`}
             >
               <option value="" disabled>
                 select…
               </option>
-              {workerOrder.map((name) => (
-                <option key={name} value={name}>
-                  {name}
+              {workerOrder.map((id) => (
+                <option key={id} value={id}>
+                  {workerStatus[id]?.displayName ?? id}
                 </option>
               ))}
             </select>
@@ -746,10 +746,10 @@ export function NewRun() {
           )}
         </div>
 
-        {workerName && unreachableLocationWorkers.includes(workerName) && (
+        {workerId && unreachableLocationWorkers.includes(workerId) && (
           <p className="-mt-2 text-xs text-warning">
-            Couldn't check what's on {workerName} -- its models aren't shown below until that's confirmed,
-            even if they're actually still there.
+            Couldn't check what's on {selectedWorker?.displayName ?? "this machine"} -- its models aren't shown
+            below until that's confirmed, even if they're actually still there.
           </p>
         )}
 

@@ -1,15 +1,22 @@
 import type { FastifyInstance } from "fastify";
 import { v4 as uuid } from "uuid";
+import { mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
+import { join } from "node:path";
 import { repo } from "../db/repo.js";
+import { queueEvents } from "../queue-events.js";
+import { safeEqual, hashToken } from "../session.js";
+import { userOrIpKeyGenerator, resolveAuthUser, assertOwnsWorker } from "../auth-middleware.js";
+import { BadRequestError, ConflictError, ForbiddenError, NotFoundError, UnauthorizedError } from "../errors.js";
 import type {
   TriggerPayload,
   Run,
   RunConfig,
   Backend,
   RunItemUpdateInput,
-  InstalledBuild,
-  LlamaCppRelease,
   Model,
+  Worker,
+  InstallBuildJobPayload,
+  BenchmarkJob,
 } from "../../../shared/types.js";
 import {
   isTerminalRunItemInput,
@@ -19,18 +26,7 @@ import {
   GPU_MEMORY_MEASUREMENT_SOURCES,
 } from "../../../shared/types.js";
 import { expandSweep } from "../../../shared/sweep.js";
-import { getWorkerForRun, getDefaultWorker, type WorkerDef } from "../config.js";
-import { describeWorkerError } from "../worker-errors.js";
 import { getReleases, filterReleasesForWorker, assetMatchesWorker } from "../github-releases.js";
-
-// The worker now acks /run as soon as it validates the request and kicks the
-// benchmark off in the background (see worker/src/index.ts) rather than
-// blocking until the whole thing finishes, so this only needs to cover a
-// normal request/response round trip -- not the bench's own duration, which
-// is governed entirely by the worker's own bench_timeout_ms instead.
-const TRIGGER_FETCH_TIMEOUT_MS = Number(
-  process.env.TRIGGER_TIMEOUT_MS ?? 20_000
-);
 
 const NUMERIC_SWEEP_FIELDS = [
   "n_prompt",
@@ -237,170 +233,52 @@ function validateRunItemUpdate(payload: unknown): string | null {
   return null;
 }
 
-const WORKER_HEALTH_TIMEOUT_MS = 5_000;
-const LLAMA_CPP_INFO_TIMEOUT_MS = 10_000;
-const BUILD_ACTIVATE_TIMEOUT_MS = 15_000;
-// Matches workers.ts's WORKER_INSTALL_TIMEOUT_MS -- a real llama.cpp release
-// archive download+extract can legitimately take minutes.
-const BUILD_INSTALL_TIMEOUT_MS = 10 * 60 * 1000;
+type ResolvedBuild =
+  | { tag: string; deviceName?: string; alreadyInstalled: true }
+  | { tag: string; deviceName?: string; alreadyInstalled: false; installPayload: InstallBuildJobPayload }
+  | { error: string };
 
-// deviceName is the Tier-1 backend_device_name fallback (see shared/types.ts's
-// Run.backend_device_name) -- always sourced from the one /health fetch at
-// the top of ensureActiveBuild below, which runs before any of its 3 return
-// paths branch, so all 3 carry it through rather than just the fast path.
-type BuildResolution = { build: string; backend: Backend; deviceName?: string } | { error: string };
-
-async function activateOnWorker(worker: WorkerDef, tag: string): Promise<{ ok: true } | { error: string }> {
-  try {
-    const res = await fetch(`${worker.url}/llama-cpp/activate`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ tag }),
-      signal: AbortSignal.timeout(BUILD_ACTIVATE_TIMEOUT_MS),
-    });
-    if (!res.ok) {
-      const text = await res.text();
-      return { error: `failed to activate llama.cpp ${tag}: ${res.status} ${text}` };
-    }
-    return { ok: true };
-  } catch (err) {
-    return { error: `failed to activate llama.cpp ${tag}: ${describeWorkerError(err)}` };
-  }
-}
-
-// A worker's llama_cpp_build (from config.ts's listWorkers, live off its own
-// /health) can be "unknown" (never successfully probed) or "none" (probed
-// fine, nothing active yet -- fresh install, or its "active" build was
-// deleted), and the Workers page can switch a worker's active build at
-// runtime anyway (see routes/workers.ts). Rather than trusting that
-// possibly-stale snapshot, self-heal at trigger time: activate the most
-// recently installed build if one exists, or download+install+activate the
-// latest available release for this worker's platform/arch/backend if
-// nothing is installed at all. Only a genuinely unreachable worker, a busy
-// worker with no active build, or a worker with no installable release at
-// all should still fail the trigger.
-async function ensureActiveBuild(worker: WorkerDef, mainGpu?: number): Promise<BuildResolution> {
-  let health: { busy?: boolean; active_build?: unknown; backend?: unknown; backend_device_name?: unknown };
-  try {
-    // mainGpu (when this trigger picked a specific GPU) is forwarded as
-    // ?main_gpu= so the worker's own backend_device_name -- see worker/src/
-    // index.ts's backendDeviceName -- is scoped to that exact selection
-    // rather than its generic "first backend-visible device" default.
-    const healthUrl = new URL(`${worker.url}/health`);
-    if (mainGpu != null) healthUrl.searchParams.set("main_gpu", String(mainGpu));
-    const res = await fetch(healthUrl, { signal: AbortSignal.timeout(WORKER_HEALTH_TIMEOUT_MS) });
-    if (!res.ok) throw new Error(`worker responded ${res.status}`);
-    health = (await res.json()) as typeof health;
-  } catch (err) {
-    return { error: describeWorkerError(err) };
-  }
-  const deviceName = typeof health.backend_device_name === "string" ? health.backend_device_name : undefined;
-  if (typeof health.active_build === "string" && typeof health.backend === "string") {
-    return { build: health.active_build, backend: health.backend as Backend, deviceName };
-  }
-  if (health.busy) {
-    return { error: "worker is busy running another benchmark and has no active llama.cpp build" };
+// Resolves which build a run should execute against, reading entirely from
+// the worker's own last-reported state (its heartbeat cache, see
+// repo.workerRepo) instead of a live HTTP round trip -- there is no outbound
+// HTTP to workers anywhere in the server under the pull model
+// (MULTIUSER_PLAN.md §1.12). Matches installed builds by tag/asset name,
+// never by a stored "backend" field on InstalledBuild -- it doesn't exist,
+// see assetMatchesWorker.
+async function resolveBuildForRun(
+  worker: Worker,
+  backend: Backend,
+  mainGpu: number | undefined
+): Promise<ResolvedBuild> {
+  const { platform, arch } = worker;
+  if (!platform || !arch) {
+    // Can't happen once the caller's offline check has passed --
+    // recordHeartbeat always sets platform/arch/hardware together in the
+    // same write. Defensive only.
+    return { error: "worker has not reported its platform/hardware yet" };
   }
 
-  let info: { platform: string; arch: string; backend: Backend; installed: InstalledBuild[]; active_tag: string | null };
-  try {
-    const res = await fetch(`${worker.url}/llama-cpp`, { signal: AbortSignal.timeout(LLAMA_CPP_INFO_TIMEOUT_MS) });
-    if (!res.ok) throw new Error(`worker responded ${res.status}`);
-    info = (await res.json()) as typeof info;
-  } catch (err) {
-    return { error: describeWorkerError(err) };
+  // Tier-1 backend_device_name fallback (see shared/types.ts's
+  // Run.backend_device_name) -- from the worker's own cached hardware, not a
+  // live fetch.
+  let deviceName: string | undefined;
+  if (worker.hardware) {
+    const visible = backendVisibleGpus(worker.hardware.gpu, backend);
+    const picked = mainGpu != null ? visible[mainGpu] : visible[0];
+    deviceName = picked?.model || picked?.vendor || undefined;
   }
 
-  // Worker already sorts `installed` by installed_at descending (see
-  // worker/src/llama-builds.ts's listInstalledBuilds), so [0] is "the
-  // latest downloaded build" with no new sorting logic needed here.
-  if (info.installed.length > 0) {
-    const latest = info.installed[0];
-    const activated = await activateOnWorker(worker, latest.tag);
-    if ("error" in activated) return activated;
-    return { build: latest.tag, backend: info.backend, deviceName };
+  const alreadyInstalled = worker.installedBuilds.find((b) =>
+    assetMatchesWorker(b.asset_name, platform, arch, backend)
+  );
+  if (alreadyInstalled) {
+    return { tag: alreadyInstalled.tag, deviceName, alreadyInstalled: true };
   }
 
-  // Nothing installed at all -- find the latest release with an asset that
-  // actually matches this worker (mirrors WorkerCard.tsx's client-side
-  // filter, which the equivalent computation in workers.ts's GET
-  // /api/workers/:name/llama-cpp route skips -- don't repeat that gap here).
+  // Nothing installed for this backend -- find the latest release with an
+  // asset that actually matches this worker (mirrors WorkerCard.tsx's
+  // client-side filter).
   let releases;
-  try {
-    releases = await getReleases();
-  } catch (err) {
-    return {
-      error: `no llama.cpp build installed on this worker, and GitHub releases are unreachable: ${
-        err instanceof Error ? err.message : String(err)
-      }`,
-    };
-  }
-  const available = filterReleasesForWorker(releases, info.platform, info.arch, worker.backend).filter(
-    (r) => r.assets.length > 0
-  );
-  if (available.length === 0) {
-    return {
-      error: "no llama.cpp build installed on this worker, and no matching release is available to auto-download",
-    };
-  }
-  const release = available[0];
-  const asset = release.assets[0];
-
-  try {
-    const res = await fetch(`${worker.url}/llama-cpp/install`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ tag: release.tag, asset_name: asset.name, download_url: asset.download_url }),
-      signal: AbortSignal.timeout(BUILD_INSTALL_TIMEOUT_MS),
-    });
-    if (!res.ok) {
-      const text = await res.text();
-      return { error: `auto-install of llama.cpp ${release.tag} failed: ${res.status} ${text}` };
-    }
-  } catch (err) {
-    return { error: `auto-install of llama.cpp ${release.tag} failed: ${describeWorkerError(err)}` };
-  }
-
-  const activated = await activateOnWorker(worker, release.tag);
-  if ("error" in activated) return activated;
-  return { build: release.tag, backend: info.backend, deviceName };
-}
-
-// Resolves (installing if necessary) a build for an EXPLICIT backend on a
-// worker, entirely independent of whichever build is that worker's own
-// persisted "active" one -- used only when a run's main_gpu names a GPU the
-// worker's default backend can't see at all (RunConfig.main_gpu_backend,
-// set by client/src/pages/NewRun.tsx's GPU picker once the user confirms
-// the switch). Deliberately never calls activateOnWorker/persists anything:
-// the resolved tag is sent to the worker as a per-run override on the /run
-// payload itself (see sendRunToWorker's main_gpu_build_tag) so this one run
-// can use a different build without touching the worker's own default for
-// every other run -- see ensureActiveBuild's self-heal above for why
-// "activate whatever the worker considers current" is right there but wrong
-// here.
-async function ensureBuildForBackend(
-  worker: WorkerDef,
-  backend: Backend
-): Promise<{ tag: string } | { error: string }> {
-  let info: { platform: string; arch: string; installed: InstalledBuild[] };
-  try {
-    const res = await fetch(`${worker.url}/llama-cpp`, { signal: AbortSignal.timeout(LLAMA_CPP_INFO_TIMEOUT_MS) });
-    if (!res.ok) throw new Error(`worker responded ${res.status}`);
-    info = (await res.json()) as typeof info;
-  } catch (err) {
-    return { error: describeWorkerError(err) };
-  }
-
-  // Already installed under some other tag? Matched the same way the
-  // "Available to install" list itself is filtered (assetMatchesWorker),
-  // just against what's already on disk instead of GitHub's release list --
-  // no need to download again just because it isn't the "active" one.
-  const alreadyInstalled = info.installed.find((b) =>
-    assetMatchesWorker(b.asset_name, info.platform, info.arch, backend)
-  );
-  if (alreadyInstalled) return { tag: alreadyInstalled.tag };
-
-  let releases: LlamaCppRelease[];
   try {
     releases = await getReleases();
   } catch (err) {
@@ -410,194 +288,51 @@ async function ensureBuildForBackend(
       }`,
     };
   }
-  const matching = filterReleasesForWorker(releases, info.platform, info.arch, backend).filter(
-    (r) => r.assets.length > 0
-  );
+  const matching = filterReleasesForWorker(releases, platform, arch, backend).filter((r) => r.assets.length > 0);
   if (matching.length === 0) {
-    return { error: `no installable llama.cpp release found for backend "${backend}" on ${info.platform}/${info.arch}` };
+    return { error: `no installable llama.cpp release found for backend "${backend}" on ${platform}/${arch}` };
   }
   const release = matching[0];
   const asset = release.assets[0];
-
-  try {
-    const res = await fetch(`${worker.url}/llama-cpp/install`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ tag: release.tag, asset_name: asset.name, download_url: asset.download_url }),
-      signal: AbortSignal.timeout(BUILD_INSTALL_TIMEOUT_MS),
-    });
-    if (!res.ok) {
-      const text = await res.text();
-      return { error: `install of llama.cpp ${release.tag} (${backend}) failed: ${res.status} ${text}` };
-    }
-  } catch (err) {
-    return { error: `install of llama.cpp ${release.tag} (${backend}) failed: ${describeWorkerError(err)}` };
-  }
-  return { tag: release.tag };
+  return {
+    tag: release.tag,
+    deviceName,
+    alreadyInstalled: false,
+    installPayload: { tag: release.tag, asset_name: asset.name, download_url: asset.download_url },
+  };
 }
 
-// Single entry point both trigger paths (immediate + queued) use to resolve
-// which build/backend a run should actually execute against -- branches
-// between the two resolution strategies above based on RunConfig.main_gpu_
-// backend (unset: the normal "whatever this worker's own default currently
-// is" path; set: this run's GPU pick needs a specific different backend, so
-// resolve+install that instead, without touching the worker's default at
-// all -- see ensureBuildForBackend). isOverride tells the caller whether to
-// forward a per-run build tag to the worker (see sendRunToWorker's
-// mainGpuBackend param) instead of just trusting its already-active build.
-async function resolveRunBuild(
-  worker: WorkerDef,
-  mainGpu: number | undefined,
-  mainGpuBackend: Backend | undefined
-): Promise<(BuildResolution & { isOverride: boolean }) | { error: string }> {
-  if (mainGpuBackend == null) {
-    const live = await ensureActiveBuild(worker, mainGpu);
-    return "error" in live ? live : { ...live, isOverride: false };
-  }
-  const resolved = await ensureBuildForBackend(worker, mainGpuBackend);
-  if ("error" in resolved) return resolved;
-  // Tier-1 backend_device_name (see shared/types.ts's Run.backend_device_name)
-  // for an override run -- ensureActiveBuild's own /health?main_gpu= trick
-  // scopes against the worker's *default* backend's device list, which is
-  // exactly wrong here (this run isn't using that backend at all), so this
-  // fetches /hardware directly instead and applies the same backendVisibleGpus
-  // filter client/src/pages/NewRun.tsx's picker itself used to decide this
-  // GPU needed a switch in the first place. Best-effort, same posture as
-  // ensureActiveBuild's own deviceName -- an unreachable /hardware here
-  // shouldn't fail the whole trigger over a display nicety.
-  let deviceName: string | undefined;
-  try {
-    const res = await fetch(`${worker.url}/hardware`, { signal: AbortSignal.timeout(WORKER_HEALTH_TIMEOUT_MS) });
-    if (res.ok) {
-      const hw = (await res.json()) as { gpu: { vendor: string; model: string }[] };
-      const visible = backendVisibleGpus(hw.gpu, mainGpuBackend);
-      const picked = mainGpu != null ? visible[mainGpu] : visible[0];
-      deviceName = picked?.model || picked?.vendor || undefined;
-    }
-  } catch {
-    /* best-effort */
-  }
-  return { build: resolved.tag, backend: mainGpuBackend, deviceName, isOverride: true };
-}
+// MULTIUSER_PLAN.md §1.10: the worker pushes its per-run log on job
+// completion instead of the server proxying a live GET to the worker's own
+// /logs -- no outbound HTTP to workers anywhere in the server, and the log
+// survives the worker being wiped. Stored gzipped exactly as the worker sent
+// it; served back with Content-Encoding: gzip so the browser decompresses it
+// rather than spending server CPU on it.
+const LOG_DIR = process.env.LOG_DIR ?? join(process.cwd(), "data", "run-logs");
+const MAX_LOG_BYTES = 5 * 1024 * 1024;
 
-type SendRunResult =
-  | { ok: true }
-  // `error`/`detail` are the reply shape a route handler sends straight to
-  // the client; `full` is the more verbose message recorded against every
-  // run_item via repo.failAllRunItems -- kept distinct so the two dispatch
-  // call sites below (an HTTP route with a client waiting, and the
-  // fire-and-forget queue dispatcher below with no client at all) can each
-  // use only the half that applies to them.
-  | { error: string; detail: string; full: string };
-
-// POSTs an already-created run to the worker that should execute it. Shared
-// by the trigger route's immediate-dispatch path and dispatchScheduledRun's
-// queued-run path below -- both create/already have the run+run_items rows
-// and just need this one HTTP round trip to actually kick it off.
-async function sendRunToWorker(
-  worker: WorkerDef,
-  runId: string,
-  model: Model,
-  mtpModel: Model | undefined,
-  sweep: TriggerPayload["sweep"],
-  build: string,
-  backend: Backend,
-  mainGpu: number | undefined,
-  // Set only for a resolveRunBuild override (RunConfig.main_gpu_backend) --
-  // tells the worker's /run handler to resolve `build` from its own
-  // installed-build registry for JUST this run, instead of trusting its
-  // persisted "active" build the way it does for every normal run. See
-  // worker/src/index.ts's /run handler.
-  mainGpuBackend: Backend | undefined
-): Promise<SendRunResult> {
-  try {
-    const res = await fetch(`${worker.url}/run`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        run_id: runId,
-        model_id: model.id,
-        model,
-        mtp_model: mtpModel,
-        main_gpu: mainGpu,
-        main_gpu_backend: mainGpuBackend,
-        sweep,
-        llama_cpp_build: build,
-        llama_cpp_backend: backend,
-      }),
-      signal: AbortSignal.timeout(TRIGGER_FETCH_TIMEOUT_MS),
-    });
-    if (!res.ok) {
-      const text = await res.text();
-      return { error: "worker rejected run", detail: text, full: `worker rejected run: ${res.status} ${text}` };
-    }
-    return { ok: true };
-  } catch (err) {
-    const message = describeWorkerError(err);
-    return { error: "could not reach worker", detail: message, full: message };
-  }
-}
-
-// Called whenever a worker might have just freed up (a run finalized, or a
-// stale "running" row was reconciled away) to see whether anything is
-// waiting behind it in that worker's queue (see repo.hasActiveRunForWorker/
-// getNextScheduledRunForWorker -- a trigger against a busy worker joins a
-// FIFO queue instead of being rejected). Deliberately fire-and-forget from
-// every call site: resolving a build can itself take minutes (installing a
-// fresh llama.cpp release, same as ensureActiveBuild's own doc comment
-// above), which is far too long to hold open the HTTP request that happened
-// to be the one to notice the worker was free.
-async function dispatchScheduledRun(app: FastifyInstance, workerName: string): Promise<void> {
-  const next = repo.getNextScheduledRunForWorker(workerName);
-  if (!next) return;
-  const worker = await getWorkerForRun(workerName);
-  if (!worker) {
-    app.log.error({ run_id: next.id, worker: workerName }, "queued run's worker is no longer configured");
-    repo.failAllRunItems(next.id, `worker "${workerName}" is no longer configured`);
-    return;
-  }
-  const model = repo.getModel(next.config.model_id);
-  if (!model) {
-    app.log.error({ run_id: next.id, model_id: next.config.model_id }, "queued run's model no longer exists");
-    repo.failAllRunItems(next.id, "model this run was queued for no longer exists");
-    return;
-  }
-  const mtpModel = next.config.mtp_model_id ? repo.getModel(next.config.mtp_model_id) : undefined;
-
-  const live = await resolveRunBuild(worker, next.config.main_gpu, next.config.main_gpu_backend);
-  if ("error" in live) {
-    app.log.error({ run_id: next.id, worker: workerName, error: live.error }, "queued run dispatch failed");
-    repo.failAllRunItems(next.id, live.error);
-    return;
-  }
-  repo.markRunRunning(next.id, {
-    llama_cpp_build: live.build,
-    llama_cpp_backend: live.backend,
-    backend_device_name: live.deviceName,
-    started_at: Date.now(),
-  });
-  app.log.info({ run_id: next.id, worker: workerName, build: live.build }, "queued run dispatching");
-
-  const sent = await sendRunToWorker(
-    worker,
-    next.id,
-    model,
-    mtpModel,
-    next.config.sweep,
-    live.build,
-    live.backend,
-    next.config.main_gpu,
-    live.isOverride ? live.backend : undefined
-  );
-  if ("error" in sent) {
-    app.log.error({ run_id: next.id, worker: workerName, error: sent.full }, "queued run rejected by worker");
-    repo.failAllRunItems(next.id, sent.full);
-  }
+function runLogPath(runId: string): string {
+  // Run ids are server-generated UUIDs (see createRun's uuid()), never
+  // user-controlled path segments -- no traversal risk from this value, but
+  // the param still comes off the URL, so it's validated as a run id (an
+  // existing `runs` row) before ever reaching this function regardless.
+  return join(LOG_DIR, `run-${runId}.log.gz`);
 }
 
 export async function runsRoutes(app: FastifyInstance): Promise<void> {
-  app.get("/api/runs", async () => {
-    return { runs: repo.listRuns() };
+  // Raw gzip bytes, not JSON -- Fastify has no built-in parser for this
+  // content type. Scoped to this plugin's own routes only (Fastify's
+  // content-type parsers are subject to the same encapsulation as routes).
+  app.addContentTypeParser("application/octet-stream", { parseAs: "buffer" }, (_req, body, done) => {
+    done(null, body);
+  });
+
+  app.get("/api/runs", async (request) => {
+    // Multi-user Stage 4 (MULTIUSER_PLAN.md §4.3): scoped to the caller's own
+    // runs once authenticated; every run in single-tenant mode (AUTH_ENABLED
+    // off), unchanged from before this scoping existed.
+    const authed = resolveAuthUser(request);
+    return { runs: repo.listRuns(authed?.user.id) };
   });
 
   app.get<{ Params: { id: string } }>(
@@ -608,92 +343,97 @@ export async function runsRoutes(app: FastifyInstance): Promise<void> {
     // these instead and reports volume once a minute.
     { logLevel: "silent" },
     async (request, reply) => {
-      const data = repo.getRunWithResults(request.params.id);
+      const authed = resolveAuthUser(request);
+      const data = repo.getRunWithResults(authed?.user.id, request.params.id);
       if (!data) return reply.code(404).send({ error: "run not found" });
-      // Best-effort: only meaningful while the run is actually in flight, and
-      // a worker that's slow or unreachable shouldn't block viewing the rest
-      // of the run's data -- same posture as workers.ts's other diagnostic
-      // /health reads.
-      let paused: boolean | undefined;
-      if (data.run.status === "running") {
-        const worker = await getWorkerForRun(data.run.worker_name);
-        if (worker) {
-          try {
-            const res = await fetch(`${worker.url}/health`, { signal: AbortSignal.timeout(WORKER_HEALTH_TIMEOUT_MS) });
-            if (res.ok) {
-              const health = (await res.json()) as {
-                paused?: unknown;
-                busy?: unknown;
-                current_run?: { run_id?: unknown } | null;
-              };
-              if (typeof health.paused === "boolean") paused = health.paused;
-
-              // The worker has no persistent state of its own -- a restart
-              // (crash, manual, pm2) or an exhausted safeItemTerminal retry
-              // on the run's last item (see worker/src/index.ts) can leave
-              // this row "running" forever with the worker no longer aware
-              // of it at all. Reconcile against what the worker actually
-              // reports rather than trusting our own stale row.
-              const workerRunId =
-                health.current_run && typeof health.current_run === "object"
-                  ? (health.current_run as { run_id?: unknown }).run_id
-                  : undefined;
-              const staleAgainstWorker =
-                health.busy === false || (typeof workerRunId === "string" && workerRunId !== data.run.id);
-              if (staleAgainstWorker) {
-                const reconciled = repo.reconcileStaleRun(data.run.id, "worker lost track of run");
-                if (reconciled) {
-                  data.run = reconciled;
-                  data.items = repo.getRunItems(data.run.id);
-                  paused = undefined;
-                  // This worker just turned out to be free -- give its
-                  // queue a chance too, same as the normal finalize path
-                  // below (a run stuck "running" forever with nothing ever
-                  // reaching the terminal item-update route would otherwise
-                  // never unblock whatever's queued behind it).
-                  void dispatchScheduledRun(app, reconciled.worker_name);
-                }
-              }
-            }
-          } catch {
-            /* worker unreachable -- leave paused undefined and don't reconcile,
-               a transient network blip shouldn't cancel a run that's actually
-               still running fine */
-          }
-        }
-      }
+      // No live worker probe anymore -- liveness/staleness are handled
+      // server-side now: a dead worker's claimed job is caught by the lease
+      // reaper (index.ts's reapExpiredLeases), not by this route reaching
+      // out on every poll. `paused` reflects the same per-worker flag the
+      // heartbeat handler delivers control from (MULTIUSER_PLAN.md §1.6/§1.7/§1.14).
+      const paused =
+        data.run.status === "running" && data.run.worker_id
+          ? repo.workerRepo.getPauseRequested(data.run.worker_id)
+          : undefined;
       return { ...data, paused };
     }
   );
 
-  // Thin proxy to the worker's own dedicated per-run log file (see
-  // worker/src/index.ts's setRunLogFile/GET /logs) -- structured build/
-  // hardware/OS header, one line per test+repeat, and an end-of-run
-  // completed/failed/cancelled summary. Surfaced in RunDetail.tsx next to
-  // the CSV export whenever a run has at least one failed test.
+  // Reads the log the worker pushed on job completion (POST below) -- no
+  // outbound call to any worker. 404 both when the run doesn't exist and
+  // when it exists but never got a log pushed (a run that failed before
+  // producing one, or predates this feature).
   app.get<{ Params: { id: string } }>("/api/runs/:id/log", async (request, reply) => {
-    const data = repo.getRunWithResults(request.params.id);
-    if (!data) return reply.code(404).send({ error: "run not found" });
-    const worker = await getWorkerForRun(data.run.worker_name);
-    if (!worker) return reply.code(404).send({ error: "worker not found for this run" });
-    try {
-      const res = await fetch(`${worker.url}/logs?run_id=${encodeURIComponent(data.run.id)}`, {
-        signal: AbortSignal.timeout(WORKER_HEALTH_TIMEOUT_MS),
-      });
-      if (res.status === 404) return reply.code(404).send({ error: "no log file for this run" });
-      if (!res.ok) throw new Error(`worker responded ${res.status}`);
-      const text = await res.text();
-      reply.header("content-type", "text/plain; charset=utf-8");
-      reply.header("content-disposition", `attachment; filename="run-${data.run.id}.log"`);
-      return text;
-    } catch (err) {
-      return reply.code(502).send({ error: describeWorkerError(err) });
-    }
+    const authed = resolveAuthUser(request);
+    const run = repo.getRun(authed?.user.id, request.params.id);
+    if (!run) return reply.code(404).send({ error: "run not found" });
+    const path = runLogPath(run.id);
+    if (!existsSync(path)) return reply.code(404).send({ error: "no log file for this run" });
+    const gzipped = readFileSync(path);
+    reply.header("content-type", "text/plain; charset=utf-8");
+    reply.header("content-encoding", "gzip");
+    reply.header("content-disposition", `attachment; filename="run-${run.id}.log"`);
+    return reply.send(gzipped);
   });
+
+  // Worker -> server push of a completed run's log file (MULTIUSER_PLAN.md
+  // §1.10). Dual-mode worker auth (Stage 3 session first, Stage 1 shared
+  // secret as fallback -- same posture as worker-auth.ts's authenticateWorker,
+  // MULTIUSER_PLAN.md §3.4/§4.3) duplicated inline rather than calling that
+  // function directly: it expects to read machine_id out of a JSON req.body,
+  // but this route's body is raw gzip bytes, so the shared-secret fallback
+  // here resolves the machine from the X-Machine-Id header instead.
+  app.post<{ Params: { id: string } }>(
+    "/api/runs/:id/log",
+    { bodyLimit: MAX_LOG_BYTES },
+    async (request, reply) => {
+      const auth = request.headers.authorization;
+      const token = auth?.startsWith("Bearer ") ? auth.slice("Bearer ".length) : undefined;
+      if (!token) throw new UnauthorizedError("missing worker token");
+
+      let worker: Worker | undefined;
+      const session = repo.sessionRepo.getByTokenHash(hashToken(token));
+      if (session && session.expiresAt >= Date.now() && session.isWorker && session.workerId) {
+        worker = repo.workerRepo.getWorker(session.workerId);
+      }
+      if (!worker) {
+        const expected = process.env.WORKER_SHARED_TOKEN;
+        if (!expected || !safeEqual(token, expected)) throw new UnauthorizedError("invalid worker token");
+        const machineId = request.headers["x-machine-id"];
+        if (typeof machineId !== "string" || !machineId) {
+          throw new BadRequestError("X-Machine-Id header is required");
+        }
+        worker = repo.workerRepo.getByMachineId(machineId);
+        if (!worker) throw new UnauthorizedError("unknown machine");
+      }
+
+      const run = repo.getRun(undefined, request.params.id);
+      if (!run) throw new NotFoundError("run not found");
+      if (run.worker_id !== worker.id) {
+        throw new ForbiddenError("this machine did not execute this run");
+      }
+
+      const body = request.body;
+      if (!Buffer.isBuffer(body) || body.length === 0) {
+        throw new BadRequestError("request body must be non-empty gzip bytes");
+      }
+      mkdirSync(LOG_DIR, { recursive: true });
+      writeFileSync(runLogPath(run.id), body);
+      return reply.code(200).send({ ok: true });
+    }
+  );
 
   app.post<{ Body: TriggerPayload }>(
     "/api/runs/trigger",
+    // §2.6: 30/hour, keyed on user (falls back to IP when AUTH_ENABLED is
+    // off / caller has no session -- there's no user to attribute it to yet).
+    { config: { rateLimit: { max: 30, timeWindow: "1 hour", keyGenerator: userOrIpKeyGenerator } } },
     async (request, reply) => {
+      // Multi-user Stage 4 (MULTIUSER_PLAN.md §4.3): the run's owner. undefined
+      // in single-tenant mode (AUTH_ENABLED off), matching every other
+      // scoped call in this route.
+      const authed = resolveAuthUser(request);
+      const userId = authed?.user.id;
       const body = request.body;
       if (!body || !body.model_id || !body.sweep) {
         return reply.code(400).send({ error: "model_id and sweep are required" });
@@ -763,76 +503,44 @@ export async function runsRoutes(app: FastifyInstance): Promise<void> {
         }
       }
 
-      const requestedWorkerName = resolveWorkerName(body.worker_name);
-      const worker = requestedWorkerName
-        ? await getWorkerForRun(requestedWorkerName)
-        : await getDefaultWorker();
-      if (!worker) {
-        request.log.warn(
-          { worker_name: requestedWorkerName },
-          "run trigger rejected: unknown or unconfigured worker"
-        );
-        return reply.code(400).send({
-          error: requestedWorkerName
-            ? `unknown worker: ${requestedWorkerName}`
-            : "no workers configured",
-        });
+      if (!body.worker_id) {
+        return reply.code(400).send({ error: "worker_id is required" });
       }
-      // A worker only ever runs one benchmark at a time (see worker/src/
-      // index.ts's `busy` flag) -- rather than rejecting this trigger
-      // outright the way a direct hit against a busy worker's own /run
-      // would, queue it: create the run/run_items rows now (so the UI can
-      // show it immediately) with status 'scheduled', skip contacting the
-      // worker or resolving a build (both are only meaningful once this
-      // run's turn actually comes), and let dispatchScheduledRun pick it up
-      // once whatever's ahead of it on this worker finishes. Checking DB
-      // state (not the worker's live /health) also naturally chains: a
-      // second trigger against an already-queued worker queues behind the
-      // first, giving a real FIFO instead of just one deep.
-      if (repo.hasActiveRunForWorker(worker.name)) {
-        const scheduledRun: Run = {
-          id: uuid(),
-          worker_name: worker.name,
-          llama_cpp_build: worker.llama_cpp_build,
-          llama_cpp_backend: worker.backend,
-          model_id: body.model_id,
-          config: {
-            model_id: body.model_id,
-            mtp_model_id: mtpModel?.id,
-            main_gpu: body.main_gpu,
-            main_gpu_backend: body.main_gpu_backend,
-            sweep: body.sweep,
-          } as RunConfig,
-          status: "scheduled",
-          started_at: Date.now(),
-        };
-        repo.createRun(scheduledRun);
-        repo.createRunItems(scheduledRun.id, expandSweep(body.sweep));
-        request.log.info(
-          { run_id: scheduledRun.id, worker: worker.name, model_id: body.model_id },
-          "run scheduled: worker busy"
-        );
-        return reply.code(201).send({ run: scheduledRun });
+      const worker = repo.workerRepo.getWorker(body.worker_id);
+      if (!worker) {
+        request.log.warn({ worker_id: body.worker_id }, "run trigger rejected: unknown machine");
+        throw new BadRequestError("unknown machine");
+      }
+      assertOwnsWorker(userId, worker.id);
+      if (worker.status === "offline") {
+        request.log.warn({ worker_id: worker.id }, "run trigger rejected: machine offline");
+        throw new ConflictError("that machine is offline -- start the worker and try again");
       }
 
-      const live = await resolveRunBuild(worker, body.main_gpu, body.main_gpu_backend);
-      if ("error" in live) {
-        request.log.warn(
-          { worker: worker.name, model_id: body.model_id, error: live.error },
-          "run trigger rejected: could not ensure an active llama.cpp build"
-        );
-        return reply.code(502).send({ error: live.error });
+      const targetBackend: Backend | null = body.main_gpu_backend ?? worker.backend;
+      if (!targetBackend) {
+        throw new BadRequestError("worker has not reported a backend yet");
       }
-      request.log.debug(
-        { worker: worker.name, model_id: body.model_id, sweep: body.sweep, build: live.build },
-        "trigger requested"
-      );
+
+      // Resolved ONCE, from the worker's own cached state -- no live HTTP
+      // round trip (MULTIUSER_PLAN.md §1.12).
+      const resolved = await resolveBuildForRun(worker, targetBackend, body.main_gpu);
+      if ("error" in resolved) {
+        request.log.warn(
+          { worker: worker.id, model_id: body.model_id, error: resolved.error },
+          "run trigger rejected: could not resolve a llama.cpp build"
+        );
+        throw new BadRequestError(resolved.error);
+      }
+
+      // EXPLICIT field list -- never spread the request body into an insert.
       const run: Run = {
         id: uuid(),
-        worker_name: worker.name,
-        llama_cpp_build: live.build,
-        llama_cpp_backend: live.backend,
-        backend_device_name: live.deviceName,
+        worker_id: worker.id,
+        worker_name: worker.displayName, // point-in-time snapshot; the export reads this directly
+        llama_cpp_build: resolved.tag,
+        llama_cpp_backend: targetBackend,
+        backend_device_name: resolved.deviceName,
         model_id: body.model_id,
         config: {
           model_id: body.model_id,
@@ -841,34 +549,40 @@ export async function runsRoutes(app: FastifyInstance): Promise<void> {
           main_gpu_backend: body.main_gpu_backend,
           sweep: body.sweep,
         } as RunConfig,
-        status: "running",
+        // Flipped to 'running' by queueRepo.claimNextJob once the worker
+        // actually claims the benchmark job (MULTIUSER_PLAN.md §1.13) --
+        // never here, regardless of whether the worker is currently idle or
+        // busy with something else. The worker_jobs queue is what serializes
+        // execution now; there's no more "queue in the DB if busy" branch.
+        status: "scheduled",
         started_at: Date.now(),
       };
-      repo.createRun(run);
+      repo.createRun(userId, run);
       const items = expandSweep(body.sweep);
-      repo.createRunItems(run.id, items);
+      repo.createRunItems(userId, run.id, items);
       request.log.info(
-        { run_id: run.id, worker: worker.name, model_id: body.model_id, items: items.length },
+        { run_id: run.id, worker: worker.id, model_id: body.model_id, items: items.length },
         "run created"
       );
 
-      const sent = await sendRunToWorker(
-        worker,
-        run.id,
-        model,
-        mtpModel,
-        body.sweep,
-        live.build,
-        live.backend,
-        body.main_gpu,
-        live.isOverride ? live.backend : undefined
-      );
-      if ("error" in sent) {
-        request.log.error({ run_id: run.id, error: sent.full }, "worker rejected run");
-        repo.failAllRunItems(run.id, sent.full);
-        return reply.code(502).send({ error: sent.error, detail: sent.detail });
+      if (!resolved.alreadyInstalled) {
+        repo.queueRepo.enqueueJob(worker.id, {
+          type: "install_build",
+          payload: resolved.installPayload,
+          runId: run.id,
+        });
       }
-      request.log.debug({ run_id: run.id }, "worker accepted run, items reporting individually");
+      const benchmarkPayload: BenchmarkJob = {
+        run_id: run.id,
+        model,
+        mtp_model: mtpModel,
+        sweep: body.sweep,
+        main_gpu: body.main_gpu,
+        llama_cpp_build: resolved.tag,
+        llama_cpp_backend: targetBackend,
+      };
+      repo.queueRepo.enqueueJob(worker.id, { type: "benchmark", payload: benchmarkPayload, runId: run.id });
+      queueEvents.emit(worker.id);
 
       return reply.code(201).send({ run });
     }
@@ -880,6 +594,18 @@ export async function runsRoutes(app: FastifyInstance): Promise<void> {
   // best-effort progress tick (loading/processing/generating/benchmarking)
   // and a terminal outcome (done/failed/failed_oom) -- discriminated by
   // `status`, matching shared/types.ts's RunItemTickInput/RunItemTerminalInput.
+  //
+  // Multi-user Stage 4 fix (MULTIUSER_PLAN.md §4.3): this route had NO worker
+  // authentication at all before this -- not /api/worker/*-prefixed, not in
+  // PUBLIC_PATHS, not in WORKER_AUTHENTICATED_ROUTES, so any caller (or, once
+  // AUTH_ENABLED ships, any logged-in user) could report fabricated results
+  // against any run. Dual-mode like the /log route above: a Stage 3 session
+  // resolves a specific worker.id directly; the Stage 1 shared-secret
+  // fallback trusts the RUN's own worker_id instead of requiring a
+  // machine_id in this route's tick/terminal payload (RunItemUpdateInput has
+  // no such field, and never did) -- the same "the shared secret means SOME
+  // worker" trust model Stage 1 already had everywhere else, just now
+  // actually checked here too.
   app.post<{ Params: { id: string; idx: string }; Body: RunItemUpdateInput }>(
     "/api/runs/:id/items/:idx",
     // Same rationale as GET /api/runs/:id above -- the worker ticks this
@@ -894,6 +620,27 @@ export async function runsRoutes(app: FastifyInstance): Promise<void> {
       if (!Number.isInteger(idx) || idx < 0) {
         return reply.code(400).send({ error: "idx must be a non-negative integer" });
       }
+
+      const auth = request.headers.authorization;
+      const token = auth?.startsWith("Bearer ") ? auth.slice("Bearer ".length) : undefined;
+      if (!token) throw new UnauthorizedError("missing worker token");
+
+      const run = repo.getRun(undefined, id);
+      if (!run) return reply.code(404).send({ error: "run not found" });
+
+      let authorizedAsWorkerId: string | null | undefined;
+      const session = repo.sessionRepo.getByTokenHash(hashToken(token));
+      if (session && session.expiresAt >= Date.now() && session.isWorker && session.workerId) {
+        authorizedAsWorkerId = session.workerId;
+      } else {
+        const expected = process.env.WORKER_SHARED_TOKEN;
+        if (!expected || !safeEqual(token, expected)) throw new UnauthorizedError("invalid worker token");
+        authorizedAsWorkerId = run.worker_id;
+      }
+      if (!run.worker_id || authorizedAsWorkerId !== run.worker_id) {
+        throw new ForbiddenError("this machine did not execute this run");
+      }
+
       const validationError = validateRunItemUpdate(request.body);
       if (validationError) {
         app.log.warn(
@@ -909,24 +656,64 @@ export async function runsRoutes(app: FastifyInstance): Promise<void> {
           { run_id: id, idx, status: body.status, error: body.error },
           "item terminal update received"
         );
-        const run = repo.recordRunItemTerminal(id, idx, body);
-        if (!run) return reply.code(404).send({ error: "run not found" });
-        // recordRunItemTerminal only flips the run off 'running' once every
-        // item is terminal -- a status other than 'running' here means this
-        // was the update that just finished the whole run, so this worker
-        // may have something queued behind it (see dispatchScheduledRun).
-        if (run.status !== "running") {
-          void dispatchScheduledRun(app, run.worker_name);
-        }
-        return reply.code(200).send({ ok: true, run_status: run.status });
+        const updatedRun = repo.recordRunItemTerminal(id, idx, body);
+        if (!updatedRun) return reply.code(404).send({ error: "run not found" });
+        // No dispatchScheduledRun anymore -- there's no "next queued run" to
+        // hand off explicitly. The worker's own pull loop just goes back to
+        // long-polling for its next job once this one's execution finishes
+        // (MULTIUSER_PLAN.md §1.9); the queue itself is what serializes it.
+        return reply.code(200).send({ ok: true, run_status: updatedRun.status });
       }
 
       repo.updateRunItemTick(id, idx, body);
       return reply.code(200).send({ ok: true });
     }
   );
-}
 
-function resolveWorkerName(name?: string): string | undefined {
-  return name ?? process.env.DEFAULT_WORKER_NAME ?? undefined;
+  // Target the RUN, not the machine (a change from the old worker-scoped
+  // /api/workers/:name/stop|pause|resume) -- the right shape once one
+  // account owns several machines (MULTIUSER_PLAN.md §1.14).
+  app.post<{ Params: { id: string } }>("/api/runs/:id/stop", async (request, reply) => {
+    const authed = resolveAuthUser(request);
+    const run = repo.getRun(authed?.user.id, request.params.id);
+    if (!run) throw new NotFoundError("run not found");
+
+    const jobs = repo.queueRepo.getNonTerminalJobsForRun(run.id);
+    repo.queueRepo.cancelPendingJobsForRun(run.id); // never-claimed jobs -- nothing to signal, cancel outright
+
+    const worker = run.worker_id ? repo.workerRepo.getWorker(run.worker_id) : undefined;
+    const anyClaimed = jobs.some((j) => j.status === "claimed");
+
+    if (!anyClaimed || !worker || worker.status === "offline") {
+      // Nothing is actually executing (or the machine is unreachable) --
+      // reconcile immediately instead of waiting on a lease/heartbeat that
+      // may never arrive.
+      const reconciled = repo.reconcileStaleRun(authed?.user.id, run.id, "stopped by user");
+      return { run: reconciled ?? run };
+    }
+
+    // Delivered on the worker's next heartbeat (≤10s) -- the UI shows
+    // "stopping…" until the worker's own terminal item reports land.
+    repo.queueRepo.requestCancelForRun(run.id);
+    queueEvents.emit(worker.id);
+    return { run };
+  });
+
+  app.post<{ Params: { id: string } }>("/api/runs/:id/pause", async (request) => {
+    const authed = resolveAuthUser(request);
+    const run = repo.getRun(authed?.user.id, request.params.id);
+    if (!run) throw new NotFoundError("run not found");
+    if (!run.worker_id) throw new ConflictError("run has no assigned machine");
+    repo.workerRepo.setPauseRequested(run.worker_id, true);
+    return { ok: true };
+  });
+
+  app.post<{ Params: { id: string } }>("/api/runs/:id/resume", async (request) => {
+    const authed = resolveAuthUser(request);
+    const run = repo.getRun(authed?.user.id, request.params.id);
+    if (!run) throw new NotFoundError("run not found");
+    if (!run.worker_id) throw new ConflictError("run has no assigned machine");
+    repo.workerRepo.setPauseRequested(run.worker_id, false);
+    return { ok: true };
+  });
 }

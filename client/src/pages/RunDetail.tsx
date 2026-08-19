@@ -20,7 +20,7 @@ import type {
   GpuMemoryAccuracyLevel,
   GpuMemoryMeasurementSource,
   Model,
-  WorkerLlamaCppInfo,
+  Worker,
 } from "../types";
 import { shortId, formatElapsed, formatFlashAttn } from "../utils";
 
@@ -373,10 +373,11 @@ export function RunDetail() {
   const [controlPending, setControlPending] = useState(false);
   const [controlError, setControlError] = useState("");
   // Subheader hardware line (arch/cpu/gpu/os) -- not on Run itself, so
-  // fetched separately from the same per-worker endpoint WorkerCard/NewRun
-  // already use. Best-effort: stays undefined (line just omits those bits)
-  // if the worker's unreachable, same as everywhere else this is fetched.
-  const [workerInfo, setWorkerInfo] = useState<WorkerLlamaCppInfo | undefined>(undefined);
+  // resolved from the same GET /api/workers list WorkerCard/NewRun already
+  // use, matched by run.worker_id. Best-effort: stays undefined (line just
+  // omits those bits) for a run predating worker_id, or whose machine was
+  // since deleted.
+  const [workerInfo, setWorkerInfo] = useState<Worker | undefined>(undefined);
   // Only fetched when a run actually named an MTP draft model -- resolves
   // config.mtp_model_id (an id, not a filename) for the subheader's "draft
   // model: X" bit. The full registry is more than this needs, but there's no
@@ -433,18 +434,18 @@ export function RunDetail() {
   }, [id]);
 
   useEffect(() => {
-    if (!run?.worker_name) return;
+    if (!run?.worker_id) return;
     let cancelled = false;
     api
-      .getWorkerLlamaCpp(run.worker_name)
-      .then((info) => {
-        if (!cancelled) setWorkerInfo(info);
+      .listWorkers()
+      .then((list) => {
+        if (!cancelled) setWorkerInfo(list.find((w) => w.id === run.worker_id));
       })
       .catch(() => {});
     return () => {
       cancelled = true;
     };
-  }, [run?.worker_name]);
+  }, [run?.worker_id]);
 
   useEffect(() => {
     if (!run?.config.mtp_model_id) return;
@@ -466,10 +467,10 @@ export function RunDetail() {
     setControlError("");
     try {
       if (paused) {
-        await api.resumeWorker(run.worker_name);
+        await api.resumeRun(run.id);
         setPaused(false);
       } else {
-        await api.pauseWorker(run.worker_name);
+        await api.pauseRun(run.id);
         setPaused(true);
       }
     } catch (err) {
@@ -488,7 +489,7 @@ export function RunDetail() {
     setControlPending(true);
     setControlError("");
     try {
-      await api.stopWorker(run.worker_name);
+      await api.stopRun(run.id);
     } catch (err) {
       setControlError(err instanceof Error ? err.message : String(err));
     } finally {

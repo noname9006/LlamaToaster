@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState, type KeyboardEvent, type MouseEvent as ReactMouseEvent } from "react";
 import { api } from "../api/client";
 import { streamChatCompletion, type ChatMessage } from "../api/aiChat";
-import { buildContextSnapshot } from "../api/aiContext";
 import {
   deriveTitle,
   loadActiveDialogueId,
@@ -25,22 +24,6 @@ const DEFAULT_WIDTH = 384; // matches the old fixed w-96
 const MIN_WIDTH = 320;
 const MAX_WIDTH = 720;
 const BOTTOM_THRESHOLD_PX = 24;
-
-const SYSTEM_PROMPT =
-  "You are an assistant embedded in LlamaToaster, a local LLM inference benchmarking tool for " +
-  "llama.cpp / llama-bench. Help the user choose llama.cpp parameters (threads, n_gpu_layers, " +
-  "batch/ubatch size, KV cache quantization, flash attention), suggest GGUF models that fit their " +
-  "hardware, and analyze the benchmark data below to say which configuration performs best on " +
-  "their machine(s).\n\n" +
-  "Grounding: you have search_huggingface_gguf_models and list_huggingface_gguf_files tools. Your " +
-  "training data's knowledge of model releases is stale — treat any belief about whether a model " +
-  "exists yet, its parameter count, or its file size as unverified until a tool confirms it this " +
-  "turn. Never say a model \"isn't released yet\" or \"isn't available\" based on memory; search " +
-  "first. If a tool call fails or returns nothing useful, say so plainly instead of falling back to " +
-  "a guess.\n\n" +
-  "Style: keep replies short — a few sentences or a short bullet list. Don't use a markdown table " +
-  "unless the user is comparing multiple options side by side or explicitly asks for one. Skip " +
-  "preamble and caveats; lead with the answer.";
 
 const EXAMPLE_PROMPTS = [
   "Which of my models runs fastest, and with what settings?",
@@ -81,8 +64,6 @@ export function ChatPanel() {
   const [overlay, setOverlay] = useState<"history" | "memory" | null>(null);
   const [draft, setDraft] = useState("");
   const [streaming, setStreaming] = useState(false);
-  const [context, setContext] = useState<string | null>(null);
-  const [contextLoading, setContextLoading] = useState(false);
   const [isAtBottom, setIsAtBottom] = useState(true);
   const abortRef = useRef<AbortController | null>(null);
   const listRef = useRef<HTMLDivElement>(null);
@@ -185,30 +166,6 @@ export function ChatPanel() {
     };
   }, [resizing]);
 
-  async function refreshContext() {
-    setContextLoading(true);
-    try {
-      setContext(await buildContextSnapshot());
-    } catch {
-      setContext("(context unavailable — couldn't reach LlamaToaster's own API)");
-    } finally {
-      setContextLoading(false);
-    }
-  }
-
-  // Pulls a fresh hardware/models/results snapshot the first time the panel
-  // is actually opened (not on app load) -- cheap per open, avoids a
-  // background fetch burst for a panel that's collapsed by default.
-  useEffect(() => {
-    if (open && configured && context === null && !contextLoading) {
-      void refreshContext();
-    }
-    // context/contextLoading deliberately excluded: this effect only reacts
-    // to the panel opening or the assistant becoming configured, not to the
-    // context fetch it itself triggers.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, configured]);
-
   function patchDialogueMessages(dialogueId: string, updater: (msgs: DisplayMessage[]) => DisplayMessage[]) {
     setDialogues((prev) =>
       prev.map((d) => (d.id === dialogueId ? { ...d, messages: updater(d.messages), updatedAt: Date.now() } : d))
@@ -252,17 +209,25 @@ export function ChatPanel() {
     abortRef.current = controller;
 
     try {
-      let ctx = context;
-      if (ctx === null) {
-        ctx = await buildContextSnapshot().catch(() => "(context unavailable)");
-        setContext(ctx);
-      }
-      const memoryBlock =
+      // The system prompt and hardware/models/results context are now built
+      // server-side on every request (MULTIUSER_PLAN.md §2.7) -- the server
+      // discards any system message a client sends anyway, so this only ever
+      // sent a system role the server would immediately throw away. The
+      // per-user "memory" block stays client-side (it's local browser
+      // storage, not something the server knows about) but is sent as a
+      // plain user message instead, so it can never be mistaken for -- or
+      // override -- a server instruction.
+      const memoryMessage: ChatMessage[] =
         memory.length > 0
-          ? `\n\nThings to remember about this user, persisted across chats:\n${memory.map((m) => `- ${m.text}`).join("\n")}`
-          : "";
+          ? [
+              {
+                role: "user",
+                content: `Things to remember about this user, persisted across chats:\n${memory.map((m) => `- ${m.text}`).join("\n")}`,
+              },
+            ]
+          : [];
       const outgoing: ChatMessage[] = [
-        { role: "system", content: `${SYSTEM_PROMPT}${memoryBlock}\n\n${ctx}` },
+        ...memoryMessage,
         ...history
           .filter((m): m is DisplayMessage & { role: "user" | "assistant" } => m.role !== "error")
           .map((m) => ({ role: m.role, content: m.content })),
@@ -447,26 +412,6 @@ export function ChatPanel() {
             </div>
           ) : (
             <>
-              <div className="flex items-center justify-between gap-2 border-b border-border px-3 py-1.5 text-xs text-muted">
-                <span className="truncate" title={model || undefined}>
-                  {contextLoading
-                    ? "Loading hardware & results…"
-                    : context
-                      ? `Context loaded · ${model}`
-                      : `No context loaded yet · ${model}`}
-                </span>
-                <button
-                  type="button"
-                  onClick={() => void refreshContext()}
-                  disabled={contextLoading}
-                  className="flex shrink-0 items-center gap-1 rounded-md px-1.5 py-0.5 hover:bg-white/5 hover:text-fg disabled:opacity-40"
-                  title="Refresh hardware & results context"
-                >
-                  <IconRefreshCw width={12} height={12} className={contextLoading ? "animate-spin" : ""} />
-                  Refresh
-                </button>
-              </div>
-
               {overlay === "history" ? (
                 <div className="flex min-h-0 flex-1 flex-col overflow-y-auto p-2">
                   {sortedDialogues.length === 0 ? (
