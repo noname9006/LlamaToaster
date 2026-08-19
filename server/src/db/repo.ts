@@ -1,6 +1,8 @@
 import { v4 as uuid } from "uuid";
 import { createHash } from "node:crypto";
 import { getDb } from "./migrate.js";
+import { deriveWorkerStatus, LEASE_MS } from "../liveness.js";
+import { generateSessionId, generateRefreshToken, hashToken } from "../session.js";
 import type {
   Model,
   ModelMetadata,
@@ -14,6 +16,19 @@ import type {
   RunItemTickInput,
   RunItemTerminalInput,
   GpuMemoryAccuracyLevel,
+  Worker,
+  WorkerStatePush,
+  ActiveJobReport,
+  QueueJob,
+  AuthUser,
+  SessionInfo,
+  AdminStats,
+  AdminRunSummary,
+  AdminRunFilters,
+  AdminUserSummary,
+  CommunityAggregateRow,
+  CommunityAggregateFilters,
+  CommunityFacets,
 } from "../../../shared/types.js";
 import type { SweepItem } from "../../../shared/sweep.js";
 
@@ -30,7 +45,14 @@ interface ModelRow {
 
 interface RunRow {
   id: string;
+  // Multi-user Stage 4/5: present on every real row (COLUMN_MIGRATIONS,
+  // §4.1) but deliberately absent from the public Run type mapRun produces
+  // (same "DB-internal only" posture as models.created_by) -- declared here
+  // only because adminRepo.listRuns (§5.1) is the one place that reads it
+  // back out, for cross-tenant display.
+  user_id?: string | null;
   worker_name: string;
+  worker_id: string | null;
   llama_cpp_build: string;
   llama_cpp_backend: string;
   backend_device_name: string | null;
@@ -138,6 +160,152 @@ interface ResultRowRaw {
   created_at: number;
 }
 
+interface WorkerRow {
+  id: string;
+  machine_id: string;
+  display_name: string;
+  backend: string | null;
+  platform: string | null;
+  arch: string | null;
+  hostname: string | null;
+  hardware_json: string | null;
+  installed_builds_json: string | null;
+  model_files_json: string | null;
+  // See WorkerVramInfo's doc comment (shared/types.ts) -- last-reported
+  // free-VRAM reading, updated on every idle heartbeat. Null until the
+  // worker's first idle heartbeat.
+  vram_json: string | null;
+  last_heartbeat_at: number | null;
+  active_job_id: string | null;
+  pause_requested: number;
+  created_at: number;
+  updated_at: number;
+  // Only present when the query joins worker_jobs on active_job_id (see
+  // WORKER_SELECT_SQL below) -- null whenever active_job_id is null, or the
+  // active job is a type with no run_id (install_build/download_model/delete_*).
+  active_job_run_id?: string | null;
+  active_job_progress_json?: string | null;
+  // Multi-user Stage 3 (MULTIUSER_PLAN.md §3.3) -- device-flow enrolment.
+  // Present on every row (SELECT workers.* below) but deliberately NEVER
+  // copied into the public Worker shape by mapWorker: enrolment_code_hash is
+  // a lookup secret like a session token hash, and user_code/expiry/approval
+  // timing have no reason to leak through the general GET /api/workers
+  // listing an already-approved worker's owner sees.
+  user_id: string | null;
+  enrolment_code_hash: string | null;
+  user_code: string | null;
+  enrolment_expires_at: number | null;
+  approved_at: number | null;
+}
+
+// Server-internal shape for the device-flow routes (routes/device.ts) --
+// deliberately narrower than the public Worker type, which never exposes
+// enrolment_code_hash/user_code/user_id/approved_at at all (see WorkerRow's
+// own doc comment above).
+export interface WorkerEnrolment {
+  id: string;
+  userId: string | null;
+  displayName: string;
+  hostname: string | null;
+  platform: string | null;
+  arch: string | null;
+  gpuModel: string | null; // first reported GPU, for the §3.1 confirm card
+  enrolmentExpiresAt: number | null;
+  approvedAt: number | null;
+}
+
+// The richer shape actually stored in workers.model_files_json (see
+// WorkerStatePush.model_files) -- ModelDirFile plus the optional GGUF
+// metadata a worker may have read off the file header. Local to this file;
+// the public Worker.modelFiles type stays the narrower ModelDirFile[].
+interface ModelDirFileMeta {
+  path: string;
+  size_bytes: number;
+  n_layer?: number | null;
+  mtp_layers?: number | null;
+  expert_count?: number | null;
+}
+
+interface WorkerJobRow {
+  id: string;
+  worker_id: string;
+  job_type: string;
+  payload_json: string;
+  status: string;
+  attempts: number;
+  lease_expires_at: number | null;
+  cancel_requested: number;
+  progress_json: string | null;
+  run_id: string | null;
+  created_at: number;
+  claimed_at: number | null;
+  completed_at: number | null;
+  error: string | null;
+}
+
+interface UserRow {
+  id: string;
+  display_name: string | null;
+  avatar_url: string | null;
+  share_benchmarks: number;
+  created_at: number;
+  updated_at: number;
+  last_login_at: number | null;
+}
+
+// Server-internal -- isSuperadmin is NOT a column (MULTIUSER_PLAN.md §5.1),
+// so a row alone can never populate it; every caller that needs a real
+// AuthUser gets this back from getUser with isSuperadmin hardcoded false and
+// is expected to override it (see server/src/auth-middleware.ts), exactly
+// like the plan's own `{ ...user, isSuperadmin }` spread.
+export type UserRecord = AuthUser & { shareBenchmarks: boolean; createdAt: number; updatedAt: number; lastLoginAt: number | null };
+
+interface IdentityRow {
+  id: string;
+  user_id: string;
+  provider: string;
+  provider_user_id: string;
+  provider_login: string | null;
+  created_at: number;
+}
+
+export interface Identity {
+  id: string;
+  userId: string;
+  provider: string;
+  providerUserId: string;
+  providerLogin: string | null;
+  createdAt: number;
+}
+
+interface SessionRow {
+  id: string;
+  user_id: string;
+  token_hash: string;
+  refresh_hash: string | null;
+  prev_refresh_hash: string | null;
+  expires_at: number;
+  is_worker: number;
+  worker_id: string | null;
+  label: string | null;
+  last_seen_at: number | null;
+  created_at: number;
+}
+
+// Server-internal session shape (camelCase) -- the wire-facing SessionInfo
+// (shared/types.ts) is a narrower, non-sensitive subset of this returned
+// only by GET /api/sessions.
+export interface SessionRecord {
+  id: string;
+  userId: string;
+  expiresAt: number;
+  isWorker: boolean;
+  workerId: string | null;
+  label: string | null;
+  lastSeenAt: number | null;
+  createdAt: number;
+}
+
 function mapModel(row: ModelRow): Model {
   return {
     id: row.id,
@@ -155,6 +323,7 @@ function mapRun(row: RunRow): Run {
   return {
     id: row.id,
     worker_name: row.worker_name,
+    worker_id: row.worker_id ?? undefined,
     llama_cpp_build: row.llama_cpp_build,
     llama_cpp_backend: row.llama_cpp_backend as Run["llama_cpp_backend"],
     backend_device_name: row.backend_device_name ?? undefined,
@@ -205,6 +374,109 @@ function mapRunItem(row: RunItemRow): RunItem {
     completed_at: row.completed_at ?? undefined,
   };
 }
+
+function mapUser(row: UserRow): UserRecord {
+  return {
+    id: row.id,
+    displayName: row.display_name,
+    avatarUrl: row.avatar_url,
+    isSuperadmin: false, // always overridden by the caller -- see UserRecord's doc comment
+    shareBenchmarks: row.share_benchmarks === 1,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    lastLoginAt: row.last_login_at,
+  };
+}
+
+function mapIdentity(row: IdentityRow): Identity {
+  return {
+    id: row.id,
+    userId: row.user_id,
+    provider: row.provider,
+    providerUserId: row.provider_user_id,
+    providerLogin: row.provider_login,
+    createdAt: row.created_at,
+  };
+}
+
+function mapSession(row: SessionRow): SessionRecord {
+  return {
+    id: row.id,
+    userId: row.user_id,
+    expiresAt: row.expires_at,
+    isWorker: row.is_worker === 1,
+    workerId: row.worker_id,
+    label: row.label,
+    lastSeenAt: row.last_seen_at,
+    createdAt: row.created_at,
+  };
+}
+
+// Tolerates a corrupt/unexpected JSON blob by falling back to the given
+// default rather than throwing -- a worker-supplied state push is validated
+// before it's ever written (see server/src/validate-worker-state.ts), but a
+// read-side parse failure (a hand-edited DB row, a future format change)
+// should degrade to "nothing reported yet," not take the whole route down.
+function safeParseJson<T>(json: string | null, fallback: T): T {
+  if (!json) return fallback;
+  try {
+    return JSON.parse(json) as T;
+  } catch {
+    return fallback;
+  }
+}
+
+function mapWorker(row: WorkerRow): Worker {
+  return {
+    id: row.id,
+    machineId: row.machine_id,
+    displayName: row.display_name,
+    hostname: row.hostname,
+    backend: row.backend,
+    platform: row.platform,
+    arch: row.arch,
+    hardware: safeParseJson(row.hardware_json, null),
+    installedBuilds: safeParseJson(row.installed_builds_json, []),
+    modelFiles: safeParseJson(row.model_files_json, []),
+    vram: safeParseJson(row.vram_json, null),
+    status: deriveWorkerStatus(row),
+    lastHeartbeatAt: row.last_heartbeat_at,
+    activeJobId: row.active_job_id,
+    activeRunId: row.active_job_run_id ?? undefined,
+    activeJobProgress: row.active_job_progress_json
+      ? safeParseJson<ActiveJobReport | null>(row.active_job_progress_json, null) ?? undefined
+      : undefined,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function mapWorkerEnrolment(row: WorkerRow): WorkerEnrolment {
+  const hardware = safeParseJson<{ gpu?: { model?: string }[] } | null>(row.hardware_json, null);
+  return {
+    id: row.id,
+    userId: row.user_id,
+    displayName: row.display_name,
+    hostname: row.hostname,
+    platform: row.platform,
+    arch: row.arch,
+    gpuModel: hardware?.gpu?.[0]?.model ?? null,
+    enrolmentExpiresAt: row.enrolment_expires_at,
+    approvedAt: row.approved_at,
+  };
+}
+
+// LEFT JOIN so a worker with no active job (the common case) still returns
+// its row -- active_job_run_id/active_job_progress_json are simply null
+// then. Only a 'benchmark' job carries a run_id (MULTIUSER_PLAN.md §1.12's
+// enqueueJob call), so install_build/download_model/etc leave
+// active_job_run_id null even while genuinely active -- the client shows
+// activeJobProgress's phase/bytes for those instead of a run link.
+const WORKER_SELECT_SQL = `
+  SELECT workers.*, wj.run_id AS active_job_run_id, wj.progress_json AS active_job_progress_json
+  FROM workers
+  LEFT JOIN worker_jobs wj ON wj.id = workers.active_job_id
+`;
 
 function safeParseNumberArray(json: string): number[] | undefined {
   try {
@@ -312,21 +584,35 @@ export const repo = {
     return row ? mapModel(row) : undefined;
   },
 
+  // Multi-user Stage 4 (MULTIUSER_PLAN.md §4.4): created_by is set ONLY on
+  // the first insert (never touched by the ON CONFLICT branch, regardless of
+  // who's calling) -- re-registering an existing model never lets a caller
+  // "adopt" one they didn't originally create. The conflict WHERE clause is
+  // the actual ownership enforcement: an unclaimed model (created_by NULL --
+  // single-tenant mode, or a legacy row) stays freely updatable by anyone;
+  // once a model has a real creator, only that same creator's calls may
+  // overwrite filename/hf_repo/hf_file/metadata -- everyone else's identical
+  // upsert-shaped call just silently no-ops instead of erroring (updateModelMetadata
+  // below remains the always-open path for filling in a missing field, e.g.
+  // backfilling n_layer, which isn't an identity field). `IS` rather than
+  // `=` throughout so two NULLs (single-tenant mode on both sides) compare
+  // equal -- plain `=` never does for NULL in SQL.
   registerModel(input: RegisterModelInput): Model {
     const id = input.id ?? deriveModelId(input);
     const now = Date.now();
     const metadata = JSON.stringify(input.metadata ?? {});
     getDb()
       .prepare(
-        `INSERT INTO models (id, filename, size_bytes, source, hf_repo, hf_file, metadata, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO models (id, filename, size_bytes, source, hf_repo, hf_file, metadata, created_by, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
            filename = excluded.filename,
            size_bytes = excluded.size_bytes,
            source = excluded.source,
            hf_repo = excluded.hf_repo,
            hf_file = excluded.hf_file,
-           metadata = excluded.metadata`
+           metadata = excluded.metadata
+         WHERE models.created_by IS NULL OR models.created_by IS excluded.created_by`
       )
       .run(
         id,
@@ -336,6 +622,7 @@ export const repo = {
         input.hf_repo ?? null,
         input.hf_file ?? null,
         metadata,
+        input.created_by ?? null,
         now
       );
     return this.getModel(id)!;
@@ -351,6 +638,18 @@ export const repo = {
     const metadata = JSON.stringify({ ...existing.metadata, ...patch });
     getDb().prepare("UPDATE models SET metadata = ? WHERE id = ?").run(metadata, id);
     return this.getModel(id);
+  },
+
+  // Multi-user Stage 4 (MULTIUSER_PLAN.md §4.4): internal-only read of a
+  // model's creator, for DELETE /api/models/:id's ownership check --
+  // deliberately not part of the public Model type (nothing in the UI needs
+  // it yet). undefined means the model doesn't exist at all, distinct from
+  // null (exists, but unclaimed -- single-tenant mode or a legacy row).
+  getModelCreatedBy(id: string): string | null | undefined {
+    const row = getDb().prepare(`SELECT created_by FROM models WHERE id = ?`).get(id) as
+      | { created_by: string | null }
+      | undefined;
+    return row?.created_by;
   },
 
   // results.model_id is a foreign key (foreign_keys=ON, see migrate.ts) with
@@ -386,7 +685,16 @@ export const repo = {
     return model;
   },
 
-  listRuns(): Run[] {
+  // Multi-user Stage 4 (MULTIUSER_PLAN.md §4.3): userId undefined means
+  // "single-tenant mode" -- either AUTH_ENABLED is off (authMiddleware never
+  // runs, so no route ever has a real req.user to pass) or the caller is
+  // system code with no request/user context at all (the reaper, a worker's
+  // own heartbeat-driven reconciliation). Both cases correctly mean "operate
+  // on every row, not just one user's" -- the `? IS NULL OR ...` clause below
+  // is what makes that a single query instead of two near-duplicate ones.
+  // Once a real userId is passed, this is the actual enforcement: ownership
+  // is checked in SQL, not layered on afterward.
+  listRuns(userId: string | undefined): Run[] {
     const rows = getDb()
       .prepare(
         `SELECT runs.*, m.filename AS model_filename,
@@ -396,13 +704,14 @@ export const repo = {
                 (SELECT COUNT(*) FROM run_items WHERE run_items.run_id = runs.id AND status = 'cancelled') AS items_cancelled
          FROM runs
          LEFT JOIN models m ON m.id = runs.model_id
+         WHERE (? IS NULL OR runs.user_id = ?)
          ORDER BY runs.started_at DESC`
       )
-      .all() as RunRow[];
+      .all(userId ?? null, userId ?? null) as RunRow[];
     return rows.map(mapRun);
   },
 
-  getRun(id: string): Run | undefined {
+  getRun(userId: string | undefined, id: string): Run | undefined {
     const row = getDb()
       .prepare(
         `SELECT runs.*, m.filename AS model_filename,
@@ -412,14 +721,14 @@ export const repo = {
                 (SELECT COUNT(*) FROM run_items WHERE run_items.run_id = runs.id AND status = 'cancelled') AS items_cancelled
          FROM runs
          LEFT JOIN models m ON m.id = runs.model_id
-         WHERE runs.id = ?`
+         WHERE runs.id = ? AND (? IS NULL OR runs.user_id = ?)`
       )
-      .get(id) as RunRow | undefined;
+      .get(id, userId ?? null, userId ?? null) as RunRow | undefined;
     return row ? mapRun(row) : undefined;
   },
 
-  getRunWithResults(id: string): { run: Run; results: ResultRow[]; items: RunItem[] } | undefined {
-    const run = this.getRun(id);
+  getRunWithResults(userId: string | undefined, id: string): { run: Run; results: ResultRow[]; items: RunItem[] } | undefined {
+    const run = this.getRun(userId, id);
     if (!run) return undefined;
     const results = this.getResultsForRun(id);
     const items = this.getRunItems(id);
@@ -445,15 +754,17 @@ export const repo = {
     return rows.map(mapResult);
   },
 
-  createRun(run: Run): void {
+  createRun(userId: string | undefined, run: Run): void {
     getDb()
       .prepare(
-        `INSERT INTO runs (id, worker_name, llama_cpp_build, llama_cpp_backend, backend_device_name, model_id, config, status, error, started_at, completed_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        `INSERT INTO runs (id, user_id, worker_name, worker_id, llama_cpp_build, llama_cpp_backend, backend_device_name, model_id, config, status, error, started_at, completed_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         run.id,
+        userId ?? null,
         run.worker_name,
+        run.worker_id ?? null,
         run.llama_cpp_build,
         run.llama_cpp_backend,
         run.backend_device_name ?? null,
@@ -472,19 +783,20 @@ export const repo = {
   // against -- both sides compute it by calling shared/sweep.ts's
   // expandSweep on the exact same sweep JSON, so there's no separate
   // registration round trip.
-  createRunItems(runId: string, items: SweepItem[]): void {
+  createRunItems(userId: string | undefined, runId: string, items: SweepItem[]): void {
     const database = getDb();
     const insert = database.prepare(
       `INSERT INTO run_items
-         (id, run_id, idx, n_prompt, n_gen, n_threads, n_gpu_layers,
+         (id, run_id, user_id, idx, n_prompt, n_gen, n_threads, n_gpu_layers,
           batch_size, ubatch_size, cache_type_k, cache_type_v, flash_attn, mtp, n_gpu_layers_draft, n_cpu_moe, status)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued')`
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued')`
     );
     const tx = database.transaction((rows: SweepItem[]) => {
       for (const item of rows) {
         insert.run(
           uuid(),
           runId,
+          userId ?? null,
           item.idx,
           item.n_prompt,
           item.n_gen,
@@ -551,8 +863,21 @@ export const repo = {
   // run doesn't exist so the route can 404 instead of silently no-op'ing.
   recordRunItemTerminal(runId: string, idx: number, input: RunItemTerminalInput): Run | undefined {
     const database = getDb();
-    const run = this.getRun(runId);
+    // undefined userId -- this is a worker-authenticated write, not a
+    // browser request; the route verifies worker.id === run.worker_id itself
+    // before ever calling this (MULTIUSER_PLAN.md §4.3's own distinction:
+    // worker-reported writes are authorized by worker identity, not user id).
+    const run = this.getRun(undefined, runId);
     if (!run) return undefined;
+    // The public Run type deliberately doesn't expose user_id (kept
+    // DB-internal, same as models.created_by) -- read it directly so every
+    // `results` row inserted below can be denormalized-stamped with the same
+    // owner as its parent run (§4.3: results.user_id, unlike run_items',
+    // isn't set at creation time -- results rows don't exist until an item
+    // goes terminal, here).
+    const runUserId = (
+      database.prepare(`SELECT user_id FROM runs WHERE id = ?`).get(runId) as { user_id: string | null } | undefined
+    )?.user_id ?? null;
 
     const tx = database.transaction(() => {
       const now = Date.now();
@@ -579,7 +904,7 @@ export const repo = {
       if (input.status === "done" && input.results) {
         const insertResult = database.prepare(
           `INSERT INTO results
-             (id, run_id, idx, model_id, test_type, n_prompt, n_gen, n_threads, n_gpu_layers,
+             (id, run_id, user_id, idx, model_id, test_type, n_prompt, n_gen, n_threads, n_gpu_layers,
               batch_size, ubatch_size, cache_type_k, cache_type_v, flash_attn, mtp, n_gpu_layers_draft, n_cpu_moe,
               avg_tps, stddev_tps, ram_peak_mib, vram_peak_mib,
               ram_avg_mib, vram_avg_mib, ram_free_before_mib, vram_free_before_mib,
@@ -591,7 +916,7 @@ export const repo = {
               gpu_layers_loaded, total_model_layers, gpu_layers_loaded_draft, total_model_layers_draft,
               sample_count, suspect_count, suspect_samples, repeat_samples, spec_drafted, spec_accepted,
               raw_json_path, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         );
         // Up to two rows for one idx (a pp row and a tg row from the same
         // benchmark process) -- distinguished by test_type, see
@@ -601,6 +926,7 @@ export const repo = {
           insertResult.run(
             row.id,
             row.run_id,
+            runUserId,
             row.idx,
             row.model_id,
             row.test_type,
@@ -652,9 +978,10 @@ export const repo = {
 
       // Tier-2 backend_device_name upgrade (see shared/types.ts's
       // Run.backend_device_name) -- a plain UPDATE, not COALESCE: the Tier-1
-      // fallback is always written first at dispatch time (markRunRunning/
-      // createRun), strictly before any item can go terminal, so this write
-      // is always the intended upgrade, never a downgrade.
+      // fallback is always written first at trigger time (createRun,
+      // routes/runs.ts's resolveBuildForRun), strictly before any item can
+      // go terminal, so this write is always the intended upgrade, never a
+      // downgrade.
       if (input.backend_device_name) {
         database.prepare(`UPDATE runs SET backend_device_name = ? WHERE id = ?`).run(input.backend_device_name, runId);
       }
@@ -665,7 +992,7 @@ export const repo = {
     });
     tx();
 
-    return this.getRun(runId);
+    return this.getRun(undefined, runId);
   },
 
   countUnfinishedItems(runId: string): number {
@@ -747,7 +1074,13 @@ export const repo = {
   // items already exist (created up front, see routes/runs.ts) but nothing
   // ever ran, so mark all of them failed rather than leaving a permanently
   // "queued" list for a run that never started.
-  failAllRunItems(runId: string, error: string): void {
+  // userId is an ownership check, not a value written anywhere here -- a run
+  // whose items are all still pre-existing rows already carries its own
+  // user_id from createRunItems; this just refuses to act on a run the
+  // caller doesn't own (undefined = system context, no check -- see this
+  // section's own header comment above listRuns).
+  failAllRunItems(userId: string | undefined, runId: string, error: string): void {
+    if (!this.getRun(userId, runId)) return;
     const database = getDb();
     const now = Date.now();
     const tx = database.transaction(() => {
@@ -762,66 +1095,19 @@ export const repo = {
     tx();
   },
 
-  // A worker only ever tracks one run at a time and has no persistent state
-  // of its own (see worker/src/index.ts) -- if it restarts mid-run, or a
-  // run's very last item terminal update exhausts safeItemTerminal's retries
-  // without reaching us, the run's row here is left "running" forever with
-  // no unfinished item ever going to arrive. Used by routes/runs.ts (GET
-  // /api/runs/:id, self-healing against /health) and routes/workers.ts
-  // (the /stop proxy, when the worker 409s "not running a benchmark") to
-  // find the row that's stuck.
-  getRunningRunForWorker(workerName: string): Run | undefined {
-    const row = getDb()
-      .prepare(`SELECT * FROM runs WHERE worker_name = ? AND status = 'running' ORDER BY started_at DESC LIMIT 1`)
-      .get(workerName) as RunRow | undefined;
-    return row ? mapRun(row) : undefined;
-  },
-
-  // True once a worker already has a run in flight or waiting its turn --
-  // routes/runs.ts's trigger handler uses this to decide whether a new run
-  // can dispatch immediately or has to join that worker's FIFO queue
-  // instead (a worker only ever runs one benchmark at a time).
-  hasActiveRunForWorker(workerName: string): boolean {
-    const row = getDb()
-      .prepare(`SELECT 1 FROM runs WHERE worker_name = ? AND status IN ('running','scheduled') LIMIT 1`)
-      .get(workerName);
-    return row !== undefined;
-  },
-
-  // Earliest-queued 'scheduled' run for a worker, if any -- pulled by
-  // routes/runs.ts's dispatchScheduledRun once the run ahead of it on that
-  // worker finalizes (or is reconciled away as stale).
-  getNextScheduledRunForWorker(workerName: string): Run | undefined {
-    const row = getDb()
-      .prepare(`SELECT * FROM runs WHERE worker_name = ? AND status = 'scheduled' ORDER BY started_at ASC LIMIT 1`)
-      .get(workerName) as RunRow | undefined;
-    return row ? mapRun(row) : undefined;
-  },
-
-  // Flips a queued run to 'running' right before it's actually dispatched to
-  // the worker. llama_cpp_build/backend and started_at are only meaningful
-  // once dispatch actually begins -- the worker's active build can change
-  // while a run sits queued, and "started" should mean "began executing",
-  // not "was queued" (see Run.started_at's use elsewhere as "when
-  // triggered", which for a queued run this now supersedes).
-  markRunRunning(
-    runId: string,
-    patch: { llama_cpp_build: string; llama_cpp_backend: string; backend_device_name?: string; started_at: number }
-  ): void {
-    getDb()
-      .prepare(
-        `UPDATE runs SET status = 'running', llama_cpp_build = ?, llama_cpp_backend = ?, backend_device_name = ?, started_at = ? WHERE id = ?`
-      )
-      .run(patch.llama_cpp_build, patch.llama_cpp_backend, patch.backend_device_name ?? null, patch.started_at, runId);
-  },
-
   // Marks a run's still-unfinished items 'cancelled' (not 'failed' --
   // nothing here indicates an actual bench failure, just that the worker
   // isn't tracking this run anymore) and finalizes it. `note` is both the
   // per-item error text and finalizeRun's cancelReason, so the run-level
   // message stays honest about this being an unconfirmed/lost run, not a
   // genuine user stop (see finalizeRun's own doc comment).
-  reconcileStaleRun(runId: string, note: string): Run | undefined {
+  // Called from system contexts with no user in scope (the reaper, a
+  // worker's own job-completion report) as well as the browser-facing
+  // /stop route -- see this section's own header comment above listRuns for
+  // why userId undefined means "no ownership check" rather than "match
+  // nothing."
+  reconcileStaleRun(userId: string | undefined, runId: string, note: string): Run | undefined {
+    if (!this.getRun(userId, runId)) return undefined;
     const database = getDb();
     const now = Date.now();
     const tx = database.transaction(() => {
@@ -834,7 +1120,1102 @@ export const repo = {
       this.finalizeRun(runId, now, note);
     });
     tx();
-    return this.getRun(runId);
+    return this.getRun(userId, runId);
+  },
+
+  // --- Multi-user Stage 1: workers (MULTIUSER_PLAN.md §1.2/§1.5/§1.6) ---
+  workerRepo: {
+    getWorker(id: string): Worker | undefined {
+      const row = getDb().prepare(`${WORKER_SELECT_SQL} WHERE workers.id = ?`).get(id) as WorkerRow | undefined;
+      return row ? mapWorker(row) : undefined;
+    },
+
+    // A worker's own persisted config.json (worker/src/index.ts) -- not
+    // anything Tailscale/network-derived, unlike the old config.ts. Used by
+    // routes/queue.ts to resolve a re-enrolling or re-connecting worker's
+    // existing row without creating a duplicate.
+    getByMachineId(machineId: string): Worker | undefined {
+      const row = getDb().prepare(`${WORKER_SELECT_SQL} WHERE workers.machine_id = ?`).get(machineId) as
+        | WorkerRow
+        | undefined;
+      return row ? mapWorker(row) : undefined;
+    },
+
+    listWorkers(): Worker[] {
+      const rows = getDb().prepare(`${WORKER_SELECT_SQL} ORDER BY workers.created_at ASC`).all() as WorkerRow[];
+      return rows.map(mapWorker);
+    },
+
+    // Multi-user Stage 4 (MULTIUSER_PLAN.md §4.6) -- the caller's own
+    // machines only, for the AI context snapshot (routes/ai.ts's
+    // hardwareSummary). A separate function rather than listWorkers(userId?)
+    // so the common global-listing call site (the Workers page's own
+    // GET /api/workers, still unscoped -- a user manages only their own
+    // machines in practice via ownership checks elsewhere, but nothing here
+    // needs a second, filtered listing of everyone else's) isn't forced to
+    // pass an always-undefined argument.
+    listWorkersForUser(userId: string): Worker[] {
+      const rows = getDb()
+        .prepare(`${WORKER_SELECT_SQL} WHERE workers.user_id = ? ORDER BY workers.created_at ASC`)
+        .all(userId) as WorkerRow[];
+      return rows.map(mapWorker);
+    },
+
+    // Searches every worker's cached model_files_json (from its last
+    // heartbeat, see WorkerStatePush.model_files) for a matching filename --
+    // replaces the old live "ask every worker" fan-out (server/src/routes/
+    // models.ts's findGgufInfoFromWorkers) now that there's no outbound HTTP
+    // to workers at all. The stored JSON is the richer WorkerStatePush shape
+    // (path + size_bytes + n_layer/mtp_layers), even though the public
+    // Worker.modelFiles type only promises plain ModelDirFile -- this is the
+    // one place that reads the extra fields back out, so the cast stays
+    // contained here rather than leaking into route code.
+    // Multi-user Stage 4 (MULTIUSER_PLAN.md §4.5): scoped to the caller's own
+    // machines once authenticated -- every machine in single-tenant mode
+    // (userId undefined), unchanged from before this scoping existed.
+    findModelFileMeta(
+      userId: string | undefined,
+      filename: string
+    ): { n_layer: number | null; mtp_layers: number | null; expert_count: number | null } | undefined {
+      const rows = getDb()
+        .prepare(`SELECT model_files_json FROM workers WHERE (? IS NULL OR user_id = ?)`)
+        .all(userId ?? null, userId ?? null) as { model_files_json: string | null }[];
+      for (const row of rows) {
+        if (!row.model_files_json) continue;
+        const files = safeParseJson<(ModelDirFileMeta)[]>(row.model_files_json, []);
+        const match = files.find((f) => f.path === filename);
+        if (
+          match &&
+          (typeof match.n_layer === "number" ||
+            typeof match.mtp_layers === "number" ||
+            typeof match.expert_count === "number")
+        ) {
+          return {
+            n_layer: match.n_layer ?? null,
+            mtp_layers: match.mtp_layers ?? null,
+            expert_count: match.expert_count ?? null,
+          };
+        }
+      }
+      return undefined;
+    },
+
+    // Self-announce: a worker identifies itself purely by the machine_id it
+    // persists locally -- the FIRST heartbeat/queue-poll from a machine_id
+    // the server has never seen creates its `workers` row (MULTIUSER_PLAN.md
+    // §1.2). Stage 3 replaces this shared-secret-plus-self-announce identity
+    // with real enrolment; this function's `getByMachineId` reuse is exactly
+    // what lets that later transition happen with no migration of existing
+    // rows (§3.4).
+    getOrCreateByMachineId(machineId: string, hostname: string): Worker {
+      const existing = this.getByMachineId(machineId);
+      if (existing) return existing;
+      const now = Date.now();
+      const id = uuid();
+      getDb()
+        .prepare(
+          `INSERT INTO workers (id, machine_id, display_name, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?)`
+        )
+        .run(id, machineId, hostname, now, now);
+      return this.getWorker(id)!;
+    },
+
+    // Called on every heartbeat/queue poll (MULTIUSER_PLAN.md §1.5).
+    // activeJobId is null while idle -- the caller (routes/queue.ts) derives
+    // it from the ActiveJobReport it received, if any, not from anything
+    // stored here previously.
+    recordHeartbeat(workerId: string, state: WorkerStatePush, activeJobId: string | null): void {
+      getDb()
+        .prepare(
+          `UPDATE workers SET
+             backend = ?, platform = ?, arch = ?, hostname = ?,
+             hardware_json = ?, installed_builds_json = ?, model_files_json = ?,
+             vram_json = COALESCE(?, vram_json),
+             last_heartbeat_at = ?, active_job_id = ?, updated_at = ?
+           WHERE id = ?`
+        )
+        .run(
+          state.backend,
+          state.hardware.platform,
+          state.hardware.arch,
+          state.hostname,
+          JSON.stringify(state.hardware),
+          JSON.stringify(state.installed_builds),
+          JSON.stringify(state.model_files),
+          state.vram !== undefined ? JSON.stringify(state.vram) : null,
+          Date.now(),
+          activeJobId,
+          Date.now(),
+          workerId
+        );
+    },
+
+    // MULTIUSER_PLAN.md §1.14: POST /api/runs/:id/pause|resume flips this
+    // per-WORKER (not per-job) flag; the heartbeat handler reads it on every
+    // poll to build HeartbeatResponse.control.pause. Persists until an
+    // explicit resume -- unlike a job's one-shot cancel_requested, pause is
+    // a standing state, matching the worker's own existing
+    // pauseRequested/resume semantics (worker/src/index.ts).
+    setPauseRequested(workerId: string, paused: boolean): void {
+      getDb().prepare(`UPDATE workers SET pause_requested = ? WHERE id = ?`).run(paused ? 1 : 0, workerId);
+    },
+
+    getPauseRequested(workerId: string): boolean {
+      const row = getDb().prepare(`SELECT pause_requested FROM workers WHERE id = ?`).get(workerId) as
+        | { pause_requested: number }
+        | undefined;
+      return row?.pause_requested === 1;
+    },
+
+    // --- Multi-user Stage 3: device-flow enrolment (MULTIUSER_PLAN.md §3.3/§3.4) ---
+
+    getEnrolmentById(id: string): WorkerEnrolment | undefined {
+      const row = getDb().prepare(`SELECT * FROM workers WHERE id = ?`).get(id) as WorkerRow | undefined;
+      return row ? mapWorkerEnrolment(row) : undefined;
+    },
+
+    // The human-facing lookup -- used by both GET /api/device/status (any
+    // state) and POST /api/device/approve (must still be pending). Not
+    // scoped by state itself; callers check approvedAt/enrolmentExpiresAt.
+    getByUserCode(userCode: string): WorkerEnrolment | undefined {
+      const row = getDb().prepare(`SELECT * FROM workers WHERE user_code = ?`).get(userCode) as WorkerRow | undefined;
+      return row ? mapWorkerEnrolment(row) : undefined;
+    },
+
+    // The worker-held lookup -- POST /api/device/token polls by this, never
+    // by user_code (that's the human's code, not the machine's).
+    getByEnrolmentCodeHash(hash: string): WorkerEnrolment | undefined {
+      const row = getDb().prepare(`SELECT * FROM workers WHERE enrolment_code_hash = ?`).get(hash) as
+        | WorkerRow
+        | undefined;
+      return row ? mapWorkerEnrolment(row) : undefined;
+    },
+
+    // First enrolment of a brand-new machine (§3.1 step 2) -- display_name
+    // defaults to the reported hostname (§3.3's own naming rule: no
+    // generated names, no identity-derived names). user_id/approved_at stay
+    // NULL until a human approves it (§3.4).
+    createPending(opts: {
+      machineId: string;
+      hostname: string;
+      platform: string;
+      arch: string;
+      deviceCode: string;
+      userCode: string;
+      expiresAt: number;
+    }): WorkerEnrolment {
+      const now = Date.now();
+      const id = uuid();
+      getDb()
+        .prepare(
+          `INSERT INTO workers
+             (id, machine_id, display_name, hostname, platform, arch,
+              enrolment_code_hash, user_code, enrolment_expires_at, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        )
+        .run(
+          id,
+          opts.machineId,
+          opts.hostname,
+          opts.hostname,
+          opts.platform,
+          opts.arch,
+          hashToken(opts.deviceCode),
+          opts.userCode,
+          opts.expiresAt,
+          now,
+          now
+        );
+      return this.getEnrolmentById(id)!;
+    },
+
+    // Re-enrolment of an ALREADY-KNOWN machine (§3.4) -- an owned machine
+    // reconnecting (expired session, revoked from Settings, rebuilt disk) or
+    // a still-pending one retrying after an abandoned attempt. Deliberately
+    // does NOT touch display_name (preserves a user's rename across
+    // reconnects) or user_id/approved_at (preserves existing ownership
+    // exactly as-is; only a FIRST enrolment ever sets those, via approve()
+    // below) -- only the self-reported hostname/platform/arch and the fresh
+    // enrolment code/expiry are refreshed.
+    reissueEnrolment(
+      workerId: string,
+      opts: { hostname: string; platform: string; arch: string; deviceCode: string; userCode: string; expiresAt: number }
+    ): WorkerEnrolment {
+      getDb()
+        .prepare(
+          `UPDATE workers SET
+             hostname = ?, platform = ?, arch = ?,
+             enrolment_code_hash = ?, user_code = ?, enrolment_expires_at = ?, updated_at = ?
+           WHERE id = ?`
+        )
+        .run(opts.hostname, opts.platform, opts.arch, hashToken(opts.deviceCode), opts.userCode, opts.expiresAt, Date.now(), workerId);
+      return this.getEnrolmentById(workerId)!;
+    },
+
+    // The ONLY place workers.user_id is ever set (§3.1 step 5) -- the
+    // approval click IS the identity binding, not a rubber stamp on a
+    // decision made earlier (§3.1's own point). Deliberately leaves
+    // enrolment_code_hash/user_code in place -- the worker's own
+    // /api/device/token poll still needs to find this row by hash to redeem
+    // its session; clearEnrolmentCode below is the actual one-shot
+    // consumption point, called once that redemption succeeds, not here.
+    approve(workerId: string, userId: string): void {
+      getDb()
+        .prepare(`UPDATE workers SET user_id = ?, approved_at = ?, updated_at = ? WHERE id = ?`)
+        .run(userId, Date.now(), Date.now(), workerId);
+    },
+
+    // Called once POST /api/device/token successfully issues a session for
+    // this worker -- the true single-use consumption point (see approve's
+    // own comment for why it isn't done there instead). Clears BOTH codes:
+    // enrolment_code_hash so the device_code can never be redeemed a second
+    // time (replay protection), and user_code so it stops occupying the
+    // partial-unique "no two pending enrolments collide" index and can't be
+    // guessed against a now-meaningless target.
+    clearEnrolmentCode(workerId: string): void {
+      getDb()
+        .prepare(
+          `UPDATE workers SET enrolment_code_hash = NULL, user_code = NULL, enrolment_expires_at = NULL, updated_at = ? WHERE id = ?`
+        )
+        .run(Date.now(), workerId);
+    },
+
+    // §1.7's own maintenance-sweep spec: "expired-enrolment pruning". Clears
+    // the code fields only -- deliberately NEVER deletes the row itself,
+    // even though a genuinely-abandoned first-time enrolment has no history
+    // to lose. A worker's own machine_id is meant to be stable, and
+    // /api/device/start's getByMachineId reuse (§3.4) means a Stage 1
+    // legacy machine UPGRADING to device-flow enrolment reuses its existing
+    // (historied) row via reissueEnrolment -- if that particular attempt
+    // then expires unapproved, deleting the row would destroy a real
+    // machine's identity/history, not just tidy up a throwaway one. Clearing
+    // just the code fields is safe either way: it frees the
+    // idx_workers_user_code_pending unique-index slot and retires a
+    // now-dead code (defense in depth -- /api/device/approve's own expiry
+    // check already rejects it) without ever risking data loss.
+    pruneExpiredEnrolments(): number {
+      return getDb()
+        .prepare(
+          `UPDATE workers SET user_code = NULL, enrolment_code_hash = NULL, enrolment_expires_at = NULL
+           WHERE approved_at IS NULL AND enrolment_expires_at IS NOT NULL AND enrolment_expires_at < ?`
+        )
+        .run(Date.now()).changes;
+    },
+  },
+
+  // --- Multi-user Stage 1: persistent pull queue (MULTIUSER_PLAN.md §1.2/§1.4/§1.5/§1.7) ---
+  queueRepo: {
+    // Atomic under Node's single-threaded/synchronous-transaction model:
+    // better-sqlite3's `transaction()` runs its callback with no `await`
+    // inside, so nothing else (including another concurrent
+    // POST /api/worker/queue call) can interleave between the SELECT and the
+    // UPDATE below -- two concurrent callers for the same worker can never
+    // both claim the same job (§1.17's exit criterion, tested in
+    // queue.test.ts).
+    //
+    // Skips (never claims) a job that was cancelled while still pending --
+    // e.g. the user stopped a 'scheduled' run before the worker ever picked
+    // it up. attempts is deliberately NOT incremented here -- it only counts
+    // lease-expiry requeues (see returnToPending), not claims.
+    //
+    // Flips the parent run to 'running' in the SAME transaction as the claim
+    // (MULTIUSER_PLAN.md §1.13) so the two can never disagree.
+    claimNextJob(workerId: string): QueueJob | undefined {
+      const database = getDb();
+      const tx = database.transaction((): QueueJob | undefined => {
+        const job = database
+          .prepare(
+            `SELECT * FROM worker_jobs
+             WHERE worker_id = ? AND status = 'pending' AND cancel_requested = 0
+             ORDER BY created_at ASC, rowid ASC LIMIT 1`
+          )
+          .get(workerId) as WorkerJobRow | undefined;
+        if (!job) return undefined;
+
+        const now = Date.now();
+        database
+          .prepare(`UPDATE worker_jobs SET status = 'claimed', lease_expires_at = ?, claimed_at = ? WHERE id = ?`)
+          .run(now + LEASE_MS, now, job.id);
+
+        // Set immediately, in the same transaction as the claim -- NOT left
+        // to wait for the worker's first heartbeat (which reports active_job
+        // and would otherwise be the only thing that ever writes this).
+        // Without this, Worker.status/activeRunId/activeJobProgress would
+        // all read stale ("idle", no run) for up to one heartbeat interval
+        // right after a claim.
+        database.prepare(`UPDATE workers SET active_job_id = ? WHERE id = ?`).run(job.id, workerId);
+
+        // Only a 'benchmark' job claim means the run itself started executing
+        // -- an 'install_build' job can share the same run_id (so the reaper
+        // can reconcile the run if the install permanently fails, see
+        // markJobFailed below) but claiming it must NOT flip the run to
+        // 'running' early.
+        if (job.run_id && job.job_type === "benchmark") {
+          database
+            .prepare(
+              `UPDATE runs SET status = 'running', started_at = ?
+               WHERE id = ? AND status NOT IN ('done','partial','failed','cancelled')`
+            )
+            .run(now, job.run_id);
+        }
+
+        return { job_id: job.id, type: job.job_type, payload: JSON.parse(job.payload_json) } as QueueJob;
+      });
+      return tx();
+    },
+
+    // Called on every heartbeat while a job is active (MULTIUSER_PLAN.md
+    // §1.5): extends the lease and records live progress. Returns undefined
+    // when the server no longer considers this job live for this worker
+    // (wrong worker, already terminal, or -- rare -- claimed by a different
+    // attempt after a reaped lease) so the caller tells the worker to stop
+    // rather than let two executions of the same job both report results.
+    extendLeaseAndGetFlags(
+      jobId: string,
+      workerId: string,
+      report: ActiveJobReport
+    ): { cancel_requested: boolean } | undefined {
+      const database = getDb();
+      const job = database.prepare(`SELECT * FROM worker_jobs WHERE id = ?`).get(jobId) as
+        | WorkerJobRow
+        | undefined;
+      if (!job || job.worker_id !== workerId || job.status !== "claimed") return undefined;
+      database
+        .prepare(`UPDATE worker_jobs SET lease_expires_at = ?, progress_json = ? WHERE id = ?`)
+        .run(Date.now() + LEASE_MS, JSON.stringify(report), jobId);
+      return { cancel_requested: job.cancel_requested === 1 };
+    },
+
+    enqueueJob(
+      workerId: string,
+      job: { type: string; payload: unknown; runId?: string }
+    ): string {
+      const id = uuid();
+      getDb()
+        .prepare(
+          `INSERT INTO worker_jobs (id, worker_id, job_type, payload_json, status, run_id, created_at)
+           VALUES (?, ?, ?, ?, 'pending', ?, ?)`
+        )
+        .run(id, workerId, job.type, JSON.stringify(job.payload), job.runId ?? null, Date.now());
+      return id;
+    },
+
+    // Every non-terminal (pending/claimed) job for a run -- a run can have up
+    // to two (install_build + benchmark, both stamped with the same run_id),
+    // so stop/pause and the reaper need to account for either one, not just
+    // "the most recent." MULTIUSER_PLAN.md §1.14.
+    getNonTerminalJobsForRun(runId: string): { id: string; workerId: string; status: string; jobType: string }[] {
+      const rows = getDb()
+        .prepare(
+          `SELECT id, worker_id, status, job_type FROM worker_jobs
+           WHERE run_id = ? AND status IN ('pending','claimed')`
+        )
+        .all(runId) as { id: string; worker_id: string; status: string; job_type: string }[];
+      return rows.map((r) => ({ id: r.id, workerId: r.worker_id, status: r.status, jobType: r.job_type }));
+    },
+
+    // Marks a still-pending (never claimed) job cancelled outright -- the
+    // worker never saw it, so there's nothing to signal. Returns false if the
+    // job wasn't pending (caller should fall back to requestCancel instead).
+    cancelPendingJob(jobId: string): boolean {
+      const result = getDb()
+        .prepare(`UPDATE worker_jobs SET status = 'cancelled', completed_at = ? WHERE id = ? AND status = 'pending'`)
+        .run(Date.now(), jobId);
+      return result.changes > 0;
+    },
+
+    // Cancels every still-pending job for a run outright in one statement --
+    // used both by a user Stop that arrives before the worker ever claimed
+    // anything, and by the reaper cleaning up a benchmark job that would
+    // otherwise be orphaned after its sibling install_build permanently
+    // fails (see index.ts's reapExpiredLeases).
+    cancelPendingJobsForRun(runId: string): void {
+      getDb()
+        .prepare(`UPDATE worker_jobs SET status = 'cancelled', completed_at = ? WHERE run_id = ? AND status = 'pending'`)
+        .run(Date.now(), runId);
+    },
+
+    // Flags an already-claimed job for cancellation -- delivered to the
+    // worker on its next heartbeat (MULTIUSER_PLAN.md §1.5/§1.14), not
+    // immediate. Also set on a still-pending job as a defensive no-op (in
+    // case it's claimed a moment later, claimNextJob's WHERE clause above
+    // will skip it rather than hand it out).
+    requestCancel(jobId: string): void {
+      getDb().prepare(`UPDATE worker_jobs SET cancel_requested = 1 WHERE id = ?`).run(jobId);
+    },
+
+    // Run-scoped version of requestCancel -- flags every currently-claimed
+    // job for a run (in practice at most one: a run's install_build and
+    // benchmark jobs are never claimed simultaneously, since the worker
+    // executes its queue strictly one job at a time).
+    requestCancelForRun(runId: string): void {
+      getDb().prepare(`UPDATE worker_jobs SET cancel_requested = 1 WHERE run_id = ? AND status = 'claimed'`).run(runId);
+    },
+
+    listExpiredLeases(
+      now: number
+    ): { id: string; worker_id: string; run_id: string | null; attempts: number; cancel_requested: number }[] {
+      return getDb()
+        .prepare(
+          `SELECT id, worker_id, run_id, attempts, cancel_requested FROM worker_jobs
+           WHERE status = 'claimed' AND lease_expires_at < ?`
+        )
+        .all(now) as {
+        id: string;
+        worker_id: string;
+        run_id: string | null;
+        attempts: number;
+        cancel_requested: number;
+      }[];
+    },
+
+    // A job only a lease-expiry has already returned to 'pending' once
+    // (attempts >= 1) is only ever reclaimable by its OWN worker_id -- jobs
+    // aren't stealable across workers. If that worker never comes back
+    // (a genuine crash, not a brief pm2/systemd restart blip), the job would
+    // otherwise sit 'pending' forever: listExpiredLeases only ever looks at
+    // 'claimed' rows, so a job that's already back in 'pending' never gets a
+    // second look. Swept on the same reap cycle as listExpiredLeases, gated
+    // on the worker's own last_heartbeat_at rather than a fixed delay so it
+    // tracks the real liveness definition (see server/src/liveness.ts).
+    // attempts >= 1 (not 0) deliberately excludes a job still awaiting its
+    // very first claim -- that path is instead guarded at trigger time
+    // (server/src/routes/runs.ts rejects triggering against an
+    // already-offline worker), so a fresh job's worker going offline before
+    // ever claiming anything is not this function's concern.
+    listStuckPendingJobsForOfflineWorkers(
+      offlineCutoff: number
+    ): { id: string; worker_id: string; run_id: string | null; attempts: number; cancel_requested: number }[] {
+      return getDb()
+        .prepare(
+          `SELECT wj.id, wj.worker_id, wj.run_id, wj.attempts, wj.cancel_requested
+           FROM worker_jobs wj
+           JOIN workers w ON w.id = wj.worker_id
+           WHERE wj.status = 'pending' AND wj.attempts >= 1
+             AND (w.last_heartbeat_at IS NULL OR w.last_heartbeat_at < ?)`
+        )
+        .all(offlineCutoff) as {
+        id: string;
+        worker_id: string;
+        run_id: string | null;
+        attempts: number;
+        cancel_requested: number;
+      }[];
+    },
+
+    // Looked up by the job-completion endpoint (routes/queue.ts) to verify
+    // the reporting worker actually owns this job before trusting its
+    // done/failed report -- one worker must never be able to complete or
+    // fail another's job.
+    getJob(
+      jobId: string
+    ): { id: string; workerId: string; runId: string | null; status: string; jobType: string } | undefined {
+      const row = getDb()
+        .prepare(`SELECT id, worker_id, run_id, status, job_type FROM worker_jobs WHERE id = ?`)
+        .get(jobId) as
+        | { id: string; worker_id: string; run_id: string | null; status: string; job_type: string }
+        | undefined;
+      if (!row) return undefined;
+      return { id: row.id, workerId: row.worker_id, runId: row.run_id, status: row.status, jobType: row.job_type };
+    },
+
+    // Clears workers.active_job_id whenever it still points at THIS job --
+    // the WHERE guard (rather than an unconditional clear by workerId) means
+    // this can never clobber a different, newer active_job_id the same
+    // worker has already moved on to by the time this runs.
+    markJobFailed(jobId: string, error: string): void {
+      const database = getDb();
+      database
+        .prepare(`UPDATE worker_jobs SET status = 'failed', error = ?, completed_at = ? WHERE id = ?`)
+        .run(error, Date.now(), jobId);
+      database.prepare(`UPDATE workers SET active_job_id = NULL WHERE active_job_id = ?`).run(jobId);
+    },
+
+    markJobCompleted(jobId: string): void {
+      const database = getDb();
+      database
+        .prepare(`UPDATE worker_jobs SET status = 'completed', completed_at = ? WHERE id = ?`)
+        .run(Date.now(), jobId);
+      database.prepare(`UPDATE workers SET active_job_id = NULL WHERE active_job_id = ?`).run(jobId);
+    },
+
+    // Returns an expired-lease job to the queue for re-claim. attempts is
+    // incremented HERE (and only here) -- it counts lease-expiry requeues,
+    // not claims, so the reaper's MAX_ATTEMPTS check means "this job's lease
+    // expired without completing N times," not "N total claims."
+    returnToPending(jobId: string): void {
+      const database = getDb();
+      database
+        .prepare(
+          `UPDATE worker_jobs SET status = 'pending', attempts = attempts + 1, lease_expires_at = NULL, claimed_at = NULL
+           WHERE id = ?`
+        )
+        .run(jobId);
+      database.prepare(`UPDATE workers SET active_job_id = NULL WHERE active_job_id = ?`).run(jobId);
+    },
+
+    // §1.7's own maintenance-sweep spec: "terminal-job pruning
+    // (pruneCompletedOlderThan, 7 days)". A terminal job row (completed/
+    // failed/cancelled) has no further use once its outcome has had time to
+    // be seen -- unlike a pending/claimed row, nothing reads it again after
+    // that. Called from reaper.ts's runMaintenanceSweep, same interval as
+    // the job-lease reaper.
+    pruneCompletedOlderThan(days: number): number {
+      const cutoff = Date.now() - days * 24 * 3600 * 1000;
+      return getDb()
+        .prepare(`DELETE FROM worker_jobs WHERE status IN ('completed', 'failed', 'cancelled') AND completed_at < ?`)
+        .run(cutoff).changes;
+    },
+  },
+
+  // --- Multi-user Stage 2: users/identities (MULTIUSER_PLAN.md §2.1/§2.4) ---
+  userRepo: {
+    getUser(userId: string): UserRecord | undefined {
+      const row = getDb().prepare(`SELECT * FROM users WHERE id = ?`).get(userId) as UserRow | undefined;
+      return row ? mapUser(row) : undefined;
+    },
+
+    getIdentities(userId: string): Identity[] {
+      const rows = getDb()
+        .prepare(`SELECT * FROM identities WHERE user_id = ? ORDER BY created_at ASC`)
+        .all(userId) as IdentityRow[];
+      return rows.map(mapIdentity);
+    },
+
+    // Looked up before either upsertByIdentity or linkIdentity act -- lets
+    // the CALLER (the OAuth callback route) decide what an existing link
+    // means in context (a normal login vs. "this identity is already
+    // somebody else's account, reject the link" -- MULTIUSER_PLAN.md §2.4's
+    // own warning about naive auto-merge) rather than baking that policy
+    // into the data layer.
+    findByIdentity(provider: string, providerUserId: string): UserRecord | undefined {
+      const row = getDb()
+        .prepare(
+          `SELECT users.* FROM users
+           JOIN identities ON identities.user_id = users.id
+           WHERE identities.provider = ? AND identities.provider_user_id = ?`
+        )
+        .get(provider, providerUserId) as UserRow | undefined;
+      return row ? mapUser(row) : undefined;
+    },
+
+    // Normal login/sign-up, one and the same (§2.1) -- a provider_user_id
+    // never seen before creates a fresh users+identities row pair in one
+    // transaction; a recognized one just refreshes provider_login (mutable,
+    // e.g. a GitHub username change) and last_login_at.
+    upsertByIdentity(
+      provider: string,
+      profile: { providerUserId: string; login: string; avatarUrl: string | null }
+    ): UserRecord {
+      const database = getDb();
+      const now = Date.now();
+      const existing = database
+        .prepare(`SELECT user_id FROM identities WHERE provider = ? AND provider_user_id = ?`)
+        .get(provider, profile.providerUserId) as { user_id: string } | undefined;
+
+      if (existing) {
+        database
+          .prepare(`UPDATE identities SET provider_login = ? WHERE provider = ? AND provider_user_id = ?`)
+          .run(profile.login, provider, profile.providerUserId);
+        database.prepare(`UPDATE users SET last_login_at = ?, updated_at = ? WHERE id = ?`).run(now, now, existing.user_id);
+        return this.getUser(existing.user_id)!;
+      }
+
+      const userId = uuid();
+      const tx = database.transaction(() => {
+        database
+          .prepare(
+            `INSERT INTO users (id, display_name, avatar_url, created_at, updated_at, last_login_at)
+             VALUES (?, ?, ?, ?, ?, ?)`
+          )
+          .run(userId, profile.login, profile.avatarUrl, now, now, now);
+        database
+          .prepare(
+            `INSERT INTO identities (id, user_id, provider, provider_user_id, provider_login, created_at)
+             VALUES (?, ?, ?, ?, ?, ?)`
+          )
+          .run(uuid(), userId, provider, profile.providerUserId, profile.login, now);
+      });
+      tx();
+      return this.getUser(userId)!;
+    },
+
+    // Settings -> "Connect another account" (§2.4). Assumes the caller has
+    // already used findByIdentity to confirm this identity isn't linked to a
+    // DIFFERENT user -- attaches it to userId (or, if it's already linked to
+    // userId itself, just refreshes provider_login).
+    linkIdentity(
+      userId: string,
+      provider: string,
+      profile: { providerUserId: string; login: string; avatarUrl: string | null }
+    ): UserRecord {
+      const database = getDb();
+      const now = Date.now();
+      const existing = database
+        .prepare(`SELECT user_id FROM identities WHERE provider = ? AND provider_user_id = ?`)
+        .get(provider, profile.providerUserId) as { user_id: string } | undefined;
+
+      if (existing) {
+        database
+          .prepare(`UPDATE identities SET provider_login = ? WHERE provider = ? AND provider_user_id = ?`)
+          .run(profile.login, provider, profile.providerUserId);
+      } else {
+        database
+          .prepare(
+            `INSERT INTO identities (id, user_id, provider, provider_user_id, provider_login, created_at)
+             VALUES (?, ?, ?, ?, ?, ?)`
+          )
+          .run(uuid(), userId, provider, profile.providerUserId, profile.login, now);
+      }
+      return this.getUser(userId)!;
+    },
+
+    // Settings' own toggle (§5.4) -- the one thing on the users row a
+    // caller can write about themselves. Default is 1 (opt-in by default,
+    // disclosed in Settings' own copy), so this only ever needs to flip it.
+    setShareBenchmarks(userId: string, value: boolean): UserRecord {
+      getDb().prepare(`UPDATE users SET share_benchmarks = ?, updated_at = ? WHERE id = ?`).run(value ? 1 : 0, Date.now(), userId);
+      return this.getUser(userId)!;
+    },
+
+    // Security checklist's own "Account deletion ships in v1" item. A plain
+    // `DELETE FROM users` would fail outright once PRAGMA foreign_keys=ON
+    // meets `models.created_by` -- that column deliberately has NO ON DELETE
+    // clause (see migrate.ts's own comment: a deleted user's created_by
+    // attribution on a model nobody else has touched should block deletion
+    // rather than silently orphan/cascade a shared catalog row). This makes
+    // that explicit: reassign the caller's own models to ownerless (global,
+    // same as any model with no known creator) FIRST, in the same
+    // transaction, then delete the user -- which cascades sessions,
+    // identities, workers, runs, results, and run_items automatically (all
+    // declared ON DELETE CASCADE, §4.1). Community aggregates need no
+    // separate cleanup: they're computed live from runs/results, which are
+    // already gone by the time any aggregate query runs again.
+    deleteAccount(userId: string): void {
+      const database = getDb();
+      const tx = database.transaction(() => {
+        database.prepare(`UPDATE models SET created_by = NULL WHERE created_by = ?`).run(userId);
+        database.prepare(`DELETE FROM users WHERE id = ?`).run(userId);
+      });
+      tx();
+    },
+  },
+
+  // --- Multi-user Stage 2: sessions (MULTIUSER_PLAN.md §2.2/§2.5) ---
+  sessionRepo: {
+    // Returns the token/refresh ONCE -- the only place either value ever
+    // exists outside the client; only their hashes are persisted.
+    create(
+      userId: string,
+      opts: { isWorker?: boolean; workerId?: string; label?: string } = {}
+    ): { token: string; refresh: string | null; expiresAt: number } {
+      const token = generateSessionId();
+      const refresh = opts.isWorker ? generateRefreshToken() : null;
+      const now = Date.now();
+      const expiresAt = now + (opts.isWorker ? 90 : 30) * 24 * 3600 * 1000;
+      getDb()
+        .prepare(
+          `INSERT INTO sessions
+             (id, user_id, token_hash, refresh_hash, expires_at, is_worker, worker_id, label, last_seen_at, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        )
+        .run(
+          uuid(),
+          userId,
+          hashToken(token),
+          refresh ? hashToken(refresh) : null,
+          expiresAt,
+          opts.isWorker ? 1 : 0,
+          opts.workerId ?? null,
+          opts.label ?? null,
+          now,
+          now
+        );
+      return { token, refresh, expiresAt };
+    },
+
+    getByTokenHash(hash: string): SessionRecord | undefined {
+      const row = getDb().prepare(`SELECT * FROM sessions WHERE token_hash = ?`).get(hash) as SessionRow | undefined;
+      return row ? mapSession(row) : undefined;
+    },
+
+    getByRefreshHash(hash: string): SessionRecord | undefined {
+      const row = getDb().prepare(`SELECT * FROM sessions WHERE refresh_hash = ?`).get(hash) as SessionRow | undefined;
+      return row ? mapSession(row) : undefined;
+    },
+
+    // Replay detection (§2.5): a presented refresh token matching a PREVIOUS
+    // (already-rotated-away) one means it was captured and reused.
+    getByPrevRefreshHash(hash: string): SessionRecord | undefined {
+      const row = getDb().prepare(`SELECT * FROM sessions WHERE prev_refresh_hash = ?`).get(hash) as
+        | SessionRow
+        | undefined;
+      return row ? mapSession(row) : undefined;
+    },
+
+    // sessions.id is STABLE across rotation -- callers that stored it
+    // earlier (e.g. workers.session_id, Stage 3) are never orphaned by a
+    // later refresh, unlike rotating the primary key itself would.
+    rotate(sessionId: string): { token: string; refresh: string; expiresAt: number } {
+      const database = getDb();
+      const current = database.prepare(`SELECT refresh_hash FROM sessions WHERE id = ?`).get(sessionId) as
+        | { refresh_hash: string | null }
+        | undefined;
+      const token = generateSessionId();
+      const refresh = generateRefreshToken();
+      const now = Date.now();
+      const expiresAt = now + 90 * 24 * 3600 * 1000;
+      database
+        .prepare(
+          `UPDATE sessions SET token_hash = ?, refresh_hash = ?, prev_refresh_hash = ?, expires_at = ? WHERE id = ?`
+        )
+        .run(hashToken(token), hashToken(refresh), current?.refresh_hash ?? null, expiresAt, sessionId);
+      return { token, refresh, expiresAt };
+    },
+
+    revokeById(id: string): void {
+      getDb().prepare(`DELETE FROM sessions WHERE id = ?`).run(id);
+    },
+
+    // Settings -> "Sign out everywhere else" (§2.5) -- keeps the caller's own
+    // current session alive.
+    revokeAllExcept(userId: string, exceptSessionId: string): void {
+      getDb().prepare(`DELETE FROM sessions WHERE user_id = ? AND id != ?`).run(userId, exceptSessionId);
+    },
+
+    // Multi-user Stage 3 (MULTIUSER_PLAN.md §3.4): called on re-enrolment
+    // (POST /api/device/start against an already-known machine_id) so a
+    // fresh enrolment never leaves an old worker session live alongside the
+    // new one -- closes the exact hole v3.3 had (its own review finding D6).
+    revokeWorkerSessions(workerId: string): void {
+      getDb().prepare(`DELETE FROM sessions WHERE worker_id = ? AND is_worker = 1`).run(workerId);
+    },
+
+    listForUser(userId: string): SessionRecord[] {
+      const rows = getDb()
+        .prepare(`SELECT * FROM sessions WHERE user_id = ? ORDER BY created_at DESC`)
+        .all(userId) as SessionRow[];
+      return rows.map(mapSession);
+    },
+
+    // Sliding expiry (§2.5): extends expires_at to now + the session's own
+    // lifetime, throttled to at most one write per hour per session so an
+    // active user's every request doesn't turn into a write.
+    touch(session: SessionRecord): void {
+      const now = Date.now();
+      if (session.lastSeenAt && now - session.lastSeenAt < 3600_000) return;
+      const expiresAt = now + (session.isWorker ? 90 : 30) * 24 * 3600 * 1000;
+      getDb().prepare(`UPDATE sessions SET last_seen_at = ?, expires_at = ? WHERE id = ?`).run(now, expiresAt, session.id);
+    },
+
+    // §1.7's own maintenance-sweep spec: "expired-session pruning -- which
+    // v3.3 never had, so sessions would grow forever despite having an
+    // expires_at index." Called from reaper.ts's runMaintenanceSweep, same
+    // interval as the job-lease reaper. Returns the deleted count purely for
+    // logging -- callers don't otherwise need it.
+    pruneExpired(): number {
+      return getDb().prepare(`DELETE FROM sessions WHERE expires_at < ?`).run(Date.now()).changes;
+    },
+  },
+
+  // --- Multi-user Stage 2: /api/ai/chat budget (MULTIUSER_PLAN.md §2.6) ---
+  aiUsageRepo: {
+    // Upsert-and-increment the (user, day, hour) bucket -- called once per
+    // request that actually reaches the provider (routes/ai.ts checks the
+    // budget BEFORE calling this, so a request rejected for being over
+    // budget is never counted against itself).
+    recordUsage(userId: string, day: string, hour: number): void {
+      getDb()
+        .prepare(
+          `INSERT INTO ai_usage (user_id, day, hour, count) VALUES (?, ?, ?, 1)
+           ON CONFLICT (user_id, day, hour) DO UPDATE SET count = count + 1`
+        )
+        .run(userId, day, hour);
+    },
+
+    getHourCount(userId: string, day: string, hour: number): number {
+      const row = getDb().prepare(`SELECT count FROM ai_usage WHERE user_id = ? AND day = ? AND hour = ?`).get(
+        userId,
+        day,
+        hour
+      ) as { count: number } | undefined;
+      return row?.count ?? 0;
+    },
+
+    getUserDayCount(userId: string, day: string): number {
+      const row = getDb().prepare(`SELECT SUM(count) as total FROM ai_usage WHERE user_id = ? AND day = ?`).get(
+        userId,
+        day
+      ) as { total: number | null } | undefined;
+      return row?.total ?? 0;
+    },
+
+    // No user_id filter -- the global circuit breaker (AI_LIMITS.globalPerDay)
+    // protects the operator's provider budget regardless of who's calling.
+    getGlobalDayCount(day: string): number {
+      const row = getDb().prepare(`SELECT SUM(count) as total FROM ai_usage WHERE day = ?`).get(day) as
+        | { total: number | null }
+        | undefined;
+      return row?.total ?? 0;
+    },
+  },
+
+  // Multi-user Stage 4 (MULTIUSER_PLAN.md §4.2): everything created before
+  // AUTH_ENABLED existed (or while it was off) has user_id/user_id-on-workers
+  // NULL -- without this, the operator's entire pre-auth benchmark history
+  // becomes invisible in the normal UI the moment they log in as a NEW user,
+  // reachable only through a future admin view. One-shot, guarded by the meta
+  // table (not a boot-time migration -- the claiming user's row has to exist
+  // first, see routes/auth.ts's OAuth callback, which calls this right after
+  // a superadmin-listed identity's login). Returns whether this call actually
+  // performed the claim (false on every call after the first, or if some
+  // other login already claimed it first) so the caller can log accordingly.
+  claimLegacyHistory(userId: string): boolean {
+    const database = getDb();
+    let claimed = false;
+    const tx = database.transaction(() => {
+      const already = database.prepare(`SELECT 1 FROM meta WHERE key = 'legacy_history_claimed'`).get();
+      if (already) return;
+      database.prepare(`UPDATE runs SET user_id = ? WHERE user_id IS NULL`).run(userId);
+      database.prepare(`UPDATE results SET user_id = ? WHERE user_id IS NULL`).run(userId);
+      database.prepare(`UPDATE run_items SET user_id = ? WHERE user_id IS NULL`).run(userId);
+      database.prepare(`UPDATE workers SET user_id = ? WHERE user_id IS NULL`).run(userId);
+      database.prepare(`INSERT INTO meta (key, value) VALUES ('legacy_history_claimed', ?)`).run(userId);
+      claimed = true;
+    });
+    tx();
+    return claimed;
+  },
+
+  // --- Multi-user Stage 5: admin surface (MULTIUSER_PLAN.md §5.1) ---
+  // Every function here is deliberately unscoped -- cross-tenant read is the
+  // whole point, gated at the ROUTE layer (routes/admin.ts's hostname +
+  // isSuperadmin hook), not here. Read-only in v1: no promote/demote/ban/edit.
+  adminRepo: {
+    stats(): AdminStats {
+      const db = getDb();
+      const count = (table: string): number => (db.prepare(`SELECT COUNT(*) as n FROM ${table}`).get() as { n: number }).n;
+      return {
+        users: count("users"),
+        machines: count("workers"),
+        runs: count("runs"),
+        tests: count("run_items"),
+        models: count("models"),
+      };
+    },
+
+    // Filterable global runs table (§5.1's own "the filterable global runs
+    // table" spec) -- User/Machine/Backend/Status filters, each optional.
+    // Capped at 500 rows: this is an operator glancing at recent activity,
+    // not a full-history export (that's GET /api/admin/results/export,
+    // which has no such cap).
+    listRuns(filters: AdminRunFilters): AdminRunSummary[] {
+      const rows = getDb()
+        .prepare(
+          `SELECT runs.*, u.display_name AS user_display_name, w.display_name AS worker_display_name,
+                  m.filename AS model_filename,
+                  (SELECT COUNT(*) FROM run_items WHERE run_items.run_id = runs.id) AS items_total,
+                  (SELECT COUNT(*) FROM run_items WHERE run_items.run_id = runs.id AND status = 'done') AS items_done,
+                  (SELECT COUNT(*) FROM run_items WHERE run_items.run_id = runs.id AND status IN ('failed','failed_oom')) AS items_failed
+           FROM runs
+           LEFT JOIN users u ON u.id = runs.user_id
+           LEFT JOIN workers w ON w.id = runs.worker_id
+           LEFT JOIN models m ON m.id = runs.model_id
+           WHERE (? IS NULL OR runs.user_id = ?)
+             AND (? IS NULL OR runs.worker_id = ?)
+             AND (? IS NULL OR runs.llama_cpp_backend = ?)
+             AND (? IS NULL OR runs.status = ?)
+           ORDER BY runs.started_at DESC
+           LIMIT 500`
+        )
+        .all(
+          filters.userId ?? null,
+          filters.userId ?? null,
+          filters.workerId ?? null,
+          filters.workerId ?? null,
+          filters.backend ?? null,
+          filters.backend ?? null,
+          filters.status ?? null,
+          filters.status ?? null
+        ) as (RunRow & { user_display_name: string | null; worker_display_name: string | null })[];
+      return rows.map((row) => ({
+        id: row.id,
+        userId: row.user_id ?? null,
+        userDisplayName: row.user_display_name,
+        workerId: row.worker_id,
+        workerDisplayName: row.worker_display_name,
+        modelId: row.model_id,
+        modelFilename: row.model_filename ?? null,
+        llamaCppBackend: row.llama_cpp_backend,
+        status: row.status,
+        error: row.error,
+        startedAt: row.started_at,
+        completedAt: row.completed_at,
+        itemsTotal: row.items_total ?? 0,
+        itemsDone: row.items_done ?? 0,
+        itemsFailed: row.items_failed ?? 0,
+      }));
+    },
+
+    // Global user list -- id/display name/superadmin-relevant identity info
+    // is intentionally NOT included (isSuperadmin is env-derived, not a DB
+    // fact about a user row, see superadmin.ts); just enough to identify an
+    // account in the admin UI.
+    listUsers(): AdminUserSummary[] {
+      const rows = getDb()
+        .prepare(`SELECT id, display_name, avatar_url, created_at, last_login_at FROM users ORDER BY created_at ASC`)
+        .all() as { id: string; display_name: string | null; avatar_url: string | null; created_at: number; last_login_at: number | null }[];
+      return rows.map((r) => ({
+        id: r.id,
+        displayName: r.display_name,
+        avatarUrl: r.avatar_url,
+        createdAt: r.created_at,
+        lastLoginAt: r.last_login_at,
+      }));
+    },
+  },
+
+  // Multi-user Stage 5 (MULTIUSER_PLAN.md §5.4) -- the AI assistant's one
+  // cross-tenant read (§5.3). k-anonymity is enforced HERE, in SQL, not by a
+  // column allowlist: filtering listAggregates down to one model/backend/
+  // platform/gpu combo used to single out one machine (and its owner) even
+  // with no username column in the result -- that's textbook singling-out,
+  // not anonymity. The fix is HAVING COUNT(DISTINCT user_id) >= 5 on every
+  // query here, so a cell describing fewer than five people is never
+  // returned at all, regardless of how narrow the caller's filter is.
+  communityRepo: {
+    // Matches the plan's own §5.4 SQL with one addition: ri.test_type is
+    // added to the SELECT/GROUP BY on top of the plan's literal query. pp and
+    // tg throughput are different units entirely (prompt processing vs.
+    // generation) -- averaging them together, as the plan's SQL does, would
+    // produce an avg_tps with no meaning. `build` stays OUT of the group key
+    // exactly as the plan specifies (§5.4 point 4): it's high-cardinality and
+    // near-unique per user at any given moment, which would re-identify
+    // through the k-threshold same as a narrow filter would.
+    listAggregates(callerId: string, filters: CommunityAggregateFilters = {}): CommunityAggregateRow[] {
+      const rows = getDb()
+        .prepare(
+          `SELECT
+             r.model_id AS model_id, m.filename AS model_filename,
+             r.llama_cpp_backend AS backend,
+             ri.test_type AS test_type,
+             json_extract(w.hardware_json, '$.platform')     AS platform,
+             json_extract(w.hardware_json, '$.gpu[0].model') AS gpu_model,
+             COUNT(DISTINCT r.user_id)     AS contributor_count,
+             COUNT(DISTINCT r.id)          AS run_count,
+             ROUND(AVG(ri.avg_tps), 1)     AS avg_tps,
+             ROUND(AVG(ri.ram_peak_mib))   AS avg_ram_peak_mib,
+             ROUND(AVG(ri.vram_peak_mib))  AS avg_vram_peak_mib
+           FROM runs r
+           JOIN results ri ON ri.run_id = r.id
+           LEFT JOIN models m  ON m.id = r.model_id
+           LEFT JOIN workers w ON w.id = r.worker_id
+           JOIN users u ON u.id = r.user_id AND u.share_benchmarks = 1
+           WHERE r.user_id IS NOT NULL AND r.user_id <> ?
+             AND (? IS NULL OR r.model_id = ?)
+             AND (? IS NULL OR r.llama_cpp_backend = ?)
+             AND (? IS NULL OR json_extract(w.hardware_json, '$.platform') = ?)
+             AND (? IS NULL OR json_extract(w.hardware_json, '$.gpu[0].model') = ?)
+           GROUP BY r.model_id, r.llama_cpp_backend, ri.test_type, platform, gpu_model
+           HAVING COUNT(DISTINCT r.user_id) >= 5
+           ORDER BY avg_tps DESC`
+        )
+        .all(
+          callerId,
+          filters.modelId ?? null,
+          filters.modelId ?? null,
+          filters.backend ?? null,
+          filters.backend ?? null,
+          filters.platform ?? null,
+          filters.platform ?? null,
+          filters.gpuModel ?? null,
+          filters.gpuModel ?? null
+        ) as {
+          model_id: string;
+          model_filename: string | null;
+          backend: string;
+          test_type: string;
+          platform: string | null;
+          gpu_model: string | null;
+          contributor_count: number;
+          run_count: number;
+          avg_tps: number;
+          avg_ram_peak_mib: number | null;
+          avg_vram_peak_mib: number | null;
+        }[];
+      return rows.map((row) => ({
+        modelId: row.model_id,
+        modelFilename: row.model_filename,
+        backend: row.backend,
+        testType: row.test_type,
+        platform: row.platform,
+        gpuModel: row.gpu_model,
+        contributorCount: row.contributor_count,
+        runCount: row.run_count,
+        avgTps: row.avg_tps,
+        avgRamPeakMib: row.avg_ram_peak_mib,
+        avgVramPeakMib: row.avg_vram_peak_mib,
+      }));
+    },
+
+    // §5.4's own closing note: "listFacets gets the same k-threshold, or it
+    // leaks the existence of a single rare GPU." Each dimension is counted on
+    // its own here (not listAggregates' full group key) so a value appears
+    // the moment five distinct people share it -- regardless of which
+    // model/backend each of them happened to run it with -- while a value
+    // only four people have anywhere stays invisible.
+    listFacets(callerId: string): CommunityFacets {
+      const db = getDb();
+      const consentWhere = `r.user_id IS NOT NULL AND r.user_id <> ? AND u.share_benchmarks = 1`;
+
+      const models = db
+        .prepare(
+          `SELECT r.model_id AS model_id, m.filename AS filename, COUNT(DISTINCT r.user_id) AS contributor_count
+           FROM runs r JOIN users u ON u.id = r.user_id LEFT JOIN models m ON m.id = r.model_id
+           WHERE ${consentWhere}
+           GROUP BY r.model_id
+           HAVING COUNT(DISTINCT r.user_id) >= 5`
+        )
+        .all(callerId) as { model_id: string; filename: string | null; contributor_count: number }[];
+
+      const backends = db
+        .prepare(
+          `SELECT r.llama_cpp_backend AS value, COUNT(DISTINCT r.user_id) AS contributor_count
+           FROM runs r JOIN users u ON u.id = r.user_id
+           WHERE ${consentWhere}
+           GROUP BY r.llama_cpp_backend
+           HAVING COUNT(DISTINCT r.user_id) >= 5`
+        )
+        .all(callerId) as { value: string; contributor_count: number }[];
+
+      const platforms = db
+        .prepare(
+          `SELECT json_extract(w.hardware_json, '$.platform') AS value, COUNT(DISTINCT r.user_id) AS contributor_count
+           FROM runs r JOIN users u ON u.id = r.user_id LEFT JOIN workers w ON w.id = r.worker_id
+           WHERE ${consentWhere} AND json_extract(w.hardware_json, '$.platform') IS NOT NULL
+           GROUP BY value
+           HAVING COUNT(DISTINCT r.user_id) >= 5`
+        )
+        .all(callerId) as { value: string; contributor_count: number }[];
+
+      const gpuModels = db
+        .prepare(
+          `SELECT json_extract(w.hardware_json, '$.gpu[0].model') AS value, COUNT(DISTINCT r.user_id) AS contributor_count
+           FROM runs r JOIN users u ON u.id = r.user_id LEFT JOIN workers w ON w.id = r.worker_id
+           WHERE ${consentWhere} AND json_extract(w.hardware_json, '$.gpu[0].model') IS NOT NULL
+           GROUP BY value
+           HAVING COUNT(DISTINCT r.user_id) >= 5`
+        )
+        .all(callerId) as { value: string; contributor_count: number }[];
+
+      return {
+        models: models.map((m) => ({ modelId: m.model_id, value: m.filename ?? m.model_id, contributorCount: m.contributor_count })),
+        backends: backends.map((b) => ({ value: b.value, contributorCount: b.contributor_count })),
+        platforms: platforms.map((p) => ({ value: p.value, contributorCount: p.contributor_count })),
+        gpuModels: gpuModels.map((g) => ({ value: g.value, contributorCount: g.contributor_count })),
+      };
+    },
   },
 };
 

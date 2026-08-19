@@ -9,15 +9,22 @@
 # Usage (from anywhere). Safe to run every time, first setup or a plain
 # restart -- if config.json already exists, setup (and the --dir prompt) is
 # skipped entirely and this just starts the worker:
-#   ./worker/setup-worker.sh
+#   ./worker/setup-worker.sh --vps-url https://llamatoaster.com
 #
 # On first run (no config.json yet), omitting --dir shows `df -h` (models
 # are often tens of GB each) and asks for a base folder and a name. Pass
 # --dir to skip that prompt, e.g. for unattended/scripted use:
-#   ./worker/setup-worker.sh --dir ~/LlamaToaster
+#   ./worker/setup-worker.sh --vps-url https://llamatoaster.com --dir ~/LlamaToaster
 #
-# No IP needed either: bind_host auto-detects via `tailscale ip -4` unless
-# you pass --bind-host explicitly.
+# No IP or port to configure at all -- the worker has no inbound listener
+# (it long-polls the server, MULTIUSER_PLAN.md §1). The FIRST time it runs
+# with no session configured yet, it prints a short code and a URL
+# (https://<vps-url>/device) to approve it from your account -- do that once,
+# in a browser, and it's connected. The saved session survives ordinary
+# restarts and never asks again on its own -- if it needs to reconnect (its
+# session was revoked from Settings, or its refresh token expired), pass
+# --reconnect (see below) rather than re-running plain setup, which is a
+# total no-op once config.json already exists.
 #
 # Other optional overrides:
 #   --worker-name <name>      default "Local"
@@ -30,26 +37,42 @@
 #                             this only to pin/override that, e.g. for
 #                             hardware the auto-detect heuristic doesn't
 #                             specifically know about.
-#   --vps-url <url>           default the orchestrator's known Tailscale address
-#   --port <n>                default 8080
-#   --force                   overwrite an existing worker/config.json
+#   --reconnect                clear this machine's saved session (keeping
+#                             machine_id and every other setting) so it goes
+#                             through device-flow approval again on the same
+#                             machine identity -- the server recognizes it as
+#                             the SAME machine (same history/display_name),
+#                             unlike --force below. Requires config.json to
+#                             already exist.
+#   --force                   overwrite an existing worker/config.json from
+#                             scratch, INCLUDING machine_id -- the server
+#                             will treat this as a brand-new machine with no
+#                             history. Use --reconnect instead unless that's
+#                             actually what you want.
+#   --allow-insecure-url       allow a plain http:// --vps-url other than
+#                             localhost/127.0.0.1 (see below). Only for a
+#                             deployment you've secured another way -- e.g.
+#                             this app's own tailnet-only mode, where
+#                             Tailscale's own WireGuard tunnel is the
+#                             encryption, not TLS.
 #
 # Safe by default: refuses to overwrite an existing worker/config.json unless
-# --force is passed (no git in this repo checkout, so an overwritten
-# config.json has no recovery path). Idempotent otherwise: if config.json
-# already exists, setup is skipped and this just (re)starts the worker with
-# it as-is -- so the exact same command works both for first-time setup and
-# every restart after.
+# --force (or --reconnect, which only ever touches the session fields) is
+# passed -- no git in this repo checkout, so an overwritten config.json has
+# no recovery path. Idempotent otherwise: if config.json already exists and
+# neither flag is given, setup is skipped and this just (re)starts the
+# worker with it as-is -- so the exact same command works both for
+# first-time setup and every restart after.
 
 set -euo pipefail
 
 DIR=""
 WORKER_NAME="Local"
 BACKEND=""
-VPS_URL="http://100.122.1.111:4010"
-BIND_HOST=""
-PORT=8080
+VPS_URL=""
 FORCE=0
+RECONNECT=0
+ALLOW_INSECURE_URL=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -57,12 +80,17 @@ while [ $# -gt 0 ]; do
     --worker-name) WORKER_NAME="$2"; shift 2 ;;
     --backend) BACKEND="$2"; shift 2 ;;
     --vps-url) VPS_URL="$2"; shift 2 ;;
-    --bind-host) BIND_HOST="$2"; shift 2 ;;
-    --port) PORT="$2"; shift 2 ;;
     --force) FORCE=1; shift ;;
+    --reconnect) RECONNECT=1; shift ;;
+    --allow-insecure-url) ALLOW_INSECURE_URL=1; shift ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
 done
+
+if [ "$FORCE" -eq 1 ] && [ "$RECONNECT" -eq 1 ]; then
+  echo "--force and --reconnect are mutually exclusive (--force wipes machine_id, --reconnect preserves it)." >&2
+  exit 1
+fi
 
 # This script writes plain POSIX paths (e.g. /f/LlamaToaster) straight into
 # config.json as literal strings. That's correct on real macOS/Linux, but on
@@ -109,25 +137,66 @@ select_install_dir() {
   echo "${base_dir%/}/$folder_name"
 }
 
+if [ "$RECONNECT" -eq 1 ]; then
+  if [ ! -f "$CONFIG_PATH" ]; then
+    echo "--reconnect needs an existing $CONFIG_PATH -- nothing to reconnect. Run without --reconnect first." >&2
+    exit 1
+  fi
+  # node, not sed/jq -- Node is already a hard requirement for this whole
+  # script, unlike jq, and this needs real JSON parsing (session_token's
+  # value can contain characters a naive sed delete-the-line approach would
+  # mishandle). Every other field -- machine_id above all -- passes through
+  # untouched; only these two are ever removed.
+  node -e '
+    const fs = require("fs");
+    const p = process.argv[1];
+    const cfg = JSON.parse(fs.readFileSync(p, "utf8"));
+    delete cfg.session_token;
+    delete cfg.refresh_token;
+    fs.writeFileSync(p, JSON.stringify(cfg, null, 2) + "\n");
+  ' "$CONFIG_PATH"
+  echo "Cleared the saved session in $CONFIG_PATH -- this machine will go through device-flow approval again on startup, same identity."
+fi
+
 SKIPPED_SETUP=0
-if [ -f "$CONFIG_PATH" ] && [ "$FORCE" -ne 1 ]; then
+if [ -f "$CONFIG_PATH" ] && [ "$FORCE" -ne 1 ] && [ "$RECONNECT" -ne 1 ]; then
   SKIPPED_SETUP=1
   echo "worker/config.json already exists -- skipping setup, starting the worker with it as-is."
-  echo "(Re-run with --force to redo setup, e.g. after changing --dir or --bind-host.)"
+  echo "(Re-run with --force to redo setup from scratch, or --reconnect to just re-approve this machine.)"
+elif [ "$RECONNECT" -eq 1 ]; then
+  SKIPPED_SETUP=1
 else
+  if [ -z "$VPS_URL" ]; then
+    echo "--vps-url is required on first setup, e.g. --vps-url https://llamatoaster.com" >&2
+    exit 1
+  fi
+  # This ends up in config.json and gets a real 90-day bearer token sent to
+  # it on every heartbeat/queue-poll (MULTIUSER_PLAN.md §3.5's own "the
+  # installer refuses http://") -- plaintext HTTP would put that credential
+  # on the wire in the clear. localhost/127.0.0.1/::1 are exempted, same
+  # convention browsers use for "secure context" -- needed for local
+  # dev/testing against a server that isn't fronted by TLS yet. Anything else
+  # over http:// needs --allow-insecure-url (e.g. this app's own tailnet-only
+  # mode, where Tailscale's own tunnel is the encryption, not TLS).
+  case "$VPS_URL" in
+    https://*) ;;
+    http://localhost*|http://127.0.0.1*|http://\[::1\]*) ;;
+    http://*)
+      if [ "$ALLOW_INSECURE_URL" -ne 1 ]; then
+        echo "--vps-url is http:// ($VPS_URL) -- that sends a real bearer credential in the clear." >&2
+        echo "Use https://, or pass --allow-insecure-url if this connection is secured another way (e.g. a Tailscale-only deployment)." >&2
+        exit 1
+      fi
+      ;;
+    *)
+      echo "--vps-url must start with https:// or http://, got: $VPS_URL" >&2
+      exit 1
+      ;;
+  esac
+
   if [ -z "$DIR" ]; then
     DIR="$(select_install_dir)"
     echo "Using $DIR"
-  fi
-
-  if [ -z "$BIND_HOST" ]; then
-    echo "No --bind-host given, trying 'tailscale ip -4'..."
-    BIND_HOST="$(tailscale ip -4 2>/dev/null | head -n1 || true)"
-    if [ -z "$BIND_HOST" ]; then
-      echo "Could not auto-detect a Tailscale IP. Pass --bind-host <this machine's tailnet IP> explicitly." >&2
-      exit 1
-    fi
-    echo "Using detected Tailscale IP: $BIND_HOST"
   fi
 
   LLAMA_DIR="$DIR/llama"
@@ -145,8 +214,6 @@ $( [ -n "$BACKEND" ] && printf '  "backend": "%s",\n' "$BACKEND" )
   "llama_bench_path": "$LLAMA_DIR/llama-bench",
   "model_dir": "$MODELS_DIR",
   "vps_url": "$VPS_URL",
-  "bind_host": "$BIND_HOST",
-  "port": $PORT,
   "raw_json_dir": "$RAW_DIR",
   "llama_cpp_builds_dir": "$LLAMA_DIR"
 }
@@ -165,10 +232,13 @@ if [ ! -e node_modules/.bin/tsx ]; then
   npm install --ignore-scripts
 fi
 
-if [ "$SKIPPED_SETUP" -eq 1 ]; then
+if [ "$RECONNECT" -eq 1 ]; then
+  echo "Starting worker -- watch the console for a short code and a link to re-approve this machine."
+elif [ "$SKIPPED_SETUP" -eq 1 ]; then
   echo "Starting worker with existing $CONFIG_PATH"
 else
   BACKEND_LABEL="${BACKEND:-auto-detected from hardware}"
   echo "Starting worker '$WORKER_NAME' ($BACKEND_LABEL) -- llama.cpp builds will install to $LLAMA_DIR on first run, models download to $MODELS_DIR from the Models page."
+  echo "First run only: watch the console for a short code and a link to approve this machine."
 fi
 npm run worker

@@ -1,26 +1,61 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { api } from "../api/client";
-import { useWorkerStatuses } from "../api/useWorkerStatus";
 import { StatCard } from "../components/StatCard";
-import { RunStatusPill, WorkerStatusPill, ElapsedSince } from "../components/StatusPill";
+import { RunStatusPill, StatusPill, type PillTone } from "../components/StatusPill";
 import { TokSpeedDemo } from "../components/TokSpeedDemo";
-import type { Model, Run } from "../types";
-import { shortId } from "../utils";
+import type { Run, Worker } from "../types";
+import { shortId, formatGpuLabel } from "../utils";
+
+// Multi-user Stage 5 (MULTIUSER_PLAN.md §5.2): "machines, not users" -- every
+// number and machine shown here comes from api.listWorkers()/api.listRuns(),
+// both already scoped to the caller's own account once authenticated
+// (Stage 4's own §4.3/§4.5 scoping) and unfiltered in single-tenant mode
+// (AUTH_ENABLED off), unchanged from before that scoping existed. Nothing
+// here computes a global/cross-tenant number -- there is no code path left
+// that could leak one onto this page. A superadmin sees exactly this same
+// personal dashboard, no branch, no admin link -- the cross-tenant view
+// lives entirely on the separate admin origin (§5.1).
+const WORKER_STATUS_TONE: Record<Worker["status"], PillTone> = {
+  offline: "danger",
+  idle: "muted",
+  busy: "accent",
+};
+
+function MachineRow({ worker }: { worker: Worker }) {
+  const gpu = worker.hardware?.gpu[0];
+  return (
+    <div className="flex items-center gap-3 rounded-lg border border-border bg-surface px-4 py-3">
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center gap-2">
+          <span className="truncate text-sm font-medium text-fg">{worker.displayName}</span>
+          <StatusPill label={worker.status} tone={WORKER_STATUS_TONE[worker.status]} />
+        </div>
+        <div className="mt-0.5 truncate text-xs text-muted">
+          {[worker.backend, gpu ? formatGpuLabel(gpu) : null].filter(Boolean).join(" · ") || "no details reported yet"}
+        </div>
+      </div>
+      {worker.status === "busy" && worker.activeJobProgress && (
+        <span className="flex-none text-xs text-muted">
+          {worker.activeJobProgress.detail ?? worker.activeJobProgress.phase}
+        </span>
+      )}
+    </div>
+  );
+}
 
 export function Dashboard() {
-  const [models, setModels] = useState<Model[]>([]);
   const [runs, setRuns] = useState<Run[]>([]);
+  const [workers, setWorkers] = useState<Worker[]>([]);
   const [loaded, setLoaded] = useState(false);
-  const { order, status } = useWorkerStatuses();
 
   useEffect(() => {
     let cancelled = false;
     (async () => {
-      const [m, r] = await Promise.all([api.listModels(), api.listRuns()]);
+      const [r, w] = await Promise.all([api.listRuns(), api.listWorkers()]);
       if (cancelled) return;
-      setModels(m);
       setRuns(r);
+      setWorkers(w);
       setLoaded(true);
     })();
     return () => {
@@ -28,38 +63,45 @@ export function Dashboard() {
     };
   }, []);
 
-  const running = runs.filter((r) => r.status === "running").length;
+  // A lifetime count, not a live online/total ratio -- see this file's own
+  // header comment and MULTIUSER_PLAN.md §5.2: an online/total ratio makes
+  // the tile flicker as boxes sleep and turns a headline number into a
+  // status widget; per-machine liveness belongs in the strip below, where
+  // it's actionable. Abandoned enrolments (never heartbeated) don't count; a
+  // machine that's merely powered off right now still does.
+  const machinesEverConnected = workers.filter((w) => w.lastHeartbeatAt !== null).length;
+  const testsTotal = runs.reduce((sum, r) => sum + (r.items_total ?? 0), 0);
+  const distinctModelsTested = new Set(runs.map((r) => r.model_id)).size;
   const recent = runs.slice(0, 8);
 
   return (
     <div>
       <h1 className="text-2xl font-semibold text-fg">Dashboard</h1>
 
-      <section className="mt-6 flex flex-wrap gap-4">
-        <StatCard label="Models" value={models.length} />
+      <section className="grid grid-cols-2 gap-4 md:grid-cols-4">
+        <StatCard label="Machines" value={machinesEverConnected} />
         <StatCard label="Runs" value={runs.length} />
-        <StatCard label="Running" value={running} />
+        <StatCard label="Tests" value={testsTotal} />
+        <StatCard label="Models tested" value={distinctModelsTested} />
       </section>
 
-      {order.length > 0 && (
-        <section className="mt-6 flex flex-wrap gap-3">
-          {order.map((name) => {
-            const s = status[name];
-            return (
-              <div
-                key={name}
-                className="flex items-center gap-2 rounded-lg border border-border bg-surface px-3 py-2"
-              >
-                <span className="text-sm font-medium text-fg">{name}</span>
-                <WorkerStatusPill inaccessible={s?.inaccessible ?? false} loading={s?.loading} />
-                {s?.info?.current_run && (
-                  <span className="text-xs text-muted">
-                    · {s.info.current_run.model_filename} · <ElapsedSince startedAt={s.info.current_run.started_at} />
-                  </span>
-                )}
-              </div>
-            );
-          })}
+      {loaded && workers.length === 0 ? (
+        <section className="mt-6 rounded-xl border border-border bg-surface px-6 py-8 text-center">
+          <p className="text-sm font-semibold text-fg">No machines yet.</p>
+          <p className="mt-1 text-sm text-muted">LlamaToaster runs benchmarks on your own hardware.</p>
+          <Link
+            to="/device"
+            className="mt-4 inline-block rounded-lg bg-accent px-4 py-2 text-sm font-semibold text-accent-fg hover:bg-accent/90"
+          >
+            Connect your first machine
+          </Link>
+          <p className="mt-2 text-xs text-muted">Takes about a minute.</p>
+        </section>
+      ) : (
+        <section className="mt-6 grid gap-3 md:grid-cols-2">
+          {workers.map((w) => (
+            <MachineRow key={w.id} worker={w} />
+          ))}
         </section>
       )}
 

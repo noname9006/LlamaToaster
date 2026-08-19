@@ -123,3 +123,132 @@ CREATE TABLE IF NOT EXISTS run_items (
 );
 
 CREATE INDEX IF NOT EXISTS idx_run_items_run ON run_items(run_id);
+
+-- Multi-user Stage 1: pull queue -- see MULTIUSER_PLAN.md §1.2.
+
+-- One row per machine. In Stage 1 rows are created by the worker's first
+-- heartbeat (self-announce, keyed on the machine_id it persists locally).
+-- Stage 3 adds enrolment columns; Stage 4 adds user_id.
+CREATE TABLE IF NOT EXISTS workers (
+  id TEXT PRIMARY KEY,                       -- UUID, server-assigned
+  machine_id TEXT UNIQUE NOT NULL,           -- stable id the worker persists in its config
+  display_name TEXT NOT NULL,                -- user-editable; defaults to the reported hostname
+  backend TEXT,                              -- from state push
+  platform TEXT,                             -- from state push
+  arch TEXT,                                 -- from state push
+  hostname TEXT,                             -- from state push, the default display_name
+  hardware_json TEXT,
+  installed_builds_json TEXT,
+  model_files_json TEXT,
+  last_heartbeat_at INTEGER,                 -- liveness source of truth; status is DERIVED (see server/src/liveness.ts)
+  active_job_id TEXT,                        -- what it is executing right now, or NULL
+  pause_requested INTEGER NOT NULL DEFAULT 0, -- see MULTIUSER_PLAN.md §1.14 -- POST /api/runs/:id/pause|resume
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+-- Persistent queue. Leases and attempts are what make a crashed worker
+-- recoverable.
+CREATE TABLE IF NOT EXISTS worker_jobs (
+  id TEXT PRIMARY KEY,
+  worker_id TEXT NOT NULL REFERENCES workers(id) ON DELETE CASCADE,
+  job_type TEXT NOT NULL,                    -- 'benchmark' | 'install_build' | 'download_model' | 'delete_model_file'
+  payload_json TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',    -- pending | claimed | completed | failed | cancelled
+  attempts INTEGER NOT NULL DEFAULT 0,
+  lease_expires_at INTEGER,                  -- set on claim, extended by every heartbeat
+  cancel_requested INTEGER NOT NULL DEFAULT 0,
+  progress_json TEXT,                        -- live phase/progress, pushed by heartbeat
+  run_id TEXT,                               -- set for benchmark jobs, for reconciliation
+  created_at INTEGER NOT NULL,
+  claimed_at INTEGER,
+  completed_at INTEGER,
+  error TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_worker_jobs_worker  ON worker_jobs(worker_id, status);
+CREATE INDEX IF NOT EXISTS idx_worker_jobs_lease   ON worker_jobs(status, lease_expires_at);
+CREATE INDEX IF NOT EXISTS idx_workers_machine     ON workers(machine_id);
+
+-- Multi-user Stage 2: auth -- see MULTIUSER_PLAN.md §2.1/§2.2.
+
+-- THE account. Provider-independent -- every other table (sessions, workers
+-- once Stage 4 adds user_id, ...) references users.id, never a provider's own
+-- id directly. No is_superadmin column here -- see §5.1, evaluated per
+-- request from env + linked identities, never a stored/cacheable flag.
+CREATE TABLE IF NOT EXISTS users (
+  id TEXT PRIMARY KEY,
+  display_name TEXT,
+  avatar_url TEXT,
+  share_benchmarks INTEGER NOT NULL DEFAULT 1,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  last_login_at INTEGER
+);
+
+-- One row per (provider, that provider's account) a user has linked. GitHub
+-- today; a second provider is a new row shape, not a new column, and not a
+-- migration of anything that already exists.
+CREATE TABLE IF NOT EXISTS identities (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  provider TEXT NOT NULL,
+  provider_user_id TEXT NOT NULL,
+  provider_login TEXT,
+  created_at INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_identities_provider ON identities(provider, provider_user_id);
+CREATE INDEX IF NOT EXISTS idx_identities_user ON identities(user_id);
+
+-- The token itself is never stored, only its hash -- see server/src/session.ts's
+-- hashToken and repo.sessionRepo.create.
+CREATE TABLE IF NOT EXISTS sessions (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  token_hash TEXT NOT NULL,
+  refresh_hash TEXT,
+  prev_refresh_hash TEXT,
+  expires_at INTEGER NOT NULL,
+  is_worker INTEGER NOT NULL DEFAULT 0,
+  worker_id TEXT,
+  label TEXT,
+  last_seen_at INTEGER,
+  created_at INTEGER NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_token   ON sessions(token_hash);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_refresh ON sessions(refresh_hash);
+CREATE INDEX IF NOT EXISTS idx_sessions_user    ON sessions(user_id);
+CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
+CREATE INDEX IF NOT EXISTS idx_sessions_worker  ON sessions(worker_id);
+
+-- Per-user/per-day/per-hour AI usage counters -- see MULTIUSER_PLAN.md §2.6.
+-- One row per (user_id, day, hour); incremented on every /api/ai/chat call
+-- that actually reaches the provider, checked before it.
+CREATE TABLE IF NOT EXISTS ai_usage (
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  day TEXT NOT NULL,     -- 'YYYY-MM-DD', UTC
+  hour INTEGER NOT NULL, -- 0-23, UTC
+  count INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (user_id, day, hour)
+);
+CREATE INDEX IF NOT EXISTS idx_ai_usage_day ON ai_usage(day);
+
+-- Multi-user Stage 4 (MULTIUSER_PLAN.md §4.2): tiny key-value store for
+-- one-shot migration flags -- currently just "has the pre-auth legacy
+-- history been claimed by the first superadmin yet" (see migrate.ts's
+-- claimLegacyHistory, run from routes/auth.ts on that user's login, not at
+-- boot -- the user row has to exist first). Not meant for anything else.
+CREATE TABLE IF NOT EXISTS meta (
+  key TEXT PRIMARY KEY,
+  value TEXT
+);
+
+-- idx_results_item (UNIQUE on results(run_id, idx, test_type), guarding
+-- against a retried terminal item report inserting a second results row) is
+-- deliberately NOT created here. results.idx is only added as a column by
+-- migrate.ts's COLUMN_MIGRATIONS + backfillResultIdx, which run AFTER this
+-- file is exec'd -- creating the index here would fail with "no such column"
+-- on any DB whose results table predates that column. See migrate.ts's
+-- createResultsItemUniqueIndex, called once idx is guaranteed to exist and
+-- be backfilled.

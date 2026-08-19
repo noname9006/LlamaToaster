@@ -1,5 +1,9 @@
 import type { FastifyInstance } from "fastify";
 import { HF_REPO_PATTERN, searchHfGgufModels, listHfGgufFiles } from "../hf.js";
+import { repo } from "../db/repo.js";
+import { resolveAuthUser } from "../auth-middleware.js";
+import { loadExportRows, type ResultExportRow } from "./results.js";
+import type { CommunityAggregateFilters } from "../../../shared/types.js";
 
 // extra_content.google.thought_signature is Gemini-specific (see the
 // thought-signature comment in the /api/ai/chat route's stream loop below)
@@ -31,6 +35,29 @@ const HF_TOOL_TIMEOUT_MS = 15_000;
 // A model that keeps calling tools instead of answering shouldn't hang the
 // request forever -- cut it off and surface whatever it's found so far.
 const MAX_TOOL_ROUNDS = 4;
+
+// §2.6: an unmetered proxy to a paid LLM, with a client-controlled message
+// array and up to MAX_TOOL_ROUNDS tool rounds per request, is the
+// highest-probability launch-day incident this app has -- one signed-up user
+// could drain the operator's provider budget in an afternoon with nothing
+// else in place. maxToolRounds is already enforced as MAX_TOOL_ROUNDS above;
+// everything else is enforced in the route handler below via aiUsageRepo
+// (server/src/db/repo.ts), backed by the ai_usage table.
+const AI_LIMITS = {
+  perUserPerHour: 30,
+  perUserPerDay: 150,
+  globalPerDay: Number(process.env.AI_GLOBAL_DAILY_CAP ?? 2000), // circuit breaker
+  maxMessages: 40,
+  maxTotalChars: 60_000, // whole conversation, enforced server-side
+};
+
+// UTC, matching ai_usage's own (day, hour) bucketing -- deliberately not
+// the server's local time, which would make the daily/hourly reset moment
+// depend on deploy timezone.
+function utcDayAndHour(now: number): { day: string; hour: number } {
+  const d = new Date(now);
+  return { day: d.toISOString().slice(0, 10), hour: d.getUTCHours() };
+}
 
 // Given to the model so it can look up real, current Hugging Face listings --
 // repo ids, download/like counts, actual GGUF file sizes per quant -- instead
@@ -72,9 +99,54 @@ const TOOLS = [
       },
     },
   },
+  // Multi-user Stage 5 (MULTIUSER_PLAN.md §5.4): the assistant's only window
+  // into other users' data, and it can only ever see k-anonymised aggregates
+  // -- every row repo.communityRepo returns already describes five or more
+  // people, never fewer, and never a username or machine id. Requires
+  // sign-in (see runTool below); with AUTH_ENABLED off or no session, both
+  // tools return an error result instead of data.
+  {
+    type: "function",
+    function: {
+      name: "list_community_facets",
+      description:
+        "Discover what community benchmark data currently exists (models, backends, platforms, GPUs) " +
+        "that has enough contributors to be shown -- use this BEFORE get_community_aggregates to find a " +
+        "valid filter value instead of guessing one. Every value returned already has 5+ contributors; a " +
+        "value with fewer never appears here at all. Requires the user to be signed in.",
+      parameters: { type: "object", properties: {} },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "get_community_aggregates",
+      description:
+        "Get anonymised, aggregated benchmark throughput (avg tok/s, avg RAM/VRAM) contributed by OTHER " +
+        "users who opted in to sharing, optionally filtered by model_id/backend/platform/gpu_model. Every " +
+        "row already represents 5 or more distinct contributors (rows describing fewer are suppressed " +
+        "server-side) -- never attribute a row to an individual, never state or imply how many people are " +
+        "in a group beyond the contributor_count field itself, and never combine two rows to try to narrow " +
+        "a group down further. Requires the user to be signed in.",
+      parameters: {
+        type: "object",
+        properties: {
+          model_id: { type: "string", description: "Filter to one model's sha256 id (see the Registered models section above)." },
+          backend: { type: "string", description: "e.g. 'cuda', 'vulkan', 'metal', 'cpu'." },
+          platform: { type: "string", description: "e.g. 'linux', 'darwin', 'win32'." },
+          gpu_model: { type: "string", description: "e.g. 'RTX 4090'." },
+        },
+      },
+    },
+  },
 ];
 
-async function runTool(name: string, rawArguments: string): Promise<unknown> {
+// callerId: the authenticated caller's user id, or undefined with
+// AUTH_ENABLED off / no session (§4.6's same convention throughout this
+// file). The two community tools (§5.4) need it both to exclude the
+// caller's own runs from an aggregate (point 3 of §5.4) and because there is
+// no "other users" concept to query at all without a real caller identity.
+async function runTool(name: string, rawArguments: string, callerId: string | undefined): Promise<unknown> {
   let args: Record<string, unknown>;
   try {
     args = JSON.parse(rawArguments || "{}");
@@ -99,6 +171,22 @@ async function runTool(name: string, rawArguments: string): Promise<unknown> {
     } catch (err) {
       return { error: err instanceof Error ? err.message : String(err) };
     }
+  }
+
+  if (name === "list_community_facets") {
+    if (!callerId) return { error: "sign in to use community benchmark data" };
+    return repo.communityRepo.listFacets(callerId);
+  }
+
+  if (name === "get_community_aggregates") {
+    if (!callerId) return { error: "sign in to use community benchmark data" };
+    const filters: CommunityAggregateFilters = {
+      modelId: typeof args.model_id === "string" ? args.model_id : undefined,
+      backend: typeof args.backend === "string" ? args.backend : undefined,
+      platform: typeof args.platform === "string" ? args.platform : undefined,
+      gpuModel: typeof args.gpu_model === "string" ? args.gpu_model : undefined,
+    };
+    return { aggregates: repo.communityRepo.listAggregates(callerId, filters) };
   }
 
   return { error: `unknown tool ${name}` };
@@ -314,12 +402,140 @@ async function* iterSseEvents(body: ReadableStream<Uint8Array>): AsyncGenerator<
   }
 }
 
+// Moved server-side from client/src/components/ChatPanel.tsx (§2.7) -- the
+// text itself is unchanged, only where it lives. The server is now the only
+// thing that can ever set the system message; a client-supplied one is
+// discarded outright (see the request handler below), which is what makes
+// this instruction actually enforceable rather than just a convention the
+// stock client happens to follow.
+const SERVER_SYSTEM_PROMPT =
+  "You are an assistant embedded in LlamaToaster, a local LLM inference benchmarking tool for " +
+  "llama.cpp / llama-bench. Help the user choose llama.cpp parameters (threads, n_gpu_layers, " +
+  "batch/ubatch size, KV cache quantization, flash attention), suggest GGUF models that fit their " +
+  "hardware, and analyze the benchmark data below to say which configuration performs best on " +
+  "their machine(s).\n\n" +
+  "Grounding: you have search_huggingface_gguf_models and list_huggingface_gguf_files tools. Your " +
+  "training data's knowledge of model releases is stale — treat any belief about whether a model " +
+  "exists yet, its parameter count, or its file size as unverified until a tool confirms it this " +
+  "turn. Never say a model \"isn't released yet\" or \"isn't available\" based on memory; search " +
+  "first. If a tool call fails or returns nothing useful, say so plainly instead of falling back to " +
+  "a guess.\n\n" +
+  "Community data: you also have list_community_facets and get_community_aggregates, which return " +
+  "OTHER users' benchmark throughput, anonymised and aggregated across everyone who ran a given " +
+  "model/backend/platform/GPU combination. Every row you get back already represents 5 or more " +
+  "distinct people — you will never be given a row for fewer, so there is nothing to protect by " +
+  "refusing to use one. But you must never try to make a row MORE identifying than it already is: " +
+  "never say or imply how many people are behind a number beyond echoing its own contributor_count, " +
+  "never attribute a result to a specific person, never speculate about who a contributor might be, " +
+  "and never chain two aggregate rows together to narrow a group down toward one individual. If asked " +
+  "who submitted a result, or for data about a specific person, explain that this tool only returns " +
+  "anonymised group aggregates and cannot identify individuals.\n\n" +
+  "Style: keep replies short — a few sentences or a short bullet list. Don't use a markdown table " +
+  "unless the user is comparing multiple options side by side or explicitly asks for one. Skip " +
+  "preamble and caveats; lead with the answer.";
+
+const MAX_CONTEXT_RESULT_ROWS = 150;
+
+// Mirrors client/src/utils.ts's formatFlashAttn exactly -- duplicated rather
+// than shared since it's a single four-line pure function with no other
+// server-side use; not worth a shared/ module for.
+function formatFlashAttn(value: string): string {
+  if (value === "true" || value === "1") return "on";
+  if (value === "false" || value === "0") return "off";
+  return value;
+}
+
+// Multi-user Stage 4 (MULTIUSER_PLAN.md §4.6): the caller's own machines
+// once authenticated; every machine in single-tenant mode (userId undefined
+// -- AUTH_ENABLED off), unchanged from before this scoping existed.
+function hardwareSummary(userId: string | undefined): string {
+  const workers = userId ? repo.workerRepo.listWorkersForUser(userId) : repo.workerRepo.listWorkers();
+  if (workers.length === 0) return "(no machines connected)";
+  return workers
+    .map((w) => {
+      const hw = w.hardware;
+      const cpu = hw ? hw.cpu.brand || hw.cpu.manufacturer || "unknown CPU" : "unknown CPU";
+      const gpu = hw && hw.gpu.length > 0 ? hw.gpu.map((g) => g.model).join(", ") : "no discrete GPU reported";
+      const activeBuild = w.installedBuilds.find((b) => b.active)?.tag;
+      return `- ${w.displayName} — ${w.backend ?? "unknown"} backend, ${w.platform ?? "?"}/${w.arch ?? "?"}, CPU: ${cpu}, GPU: ${gpu}, build ${activeBuild ?? "none"} (${w.status})`;
+    })
+    .join("\n");
+}
+
+function modelsSummary(): { text: string; count: number } {
+  const models = repo.listModels();
+  if (models.length === 0) return { text: "(none registered)", count: 0 };
+  const text = models
+    .map((m) => {
+      const family = typeof m.metadata.arch === "string" ? m.metadata.arch : "unknown arch";
+      const quant = typeof m.metadata.quant === "string" ? `, ${m.metadata.quant}` : "";
+      const repoLabel = m.hf_repo ? ` — ${m.hf_repo}` : "";
+      return `- ${m.filename} (${family}${quant})${repoLabel}`;
+    })
+    .join("\n");
+  return { text, count: models.length };
+}
+
+// Multi-user Stage 4 (MULTIUSER_PLAN.md §4.6): the caller's own results once
+// authenticated; every result in single-tenant mode, same as hardwareSummary
+// above.
+function resultsSummary(userId: string | undefined): string {
+  const rows: ResultExportRow[] = loadExportRows(userId);
+  if (rows.length === 0) return "(no benchmark results yet)";
+  const sorted = [...rows].sort((a, b) => b.created_at - a.created_at);
+  const capped = sorted.slice(0, MAX_CONTEXT_RESULT_ROWS);
+  const header =
+    "worker | backend | model | test | n_prompt | n_gen | threads | ngl (loaded/total) | batch | ubatch | ctk | ctv | fa | avg_tps | ram_peak_mib | vram_peak_mib | vram_total_mib";
+  const lines = capped.map(
+    (r) =>
+      `${r.worker_name} | ${r.backend_type}${r.backend_device_name ? ` (${r.backend_device_name})` : ""} | ${r.model_filename} | ${r.test_type} | ${r.n_prompt} | ${r.n_gen} | ${r.n_threads} | ` +
+      `${r.n_gpu_layers} (${r.gpu_layers_loaded ?? "?"}/${r.total_model_layers ?? "?"}) | ${r.batch_size} | ${r.ubatch_size} | ${r.cache_type_k} | ${r.cache_type_v} | ${formatFlashAttn(r.flash_attn)} | ` +
+      `${r.avg_tps.toFixed(2)} | ${r.ram_peak_mib} | ${r.vram_peak_mib ?? "n/a"} | ${r.gpu_memory_total_mib ?? "n/a"}`
+  );
+  const scope = rows.length > capped.length ? `most recent ${capped.length} of ${rows.length} total` : `${rows.length} total`;
+  return `(${scope})\n${header}\n${lines.join("\n")}`;
+}
+
+// Server-side port of client/src/api/aiContext.ts's buildContextSnapshot
+// (§2.7) -- same output shape, but reads the DB directly instead of an HTTP
+// round-trip to this server's own API. userId now genuinely scopes hardware/
+// results to the caller (§4.6) -- modelsSummary stays unscoped, since the
+// model catalog is global (§4.3). Exported for ai.test.ts's own isolation
+// coverage -- otherwise unused outside this module.
+export function buildContextSnapshot(userId: string | undefined): string {
+  const { text: models, count: modelCount } = modelsSummary();
+  return [
+    "## Hardware",
+    hardwareSummary(userId),
+    "",
+    `## Registered models (n=${modelCount})`,
+    models,
+    "",
+    "## Recent benchmark results",
+    resultsSummary(userId),
+  ].join("\n");
+}
+
 export async function aiRoutes(app: FastifyInstance): Promise<void> {
   // Lets the client show "set up the assistant" vs. the chat UI, and which
-  // model is active, without ever exposing the key itself.
-  app.get("/api/ai/status", async () => {
+  // model is active, without ever exposing the key itself. Also surfaces the
+  // caller's own remaining §2.6 quota (when authenticated) so the limit is
+  // visible in the chat panel before it bites, per the plan's own
+  // requirement -- omitted entirely with AUTH_ENABLED off/unauthenticated,
+  // since there's no per-user budget to report in that mode.
+  app.get("/api/ai/status", async (request) => {
     const config = aiConfig();
-    return { configured: config !== null, model: config?.models[0] };
+    const authed = resolveAuthUser(request);
+    const quota = authed
+      ? (() => {
+          const { day, hour } = utcDayAndHour(Date.now());
+          return {
+            remainingHour: Math.max(0, AI_LIMITS.perUserPerHour - repo.aiUsageRepo.getHourCount(authed.user.id, day, hour)),
+            remainingDay: Math.max(0, AI_LIMITS.perUserPerDay - repo.aiUsageRepo.getUserDayCount(authed.user.id, day)),
+          };
+        })()
+      : undefined;
+    return { configured: config !== null, model: config?.models[0], quota };
   });
 
   // Proxies to the configured OpenAI-compatible provider so the API key
@@ -337,9 +553,54 @@ export async function aiRoutes(app: FastifyInstance): Promise<void> {
         error: "AI assistant not configured on this server -- set AI_API_KEY, AI_BASE_URL, and AI_MODEL in a .env file at the repo root, then restart the server.",
       });
     }
-    const messages = request.body?.messages;
-    if (!isValidMessages(messages)) {
+    const rawMessages = request.body?.messages;
+    if (!isValidMessages(rawMessages)) {
       return reply.code(400).send({ error: "messages must be a non-empty array of {role, content}" });
+    }
+
+    // §2.7: the server owns the system prompt -- ANY client-supplied system
+    // message is discarded outright, never merged with or allowed to
+    // override SERVER_SYSTEM_PROMPT below. This is what actually makes that
+    // instruction enforceable (previously the browser built the whole
+    // conversation including the system message, so `curl`ing this endpoint
+    // directly could send anything).
+    const userMessages = rawMessages.filter((m) => m.role !== "system");
+    if (userMessages.length !== rawMessages.length) {
+      request.log.warn({ discarded: rawMessages.length - userMessages.length }, "ai chat: client-supplied system message(s) discarded");
+    }
+
+    if (userMessages.length > AI_LIMITS.maxMessages) {
+      return reply.code(400).send({ error: `too many messages in this conversation (max ${AI_LIMITS.maxMessages})` });
+    }
+    const totalChars = userMessages.reduce((sum, m) => sum + m.content.length, 0);
+    if (totalChars > AI_LIMITS.maxTotalChars) {
+      return reply.code(400).send({ error: `conversation too long (max ${AI_LIMITS.maxTotalChars} characters total)` });
+    }
+
+    // §2.6 budget: only enforced against a REAL user (ai_usage.user_id has a
+    // real FK to users(id) -- there's nothing to attribute usage to with
+    // AUTH_ENABLED off, so Stage 1's original unmetered behavior applies
+    // unchanged in that mode). The global circuit breaker, by contrast,
+    // protects the operator's own provider budget regardless of who's
+    // calling, so it's checked either way -- it just never accumulates at
+    // all in Stage-1-only mode, since nothing ever gets recorded.
+    const authed = resolveAuthUser(request);
+    const { day, hour } = utcDayAndHour(Date.now());
+    if (repo.aiUsageRepo.getGlobalDayCount(day) >= AI_LIMITS.globalPerDay) {
+      return reply.code(503).send({ error: "the assistant is over its daily budget, try again tomorrow" });
+    }
+    if (authed) {
+      if (repo.aiUsageRepo.getHourCount(authed.user.id, day, hour) >= AI_LIMITS.perUserPerHour) {
+        return reply
+          .code(429)
+          .send({ error: `hourly AI usage limit reached (${AI_LIMITS.perUserPerHour}/hour) -- try again later` });
+      }
+      if (repo.aiUsageRepo.getUserDayCount(authed.user.id, day) >= AI_LIMITS.perUserPerDay) {
+        return reply
+          .code(429)
+          .send({ error: `daily AI usage limit reached (${AI_LIMITS.perUserPerDay}/day) -- try again tomorrow` });
+      }
+      repo.aiUsageRepo.recordUsage(authed.user.id, day, hour);
     }
 
     // Aborts the upstream request if the client disconnects (closes the tab,
@@ -363,9 +624,16 @@ export async function aiRoutes(app: FastifyInstance): Promise<void> {
       if (!finished) request.log.info("ai chat: client disconnected before a final answer");
     });
 
-    request.log.info({ messageCount: messages.length }, "ai chat: request started");
+    request.log.info({ messageCount: userMessages.length, authed: authed !== null }, "ai chat: request started");
 
-    const conversation: AiChatMessage[] = [...messages];
+    // Server-built system message, prepended unconditionally -- see §2.7's
+    // header comment above. buildContextSnapshot is synchronous (direct DB
+    // reads, no network round-trip), unlike the client-side version it
+    // replaces.
+    const conversation: AiChatMessage[] = [
+      { role: "system", content: `${SERVER_SYSTEM_PROMPT}\n\n${buildContextSnapshot(authed?.user.id)}` },
+      ...userMessages,
+    ];
 
     for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
       // Round 0 forces a tool call ("required", not "auto") -- left to its own
@@ -532,7 +800,7 @@ export async function aiRoutes(app: FastifyInstance): Promise<void> {
             { round, tool: call.function.name, args: call.function.arguments },
             "ai chat: tool call started"
           );
-          const result = await runTool(call.function.name, call.function.arguments);
+          const result = await runTool(call.function.name, call.function.arguments, authed?.user.id);
           const isError = Boolean(result && typeof result === "object" && "error" in result);
           request.log.info(
             { round, tool: call.function.name, toolLatencyMs: Date.now() - toolStartedAt, ok: !isError },

@@ -13,6 +13,12 @@ export default defineConfig({
     proxy: {
       "/api": apiProxyTarget,
       "/health": apiProxyTarget,
+      // Multi-user Stage 2 (MULTIUSER_PLAN.md §2.4/§2.5): browser-facing
+      // OAuth/session routes the same server also owns in production
+      // (same-origin, §0.5) -- without this, vite's own SPA fallback
+      // silently swallows /auth/github, /auth/github/callback, and
+      // /auth/logout in dev instead of ever reaching the real backend.
+      "/auth": apiProxyTarget,
     },
   },
   build: {
