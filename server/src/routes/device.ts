@@ -2,9 +2,9 @@ import type { FastifyInstance } from "fastify";
 import { repo } from "../db/repo.js";
 import { generateEnrolmentCode, generateUserCode, hashToken } from "../session.js";
 import { parseDeviceStart, parseDeviceToken } from "../validate-worker-state.js";
-import { NotFoundError, ConflictError } from "../errors.js";
+import { NotFoundError, ConflictError, BadRequestError } from "../errors.js";
 import type { AuthenticatedRequest } from "../auth-middleware.js";
-import { userOrIpKeyGenerator } from "../auth-middleware.js";
+import { userOrIpKeyGenerator, assertOwnsWorker } from "../auth-middleware.js";
 import type {
   DeviceStartResponse,
   DeviceTokenSuccess,
@@ -29,9 +29,12 @@ export async function deviceRoutes(app: FastifyInstance): Promise<void> {
   // it's the same "reuse the row" path either way.
   app.post(
     "/api/device/start",
-    { config: { bodyLimit: 4_096, rateLimit: { max: 30, timeWindow: "1 minute" } } },
+    // 16KB, not the old 4KB -- this now also carries a HardwareInfo blob
+    // (cpu flags, gpu list, ...), same shape/validator as the heartbeat path
+    // but nowhere near that route's 1MB WORKER_BODY_LIMIT (queue.ts).
+    { config: { bodyLimit: 16_384, rateLimit: { max: 30, timeWindow: "1 minute" } } },
     async (req): Promise<DeviceStartResponse> => {
-      const { machine_id, hostname, platform, arch } = parseDeviceStart(req.body);
+      const { machine_id, hostname, platform, arch, hardware } = parseDeviceStart(req.body);
       const deviceCode = generateEnrolmentCode();
       const userCode = generateUserCode();
       const expiresAt = Date.now() + ENROLMENT_TTL_MS;
@@ -42,9 +45,9 @@ export async function deviceRoutes(app: FastifyInstance): Promise<void> {
         // re-registering never leaves an old worker session live alongside
         // the new one (§3.4's own review-finding callout, D6).
         repo.sessionRepo.revokeWorkerSessions(existing.id);
-        repo.workerRepo.reissueEnrolment(existing.id, { hostname, platform, arch, deviceCode, userCode, expiresAt });
+        repo.workerRepo.reissueEnrolment(existing.id, { hostname, platform, arch, deviceCode, userCode, expiresAt, hardware });
       } else {
-        repo.workerRepo.createPending({ machineId: machine_id, hostname, platform, arch, deviceCode, userCode, expiresAt });
+        repo.workerRepo.createPending({ machineId: machine_id, hostname, platform, arch, deviceCode, userCode, expiresAt, hardware });
       }
       return { device_code: deviceCode, user_code: userCode, verification_uri: "/device", interval: 5, expires_in: 900 };
     }
@@ -106,7 +109,7 @@ export async function deviceApprovalRoutes(app: FastifyInstance): Promise<void> 
     // the human even reaches for the Approve button -- see
     // workerRepo.findPossibleDuplicate's own doc comment for why this exists.
     const userId = (req as AuthenticatedRequest).user.id;
-    const possibleDuplicate = repo.workerRepo.findPossibleDuplicate(userId, worker.hostname, worker.id) ?? null;
+    const possibleDuplicate = repo.workerRepo.findPossibleDuplicate(userId, worker.id) ?? null;
     return {
       state: "pending" as const,
       machine: { hostname: worker.hostname, platform: worker.platform, arch: worker.arch, gpu: worker.gpuModel },
@@ -114,7 +117,7 @@ export async function deviceApprovalRoutes(app: FastifyInstance): Promise<void> 
     };
   });
 
-  app.post<{ Body: { user_code?: string; confirm_duplicate?: boolean } }>(
+  app.post<{ Body: { user_code?: string; confirm_duplicate?: boolean; merge_into?: string } }>(
     "/api/device/approve",
     { config: { rateLimit: { max: 20, timeWindow: "1 minute", keyGenerator: userOrIpKeyGenerator } } },
     async (req): Promise<DeviceApproveResponse> => {
@@ -129,12 +132,30 @@ export async function deviceApprovalRoutes(app: FastifyInstance): Promise<void> 
         throw new NotFoundError("invalid or expired code");
       }
       const userId = (req as AuthenticatedRequest).user.id;
-      // Re-checked here (not just trusted from a prior GET /status) since
-      // that's a separate, unauthoritative poll -- this is the actual
-      // decision point. A caller that already got the human's explicit
-      // "add it anyway" (confirm_duplicate) skips straight to approving.
+      // Merge takes priority over confirm_duplicate/plain-approve when both
+      // are somehow present -- the client only ever sends one. Re-checked
+      // here (not just trusted from a prior GET /status or the human's
+      // earlier click) since that's a separate, unauthoritative poll: a
+      // stale/mismatched merge target is refused rather than trusted blindly.
+      if (req.body.merge_into) {
+        const duplicateOf = repo.workerRepo.findPossibleDuplicate(userId, worker.id);
+        if (!duplicateOf || duplicateOf.id !== req.body.merge_into) {
+          throw new BadRequestError("that machine is no longer a suggested match -- refresh and try again");
+        }
+        assertOwnsWorker(userId, req.body.merge_into);
+        // Same reasoning /api/device/start already applies when a known
+        // machine_id re-enrols (above): a merge re-issues this worker's
+        // identity, so a session from whichever install is being merged away
+        // from shouldn't silently stay valid alongside the new one.
+        repo.sessionRepo.revokeWorkerSessions(req.body.merge_into);
+        const merged = repo.workerRepo.mergeEnrolment(worker.id, req.body.merge_into);
+        return { ok: true, machine: { hostname: merged.hostname }, merged: true };
+      }
+      // A caller that already got the human's explicit "add it anyway"
+      // (confirm_duplicate) skips straight to approving as a new, separate
+      // worker.
       if (!req.body.confirm_duplicate) {
-        const duplicateOf = repo.workerRepo.findPossibleDuplicate(userId, worker.hostname, worker.id);
+        const duplicateOf = repo.workerRepo.findPossibleDuplicate(userId, worker.id);
         if (duplicateOf) {
           return { ok: false, needsConfirmation: true, duplicateOf };
         }

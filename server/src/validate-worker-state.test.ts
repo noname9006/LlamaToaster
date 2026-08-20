@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseWorkerState, parseActiveJobReport } from "./validate-worker-state.js";
+import { parseWorkerState, parseActiveJobReport, parseDeviceStart } from "./validate-worker-state.js";
 import { BadRequestError } from "./errors.js";
 
 function validBody(overrides: Record<string, unknown> = {}) {
@@ -105,5 +105,42 @@ describe("parseActiveJobReport", () => {
     expect(() => parseActiveJobReport({ active_job: { job_id: "job-1", phase: "sleeping" } })).toThrow(
       BadRequestError
     );
+  });
+});
+
+describe("parseDeviceStart", () => {
+  function body(overrides: Record<string, unknown> = {}) {
+    return {
+      machine_id: "machine-1",
+      hostname: "gpu-tower",
+      platform: "linux",
+      arch: "x64",
+      ...overrides,
+    };
+  }
+
+  it("accepts a body with no hardware field at all (a not-yet-updated worker binary)", () => {
+    const input = parseDeviceStart(body());
+    expect(input.hardware).toBeUndefined();
+  });
+
+  it("parses hardware via the same validator the heartbeat path uses, when present", () => {
+    const input = parseDeviceStart(
+      body({
+        hardware: {
+          platform: "linux",
+          arch: "x64",
+          cpu: { manufacturer: "AMD", brand: "Ryzen 5 5600X", flags: ["avx2"], cores: 6 },
+          gpu: [{ vendor: "NVIDIA", model: "RTX 4090", vram_mb: 24576, vram_dynamic: false }],
+          mem_total_bytes: 34_000_000_000,
+        },
+      })
+    );
+    expect(input.hardware?.cpu.brand).toBe("Ryzen 5 5600X");
+    expect(input.hardware?.gpu[0]?.model).toBe("RTX 4090");
+  });
+
+  it("rejects a malformed hardware object rather than silently dropping it", () => {
+    expect(() => parseDeviceStart(body({ hardware: { platform: "linux" } }))).toThrow(BadRequestError);
   });
 });
