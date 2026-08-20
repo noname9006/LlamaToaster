@@ -15,6 +15,7 @@ import { authRoutes } from "./routes/auth.js";
 import { sessionRoutes } from "./routes/sessions.js";
 import { deviceRoutes, deviceApprovalRoutes } from "./routes/device.js";
 import { adminRoutes } from "./routes/admin.js";
+import { statsRoutes } from "./routes/stats.js";
 import { getDb } from "./db/migrate.js";
 import { runMaintenanceSweep, REAP_INTERVAL_MS } from "./reaper.js";
 import { authMiddleware } from "./auth-middleware.js";
@@ -117,6 +118,7 @@ app.register(resultsRoutes);
 app.register(workersRoutes);
 app.register(aiRoutes);
 app.register(queueRoutes);
+app.register(statsRoutes);
 // Registered unconditionally (not gated on AUTH_ENABLED) -- GET
 // /api/auth/status is the SPA's own boot check and needs to answer even when
 // auth is off (MULTIUSER_PLAN.md §2.3's independent-deploy split), and the

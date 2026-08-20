@@ -72,7 +72,6 @@ export function Sidebar({ authEnabled }: SidebarProps) {
           </NavLink>
         </div>
       )}
-      <div className="px-5 py-4 text-xs text-muted">Tailscale-only orchestrator</div>
     </aside>
   );
 }

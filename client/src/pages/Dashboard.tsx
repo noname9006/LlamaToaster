@@ -7,15 +7,19 @@ import { TokSpeedDemo } from "../components/TokSpeedDemo";
 import type { Run, Worker } from "../types";
 import { shortId, formatGpuLabel } from "../utils";
 
-// Multi-user Stage 5 (MULTIUSER_PLAN.md §5.2): "machines, not users" -- every
-// number and machine shown here comes from api.listWorkers()/api.listRuns(),
-// both already scoped to the caller's own account once authenticated
-// (Stage 4's own §4.3/§4.5 scoping) and unfiltered in single-tenant mode
-// (AUTH_ENABLED off), unchanged from before that scoping existed. Nothing
-// here computes a global/cross-tenant number -- there is no code path left
-// that could leak one onto this page. A superadmin sees exactly this same
-// personal dashboard, no branch, no admin link -- the cross-tenant view
-// lives entirely on the separate admin origin (§5.1).
+// Multi-user Stage 5 (MULTIUSER_PLAN.md §5.2): "machines, not users" for
+// every number EXCEPT the "Users" stat card below -- every other number and
+// machine shown here comes from api.listWorkers()/api.listRuns(), both
+// already scoped to the caller's own account once authenticated (Stage 4's
+// own §4.3/§4.5 scoping) and unfiltered in single-tenant mode (AUTH_ENABLED
+// off), unchanged from before that scoping existed. "Users" is a deliberate,
+// later exception (operator request): a single unscoped GET /api/stats call
+// (server/src/routes/stats.ts) returning just a total account count, no
+// per-user data -- every signed-in user sees the same platform-wide number,
+// not just a superadmin. A superadmin otherwise sees exactly this same
+// personal dashboard, no branch, no admin link -- the full cross-tenant view
+// (every user's own machines/runs) still lives entirely on the separate
+// admin origin (§5.1).
 const WORKER_STATUS_TONE: Record<Worker["status"], PillTone> = {
   offline: "danger",
   idle: "muted",
@@ -47,15 +51,17 @@ function MachineRow({ worker }: { worker: Worker }) {
 export function Dashboard() {
   const [runs, setRuns] = useState<Run[]>([]);
   const [workers, setWorkers] = useState<Worker[]>([]);
+  const [userCount, setUserCount] = useState<number | null>(null);
   const [loaded, setLoaded] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
     (async () => {
-      const [r, w] = await Promise.all([api.listRuns(), api.listWorkers()]);
+      const [r, w, s] = await Promise.all([api.listRuns(), api.listWorkers(), api.getStats()]);
       if (cancelled) return;
       setRuns(r);
       setWorkers(w);
+      setUserCount(s.users);
       setLoaded(true);
     })();
     return () => {
@@ -78,11 +84,12 @@ export function Dashboard() {
     <div>
       <h1 className="text-2xl font-semibold text-fg">Dashboard</h1>
 
-      <section className="grid grid-cols-2 gap-4 md:grid-cols-4">
+      <section className="grid grid-cols-2 gap-4 md:grid-cols-5">
+        <StatCard label="Users" value={userCount ?? "—"} />
         <StatCard label="Machines" value={machinesEverConnected} />
-        <StatCard label="Runs" value={runs.length} />
-        <StatCard label="Tests" value={testsTotal} />
         <StatCard label="Models tested" value={distinctModelsTested} />
+        <StatCard label="Tests performed" value={testsTotal} />
+        <StatCard label="Total runs" value={runs.length} />
       </section>
 
       {loaded && workers.length === 0 ? (

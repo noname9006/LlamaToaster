@@ -114,8 +114,9 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
   // independently-deployable Stage 1/Stage 2 split).
   app.get("/api/auth/status", async (req): Promise<AuthStatus> => {
     const authEnabled = process.env.AUTH_ENABLED === "true";
-    if (!authEnabled) return { user: null, authEnabled };
-    return { user: resolveAuthUser(req)?.user ?? null, authEnabled };
+    const appSettings = repo.appSettingsRepo.get();
+    if (!authEnabled) return { user: null, authEnabled, appSettings };
+    return { user: resolveAuthUser(req)?.user ?? null, authEnabled, appSettings };
   });
 
   app.get<{ Params: { provider: string }; Querystring: { link?: string } }>(

@@ -254,4 +254,8 @@ export const api = {
   // hint. See server/src/routes/models.ts's /api/models/hf-updates.
   getModelHfUpdates: (): Promise<Record<string, string | null>> =>
     request<{ updates: Record<string, string | null> }>("/api/models/hf-updates").then((d) => d.updates),
+
+  // The one intentionally cross-tenant number on the (otherwise
+  // per-account-scoped) Dashboard -- see Dashboard.tsx's own header comment.
+  getStats: (): Promise<{ users: number }> => request("/api/stats"),
 };
