@@ -217,6 +217,14 @@ export const api = {
       method: "POST",
     }),
 
+  // Tells apart "still queued behind the worker's concurrent-download cap"
+  // from "actually gone" -- see server/src/routes/workers.ts's GET route.
+  getDownloadStatus: (
+    workerId: string,
+    jobId: string
+  ): Promise<{ status: "pending" | "claimed" | "completed" | "failed" | "cancelled" }> =>
+    request(`/api/workers/${encodeURIComponent(workerId)}/downloads/${encodeURIComponent(jobId)}`),
+
   listRuns: (): Promise<Run[]> => request<{ runs: Run[] }>("/api/runs").then((d) => d.runs),
 
   getRun: (id: string): Promise<{ run: Run; results: ResultRow[]; items: RunItem[]; paused?: boolean }> =>

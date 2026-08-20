@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
-import { api } from "../api/client";
+import { api, ApiError } from "../api/client";
 import { StatusPill } from "../components/StatusPill";
 import { IconChevronDown, IconDownload, IconRefreshCw, IconTrash } from "../components/icons";
 import { ParamsRangeSlider, PARAMS_STOPS, paramsInRange } from "../components/ParamsRangeSlider";
@@ -564,18 +564,32 @@ export function Models() {
             setSpeeds((s) => ({ ...s, [key]: smoothed }));
           }
           prevSampleRef.current[key] = { bytes, time: now };
-        } else {
-          // No longer in this worker's activeDownloads -- either it just
-          // finished (success or failure) or it hasn't been claimed yet
-          // (still queued). A grace period before finalizing either way,
-          // since the worker's heartbeat cadence means "just changed" and
-          // "genuinely done" look identical for a few ticks.
+        } else if (seenRef.current[key]) {
+          // Was actively downloading and just dropped out of activeDownloads
+          // -- a genuine finish (success or failure), not a queued job, so no
+          // need to consult job status. A short grace period since the
+          // worker's heartbeat cadence means "just changed" and "genuinely
+          // done" look identical for a tick or two.
           const misses = (missesRef.current[key] ?? 0) + 1;
           missesRef.current[key] = misses;
           const SEEN_GRACE_MISSES = 3;
-          const NEVER_SEEN_TIMEOUT_MISSES = 6;
-          if ((seenRef.current[key] && misses >= SEEN_GRACE_MISSES) || misses >= NEVER_SEEN_TIMEOUT_MISSES) {
-            finalizeDownload(key);
+          if (misses >= SEEN_GRACE_MISSES) finalizeDownload(key);
+        } else {
+          // Never seen active yet -- could be queued behind the worker's
+          // max_concurrent_downloads cap (a pending job never appears in
+          // activeDownloads until claimed, and can legitimately wait there
+          // for a long time) rather than actually gone. Ask the server which
+          // it is instead of guessing from a timeout, so a merely-queued
+          // download doesn't get wrongly finalized as "dropped".
+          try {
+            const { status } = await api.getDownloadStatus(state.workerId, state.jobId);
+            if (status === "pending" || status === "claimed") continue; // still queued/just claimed -- keep waiting
+            finalizeDownload(key); // completed/failed/cancelled
+          } catch (err) {
+            if (err instanceof ApiError && err.status === 404) {
+              finalizeDownload(key); // job/worker genuinely gone
+            }
+            // otherwise transient (network hiccup, server restart) -- try again next tick
           }
         }
       }
