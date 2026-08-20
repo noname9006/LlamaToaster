@@ -501,14 +501,23 @@ export function Models() {
     const label = downloading[key]?.file.path ?? key;
     removeDownloadState(key);
     setHfMsg(`${label} is no longer downloading -- refreshed the model list.`);
+    // Both calls matter: loadModels() brings in the new registry row, but
+    // presentModels/modelsByWorker gate visibility on `locations` (which
+    // worker actually has the file) -- see handleDeleteModelFile above for
+    // the same pairing. Without loadLocations() too, a freshly-completed
+    // download stays invisible until a manual page reload.
     void loadModels();
+    void loadLocations();
     // Safety net: the worker's progress entry disappearing only means the
     // byte transfer is done, not that the server has finished registering
     // the model (that still needs the worker's callback to reach
     // POST /api/models/download-callback and hit repo.registerModel -- see
-    // worker/src/index.ts's runModelDownload). The loadModels() above can
-    // race ahead of that and miss the new row; this second pass catches it.
-    setTimeout(() => void loadModels(), 2000);
+    // worker/src/index.ts's runModelDownload). The pass above can race ahead
+    // of that and miss the new row/location; this second pass catches it.
+    setTimeout(() => {
+      void loadModels();
+      void loadLocations();
+    }, 2000);
   }
 
   // Reads progress off the owning worker's activeDownloads (one
