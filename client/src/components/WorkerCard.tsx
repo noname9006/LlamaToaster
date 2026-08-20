@@ -190,6 +190,21 @@ export function WorkerCard({ worker, onRefresh }: { worker: Worker; onRefresh: (
     };
   }, [worker.activeRunId]);
 
+  async function handleShutdown() {
+    const busyNote =
+      worker.status === "busy"
+        ? " It's currently busy -- the shutdown will happen once the current job finishes, not immediately."
+        : "";
+    if (
+      !window.confirm(
+        `Shut down the LlamaToaster worker process on ${worker.displayName}?${busyNote} You'll need to start it again yourself (console access, or however it's set up to run).`
+      )
+    ) {
+      return;
+    }
+    await withBusy("shutdown", () => api.shutdownWorker(worker.id).then(() => undefined), "Shutdown queued");
+  }
+
   async function handleRemove() {
     if (
       !window.confirm(
@@ -269,6 +284,17 @@ export function WorkerCard({ worker, onRefresh }: { worker: Worker; onRefresh: (
         <div className="flex items-center gap-2">
           {worker.backend && <StatusPill label={worker.backend} tone="muted" />}
           <WorkerStatusPill inaccessible={inaccessible} />
+          {!inaccessible && (
+            <button
+              type="button"
+              onClick={() => void handleShutdown()}
+              disabled={busyTag !== null}
+              className="flex-none text-xs font-semibold text-muted hover:text-danger disabled:opacity-50"
+              title="Queue a shutdown -- the worker process exits once it's free (or right away if idle)"
+            >
+              {busyTag === "shutdown" ? "Queuing…" : "Shut down"}
+            </button>
+          )}
         </div>
       </div>
 

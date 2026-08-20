@@ -188,6 +188,28 @@ describe("per-worker action routes ownership (assertOwnsWorker via requireOnline
     expect(res.status).toBe(403);
   });
 
+  it("POST .../shutdown queues a shutdown_worker job for the owner", async () => {
+    const id = await heartbeatWorker("action-shutdown-owner");
+    const { userId, token } = await sessionFor("action-shutdown-owner-user");
+    claimWorker(id, userId);
+
+    const res = await fetch(`${baseUrl}/api/workers/${id}/shutdown`, { method: "POST", headers: authed(token) });
+    expect(res.status).toBe(202);
+  });
+
+  it("POST .../shutdown is ownership-gated the same way", async () => {
+    const id = await heartbeatWorker("action-shutdown-intruder");
+    const { userId } = await sessionFor("action-shutdown-real-owner");
+    claimWorker(id, userId);
+    const { token: intruderToken } = await sessionFor("action-shutdown-intruder-user");
+
+    const res = await fetch(`${baseUrl}/api/workers/${id}/shutdown`, {
+      method: "POST",
+      headers: authed(intruderToken),
+    });
+    expect(res.status).toBe(403);
+  });
+
   it("DELETE .../models (delete a model file) is ownership-gated the same way", async () => {
     const id = await heartbeatWorker("action-delete-file");
     const { userId } = await sessionFor("action-delete-owner");

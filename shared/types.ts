@@ -999,7 +999,11 @@ export type QueueJob =
   | { job_id: string; type: "activate_build"; payload: ActivateBuildJobPayload }
   | { job_id: string; type: "delete_build"; payload: DeleteBuildJobPayload }
   | { job_id: string; type: "download_model"; payload: DownloadModelJobPayload }
-  | { job_id: string; type: "delete_model_file"; payload: { filename: string } };
+  | { job_id: string; type: "delete_model_file"; payload: { filename: string } }
+  // No payload -- just a signal. Queued (not sent via HeartbeatResponse.control
+  // like cancel/pause) so it takes its place behind whatever job is already
+  // running instead of yanking the process mid-benchmark.
+  | { job_id: string; type: "shutdown_worker"; payload: Record<string, never> };
 
 // --- Multi-user Stage 2: auth (MULTIUSER_PLAN.md §2) ---
 

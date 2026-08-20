@@ -165,6 +165,11 @@ export const api = {
       method: "DELETE",
     }),
 
+  // Queues a shutdown -- takes effect once the worker finishes whatever's
+  // currently running (or immediately if it's idle), not instantly.
+  shutdownWorker: (workerId: string): Promise<{ ok: true; queued: true }> =>
+    request(`/api/workers/${encodeURIComponent(workerId)}/shutdown`, postJson({})),
+
   // sort/direction map to HF's own search API params (server/src/hf.ts);
   // cursor comes from a previous call's nextCursor -- HF paginates via a
   // forward-only cursor, not an offset/page number, so there's no way to
