@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { api } from "../api/client";
-import type { SessionInfo, IdentityInfo } from "../types";
+import type { SessionInfo, IdentityInfo, AppSettings } from "../types";
 import { formatRelativeTime } from "../utils";
 import { IconTrash } from "../components/icons";
 
@@ -13,6 +13,10 @@ export function Settings() {
   const [sessions, setSessions] = useState<SessionInfo[] | null>(null);
   const [identities, setIdentities] = useState<IdentityInfo[] | null>(null);
   const [shareBenchmarks, setShareBenchmarksState] = useState<boolean | null>(null);
+  // Operator-controlled gates from the supervise dashboard (shared/types.ts's
+  // AppSettings) -- null until the initial getAuthStatus() resolves, same
+  // "haven't loaded yet" convention as the other nullable state here.
+  const [appSettings, setAppSettings] = useState<AppSettings | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [deleteConfirmText, setDeleteConfirmText] = useState("");
@@ -33,6 +37,7 @@ export function Settings() {
       .getAuthStatus()
       .then((status) => {
         setAuthEnabled(status.authEnabled);
+        setAppSettings(status.appSettings);
         if (status.authEnabled) {
           setShareBenchmarksState(status.user?.shareBenchmarks ?? null);
           void load();
@@ -174,30 +179,35 @@ export function Settings() {
       <section className="mt-8">
         <h2 className="text-sm font-semibold text-fg">Community benchmark data</h2>
         <p className="mt-1 text-sm text-muted">
-          When enabled, the AI assistant can include your benchmark results in anonymised, aggregated
-          numbers it shows to other signed-in users (never your username or machine — only a group
-          average, and only once at least 5 people share a given model/backend/GPU combination). The
-          assistant can also show you the same kind of aggregate from others who've opted in.
+          All benchmarks run through this platform are automatically saved to our database, including
+          hardware configurations, OS details, models, and test results. Your privacy is strictly
+          protected: all shared data is fully anonymized, ensuring no other user can ever associate your
+          account or machines with your test runs.
         </p>
         <div className="mt-3 flex items-center justify-between rounded-lg border border-border px-3 py-2.5">
-          <span className="text-sm font-medium text-fg">Share my benchmarks with the community</span>
+          <span className="text-sm font-medium text-fg">Contribute to the community benchmark database</span>
           <button
             type="button"
             role="switch"
             aria-checked={shareBenchmarks ?? false}
             onClick={() => void handleToggleShareBenchmarks()}
-            disabled={shareBenchmarks === null}
+            disabled={shareBenchmarks === null || !appSettings?.communitySharingAllowed}
             className={`relative h-6 w-11 flex-none rounded-full transition-colors disabled:opacity-50 ${
               shareBenchmarks ? "bg-accent" : "bg-white/10"
             }`}
           >
             <span
-              className={`absolute top-0.5 h-5 w-5 rounded-full bg-white transition-transform ${
-                shareBenchmarks ? "translate-x-[22px]" : "translate-x-0.5"
+              className={`absolute left-0.5 top-0.5 h-5 w-5 rounded-full bg-white transition-transform ${
+                shareBenchmarks ? "translate-x-[22px]" : "translate-x-0"
               }`}
             />
           </button>
         </div>
+        {appSettings !== null && !appSettings.communitySharingAllowed && (
+          <p className="mt-1.5 text-xs text-muted">
+            Your operator hasn&apos;t turned this on for this deployment yet.
+          </p>
+        )}
       </section>
 
       <section className="mt-8">
@@ -260,40 +270,42 @@ export function Settings() {
         </div>
       </section>
 
-      <section className="mt-8">
-        <h2 className="text-sm font-semibold text-danger">Danger zone</h2>
-        <p className="mt-1 text-sm text-muted">
-          Permanently deletes your account: every linked sign-in, active session, machine, run, and
-          result. Models you registered stay in the shared catalog for other users, just no longer
-          attributed to you. This cannot be undone —{" "}
-          <a href="/api/results/export?format=csv" className="text-accent hover:underline">
-            export your results first
-          </a>{" "}
-          if you want a copy.
-        </p>
-        <div className="mt-3 flex flex-wrap items-center gap-2 rounded-lg border border-danger/30 bg-danger-bg px-3 py-2.5">
-          <label className="flex-1 text-xs text-muted" htmlFor="delete-account-confirm">
-            Type <span className="font-mono font-semibold text-fg">DELETE</span> to confirm
-          </label>
-          <input
-            id="delete-account-confirm"
-            type="text"
-            value={deleteConfirmText}
-            onChange={(e) => setDeleteConfirmText(e.target.value)}
-            disabled={deleting}
-            className="w-32 rounded-md border border-border bg-surface px-2 py-1 text-sm text-fg"
-            autoComplete="off"
-          />
-          <button
-            type="button"
-            onClick={() => void handleDeleteAccount()}
-            disabled={deleteConfirmText !== "DELETE" || deleting}
-            className="rounded-lg border border-danger/40 px-3 py-1.5 text-sm font-semibold text-danger hover:bg-danger-bg disabled:cursor-not-allowed disabled:opacity-40"
-          >
-            {deleting ? "Deleting…" : "Delete my account"}
-          </button>
-        </div>
-      </section>
+      {appSettings?.accountDeletionAllowed && (
+        <section className="mt-8">
+          <h2 className="text-sm font-semibold text-danger">Danger zone</h2>
+          <p className="mt-1 text-sm text-muted">
+            Permanently deletes your account: every linked sign-in, active session, machine, run, and
+            result. Models you registered stay in the shared catalog for other users, just no longer
+            attributed to you. This cannot be undone —{" "}
+            <a href="/api/results/export?format=csv" className="text-accent hover:underline">
+              export your results first
+            </a>{" "}
+            if you want a copy.
+          </p>
+          <div className="mt-3 flex flex-wrap items-center gap-2 rounded-lg border border-danger/30 bg-danger-bg px-3 py-2.5">
+            <label className="flex-1 text-xs text-muted" htmlFor="delete-account-confirm">
+              Type <span className="font-mono font-semibold text-fg">DELETE</span> to confirm
+            </label>
+            <input
+              id="delete-account-confirm"
+              type="text"
+              value={deleteConfirmText}
+              onChange={(e) => setDeleteConfirmText(e.target.value)}
+              disabled={deleting}
+              className="w-32 rounded-md border border-border bg-surface px-2 py-1 text-sm text-fg"
+              autoComplete="off"
+            />
+            <button
+              type="button"
+              onClick={() => void handleDeleteAccount()}
+              disabled={deleteConfirmText !== "DELETE" || deleting}
+              className="rounded-lg border border-danger/40 px-3 py-1.5 text-sm font-semibold text-danger hover:bg-danger-bg disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              {deleting ? "Deleting…" : "Delete my account"}
+            </button>
+          </div>
+        </section>
+      )}
     </div>
   );
 }

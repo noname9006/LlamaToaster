@@ -240,8 +240,8 @@ describe("POST /api/ai/chat -- usage is only recorded for real calls, not reject
 });
 
 // Multi-user Stage 5 (MULTIUSER_PLAN.md §5.4) -- the community tools' own
-// auth gate and wiring into repo.communityRepo. The k-anonymity math itself
-// (suppression, consent, caller-exclusion, build dropped from the key) is
+// auth/operator-flag gates and wiring into repo.communityRepo. The grouping
+// math itself (consent, caller-exclusion, build dropped from the key) is
 // exhaustively covered at the DB layer in db/community-aggregates.test.ts;
 // this only proves the route actually reaches that code with the right
 // caller id and tool arguments.
@@ -271,6 +271,10 @@ describe("POST /api/ai/chat -- community tools (§5.4)", () => {
   });
 
   it("when authenticated, reaches repo.communityRepo.listAggregates with the caller excluded and filters forwarded", async () => {
+    // communitySharingAllowed defaults to false (Settings' toggle starts
+    // greyed out) -- the operator has to turn it on before these tools do
+    // anything, same gate Settings.tsx checks client-side.
+    repo.appSettingsRepo.setCommunitySharingAllowed(true);
     // Five OTHER opted-in users sharing one exact group, plus the caller
     // themselves also in that same group (must be excluded, not counted).
     const caller = repo.userRepo.upsertByIdentity("github", { providerUserId: "community-caller", login: "caller", avatarUrl: null });

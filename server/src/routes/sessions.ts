@@ -97,11 +97,18 @@ export async function sessionRoutes(app: FastifyInstance): Promise<void> {
   // Settings' own toggle (§5.4) -- the consent flag community aggregates
   // (routes/ai.ts's community tools) are gated on. Returns the updated
   // AuthUser shape so the client can update its local state from the
-  // response rather than re-fetching /api/auth/status.
+  // response rather than re-fetching /api/auth/status. Turning it ON also
+  // requires the operator's own communitySharingAllowed gate (Settings
+  // greys the toggle out client-side for the same reason, but this is the
+  // enforcement a direct API call can't bypass); turning it OFF is always
+  // allowed regardless, since that can only ever narrow what's shared.
   app.post<{ Body: { enabled?: boolean } }>("/api/auth/share-benchmarks", async (req, reply) => {
     const { user } = req as AuthenticatedRequest;
     if (typeof req.body?.enabled !== "boolean") {
       return reply.code(400).send({ error: "enabled must be a boolean" });
+    }
+    if (req.body.enabled && !repo.appSettingsRepo.get().communitySharingAllowed) {
+      return reply.code(403).send({ error: "community benchmark sharing is currently disabled by the operator" });
     }
     const updated = repo.userRepo.setShareBenchmarks(user.id, req.body.enabled);
     return { shareBenchmarks: updated.shareBenchmarks };
@@ -117,6 +124,9 @@ export async function sessionRoutes(app: FastifyInstance): Promise<void> {
   // longer exists.
   app.delete<{ Body: { confirm?: boolean } }>("/api/auth/account", async (req, reply) => {
     const { user } = req as AuthenticatedRequest;
+    if (!repo.appSettingsRepo.get().accountDeletionAllowed) {
+      return reply.code(403).send({ error: "account deletion is currently disabled by the operator" });
+    }
     if (req.body?.confirm !== true) {
       return reply.code(400).send({ error: "confirm: true is required to delete an account" });
     }
