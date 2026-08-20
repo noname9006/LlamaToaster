@@ -37,6 +37,7 @@ beforeAll(async () => {
   app.post("/api/worker/queue", async () => ({ ok: true }));
   app.get<{ Params: { id: string } }>("/api/runs/:id/log", async () => ({ ok: true, via: "GET (user-authed)" }));
   app.post<{ Params: { id: string } }>("/api/runs/:id/log", async () => ({ ok: true, via: "POST (worker-authed)" }));
+  app.post("/api/models/download-callback", async () => ({ ok: true }));
 
   await app.listen({ port: 0, host: "127.0.0.1" });
   const address = app.server.address();
@@ -126,6 +127,11 @@ describe("authMiddleware", () => {
 
     const getRes = await fetch(`${baseUrl}/api/runs/abc/log`);
     expect(getRes.status).toBe(401);
+  });
+
+  it("POST /api/models/download-callback is exempt -- worker credential, not a user session (regression: 401'd \"no session\" before this route was added to WORKER_AUTHENTICATED_ROUTES)", async () => {
+    const res = await fetch(`${baseUrl}/api/models/download-callback`, { method: "POST" });
+    expect(res.status).toBe(200);
   });
 
   it("an unmatched route fails closed (never treated as public)", async () => {

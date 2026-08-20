@@ -31,6 +31,18 @@ interface DownloadState {
   workerId: string;
   startedAt: number;
   file: HfFileEntry;
+  // Identifies this download's worker_jobs row -- lets the poll effect match
+  // this exact job in worker.activeDownloads (rather than string-matching
+  // detail against repoId/file.path, which used to be the only way to tell
+  // downloads apart when a worker could only ever run one job at a time) and
+  // lets the Pause button target the right job.
+  jobId: string;
+  // Set once the user pauses this download -- worker.activeDownloads
+  // legitimately stops including it forever at that point (same as a real
+  // completion/failure), so this flag is what tells the poll effect to stop
+  // waiting for it to reappear and show a Resume affordance instead of
+  // finalizing the row away.
+  paused?: boolean;
 }
 
 // Keyed by file path, mirrors `downloading` below -- persisted so an
@@ -57,6 +69,27 @@ function persistDownloads(downloads: Record<string, DownloadState>): void {
   }
 }
 
+// Remembers the manual-add panel's collapsed/expanded state across visits --
+// defaults to collapsed (the common case is browsing/downloading from
+// Hugging Face, not hand-entering a model).
+const MANUAL_ADD_OPEN_KEY = "llamatoaster:models-manual-add-open";
+
+function loadManualAddOpen(): boolean {
+  try {
+    return localStorage.getItem(MANUAL_ADD_OPEN_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function persistManualAddOpen(open: boolean): void {
+  try {
+    localStorage.setItem(MANUAL_ADD_OPEN_KEY, open ? "1" : "0");
+  } catch {
+    /* localStorage unavailable -- state just won't survive a refresh */
+  }
+}
+
 // `downloading`/`progress`/`speeds` below used to be keyed by bare filename
 // alone, which collided whenever two downloads shared a filename -- common
 // for GGUF quants, since many uploaders reuse fixed names like
@@ -80,16 +113,35 @@ const SORT_OPTIONS: { value: SortField; label: string }[] = [
   { value: "size", label: "Size" },
 ];
 
-type HfSortField = "relevance" | "name" | "likes" | "downloads" | "params" | "newest";
+// "Name (A-Z)" and "Parameters" (the old client-side-only sort options) are
+// gone -- HF's search API has no equivalent for either, and now that results
+// are real paginated pages (server/src/hf.ts), a client-only re-sort would
+// only ever see the current page's 15 items, not the true global order,
+// which would be actively misleading rather than just a lesser feature.
+type HfSortField = "relevance" | "downloads" | "likes" | "newest" | "updated";
 
 const HF_SORT_OPTIONS: { value: HfSortField; label: string }[] = [
   { value: "relevance", label: "Relevance" },
-  { value: "newest", label: "Newest" },
-  { value: "name", label: "Name (A-Z)" },
-  { value: "likes", label: "Likes" },
   { value: "downloads", label: "Downloads" },
-  { value: "params", label: "Parameters" },
+  { value: "likes", label: "Likes" },
+  { value: "newest", label: "Newest" },
+  { value: "updated", label: "Recently updated" },
 ];
+
+// Maps the client's sort dropdown to HF's own API sort field names --
+// "relevance" sends no sort param at all (HF's default search-relevance
+// ordering).
+const HF_SORT_SERVER_FIELD: Partial<Record<HfSortField, "downloads" | "likes" | "createdAt" | "lastModified">> = {
+  downloads: "downloads",
+  likes: "likes",
+  newest: "createdAt",
+  updated: "lastModified",
+};
+
+interface HfPage {
+  results: HfRepoSearchResult[];
+  nextCursor: string | null;
+}
 
 // Session-scoped (not localStorage) -- a search is "current" for as long as
 // the tab lives, but stale HF result counts/likes shouldn't linger forever
@@ -98,7 +150,8 @@ const HF_SEARCH_STORAGE_KEY = "llamatoaster:hf-search";
 
 interface PersistedHfSearch {
   query: string;
-  results: HfRepoSearchResult[];
+  pages: HfPage[];
+  pageIndex: number;
   expandedRepo: string | null;
   filesByRepo: Record<string, HfFileEntry[]>;
   paramsLoIndex: number;
@@ -179,9 +232,19 @@ export function Models() {
 
   const [form, setForm] = useState(emptyForm);
   const [addMsg, setAddMsg] = useState("");
+  const [manualAddOpen, setManualAddOpen] = useState(loadManualAddOpen);
 
   const [hfQuery, setHfQuery] = useState(() => loadPersistedHfSearch()?.query ?? "");
-  const [hfResults, setHfResults] = useState<HfRepoSearchResult[]>(() => loadPersistedHfSearch()?.results ?? []);
+  // One entry per fetched page, indexed by page number -- pageIndex points
+  // at which one is currently shown. "Prev" just moves the index back (no
+  // refetch, already cached); "Next" moves forward if that page is already
+  // cached, otherwise fetches using the current page's nextCursor. HF's
+  // search API paginates via a forward-only opaque cursor, not an
+  // offset/page number, so there's no way to jump directly to an arbitrary
+  // page -- see server/src/hf.ts.
+  const [hfPages, setHfPages] = useState<HfPage[]>(() => loadPersistedHfSearch()?.pages ?? []);
+  const [hfPageIndex, setHfPageIndex] = useState(() => loadPersistedHfSearch()?.pageIndex ?? 0);
+  const hfResults = hfPages[hfPageIndex]?.results ?? [];
   const [expandedRepo, setExpandedRepo] = useState<string | null>(() => loadPersistedHfSearch()?.expandedRepo ?? null);
   const [filesByRepo, setFilesByRepo] = useState<Record<string, HfFileEntry[]>>(
     () => loadPersistedHfSearch()?.filesByRepo ?? {}
@@ -288,30 +351,13 @@ export function Models() {
     [workers, filteredModels, locations, sortField, sortDir]
   );
 
-  const visibleHfResults = useMemo(() => {
-    const list = hfResults.filter((r) => paramsInRange(paramsBFromText(r.id), hfParamsLoIndex, hfParamsHiIndex));
-    if (hfSortField === "relevance") return list;
-    const dir = hfSortDir === "asc" ? 1 : -1;
-    return [...list].sort((a, b) => {
-      switch (hfSortField) {
-        case "name":
-          return dir * a.id.localeCompare(b.id);
-        case "likes":
-          return dir * (a.likes - b.likes);
-        case "downloads":
-          return dir * (a.downloads - b.downloads);
-        case "params":
-          return dir * ((paramsBFromText(a.id) ?? -1) - (paramsBFromText(b.id) ?? -1));
-        case "newest": {
-          const ta = a.created_at ? new Date(a.created_at).getTime() : -1;
-          const tb = b.created_at ? new Date(b.created_at).getTime() : -1;
-          return dir * (ta - tb);
-        }
-        default:
-          return 0;
-      }
-    });
-  }, [hfResults, hfParamsLoIndex, hfParamsHiIndex, hfSortField, hfSortDir]);
+  // Sort is applied server-side now (server/src/hf.ts) -- this only
+  // client-side-filters the current page's 15 results by parameter count, a
+  // refinement that doesn't need to be globally correct the way a sort does.
+  const visibleHfResults = useMemo(
+    () => hfResults.filter((r) => paramsInRange(paramsBFromText(r.id), hfParamsLoIndex, hfParamsHiIndex)),
+    [hfResults, hfParamsLoIndex, hfParamsHiIndex]
+  );
 
   async function loadModels() {
     setModels(await api.listModels());
@@ -388,6 +434,16 @@ export function Models() {
     })();
   }, []);
 
+  // Shows a default "top 15" HF listing on first load instead of leaving the
+  // section blank until the user types something -- but only when there's
+  // nothing already restored from sessionStorage (a real prior search, or
+  // this same default listing from earlier in the tab's life), so revisiting
+  // the page mid-session doesn't stomp on what the user was looking at.
+  useEffect(() => {
+    if (hfPages.length === 0) void handleSearch();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   useEffect(() => {
     persistDownloads(downloading);
   }, [downloading]);
@@ -395,7 +451,8 @@ export function Models() {
   useEffect(() => {
     persistHfSearch({
       query: hfQuery,
-      results: hfResults,
+      pages: hfPages,
+      pageIndex: hfPageIndex,
       expandedRepo,
       filesByRepo,
       paramsLoIndex: hfParamsLoIndex,
@@ -403,7 +460,7 @@ export function Models() {
       sortField: hfSortField,
       sortDir: hfSortDir,
     });
-  }, [hfQuery, hfResults, expandedRepo, filesByRepo, hfParamsLoIndex, hfParamsHiIndex, hfSortField, hfSortDir]);
+  }, [hfQuery, hfPages, hfPageIndex, expandedRepo, filesByRepo, hfParamsLoIndex, hfParamsHiIndex, hfSortField, hfSortDir]);
 
   // Cleans up a download once the worker stops reporting progress for it --
   // the only signal available that it's done, since the worker's download
@@ -447,7 +504,7 @@ export function Models() {
     setTimeout(() => void loadModels(), 2000);
   }
 
-  // Reads progress off the owning worker's activeJobProgress (one
+  // Reads progress off the owning worker's activeDownloads (one
   // GET /api/workers read per tick, not one call per file) instead of a
   // dedicated per-file progress endpoint -- that endpoint doesn't exist
   // anymore (MULTIUSER_PLAN.md §1.5/§1.11: workers push progress via their
@@ -455,12 +512,11 @@ export function Models() {
   // that heartbeat cadence wouldn't see any new data, so this ticks every 2s
   // (matching RunDetail's own live-poll interval) rather than the old 750ms.
   //
-  // Known limitation: since a worker now runs exactly one job at a time, if
-  // two downloads are queued on the SAME worker back to back, only the
-  // first one's progress is visible (the worker hasn't started the second
-  // at all yet) -- its entry stays at "Starting…" until the first finishes
-  // and it actually becomes the active job. Downloads on different workers
-  // are unaffected; each worker's own activeJobProgress is independent.
+  // Each entry is matched by jobId now (worker/src/index.ts's downloadJobPool
+  // reports every concurrently-active download's own progress, keyed by its
+  // own job id) rather than string-matching a single shared activeJobProgress
+  // -- several downloads on the SAME worker genuinely run and report progress
+  // at once now, not just one at a time.
   useEffect(() => {
     const entries = Object.entries(downloading);
     if (entries.length === 0) return;
@@ -475,18 +531,11 @@ export function Models() {
       const byId = new Map(workerList.map((w) => [w.id, w]));
 
       for (const [key, state] of entries) {
+        if (state.paused) continue; // legitimately gone from activeDownloads forever -- nothing to poll for
         const worker = byId.get(state.workerId);
-        const active = worker?.activeJobProgress;
-        const workerIsDownloading = worker?.status === "busy" && active?.phase === "downloading";
-        // A worker's activeJobProgress only ever describes ONE job -- match
-        // it against `detail`, which executeDownloadModelJob sets to the
-        // same "<hf_repo>/<hf_file>" it downloads (see worker/src/index.ts).
-        // Without this check, every entry queued for this worker read the
-        // same activeJobProgress and rendered identical bytes/speed, no
-        // matter which file it actually belonged to.
-        const isThisDownload = workerIsDownloading && active?.detail === `${state.repoId}/${state.file.path}`;
+        const active = worker?.activeDownloads?.find((d) => d.job_id === state.jobId);
 
-        if (isThisDownload && active) {
+        if (active) {
           seenRef.current[key] = true;
           missesRef.current[key] = 0;
           const bytes = active.bytes ?? 0;
@@ -508,19 +557,12 @@ export function Models() {
             setSpeeds((s) => ({ ...s, [key]: smoothed }));
           }
           prevSampleRef.current[key] = { bytes, time: now };
-        } else if (workerIsDownloading) {
-          // The worker is busy, but downloading a *different* job right now
-          // -- this entry is still queued behind it, neither done nor
-          // failed. Don't count this toward the miss-based finalize
-          // timeout below, or a long first download would cause everything
-          // queued behind it on the same worker to be wrongly finalized
-          // long before it even started.
         } else {
-          // No longer this worker's active job -- either it just finished
-          // (success or failure), or it hasn't started yet (still queued
-          // behind another job). A grace period before finalizing either
-          // way, since the worker's heartbeat cadence means "just changed"
-          // and "genuinely done" look identical for a few ticks.
+          // No longer in this worker's activeDownloads -- either it just
+          // finished (success or failure) or it hasn't been claimed yet
+          // (still queued). A grace period before finalizing either way,
+          // since the worker's heartbeat cadence means "just changed" and
+          // "genuinely done" look identical for a few ticks.
           const misses = (missesRef.current[key] ?? 0) + 1;
           missesRef.current[key] = misses;
           const SEEN_GRACE_MISSES = 3;
@@ -566,22 +608,67 @@ export function Models() {
     }
   }
 
-  async function handleSearch(e: FormEvent) {
-    e.preventDefault();
+  // Fetches page 0 fresh and replaces hfPages wholesale -- shared by the
+  // search form's submit, and by the sort field/direction controls (which
+  // must restart from page 0 since previously-cached pages are in the wrong
+  // order once the sort changes). Takes field/dir as explicit params rather
+  // than reading hfSortField/hfSortDir off state so a control's own onChange
+  // can pass its *new* value without waiting a render for state to catch up.
+  async function runFreshHfSearch(field: HfSortField, dir: SortDir) {
     setHfMsg("");
-    setHfResults([]);
     setExpandedRepo(null);
-    if (!hfQuery.trim()) return;
     setSearching(true);
     try {
-      const results = await api.searchHf(hfQuery);
-      setHfResults(results);
+      const { results, nextCursor } = await api.searchHf({
+        q: hfQuery,
+        sort: HF_SORT_SERVER_FIELD[field],
+        direction: field === "relevance" ? undefined : dir === "asc" ? 1 : -1,
+      });
+      setHfPages([{ results, nextCursor }]);
+      setHfPageIndex(0);
       if (!results.length) setHfMsg("No repos found.");
     } catch (err) {
       setHfMsg(`Search error: ${err instanceof Error ? err.message : String(err)}`);
     } finally {
       setSearching(false);
     }
+  }
+
+  // query may be empty (that's the default "top 15 by downloads" listing
+  // shown before the user types anything). e is undefined when triggered
+  // programmatically (on mount) rather than from the form's onSubmit.
+  async function handleSearch(e?: FormEvent) {
+    e?.preventDefault();
+    await runFreshHfSearch(hfSortField, hfSortDir);
+  }
+
+  async function goToNextHfPage() {
+    if (hfPageIndex + 1 < hfPages.length) {
+      setHfPageIndex(hfPageIndex + 1);
+      return;
+    }
+    const cursor = hfPages[hfPageIndex]?.nextCursor;
+    if (!cursor) return;
+    setSearching(true);
+    setHfMsg("");
+    try {
+      const { results, nextCursor } = await api.searchHf({
+        q: hfQuery,
+        sort: HF_SORT_SERVER_FIELD[hfSortField],
+        direction: hfSortField === "relevance" ? undefined : hfSortDir === "asc" ? 1 : -1,
+        cursor,
+      });
+      setHfPages((pages) => [...pages, { results, nextCursor }]);
+      setHfPageIndex(hfPageIndex + 1);
+    } catch (err) {
+      setHfMsg(`Search error: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      setSearching(false);
+    }
+  }
+
+  function goToPrevHfPage() {
+    setHfPageIndex((i) => Math.max(0, i - 1));
   }
 
   async function toggleRepo(repoId: string) {
@@ -616,15 +703,39 @@ export function Models() {
       // to one queue-poll cycle even for an idle machine), so completion is
       // only observable via the progress-poll effect below, same as an
       // entry restored from localStorage after a refresh. finalizeDownload
-      // is the one place that ever clears `downloading` now.
-      await api.downloadHfFile(workerId, repoId, file.path);
+      // is the one place that ever clears `downloading` now. Also doubles as
+      // "Resume" (Models page's active-downloads section below) -- calling
+      // this again for the same worker/repo/file just re-queues a fresh
+      // download_model job, which the worker's own .part-file detection
+      // (worker/src/index.ts's executeDownloadModelJob) picks up and
+      // continues rather than restarting from byte 0.
+      const { job_id } = await api.downloadHfFile(workerId, repoId, file.path);
       setDownloading((d) => ({
         ...d,
-        [downloadKey(workerId, repoId, file.path)]: { repoId, workerId, startedAt: Date.now(), file },
+        [downloadKey(workerId, repoId, file.path)]: { repoId, workerId, startedAt: Date.now(), file, jobId: job_id },
       }));
     } catch (err) {
       setHfMsg(`Error: ${err instanceof Error ? err.message : String(err)}`);
     }
+  }
+
+  async function handlePauseDownload(key: string) {
+    const state = downloading[key];
+    if (!state) return;
+    try {
+      await api.pauseDownload(state.workerId, state.jobId);
+      setDownloading((d) => (d[key] ? { ...d, [key]: { ...d[key], paused: true } } : d));
+    } catch (err) {
+      setHfMsg(`Error pausing: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  async function handleResumeDownload(key: string) {
+    const state = downloading[key];
+    if (!state) return;
+    // handleDownload overwrites this same key (downloadKey is deterministic
+    // off worker/repo/path, not jobId) with a fresh, unpaused entry.
+    await handleDownload(state.repoId, state.file);
   }
 
   function renderModelRow(m: Model, worker: Worker, indent: boolean) {
@@ -866,10 +977,33 @@ export function Models() {
                         {state.repoId} · {workers.find((w) => w.id === state.workerId)?.displayName ?? state.workerId}
                       </span>
                     </div>
-                    <span className="text-xs text-muted">{pct !== null ? `${pct}%` : "Starting…"}</span>
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs text-muted">
+                        {state.paused ? "Paused" : pct !== null ? `${pct}%` : "Starting…"}
+                      </span>
+                      {state.paused ? (
+                        <button
+                          type="button"
+                          onClick={() => void handleResumeDownload(key)}
+                          className="rounded-md border border-border px-2 py-0.5 text-xs text-fg hover:border-accent/40 hover:text-accent"
+                        >
+                          Resume
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={() => void handlePauseDownload(key)}
+                          className="rounded-md border border-border px-2 py-0.5 text-xs text-muted hover:border-accent/40 hover:text-accent"
+                        >
+                          Pause
+                        </button>
+                      )}
+                    </div>
                   </div>
                   <div className="h-1.5 w-full overflow-hidden rounded-full bg-surface-raised">
-                    {pct !== null ? (
+                    {state.paused ? (
+                      <div className="h-full w-full rounded-full bg-surface-raised" />
+                    ) : pct !== null ? (
                       <div
                         className="h-full rounded-full bg-accent transition-[width]"
                         style={{ width: `${pct}%` }}
@@ -883,7 +1017,7 @@ export function Models() {
                       {formatBytes(prog?.bytes ?? 0)}
                       {totalBytes != null ? ` / ${formatBytes(totalBytes)}` : ""}
                     </span>
-                    {speed !== undefined && <span>· {formatBytes(speed)}/s</span>}
+                    {!state.paused && speed !== undefined && <span>· {formatBytes(speed)}/s</span>}
                   </div>
                 </div>
               );
@@ -891,6 +1025,104 @@ export function Models() {
           </div>
         </section>
       )}
+
+      <details
+        className="group mt-8 rounded-xl border border-border bg-surface"
+        open={manualAddOpen}
+        onToggle={(e) => {
+          const open = e.currentTarget.open;
+          setManualAddOpen(open);
+          persistManualAddOpen(open);
+        }}
+      >
+        <summary className="flex cursor-pointer items-center justify-between px-5 py-3 text-sm font-semibold uppercase tracking-wide text-muted">
+          Add a model manually
+          <IconChevronDown width={16} height={16} className="transition-transform group-open:rotate-180" />
+        </summary>
+        <form onSubmit={handleAdd} className="flex flex-col gap-3 border-t border-border px-5 py-4">
+          <div className="flex flex-wrap gap-3">
+            <label className="flex flex-col gap-1.5 text-sm">
+              <span className="text-muted">Source</span>
+              <select
+                value={form.source}
+                onChange={(e) => setForm({ ...form, source: e.target.value as ModelSource })}
+                className="rounded-lg border border-border bg-surface px-3 py-1.5 text-fg outline-none focus:border-accent"
+              >
+                <option value="local">local</option>
+                <option value="huggingface">huggingface</option>
+              </select>
+            </label>
+            <label className="flex flex-col gap-1.5 text-sm">
+              <span className="text-muted">ID (sha256, optional)</span>
+              <input
+                value={form.id}
+                onChange={(e) => setForm({ ...form, id: e.target.value })}
+                placeholder="sha256:…"
+                className="rounded-lg border border-border bg-surface px-3 py-1.5 text-fg outline-none focus:border-accent"
+              />
+            </label>
+            <label className="flex flex-col gap-1.5 text-sm">
+              <span className="text-muted">Filename</span>
+              <input
+                value={form.filename}
+                onChange={(e) => setForm({ ...form, filename: e.target.value })}
+                placeholder="model.gguf"
+                className="rounded-lg border border-border bg-surface px-3 py-1.5 text-fg outline-none focus:border-accent"
+              />
+            </label>
+            <label className="flex flex-col gap-1.5 text-sm">
+              <span className="text-muted">Size bytes</span>
+              <input
+                value={form.size_bytes}
+                onChange={(e) => setForm({ ...form, size_bytes: e.target.value })}
+                type="number"
+                placeholder="0"
+                className="w-32 rounded-lg border border-border bg-surface px-3 py-1.5 text-fg outline-none focus:border-accent"
+              />
+            </label>
+          </div>
+          {form.source === "huggingface" && (
+            <div className="flex flex-wrap gap-3">
+              <label className="flex flex-col gap-1.5 text-sm">
+                <span className="text-muted">HF repo</span>
+                <input
+                  value={form.hf_repo}
+                  onChange={(e) => setForm({ ...form, hf_repo: e.target.value })}
+                  placeholder="user/repo"
+                  className="rounded-lg border border-border bg-surface px-3 py-1.5 text-fg outline-none focus:border-accent"
+                />
+              </label>
+              <label className="flex flex-col gap-1.5 text-sm">
+                <span className="text-muted">HF file</span>
+                <input
+                  value={form.hf_file}
+                  onChange={(e) => setForm({ ...form, hf_file: e.target.value })}
+                  placeholder="model-q4_k_m.gguf"
+                  className="rounded-lg border border-border bg-surface px-3 py-1.5 text-fg outline-none focus:border-accent"
+                />
+              </label>
+            </div>
+          )}
+          <label className="flex flex-col gap-1.5 text-sm">
+            <span className="text-muted">Metadata JSON</span>
+            <input
+              value={form.metadata}
+              onChange={(e) => setForm({ ...form, metadata: e.target.value })}
+              placeholder='{"arch":"llama","quant":"q4_k_m"}'
+              className="rounded-lg border border-border bg-surface px-3 py-1.5 text-fg outline-none focus:border-accent"
+            />
+          </label>
+          <div className="flex items-center gap-3">
+            <button
+              type="submit"
+              className="self-start rounded-lg bg-accent px-4 py-1.5 text-sm font-semibold text-accent-fg"
+            >
+              Register
+            </button>
+            {addMsg && <span className="text-sm text-muted">{addMsg}</span>}
+          </div>
+        </form>
+      </details>
 
       <section className="mt-8">
         <h2 className="text-sm font-semibold uppercase tracking-wide text-muted">
@@ -964,7 +1196,11 @@ export function Models() {
                 <div className="flex items-center gap-1.5">
                   <select
                     value={hfSortField}
-                    onChange={(e) => setHfSortField(e.target.value as HfSortField)}
+                    onChange={(e) => {
+                      const field = e.target.value as HfSortField;
+                      setHfSortField(field);
+                      void runFreshHfSearch(field, hfSortDir);
+                    }}
                     className="rounded-lg border border-border bg-surface px-3 py-1.5 text-fg outline-none focus:border-accent"
                   >
                     {HF_SORT_OPTIONS.map((o) => (
@@ -976,7 +1212,11 @@ export function Models() {
                   {hfSortField !== "relevance" && (
                     <button
                       type="button"
-                      onClick={() => setHfSortDir((d) => (d === "asc" ? "desc" : "asc"))}
+                      onClick={() => {
+                        const dir: SortDir = hfSortDir === "asc" ? "desc" : "asc";
+                        setHfSortDir(dir);
+                        void runFreshHfSearch(hfSortField, dir);
+                      }}
                       className="rounded-lg border border-border px-2.5 py-1.5 text-fg hover:border-accent/40"
                       aria-label={hfSortDir === "asc" ? "Ascending" : "Descending"}
                       title={hfSortDir === "asc" ? "Ascending" : "Descending"}
@@ -1100,100 +1340,29 @@ export function Models() {
               </div>
             ))}
           </div>
+          <div className="mt-3 flex items-center justify-center gap-3 text-sm">
+            <button
+              type="button"
+              onClick={goToPrevHfPage}
+              disabled={hfPageIndex === 0 || searching}
+              className="rounded-lg border border-border px-3 py-1.5 text-muted hover:border-accent/40 hover:text-accent disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:border-border disabled:hover:text-muted"
+            >
+              ← Prev
+            </button>
+            <span className="text-muted">Page {hfPageIndex + 1}</span>
+            <button
+              type="button"
+              onClick={() => void goToNextHfPage()}
+              disabled={searching || (hfPageIndex + 1 >= hfPages.length && !hfPages[hfPageIndex]?.nextCursor)}
+              className="rounded-lg border border-border px-3 py-1.5 text-muted hover:border-accent/40 hover:text-accent disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:border-border disabled:hover:text-muted"
+            >
+              Next →
+            </button>
+          </div>
           </>
         )}
         {hfMsg && <p className="mt-3 text-sm text-muted">{hfMsg}</p>}
       </section>
-
-      <details className="group mt-8 rounded-xl border border-border bg-surface">
-        <summary className="flex cursor-pointer items-center justify-between px-5 py-3 text-sm font-semibold uppercase tracking-wide text-muted">
-          Add a model manually
-          <IconChevronDown width={16} height={16} className="transition-transform group-open:rotate-180" />
-        </summary>
-        <form onSubmit={handleAdd} className="flex flex-col gap-3 border-t border-border px-5 py-4">
-          <div className="flex flex-wrap gap-3">
-            <label className="flex flex-col gap-1.5 text-sm">
-              <span className="text-muted">Source</span>
-              <select
-                value={form.source}
-                onChange={(e) => setForm({ ...form, source: e.target.value as ModelSource })}
-                className="rounded-lg border border-border bg-surface px-3 py-1.5 text-fg outline-none focus:border-accent"
-              >
-                <option value="local">local</option>
-                <option value="huggingface">huggingface</option>
-              </select>
-            </label>
-            <label className="flex flex-col gap-1.5 text-sm">
-              <span className="text-muted">ID (sha256, optional)</span>
-              <input
-                value={form.id}
-                onChange={(e) => setForm({ ...form, id: e.target.value })}
-                placeholder="sha256:…"
-                className="rounded-lg border border-border bg-surface px-3 py-1.5 text-fg outline-none focus:border-accent"
-              />
-            </label>
-            <label className="flex flex-col gap-1.5 text-sm">
-              <span className="text-muted">Filename</span>
-              <input
-                value={form.filename}
-                onChange={(e) => setForm({ ...form, filename: e.target.value })}
-                placeholder="model.gguf"
-                className="rounded-lg border border-border bg-surface px-3 py-1.5 text-fg outline-none focus:border-accent"
-              />
-            </label>
-            <label className="flex flex-col gap-1.5 text-sm">
-              <span className="text-muted">Size bytes</span>
-              <input
-                value={form.size_bytes}
-                onChange={(e) => setForm({ ...form, size_bytes: e.target.value })}
-                type="number"
-                placeholder="0"
-                className="w-32 rounded-lg border border-border bg-surface px-3 py-1.5 text-fg outline-none focus:border-accent"
-              />
-            </label>
-          </div>
-          {form.source === "huggingface" && (
-            <div className="flex flex-wrap gap-3">
-              <label className="flex flex-col gap-1.5 text-sm">
-                <span className="text-muted">HF repo</span>
-                <input
-                  value={form.hf_repo}
-                  onChange={(e) => setForm({ ...form, hf_repo: e.target.value })}
-                  placeholder="user/repo"
-                  className="rounded-lg border border-border bg-surface px-3 py-1.5 text-fg outline-none focus:border-accent"
-                />
-              </label>
-              <label className="flex flex-col gap-1.5 text-sm">
-                <span className="text-muted">HF file</span>
-                <input
-                  value={form.hf_file}
-                  onChange={(e) => setForm({ ...form, hf_file: e.target.value })}
-                  placeholder="model-q4_k_m.gguf"
-                  className="rounded-lg border border-border bg-surface px-3 py-1.5 text-fg outline-none focus:border-accent"
-                />
-              </label>
-            </div>
-          )}
-          <label className="flex flex-col gap-1.5 text-sm">
-            <span className="text-muted">Metadata JSON</span>
-            <input
-              value={form.metadata}
-              onChange={(e) => setForm({ ...form, metadata: e.target.value })}
-              placeholder='{"arch":"llama","quant":"q4_k_m"}'
-              className="rounded-lg border border-border bg-surface px-3 py-1.5 text-fg outline-none focus:border-accent"
-            />
-          </label>
-          <div className="flex items-center gap-3">
-            <button
-              type="submit"
-              className="self-start rounded-lg bg-accent px-4 py-1.5 text-sm font-semibold text-accent-fg"
-            >
-              Register
-            </button>
-            {addMsg && <span className="text-sm text-muted">{addMsg}</span>}
-          </div>
-        </form>
-      </details>
     </div>
   );
 }

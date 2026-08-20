@@ -2,7 +2,8 @@ import { useEffect, useState } from "react";
 import { api } from "../api/client";
 import type { Worker, Run, LlamaCppRelease } from "../types";
 import { StatusPill, WorkerStatusPill, ElapsedSince } from "./StatusPill";
-import { IconCheck, IconChevronDown, IconDownload, IconTrash } from "./icons";
+import { IconCheck, IconChevronDown, IconDownload, IconPencil, IconTrash } from "./icons";
+import { Tooltip } from "./Tooltip";
 import { copyToClipboard, formatBytes, formatDate, formatGpuLabel } from "../utils";
 
 export type SetupOS = "windows" | "macos" | "linux";
@@ -12,6 +13,18 @@ export const SETUP_OS_LABELS: Array<{ key: SetupOS; label: string; badgeClass: s
   { key: "macos", label: "MACOS", badgeClass: "text-[#c9a6e8] bg-[#c9a6e8]/15" },
   { key: "linux", label: "LINUX", badgeClass: "text-[#f0b86e] bg-[#f0b86e]/15" },
 ];
+
+// Every Windows command below is PowerShell syntax (iex "& {...}", .\x.ps1
+// invocation) -- pasting it into cmd.exe just errors. Deliberately quiet
+// (not the warning-colored treatment used elsewhere on this page) since it's
+// a heads-up, not something wrong.
+export function PowerShellNotice() {
+  return (
+    <Tooltip text="Written for PowerShell -- paste into a PowerShell window, not Command Prompt (cmd.exe).">
+      <span className="text-[10px] font-normal normal-case tracking-normal text-muted/70">PowerShell</span>
+    </Tooltip>
+  );
+}
 
 // Best-effort guess at the OS of the machine viewing the page -- used to
 // pre-select client/src/pages/Device.tsx's OS tab so the right setup command
@@ -28,6 +41,19 @@ export function detectOS(): SetupOS {
   if (platform.includes("win")) return "windows";
   if (platform.includes("mac")) return "macos";
   return "linux";
+}
+
+// worker.platform is Node's raw os.platform() value (see worker/src/
+// hardware.ts), not the SetupOS union above -- maps one to the other so the
+// Workers-list setup panel can show just THAT machine's own command instead
+// of every OS's. Returns null for a worker that's never heartbeated hardware
+// info yet (or an unrecognized platform string), so the caller can fall back
+// to the browser-viewer-guessing detectOS() + a manual OS switcher instead.
+export function platformToSetupOS(platform: string | null | undefined): SetupOS | null {
+  if (platform === "win32") return "windows";
+  if (platform === "darwin") return "macos";
+  if (platform === "linux") return "linux";
+  return null;
 }
 
 export interface SetupScenario {
@@ -112,6 +138,13 @@ export function WorkerCard({ worker, onRefresh }: { worker: Worker; onRefresh: (
   const [available, setAvailable] = useState<LlamaCppRelease[]>([]);
   const [updateAvailable, setUpdateAvailable] = useState(false);
   const [activeRun, setActiveRun] = useState<Run | undefined>(undefined);
+  const [renaming, setRenaming] = useState(false);
+  const [nameDraft, setNameDraft] = useState(worker.displayName);
+  // Manual OS override, only ever consulted when this worker's own reported
+  // platform is unknown (e.g. it's never heartbeated hardware info yet) --
+  // seeded from the viewing browser's own OS as a starting guess, same as
+  // Device.tsx's add-machine screen.
+  const [manualOS, setManualOS] = useState<SetupOS>(() => detectOS());
 
   const inaccessible = worker.status === "offline";
 
@@ -168,6 +201,17 @@ export function WorkerCard({ worker, onRefresh }: { worker: Worker; onRefresh: (
     await withBusy("remove", () => api.deleteWorker(worker.id).then(() => undefined), "Removed");
   }
 
+  async function commitRename() {
+    const trimmed = nameDraft.trim();
+    if (!trimmed || trimmed === worker.displayName) {
+      setNameDraft(worker.displayName);
+      setRenaming(false);
+      return;
+    }
+    setRenaming(false);
+    await withBusy("rename", () => api.renameWorker(worker.id, trimmed).then(() => undefined), "Renamed");
+  }
+
   async function withBusy(tag: string, action: () => Promise<void>, doneMsg: string) {
     setBusyTag(tag);
     setMsg("");
@@ -188,7 +232,40 @@ export function WorkerCard({ worker, onRefresh }: { worker: Worker; onRefresh: (
   return (
     <div className="rounded-xl border border-border bg-surface p-5">
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <h3 className="text-lg font-semibold text-fg">{worker.displayName}</h3>
+        {renaming ? (
+          <input
+            autoFocus
+            value={nameDraft}
+            onChange={(e) => setNameDraft(e.target.value)}
+            onBlur={() => void commitRename()}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") void commitRename();
+              else if (e.key === "Escape") {
+                setNameDraft(worker.displayName);
+                setRenaming(false);
+              }
+            }}
+            maxLength={100}
+            className="rounded-lg border border-border bg-surface px-2 py-1 text-lg font-semibold text-fg outline-none focus:border-accent/50"
+          />
+        ) : (
+          <button
+            type="button"
+            onClick={() => {
+              setNameDraft(worker.displayName);
+              setRenaming(true);
+            }}
+            className="group/rename flex items-center gap-1.5 text-left"
+            title="Rename this machine"
+          >
+            <h3 className="text-lg font-semibold text-fg">{worker.displayName}</h3>
+            <IconPencil
+              width={13}
+              height={13}
+              className="flex-none text-muted opacity-0 transition-opacity group-hover/rename:opacity-100"
+            />
+          </button>
+        )}
         <div className="flex items-center gap-2">
           {worker.backend && <StatusPill label={worker.backend} tone="muted" />}
           <WorkerStatusPill inaccessible={inaccessible} />
@@ -216,32 +293,60 @@ export function WorkerCard({ worker, onRefresh }: { worker: Worker; onRefresh: (
           <IconChevronDown width={14} height={14} className="transition-transform group-open:rotate-180" />
         </summary>
         <div className="flex flex-col gap-3 border-t border-border p-3">
-          {buildSetupScenarios(window.location.origin).map((scenario, i) => (
-            <div key={scenario.title} className="overflow-hidden rounded-lg border border-border">
-              <div className="bg-surface-raised px-3 py-2.5">
-                <div className="flex items-center gap-2">
-                  <span className="flex h-5 w-5 flex-none items-center justify-center rounded-md bg-accent/15 font-mono text-[11px] font-bold text-accent">
-                    {i + 1}
-                  </span>
-                  <span className="text-sm font-semibold text-fg">{scenario.title}</span>
+          {(() => {
+            // Prefer this machine's own reported platform over guessing --
+            // only fall back to a manual switcher (seeded from the viewing
+            // browser's OS) when it's never heartbeated hardware info yet.
+            const knownOS = platformToSetupOS(worker.platform);
+            const effectiveOS = knownOS ?? manualOS;
+            const effectiveLabel = SETUP_OS_LABELS.find((o) => o.key === effectiveOS)!;
+            return (
+              <>
+                <div className="flex items-center gap-1.5">
+                  {knownOS ? (
+                    <span
+                      className={`rounded-md px-2.5 py-1 text-[11px] font-semibold tracking-wide ${effectiveLabel.badgeClass}`}
+                    >
+                      {effectiveLabel.label}
+                    </span>
+                  ) : (
+                    SETUP_OS_LABELS.map(({ key, label, badgeClass }) => (
+                      <button
+                        key={key}
+                        type="button"
+                        onClick={() => setManualOS(key)}
+                        className={`rounded-md px-2.5 py-1 text-[11px] font-semibold tracking-wide transition-colors ${
+                          effectiveOS === key ? badgeClass : "text-muted hover:bg-white/5"
+                        }`}
+                      >
+                        {label}
+                      </button>
+                    ))
+                  )}
+                  {effectiveOS === "windows" && <PowerShellNotice />}
                 </div>
-                <p className="mt-1.5 text-xs leading-relaxed text-muted">{scenario.desc}</p>
-              </div>
-              {SETUP_OS_LABELS.map(({ key, label, badgeClass }) => (
-                <div key={key} className="flex items-start gap-3 border-t border-border bg-bg px-3 py-2.5">
-                  <span
-                    className={`mt-0.5 w-16 flex-none rounded py-[3px] text-center text-[10.5px] font-semibold tracking-wide ${badgeClass}`}
-                  >
-                    {label}
-                  </span>
-                  <code className="flex-1 whitespace-pre-wrap break-all font-mono text-xs text-fg">
-                    {scenario.cmd[key]}
-                  </code>
-                  <CopyCommandButton text={scenario.cmd[key]} />
-                </div>
-              ))}
-            </div>
-          ))}
+                {buildSetupScenarios(window.location.origin).map((scenario, i) => (
+                  <div key={scenario.title} className="overflow-hidden rounded-lg border border-border">
+                    <div className="bg-surface-raised px-3 py-2.5">
+                      <div className="flex items-center gap-2">
+                        <span className="flex h-5 w-5 flex-none items-center justify-center rounded-md bg-accent/15 font-mono text-[11px] font-bold text-accent">
+                          {i + 1}
+                        </span>
+                        <span className="text-sm font-semibold text-fg">{scenario.title}</span>
+                      </div>
+                      <p className="mt-1.5 text-xs leading-relaxed text-muted">{scenario.desc}</p>
+                    </div>
+                    <div className="flex items-start gap-3 border-t border-border bg-bg px-3 py-2.5">
+                      <code className="flex-1 whitespace-pre-wrap break-all font-mono text-xs text-fg">
+                        {scenario.cmd[effectiveOS]}
+                      </code>
+                      <CopyCommandButton text={scenario.cmd[effectiveOS]} />
+                    </div>
+                  </div>
+                ))}
+              </>
+            );
+          })()}
         </div>
       </details>
       {!inaccessible && worker.status === "busy" && (

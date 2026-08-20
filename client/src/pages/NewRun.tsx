@@ -107,7 +107,10 @@ function rememberLastModel(workerId: string, selection: LastModelSelection): voi
   }
 }
 
-const CACHE_TYPES = ["f16", "q8_0", "q4_0", "q4_1", "q5_0", "q5_1"];
+// Sorted biggest to smallest (bits per weight): f32 (32) -> bf16/f16 (16) ->
+// q8_0 (8) -> q5_1/q5_0 (~5) -> q4_1/q4_0/iq4_nl (~4) -- llama.cpp's full
+// accepted set for --cache-type-k/-ctk and --cache-type-v/-ctv.
+const CACHE_TYPES = ["f32", "bf16", "f16", "q8_0", "q5_1", "q5_0", "q4_1", "q4_0", "iq4_nl"];
 const FLASH_ATTN_OPTIONS = ["on", "off"];
 // "off" first (not "on" like FLASH_ATTN_OPTIONS above) -- sanitizeSweep below
 // falls back to options[0] for an empty/invalid value, and unlike flash
