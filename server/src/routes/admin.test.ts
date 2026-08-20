@@ -179,3 +179,66 @@ describe("admin routes, cross-tenant by design", () => {
     expect(body.users.length).toBeGreaterThanOrEqual(1);
   });
 });
+
+// The supervise dashboard's own two platform-wide toggles (shared/types.ts's
+// AppSettings) -- item 4 of the Settings rework: community sharing starts
+// greyed out (default false) until an operator turns it on here, account
+// deletion starts allowed (default true, matching what already shipped).
+describe("admin settings (AppSettings toggles)", () => {
+  it("GET /api/admin/settings reports the documented defaults on a fresh DB", async () => {
+    const adminToken = await superadminSession();
+    const res = await fetch(`${baseUrl}/api/admin/settings`, { headers: withHost(ADMIN_HOST, { authorization: `Bearer ${adminToken}` }) });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { communitySharingAllowed: boolean; accountDeletionAllowed: boolean };
+    expect(body.communitySharingAllowed).toBe(false);
+    expect(body.accountDeletionAllowed).toBe(true);
+  });
+
+  it("POST /api/admin/settings flips one flag without disturbing the other, and persists", async () => {
+    const adminToken = await superadminSession();
+    const headers = { "content-type": "application/json", ...withHost(ADMIN_HOST, { authorization: `Bearer ${adminToken}` }) };
+
+    const res1 = await fetch(`${baseUrl}/api/admin/settings`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ communitySharingAllowed: true }),
+    });
+    expect(res1.status).toBe(200);
+    expect((await res1.json()) as { communitySharingAllowed: boolean }).toMatchObject({ communitySharingAllowed: true });
+
+    const res2 = await fetch(`${baseUrl}/api/admin/settings`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ accountDeletionAllowed: false }),
+    });
+    expect(res2.status).toBe(200);
+    const body2 = (await res2.json()) as { communitySharingAllowed: boolean; accountDeletionAllowed: boolean };
+    // communitySharingAllowed from the previous call must still be true --
+    // this call only touched accountDeletionAllowed.
+    expect(body2.communitySharingAllowed).toBe(true);
+    expect(body2.accountDeletionAllowed).toBe(false);
+
+    // Reset back to the defaults other tests in this file/process rely on.
+    await fetch(`${baseUrl}/api/admin/settings`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ communitySharingAllowed: false, accountDeletionAllowed: true }),
+    });
+  });
+
+  it("400s a non-boolean value instead of silently coercing it", async () => {
+    const adminToken = await superadminSession();
+    const res = await fetch(`${baseUrl}/api/admin/settings`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...withHost(ADMIN_HOST, { authorization: `Bearer ${adminToken}` }) },
+      body: JSON.stringify({ communitySharingAllowed: "yes" }),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("404s on the main hostname, same as every other admin route", async () => {
+    const adminToken = await superadminSession();
+    const res = await fetch(`${baseUrl}/api/admin/settings`, { headers: withHost(MAIN_HOST, { authorization: `Bearer ${adminToken}` }) });
+    expect(res.status).toBe(404);
+  });
+});

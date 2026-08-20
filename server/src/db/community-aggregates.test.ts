@@ -82,7 +82,7 @@ function insertResult(
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-describe("repo.communityRepo (§5.4 k-anonymity)", () => {
+describe("repo.communityRepo (§5.4 consent + self-exclusion, no k-anonymity floor)", () => {
   const modelId = "community-model-1";
 
   beforeAll(() => {
@@ -110,25 +110,28 @@ describe("repo.communityRepo (§5.4 k-anonymity)", () => {
     insertRun("run8", "u8-optout", "w8", modelId, "cuda", "b9999");
     insertResult("run8", "u8-optout", modelId, "tg", 999, 8000, 20000);
 
-    // Group Y: a single opted-in contributor on a rare GPU -- the "synthetic
-    // single-contributor group" that must be completely absent from every
-    // query below, at k=4 short of the k=5 threshold.
+    // Group Y: a single opted-in contributor on a rare GPU -- the k-anonymity
+    // floor that used to suppress groups like this was deliberately dropped
+    // (operator decision: collecting five identical hardware/model/backend
+    // combos was unrealistic), so this group must now be VISIBLE.
     insertUser("u7-lonely", true);
     insertWorker("w7", "linux", "RTX 3060");
     insertRun("run7", "u7-lonely", "w7", modelId, "cuda", "b2000");
     insertResult("run7", "u7-lonely", modelId, "tg", 40, 6000, 10000);
   });
 
-  it("suppresses a group below k=5 entirely, even called by an unrelated caller", () => {
+  it("no longer suppresses a single-contributor group -- it's shown with contributorCount 1", () => {
     const rows = repo.communityRepo.listAggregates("some-other-caller");
     const rtx3060 = rows.find((r) => r.gpuModel === "RTX 3060");
-    expect(rtx3060).toBeUndefined();
+    expect(rtx3060).toBeDefined();
+    expect(rtx3060!.contributorCount).toBe(1);
+    expect(rtx3060!.avgTps).toBeCloseTo(40, 1);
   });
 
   it("excludes the caller's own contribution from both the group and its average, and drops build from the key", () => {
-    // Called as u1: 6 opted-in contributors minus u1 = 5, exactly clearing
-    // k=5. If `build` were still part of the group key, this group would
-    // fragment into six size-1 cells and vanish entirely from the output.
+    // Called as u1: 6 opted-in contributors minus u1 = 5. If `build` were
+    // still part of the group key, this group would fragment into six
+    // size-1 cells and vanish entirely from the output.
     const rows = repo.communityRepo.listAggregates("u1");
     const tgRow = rows.find((r) => r.gpuModel === "RTX 4090" && r.testType === "tg");
     expect(tgRow).toBeDefined();
@@ -157,11 +160,11 @@ describe("repo.communityRepo (§5.4 k-anonymity)", () => {
     expect(tgRow!.contributorCount).toBe(6);
   });
 
-  it("every returned row clears k=5 and carries no UUID- or username-shaped value", () => {
+  it("every returned row has at least one contributor and carries no UUID- or username-shaped value", () => {
     const rows = repo.communityRepo.listAggregates("some-other-caller");
     expect(rows.length).toBeGreaterThan(0);
     for (const row of rows) {
-      expect(row.contributorCount).toBeGreaterThanOrEqual(5);
+      expect(row.contributorCount).toBeGreaterThanOrEqual(1);
       // CommunityAggregateRow's own type has no userId/username field at
       // all -- this walks every string value actually present to also catch
       // a UUID or a synthetic user id leaking through an unexpected field.
@@ -176,14 +179,15 @@ describe("repo.communityRepo (§5.4 k-anonymity)", () => {
     }
   });
 
-  it("listFacets suppresses a facet value below k=5 and surfaces one that clears it", () => {
+  it("listFacets no longer suppresses a low-contributor facet value", () => {
     const facets = repo.communityRepo.listFacets("u1");
     const gpu4090 = facets.gpuModels.find((g) => g.value === "RTX 4090");
     expect(gpu4090).toBeDefined();
     expect(gpu4090!.contributorCount).toBe(5); // u1 excluded, u8-optout excluded by consent
 
     const gpu3060 = facets.gpuModels.find((g) => g.value === "RTX 3060");
-    expect(gpu3060).toBeUndefined(); // only 1 contributor, well under k=5
+    expect(gpu3060).toBeDefined(); // no minimum contributor count anymore
+    expect(gpu3060!.contributorCount).toBe(1);
 
     // model facet counts every contributor on that model regardless of GPU
     // -- u2..u6 (RTX 4090) plus u7-lonely (RTX 3060) = 6, u1 excluded as

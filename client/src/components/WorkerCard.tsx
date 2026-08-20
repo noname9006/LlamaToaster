@@ -13,6 +13,23 @@ export const SETUP_OS_LABELS: Array<{ key: SetupOS; label: string; badgeClass: s
   { key: "linux", label: "LINUX", badgeClass: "text-[#f0b86e] bg-[#f0b86e]/15" },
 ];
 
+// Best-effort guess at the OS of the machine viewing the page -- used to
+// pre-select client/src/pages/Device.tsx's OS tab so the right setup command
+// is already showing on first paint instead of defaulting to "linux"
+// regardless of who's looking. navigator.userAgentData (Chromium) is
+// preferred where present since it's a plain platform string rather than a
+// UA string to pattern-match; every other browser falls back to
+// navigator.userAgent. Genuinely ambiguous/unrecognized cases fall back to
+// "linux" -- the same default this always had, just now only reached when
+// detection can't tell.
+export function detectOS(): SetupOS {
+  const uaData = (navigator as Navigator & { userAgentData?: { platform?: string } }).userAgentData;
+  const platform = (uaData?.platform || navigator.userAgent || "").toLowerCase();
+  if (platform.includes("win")) return "windows";
+  if (platform.includes("mac")) return "macos";
+  return "linux";
+}
+
 export interface SetupScenario {
   title: string;
   desc: string;
