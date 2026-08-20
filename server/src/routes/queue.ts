@@ -3,7 +3,7 @@ import type { IncomingMessage } from "node:http";
 import { repo } from "../db/repo.js";
 import { queueEvents } from "../queue-events.js";
 import { authenticateWorker } from "../worker-auth.js";
-import { parseWorkerState, parseActiveJobReport } from "../validate-worker-state.js";
+import { parseWorkerState, parseActiveJobReport, parseActiveDownloads } from "../validate-worker-state.js";
 import { LEASE_MS } from "../liveness.js";
 import { NotFoundError } from "../errors.js";
 import type { QueueJob, HeartbeatResponse } from "../../../shared/types.js";
@@ -77,6 +77,7 @@ export async function queueRoutes(app: FastifyInstance): Promise<void> {
       const worker = await authenticateWorker(req);
       const state = parseWorkerState(req.body);
       const active = parseActiveJobReport(req.body);
+      const activeDownloads = parseActiveDownloads(req.body);
 
       repo.workerRepo.recordHeartbeat(worker.id, state, active?.job_id ?? null);
 
@@ -84,16 +85,21 @@ export async function queueRoutes(app: FastifyInstance): Promise<void> {
         cancel_job_ids: [],
         pause: repo.workerRepo.getPauseRequested(worker.id),
       };
-      if (active) {
-        const flags = repo.queueRepo.extendLeaseAndGetFlags(active.job_id, worker.id, active);
+      // Same lease-extend-and-check-cancel dance for both the one serial job
+      // and every concurrently-active download (worker/src/index.ts's
+      // downloadJobPool) -- extendLeaseAndGetFlags is generic per job id, not
+      // tied to job type, so a download's Pause button (routes/workers.ts)
+      // reaches the worker through this exact same cancel_job_ids channel.
+      for (const report of active ? [active, ...activeDownloads] : activeDownloads) {
+        const flags = repo.queueRepo.extendLeaseAndGetFlags(report.job_id, worker.id, report);
         if (!flags) {
           // The server no longer considers this job live for this worker
           // (lease expired and reassigned, or the run was deleted/reconciled).
           // Tell the worker to stop rather than let two executions of the
           // same job both report results.
-          control.cancel_job_ids.push(active.job_id);
+          control.cancel_job_ids.push(report.job_id);
         } else if (flags.cancel_requested) {
-          control.cancel_job_ids.push(active.job_id);
+          control.cancel_job_ids.push(report.job_id);
         }
       }
       return { worker_id: worker.id, control, lease_until: Date.now() + LEASE_MS };

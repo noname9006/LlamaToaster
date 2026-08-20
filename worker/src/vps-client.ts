@@ -60,18 +60,19 @@ export async function postRunItemUpdate(
 // downloaded file on disk that the app never learns about.
 export async function postModelDownloadResult(
   vpsUrl: string,
+  token: string,
   payload: ModelDownloadCallbackInput,
   timeoutMs = 10_000
 ): Promise<void> {
   const res = await fetch(`${vpsUrl}/api/models/download-callback`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", ...authHeader(token) },
     body: JSON.stringify(payload),
     signal: AbortSignal.timeout(timeoutMs),
   });
   if (!res.ok) {
     const text = await res.text();
-    throw new Error(`model download callback failed (${res.status}): ${text}`);
+    throw new HttpError(res.status, `model download callback failed (${res.status}): ${text}`);
   }
 }
 
@@ -107,12 +108,16 @@ export async function postHeartbeat(
   token: string,
   state: WorkerStatePush,
   activeJob: ActiveJobReport | null,
+  // Concurrently-running download_model jobs (index.ts's downloadJobPool) --
+  // reported alongside activeJob, not exclusive with it. See
+  // server/src/validate-worker-state.ts's parseActiveDownloads.
+  activeDownloads: ActiveJobReport[],
   timeoutMs = 10_000
 ): Promise<HeartbeatResponse> {
   const res = await fetch(`${vpsUrl}/api/worker/heartbeat`, {
     method: "POST",
     headers: { "content-type": "application/json", ...authHeader(token) },
-    body: JSON.stringify({ ...state, active_job: activeJob ?? undefined }),
+    body: JSON.stringify({ ...state, active_job: activeJob ?? undefined, active_downloads: activeDownloads }),
     signal: AbortSignal.timeout(timeoutMs),
   });
   if (!res.ok) throw new HttpError(res.status, `heartbeat failed (${res.status}): ${await res.text()}`);

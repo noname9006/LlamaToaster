@@ -126,6 +126,14 @@ export function IconTrash(props: SVGProps<SVGSVGElement>) {
   );
 }
 
+export function IconPencil(props: SVGProps<SVGSVGElement>) {
+  return (
+    <Icon {...props}>
+      <path d="M12 20h9M16.5 3.5a2.121 2.121 0 013 3L7 19l-4 1 1-4L16.5 3.5z" />
+    </Icon>
+  );
+}
+
 export function IconMessageCircle(props: SVGProps<SVGSVGElement>) {
   return (
     <Icon {...props}>

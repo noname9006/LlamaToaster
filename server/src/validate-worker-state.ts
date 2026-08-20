@@ -146,6 +146,25 @@ export function parseWorkerState(body: unknown): WorkerStatePush {
 
 const ACTIVE_JOB_PHASES = ["downloading", "extracting", "loading", "benchmarking", "finalizing"] as const;
 
+function parseActiveJobReportShape(raw: unknown, field: string): ActiveJobReport {
+  if (typeof raw !== "object" || raw === null) throw new BadRequestError(`${field} must be an object`);
+  const a = raw as Record<string, unknown>;
+
+  if (!ACTIVE_JOB_PHASES.includes(a.phase as (typeof ACTIVE_JOB_PHASES)[number])) {
+    throw new BadRequestError(`${field}.phase must be one of ${ACTIVE_JOB_PHASES.join(", ")}`);
+  }
+
+  return {
+    job_id: sanitizeString(a.job_id, `${field}.job_id`),
+    phase: a.phase as ActiveJobReport["phase"],
+    bytes: optionalNumber(a.bytes, `${field}.bytes`),
+    total_bytes: optionalNumber(a.total_bytes, `${field}.total_bytes`),
+    item_idx: optionalNumber(a.item_idx, `${field}.item_idx`),
+    items_total: optionalNumber(a.items_total, `${field}.items_total`),
+    detail: optionalString(a.detail, `${field}.detail`, 1024), // best-effort human text, e.g. a stderr line
+  };
+}
+
 // Present only on the heartbeat route, and only while a job is running --
 // req.body there is a WorkerStatePush with this one extra field alongside it
 // (MULTIUSER_PLAN.md §1.5). Absent/null means idle, not a validation error.
@@ -153,22 +172,25 @@ export function parseActiveJobReport(body: unknown): ActiveJobReport | undefined
   if (typeof body !== "object" || body === null) return undefined;
   const raw = (body as Record<string, unknown>).active_job;
   if (raw === undefined || raw === null) return undefined;
-  if (typeof raw !== "object") throw new BadRequestError("active_job must be an object");
-  const a = raw as Record<string, unknown>;
+  return parseActiveJobReportShape(raw, "active_job");
+}
 
-  if (!ACTIVE_JOB_PHASES.includes(a.phase as (typeof ACTIVE_JOB_PHASES)[number])) {
-    throw new BadRequestError(`active_job.phase must be one of ${ACTIVE_JOB_PHASES.join(", ")}`);
-  }
+// Concurrently-running download_model jobs (worker/src/index.ts's
+// downloadJobPool) -- reported alongside active_job on every heartbeat, not
+// exclusive with it: a worker can be "idle" (no serial job) while several of
+// these are in flight, since only the serial job slot drives
+// WorkerStatePush.status. Absent/empty means no downloads active, same
+// non-error posture as parseActiveJobReport.
+const MAX_ACTIVE_DOWNLOADS_REPORTED = 32; // generous upper bound, not a real concurrency cap
 
-  return {
-    job_id: sanitizeString(a.job_id, "active_job.job_id"),
-    phase: a.phase as ActiveJobReport["phase"],
-    bytes: optionalNumber(a.bytes, "active_job.bytes"),
-    total_bytes: optionalNumber(a.total_bytes, "active_job.total_bytes"),
-    item_idx: optionalNumber(a.item_idx, "active_job.item_idx"),
-    items_total: optionalNumber(a.items_total, "active_job.items_total"),
-    detail: optionalString(a.detail, "active_job.detail", 1024), // best-effort human text, e.g. a stderr line
-  };
+export function parseActiveDownloads(body: unknown): ActiveJobReport[] {
+  if (typeof body !== "object" || body === null) return [];
+  const raw = (body as Record<string, unknown>).active_downloads;
+  if (raw === undefined || raw === null) return [];
+  if (!Array.isArray(raw)) throw new BadRequestError("active_downloads must be an array");
+  return raw
+    .slice(0, MAX_ACTIVE_DOWNLOADS_REPORTED)
+    .map((r, i) => parseActiveJobReportShape(r, `active_downloads[${i}]`));
 }
 
 // Multi-user Stage 3 (MULTIUSER_PLAN.md §3.4): POST /api/device/start's own

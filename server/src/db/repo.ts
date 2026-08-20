@@ -464,7 +464,27 @@ function hardwareLooksTheSame(
   return true;
 }
 
+// Unlike the single active_job_id FK on `workers` (JOINed in via
+// WORKER_SELECT_SQL above), several download_model jobs can be genuinely
+// 'claimed' for the same worker at once (worker/src/index.ts's
+// downloadJobPool), so this is a second, one-to-many query rather than
+// another JOIN column. Small worker/job counts in practice make the N+1
+// query pattern (once per mapWorker call) a non-issue here.
+function getActiveDownloadReports(workerId: string): ActiveJobReport[] {
+  const rows = getDb()
+    .prepare(
+      `SELECT progress_json FROM worker_jobs
+       WHERE worker_id = ? AND status = 'claimed' AND job_type = 'download_model'
+       ORDER BY created_at ASC`
+    )
+    .all(workerId) as { progress_json: string | null }[];
+  return rows
+    .map((r) => (r.progress_json ? safeParseJson<ActiveJobReport | null>(r.progress_json, null) : null))
+    .filter((r): r is ActiveJobReport => r !== null);
+}
+
 function mapWorker(row: WorkerRow): Worker {
+  const activeDownloads = getActiveDownloadReports(row.id);
   return {
     id: row.id,
     machineId: row.machine_id,
@@ -484,6 +504,7 @@ function mapWorker(row: WorkerRow): Worker {
     activeJobProgress: row.active_job_progress_json
       ? safeParseJson<ActiveJobReport | null>(row.active_job_progress_json, null) ?? undefined
       : undefined,
+    activeDownloads: activeDownloads.length > 0 ? activeDownloads : undefined,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -1198,6 +1219,17 @@ export const repo = {
     // this table too, so the server treats it as a brand-new enrolment.
     deleteWorker(id: string): void {
       getDb().prepare(`DELETE FROM workers WHERE id = ?`).run(id);
+    },
+
+    // Cosmetic, user-controlled rename -- the DB column's own comment
+    // ("user-editable; defaults to the reported hostname") anticipated this,
+    // and reissueEnrolment above already takes care not to clobber it across
+    // a re-enrolment; this was simply the write path that never got built.
+    // Ownership is checked by the route (assertOwnsWorker), same as every
+    // other per-worker action -- this just does the update.
+    renameWorker(id: string, displayName: string): Worker | undefined {
+      getDb().prepare(`UPDATE workers SET display_name = ?, updated_at = ? WHERE id = ?`).run(displayName, Date.now(), id);
+      return this.getWorker(id);
     },
 
     // Multi-user Stage 4 (MULTIUSER_PLAN.md §4.6) -- the caller's own
