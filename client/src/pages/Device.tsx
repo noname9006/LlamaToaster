@@ -40,7 +40,7 @@ export function Device() {
   const [status, setStatus] = useState<DeviceStatusResponse | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [approvedHost, setApprovedHost] = useState<string | null>(null);
+  const [approved, setApproved] = useState<{ hostname: string; merged: boolean } | null>(null);
 
   // This page's own origin IS the server's public URL (see
   // WorkerCard.tsx's buildSetupScenarios doc comment) -- stable for the
@@ -93,7 +93,7 @@ export function Device() {
     setError(null);
   }
 
-  async function handleApprove() {
+  async function handleApprove(mergeInto?: string) {
     setBusy(true);
     setError(null);
     try {
@@ -103,16 +103,18 @@ export function Device() {
       // deleting a worker's install folder wipes its persisted machine_id,
       // so re-running setup looks like a brand-new machine to the server,
       // and without this check would silently create an indistinguishable
-      // duplicate of a machine the user already has.
-      const res = await api.approveDevice(codeInput, status?.state === "pending" && status.possibleDuplicate != null);
+      // duplicate of a machine the user already has. mergeInto instead asks
+      // the server to re-attach this connection to that existing machine.
+      const confirmDuplicate = !mergeInto && status?.state === "pending" && status.possibleDuplicate != null;
+      const res = await api.approveDevice(codeInput, confirmDuplicate, mergeInto);
       if (!res.ok) {
         // Race: the duplicate was only detected server-side just now (this
         // poll hadn't caught up yet) -- the next poll tick will pick up
-        // possibleDuplicate and relabel the button; nothing was approved.
-        setError('This machine looks like one you already have -- click "Add as new machine" once it appears below.');
+        // possibleDuplicate and relabel the buttons; nothing was approved.
+        setError('This machine looks like one you already have -- pick "Merge" or "Add as new machine" once it appears below.');
         return;
       }
-      setApprovedHost(res.machine.hostname ?? "This machine");
+      setApproved({ hostname: res.machine.hostname ?? "This machine", merged: res.merged === true });
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -194,13 +196,15 @@ export function Device() {
         ))}
       </div>
 
-      {approvedHost ? (
+      {approved ? (
         <div className="mt-6 flex items-center gap-3 rounded-lg border border-success/30 bg-success-bg px-4 py-3">
           <IconCheck width={18} height={18} className="flex-none text-success" />
           <div>
-            <div className="text-sm font-semibold text-fg">Connected</div>
+            <div className="text-sm font-semibold text-fg">{approved.merged ? "Merged" : "Connected"}</div>
             <div className="text-xs text-muted">
-              {approvedHost} is approved — it'll show up on the Workers page shortly.
+              {approved.merged
+                ? `${approved.hostname} reconnected to its existing worker -- its history and settings are unchanged.`
+                : `${approved.hostname} is approved — it'll show up on the Workers page shortly.`}
             </div>
           </div>
         </div>
@@ -251,11 +255,17 @@ export function Device() {
                 <div className="mt-3 flex items-start gap-2 rounded-md bg-warning-bg px-2.5 py-2 text-xs text-warning">
                   <IconInfo width={14} height={14} className="mt-0.5 flex-none" />
                   <span>
-                    This looks like a machine you already have -- "{status.possibleDuplicate.displayName}"
-                    {status.possibleDuplicate.lastHeartbeatAt != null
+                    This looks like a machine you already have -- "{status.possibleDuplicate.displayName}" (
+                    {status.possibleDuplicate.hostnameMatch && status.possibleDuplicate.hardwareMatch
+                      ? "same name and hardware"
+                      : status.possibleDuplicate.hostnameMatch
+                        ? "same name"
+                        : "looks like the same hardware, different name"}
+                    ){status.possibleDuplicate.lastHeartbeatAt != null
                       ? `, last seen ${formatRelativeTime(new Date(status.possibleDuplicate.lastHeartbeatAt).toISOString())}`
                       : ", never connected"}
-                    . Adding it won't carry over that history -- they'll show up as two separate workers.
+                    . Merge to reconnect it to that same worker and keep its history, or add it as a new,
+                    separate one.
                   </span>
                 </div>
               ) : (
@@ -265,14 +275,35 @@ export function Device() {
                 </div>
               )}
               <div className="mt-3 flex gap-2">
-                <button
-                  type="button"
-                  onClick={() => void handleApprove()}
-                  disabled={busy}
-                  className="rounded-lg bg-accent px-4 py-1.5 text-sm font-semibold text-accent-fg disabled:opacity-50"
-                >
-                  {status.possibleDuplicate ? "Add as new machine" : "Approve"}
-                </button>
+                {status.possibleDuplicate ? (
+                  <button
+                    type="button"
+                    onClick={() => void handleApprove(status.possibleDuplicate!.id)}
+                    disabled={busy}
+                    className="rounded-lg bg-accent px-4 py-1.5 text-sm font-semibold text-accent-fg disabled:opacity-50"
+                  >
+                    Merge into "{status.possibleDuplicate.displayName}"
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => void handleApprove()}
+                    disabled={busy}
+                    className="rounded-lg bg-accent px-4 py-1.5 text-sm font-semibold text-accent-fg disabled:opacity-50"
+                  >
+                    Approve
+                  </button>
+                )}
+                {status.possibleDuplicate && (
+                  <button
+                    type="button"
+                    onClick={() => void handleApprove()}
+                    disabled={busy}
+                    className="rounded-lg border border-border px-4 py-1.5 text-sm font-semibold text-fg hover:border-accent/40 hover:text-accent disabled:opacity-50"
+                  >
+                    Add as new machine
+                  </button>
+                )}
                 <button
                   type="button"
                   onClick={handleDeny}

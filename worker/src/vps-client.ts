@@ -11,6 +11,7 @@ import type {
   DeviceTokenSuccess,
   DeviceTokenError,
   RefreshResponse,
+  HardwareInfo,
 } from "../../shared/types.js";
 
 export function writeRawJson(runDir: string, runId: string, data: unknown): string {
@@ -194,7 +195,7 @@ export async function pushRunLog(
 
 export async function startDeviceEnrolment(
   vpsUrl: string,
-  info: { machine_id: string; hostname: string; platform: string; arch: string },
+  info: { machine_id: string; hostname: string; platform: string; arch: string; hardware: HardwareInfo },
   timeoutMs = 10_000
 ): Promise<DeviceStartResponse> {
   const res = await fetch(`${vpsUrl}/api/device/start`, {

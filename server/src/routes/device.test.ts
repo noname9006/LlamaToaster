@@ -296,6 +296,91 @@ describe("duplicate-machine detection (bug fix: deleted worker folder loses mach
     expect(res.status).toBe(200);
     expect((await res.json()) as { ok: boolean }).toMatchObject({ ok: true });
   });
+
+  it("POST /approve merges into the existing worker when merge_into matches the suggested duplicate", async () => {
+    const user = repo.userRepo.upsertByIdentity("github", { providerUserId: "dupfix-merge-1", login: "merge1", avatarUrl: null });
+    const { token } = repo.sessionRepo.create(user.id, { label: "merge1" });
+
+    const first = await startDevice("dupfix-merge-original", { hostname: "dupfix-box-merge" });
+    await postJson("/api/device/approve", { user_code: first.user_code }, authed(token));
+    const originalWorker = repo.workerRepo.getByEnrolmentCodeHash(hashToken(first.device_code))!;
+
+    const second = await startDevice("dupfix-merge-rebuilt", { hostname: "dupfix-box-merge" });
+    const pendingId = repo.workerRepo.getByUserCode(second.user_code)!.id;
+
+    const held = await postJson("/api/device/approve", { user_code: second.user_code }, authed(token));
+    const heldBody = (await held.json()) as { duplicateOf?: { id: string } };
+    expect(heldBody.duplicateOf?.id).toBe(originalWorker.id);
+
+    const merged = await postJson(
+      "/api/device/approve",
+      { user_code: second.user_code, merge_into: heldBody.duplicateOf!.id },
+      authed(token)
+    );
+    expect(merged.status).toBe(200);
+    expect((await merged.json()) as { ok: boolean; merged?: boolean }).toMatchObject({ ok: true, merged: true });
+
+    // Same worker id as before -- a continuous history/display name, not a
+    // second, disconnected row.
+    expect(repo.workerRepo.getEnrolmentById(originalWorker.id)?.userId).toBe(user.id);
+    // The rebuilt machine's own device_code now redeems against that SAME id.
+    expect(repo.workerRepo.getByEnrolmentCodeHash(hashToken(second.device_code))?.id).toBe(originalWorker.id);
+    // The pending row it used to be is gone -- no stray duplicate left over.
+    expect(repo.workerRepo.getEnrolmentById(pendingId)).toBeUndefined();
+
+    // What actually matters to the physically-connecting worker: its own
+    // still-unredeemed device_code (from the "rebuilt" enrolment it started)
+    // now polls successfully -- no waiting on a second approval -- and
+    // hands back a session tied to the ORIGINAL (merged-into) worker id.
+    const tokenRes = await postJson("/api/device/token", { device_code: second.device_code });
+    expect(tokenRes.status).toBe(200);
+    const { session_token } = (await tokenRes.json()) as { session_token: string };
+    const session = repo.sessionRepo.getByTokenHash(hashToken(session_token));
+    expect(session?.isWorker).toBe(true);
+    expect(session?.workerId).toBe(originalWorker.id);
+  });
+
+  it("rejects merge_into when it doesn't match the currently-suggested duplicate", async () => {
+    const user = repo.userRepo.upsertByIdentity("github", { providerUserId: "dupfix-merge-2", login: "merge2", avatarUrl: null });
+    const { token } = repo.sessionRepo.create(user.id, { label: "merge2" });
+
+    // A machine this user owns, but with a different hostname -- never
+    // actually flagged as a duplicate of the one being approved below.
+    const unrelated = await startDevice("dupfix-merge-unrelated", { hostname: "totally-unrelated-box" });
+    await postJson("/api/device/approve", { user_code: unrelated.user_code }, authed(token));
+    const unrelatedWorker = repo.workerRepo.getByEnrolmentCodeHash(hashToken(unrelated.device_code))!;
+
+    const pending = await startDevice("dupfix-merge-pending", { hostname: "dupfix-box-merge-reject" });
+    const res = await postJson(
+      "/api/device/approve",
+      { user_code: pending.user_code, merge_into: unrelatedWorker.id },
+      authed(token)
+    );
+    expect(res.status).toBe(400);
+  });
+
+  it("rejects merge_into a machine the caller doesn't own", async () => {
+    const owner = repo.userRepo.upsertByIdentity("github", { providerUserId: "dupfix-merge-owner", login: "merge-owner", avatarUrl: null });
+    const attacker = repo.userRepo.upsertByIdentity("github", { providerUserId: "dupfix-merge-attacker", login: "merge-attacker", avatarUrl: null });
+    const ownerToken = repo.sessionRepo.create(owner.id, { label: "owner" }).token;
+    const attackerToken = repo.sessionRepo.create(attacker.id, { label: "attacker" }).token;
+
+    const ownersMachine = await startDevice("dupfix-merge-victim", { hostname: "victim-box" });
+    await postJson("/api/device/approve", { user_code: ownersMachine.user_code }, authed(ownerToken));
+    const ownersWorker = repo.workerRepo.getByEnrolmentCodeHash(hashToken(ownersMachine.device_code))!;
+
+    // The attacker enrols their own new machine and tries to merge it
+    // straight into the victim's worker id, skipping the normal
+    // findPossibleDuplicate flow entirely (it's cross-user, so it would
+    // never surface this as a suggested match) -- must be refused regardless.
+    const attackerMachine = await startDevice("dupfix-merge-attacker-machine");
+    const res = await postJson(
+      "/api/device/approve",
+      { user_code: attackerMachine.user_code, merge_into: ownersWorker.id },
+      authed(attackerToken)
+    );
+    expect(res.status).toBe(400);
+  });
 });
 
 describe("full enrolment flow, start to finish", () => {

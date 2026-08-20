@@ -179,6 +179,12 @@ export interface DeviceStartInput {
   hostname: string;
   platform: string;
   arch: string;
+  // Optional so a not-yet-updated worker binary (built before this field
+  // existed) can still enrol -- see repo.ts's createPending/reissueEnrolment
+  // for how a missing value is handled. Reuses parseHardware, the same
+  // validator the heartbeat path (parseWorkerState below) already applies to
+  // this exact shape, since a worker reports it identically in both places.
+  hardware?: HardwareInfo;
 }
 
 export function parseDeviceStart(body: unknown): DeviceStartInput {
@@ -189,6 +195,7 @@ export function parseDeviceStart(body: unknown): DeviceStartInput {
     hostname: sanitizeString(b.hostname, "hostname"),
     platform: sanitizeString(b.platform, "platform"),
     arch: sanitizeString(b.arch, "arch"),
+    hardware: b.hardware !== undefined ? parseHardware(b.hardware) : undefined,
   };
 }
 
