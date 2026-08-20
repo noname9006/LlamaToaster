@@ -83,13 +83,16 @@ export async function queueRoutes(app: FastifyInstance): Promise<void> {
 
       const control: HeartbeatResponse["control"] = {
         cancel_job_ids: [],
+        discard_job_ids: [],
         pause: repo.workerRepo.getPauseRequested(worker.id),
       };
       // Same lease-extend-and-check-cancel dance for both the one serial job
       // and every concurrently-active download (worker/src/index.ts's
       // downloadJobPool) -- extendLeaseAndGetFlags is generic per job id, not
-      // tied to job type, so a download's Pause button (routes/workers.ts)
-      // reaches the worker through this exact same cancel_job_ids channel.
+      // tied to job type, so a download's Pause/Cancel buttons
+      // (routes/workers.ts) reach the worker through this exact same
+      // cancel_job_ids channel; discard_job_ids additionally tells it to
+      // delete the .part file for a Cancel rather than keep it for resume.
       for (const report of active ? [active, ...activeDownloads] : activeDownloads) {
         const flags = repo.queueRepo.extendLeaseAndGetFlags(report.job_id, worker.id, report);
         if (!flags) {
@@ -100,6 +103,7 @@ export async function queueRoutes(app: FastifyInstance): Promise<void> {
           control.cancel_job_ids.push(report.job_id);
         } else if (flags.cancel_requested) {
           control.cancel_job_ids.push(report.job_id);
+          if (flags.discard_requested) control.discard_job_ids.push(report.job_id);
         }
       }
       return { worker_id: worker.id, control, lease_until: Date.now() + LEASE_MS };
