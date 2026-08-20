@@ -472,8 +472,10 @@ export function Models() {
   // POST that starts a download resolves as soon as the worker acks it, long
   // before the transfer itself finishes, so there's no blocking call left to
   // hang cleanup off of.
-  function finalizeDownload(key: string) {
-    const label = downloading[key]?.file.path ?? key;
+  // Shared by finalizeDownload (genuine completion/failure) and
+  // handleCancelDownload (user-discarded) -- just the bookkeeping common to
+  // both, since only the messaging/loadModels behavior after differs.
+  function removeDownloadState(key: string) {
     setDownloading((d) => {
       const next = { ...d };
       delete next[key];
@@ -493,6 +495,11 @@ export function Models() {
     delete smoothedSpeedRef.current[key];
     delete seenRef.current[key];
     delete missesRef.current[key];
+  }
+
+  function finalizeDownload(key: string) {
+    const label = downloading[key]?.file.path ?? key;
+    removeDownloadState(key);
     setHfMsg(`${label} is no longer downloading -- refreshed the model list.`);
     void loadModels();
     // Safety net: the worker's progress entry disappearing only means the
@@ -736,6 +743,22 @@ export function Models() {
     // handleDownload overwrites this same key (downloadKey is deterministic
     // off worker/repo/path, not jobId) with a fresh, unpaused entry.
     await handleDownload(state.repoId, state.file);
+  }
+
+  async function handleCancelDownload(key: string) {
+    const state = downloading[key];
+    if (!state) return;
+    const label = state.file.path;
+    try {
+      await api.cancelDownload(state.workerId, state.jobId);
+      // Unlike a pause->finalize, there's genuinely nothing left (the
+      // worker deletes the .part file too), so this skips finalizeDownload's
+      // loadModels() calls -- nothing new could have been registered.
+      removeDownloadState(key);
+      setHfMsg(`${label} cancelled -- the partial download was deleted.`);
+    } catch (err) {
+      setHfMsg(`Error cancelling: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   function renderModelRow(m: Model, worker: Worker, indent: boolean) {
@@ -998,6 +1021,17 @@ export function Models() {
                           Pause
                         </button>
                       )}
+                      <button
+                        type="button"
+                        onClick={() => {
+                          if (window.confirm(`Cancel downloading ${state.file.path}? The partial file will be deleted.`)) {
+                            void handleCancelDownload(key);
+                          }
+                        }}
+                        className="rounded-md border border-border px-2 py-0.5 text-xs text-muted hover:border-danger/40 hover:text-danger"
+                      >
+                        Cancel
+                      </button>
                     </div>
                   </div>
                   <div className="h-1.5 w-full overflow-hidden rounded-full bg-surface-raised">

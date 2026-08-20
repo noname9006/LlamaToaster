@@ -149,6 +149,12 @@ const COLUMN_MIGRATIONS: ColumnSpec[] = [
   // (pull-queue model: this is populated from the worker's own heartbeat,
   // not a live server->worker proxy read).
   { table: "workers", column: "vram_json", ddlType: "TEXT" },
+  // Cancel Download (distinct from Pause) -- set alongside cancel_requested
+  // when the user wants a download's partial .part file deleted, not kept
+  // for resume (server/src/routes/workers.ts's cancel route,
+  // worker/src/index.ts's discard handling). Meaningless for any other job
+  // type; only ever read/set for 'download_model' rows.
+  { table: "worker_jobs", column: "discard_requested", ddlType: "INTEGER DEFAULT 0" },
 ];
 
 function applyColumnMigrations(database: Database.Database): void {

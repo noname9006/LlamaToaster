@@ -577,6 +577,19 @@ function requestDownloadStop(jobId: string): void {
   activeDownloadControllers.get(jobId)?.abort();
 }
 
+// Job ids the server has told this worker to discard (Cancel Download,
+// server/src/routes/workers.ts's cancel route -> heartbeat's
+// discard_job_ids), as opposed to merely pause (cancel_job_ids alone) --
+// executeDownloadModelJob checks this on abort to decide whether to delete
+// the .part file or keep it for resume. Cleared in runDownloadJob's finally
+// alongside activeDownloadReports/activeDownloadControllers.
+const discardRequestedJobIds = new Set<string>();
+
+function requestDownloadDiscard(jobId: string): void {
+  discardRequestedJobIds.add(jobId);
+  requestDownloadStop(jobId);
+}
+
 function toInstalledBuildList(): InstalledBuild[] {
   return listInstalledBuilds(buildsDir).map((b) => ({
     tag: b.tag,
@@ -1787,7 +1800,23 @@ async function executeDownloadModelJob(
     }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    if (signal.aborted) {
+    const discard = signal.aborted && discardRequestedJobIds.has(jobId);
+    if (discard) {
+      // Cancel Download (routes/workers.ts's cancel route ->
+      // requestDownloadDiscard) -- unlike a plain pause, the .part is
+      // deleted: there's nothing to resume, this download is being thrown
+      // away outright.
+      try {
+        unlinkSync(partPath);
+        log.info(`model download cancelled for ${progressKey} (.part deleted)`);
+      } catch (unlinkErr) {
+        log.warn(
+          `model download cancelled for ${progressKey}, but couldn't delete .part: ${
+            unlinkErr instanceof Error ? unlinkErr.message : String(unlinkErr)
+          }`
+        );
+      }
+    } else if (signal.aborted) {
       // Paused (routes/workers.ts's pause route -> requestDownloadStop) --
       // the .part file is deliberately left in place so a fresh
       // download_model job for the same file resumes instead of restarting.
@@ -1811,7 +1840,7 @@ async function executeDownloadModelJob(
       hf_repo: payload.hf_repo,
       hf_file: payload.hf_file,
       ok: false,
-      error: signal.aborted ? "paused by user" : message,
+      error: discard ? "cancelled by user" : signal.aborted ? "paused by user" : message,
     });
     throw err; // also mark the worker_jobs row itself failed
   }
@@ -2006,6 +2035,11 @@ function startHeartbeatLoop(): void {
       const res = await withAuth((token) =>
         postHeartbeat(config.vps_url, token, state, currentJobReport, Array.from(activeDownloadReports.values()), 10_000)
       );
+      // discard_job_ids is a subset of cancel_job_ids -- mark discards FIRST
+      // so executeDownloadModelJob's abort handler (which may run
+      // synchronously off the abort() call inside requestDownloadStop) sees
+      // discardRequestedJobIds already populated for this job.
+      for (const jobId of res.control.discard_job_ids) requestDownloadDiscard(jobId);
       for (const jobId of res.control.cancel_job_ids) {
         requestStop(jobId);
         requestDownloadStop(jobId);
@@ -2068,6 +2102,7 @@ async function runDownloadJob(job: { job_id: string; payload: DownloadModelJobPa
   } finally {
     activeDownloadReports.delete(job.job_id);
     activeDownloadControllers.delete(job.job_id);
+    discardRequestedJobIds.delete(job.job_id);
   }
 }
 

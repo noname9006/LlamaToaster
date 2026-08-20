@@ -209,6 +209,14 @@ export const api = {
       method: "POST",
     }),
 
+  // Unlike pause, tells the worker to delete the partial .part file too --
+  // nothing is left to resume (see server/src/routes/workers.ts's cancel
+  // route and worker/src/index.ts's discard handling).
+  cancelDownload: (workerId: string, jobId: string): Promise<{ ok: true }> =>
+    request(`/api/workers/${encodeURIComponent(workerId)}/downloads/${encodeURIComponent(jobId)}/cancel`, {
+      method: "POST",
+    }),
+
   listRuns: (): Promise<Run[]> => request<{ runs: Run[] }>("/api/runs").then((d) => d.runs),
 
   getRun: (id: string): Promise<{ run: Run; results: ResultRow[]; items: RunItem[]; paused?: boolean }> =>

@@ -371,3 +371,88 @@ describe("POST /api/models/download-callback (worker credential, not a user sess
     expect(res.status).toBe(200);
   });
 });
+
+describe("POST /api/workers/:id/downloads/:jobId/pause", () => {
+  it("flags cancel_requested on a claimed download_model job, without discard_requested", async () => {
+    const id = await heartbeatWorker("pause-worker");
+    const jobId = repo.queueRepo.enqueueJob(id, { type: "download_model", payload: { hf_repo: "org/repo", hf_file: "model.gguf" } });
+    getDb().prepare(`UPDATE worker_jobs SET status = 'claimed' WHERE id = ?`).run(jobId);
+
+    const res = await fetch(`${baseUrl}/api/workers/${id}/downloads/${jobId}/pause`, { method: "POST" });
+    expect(res.status).toBe(200);
+    const row = getDb().prepare(`SELECT cancel_requested, discard_requested FROM worker_jobs WHERE id = ?`).get(jobId) as {
+      cancel_requested: number;
+      discard_requested: number;
+    };
+    expect(row.cancel_requested).toBe(1);
+    expect(row.discard_requested).toBe(0);
+  });
+
+  it("404s a job that isn't a download_model job for this worker", async () => {
+    const id = await heartbeatWorker("pause-wrong-type");
+    const jobId = repo.queueRepo.enqueueJob(id, { type: "delete_model_file", payload: { filename: "x.gguf" } });
+    getDb().prepare(`UPDATE worker_jobs SET status = 'claimed' WHERE id = ?`).run(jobId);
+
+    const res = await fetch(`${baseUrl}/api/workers/${id}/downloads/${jobId}/pause`, { method: "POST" });
+    expect(res.status).toBe(404);
+  });
+
+  it("404s an unknown job id", async () => {
+    const id = await heartbeatWorker("pause-unknown-job");
+    const res = await fetch(`${baseUrl}/api/workers/${id}/downloads/not-a-real-job/pause`, { method: "POST" });
+    expect(res.status).toBe(404);
+  });
+});
+
+describe("POST /api/workers/:id/downloads/:jobId/cancel", () => {
+  it("cancels a still-pending download outright (no worker round trip needed)", async () => {
+    const id = await heartbeatWorker("cancel-pending-worker");
+    const jobId = repo.queueRepo.enqueueJob(id, { type: "download_model", payload: { hf_repo: "org/repo", hf_file: "model.gguf" } });
+
+    const res = await fetch(`${baseUrl}/api/workers/${id}/downloads/${jobId}/cancel`, { method: "POST" });
+    expect(res.status).toBe(200);
+    const row = getDb().prepare(`SELECT status FROM worker_jobs WHERE id = ?`).get(jobId) as { status: string };
+    expect(row.status).toBe("cancelled");
+  });
+
+  it("flags both cancel_requested and discard_requested on a claimed download", async () => {
+    const id = await heartbeatWorker("cancel-claimed-worker");
+    const jobId = repo.queueRepo.enqueueJob(id, { type: "download_model", payload: { hf_repo: "org/repo", hf_file: "model.gguf" } });
+    getDb().prepare(`UPDATE worker_jobs SET status = 'claimed' WHERE id = ?`).run(jobId);
+
+    const res = await fetch(`${baseUrl}/api/workers/${id}/downloads/${jobId}/cancel`, { method: "POST" });
+    expect(res.status).toBe(200);
+    const row = getDb().prepare(`SELECT status, cancel_requested, discard_requested FROM worker_jobs WHERE id = ?`).get(jobId) as {
+      status: string;
+      cancel_requested: number;
+      discard_requested: number;
+    };
+    // Still 'claimed' -- the worker hasn't reported back yet, this route
+    // only sets the flags the next heartbeat delivers.
+    expect(row.status).toBe("claimed");
+    expect(row.cancel_requested).toBe(1);
+    expect(row.discard_requested).toBe(1);
+  });
+
+  it("404s a job that isn't a download_model job for this worker", async () => {
+    const id = await heartbeatWorker("cancel-wrong-type");
+    const jobId = repo.queueRepo.enqueueJob(id, { type: "delete_model_file", payload: { filename: "x.gguf" } });
+
+    const res = await fetch(`${baseUrl}/api/workers/${id}/downloads/${jobId}/cancel`, { method: "POST" });
+    expect(res.status).toBe(404);
+  });
+
+  it("a different authenticated user cannot cancel someone else's download", async () => {
+    const id = await heartbeatWorker("cancel-intruder-worker");
+    const { userId } = await sessionFor("cancel-real-owner");
+    claimWorker(id, userId);
+    const { token: intruderToken } = await sessionFor("cancel-intruder-user");
+    const jobId = repo.queueRepo.enqueueJob(id, { type: "download_model", payload: { hf_repo: "org/repo", hf_file: "model.gguf" } });
+
+    const res = await fetch(`${baseUrl}/api/workers/${id}/downloads/${jobId}/cancel`, {
+      method: "POST",
+      headers: authed(intruderToken),
+    });
+    expect(res.status).toBe(403);
+  });
+});

@@ -238,6 +238,7 @@ interface WorkerJobRow {
   attempts: number;
   lease_expires_at: number | null;
   cancel_requested: number;
+  discard_requested: number;
   progress_json: string | null;
   run_id: string | null;
   created_at: number;
@@ -1701,7 +1702,7 @@ export const repo = {
       jobId: string,
       workerId: string,
       report: ActiveJobReport
-    ): { cancel_requested: boolean } | undefined {
+    ): { cancel_requested: boolean; discard_requested: boolean } | undefined {
       const database = getDb();
       const job = database.prepare(`SELECT * FROM worker_jobs WHERE id = ?`).get(jobId) as
         | WorkerJobRow
@@ -1710,7 +1711,7 @@ export const repo = {
       database
         .prepare(`UPDATE worker_jobs SET lease_expires_at = ?, progress_json = ? WHERE id = ?`)
         .run(Date.now() + LEASE_MS, JSON.stringify(report), jobId);
-      return { cancel_requested: job.cancel_requested === 1 };
+      return { cancel_requested: job.cancel_requested === 1, discard_requested: job.discard_requested === 1 };
     },
 
     enqueueJob(
@@ -1769,6 +1770,17 @@ export const repo = {
     // will skip it rather than hand it out).
     requestCancel(jobId: string): void {
       getDb().prepare(`UPDATE worker_jobs SET cancel_requested = 1 WHERE id = ?`).run(jobId);
+    },
+
+    // Cancel Download -- same delivery as requestCancel above (the worker
+    // sees this job's id in the next heartbeat's cancel_job_ids either way),
+    // but also flags discard_requested so the worker deletes the .part file
+    // instead of keeping it for resume (see routes/queue.ts's heartbeat
+    // handler and worker/src/index.ts's discard handling). Only meaningful
+    // for a download_model job -- the route calling this already checked
+    // that (server/src/routes/workers.ts).
+    requestDiscard(jobId: string): void {
+      getDb().prepare(`UPDATE worker_jobs SET cancel_requested = 1, discard_requested = 1 WHERE id = ?`).run(jobId);
     },
 
     // Run-scoped version of requestCancel -- flags every currently-claimed
