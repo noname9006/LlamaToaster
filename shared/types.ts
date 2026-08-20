@@ -1024,18 +1024,25 @@ export interface IdentityInfo {
   createdAt: number;
 }
 
-// A candidate machine's `hostname` matches another machine the same user
-// already owns -- surfaced so the approval screen can ask "add it as a new
-// worker anyway?" instead of silently creating an indistinguishable
-// duplicate. This is the common case after a user deletes a worker's install
-// folder and re-runs setup: worker/config.json's machine_id (worker/src/
-// index.ts) is generated once and lives ONLY in that folder, so wiping it
-// makes the next enrolment look like a brand-new machine even though it's
-// the same box -- see server/src/db/repo.ts's workerRepo.findPossibleDuplicate.
+// A candidate machine's `hostname` and/or hardware (CPU/GPU/RAM) look like
+// another machine the same user already owns -- surfaced so the approval
+// screen can offer merging into that existing worker instead of silently
+// creating an indistinguishable duplicate. This is the common case after a
+// user deletes a worker's install folder and re-runs setup: worker/
+// config.json's machine_id (worker/src/index.ts) is generated once and lives
+// ONLY in that folder, so wiping it makes the next enrolment look like a
+// brand-new machine even though it's the same box -- see
+// server/src/db/repo.ts's workerRepo.findPossibleDuplicate.
+// hostnameMatch/hardwareMatch let the UI say *why* this candidate was
+// flagged -- hostname alone is a weak signal (a generic default like
+// "DESKTOP-XXXXXXX" collides across genuinely different machines), so a
+// human deciding whether to merge benefits from knowing which signal(s) fired.
 export interface PossibleDuplicateWorker {
   id: string;
   displayName: string;
   lastHeartbeatAt: number | null;
+  hostnameMatch: boolean;
+  hardwareMatch: boolean;
 }
 
 // GET /api/device/status?user_code=... -- the browser's own poll while the
@@ -1053,12 +1060,15 @@ export type DeviceStatusResponse =
     };
 
 // POST /api/device/approve -- normally approves outright. If the candidate
-// machine's hostname matches another machine this user already owns (see
-// PossibleDuplicateWorker above) and the request didn't pass
-// confirm_duplicate, approval is held pending an explicit "yes, add it
-// anyway" from the human instead of silently creating a duplicate.
+// machine looks like another machine this user already owns (see
+// PossibleDuplicateWorker above) and the request passed neither
+// confirm_duplicate nor merge_into, approval is held pending an explicit
+// choice from the human: "add it anyway" (confirm_duplicate) or "merge it
+// into <duplicateOf>" (merge_into: duplicateOf.id) instead of silently
+// creating a duplicate. `merged` is only ever true on the merge path -- see
+// server/src/db/repo.ts's workerRepo.mergeEnrolment.
 export type DeviceApproveResponse =
-  | { ok: true; machine: { hostname: string | null } }
+  | { ok: true; machine: { hostname: string | null }; merged?: true }
   | { ok: false; needsConfirmation: true; duplicateOf: PossibleDuplicateWorker };
 
 // Multi-user Stage 5 (MULTIUSER_PLAN.md §5.1) -- the admin surface's own

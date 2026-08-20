@@ -201,3 +201,67 @@ describe("per-worker action routes ownership (assertOwnsWorker via requireOnline
     expect(res.status).toBe(403);
   });
 });
+
+describe("DELETE /api/workers/:id (permanently remove a machine)", () => {
+  it("the owner can remove their own idle machine", async () => {
+    const id = await heartbeatWorker("remove-owner-ok");
+    const { userId, token } = await sessionFor("remove-owner");
+    claimWorker(id, userId);
+
+    const res = await fetch(`${baseUrl}/api/workers/${id}`, { method: "DELETE", headers: authed(token) });
+    expect(res.status).toBe(200);
+    expect(repo.workerRepo.getWorker(id)).toBeUndefined();
+  });
+
+  it("a different authenticated user cannot remove someone else's machine", async () => {
+    const id = await heartbeatWorker("remove-intruder");
+    const { userId } = await sessionFor("remove-real-owner");
+    claimWorker(id, userId);
+    const { token: intruderToken } = await sessionFor("remove-intruder-user");
+
+    const res = await fetch(`${baseUrl}/api/workers/${id}`, { method: "DELETE", headers: authed(intruderToken) });
+    expect(res.status).toBe(403);
+    expect(repo.workerRepo.getWorker(id)).toBeDefined();
+  });
+
+  it("404s an unknown machine id", async () => {
+    const res = await fetch(`${baseUrl}/api/workers/not-a-real-id`, { method: "DELETE" });
+    expect(res.status).toBe(404);
+  });
+
+  it("409s a busy machine instead of silently orphaning its in-flight job", async () => {
+    const id = await heartbeatWorker("remove-busy");
+    getDb().prepare(`UPDATE workers SET active_job_id = 'fake-job-id' WHERE id = ?`).run(id);
+
+    const res = await fetch(`${baseUrl}/api/workers/${id}`, { method: "DELETE" });
+    expect(res.status).toBe(409);
+    expect(repo.workerRepo.getWorker(id)).toBeDefined();
+  });
+
+  it("unauthenticated (single-tenant mode) can remove any machine regardless of claimed ownership", async () => {
+    const id = await heartbeatWorker("remove-single-tenant");
+    const { userId } = await sessionFor("remove-single-tenant-owner");
+    claimWorker(id, userId);
+
+    const res = await fetch(`${baseUrl}/api/workers/${id}`, { method: "DELETE" });
+    expect(res.status).toBe(200);
+    expect(repo.workerRepo.getWorker(id)).toBeUndefined();
+  });
+
+  it("removing a machine detaches (not deletes) its past runs -- worker_id goes null, the worker_name snapshot survives", async () => {
+    const id = await heartbeatWorker("remove-with-history");
+    getDb()
+      .prepare(`INSERT INTO runs (id, worker_id, worker_name, status, started_at) VALUES (?, ?, ?, ?, ?)`)
+      .run("run-remove-with-history", id, "remove-with-history", "done", Date.now());
+
+    const res = await fetch(`${baseUrl}/api/workers/${id}`, { method: "DELETE" });
+    expect(res.status).toBe(200);
+
+    const run = getDb().prepare(`SELECT worker_id, worker_name FROM runs WHERE id = ?`).get("run-remove-with-history") as {
+      worker_id: string | null;
+      worker_name: string | null;
+    };
+    expect(run.worker_id).toBeNull();
+    expect(run.worker_name).toBe("remove-with-history");
+  });
+});

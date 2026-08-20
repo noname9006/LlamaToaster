@@ -118,6 +118,14 @@ export const api = {
   // separate per-worker fetch (MULTIUSER_PLAN.md §1.16).
   listWorkers: (): Promise<Worker[]> => request<{ workers: Worker[] }>("/api/workers").then((d) => d.workers),
 
+  // Permanently removes a machine from the Workers page -- distinct from
+  // Settings' session revoke, which only kicks it off and leaves the row
+  // (and card) in place. Run history is untouched (see server/src/db/
+  // repo.ts's deleteWorker doc comment); reconnecting afterward re-enrols as
+  // a brand-new machine.
+  deleteWorker: (workerId: string): Promise<{ ok: true }> =>
+    request(`/api/workers/${encodeURIComponent(workerId)}`, { method: "DELETE" }),
+
   // Which llama.cpp releases a specific machine could install, and whether
   // a newer one than what it has exists -- the one piece of per-worker
   // "live" info that's a GitHub lookup, not something the worker itself
@@ -232,8 +240,14 @@ export const api = {
   getDeviceStatus: (userCode: string): Promise<DeviceStatusResponse> =>
     request(`/api/device/status?user_code=${encodeURIComponent(userCode)}`),
 
-  approveDevice: (userCode: string, confirmDuplicate = false): Promise<DeviceApproveResponse> =>
-    request("/api/device/approve", postJson({ user_code: userCode, confirm_duplicate: confirmDuplicate })),
+  // mergeInto (a PossibleDuplicateWorker.id) takes priority over
+  // confirmDuplicate server-side when both are somehow set -- callers only
+  // ever pass one.
+  approveDevice: (userCode: string, confirmDuplicate = false, mergeInto?: string): Promise<DeviceApproveResponse> =>
+    request(
+      "/api/device/approve",
+      postJson({ user_code: userCode, confirm_duplicate: confirmDuplicate, merge_into: mergeInto })
+    ),
 
   // Live (not persisted) Hugging Face check, keyed by model id -- powers the
   // New Run model picker's "Updated X ago" label and "possibly newer on HF"

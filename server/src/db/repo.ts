@@ -30,6 +30,7 @@ import type {
   CommunityAggregateFilters,
   CommunityFacets,
   PossibleDuplicateWorker,
+  HardwareInfo,
 } from "../../../shared/types.js";
 import type { SweepItem } from "../../../shared/sweep.js";
 
@@ -425,6 +426,41 @@ function safeParseJson<T>(json: string | null, fallback: T): T {
   } catch {
     return fallback;
   }
+}
+
+// Used by workerRepo.findPossibleDuplicate below to corroborate (or, in the
+// future, stand in for) a hostname match with an actual hardware fingerprint
+// -- hostname alone is a weak signal (a generic default like
+// "DESKTOP-XXXXXXX" collides across genuinely different machines). Compares
+// only the fields that are stable across reboots/reinstalls of the SAME
+// physical box: CPU brand+cores, the set of GPU models (not vram/driver
+// fields, which can read back slightly differently run to run), platform+
+// arch, and total RAM within a small tolerance (firmware/OS-reserved amounts
+// can differ by a sliver from boot to boot). Deliberately conservative: two
+// genuinely different but identically-specced headless/no-GPU machines (e.g.
+// two identical cloud VMs) could false-positive here -- acceptable since this
+// only ever feeds a human-confirmed suggestion, never an automatic merge.
+const RAM_TOLERANCE_FRACTION = 0.03;
+
+function hardwareLooksTheSame(
+  a: HardwareInfo | null,
+  b: HardwareInfo | null,
+  platform: string | null,
+  arch: string | null
+): boolean {
+  if (!a || !b) return false;
+  if (a.platform !== platform || a.arch !== arch || b.platform !== platform || b.arch !== arch) return false;
+  if (a.cpu.brand.trim().toLowerCase() !== b.cpu.brand.trim().toLowerCase()) return false;
+  if (a.cpu.cores !== b.cpu.cores) return false;
+  const gpuSet = (h: HardwareInfo) => new Set(h.gpu.map((g) => g.model.trim().toLowerCase()));
+  const ga = gpuSet(a);
+  const gb = gpuSet(b);
+  if (ga.size !== gb.size || [...ga].some((m) => !gb.has(m))) return false;
+  if (a.mem_total_bytes != null && b.mem_total_bytes != null) {
+    const diff = Math.abs(a.mem_total_bytes - b.mem_total_bytes);
+    if (diff > a.mem_total_bytes * RAM_TOLERANCE_FRACTION) return false;
+  }
+  return true;
 }
 
 function mapWorker(row: WorkerRow): Worker {
@@ -1147,6 +1183,22 @@ export const repo = {
       return rows.map(mapWorker);
     },
 
+    // Permanently forgets a machine (routes/workers.ts's DELETE
+    // /api/workers/:id -- the ownership + not-busy checks live there, this
+    // is just the row removal). Deliberately NOT the same posture as
+    // pruneExpiredEnrolments' "never delete a row with history" -- this IS
+    // the user asking to delete it. Safe regardless: runs.worker_id is
+    // `ON DELETE SET NULL` and runs.worker_name is a point-in-time snapshot
+    // (COLUMN_MIGRATIONS in migrate.ts), so every past run stays fully
+    // readable, just no longer linked to a live worker row. worker_jobs rows
+    // (`ON DELETE CASCADE`) go with it -- correct, since the caller already
+    // refused to delete a busy machine, so there's nothing queued/in-flight
+    // to lose. If this machine reconnects later, its machine_id is gone from
+    // this table too, so the server treats it as a brand-new enrolment.
+    deleteWorker(id: string): void {
+      getDb().prepare(`DELETE FROM workers WHERE id = ?`).run(id);
+    },
+
     // Multi-user Stage 4 (MULTIUSER_PLAN.md §4.6) -- the caller's own
     // machines only, for the AI context snapshot (routes/ai.ts's
     // hardwareSummary). A separate function rather than listWorkers(userId?)
@@ -1305,15 +1357,21 @@ export const repo = {
       deviceCode: string;
       userCode: string;
       expiresAt: number;
+      // Not yet known from a heartbeat (there's been none) -- carried
+      // straight from the worker's own POST /api/device/start body instead,
+      // so findPossibleDuplicate below has something to compare against
+      // before this machine is even approved. Optional purely for a
+      // not-yet-updated worker binary; a normal fresh install always sends it.
+      hardware?: HardwareInfo;
     }): WorkerEnrolment {
       const now = Date.now();
       const id = uuid();
       getDb()
         .prepare(
           `INSERT INTO workers
-             (id, machine_id, display_name, hostname, platform, arch,
+             (id, machine_id, display_name, hostname, platform, arch, hardware_json,
               enrolment_code_hash, user_code, enrolment_expires_at, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         )
         .run(
           id,
@@ -1322,6 +1380,7 @@ export const repo = {
           opts.hostname,
           opts.platform,
           opts.arch,
+          opts.hardware ? JSON.stringify(opts.hardware) : null,
           hashToken(opts.deviceCode),
           opts.userCode,
           opts.expiresAt,
@@ -1341,16 +1400,34 @@ export const repo = {
     // enrolment code/expiry are refreshed.
     reissueEnrolment(
       workerId: string,
-      opts: { hostname: string; platform: string; arch: string; deviceCode: string; userCode: string; expiresAt: number }
+      opts: {
+        hostname: string;
+        platform: string;
+        arch: string;
+        deviceCode: string;
+        userCode: string;
+        expiresAt: number;
+        hardware?: HardwareInfo;
+      }
     ): WorkerEnrolment {
       getDb()
         .prepare(
           `UPDATE workers SET
-             hostname = ?, platform = ?, arch = ?,
+             hostname = ?, platform = ?, arch = ?, hardware_json = COALESCE(?, hardware_json),
              enrolment_code_hash = ?, user_code = ?, enrolment_expires_at = ?, updated_at = ?
            WHERE id = ?`
         )
-        .run(opts.hostname, opts.platform, opts.arch, hashToken(opts.deviceCode), opts.userCode, opts.expiresAt, Date.now(), workerId);
+        .run(
+          opts.hostname,
+          opts.platform,
+          opts.arch,
+          opts.hardware ? JSON.stringify(opts.hardware) : null,
+          hashToken(opts.deviceCode),
+          opts.userCode,
+          opts.expiresAt,
+          Date.now(),
+          workerId
+        );
       return this.getEnrolmentById(workerId)!;
     },
 
@@ -1361,27 +1438,112 @@ export const repo = {
     // getByMachineId above always misses, and createPending would otherwise
     // silently insert a second, indistinguishable `workers` row (same
     // hostname/platform/arch/owner) with no history and no link to the old
-    // one. This is the best signal available for "looks like a machine this
-    // user already has" -- scoped to their OWN already-approved machines
-    // (never another user's, and never a still-pending one) and matched on
-    // self-reported hostname, since that's the one detail a human would
-    // actually recognize on the approval screen. A soft signal, not a
-    // uniqueness constraint: used by GET /api/device/status and
-    // POST /api/device/approve to ask before creating the duplicate, never to
-    // block it outright (a genuine second machine can share a hostname, e.g.
-    // an unconfigured "DESKTOP-XXXXXXX" default).
-    findPossibleDuplicate(userId: string, hostname: string | null, excludeWorkerId: string): PossibleDuplicateWorker | undefined {
-      if (!hostname) return undefined;
-      const row = getDb()
-        .prepare(
-          `SELECT id, display_name, last_heartbeat_at FROM workers
-           WHERE user_id = ? AND approved_at IS NOT NULL AND hostname = ? AND id != ?
-           ORDER BY last_heartbeat_at DESC LIMIT 1`
-        )
-        .get(userId, hostname, excludeWorkerId) as
-        | { id: string; display_name: string; last_heartbeat_at: number | null }
+    // one. Matches on EITHER self-reported hostname OR a hardware fingerprint
+    // (hardwareLooksTheSame above) against the user's OWN already-approved
+    // machines (never another user's, and never a still-pending one) --
+    // hostname alone is a weak signal (a generic default like
+    // "DESKTOP-XXXXXXX" collides across genuinely different machines), so
+    // hardware corroborates or, when the hostname was actually changed,
+    // stands in for it. Takes the CANDIDATE's own worker id (rather than a
+    // bare hostname) so it can pull hostname/platform/arch/hardware_json for
+    // that row itself -- both call sites (GET /api/device/status, POST
+    // /api/device/approve) already have this id at hand. A soft signal, not
+    // a uniqueness constraint: used to ask before creating a duplicate (or to
+    // offer merging into the match, see mergeEnrolment below), never to block
+    // outright.
+    findPossibleDuplicate(userId: string, candidateWorkerId: string): PossibleDuplicateWorker | undefined {
+      const candidate = getDb()
+        .prepare(`SELECT hostname, platform, arch, hardware_json FROM workers WHERE id = ?`)
+        .get(candidateWorkerId) as
+        | { hostname: string | null; platform: string | null; arch: string | null; hardware_json: string | null }
         | undefined;
-      return row ? { id: row.id, displayName: row.display_name, lastHeartbeatAt: row.last_heartbeat_at } : undefined;
+      if (!candidate) return undefined;
+      const candidateHardware = safeParseJson<HardwareInfo | null>(candidate.hardware_json, null);
+      const rows = getDb()
+        .prepare(
+          `SELECT id, display_name, last_heartbeat_at, hostname, hardware_json FROM workers
+           WHERE user_id = ? AND approved_at IS NOT NULL AND id != ?
+           ORDER BY last_heartbeat_at DESC`
+        )
+        .all(userId, candidateWorkerId) as {
+        id: string;
+        display_name: string;
+        last_heartbeat_at: number | null;
+        hostname: string | null;
+        hardware_json: string | null;
+      }[];
+      for (const row of rows) {
+        const hostnameMatch = candidate.hostname != null && row.hostname === candidate.hostname;
+        const hardwareMatch = hardwareLooksTheSame(
+          candidateHardware,
+          safeParseJson<HardwareInfo | null>(row.hardware_json, null),
+          candidate.platform,
+          candidate.arch
+        );
+        if (hostnameMatch || hardwareMatch) {
+          return { id: row.id, displayName: row.display_name, lastHeartbeatAt: row.last_heartbeat_at, hostnameMatch, hardwareMatch };
+        }
+      }
+      return undefined;
+    },
+
+    // Re-points an EXISTING approved worker row onto a freshly-enrolling
+    // machine's identity, instead of approving the pending row as a second,
+    // disconnected one -- the actual fix for findPossibleDuplicate's warning
+    // above, called once a human confirms "yes, this is the same machine"
+    // (routes/device.ts's POST /api/device/approve, `merge_into`).
+    // Deliberately preserves the target's id/display_name/user_id/
+    // approved_at/created_at (that continuity -- same worker id, same
+    // history, same human-assigned name -- is the whole point) and instead
+    // transplants the PENDING row's machine_id/hostname/platform/arch/
+    // hardware_json plus its enrolment_code_hash/user_code/
+    // enrolment_expires_at, so the connecting worker's next POST
+    // /api/device/token poll (which looks itself up by that hash) finds the
+    // target row -- already approved, so it succeeds immediately. The pending
+    // row is deleted FIRST, in the same transaction: machine_id is UNIQUE NOT
+    // NULL, so its value has to be freed before the target row can take it.
+    mergeEnrolment(pendingWorkerId: string, targetWorkerId: string): Worker {
+      const database = getDb();
+      const tx = database.transaction(() => {
+        const pending = database
+          .prepare(
+            `SELECT machine_id, hostname, platform, arch, hardware_json,
+                    enrolment_code_hash, user_code, enrolment_expires_at
+             FROM workers WHERE id = ?`
+          )
+          .get(pendingWorkerId) as {
+          machine_id: string;
+          hostname: string | null;
+          platform: string | null;
+          arch: string | null;
+          hardware_json: string | null;
+          enrolment_code_hash: string | null;
+          user_code: string | null;
+          enrolment_expires_at: number | null;
+        };
+        database.prepare(`DELETE FROM workers WHERE id = ?`).run(pendingWorkerId);
+        database
+          .prepare(
+            `UPDATE workers SET
+               machine_id = ?, hostname = ?, platform = ?, arch = ?, hardware_json = ?,
+               enrolment_code_hash = ?, user_code = ?, enrolment_expires_at = ?, updated_at = ?
+             WHERE id = ?`
+          )
+          .run(
+            pending.machine_id,
+            pending.hostname,
+            pending.platform,
+            pending.arch,
+            pending.hardware_json,
+            pending.enrolment_code_hash,
+            pending.user_code,
+            pending.enrolment_expires_at,
+            Date.now(),
+            targetWorkerId
+          );
+      });
+      tx();
+      return this.getWorker(targetWorkerId)!;
     },
 
     // The ONLY place workers.user_id is ever set (§3.1 step 5) -- the
