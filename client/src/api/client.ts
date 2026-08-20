@@ -240,8 +240,14 @@ export const api = {
   getDeviceStatus: (userCode: string): Promise<DeviceStatusResponse> =>
     request(`/api/device/status?user_code=${encodeURIComponent(userCode)}`),
 
-  approveDevice: (userCode: string, confirmDuplicate = false): Promise<DeviceApproveResponse> =>
-    request("/api/device/approve", postJson({ user_code: userCode, confirm_duplicate: confirmDuplicate })),
+  // mergeInto (a PossibleDuplicateWorker.id) takes priority over
+  // confirmDuplicate server-side when both are somehow set -- callers only
+  // ever pass one.
+  approveDevice: (userCode: string, confirmDuplicate = false, mergeInto?: string): Promise<DeviceApproveResponse> =>
+    request(
+      "/api/device/approve",
+      postJson({ user_code: userCode, confirm_duplicate: confirmDuplicate, merge_into: mergeInto })
+    ),
 
   // Live (not persisted) Hugging Face check, keyed by model id -- powers the
   // New Run model picker's "Updated X ago" label and "possibly newer on HF"
