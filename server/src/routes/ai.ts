@@ -157,7 +157,7 @@ async function runTool(name: string, rawArguments: string, callerId: string | un
   if (name === "search_huggingface_gguf_models") {
     const query = typeof args.query === "string" ? args.query : "";
     try {
-      return { results: await searchHfGgufModels(query, HF_TOOL_TIMEOUT_MS) };
+      return { results: (await searchHfGgufModels(query, HF_TOOL_TIMEOUT_MS)).items };
     } catch (err) {
       return { error: err instanceof Error ? err.message : String(err) };
     }

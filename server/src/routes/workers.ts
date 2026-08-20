@@ -4,6 +4,7 @@ import { queueEvents } from "../queue-events.js";
 import { getReleases, filterReleasesForWorker } from "../github-releases.js";
 import { BadRequestError, ConflictError, NotFoundError } from "../errors.js";
 import { resolveAuthUser, assertOwnsWorker } from "../auth-middleware.js";
+import { authenticateWorker } from "../worker-auth.js";
 import { isMtpDraftModel } from "../../../shared/types.js";
 import type {
   HfRepoSearchResult,
@@ -13,7 +14,7 @@ import type {
   LlamaCppRelease,
   WorkerVramInfo,
 } from "../../../shared/types.js";
-import { HF_REPO_PATTERN, searchHfGgufModels, listHfGgufFiles, getHfGgufMeta } from "../hf.js";
+import { HF_REPO_PATTERN, searchHfGgufModels, listHfGgufFiles, getHfGgufMeta, type HfSortField } from "../hf.js";
 
 const WORKER_READ_TIMEOUT_MS = 5_000;
 
@@ -164,6 +165,25 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
     return reply.code(200).send({ ok: true });
   });
 
+  // Cosmetic rename -- doesn't require the machine to be online (unlike the
+  // requireOnlineWorker-gated routes above), since it's a server-side-only
+  // label with no worker-side effect at all.
+  app.patch<{ Params: { id: string }; Body: { display_name?: string } }>(
+    "/api/workers/:id",
+    async (request, reply) => {
+      const worker = repo.workerRepo.getWorker(request.params.id);
+      if (!worker) throw new NotFoundError("unknown machine");
+      assertOwnsWorker(resolveAuthUser(request)?.user.id, worker.id);
+      const raw = request.body?.display_name;
+      if (typeof raw !== "string") throw new BadRequestError("display_name is required");
+      const displayName = raw.trim();
+      if (!displayName) throw new BadRequestError("display_name can't be empty");
+      if (displayName.length > 100) throw new BadRequestError("display_name is too long (max 100 characters)");
+      const updated = repo.workerRepo.renameWorker(worker.id, displayName);
+      return reply.code(200).send({ worker: updated });
+    }
+  );
+
   app.delete<{ Params: { id: string }; Querystring: { file?: string } }>(
     "/api/workers/:id/models",
     async (request, reply) => {
@@ -191,17 +211,26 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
     return worker.vram as WorkerVramInfo;
   });
 
-  app.get<{ Querystring: { q?: string } }>("/api/hf/search", async (request, reply) => {
-    const q = (request.query.q ?? "").trim();
-    if (!q) return { results: [] as HfRepoSearchResult[] };
-    try {
-      const results: HfRepoSearchResult[] = await searchHfGgufModels(q, WORKER_READ_TIMEOUT_MS);
-      return { results };
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      return reply.code(502).send({ error: message });
+  const HF_SORT_FIELDS = new Set<HfSortField>(["downloads", "likes", "createdAt", "lastModified"]);
+
+  // q may be empty -- that's the Models page's default "top 15" listing
+  // (search box empty, sort=downloads) shown before the user types anything.
+  app.get<{ Querystring: { q?: string; sort?: string; direction?: string; cursor?: string } }>(
+    "/api/hf/search",
+    async (request, reply) => {
+      const q = (request.query.q ?? "").trim();
+      const sort = HF_SORT_FIELDS.has(request.query.sort as HfSortField) ? (request.query.sort as HfSortField) : undefined;
+      const direction = request.query.direction === "1" ? 1 : request.query.direction === "-1" ? -1 : undefined;
+      const cursor = request.query.cursor || undefined;
+      try {
+        const page = await searchHfGgufModels(q, WORKER_READ_TIMEOUT_MS, { sort, direction, cursor });
+        return { results: page.items as HfRepoSearchResult[], next_cursor: page.nextCursor };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return reply.code(502).send({ error: message });
+      }
     }
-  });
+  );
 
   app.get<{ Params: { "*": string } }>("/api/hf/repo/*", async (request, reply) => {
     const repoId = request.params["*"];
@@ -228,9 +257,35 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
       const { hf_repo, hf_file } = request.body ?? {};
       if (!hf_repo || !hf_file) throw new BadRequestError("hf_repo and hf_file are required");
       request.log.info({ worker: worker.id, hf_repo, hf_file }, "model download queued");
-      repo.queueRepo.enqueueJob(worker.id, { type: "download_model", payload: { hf_repo, hf_file } });
+      const jobId = repo.queueRepo.enqueueJob(worker.id, { type: "download_model", payload: { hf_repo, hf_file } });
       queueEvents.emit(worker.id);
-      return reply.code(202).send({ ok: true, queued: true });
+      // job_id lets the client target this specific download with the pause
+      // route below -- multiple downloads for the same worker can be queued
+      // and running concurrently now (worker/src/index.ts's downloadJobPool),
+      // so hf_repo/hf_file alone no longer uniquely identifies "the" download.
+      return reply.code(202).send({ ok: true, queued: true, job_id: jobId });
+    }
+  );
+
+  // Pauses an in-flight (or still-queued) download -- flags the same
+  // cancel_requested column a benchmark job's Stop button already uses
+  // (requestCancel), delivered to the worker on its next heartbeat
+  // (routes/queue.ts). The worker leaves the partial file's .part on disk
+  // rather than deleting it (worker/src/index.ts's executeDownloadModelJob),
+  // so "Resume" is just re-queuing the same download -- it picks the .part
+  // file back up via an HTTP Range request automatically.
+  app.post<{ Params: { id: string; jobId: string } }>(
+    "/api/workers/:id/downloads/:jobId/pause",
+    async (request, reply) => {
+      const worker = repo.workerRepo.getWorker(request.params.id);
+      if (!worker) throw new NotFoundError("unknown machine");
+      assertOwnsWorker(resolveAuthUser(request)?.user.id, worker.id);
+      const job = repo.queueRepo.getJob(request.params.jobId);
+      if (!job || job.workerId !== worker.id || job.jobType !== "download_model") {
+        throw new NotFoundError("unknown download");
+      }
+      repo.queueRepo.requestCancel(job.id);
+      return reply.code(200).send({ ok: true });
     }
   );
 
@@ -248,6 +303,14 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
     // isn't a user-facing request, no need for Fastify's automatic pair.
     { logLevel: "silent" },
     async (request, reply) => {
+      // Worker credential, not a browser session -- see auth-middleware.ts's
+      // WORKER_AUTHENTICATED_ROUTES entry for this route, same pattern as
+      // every /api/worker/* route in routes/queue.ts. The body has no
+      // machine_id, so this only resolves via a real Stage 3 worker session
+      // (not the Stage 1 WORKER_SHARED_TOKEN+machine_id fallback) -- fine,
+      // since every worker that can reach this point already authenticated
+      // the same way for its heartbeat/queue-poll calls.
+      await authenticateWorker(request);
       const validationError = validateModelDownloadCallback(request.body);
       if (validationError) {
         app.log.warn({ error: validationError }, "model download callback rejected: invalid payload");

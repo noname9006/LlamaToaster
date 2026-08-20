@@ -56,20 +56,23 @@ export interface SweepItem {
 // (build b10442): "llama_init_from_model: quantized V cache requires
 // flash_attn to be enabled", thrown from both the llama-bench and
 // llama-server paths identically. There's no partial credit for only one
-// side being f16 either -- ctk=f16/ctv=q8_0/fa=off fails the exact same way
-// as ctk=q8_0/ctv=q8_0/fa=off, so both sides are checked. A sweep that
-// cross-products flash_attn:[on,off] against any quantized cache type (a
-// natural thing to do, e.g. comparing fa on vs off at a fixed cache
-// setting) previously still produced these as real items: each one spawned
-// a whole process just to die in a few seconds with a context-creation
-// error, and produced no usable pp/tg row -- see worker/src/bench.ts and
-// worker/src/serverBench.ts, which have no way to know this in advance
-// per-item. Skipped here instead, in the one place both the server (item
-// pre-creation) and worker (item execution) independently call this on the
-// same sweep JSON, so both stay in agreement on the smaller item count
-// without any registration round trip.
+// side being unquantized either -- ctk=f16/ctv=q8_0/fa=off fails the exact
+// same way as ctk=q8_0/ctv=q8_0/fa=off, so both sides are checked. f32 and
+// bf16 get the same exemption as f16 here -- all three are full-precision
+// (non-quantized) ggml types; only q8_0/q5_1/q5_0/q4_1/q4_0/iq4_nl actually
+// require flash attention. A sweep that cross-products flash_attn:[on,off]
+// against any quantized cache type (a natural thing to do, e.g. comparing fa
+// on vs off at a fixed cache setting) previously still produced these as
+// real items: each one spawned a whole process just to die in a few seconds
+// with a context-creation error, and produced no usable pp/tg row -- see
+// worker/src/bench.ts and worker/src/serverBench.ts, which have no way to
+// know this in advance per-item. Skipped here instead, in the one place both
+// the server (item pre-creation) and worker (item execution) independently
+// call this on the same sweep JSON, so both stay in agreement on the smaller
+// item count without any registration round trip.
+const UNQUANTIZED_CACHE_TYPES = new Set(["f32", "f16", "bf16"]);
 function isValidCombo(cache_type_k: string, cache_type_v: string, flash_attn: string): boolean {
-  return flash_attn !== "off" || (cache_type_k === "f16" && cache_type_v === "f16");
+  return flash_attn !== "off" || (UNQUANTIZED_CACHE_TYPES.has(cache_type_k) && UNQUANTIZED_CACHE_TYPES.has(cache_type_v));
 }
 
 export function expandSweep(sweep: Omit<SweepConfig, "model_id">): SweepItem[] {

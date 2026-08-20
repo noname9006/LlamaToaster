@@ -8,6 +8,7 @@ import {
   renameSync,
   mkdirSync,
   createWriteStream,
+  createReadStream,
   unlinkSync,
   readdirSync,
   statSync,
@@ -144,6 +145,12 @@ interface WorkerConfig {
   // (127.0.0.1-bound /health), NOT used for dispatch: the worker needs no
   // inbound HTTP at all under the pull model (MULTIUSER_PLAN.md §1.11).
   debug_port?: number;
+  // How many download_model jobs this worker runs concurrently -- everything
+  // else (benchmark, install_build, ...) stays strictly serial regardless of
+  // this value (see workerMain's downloadJobPool). Defaults to 2 if unset;
+  // a local, per-machine resource tuning knob, same posture as backend/
+  // llama_bench_path above -- no server-side UI to set it, edit config.json.
+  max_concurrent_downloads?: number;
 }
 
 function loadConfig(): WorkerConfig {
@@ -372,6 +379,11 @@ function listModelDirFiles(): ModelDirFile[] {
       if (entry.isDirectory()) {
         walk(full);
       } else if (entry.isFile()) {
+        // A .part is an in-progress/paused download (executeDownloadModelJob
+        // below) -- never a real, usable model file, so it must never be
+        // reported as one (it'd otherwise show up in the Models page's Local
+        // file listing as if it were complete).
+        if (entry.name.endsWith(".part")) continue;
         const rel = relative(root, full).split(sep).join("/");
         results.push({ path: rel, size_bytes: statSync(full).size });
       }
@@ -466,24 +478,26 @@ function hfResolveUrl(repo: string, file: string): string {
   return `https://huggingface.co/${encRepo}/resolve/main/${encFile}`;
 }
 
-class HashingPassThrough extends Transform {
-  private hash = createHash("sha256");
-  private bytes = 0;
-  override _transform(
-    chunk: Buffer,
-    _enc: string,
-    cb: (err?: Error | null, data?: unknown) => void
-  ): void {
-    this.hash.update(chunk);
-    this.bytes += chunk.length;
-    cb(undefined, chunk);
-  }
-  digestHex(): string {
-    return this.hash.digest("hex");
-  }
-  get byteLength(): number {
-    return this.bytes;
-  }
+// Hashes a file already fully on disk, streamed rather than read whole into
+// memory (models are often multiple GB). Used by executeDownloadModelJob
+// AFTER the download completes, not inline during the write -- a Range-
+// resumed download only streams the NEW bytes, so hashing inline would only
+// ever cover the tail written in this particular process run, not bytes
+// written by an earlier attempt before a pause/restart. One full sequential
+// read of the file is a bounded, known cost regardless of how many times a
+// download was paused and resumed.
+function hashFile(path: string): Promise<{ sha256: string; byteLength: number }> {
+  return new Promise((resolve, reject) => {
+    const hash = createHash("sha256");
+    let byteLength = 0;
+    const rs = createReadStream(path);
+    rs.on("data", (chunk: Buffer) => {
+      hash.update(chunk);
+      byteLength += chunk.length;
+    });
+    rs.on("end", () => resolve({ sha256: hash.digest("hex"), byteLength }));
+    rs.on("error", reject);
+  });
 }
 
 // How often a running item's live progress tick (phase + ram/vram) is sent.
@@ -534,6 +548,33 @@ let currentJobReport: ActiveJobReport | null = null;
 function updateJobReport(patch: Partial<Omit<ActiveJobReport, "job_id">>): void {
   if (!currentJobReport) return;
   Object.assign(currentJobReport, patch);
+}
+
+// Concurrently-running download_model jobs -- separate from currentJobReport
+// above, which stays reserved for the ONE serial (benchmark/build) job slot.
+// Keyed by job_id. workerMain's downloadJobPool adds/removes entries as
+// downloads start and finish; the heartbeat loop reports Array.from(...) of
+// this on every beat (postHeartbeat's activeDownloads param) regardless of
+// whether the worker is otherwise idle or busy.
+const activeDownloadReports = new Map<string, ActiveJobReport>();
+// One AbortController per active download, used by requestDownloadStop
+// (delivered via the heartbeat's cancel_job_ids, same channel requestStop
+// uses for the serial job) to cancel a specific in-flight fetch -- keyed
+// alongside activeDownloadReports rather than merged into it since
+// AbortController isn't JSON-serializable state.
+const activeDownloadControllers = new Map<string, AbortController>();
+
+function updateDownloadReport(jobId: string, patch: Partial<Omit<ActiveJobReport, "job_id">>): void {
+  const cur = activeDownloadReports.get(jobId);
+  if (cur) Object.assign(cur, patch);
+}
+
+// Delivered on the heartbeat's cancel_job_ids -- the download equivalent of
+// requestStop below. No-ops if jobId doesn't name a download this worker is
+// currently tracking (e.g. a stale/duplicate signal after it already
+// finished on its own).
+function requestDownloadStop(jobId: string): void {
+  activeDownloadControllers.get(jobId)?.abort();
 }
 
 function toInstalledBuildList(): InstalledBuild[] {
@@ -656,19 +697,22 @@ function sendTick(runId: string, idx: number, tick: RunItemTickInput): void {
 // Same retry-with-backoff posture as safeItemTerminal above -- this is the
 // only thing that gets a completed download registered as a Model
 // server-side, so losing it silently would leave a fully downloaded file on
-// disk the app never learns about.
-async function safeReportDownloadResult(payload: ModelDownloadCallbackInput): Promise<void> {
+// disk the app never learns about. Returns whether delivery ultimately
+// succeeded so callers can distinguish that from a silently-swallowed
+// failure -- see executeDownloadModelJob's success path, which used to
+// report the job as complete even when this returned false.
+async function safeReportDownloadResult(payload: ModelDownloadCallbackInput): Promise<boolean> {
   const key = `${payload.hf_repo}/${payload.hf_file}`;
   for (let attempt = 0; ; attempt++) {
     try {
-      await postModelDownloadResult(config.vps_url, payload, 10_000);
+      await withAuth((token) => postModelDownloadResult(config.vps_url, token, payload, 10_000));
       log.info(`download callback ok for ${key} (ok=${payload.ok}, attempt ${attempt + 1})`);
-      return;
+      return true;
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       if (attempt >= ITEM_RETRY_DELAYS_MS.length) {
         log.error(`download callback failed for ${key} after ${attempt + 1} attempts, giving up: ${message}`);
-        return;
+        return false;
       }
       const delay = ITEM_RETRY_DELAYS_MS[attempt];
       log.warn(`download callback attempt ${attempt + 1} failed for ${key}, retrying in ${delay}ms: ${message}`);
@@ -1629,72 +1673,145 @@ async function executeDeleteBuildJob(payload: DeleteBuildJobPayload): Promise<vo
   log.info(`deleted llama.cpp build ${payload.tag}`);
 }
 
-async function executeDownloadModelJob(payload: DownloadModelJobPayload): Promise<void> {
+// jobId identifies this download in activeDownloadReports (workerMain's
+// downloadJobPool sets up the initial entry before calling this, and cleans
+// it -- and the AbortController this reacts to on pause -- up afterward,
+// regardless of outcome). Reporting goes through updateDownloadReport, never
+// the serial-job updateJobReport/currentJobReport, since several of these
+// can be running at once.
+async function executeDownloadModelJob(
+  jobId: string,
+  payload: DownloadModelJobPayload,
+  signal: AbortSignal
+): Promise<void> {
   validateHfRepo(payload.hf_repo);
   validateHfFile(payload.hf_file);
   const target = resolveDownloadTarget(payload.hf_file);
+  const partPath = `${target}.part`;
   mkdirSync(dirname(target), { recursive: true });
   const progressKey = `${payload.hf_repo}/${payload.hf_file}`;
   const downloadStartedAt = Date.now();
-  updateJobReport({ phase: "downloading", bytes: 0, detail: progressKey });
-  log.info(`downloading ${progressKey} -> ${target}`);
+  updateDownloadReport(jobId, { phase: "downloading", bytes: 0, detail: progressKey });
 
   try {
-    const sourceUrl = hfResolveUrl(payload.hf_repo, payload.hf_file);
-    const upstream = await fetch(sourceUrl, {
-      headers: { "user-agent": "llamatoaster-worker" },
-      redirect: "follow",
-    });
-    if (!upstream.ok || !upstream.body) {
-      throw new Error(`download failed: ${upstream.status} ${upstream.statusText}`);
+    // A .part left over from an earlier attempt (paused, crashed, or a
+    // transient network drop) is resumed via an HTTP Range request rather
+    // than restarted from byte 0 -- see the 206 handling below. Already
+    // fully downloaded under a previous job? resolveDownloadTarget's target
+    // would exist and this job wouldn't normally have been queued again, but
+    // guard cheaply anyway rather than re-fetch a file that's already there.
+    let resumeFrom = 0;
+    if (existsSync(target)) {
+      log.info(`${progressKey} already present at ${target}, skipping re-download`);
+    } else {
+      try {
+        resumeFrom = statSync(partPath).size;
+      } catch {
+        resumeFrom = 0;
+      }
+      if (resumeFrom > 0) log.info(`resuming ${progressKey} from byte ${resumeFrom} (${partPath})`);
+      else log.info(`downloading ${progressKey} -> ${target}`);
+
+      const sourceUrl = hfResolveUrl(payload.hf_repo, payload.hf_file);
+      const headers: Record<string, string> = { "user-agent": "llamatoaster-worker" };
+      if (resumeFrom > 0) headers.range = `bytes=${resumeFrom}-`;
+      const upstream = await fetch(sourceUrl, { headers, redirect: "follow", signal });
+      if (!upstream.body || (!upstream.ok && upstream.status !== 206)) {
+        throw new Error(`download failed: ${upstream.status} ${upstream.statusText}`);
+      }
+
+      // Some CDN edges/mirrors don't honor Range and just return 200 with
+      // the full body -- appending that on top of existing bytes would
+      // corrupt the file, so treat it as a fresh download instead of
+      // trusting our own resumeFrom.
+      const resumed = upstream.status === 206;
+      if (resumeFrom > 0 && !resumed) {
+        log.warn(`${progressKey}: server ignored the Range request, restarting from byte 0`);
+        resumeFrom = 0;
+      }
+
+      const contentLength = Number(upstream.headers.get("content-length"));
+      const totalBytes = Number.isFinite(contentLength) && contentLength > 0 ? contentLength + resumeFrom : undefined;
+      if (totalBytes) updateDownloadReport(jobId, { total_bytes: totalBytes });
+      updateDownloadReport(jobId, { bytes: resumeFrom });
+
+      const tracker = new Transform({
+        transform(chunk: Buffer, _enc, cb) {
+          const cur = activeDownloadReports.get(jobId);
+          updateDownloadReport(jobId, { bytes: (cur?.bytes ?? resumeFrom) + chunk.length });
+          cb(null, chunk);
+        },
+      });
+      await pipeline(
+        Readable.fromWeb(upstream.body as any),
+        tracker,
+        createWriteStream(partPath, { flags: resumed ? "a" : "w" })
+      );
+      const elapsedMs = Date.now() - downloadStartedAt;
+      log.info(`downloaded ${progressKey} -> ${partPath} in ${elapsedMs}ms`);
+
+      updateDownloadReport(jobId, { phase: "finalizing", detail: "hashing" });
+      const { sha256, byteLength } = await hashFile(partPath);
+      renameSync(partPath, target);
+
+      updateDownloadReport(jobId, { detail: "reading GGUF metadata" });
+      const { n_layer, mtp_layers, expert_count } = await readGgufInfo(target);
+      log.info(
+        `gguf metadata for ${progressKey}: n_layer=${n_layer ?? "unknown"} mtp_layers=${mtp_layers ?? "unknown"} ` +
+          `expert_count=${expert_count ?? "unknown"}`
+      );
+
+      // Reflect the new file immediately rather than waiting for the periodic
+      // refresh -- see refreshModelDirFilesCache above.
+      refreshModelDirFilesCache();
+
+      const reported = await safeReportDownloadResult({
+        worker: config.worker_name,
+        machine_id: config.machine_id,
+        hf_repo: payload.hf_repo,
+        hf_file: payload.hf_file,
+        ok: true,
+        sha256,
+        size_bytes: byteLength,
+        n_layer,
+        mtp_layers,
+        expert_count,
+      });
+      if (!reported) {
+        // The file is on disk and hashed, but the server never learned about
+        // it -- surface this as a real job failure instead of letting
+        // workerMain report {ok: true} for a download the catalog never
+        // registered (see server/src/routes/workers.ts's registerModel call).
+        throw new Error(`downloaded ${progressKey} but the completion callback never got through`);
+      }
     }
-    const contentLength = Number(upstream.headers.get("content-length"));
-    if (Number.isFinite(contentLength) && contentLength > 0) {
-      updateJobReport({ total_bytes: contentLength });
-    }
-    const tracker = new Transform({
-      transform(chunk: Buffer, _enc, cb) {
-        updateJobReport({ bytes: (currentJobReport?.bytes ?? 0) + chunk.length });
-        cb(null, chunk);
-      },
-    });
-
-    const hasher = new HashingPassThrough();
-    await pipeline(Readable.fromWeb(upstream.body as any), tracker, hasher, createWriteStream(target));
-    const elapsedMs = Date.now() - downloadStartedAt;
-    log.info(`downloaded ${progressKey}: ${hasher.byteLength}B in ${elapsedMs}ms`);
-
-    updateJobReport({ phase: "finalizing", detail: "reading GGUF metadata" });
-    const { n_layer, mtp_layers, expert_count } = await readGgufInfo(target);
-    log.info(
-      `gguf metadata for ${progressKey}: n_layer=${n_layer ?? "unknown"} mtp_layers=${mtp_layers ?? "unknown"} ` +
-        `expert_count=${expert_count ?? "unknown"}`
-    );
-
-    // Reflect the new file immediately rather than waiting for the periodic
-    // refresh -- see refreshModelDirFilesCache above.
-    refreshModelDirFilesCache();
-
-    await safeReportDownloadResult({
-      worker: config.worker_name,
-      hf_repo: payload.hf_repo,
-      hf_file: payload.hf_file,
-      ok: true,
-      sha256: hasher.digestHex(),
-      size_bytes: hasher.byteLength,
-      n_layer,
-      mtp_layers,
-      expert_count,
-    });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    log.error(`model download failed for ${progressKey}: ${message}`);
+    if (signal.aborted) {
+      // Paused (routes/workers.ts's pause route -> requestDownloadStop) --
+      // the .part file is deliberately left in place so a fresh
+      // download_model job for the same file resumes instead of restarting.
+      // Still reported as a job failure (worker_jobs.status='failed', same
+      // posture as a user-stopped benchmark job -- see requestStop's own
+      // comment) since nothing further will happen for THIS job.
+      const keptBytes = (() => {
+        try {
+          return statSync(partPath).size;
+        } catch {
+          return 0;
+        }
+      })();
+      log.info(`model download paused for ${progressKey} (${keptBytes} bytes kept for resume)`);
+    } else {
+      log.error(`model download failed for ${progressKey}: ${message}`);
+    }
     await safeReportDownloadResult({
       worker: config.worker_name,
+      machine_id: config.machine_id,
       hf_repo: payload.hf_repo,
       hf_file: payload.hf_file,
       ok: false,
-      error: message,
+      error: signal.aborted ? "paused by user" : message,
     });
     throw err; // also mark the worker_jobs row itself failed
   }
@@ -1714,7 +1831,13 @@ async function executeDeleteModelFileJob(payload: { filename: string }): Promise
   refreshModelDirFilesCache();
 }
 
-async function executeJob(job: QueueJob): Promise<void> {
+// download_model is deliberately NOT handled here -- workerMain's
+// downloadJobPool intercepts and dispatches it before a job ever reaches
+// this function (see the loop below), so the type excludes it: a stray call
+// with one would be a real bug, not something to silently execute serially.
+type SerialQueueJob = Exclude<QueueJob, { type: "download_model" }>;
+
+async function executeJob(job: SerialQueueJob): Promise<void> {
   switch (job.type) {
     case "benchmark":
       return executeBenchmarkJob(job.payload);
@@ -1724,8 +1847,6 @@ async function executeJob(job: QueueJob): Promise<void> {
       return executeActivateBuildJob(job.payload);
     case "delete_build":
       return executeDeleteBuildJob(job.payload);
-    case "download_model":
-      return executeDownloadModelJob(job.payload);
     case "delete_model_file":
       return executeDeleteModelFileJob(job.payload);
   }
@@ -1882,8 +2003,13 @@ function startHeartbeatLoop(): void {
   setInterval(async () => {
     try {
       const state = await collectState();
-      const res = await withAuth((token) => postHeartbeat(config.vps_url, token, state, currentJobReport, 10_000));
-      for (const jobId of res.control.cancel_job_ids) requestStop(jobId);
+      const res = await withAuth((token) =>
+        postHeartbeat(config.vps_url, token, state, currentJobReport, Array.from(activeDownloadReports.values()), 10_000)
+      );
+      for (const jobId of res.control.cancel_job_ids) {
+        requestStop(jobId);
+        requestDownloadStop(jobId);
+      }
       pauseRequested = res.control.pause;
     } catch (err) {
       // Transient -- the server's lease is 6 heartbeats wide (LEASE_MS), so
@@ -1899,16 +2025,85 @@ function startHeartbeatLoop(): void {
 // return 204 on its own.
 const QUEUE_POLL_TIMEOUT_MS = 35_000;
 
+function maxConcurrentDownloads(): number {
+  const n = config.max_concurrent_downloads;
+  return Number.isInteger(n) && (n as number) > 0 ? (n as number) : 2;
+}
+
+// One promise per in-flight download, keyed by job_id -- purely a pool-size
+// gate for workerMain's loop below (Promise.race lets it wake up as soon as
+// any one slot frees, rather than polling on a timer). Distinct from
+// activeDownloadReports (progress) and activeDownloadControllers (abort) --
+// this one only tracks "is a slot occupied."
+const activeDownloadJobs = new Map<string, Promise<void>>();
+
+// Executes one download_model job to completion and reports the outcome --
+// the download equivalent of workerMain's serial try/executeJob/
+// reportJobResult block below, but scoped to this one job's own state
+// (activeDownloadReports/activeDownloadControllers) rather than the shared
+// busy/currentJobReport globals, since several of these run concurrently.
+async function runDownloadJob(job: { job_id: string; payload: DownloadModelJobPayload }): Promise<void> {
+  const controller = new AbortController();
+  activeDownloadControllers.set(job.job_id, controller);
+  activeDownloadReports.set(job.job_id, { job_id: job.job_id, phase: "downloading" });
+  log.info(`claimed job ${job.job_id} (download_model)`);
+  try {
+    await executeDownloadModelJob(job.job_id, job.payload, controller.signal);
+    await withAuth((token) => reportJobResult(config.vps_url, token, config.machine_id!, job.job_id, { ok: true }));
+    log.info(`job ${job.job_id} (download_model) completed`);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    log.error(`job ${job.job_id} (download_model) failed: ${message}`);
+    try {
+      await withAuth((token) =>
+        reportJobResult(config.vps_url, token, config.machine_id!, job.job_id, { ok: false, error: message })
+      );
+    } catch (reportErr) {
+      log.error(
+        `could not report job ${job.job_id} failure to server: ${
+          reportErr instanceof Error ? reportErr.message : String(reportErr)
+        }`
+      );
+    }
+  } finally {
+    activeDownloadReports.delete(job.job_id);
+    activeDownloadControllers.delete(job.job_id);
+  }
+}
+
 // The main loop: pull one job at a time, execute it to completion, report
-// the outcome, repeat forever. Only ever polls the queue while idle
-// (MULTIUSER_PLAN.md §1.3) -- heartbeating (busy or idle) is entirely the
-// separate loop above.
+// the outcome, repeat forever -- EXCEPT download_model jobs, which are
+// dispatched into a bounded concurrent pool (activeDownloadJobs,
+// maxConcurrentDownloads) instead of being awaited inline, so the loop can
+// go straight back to polling rather than blocking for the whole transfer.
+// Every other job type stays exactly as serial as before: the loop still
+// only polls for a NEW job once nothing else is being awaited here, so e.g.
+// a benchmark job claimed while downloads are already running won't itself
+// start until any job ahead of it in this loop finishes -- only downloads
+// get to run alongside one another. Only ever polls the queue while able to
+// act on what it might get back (MULTIUSER_PLAN.md §1.3) -- heartbeating
+// (busy or idle, and carrying every active download's own progress) is
+// entirely the separate loop above.
 async function workerMain(): Promise<void> {
   while (true) {
     try {
+      if (activeDownloadJobs.size >= maxConcurrentDownloads()) {
+        // Every download slot is full -- wait for one to free rather than
+        // claim a job (of any type) we can't act on yet, which would
+        // otherwise just sit 'claimed' un-executed until its lease expires.
+        await Promise.race(activeDownloadJobs.values());
+        continue;
+      }
+
       const state = await collectState();
       const job = await withAuth((token) => pollQueue(config.vps_url, token, state, QUEUE_POLL_TIMEOUT_MS));
       if (!job) continue;
+
+      if (job.type === "download_model") {
+        const p = runDownloadJob(job).finally(() => activeDownloadJobs.delete(job.job_id));
+        activeDownloadJobs.set(job.job_id, p);
+        continue; // not awaited -- poll again immediately, this one runs in the background
+      }
 
       busy = true;
       currentJobReport = { job_id: job.job_id, phase: jobInitialPhase(job.type) };

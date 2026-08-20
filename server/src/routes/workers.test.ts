@@ -265,3 +265,109 @@ describe("DELETE /api/workers/:id (permanently remove a machine)", () => {
     expect(run.worker_name).toBe("remove-with-history");
   });
 });
+
+describe("PATCH /api/workers/:id (rename)", () => {
+  it("the owner can rename their own machine", async () => {
+    const id = await heartbeatWorker("rename-owner-ok");
+    const { userId, token } = await sessionFor("rename-owner");
+    claimWorker(id, userId);
+
+    const res = await fetch(`${baseUrl}/api/workers/${id}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json", ...authed(token) },
+      body: JSON.stringify({ display_name: "  My GPU Box  " }),
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { worker: { displayName: string } };
+    expect(body.worker.displayName).toBe("My GPU Box"); // trimmed
+    expect(repo.workerRepo.getWorker(id)?.displayName).toBe("My GPU Box");
+  });
+
+  it("rejects an empty display_name", async () => {
+    const id = await heartbeatWorker("rename-empty");
+    const res = await fetch(`${baseUrl}/api/workers/${id}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ display_name: "   " }),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("rejects a display_name over 100 characters", async () => {
+    const id = await heartbeatWorker("rename-too-long");
+    const res = await fetch(`${baseUrl}/api/workers/${id}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ display_name: "x".repeat(101) }),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("a different authenticated user cannot rename someone else's machine", async () => {
+    const id = await heartbeatWorker("rename-intruder");
+    const { userId } = await sessionFor("rename-real-owner");
+    claimWorker(id, userId);
+    const { token: intruderToken } = await sessionFor("rename-intruder-user");
+
+    const res = await fetch(`${baseUrl}/api/workers/${id}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json", ...authed(intruderToken) },
+      body: JSON.stringify({ display_name: "Hijacked" }),
+    });
+    expect(res.status).toBe(403);
+  });
+
+  it("404s an unknown machine id", async () => {
+    const res = await fetch(`${baseUrl}/api/workers/not-a-real-id`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ display_name: "Anything" }),
+    });
+    expect(res.status).toBe(404);
+  });
+
+  it("renaming an offline/busy machine is fine -- no requireOnlineWorker gate", async () => {
+    const id = await heartbeatWorker("rename-busy-ok");
+    getDb().prepare(`UPDATE workers SET active_job_id = 'fake-job-id' WHERE id = ?`).run(id);
+
+    const res = await fetch(`${baseUrl}/api/workers/${id}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ display_name: "Still renameable" }),
+    });
+    expect(res.status).toBe(200);
+  });
+});
+
+// Regression coverage for the bug where every download's completion
+// callback 401'd with "no session" once AUTH_ENABLED was on: this route is a
+// worker->server call (like heartbeat/queue-poll), not a browser request, so
+// it must authenticate via authenticateWorker() -- unconditionally, same as
+// every other worker-to-server route, not gated on AUTH_ENABLED.
+describe("POST /api/models/download-callback (worker credential, not a user session)", () => {
+  it("rejects a request with no worker credential at all", async () => {
+    const res = await fetch(`${baseUrl}/api/models/download-callback`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ worker: "w", hf_repo: "org/repo", hf_file: "model.gguf", ok: false, error: "boom" }),
+    });
+    expect(res.status).toBe(401);
+  });
+
+  it("accepts a valid Stage 3 worker session token", async () => {
+    const id = await heartbeatWorker("download-callback-worker");
+    const { userId } = await sessionFor("download-callback-owner");
+    const { token } = repo.sessionRepo.create(userId, { isWorker: true, workerId: id });
+
+    const res = await fetch(`${baseUrl}/api/models/download-callback`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...authed(token) },
+      // ok: false avoids hitting the real getHfGgufMeta/registerModel path,
+      // which would need network access -- the point of this test is the
+      // auth gate, already covered end-to-end for the success path by the
+      // real worker in Phase 1's manual verification.
+      body: JSON.stringify({ worker: "w", hf_repo: "org/repo", hf_file: "model.gguf", ok: false, error: "boom" }),
+    });
+    expect(res.status).toBe(200);
+  });
+});

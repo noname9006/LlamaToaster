@@ -27,19 +27,77 @@ export function parseQuant(filename: string): string | null {
   return m ? m[1].toUpperCase() : null;
 }
 
-export async function searchHfGgufModels(query: string, timeoutMs: number): Promise<HfSearchResult[]> {
+// HF's own accepted values for its search API's `sort` param -- confirmed
+// live against https://huggingface.co/api/models (no vendored llama.cpp/HF
+// source or docs in this repo to check against instead). Deliberately a
+// subset of what the client's old sort dropdown offered: "Name (A-Z)" and
+// "Parameters" have no server-side equivalent, and would be misleading as a
+// client-only sort now that results are real paginated pages (a client-side
+// re-sort only ever sees the current page's 15 items, not the true global
+// order).
+export type HfSortField = "downloads" | "likes" | "createdAt" | "lastModified";
+
+export interface HfSearchOptions {
+  sort?: HfSortField;
+  // -1 = descending (HF's own convention), 1 = ascending. Omitted entirely
+  // (along with sort) for the default "Relevance" ordering.
+  direction?: -1 | 1;
+  // Opaque cursor from a previous page's nextCursor -- HF's search API
+  // paginates via a `Link: <...&cursor=...>; rel="next"` response header
+  // (cursor-based, forward-only), not an offset/page-number param. Confirmed
+  // live: the API returns no total-match count in any form either, hence no
+  // "N models match" UI on the client side.
+  cursor?: string;
+  limit?: number;
+}
+
+export interface HfSearchPage {
+  items: HfSearchResult[];
+  nextCursor: string | null;
+}
+
+const HF_DEFAULT_PAGE_SIZE = 15;
+
+// Extracts the cursor query param from a `Link: <url>; rel="next"` response
+// header -- returns null when absent (last page) or unparseable. Exported
+// for its own unit test (see hf.test.ts) -- this is the one bit of new
+// pagination logic worth testing in isolation, since the rest of
+// searchHfGgufModels just builds a URL and makes a real network call.
+export function parseNextCursor(linkHeader: string | null): string | null {
+  if (!linkHeader) return null;
+  const match = linkHeader.match(/<([^>]+)>\s*;\s*rel="next"/);
+  if (!match) return null;
+  try {
+    return new URL(match[1]).searchParams.get("cursor");
+  } catch {
+    return null;
+  }
+}
+
+// query may be empty -- an empty query + sort=downloads is exactly the
+// Models page's default "top 15" listing shown before the user searches.
+export async function searchHfGgufModels(
+  query: string,
+  timeoutMs: number,
+  options: HfSearchOptions = {}
+): Promise<HfSearchPage> {
   const q = query.trim();
-  if (!q) return [];
-  const url = `https://huggingface.co/api/models?search=${encodeURIComponent(q)}&filter=gguf&limit=20`;
+  const params = new URLSearchParams({ filter: "gguf", limit: String(options.limit ?? HF_DEFAULT_PAGE_SIZE) });
+  if (q) params.set("search", q);
+  if (options.sort) params.set("sort", options.sort);
+  if (options.direction) params.set("direction", String(options.direction));
+  if (options.cursor) params.set("cursor", options.cursor);
+  const url = `https://huggingface.co/api/models?${params.toString()}`;
   const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
   if (!res.ok) throw new Error(`HF search failed: ${res.status}`);
   const data = (await res.json()) as { id: string; downloads?: number; likes?: number; createdAt?: string }[];
-  return data.map((m) => ({
+  const items = data.map((m) => ({
     id: m.id,
     downloads: m.downloads ?? 0,
     likes: m.likes ?? 0,
     created_at: typeof m.createdAt === "string" ? m.createdAt : null,
   }));
+  return { items, nextCursor: parseNextCursor(res.headers.get("link")) };
 }
 
 export async function listHfGgufFiles(repoId: string, timeoutMs: number): Promise<HfFileEntry[]> {

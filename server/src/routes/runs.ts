@@ -455,7 +455,7 @@ export async function runsRoutes(app: FastifyInstance): Promise<void> {
       if (expandSweep(body.sweep).length === 0) {
         return reply.code(400).send({
           error:
-            "sweep has no valid combinations -- flash_attn:\"off\" can't be paired with a quantized cache_type_k/cache_type_v (llama.cpp requires flash attention for a quantized KV cache); add flash_attn:\"on\" or use cache_type_k/v:\"f16\"",
+            "sweep has no valid combinations -- flash_attn:\"off\" can't be paired with a quantized cache_type_k/cache_type_v (llama.cpp requires flash attention for a quantized KV cache); add flash_attn:\"on\" or use cache_type_k/v:\"f32\"/\"f16\"/\"bf16\"",
         });
       }
       if (body.main_gpu !== undefined && (!Number.isInteger(body.main_gpu) || body.main_gpu < 0)) {

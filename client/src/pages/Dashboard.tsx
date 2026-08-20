@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { api } from "../api/client";
 import { StatCard } from "../components/StatCard";
@@ -53,19 +53,30 @@ export function Dashboard() {
   const [workers, setWorkers] = useState<Worker[]>([]);
   const [userCount, setUserCount] = useState<number | null>(null);
   const [loaded, setLoaded] = useState(false);
+  const timerRef = useRef<number | undefined>(undefined);
 
+  // Self-rescheduling poll (same shape as Workers page's useWorkerStatuses)
+  // rather than a one-shot fetch -- a worker's build install/activate here
+  // used to look permanently stuck at its pre-job state since nothing ever
+  // refetched after the initial mount.
   useEffect(() => {
     let cancelled = false;
-    (async () => {
-      const [r, w, s] = await Promise.all([api.listRuns(), api.listWorkers(), api.getStats()]);
-      if (cancelled) return;
-      setRuns(r);
-      setWorkers(w);
-      setUserCount(s.users);
-      setLoaded(true);
-    })();
+    async function poll() {
+      try {
+        const [r, w, s] = await Promise.all([api.listRuns(), api.listWorkers(), api.getStats()]);
+        if (cancelled) return;
+        setRuns(r);
+        setWorkers(w);
+        setUserCount(s.users);
+        setLoaded(true);
+      } finally {
+        if (!cancelled) timerRef.current = window.setTimeout(poll, 5000);
+      }
+    }
+    void poll();
     return () => {
       cancelled = true;
+      if (timerRef.current) window.clearTimeout(timerRef.current);
     };
   }, []);
 

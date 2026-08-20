@@ -814,6 +814,15 @@ export interface HfFileEntry {
 // must be safe to apply twice.
 export interface ModelDownloadCallbackInput {
   worker: string;
+  // Needed for worker-auth.ts's Stage 1 (WORKER_SHARED_TOKEN) fallback path,
+  // which resolves worker identity from the body's machine_id -- every other
+  // worker->server call already includes this (WorkerStatePush.machine_id);
+  // this route was the one place it got missed, which silently broke the
+  // download callback for any worker still on shared-token auth (a Stage 3
+  // session-token worker never hits this fallback at all, since
+  // authenticateWorker tries the session first). Optional only so an
+  // old-not-yet-updated worker binary doesn't fail request validation.
+  machine_id?: string;
   hf_repo: string;
   hf_file: string;
   ok: boolean;
@@ -860,6 +869,13 @@ export interface Worker {
   // point at, just activeJobProgress's phase/bytes.
   activeRunId?: string;
   activeJobProgress?: ActiveJobReport;
+  // Concurrently-running download_model jobs (worker/src/index.ts's
+  // downloadJobPool) -- separate from activeJobProgress above, which is
+  // reserved for the ONE serial (benchmark/build) job slot. A worker can
+  // have several of these at once (up to its configured
+  // max_concurrent_downloads) while activeJobProgress is undefined (status
+  // stays "idle" -- see WorkerStatePush.status's own doc comment).
+  activeDownloads?: ActiveJobReport[];
   createdAt: number;
   updatedAt: number;
 }

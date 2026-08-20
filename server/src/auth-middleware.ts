@@ -44,7 +44,15 @@ export const PUBLIC_PATHS = new Set([
 // check, because both URL patterns are ALSO used by a GET/browser-session
 // caller (log download, run detail polling) -- only the POST leg of each is
 // worker-to-server.
-const WORKER_AUTHENTICATED_ROUTES = new Set(["POST /api/runs/:id/log", "POST /api/runs/:id/items/:idx"]);
+const WORKER_AUTHENTICATED_ROUTES = new Set([
+  "POST /api/runs/:id/log",
+  "POST /api/runs/:id/items/:idx",
+  // Worker -> server download-completion callback (routes/workers.ts) -- was
+  // missed when auth was bolted on, so every download's callback 401'd with
+  // "no session" under AUTH_ENABLED (the download itself succeeded, but the
+  // model never got registered since the callback never got through).
+  "POST /api/models/download-callback",
+]);
 
 // Cast target for req.user/req.session once authMiddleware (or a route that
 // calls resolveAuthUser directly, e.g. GET /api/auth/status) has populated

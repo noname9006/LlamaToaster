@@ -126,6 +126,15 @@ export const api = {
   deleteWorker: (workerId: string): Promise<{ ok: true }> =>
     request(`/api/workers/${encodeURIComponent(workerId)}`, { method: "DELETE" }),
 
+  // Cosmetic rename, stored server-side (server/src/db/repo.ts's
+  // renameWorker) -- no worker-side effect at all.
+  renameWorker: (workerId: string, displayName: string): Promise<{ worker: Worker }> =>
+    request(`/api/workers/${encodeURIComponent(workerId)}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ display_name: displayName }),
+    }),
+
   // Which llama.cpp releases a specific machine could install, and whether
   // a newer one than what it has exists -- the one piece of per-worker
   // "live" info that's a GitHub lookup, not something the worker itself
@@ -156,8 +165,25 @@ export const api = {
       method: "DELETE",
     }),
 
-  searchHf: (q: string): Promise<HfRepoSearchResult[]> =>
-    request<{ results: HfRepoSearchResult[] }>(`/api/hf/search?q=${encodeURIComponent(q)}`).then((d) => d.results),
+  // sort/direction map to HF's own search API params (server/src/hf.ts);
+  // cursor comes from a previous call's nextCursor -- HF paginates via a
+  // forward-only cursor, not an offset/page number, so there's no way to
+  // jump directly to an arbitrary page.
+  searchHf: (params: {
+    q?: string;
+    sort?: "downloads" | "likes" | "createdAt" | "lastModified";
+    direction?: -1 | 1;
+    cursor?: string;
+  }): Promise<{ results: HfRepoSearchResult[]; nextCursor: string | null }> => {
+    const qs = new URLSearchParams();
+    if (params.q) qs.set("q", params.q);
+    if (params.sort) qs.set("sort", params.sort);
+    if (params.direction) qs.set("direction", String(params.direction));
+    if (params.cursor) qs.set("cursor", params.cursor);
+    return request<{ results: HfRepoSearchResult[]; next_cursor: string | null }>(
+      `/api/hf/search?${qs.toString()}`
+    ).then((d) => ({ results: d.results, nextCursor: d.next_cursor }));
+  },
 
   listHfFiles: (repo: string): Promise<HfFileEntry[]> =>
     request<{ files: HfFileEntry[] }>(
@@ -168,11 +194,20 @@ export const api = {
   // is now read off the matching Worker's activeJobProgress (see
   // listWorkers above), polled the same way the rest of that machine's live
   // state already is, instead of a separate per-file progress endpoint.
-  downloadHfFile: (workerId: string, hfRepo: string, hfFile: string): Promise<{ ok: true; queued: true }> =>
-    request<{ ok: true; queued: true }>(
+  downloadHfFile: (workerId: string, hfRepo: string, hfFile: string): Promise<{ ok: true; queued: true; job_id: string }> =>
+    request<{ ok: true; queued: true; job_id: string }>(
       `/api/workers/${encodeURIComponent(workerId)}/models/download`,
       postJson({ hf_repo: hfRepo, hf_file: hfFile })
     ),
+
+  // Pauses an in-flight (or still-queued) download -- the worker leaves its
+  // .part file in place, so re-calling downloadHfFile for the same
+  // repo/file later resumes instead of restarting (see server/src/routes/
+  // workers.ts's pause route and worker/src/index.ts's executeDownloadModelJob).
+  pauseDownload: (workerId: string, jobId: string): Promise<{ ok: true }> =>
+    request(`/api/workers/${encodeURIComponent(workerId)}/downloads/${encodeURIComponent(jobId)}/pause`, {
+      method: "POST",
+    }),
 
   listRuns: (): Promise<Run[]> => request<{ runs: Run[] }>("/api/runs").then((d) => d.runs),
 

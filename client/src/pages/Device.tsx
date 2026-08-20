@@ -1,7 +1,14 @@
 import { useEffect, useMemo, useState } from "react";
 import { api } from "../api/client";
 import type { DeviceStatusResponse } from "../types";
-import { CopyCommandButton, SETUP_OS_LABELS, buildSetupScenarios, detectOS, type SetupOS } from "../components/WorkerCard";
+import {
+  CopyCommandButton,
+  PowerShellNotice,
+  SETUP_OS_LABELS,
+  buildSetupScenarios,
+  detectOS,
+  type SetupOS,
+} from "../components/WorkerCard";
 import { IconServer, IconInfo, IconCheck } from "../components/icons";
 import { formatRelativeTime } from "../utils";
 
@@ -160,7 +167,7 @@ export function Device() {
         enter that code below once it appears. A plain restart doesn't need this page at all.
       </p>
 
-      <div className="mt-6 flex gap-1.5">
+      <div className="mt-6 flex items-center gap-1.5">
         {SETUP_OS_LABELS.map(({ key, label, badgeClass }) => (
           <button
             key={key}
@@ -173,6 +180,7 @@ export function Device() {
             {label}
           </button>
         ))}
+        {os === "windows" && <PowerShellNotice />}
       </div>
       {/* First-run command has this page's own origin baked in as -VpsUrl/
           --vps-url (see WorkerCard.tsx's buildSetupScenarios) -- copy-paste
