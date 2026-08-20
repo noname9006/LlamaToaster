@@ -147,6 +147,17 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
     return reply.code(202).send({ ok: true, queued: true });
   });
 
+  // Queued like any other command (not pushed via HeartbeatResponse.control)
+  // so it takes its place behind whatever's already running rather than
+  // killing an in-progress benchmark -- see shared/types.ts's shutdown_worker.
+  app.post<{ Params: { id: string } }>("/api/workers/:id/shutdown", async (request, reply) => {
+    const worker = requireOnlineWorker(resolveAuthUser(request)?.user.id, request.params.id);
+    request.log.info({ worker: worker.id }, "shutdown queued");
+    repo.queueRepo.enqueueJob(worker.id, { type: "shutdown_worker", payload: {} });
+    queueEvents.emit(worker.id);
+    return reply.code(202).send({ ok: true, queued: true });
+  });
+
   // Permanently forgets this machine -- distinct from a session revoke
   // (Settings' "Active sessions"), which only kicks the machine off and
   // leaves the workers row (and its Workers-page card) in place forever

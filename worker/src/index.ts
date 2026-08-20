@@ -1849,6 +1849,16 @@ async function executeDownloadModelJob(
   }
 }
 
+// Resolves immediately (so the normal reportJobResult call right after
+// executeJob in workerMain still gets to fire and tell the server this job
+// succeeded) but schedules the actual exit a beat later rather than doing it
+// inline -- process.exit() here would race that HTTP report and could kill
+// the process before the response even goes out.
+async function executeShutdownWorkerJob(): Promise<void> {
+  log.info("shutdown requested from server -- exiting shortly");
+  setTimeout(() => process.exit(0), 500);
+}
+
 async function executeDeleteModelFileJob(payload: { filename: string }): Promise<void> {
   validateHfFile(payload.filename);
   const target = resolveDownloadTarget(payload.filename);
@@ -1881,6 +1891,8 @@ async function executeJob(job: SerialQueueJob): Promise<void> {
       return executeDeleteBuildJob(job.payload);
     case "delete_model_file":
       return executeDeleteModelFileJob(job.payload);
+    case "shutdown_worker":
+      return executeShutdownWorkerJob();
   }
 }
 
