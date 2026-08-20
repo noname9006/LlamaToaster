@@ -1771,6 +1771,7 @@ async function enrolDevice(): Promise<void> {
     hostname: osHostname(),
     platform: detectedHardware.platform,
     arch: detectedHardware.arch,
+    hardware: detectedHardware,
   });
   log.info(`[worker ${config.worker_name}] to connect this machine, visit ${config.vps_url}${start.verification_uri}`);
   log.info(`[worker ${config.worker_name}] code: ${start.user_code}  (expires in ${Math.round(start.expires_in / 60)} minutes)`);
