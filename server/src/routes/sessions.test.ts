@@ -226,6 +226,41 @@ describe("POST /api/auth/share-benchmarks", () => {
     });
     expect(res.status).toBe(400);
   });
+
+  it("403s turning it ON while the operator has communitySharingAllowed off (the default) -- turning it OFF is always allowed", async () => {
+    expect(repo.appSettingsRepo.get().communitySharingAllowed).toBe(false); // documented default
+    const user = repo.userRepo.upsertByIdentity("github", { providerUserId: "share-route-3", login: "share-route-user-3", avatarUrl: null });
+    const { token } = repo.sessionRepo.create(user.id, { label: "share-disallowed" });
+
+    const onRes = await fetch(`${baseUrl}/api/auth/share-benchmarks`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...authed(token) },
+      body: JSON.stringify({ enabled: true }),
+    });
+    expect(onRes.status).toBe(403);
+    expect(repo.userRepo.getUser(user.id)!.shareBenchmarks).toBe(true); // default-on, unchanged by the rejected call
+
+    const offRes = await fetch(`${baseUrl}/api/auth/share-benchmarks`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...authed(token) },
+      body: JSON.stringify({ enabled: false }),
+    });
+    expect(offRes.status).toBe(200);
+  });
+
+  it("allows turning it ON once the operator sets communitySharingAllowed", async () => {
+    repo.appSettingsRepo.setCommunitySharingAllowed(true);
+    const user = repo.userRepo.upsertByIdentity("github", { providerUserId: "share-route-4", login: "share-route-user-4", avatarUrl: null });
+    const { token } = repo.sessionRepo.create(user.id, { label: "share-allowed" });
+
+    const res = await fetch(`${baseUrl}/api/auth/share-benchmarks`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...authed(token) },
+      body: JSON.stringify({ enabled: true }),
+    });
+    expect(res.status).toBe(200);
+    repo.appSettingsRepo.setCommunitySharingAllowed(false); // restore the default for later tests
+  });
 });
 
 // Security checklist's own "Account deletion ships in v1" item.
@@ -274,5 +309,21 @@ describe("DELETE /api/auth/account", () => {
 
     const afterRes = await fetch(`${baseUrl}/api/sessions`, { headers: authed(token) });
     expect(afterRes.status).toBe(401); // the session this token names no longer exists
+  });
+
+  it("403s the whole request (before even checking confirm) when the operator has disabled account deletion", async () => {
+    repo.appSettingsRepo.setAccountDeletionAllowed(false);
+    const user = repo.userRepo.upsertByIdentity("github", { providerUserId: "delete-route-disabled", login: "disabled", avatarUrl: null });
+    const { token } = repo.sessionRepo.create(user.id, { label: "delete-disabled" });
+
+    const res = await fetch(`${baseUrl}/api/auth/account`, {
+      method: "DELETE",
+      headers: { "content-type": "application/json", ...authed(token) },
+      body: JSON.stringify({ confirm: true }),
+    });
+    expect(res.status).toBe(403);
+    expect(repo.userRepo.getUser(user.id)).toBeDefined(); // untouched
+
+    repo.appSettingsRepo.setAccountDeletionAllowed(true); // restore the default for later tests
   });
 });

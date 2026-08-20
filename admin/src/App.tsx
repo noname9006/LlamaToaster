@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { api, ApiError } from "./api";
-import type { AdminStats, AdminRunSummary } from "./types";
+import type { AdminStats, AdminRunSummary, AppSettings } from "./types";
 
 type Phase = "loading" | "unauthorized" | "ready" | "error";
 
@@ -10,6 +10,30 @@ function StatCard({ label, value }: { label: string; value: string | number }) {
       <div className="text-3xl font-bold text-accent">{value}</div>
       <div className="mt-1 text-sm text-muted">{label}</div>
     </div>
+  );
+}
+
+// Same visual pattern as the main app's own Settings.tsx toggle -- kept as a
+// separate copy rather than a shared component since admin/ and client/ are
+// two independently-built SPAs with no shared component module between them.
+function Toggle({ checked, onChange, disabled }: { checked: boolean; onChange: () => void; disabled?: boolean }) {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={checked}
+      onClick={onChange}
+      disabled={disabled}
+      className={`relative h-6 w-11 flex-none rounded-full transition-colors disabled:opacity-50 ${
+        checked ? "bg-accent" : "bg-white/10"
+      }`}
+    >
+      <span
+        className={`absolute left-0.5 top-0.5 h-5 w-5 rounded-full bg-white transition-transform ${
+          checked ? "translate-x-[22px]" : "translate-x-0"
+        }`}
+      />
+    </button>
   );
 }
 
@@ -53,6 +77,8 @@ export default function App() {
   const [errorMessage, setErrorMessage] = useState("");
   const [stats, setStats] = useState<AdminStats | null>(null);
   const [runs, setRuns] = useState<AdminRunSummary[]>([]);
+  const [settings, setSettings] = useState<AppSettings | null>(null);
+  const [settingsError, setSettingsError] = useState<string | null>(null);
 
   const [userFilter, setUserFilter] = useState("");
   const [workerFilter, setWorkerFilter] = useState("");
@@ -60,10 +86,11 @@ export default function App() {
   const [statusFilter, setStatusFilter] = useState("");
 
   useEffect(() => {
-    Promise.all([api.getStats(), api.listRuns()])
-      .then(([s, r]) => {
+    Promise.all([api.getStats(), api.listRuns(), api.getSettings()])
+      .then(([s, r, settingsResult]) => {
         setStats(s);
         setRuns(r.runs);
+        setSettings(settingsResult);
         setPhase("ready");
       })
       .catch((err) => {
@@ -110,6 +137,22 @@ export default function App() {
     [runs, userFilter, workerFilter, backendFilter, statusFilter]
   );
 
+  // Optimistic toggle, reverted on failure -- same pattern as the main app's
+  // own Settings.tsx handleToggleShareBenchmarks.
+  async function handleToggleSetting(key: keyof AppSettings) {
+    if (settings === null) return;
+    const next = { ...settings, [key]: !settings[key] };
+    setSettings(next);
+    setSettingsError(null);
+    try {
+      const result = await api.updateSettings({ [key]: next[key] });
+      setSettings(result);
+    } catch (err) {
+      setSettings(settings);
+      setSettingsError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
   if (phase === "loading") {
     return <div className="flex min-h-screen items-center justify-center text-sm text-muted">Loading…</div>;
   }
@@ -147,9 +190,51 @@ export default function App() {
       <section className="mt-6 grid grid-cols-2 gap-4 md:grid-cols-5">
         <StatCard label="Users" value={stats!.users} />
         <StatCard label="Machines" value={stats!.machines} />
-        <StatCard label="Runs" value={stats!.runs} />
-        <StatCard label="Tests" value={stats!.tests} />
-        <StatCard label="Models" value={stats!.models} />
+        <StatCard label="Models tested" value={stats!.models} />
+        <StatCard label="Tests performed" value={stats!.tests} />
+        <StatCard label="Total runs" value={stats!.runs} />
+      </section>
+
+      <section className="mt-8">
+        <h2 className="text-lg font-semibold text-fg">Platform settings</h2>
+        <p className="mt-1 text-sm text-muted">
+          Feature gates for every user on this deployment (shared/types.ts's AppSettings).
+        </p>
+        {settingsError && (
+          <p className="mt-2 rounded-lg border border-danger/30 bg-danger-bg px-3 py-2 text-sm text-danger">
+            {settingsError}
+          </p>
+        )}
+        <div className="mt-3 flex flex-col gap-2">
+          <div className="flex items-center justify-between rounded-lg border border-border px-3 py-2.5">
+            <div>
+              <div className="text-sm font-medium text-fg">Allow community benchmark sharing</div>
+              <div className="text-xs text-muted">
+                When off, every user's "Contribute to the community benchmark database" toggle in Settings
+                stays greyed out, and the AI assistant's community tools refuse to run.
+              </div>
+            </div>
+            <Toggle
+              checked={settings?.communitySharingAllowed ?? false}
+              onChange={() => void handleToggleSetting("communitySharingAllowed")}
+              disabled={settings === null}
+            />
+          </div>
+          <div className="flex items-center justify-between rounded-lg border border-border px-3 py-2.5">
+            <div>
+              <div className="text-sm font-medium text-fg">Allow self-service account deletion</div>
+              <div className="text-xs text-muted">
+                When off, the Danger zone section (and "Delete my account") disappears from every user's
+                Settings page entirely, and the delete endpoint refuses server-side too.
+              </div>
+            </div>
+            <Toggle
+              checked={settings?.accountDeletionAllowed ?? false}
+              onChange={() => void handleToggleSetting("accountDeletionAllowed")}
+              disabled={settings === null}
+            />
+          </div>
+        </div>
       </section>
 
       <section className="mt-8">

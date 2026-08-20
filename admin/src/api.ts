@@ -1,4 +1,4 @@
-import type { AdminStats, AdminRunSummary, AdminRunFilters, AdminUserSummary } from "./types";
+import type { AdminStats, AdminRunSummary, AdminRunFilters, AdminUserSummary, AppSettings } from "./types";
 
 export class ApiError extends Error {
   status: number;
@@ -17,10 +17,10 @@ function extractErrorMessage(data: unknown, status: number): string {
   return `request failed: ${status}`;
 }
 
-async function request<T>(path: string): Promise<T> {
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
   let res: Response;
   try {
-    res = await fetch(path);
+    res = await fetch(path, init);
   } catch (err) {
     throw new ApiError(err instanceof Error ? err.message : String(err), 0);
   }
@@ -56,4 +56,13 @@ export const api = {
   listUsers: (): Promise<{ users: AdminUserSummary[] }> => request("/api/admin/users"),
 
   exportUrl: (format: "json" | "csv" | "md"): string => `/api/admin/results/export?format=${format}`,
+
+  getSettings: (): Promise<AppSettings> => request("/api/admin/settings"),
+
+  updateSettings: (patch: Partial<AppSettings>): Promise<AppSettings> =>
+    request("/api/admin/settings", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(patch),
+    }),
 };

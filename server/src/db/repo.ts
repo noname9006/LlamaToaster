@@ -31,6 +31,7 @@ import type {
   CommunityFacets,
   PossibleDuplicateWorker,
   HardwareInfo,
+  AppSettings,
 } from "../../../shared/types.js";
 import type { SweepItem } from "../../../shared/sweep.js";
 
@@ -2270,13 +2271,14 @@ export const repo = {
   },
 
   // Multi-user Stage 5 (MULTIUSER_PLAN.md §5.4) -- the AI assistant's one
-  // cross-tenant read (§5.3). k-anonymity is enforced HERE, in SQL, not by a
-  // column allowlist: filtering listAggregates down to one model/backend/
-  // platform/gpu combo used to single out one machine (and its owner) even
-  // with no username column in the result -- that's textbook singling-out,
-  // not anonymity. The fix is HAVING COUNT(DISTINCT user_id) >= 5 on every
-  // query here, so a cell describing fewer than five people is never
-  // returned at all, regardless of how narrow the caller's filter is.
+  // cross-tenant read (§5.3). Consent is still enforced HERE, in SQL
+  // (u.share_benchmarks = 1 / the consentWhere clause below) -- only opted-in
+  // users' rows are ever included, and the caller's own contribution is
+  // always excluded from their own results. The original HAVING
+  // COUNT(DISTINCT user_id) >= 5 k-anonymity floor was deliberately dropped
+  // (operator decision: collecting five people on the exact same model/
+  // backend/GPU combo was unrealistic and made the feature useless in
+  // practice) -- a group may now be shown with as few as one contributor.
   communityRepo: {
     // Matches the plan's own §5.4 SQL with one addition: ri.test_type is
     // added to the SELECT/GROUP BY on top of the plan's literal query. pp and
@@ -2311,7 +2313,6 @@ export const repo = {
              AND (? IS NULL OR json_extract(w.hardware_json, '$.platform') = ?)
              AND (? IS NULL OR json_extract(w.hardware_json, '$.gpu[0].model') = ?)
            GROUP BY r.model_id, r.llama_cpp_backend, ri.test_type, platform, gpu_model
-           HAVING COUNT(DISTINCT r.user_id) >= 5
            ORDER BY avg_tps DESC`
         )
         .all(
@@ -2352,12 +2353,12 @@ export const repo = {
       }));
     },
 
-    // §5.4's own closing note: "listFacets gets the same k-threshold, or it
-    // leaks the existence of a single rare GPU." Each dimension is counted on
-    // its own here (not listAggregates' full group key) so a value appears
-    // the moment five distinct people share it -- regardless of which
-    // model/backend each of them happened to run it with -- while a value
-    // only four people have anywhere stays invisible.
+    // Each dimension is counted on its own here (not listAggregates' full
+    // group key), so a value appears the moment anyone opted-in has shared
+    // it -- regardless of which model/backend they happened to run it with.
+    // No minimum contributor count (see communityRepo's own doc comment
+    // above) -- consent (u.share_benchmarks = 1) and self-exclusion are the
+    // only gates.
     listFacets(callerId: string): CommunityFacets {
       const db = getDb();
       const consentWhere = `r.user_id IS NOT NULL AND r.user_id <> ? AND u.share_benchmarks = 1`;
@@ -2367,8 +2368,7 @@ export const repo = {
           `SELECT r.model_id AS model_id, m.filename AS filename, COUNT(DISTINCT r.user_id) AS contributor_count
            FROM runs r JOIN users u ON u.id = r.user_id LEFT JOIN models m ON m.id = r.model_id
            WHERE ${consentWhere}
-           GROUP BY r.model_id
-           HAVING COUNT(DISTINCT r.user_id) >= 5`
+           GROUP BY r.model_id`
         )
         .all(callerId) as { model_id: string; filename: string | null; contributor_count: number }[];
 
@@ -2377,8 +2377,7 @@ export const repo = {
           `SELECT r.llama_cpp_backend AS value, COUNT(DISTINCT r.user_id) AS contributor_count
            FROM runs r JOIN users u ON u.id = r.user_id
            WHERE ${consentWhere}
-           GROUP BY r.llama_cpp_backend
-           HAVING COUNT(DISTINCT r.user_id) >= 5`
+           GROUP BY r.llama_cpp_backend`
         )
         .all(callerId) as { value: string; contributor_count: number }[];
 
@@ -2387,8 +2386,7 @@ export const repo = {
           `SELECT json_extract(w.hardware_json, '$.platform') AS value, COUNT(DISTINCT r.user_id) AS contributor_count
            FROM runs r JOIN users u ON u.id = r.user_id LEFT JOIN workers w ON w.id = r.worker_id
            WHERE ${consentWhere} AND json_extract(w.hardware_json, '$.platform') IS NOT NULL
-           GROUP BY value
-           HAVING COUNT(DISTINCT r.user_id) >= 5`
+           GROUP BY value`
         )
         .all(callerId) as { value: string; contributor_count: number }[];
 
@@ -2397,8 +2395,7 @@ export const repo = {
           `SELECT json_extract(w.hardware_json, '$.gpu[0].model') AS value, COUNT(DISTINCT r.user_id) AS contributor_count
            FROM runs r JOIN users u ON u.id = r.user_id LEFT JOIN workers w ON w.id = r.worker_id
            WHERE ${consentWhere} AND json_extract(w.hardware_json, '$.gpu[0].model') IS NOT NULL
-           GROUP BY value
-           HAVING COUNT(DISTINCT r.user_id) >= 5`
+           GROUP BY value`
         )
         .all(callerId) as { value: string; contributor_count: number }[];
 
@@ -2408,6 +2405,53 @@ export const repo = {
         platforms: platforms.map((p) => ({ value: p.value, contributorCount: p.contributor_count })),
         gpuModels: gpuModels.map((g) => ({ value: g.value, contributorCount: g.contributor_count })),
       };
+    },
+  },
+
+  // Operator-controlled feature gates -- see shared/types.ts's AppSettings
+  // doc comment for what each flag does. Backed by the `meta` key-value
+  // table (schema.sql) rather than a dedicated table: there are only ever
+  // these two flags, and `meta` already exists for exactly this kind of
+  // single-row/small-key-count setting.
+  appSettingsRepo: {
+    get(): AppSettings {
+      const db = getDb();
+      const read = (key: string): string | undefined =>
+        (db.prepare(`SELECT value FROM meta WHERE key = ?`).get(key) as { value: string } | undefined)?.value;
+      return {
+        communitySharingAllowed: read("community_sharing_allowed") === "1",
+        accountDeletionAllowed: read("account_deletion_allowed") !== "0",
+      };
+    },
+
+    setCommunitySharingAllowed(allowed: boolean): AppSettings {
+      getDb()
+        .prepare(
+          `INSERT INTO meta (key, value) VALUES ('community_sharing_allowed', ?)
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value`
+        )
+        .run(allowed ? "1" : "0");
+      return repo.appSettingsRepo.get();
+    },
+
+    setAccountDeletionAllowed(allowed: boolean): AppSettings {
+      getDb()
+        .prepare(
+          `INSERT INTO meta (key, value) VALUES ('account_deletion_allowed', ?)
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value`
+        )
+        .run(allowed ? "1" : "0");
+      return repo.appSettingsRepo.get();
+    },
+  },
+
+  // Total registered accounts -- the one intentionally cross-tenant number
+  // shown on the (otherwise per-account-scoped) main Dashboard, alongside
+  // the caller's own machine/run/test counts. See client/src/pages/
+  // Dashboard.tsx's own header comment for why this is the one exception.
+  statsRepo: {
+    userCount(): number {
+      return (getDb().prepare(`SELECT COUNT(*) as n FROM users`).get() as { n: number }).n;
     },
   },
 };

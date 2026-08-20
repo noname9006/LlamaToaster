@@ -110,10 +110,10 @@ const TOOLS = [
     function: {
       name: "list_community_facets",
       description:
-        "Discover what community benchmark data currently exists (models, backends, platforms, GPUs) " +
-        "that has enough contributors to be shown -- use this BEFORE get_community_aggregates to find a " +
-        "valid filter value instead of guessing one. Every value returned already has 5+ contributors; a " +
-        "value with fewer never appears here at all. Requires the user to be signed in.",
+        "Discover what community benchmark data currently exists (models, backends, platforms, GPUs) -- " +
+        "use this BEFORE get_community_aggregates to find a valid filter value instead of guessing one. " +
+        "A value may be backed by as few as a single contributor -- always mention its contributor_count " +
+        "rather than assuming it represents many people. Requires the user to be signed in.",
       parameters: { type: "object", properties: {} },
     },
   },
@@ -123,11 +123,11 @@ const TOOLS = [
       name: "get_community_aggregates",
       description:
         "Get anonymised, aggregated benchmark throughput (avg tok/s, avg RAM/VRAM) contributed by OTHER " +
-        "users who opted in to sharing, optionally filtered by model_id/backend/platform/gpu_model. Every " +
-        "row already represents 5 or more distinct contributors (rows describing fewer are suppressed " +
-        "server-side) -- never attribute a row to an individual, never state or imply how many people are " +
-        "in a group beyond the contributor_count field itself, and never combine two rows to try to narrow " +
-        "a group down further. Requires the user to be signed in.",
+        "users who opted in to sharing, optionally filtered by model_id/backend/platform/gpu_model. A row " +
+        "may represent as few as a single contributor -- ALWAYS state its contributor_count when reporting " +
+        "a number from this tool, never attribute a row to an individual, never speculate about who a " +
+        "single-contributor row might belong to, and never combine two rows to try to narrow a group down " +
+        "further. Requires the user to be signed in.",
       parameters: {
         type: "object",
         properties: {
@@ -175,11 +175,17 @@ async function runTool(name: string, rawArguments: string, callerId: string | un
 
   if (name === "list_community_facets") {
     if (!callerId) return { error: "sign in to use community benchmark data" };
+    if (!repo.appSettingsRepo.get().communitySharingAllowed) {
+      return { error: "community benchmark sharing is currently disabled by the operator" };
+    }
     return repo.communityRepo.listFacets(callerId);
   }
 
   if (name === "get_community_aggregates") {
     if (!callerId) return { error: "sign in to use community benchmark data" };
+    if (!repo.appSettingsRepo.get().communitySharingAllowed) {
+      return { error: "community benchmark sharing is currently disabled by the operator" };
+    }
     const filters: CommunityAggregateFilters = {
       modelId: typeof args.model_id === "string" ? args.model_id : undefined,
       backend: typeof args.backend === "string" ? args.backend : undefined,
@@ -422,14 +428,13 @@ const SERVER_SYSTEM_PROMPT =
   "a guess.\n\n" +
   "Community data: you also have list_community_facets and get_community_aggregates, which return " +
   "OTHER users' benchmark throughput, anonymised and aggregated across everyone who ran a given " +
-  "model/backend/platform/GPU combination. Every row you get back already represents 5 or more " +
-  "distinct people — you will never be given a row for fewer, so there is nothing to protect by " +
-  "refusing to use one. But you must never try to make a row MORE identifying than it already is: " +
-  "never say or imply how many people are behind a number beyond echoing its own contributor_count, " +
-  "never attribute a result to a specific person, never speculate about who a contributor might be, " +
-  "and never chain two aggregate rows together to narrow a group down toward one individual. If asked " +
-  "who submitted a result, or for data about a specific person, explain that this tool only returns " +
-  "anonymised group aggregates and cannot identify individuals.\n\n" +
+  "model/backend/platform/GPU combination. A row can represent as few as ONE contributor — always " +
+  "surface its contributor_count when you report a number from these tools, so the user knows how " +
+  "many people it's actually averaged over. Never try to make a row MORE identifying than it already " +
+  "is: never attribute a result to a specific person, never speculate about who a contributor (especially " +
+  "a single one) might be, and never chain two aggregate rows together to narrow a group down toward one " +
+  "individual. If asked who submitted a result, or for data about a specific person, explain that this " +
+  "tool only returns anonymised group aggregates and cannot identify individuals.\n\n" +
   "Style: keep replies short — a few sentences or a short bullet list. Don't use a markdown table " +
   "unless the user is comparing multiple options side by side or explicitly asks for one. Skip " +
   "preamble and caveats; lead with the answer.";
