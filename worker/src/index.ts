@@ -1709,10 +1709,13 @@ async function executeDownloadModelJob(
   try {
     // A .part left over from an earlier attempt (paused, crashed, or a
     // transient network drop) is resumed via an HTTP Range request rather
-    // than restarted from byte 0 -- see the 206 handling below. Already
-    // fully downloaded under a previous job? resolveDownloadTarget's target
-    // would exist and this job wouldn't normally have been queued again, but
-    // guard cheaply anyway rather than re-fetch a file that's already there.
+    // than restarted from byte 0 -- see the 206 handling below. If the
+    // target itself already exists, the transfer is already done (e.g. this
+    // job is a fresh re-queue of a download whose earlier attempt finished
+    // downloading but never got registered -- see the "already present"
+    // branch below); either way, hashing/metadata/registration always still
+    // run afterward, since "the bytes are on disk" and "the catalog knows
+    // about it" are two different things.
     let resumeFrom = 0;
     if (existsSync(target)) {
       log.info(`${progressKey} already present at ${target}, skipping re-download`);
@@ -1762,41 +1765,41 @@ async function executeDownloadModelJob(
       );
       const elapsedMs = Date.now() - downloadStartedAt;
       log.info(`downloaded ${progressKey} -> ${partPath} in ${elapsedMs}ms`);
-
-      updateDownloadReport(jobId, { phase: "finalizing", detail: "hashing" });
-      const { sha256, byteLength } = await hashFile(partPath);
       renameSync(partPath, target);
+    }
 
-      updateDownloadReport(jobId, { detail: "reading GGUF metadata" });
-      const { n_layer, mtp_layers, expert_count } = await readGgufInfo(target);
-      log.info(
-        `gguf metadata for ${progressKey}: n_layer=${n_layer ?? "unknown"} mtp_layers=${mtp_layers ?? "unknown"} ` +
-          `expert_count=${expert_count ?? "unknown"}`
-      );
+    updateDownloadReport(jobId, { phase: "finalizing", detail: "hashing" });
+    const { sha256, byteLength } = await hashFile(target);
 
-      // Reflect the new file immediately rather than waiting for the periodic
-      // refresh -- see refreshModelDirFilesCache above.
-      refreshModelDirFilesCache();
+    updateDownloadReport(jobId, { detail: "reading GGUF metadata" });
+    const { n_layer, mtp_layers, expert_count } = await readGgufInfo(target);
+    log.info(
+      `gguf metadata for ${progressKey}: n_layer=${n_layer ?? "unknown"} mtp_layers=${mtp_layers ?? "unknown"} ` +
+        `expert_count=${expert_count ?? "unknown"}`
+    );
 
-      const reported = await safeReportDownloadResult({
-        worker: config.worker_name,
-        machine_id: config.machine_id,
-        hf_repo: payload.hf_repo,
-        hf_file: payload.hf_file,
-        ok: true,
-        sha256,
-        size_bytes: byteLength,
-        n_layer,
-        mtp_layers,
-        expert_count,
-      });
-      if (!reported) {
-        // The file is on disk and hashed, but the server never learned about
-        // it -- surface this as a real job failure instead of letting
-        // workerMain report {ok: true} for a download the catalog never
-        // registered (see server/src/routes/workers.ts's registerModel call).
-        throw new Error(`downloaded ${progressKey} but the completion callback never got through`);
-      }
+    // Reflect the new file immediately rather than waiting for the periodic
+    // refresh -- see refreshModelDirFilesCache above.
+    refreshModelDirFilesCache();
+
+    const reported = await safeReportDownloadResult({
+      worker: config.worker_name,
+      machine_id: config.machine_id,
+      hf_repo: payload.hf_repo,
+      hf_file: payload.hf_file,
+      ok: true,
+      sha256,
+      size_bytes: byteLength,
+      n_layer,
+      mtp_layers,
+      expert_count,
+    });
+    if (!reported) {
+      // The file is on disk and hashed, but the server never learned about
+      // it -- surface this as a real job failure instead of letting
+      // workerMain report {ok: true} for a download the catalog never
+      // registered (see server/src/routes/workers.ts's registerModel call).
+      throw new Error(`downloaded ${progressKey} but the completion callback never got through`);
     }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
