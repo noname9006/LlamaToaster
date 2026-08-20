@@ -289,6 +289,32 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
     }
   );
 
+  // Cancel Download -- unlike pause above, tells the worker to delete the
+  // .part file too (worker/src/index.ts's discard handling), so there's
+  // nothing left to resume; the client removes the row outright rather than
+  // offering Resume. A still-'pending' download (never claimed, so no
+  // partial file exists at all) is cancelled directly here instead of
+  // round-tripping through a heartbeat that will never come for a job no
+  // worker has picked up yet.
+  app.post<{ Params: { id: string; jobId: string } }>(
+    "/api/workers/:id/downloads/:jobId/cancel",
+    async (request, reply) => {
+      const worker = repo.workerRepo.getWorker(request.params.id);
+      if (!worker) throw new NotFoundError("unknown machine");
+      assertOwnsWorker(resolveAuthUser(request)?.user.id, worker.id);
+      const job = repo.queueRepo.getJob(request.params.jobId);
+      if (!job || job.workerId !== worker.id || job.jobType !== "download_model") {
+        throw new NotFoundError("unknown download");
+      }
+      if (job.status === "pending") {
+        repo.queueRepo.cancelPendingJob(job.id);
+      } else {
+        repo.queueRepo.requestDiscard(job.id);
+      }
+      return reply.code(200).send({ ok: true });
+    }
+  );
+
   // Worker -> server callback reporting a download's terminal outcome.
   // Retried by the worker with backoff (safeReportDownloadResult), so this
   // must stay safe to receive more than once for the same download --

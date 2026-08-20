@@ -113,9 +113,13 @@ describe("POST /api/worker/heartbeat", () => {
   it("returns worker_id, empty control, and a lease_until in the future for an idle worker", async () => {
     const res = await postJson("/api/worker/heartbeat", hardwareState("hb-1", "idle"));
     expect(res.status).toBe(200);
-    const body = (await res.json()) as { worker_id: string; control: { cancel_job_ids: string[]; pause: boolean }; lease_until: number };
+    const body = (await res.json()) as {
+      worker_id: string;
+      control: { cancel_job_ids: string[]; discard_job_ids: string[]; pause: boolean };
+      lease_until: number;
+    };
     expect(body.worker_id).toBeTruthy();
-    expect(body.control).toEqual({ cancel_job_ids: [], pause: false });
+    expect(body.control).toEqual({ cancel_job_ids: [], discard_job_ids: [], pause: false });
     expect(body.lease_until).toBeGreaterThan(Date.now());
   });
 

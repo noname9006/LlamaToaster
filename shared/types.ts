@@ -920,7 +920,12 @@ export interface ActiveJobReport {
 
 export interface HeartbeatResponse {
   worker_id: string;
-  control: { cancel_job_ids: string[]; pause: boolean };
+  // discard_job_ids is a subset of cancel_job_ids (every discarded job is
+  // also a cancelled one) -- Cancel Download vs Pause on the Models page:
+  // both abort the same in-flight fetch, but only Cancel also tells the
+  // worker to delete the .part file instead of keeping it for resume (see
+  // worker/src/index.ts's discard handling).
+  control: { cancel_job_ids: string[]; discard_job_ids: string[]; pause: boolean };
   lease_until: number;
 }
 
