@@ -27,7 +27,13 @@ export default function App() {
     api
       .getAuthStatus()
       .then(setAuthStatus)
-      .catch(() => setAuthStatus({ user: null, authEnabled: false }));
+      .catch(() =>
+        setAuthStatus({
+          user: null,
+          authEnabled: false,
+          appSettings: { communitySharingAllowed: false, accountDeletionAllowed: true },
+        })
+      );
   }, []);
 
   const needsLogin = authStatus !== null && authStatus.authEnabled && authStatus.user === null;
