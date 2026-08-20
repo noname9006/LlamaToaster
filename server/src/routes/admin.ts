@@ -4,7 +4,7 @@ import { resolveAuthUser } from "../auth-middleware.js";
 import type { AuthenticatedRequest } from "../auth-middleware.js";
 import { NotFoundError, ForbiddenError } from "../errors.js";
 import { loadExportRows, formatResultsExport } from "./results.js";
-import type { AdminRunFilters } from "../../../shared/types.js";
+import type { AdminRunFilters, AppSettings } from "../../../shared/types.js";
 
 // Multi-user Stage 5 (MULTIUSER_PLAN.md §5.1): the ONLY cross-tenant read
 // surface in this app, reachable exclusively from its own origin --
@@ -62,4 +62,27 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
   );
 
   app.get("/api/admin/users", async () => ({ users: repo.adminRepo.listUsers() }));
+
+  // The supervise dashboard's own two platform-wide toggles (see shared/
+  // types.ts's AppSettings doc comment) -- community benchmark sharing and
+  // self-service account deletion. Same {}-partial-body shape for both so
+  // the admin SPA can flip either without re-sending the other's value.
+  app.get("/api/admin/settings", async (): Promise<AppSettings> => repo.appSettingsRepo.get());
+
+  app.post<{ Body: Partial<AppSettings> }>("/api/admin/settings", async (req, reply) => {
+    const body = req.body ?? {};
+    if (body.communitySharingAllowed !== undefined && typeof body.communitySharingAllowed !== "boolean") {
+      return reply.code(400).send({ error: "communitySharingAllowed must be a boolean" });
+    }
+    if (body.accountDeletionAllowed !== undefined && typeof body.accountDeletionAllowed !== "boolean") {
+      return reply.code(400).send({ error: "accountDeletionAllowed must be a boolean" });
+    }
+    if (body.communitySharingAllowed !== undefined) {
+      repo.appSettingsRepo.setCommunitySharingAllowed(body.communitySharingAllowed);
+    }
+    if (body.accountDeletionAllowed !== undefined) {
+      repo.appSettingsRepo.setAccountDeletionAllowed(body.accountDeletionAllowed);
+    }
+    return repo.appSettingsRepo.get();
+  });
 }

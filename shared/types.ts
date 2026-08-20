@@ -1002,6 +1002,29 @@ export interface AuthStatus {
   // these routes exist regardless of AUTH_ENABLED, and `user` alone can't
   // distinguish "nobody is logged in" from "logins aren't required here."
   authEnabled: boolean;
+  // Operator-controlled feature gates (see AppSettings below) -- always
+  // present, computed regardless of authEnabled, so Settings.tsx can decide
+  // what to show/allow without a second round trip.
+  appSettings: AppSettings;
+}
+
+// Operator-controlled toggles, set from the admin/supervise dashboard (see
+// routes/admin.ts's GET/POST /api/admin/settings) and stored in the `meta`
+// key-value table (server/src/db/schema.sql) rather than a dedicated table --
+// there are only ever these two flags. Absent key reads as the documented
+// default on each field below (repo.ts's appSettingsRepo.get()).
+export interface AppSettings {
+  // Whether users are allowed to turn ON the "contribute to community
+  // benchmark database" toggle in Settings at all -- default false (starts
+  // greyed out). Also enforced server-side (POST /api/auth/share-benchmarks,
+  // and the AI assistant's community tools in routes/ai.ts) so a direct API
+  // call can't bypass a disabled toggle.
+  communitySharingAllowed: boolean;
+  // Whether the self-service "delete my account" flow is exposed at all --
+  // default true (matches the shipped v1 behavior). When false, Settings
+  // hides the whole Danger zone section, and DELETE /api/auth/account
+  // refuses server-side too.
+  accountDeletionAllowed: boolean;
 }
 
 // GET /api/sessions -- one row per live session for the caller's own
@@ -1123,9 +1146,12 @@ export interface AdminUserSummary {
 }
 
 // Multi-user Stage 5 (MULTIUSER_PLAN.md §5.4) -- the AI assistant's one
-// cross-tenant read (§5.3). Every row returned by repo.communityRepo already
-// satisfies contributor_count >= 5 (SQL-enforced, see repo.ts) -- there is no
-// field here and no code path that can carry a UUID or per-user identifier.
+// cross-tenant read (§5.3). No minimum contributor count is enforced (the
+// original k>=5 anonymity floor was deliberately dropped -- collecting five
+// identical hardware/model/backend combos was unrealistic in practice), so a
+// row may describe as few as a single opted-in contributor. There is no
+// field here and no code path that can carry a UUID or per-user identifier,
+// but contributorCount itself should always be shown/considered by callers.
 export interface CommunityAggregateRow {
   modelId: string;
   modelFilename: string | null;
@@ -1147,10 +1173,10 @@ export interface CommunityAggregateFilters {
   gpuModel?: string;
 }
 
-// One (dimension, value) pair that currently clears k=5 on its own -- lets a
-// caller discover valid CommunityAggregateFilters values without being able
-// to fish for one that would turn out to describe fewer than five people
-// (§5.4's own "or it leaks the existence of a single rare GPU").
+// One (dimension, value) pair that currently has at least one opted-in
+// contributor -- lets a caller discover valid CommunityAggregateFilters
+// values instead of guessing one blind. No minimum contributor count is
+// enforced (see CommunityAggregateRow's own doc comment).
 export interface CommunityFacetValue {
   value: string;
   contributorCount: number;
