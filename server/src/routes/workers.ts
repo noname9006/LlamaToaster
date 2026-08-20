@@ -315,6 +315,27 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
     }
   );
 
+  // Lets the client tell a download that's genuinely gone (completed, failed,
+  // cancelled, or never existed) apart from one that's still queued behind
+  // the worker's max_concurrent_downloads cap -- such a job never appears in
+  // the worker's heartbeat-reported activeDownloads (that only lists jobs
+  // actually claimed/running), so without this the Models page poll loop had
+  // no way to distinguish "queued, waiting for a slot" from "dropped" and
+  // wrongly finalized it after a few missed polls.
+  app.get<{ Params: { id: string; jobId: string } }>(
+    "/api/workers/:id/downloads/:jobId",
+    async (request, reply) => {
+      const worker = repo.workerRepo.getWorker(request.params.id);
+      if (!worker) throw new NotFoundError("unknown machine");
+      assertOwnsWorker(resolveAuthUser(request)?.user.id, worker.id);
+      const job = repo.queueRepo.getJob(request.params.jobId);
+      if (!job || job.workerId !== worker.id || job.jobType !== "download_model") {
+        throw new NotFoundError("unknown download");
+      }
+      return reply.code(200).send({ status: job.status });
+    }
+  );
+
   // Worker -> server callback reporting a download's terminal outcome.
   // Retried by the worker with backoff (safeReportDownloadResult), so this
   // must stay safe to receive more than once for the same download --
