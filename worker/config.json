@@ -1,0 +1,15 @@
+{
+  "worker_name": "Local",
+  "backend": "vulkan",
+  "llama_cpp_build": "b10362",
+  "llama_bench_path": "F:\\BOT\\GitHub\\LlamaToaster\\worker\\llama-builds\\b10362\\llama-bench.exe",
+  "model_dir": "F:\\AI\\.models",
+  "vps_url": "https://llamatoaster.com",
+  "bind_host": "100.121.205.70",
+  "port": 8080,
+  "raw_json_dir": "F:\\AI\\llm\\raw",
+  "llama_server_path": "F:\\BOT\\GitHub\\LlamaToaster\\worker\\llama-builds\\b10362\\llama-server.exe",
+  "machine_id": "63b0bfd5-14c6-4fee-b1fa-d875085a27d8",
+  "session_token": "xWv0qzloKHsz-vqcfyfbSY7SeKG80b4pN6oAPLoR0bM",
+  "refresh_token": "F9d-P7evHEXVAlvp35EAYZK7SEcMq-rSAJSLUL6GfbY"
+}
