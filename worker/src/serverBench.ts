@@ -201,6 +201,17 @@ function buildArgs(input: ServerBenchRunInput): string[] {
     "127.0.0.1",
     "--spec-type",
     "draft-mtp",
+    // Only ever one /completion request in flight at a time (the repeat loop
+    // below is strictly sequential), but llama-server's own default spins up
+    // multiple slots (observed live: n_slots=4) and sizes its unified KV
+    // cache for all of them combined even though 3 sit idle the entire run.
+    // Pinning to 1 slot removes that unused allocation/bookkeeping from the
+    // pp comparison against llama-bench (which has no slot concept at all)
+    // -- confirmed via real b10516 stderr logs that pp under MTP measured
+    // ~285-300 tok/s against llama-bench's ~1500-1700 tok/s for the same
+    // model/layers/batch on the same run, well before this flag existed.
+    "--parallel",
+    "1",
     // Exposes /metrics, the only way to confirm the draft model is actually
     // contributing accepted tokens rather than --spec-type draft-mtp above
     // silently no-opping (bad/incompatible --model-draft file, draft model

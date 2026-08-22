@@ -16,6 +16,7 @@ import {
   type IdentityInfo,
   type DeviceStatusResponse,
   type DeviceApproveResponse,
+  type HfGgufIndexEntry,
 } from "../types";
 
 export class ApiError extends Error {
@@ -314,4 +315,21 @@ export const api = {
   // The one intentionally cross-tenant number on the (otherwise
   // per-account-scoped) Dashboard -- see Dashboard.tsx's own header comment.
   getStats: (): Promise<{ users: number }> => request("/api/stats"),
+
+  // Hash lookup: sends SHA-256 hashes of local files and gets back the
+  // matching HF metadata (repo_id, filename, revision) so the Models page
+  // can display "this is bartowski/gemma-3-27b-it-GGUF/…". Hashes not in
+  // the index are simply absent from the results -- the caller falls back
+  // to "unknown" state for those. See server/src/routes/models.ts's
+  // POST /api/models/hash-lookup and server/src/hf-index.ts.
+  lookupHashes: (hashes: string[]): Promise<{ results: HfGgufIndexEntry[] }> =>
+    request<{ results: HfGgufIndexEntry[] }>("/api/models/hash-lookup", postJson({ hashes })),
+
+  // Trigger a model refresh on workers
+  refreshModels: (workerId: string): Promise<{ ok: true; queued: true; job_id: string; message: string }> =>
+    request("/api/models/refresh", postJson({ worker_id: workerId })),
+
+  // Generic job status (refresh_models, etc.) -- see server/src/routes/workers.ts's GET /api/workers/:id/jobs/:jobId
+  getJobStatus: (workerId: string, jobId: string): Promise<{ status: string; job_type: string }> =>
+    request(`/api/workers/${encodeURIComponent(workerId)}/jobs/${encodeURIComponent(jobId)}`),
 };

@@ -2137,6 +2137,44 @@ export const repo = {
       return rows.map(mapSession);
     },
 
+    // Reusable session (§2.8): returns the most recent non-expired,
+    // non-worker session for a user if one exists, so the OAuth callback can
+    // hand back the SAME cookie on every login instead of minting a new
+    // session row per page refresh. Workers are excluded -- a worker session
+    // is a different identity space (it authenticates via its own refresh
+    // token, never via this cookie) and must never be reused as a browser
+    // session. Returns undefined when there's nothing to reuse (first login
+    // ever, every session expired, all sessions are worker sessions).
+    getActiveBrowserSession(userId: string): SessionRecord | undefined {
+      const row = getDb()
+        .prepare(
+          `SELECT * FROM sessions
+            WHERE user_id = ? AND is_worker = 0 AND expires_at > ?
+            ORDER BY last_seen_at DESC, created_at DESC
+            LIMIT 1`
+        )
+        .get(userId, Date.now()) as SessionRow | undefined;
+      return row ? mapSession(row) : undefined;
+    },
+
+    // Issues a fresh access token for an existing session row, keeping the
+    // same id/created_at/refresh_hash (§2.8). The raw token is only ever
+    // returned here and at create() time -- the DB stores only its hash, so
+    // this is the only way to get a usable token for a row that already
+    // exists. Used by the OAuth callback to reuse a session across logins
+    // instead of minting a new row each time.
+    regenerateToken(sessionId: string): { token: string; expiresAt: number } {
+      const token = generateSessionId();
+      const now = Date.now();
+      const expiresAt = now + 30 * 24 * 3600 * 1000;
+      getDb()
+        .prepare(
+          `UPDATE sessions SET token_hash = ?, expires_at = ?, last_seen_at = ? WHERE id = ?`
+        )
+        .run(hashToken(token), expiresAt, now, sessionId);
+      return { token, expiresAt };
+    },
+
     // Sliding expiry (§2.5): extends expires_at to now + the session's own
     // lifetime, throttled to at most one write per hour per session so an
     // active user's every request doesn't turn into a write.

@@ -48,6 +48,8 @@ import {
 } from "./llama-builds.js";
 import { detectHardware, detectBackend } from "./hardware.js";
 import { readGgufInfo } from "./gguf.js";
+import { LocalModelCache, createLocalModelCache } from "./local-cache.js";
+import { runStartupReconciliation, refreshModels, getModelFilesWithState, HashingQueue, lookupHashes } from "./model-scanner.js";
 import {
   backendVisibleGpus,
   type Model,
@@ -69,6 +71,7 @@ import {
   type DeleteBuildJobPayload,
   type DownloadModelJobPayload,
   type WorkerVramInfo,
+  type LocalModelState,
 } from "../../shared/types.js";
 import { expandSweep, deriveTestType, type SweepItem } from "../../shared/sweep.js";
 
@@ -200,6 +203,9 @@ const buildsDir = resolve(config.llama_cpp_builds_dir ?? join(__dirname, "..", "
 
 const logDir = resolve(config.log_dir ?? join(__dirname, "..", "logs"));
 configureLogging(logDir, process.env.LOG_LEVEL);
+
+// Initialize local model cache
+const localModelCache = await createLocalModelCache(config.model_dir);
 
 // One dedicated, structured log file per run (see setRunLogFile/
 // executeBenchmarkJob below), separate from the shared daily worker-*.log
@@ -393,23 +399,6 @@ function listModelDirFiles(): ModelDirFile[] {
   return results;
 }
 
-// Cache for listModelDirFiles(), populated once at startup and then on a
-// timer (see refreshModelDirFilesCache below) rather than re-walked on every
-// heartbeat -- mirrors the hardware snapshot above, though unlike hardware
-// this data *can* change while the process is up (downloads, manual file
-// drops), hence the periodic refresh instead of a one-shot. Sent verbatim as
-// WorkerStatePush.model_files on every heartbeat/queue poll -- see
-// collectState below.
-let modelDirFilesCache: ModelDirFile[] = [];
-
-function refreshModelDirFilesCache(): void {
-  try {
-    modelDirFilesCache = listModelDirFiles();
-  } catch (err) {
-    log.error(`model dir listing refresh failed: ${err instanceof Error ? err.message : String(err)}`);
-  }
-}
-
 // Where writeRawJson (worker/src/vps-client.ts) actually lands a given raw
 // dump -- bucketed by outcome so pruneRawJson below can apply a different
 // retention window to each without needing to ask the server "was this item
@@ -476,6 +465,59 @@ function hfResolveUrl(repo: string, file: string): string {
   const encRepo = repo.split("/").map(encodeURIComponent).join("/");
   const encFile = file.split("/").map(encodeURIComponent).join("/");
   return `https://huggingface.co/${encRepo}/resolve/main/${encFile}`;
+}
+
+// --- Hugging Face auth + resolver helpers (mirrors server/src/hf-rate-limit.ts) ---
+
+function getWorkerHfToken(): string | undefined {
+  const raw =
+    process.env.HF_TOKEN ??
+    process.env.HF_API_KEY ??
+    process.env.HUGGING_FACE_HUB_TOKEN ??
+    process.env.HUGGINGFACE_TOKEN ??
+    process.env.HUGGINGFACE_HUB_TOKEN;
+  const trimmed = raw?.trim();
+  return trimmed ? trimmed : undefined;
+}
+
+function getWorkerHfHeaders(extra?: Record<string, string>): Record<string, string> {
+  const headers: Record<string, string> = { ...(extra ?? {}) };
+  const token = getWorkerHfToken();
+  if (token && !headers.authorization && !headers.Authorization) {
+    headers.authorization = `Bearer ${token}`;
+  }
+  if (!headers["user-agent"] && !headers["User-Agent"]) headers["user-agent"] = "llamatoaster-worker";
+  return headers;
+}
+
+// Fetched BEFORE download to obtain expected SHA256 (LFS oid) for verification.
+// Mirrors server/src/hf-index.ts's fetchHfFileSha256 but runs on the worker
+// so verification doesn't depend on HF index freshness. Returns null if hash
+// can't be determined (non-LFS, API error, timeout) -- callers fall back to
+// post-hash index existence check and treat as unknown.
+// Uses Bearer token when HF_TOKEN is set -- bumps from anonymous 500->1000 api
+// and 3000->5000 resolvers limits per 5-minute window (PRO 2500/12000 etc),
+// and handles 429 by respecting the RateLimit t= header.
+async function fetchExpectedSha256(repoId: string, filename: string, timeoutMs = 15_000): Promise<string | null> {
+  try {
+    const encoded = filename.split("/").map(encodeURIComponent).join("/");
+    const url = `https://huggingface.co/api/models/${repoId}/tree/main/${encoded}`;
+    let res = await fetch(url, { headers: getWorkerHfHeaders(), signal: AbortSignal.timeout(timeoutMs) });
+    if (res.status === 429) {
+      const tRaw = res.headers.get("ratelimit") ?? res.headers.get("RateLimit") ?? "";
+      const tm = tRaw.match(/t\s*=\s*(\d+)/i) ?? res.headers.get("retry-after")?.match(/(\d+)/);
+      const waitSec = tm ? Number(tm[1]) : 15;
+      const waitMs = Number.isFinite(waitSec) && waitSec > 0 && waitSec <= 300 ? waitSec * 1000 : 15000;
+      log.warn(`[hf] fetchExpectedSha256 429 for ${repoId}/${filename} -- retrying after ${Math.ceil(waitMs / 1000)}s`);
+      await new Promise((r) => setTimeout(r, waitMs));
+      res = await fetch(url, { headers: getWorkerHfHeaders(), signal: AbortSignal.timeout(timeoutMs) });
+    }
+    if (!res.ok) return null;
+    const data = (await res.json()) as { lfs?: { oid?: string } };
+    return data.lfs?.oid ?? null;
+  } catch {
+    return null;
+  }
 }
 
 // Hashes a file already fully on disk, streamed rather than read whole into
@@ -632,7 +674,7 @@ async function collectState(): Promise<WorkerStatePush> {
     backend,
     hardware: detectedHardware,
     installed_builds: toInstalledBuildList(),
-    model_files: modelDirFilesCache,
+    model_files: await getModelFilesWithState(localModelCache, config.model_dir),
     status: busy ? "busy" : "idle",
     vram,
   };
@@ -883,7 +925,7 @@ function formatDeviceSelection(backend: Backend, mainGpu: number | undefined): s
   const visible = backendVisibleGpus(detectedHardware.gpu, backend);
   if (mainGpu == null) {
     return visible.length > 0
-      ? `auto -- split across all ${backend}-visible GPU(s): ${visible.map((g) => formatGpuEntry(g)).join(", ")}`
+      ? `auto -- split across all ${backend}-visible GPU(s): ${visible.map((g: { model: string; vendor: string; vram_mb?: number | null; vram_dynamic?: boolean }) => formatGpuEntry(g)).join(", ")}`
       : `auto (no ${backend}-visible GPU detected)`;
   }
   const picked = visible[mainGpu];
@@ -1706,6 +1748,16 @@ async function executeDownloadModelJob(
   const downloadStartedAt = Date.now();
   updateDownloadReport(jobId, { phase: "downloading", bytes: 0, detail: progressKey });
 
+  // Obtain expected SHA256 BEFORE download (spec: Before download obtain expected SHA256)
+  let expectedSha256: string | null = null;
+  try {
+    expectedSha256 = await fetchExpectedSha256(payload.hf_repo, payload.hf_file);
+    if (expectedSha256) log.info(`expected SHA256 for ${progressKey}: ${expectedSha256}`);
+    else log.info(`no expected SHA256 available for ${progressKey} (non-LFS or HF lookup failed)`);
+  } catch {
+    // leave as null -> post-hash fallback to index existence check
+  }
+
   try {
     // A .part left over from an earlier attempt (paused, crashed, or a
     // transient network drop) is resumed via an HTTP Range request rather
@@ -1729,9 +1781,23 @@ async function executeDownloadModelJob(
       else log.info(`downloading ${progressKey} -> ${target}`);
 
       const sourceUrl = hfResolveUrl(payload.hf_repo, payload.hf_file);
-      const headers: Record<string, string> = { "user-agent": "llamatoaster-worker" };
-      if (resumeFrom > 0) headers.range = `bytes=${resumeFrom}-`;
-      const upstream = await fetch(sourceUrl, { headers, redirect: "follow", signal });
+      // Resolver bucket benefits from HF_TOKEN (3000->5000 anonymous->free,
+      // PRO 12000, Team 20000 etc) and benefits from precise RateLimit t= retry
+      // (mirrors huggingface_hub 1.2.0+ smart retry for downloads).
+      const baseHeaders: Record<string, string> = { "user-agent": "llamatoaster-worker" };
+      if (resumeFrom > 0) baseHeaders.range = `bytes=${resumeFrom}-`;
+      const headers = getWorkerHfHeaders(baseHeaders);
+      let upstream = await fetch(sourceUrl, { headers, redirect: "follow", signal });
+      // Smart 429 retry: parse RateLimit t= like huggingface_hub does for resolvers.
+      if (upstream.status === 429) {
+        const tRaw = upstream.headers.get("ratelimit") ?? upstream.headers.get("RateLimit") ?? "";
+        const tm = tRaw.match(/t\s*=\s*(\d+)/i) ?? upstream.headers.get("retry-after")?.match(/(\d+)/);
+        const waitSec = tm ? Number(tm[1]) : 15;
+        const waitMs = Number.isFinite(waitSec) && waitSec > 0 && waitSec <= 300 ? waitSec * 1000 : 15000;
+        log.warn(`[hf] download 429 for ${progressKey} (resolvers bucket) -- retrying after ${Math.ceil(waitMs / 1000)}s`);
+        await new Promise((r) => setTimeout(r, waitMs));
+        upstream = await fetch(sourceUrl, { headers, redirect: "follow", signal });
+      }
       if (!upstream.body || (!upstream.ok && upstream.status !== 206)) {
         throw new Error(`download failed: ${upstream.status} ${upstream.statusText}`);
       }
@@ -1771,6 +1837,34 @@ async function executeDownloadModelJob(
     updateDownloadReport(jobId, { phase: "finalizing", detail: "hashing" });
     const { sha256, byteLength } = await hashFile(target);
 
+    // Download verification: compare expected vs actual (spec: After download calculate SHA256, compare, detect corruption)
+    let verificationState: "verified" | "corrupted" | "unknown" = "unknown";
+    if (expectedSha256) {
+      if (sha256 === expectedSha256) {
+        verificationState = "verified";
+        log.info(`Download verified: ${progressKey} hash matches expected ${expectedSha256}`);
+      } else {
+        verificationState = "corrupted";
+        log.error(`Download CORRUPTED: ${progressKey} expected ${expectedSha256} but got ${sha256}`);
+      }
+    } else {
+      // Fallback: check HF index existence (covers mirrored/cached expected unavailable)
+      try {
+        const hashes = await lookupHashes(config.vps_url, authToken, [sha256]);
+        const match = hashes.get(sha256);
+        if (match) {
+          verificationState = "verified";
+          log.info(`Download verified via HF index: ${progressKey} matches ${match.repo_id}/${match.filename}`);
+        } else {
+          verificationState = "unknown";
+          log.info(`Download hash not found in HF index: ${progressKey}`);
+        }
+      } catch (err) {
+        log.warn(`Hash lookup failed for ${progressKey}: ${err instanceof Error ? err.message : String(err)}`);
+        verificationState = "unknown";
+      }
+    }
+
     updateDownloadReport(jobId, { detail: "reading GGUF metadata" });
     const { n_layer, mtp_layers, expert_count } = await readGgufInfo(target);
     log.info(
@@ -1778,9 +1872,43 @@ async function executeDownloadModelJob(
         `expert_count=${expert_count ?? "unknown"}`
     );
 
+    // Update local cache with the new file info
+    await localModelCache.upsert({
+      path: payload.hf_file,
+      size: byteLength,
+      mtime: statSync(target).mtimeMs,
+      sha256,
+      hf_model_id: verificationState === "verified" ? `${payload.hf_repo}/${payload.hf_file}` : undefined,
+      // This upsert *is* a fresh verification (the hash lookup a few lines
+      // above just ran), so stamp hf_checked_at now -- otherwise this entry
+      // would look stale on the very next scan and trigger a redundant
+      // re-lookup.
+      hf_checked_at: verificationState === "verified" ? Date.now() : undefined,
+      last_verified: Date.now(),
+      state: verificationState,
+    });
+
     // Reflect the new file immediately rather than waiting for the periodic
     // refresh -- see refreshModelDirFilesCache above.
     refreshModelDirFilesCache();
+
+    // Only verified (and unknown where no expected hash was available) downloads
+    // are considered successfully imported per spec. Corrupted means the file
+    // is retained locally with corrupted state for UI inspection, but we do
+    // NOT register it in the server catalog and we surface the job as failed
+    // so the user sees the corruption and can retry.
+    if (verificationState === "corrupted") {
+      const errMsg = `SHA256 mismatch: expected ${expectedSha256} but got ${sha256} (file kept as corrupted)`;
+      await safeReportDownloadResult({
+        worker: config.worker_name,
+        machine_id: config.machine_id,
+        hf_repo: payload.hf_repo,
+        hf_file: payload.hf_file,
+        ok: false,
+        error: errMsg,
+      });
+      throw new Error(errMsg);
+    }
 
     const reported = await safeReportDownloadResult({
       worker: config.worker_name,
@@ -1870,7 +1998,18 @@ async function executeDeleteModelFileJob(payload: { filename: string }): Promise
   }
   unlinkSync(target);
   log.info(`deleted model file ${payload.filename}`);
-  refreshModelDirFilesCache();
+}
+
+async function executeRefreshModelsJob(): Promise<void> {
+  log.info("Starting model directory refresh via job queue");
+  await runStartupReconciliation(
+    config.model_dir,
+    localModelCache,
+    config.vps_url,
+    authToken,
+    config.raw_json_dir
+  );
+  log.info("Model directory refresh completed");
 }
 
 // download_model is deliberately NOT handled here -- workerMain's
@@ -1891,13 +2030,15 @@ async function executeJob(job: SerialQueueJob): Promise<void> {
       return executeDeleteBuildJob(job.payload);
     case "delete_model_file":
       return executeDeleteModelFileJob(job.payload);
+    case "refresh_models":
+      return executeRefreshModelsJob();
     case "shutdown_worker":
       return executeShutdownWorkerJob();
   }
 }
 
 function jobInitialPhase(type: QueueJob["type"]): ActiveJobReport["phase"] {
-  return type === "download_model" ? "downloading" : "loading";
+  return type === "download_model" ? "downloading" : type === "refresh_models" ? "loading" : "loading";
 }
 
 // Delivered on the heartbeat's control.cancel_job_ids -- ignored unless it
@@ -1916,7 +2057,7 @@ function requestStop(jobId: string): void {
 // 401 -- every outbound authenticated call reads these fresh via withAuth
 // rather than capturing a value, so a mid-process refresh takes effect on
 // the very next call without restarting anything.
-let authToken: string;
+let authToken!: string;
 let refreshToken: string | undefined;
 // True once this worker is authenticating via a per-worker session (Stage
 // 3) rather than the legacy shared secret (Stage 1) -- only a session can be
@@ -2232,15 +2373,21 @@ const RAW_JSON_PRUNE_INTERVAL_MS = 24 * 60 * 60 * 1000;
 pruneRawJson();
 setInterval(pruneRawJson, RAW_JSON_PRUNE_INTERVAL_MS).unref();
 
-// Populate the model-files cache right away so the first heartbeat after
-// startup doesn't report an empty list, then keep it fresh on a timer -- see
-// refreshModelDirFilesCache above.
-const MODEL_LIST_REFRESH_INTERVAL_MS = 2 * 60 * 1000;
-refreshModelDirFilesCache();
-setInterval(refreshModelDirFilesCache, MODEL_LIST_REFRESH_INTERVAL_MS).unref();
-
-log.info(`[worker ${config.worker_name}] no inbound HTTP listener -- pull queue only (tailnet not required)`);
+// Run startup reconciliation after authentication is established
+// This runs in the background and doesn't block startup
 await ensureAuthCredential();
+
+// Now start the reconciliation with the auth token
+void runStartupReconciliation(
+  config.model_dir,
+  localModelCache,
+  config.vps_url,
+  authToken,
+  config.raw_json_dir
+).catch((err) => {
+  log.error(`Startup reconciliation failed: ${err instanceof Error ? err.message : String(err)}`);
+});
+
 startHeartbeatLoop();
 void workerMain();
 

@@ -244,6 +244,29 @@ CREATE TABLE IF NOT EXISTS meta (
   value TEXT
 );
 
+-- Hugging Face GGUF index -- see server/src/hf-index.ts for the full
+-- indexing flow. One row per (sha256, repo_id, filename, revision)
+-- combination. Composite PRIMARY KEY (sha256, repo_id, filename) so the same
+-- content hash mirrored across repos (or renamed files) keeps distinct rows
+-- rather than collapsing via sha256-only conflict. last_seen tracks when this
+-- row was last confirmed present on HF (for incremental refresh -- repos
+-- whose last_seen is older than the refresh interval get re-checked).
+CREATE TABLE IF NOT EXISTS hf_gguf_index (
+  sha256 TEXT NOT NULL,
+  repo_id TEXT NOT NULL,
+  filename TEXT NOT NULL,
+  revision TEXT,
+  file_size INTEGER,
+  last_seen INTEGER NOT NULL,
+  deleted_at INTEGER,
+  PRIMARY KEY (sha256, repo_id, filename)
+);
+
+CREATE INDEX IF NOT EXISTS idx_hf_gguf_index_sha256 ON hf_gguf_index(sha256);
+CREATE INDEX IF NOT EXISTS idx_hf_gguf_index_repo ON hf_gguf_index(repo_id);
+CREATE INDEX IF NOT EXISTS idx_hf_gguf_index_last_seen ON hf_gguf_index(last_seen);
+CREATE INDEX IF NOT EXISTS idx_hf_gguf_index_deleted_at ON hf_gguf_index(deleted_at);
+
 -- idx_results_item (UNIQUE on results(run_id, idx, test_type), guarding
 -- against a retried terminal item report inserting a second results row) is
 -- deliberately NOT created here. results.idx is only added as a column by
@@ -252,3 +275,29 @@ CREATE TABLE IF NOT EXISTS meta (
 -- on any DB whose results table predates that column. See migrate.ts's
 -- createResultsItemUniqueIndex, called once idx is guaranteed to exist and
 -- be backfilled.
+
+-- Worker-local persistent cache of model file hashes and their HF
+-- mappings. See worker/src/local-cache.ts for the full scan/validate/
+-- hash/resolve flow. path is the PRIMARY KEY because it's worker-local:
+-- each worker maintains its own cache for its own model_dir. sha256 and
+-- hf_model_id are optional: a file that hasn't been hashed yet has neither,
+-- and a hashed file with no HF match has sha256 but no hf_model_id.
+-- last_verified tracks when this row was last confirmed valid (for
+-- incremental re-validation -- files whose mtime changed or whose
+-- last_verified is older than the recheck interval get re-hashed).
+-- state is the ModelState enum (detected/hashing/verified/etc) - see
+-- shared/types.ts. Present in worker DB, but also defined here for
+-- tooling/inspection of a worker DB copied to server side.
+CREATE TABLE IF NOT EXISTS local_model_cache (
+  path TEXT PRIMARY KEY,
+  size INTEGER NOT NULL,
+  mtime INTEGER NOT NULL,
+  sha256 TEXT,
+  hf_model_id TEXT,
+  last_verified INTEGER NOT NULL,
+  state TEXT NOT NULL DEFAULT 'detected'
+);
+
+CREATE INDEX IF NOT EXISTS idx_local_model_cache_sha256 ON local_model_cache(sha256);
+CREATE INDEX IF NOT EXISTS idx_local_model_cache_hf ON local_model_cache(hf_model_id);
+CREATE INDEX IF NOT EXISTS idx_local_model_cache_state ON local_model_cache(state);

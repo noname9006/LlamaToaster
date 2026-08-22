@@ -19,6 +19,7 @@ import { statsRoutes } from "./routes/stats.js";
 import { getDb } from "./db/migrate.js";
 import { runMaintenanceSweep, REAP_INTERVAL_MS } from "./reaper.js";
 import { authMiddleware } from "./auth-middleware.js";
+import { startHfIndexService, stopHfIndexService } from "./hf-index.js";
 
 // Backs the AI assistant's server-side config only (AI_API_KEY/AI_BASE_URL/
 // AI_MODEL, see routes/ai.ts) -- every other env var here (PORT,
@@ -195,8 +196,15 @@ app.addHook("onClose", async () => {
 const reapInterval = setInterval(() => runMaintenanceSweep(app.log), REAP_INTERVAL_MS);
 reapInterval.unref();
 
+// Hugging Face GGUF index service -- see server/src/hf-index.ts for the
+// full indexing flow. Started after the server is listening so a slow
+// initial scan doesn't delay the first request; stopped on shutdown
+// alongside the other background intervals.
+startHfIndexService();
+
 app.addHook("onClose", async () => {
   clearInterval(reapInterval);
+  stopHfIndexService();
 });
 
 // Public (MULTIUSER_PLAN.md §6.2): a bare {ok, db} only -- this used to also

@@ -44,7 +44,15 @@ export async function sessionRoutes(app: FastifyInstance): Promise<void> {
     }
 
     const session = repo.sessionRepo.getByRefreshHash(hash);
-    if (!session || session.expiresAt < Date.now()) throw new UnauthorizedError("refresh token expired");
+    if (!session) throw new UnauthorizedError("refresh token expired");
+    // Sliding expiry for worker refresh tokens, same as every other
+    // authenticated route (auth-middleware.ts:170, worker-auth.ts:31): a
+    // worker that's actively heartbeating/polling keeps its refresh token
+    // alive indefinitely. Without this, a 90-day refresh token on a worker
+    // that never sleeps would expire on its own and force a re-enrolment
+    // every ~3 months -- the exact UX gap this worker hit.
+    repo.sessionRepo.touch(session);
+    if (session.expiresAt < Date.now()) throw new UnauthorizedError("refresh token expired");
 
     // sessions.id is STABLE across rotation -- a caller that stored it
     // earlier (Stage 3's workers.session_id) is never orphaned by a refresh.

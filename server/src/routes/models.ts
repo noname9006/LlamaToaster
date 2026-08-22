@@ -1,9 +1,10 @@
 import type { FastifyInstance } from "fastify";
 import { repo } from "../db/repo.js";
 import { getHfGgufMeta } from "../hf.js";
+import { lookupHfGgufHashes, verifyRepoInBackground, HF_INDEX_REFRESH_INTERVAL_MS } from "../hf-index.js";
 import { isMtpDraftModel } from "../../../shared/types.js";
 import type { RegisterModelInput } from "../../../shared/types.js";
-import { userOrIpKeyGenerator, resolveAuthUser } from "../auth-middleware.js";
+import { userOrIpKeyGenerator, resolveAuthUser, assertOwnsWorker } from "../auth-middleware.js";
 import { ForbiddenError } from "../errors.js";
 
 const HF_META_TIMEOUT_MS = 15_000;
@@ -23,11 +24,36 @@ const hfUpdatesCache = new Map<string, { value: string | null; expiresAt: number
 // runs.ts's trigger limit) -- shared across POST /api/models and both
 // backfill routes below, all comparably cheap-but-not-free registry writes.
 const REGISTRY_WRITE_RATE_LIMIT = { max: 60, timeWindow: "1 hour", keyGenerator: userOrIpKeyGenerator } as const;
+const HASH_LOOKUP_RATE_LIMIT = { max: 120, timeWindow: "1 hour", keyGenerator: userOrIpKeyGenerator } as const;
 
 export async function modelsRoutes(app: FastifyInstance): Promise<void> {
   app.get("/api/models", async () => {
     return { models: repo.listModels() };
   });
+
+  // Trigger a full model refresh on a specific worker
+  app.post<{ Body: { worker_id?: string } }>(
+    "/api/models/refresh",
+    async (request, reply) => {
+      const { worker_id } = request.body ?? {};
+      const authed = resolveAuthUser(request);
+      
+      // If worker_id specified, verify ownership and queue refresh job
+      if (worker_id) {
+        const worker = repo.workerRepo.getWorker(worker_id);
+        if (!worker) {
+          return reply.code(404).send({ error: "unknown machine" });
+        }
+        assertOwnsWorker(authed?.user.id, worker.id);
+        
+        const jobId = repo.queueRepo.enqueueJob(worker.id, { type: "refresh_models", payload: {} });
+        return reply.code(202).send({ ok: true, queued: true, job_id: jobId, message: "Model refresh job queued" });
+      }
+      
+      // If no worker_id, return guidance
+      return reply.code(400).send({ error: "worker_id is required to trigger a model refresh" });
+    }
+  );
 
   app.post<{ Body: RegisterModelInput }>(
     "/api/models",
@@ -250,4 +276,42 @@ export async function modelsRoutes(app: FastifyInstance): Promise<void> {
     );
     return { updates };
   });
+
+  // Hash lookup: workers send SHA-256 hashes of local files, and the server
+  // returns the matching HF metadata (repo_id, filename, revision) so the
+  // client can display "this is bartowski/gemma-3-27b-it-GGUF/…". This is
+  // the bridge between the worker's local file scan and the server's
+  // hf_gguf_index table (see server/src/hf-index.ts for how that index is
+  // built). Hashes not in the index are simply absent from the result --
+  // the caller falls back to "unknown" state for those.
+  // Rate-limited per IP/user (same posture as registry writes) to prevent abuse.
+  app.post<{ Body: { hashes?: string[] } }>(
+    "/api/models/hash-lookup",
+    { config: { rateLimit: HASH_LOOKUP_RATE_LIMIT } },
+    async (request, reply) => {
+      const hashes = request.body?.hashes;
+      if (!Array.isArray(hashes) || hashes.length === 0) {
+        return reply.code(400).send({ error: "hashes array is required" });
+      }
+      // Cap at a reasonable batch size to bound the query and prevent
+      // abuse -- a worker heartbeat carries at most its model_dir's files.
+      if (hashes.length > 500) {
+        return reply.code(400).send({ error: "too many hashes (max 500)" });
+      }
+      const results = lookupHfGgufHashes(hashes);
+      // Lazy, on-demand verification instead of a background reconciliation
+      // crawl: a matched row that's gone stale gets re-checked against HF
+      // only because a real worker just depended on it, not on a schedule.
+      // Fire-and-forget -- never delays this response; a soft-delete (or
+      // updated files) lands in the DB in time for the *next* lookup.
+      // Already-deleted rows are skipped -- no value in repeatedly re-asking
+      // HF about a repo already confirmed gone.
+      for (const r of results) {
+        if (r.deleted_at == null && Date.now() - r.last_seen > HF_INDEX_REFRESH_INTERVAL_MS) {
+          verifyRepoInBackground(r.repo_id);
+        }
+      }
+      return { results };
+    }
+  );
 }
