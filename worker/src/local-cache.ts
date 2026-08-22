@@ -1,5 +1,4 @@
-import { open, type Database } from "sqlite";
-import sqlite3 from "sqlite3";
+import Database from "better-sqlite3";
 import { resolve } from "node:path";
 import { existsSync, mkdirSync } from "node:fs";
 import { log } from "./log.js";
@@ -24,8 +23,18 @@ export interface LocalCacheEntry {
 
 const LOCAL_CACHE_DB_NAME = "local-model-cache.sqlite";
 
+// Public methods stay `async`/Promise-returning even though better-sqlite3
+// itself is synchronous -- callers (model-scanner.ts, worker/src/index.ts)
+// already await these, and keeping the same contract means this file is the
+// only one that needed to change when the driver did. Was `sqlite`/`sqlite3`
+// (async node-sqlite3 wrapper) until that package's unreliable prebuild
+// coverage started crashing fresh `npm install`s with no C++ toolchain on
+// PATH ("Could not locate the bindings file") -- better-sqlite3 is already
+// this repo's server-side driver and has broad, actively-maintained prebuild
+// coverage, so reusing it here removes the failure mode entirely instead of
+// requiring every worker host to have Visual Studio Build Tools installed.
 export class LocalModelCache {
-  private db: Database | null = null;
+  private db: Database.Database | null = null;
   private cacheDir: string;
   private dbPath: string;
 
@@ -43,22 +52,16 @@ export class LocalModelCache {
       // Read-only or permission error - fallback to in-memory DB to keep worker alive
       // Cache will be ephemeral but hashing will still work (just rehash each startup)
       log.warn(`Failed to create cache dir ${this.cacheDir}: ${err instanceof Error ? err.message : String(err)} - using in-memory cache`);
-      this.db = await open({
-        filename: ":memory:",
-        driver: sqlite3.Database,
-      });
-      await this.db.exec("PRAGMA foreign_keys = ON;");
-      await this.createTables();
+      this.db = new Database(":memory:");
+      this.db.pragma("foreign_keys = ON");
+      this.createTables();
       log.info(`Local model cache initialized in-memory (ephemeral)`);
       return;
     }
 
     // Try to open DB, with recovery for corrupted file
     try {
-      this.db = await open({
-        filename: this.dbPath,
-        driver: sqlite3.Database,
-      });
+      this.db = new Database(this.dbPath);
     } catch (err) {
       log.warn(`Failed to open cache DB at ${this.dbPath}: ${err instanceof Error ? err.message : String(err)} - attempting recovery`);
       try {
@@ -67,53 +70,47 @@ export class LocalModelCache {
         try { unlinkSync(this.dbPath); } catch {}
         try { unlinkSync(`${this.dbPath}-wal`); } catch {}
         try { unlinkSync(`${this.dbPath}-shm`); } catch {}
-        this.db = await open({
-          filename: this.dbPath,
-          driver: sqlite3.Database,
-        });
+        this.db = new Database(this.dbPath);
         log.info(`Cache DB recovered by deleting corrupted file`);
       } catch (recoveryErr) {
         log.error(`Cache recovery failed: ${recoveryErr instanceof Error ? recoveryErr.message : String(recoveryErr)} - using in-memory`);
-        this.db = await open({
-          filename: ":memory:",
-          driver: sqlite3.Database,
-        });
+        this.db = new Database(":memory:");
       }
     }
 
     try {
       // Enable WAL mode for better concurrency (may fail on in-memory or read-only)
-      await this.db.exec("PRAGMA journal_mode = WAL;");
+      this.db.pragma("journal_mode = WAL");
     } catch {}
     try {
-      await this.db.exec("PRAGMA synchronous = NORMAL;");
+      this.db.pragma("synchronous = NORMAL");
     } catch {}
     try {
-      await this.db.exec("PRAGMA foreign_keys = ON;");
+      this.db.pragma("foreign_keys = ON");
     } catch {}
 
     try {
-      await this.createTables();
+      this.createTables();
     } catch (err) {
       // Table creation failed due to corruption or version mismatch - try to recreate from scratch
       log.warn(`Failed to create tables: ${err instanceof Error ? err.message : String(err)} - resetting cache`);
       try {
-        await this.db.exec(`DROP TABLE IF EXISTS local_model_cache`);
-        await this.createTables();
+        this.db.exec(`DROP TABLE IF EXISTS local_model_cache`);
+        this.createTables();
       } catch (e2) {
         log.error(`Cache reset failed: ${e2 instanceof Error ? e2.message : String(e2)} - using in-memory`);
-        await this.db.close().catch(() => {});
-        this.db = await open({ filename: ":memory:", driver: sqlite3.Database });
-        await this.createTables();
+        this.db.close();
+        this.db = new Database(":memory:");
+        this.createTables();
       }
     }
     log.info(`Local model cache initialized at ${this.dbPath}`);
   }
 
-  private async createTables(): Promise<void> {
+  private createTables(): void {
     if (!this.db) throw new Error("Database not initialized");
 
-    await this.db.exec(`
+    this.db.exec(`
       CREATE TABLE IF NOT EXISTS local_model_cache (
         path TEXT PRIMARY KEY,
         size INTEGER NOT NULL,
@@ -133,102 +130,102 @@ export class LocalModelCache {
 
     // Migration for DBs created before these columns existed (CREATE TABLE IF
     // NOT EXISTS is a no-op on an already-existing table).
-    const cols = await this.db.all(`PRAGMA table_info(local_model_cache)`) as { name: string }[];
+    const cols = this.db.prepare(`PRAGMA table_info(local_model_cache)`).all() as { name: string }[];
     if (!cols.some((c) => c.name === "state")) {
-      await this.db.exec(`ALTER TABLE local_model_cache ADD COLUMN state TEXT NOT NULL DEFAULT 'detected'`);
-      await this.db.exec(`CREATE INDEX IF NOT EXISTS idx_local_model_cache_state ON local_model_cache(state)`);
+      this.db.exec(`ALTER TABLE local_model_cache ADD COLUMN state TEXT NOT NULL DEFAULT 'detected'`);
+      this.db.exec(`CREATE INDEX IF NOT EXISTS idx_local_model_cache_state ON local_model_cache(state)`);
     }
     if (!cols.some((c) => c.name === "hf_checked_at")) {
-      await this.db.exec(`ALTER TABLE local_model_cache ADD COLUMN hf_checked_at INTEGER`);
+      this.db.exec(`ALTER TABLE local_model_cache ADD COLUMN hf_checked_at INTEGER`);
     }
     if (!cols.some((c) => c.name === "hf_deleted_at")) {
-      await this.db.exec(`ALTER TABLE local_model_cache ADD COLUMN hf_deleted_at INTEGER`);
+      this.db.exec(`ALTER TABLE local_model_cache ADD COLUMN hf_deleted_at INTEGER`);
     }
   }
 
   async get(path: string): Promise<LocalCacheEntry | null> {
     if (!this.db) throw new Error("Database not initialized");
 
-    const row = await this.db.get(
-      `SELECT path, size, mtime, sha256, hf_model_id, hf_checked_at, hf_deleted_at, last_verified, state
-       FROM local_model_cache WHERE path = ?`,
-      path
-    );
+    const row = this.db
+      .prepare(
+        `SELECT path, size, mtime, sha256, hf_model_id, hf_checked_at, hf_deleted_at, last_verified, state
+         FROM local_model_cache WHERE path = ?`
+      )
+      .get(path);
 
-    return row ? this.mapRow(row) : null;
+    return row ? this.mapRow(row as Parameters<LocalModelCache["mapRow"]>[0]) : null;
   }
 
   async getAll(): Promise<LocalCacheEntry[]> {
     if (!this.db) throw new Error("Database not initialized");
 
-    const rows = await this.db.all(
-      `SELECT path, size, mtime, sha256, hf_model_id, hf_checked_at, hf_deleted_at, last_verified, state
-       FROM local_model_cache`
-    );
+    const rows = this.db
+      .prepare(
+        `SELECT path, size, mtime, sha256, hf_model_id, hf_checked_at, hf_deleted_at, last_verified, state
+         FROM local_model_cache`
+      )
+      .all();
 
-    return rows.map(this.mapRow);
+    return (rows as Parameters<LocalModelCache["mapRow"]>[0][]).map((r) => this.mapRow(r));
   }
 
   async getBySha256(sha256: string): Promise<LocalCacheEntry | null> {
     if (!this.db) throw new Error("Database not initialized");
 
-    const row = await this.db.get(
-      `SELECT path, size, mtime, sha256, hf_model_id, hf_checked_at, hf_deleted_at, last_verified, state
-       FROM local_model_cache WHERE sha256 = ?`,
-      sha256
-    );
+    const row = this.db
+      .prepare(
+        `SELECT path, size, mtime, sha256, hf_model_id, hf_checked_at, hf_deleted_at, last_verified, state
+         FROM local_model_cache WHERE sha256 = ?`
+      )
+      .get(sha256);
 
-    return row ? this.mapRow(row) : null;
+    return row ? this.mapRow(row as Parameters<LocalModelCache["mapRow"]>[0]) : null;
   }
 
   async upsert(entry: LocalCacheEntry): Promise<void> {
     if (!this.db) throw new Error("Database not initialized");
 
-    await this.db.run(
-      `INSERT INTO local_model_cache (path, size, mtime, sha256, hf_model_id, hf_checked_at, hf_deleted_at, last_verified, state)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(path) DO UPDATE SET
-         size = excluded.size,
-         mtime = excluded.mtime,
-         sha256 = excluded.sha256,
-         hf_model_id = excluded.hf_model_id,
-         hf_checked_at = excluded.hf_checked_at,
-         hf_deleted_at = excluded.hf_deleted_at,
-         last_verified = excluded.last_verified,
-         state = excluded.state`,
-      entry.path,
-      entry.size,
-      entry.mtime,
-      entry.sha256 ?? null,
-      entry.hf_model_id ?? null,
-      entry.hf_checked_at ?? null,
-      entry.hf_deleted_at ?? null,
-      entry.last_verified,
-      entry.state
-    );
+    this.db
+      .prepare(
+        `INSERT INTO local_model_cache (path, size, mtime, sha256, hf_model_id, hf_checked_at, hf_deleted_at, last_verified, state)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(path) DO UPDATE SET
+           size = excluded.size,
+           mtime = excluded.mtime,
+           sha256 = excluded.sha256,
+           hf_model_id = excluded.hf_model_id,
+           hf_checked_at = excluded.hf_checked_at,
+           hf_deleted_at = excluded.hf_deleted_at,
+           last_verified = excluded.last_verified,
+           state = excluded.state`
+      )
+      .run(
+        entry.path,
+        entry.size,
+        entry.mtime,
+        entry.sha256 ?? null,
+        entry.hf_model_id ?? null,
+        entry.hf_checked_at ?? null,
+        entry.hf_deleted_at ?? null,
+        entry.last_verified,
+        entry.state
+      );
   }
 
   async updateState(path: string, state: LocalModelState): Promise<void> {
     if (!this.db) throw new Error("Database not initialized");
 
-    await this.db.run(
-      `UPDATE local_model_cache SET state = ?, last_verified = ? WHERE path = ?`,
-      state,
-      Date.now(),
-      path
-    );
+    this.db
+      .prepare(`UPDATE local_model_cache SET state = ?, last_verified = ? WHERE path = ?`)
+      .run(state, Date.now(), path);
   }
 
   async updateHash(path: string, sha256: string): Promise<void> {
     if (!this.db) throw new Error("Database not initialized");
 
-    await this.db.run(
-      `UPDATE local_model_cache SET sha256 = ?, state = ?, last_verified = ? WHERE path = ?`,
-      sha256,
-      "hashing",
-      Date.now(),
-      path
-    );
+    this.db
+      .prepare(`UPDATE local_model_cache SET sha256 = ?, state = ?, last_verified = ? WHERE path = ?`)
+      .run(sha256, "hashing", Date.now(), path);
   }
 
   // deletedAt: the server's hf_gguf_index.deleted_at for this match (null if
@@ -238,21 +235,17 @@ export class LocalModelCache {
   async updateHfMatch(path: string, hf_model_id: string, deletedAt: number | null = null): Promise<void> {
     if (!this.db) throw new Error("Database not initialized");
 
-    await this.db.run(
-      `UPDATE local_model_cache SET hf_model_id = ?, hf_checked_at = ?, hf_deleted_at = ?, state = ?, last_verified = ? WHERE path = ?`,
-      hf_model_id,
-      Date.now(),
-      deletedAt,
-      "verified",
-      Date.now(),
-      path
-    );
+    this.db
+      .prepare(
+        `UPDATE local_model_cache SET hf_model_id = ?, hf_checked_at = ?, hf_deleted_at = ?, state = ?, last_verified = ? WHERE path = ?`
+      )
+      .run(hf_model_id, Date.now(), deletedAt, "verified", Date.now(), path);
   }
 
   async delete(path: string): Promise<void> {
     if (!this.db) throw new Error("Database not initialized");
 
-    await this.db.run(`DELETE FROM local_model_cache WHERE path = ?`, path);
+    this.db.prepare(`DELETE FROM local_model_cache WHERE path = ?`).run(path);
   }
 
   async deleteMissing(existingPaths: string[]): Promise<number> {
@@ -260,21 +253,20 @@ export class LocalModelCache {
 
     if (existingPaths.length === 0) {
       // Delete all entries if no files exist
-      const result = await this.db.run(`DELETE FROM local_model_cache`);
+      const result = this.db.prepare(`DELETE FROM local_model_cache`).run();
       return result.changes ?? 0;
     }
 
     const placeholders = existingPaths.map(() => "?").join(",");
-    const result = await this.db.run(
-      `DELETE FROM local_model_cache WHERE path NOT IN (${placeholders})`,
-      ...existingPaths
-    );
+    const result = this.db
+      .prepare(`DELETE FROM local_model_cache WHERE path NOT IN (${placeholders})`)
+      .run(...existingPaths);
     return result.changes ?? 0;
   }
 
   async close(): Promise<void> {
     if (this.db) {
-      await this.db.close();
+      this.db.close();
       this.db = null;
     }
   }
