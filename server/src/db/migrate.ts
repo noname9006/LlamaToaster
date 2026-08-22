@@ -34,6 +34,7 @@ function migrate(database: Database.Database): void {
   createWorkerEnrolmentIndexes(database);
   createMultiTenancyIndexes(database);
   createHfGgufIndexSha256Index(database);
+  createHfGgufIndexDeletedAtIndex(database);
 }
 
 interface ColumnSpec {
@@ -102,6 +103,14 @@ const COLUMN_MIGRATIONS: ColumnSpec[] = [
   // parseOffloadLayers.
   { table: "results", column: "gpu_layers_loaded_draft", ddlType: "INTEGER" },
   { table: "results", column: "total_model_layers_draft", ddlType: "INTEGER" },
+  // Estimated actually-VRAM-resident base-model layer count, written only by
+  // a worker whose post-run VRAM-discrepancy check fired for this item (the
+  // Windows CUDA sysmem-fallback case) -- see shared/types.ts's ResultRow
+  // doc comment and shared/vramEstimate.ts's estimateResidentGpuLayers.
+  // NULL on every row inserted before this migration and on every row whose
+  // offload claim wasn't contradicted -- both correctly read as "no
+  // independent residency estimate, claim stands".
+  { table: "results", column: "gpu_layers_resident_est", ddlType: "INTEGER" },
   // -ngld for the MTP/draft companion model -- see shared/sweep.ts's
   // SweepItem.n_gpu_layers_draft. DEFAULT 0 (not NULL) so a row/item
   // predating this column reads the same as "not applicable", matching
@@ -315,6 +324,15 @@ function migrateHfGgufIndexPk(database: Database.Database): void {
 
 function createHfGgufIndexSha256Index(database: Database.Database): void {
   database.exec(`CREATE INDEX IF NOT EXISTS idx_hf_gguf_index_sha256 ON hf_gguf_index(sha256)`);
+}
+
+// Same "must run after applyColumnMigrations" ordering rule as the function
+// above -- deleted_at only exists as a column once that migration has
+// applied (COLUMN_MIGRATIONS), so an index on it in schema.sql's static
+// CREATE TABLE block would fail on any DB that already had hf_gguf_index
+// before this column was added.
+function createHfGgufIndexDeletedAtIndex(database: Database.Database): void {
+  database.exec(`CREATE INDEX IF NOT EXISTS idx_hf_gguf_index_deleted_at ON hf_gguf_index(deleted_at)`);
 }
 
 // Multi-user Stage 4 (MULTIUSER_PLAN.md §4.1) -- same "must run after
