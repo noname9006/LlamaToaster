@@ -265,7 +265,12 @@ CREATE TABLE IF NOT EXISTS hf_gguf_index (
 CREATE INDEX IF NOT EXISTS idx_hf_gguf_index_sha256 ON hf_gguf_index(sha256);
 CREATE INDEX IF NOT EXISTS idx_hf_gguf_index_repo ON hf_gguf_index(repo_id);
 CREATE INDEX IF NOT EXISTS idx_hf_gguf_index_last_seen ON hf_gguf_index(last_seen);
-CREATE INDEX IF NOT EXISTS idx_hf_gguf_index_deleted_at ON hf_gguf_index(deleted_at);
+-- idx_hf_gguf_index_deleted_at is created in migrate.ts's
+-- createHfGgufIndexDeletedAtIndex, not here -- deleted_at is added via
+-- COLUMN_MIGRATIONS' ALTER TABLE on an already-existing DB (this
+-- CREATE TABLE IF NOT EXISTS is a no-op there), so an index on it in this
+-- file would run before the column exists and fail on any pre-existing
+-- database.
 
 -- idx_results_item (UNIQUE on results(run_id, idx, test_type), guarding
 -- against a retried terminal item report inserting a second results row) is

@@ -1,6 +1,9 @@
 node_modules/
 plans/
 
+# Planning documents -- local working drafts, not project source
+*PLAN*.md
+
 # Claude Code session runtime state (e.g. launch.json, scheduled_tasks.lock)
 # -- created by the Claude Code app itself when used against this folder,
 # not project source.

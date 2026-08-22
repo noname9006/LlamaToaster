@@ -1022,7 +1022,36 @@ export function RunDetail() {
                       <td className="pl-1 pr-0.5 py-1.5 text-muted">{it.n_threads}</td>
                       <td className="pl-0.5 pr-1 py-1.5 text-muted">{it.n_gpu_layers}</td>
                       <td className="px-1 py-1.5 text-muted">
-                        {anyResult?.gpu_layers_loaded != null && anyResult?.total_model_layers != null
+                        {/* gpu_layers_resident_est is only ever non-null when
+                            other telemetry from the same run contradicted
+                            llama.cpp's claimed offload (Windows CUDA sysmem
+                            fallback) -- see shared/types.ts's
+                            ResultRow.gpu_layers_resident_est. That telemetry
+                            is either llama.cpp's own post-allocation buffer
+                            report (preferred, see worker/src/bench.ts's
+                            parseModelBufferSizes) or, when that line wasn't
+                            available, a VRAM-sample-based estimate -- the DB
+                            doesn't record which, so this tooltip is worded to
+                            hold for either. The cell shows the estimated
+                            actually-resident figure instead of endorsing a
+                            claim that never really happened; the full
+                            claimed-vs-actual story goes in the tooltip,
+                            matching the warning already shown in this row's
+                            status column. */}
+                        {anyResult?.gpu_layers_resident_est != null && anyResult?.total_model_layers != null ? (
+                          <span
+                            className="text-warning"
+                            title={
+                              `llama.cpp reported ${anyResult.gpu_layers_loaded}/${anyResult.total_model_layers} layers offloaded to GPU, ` +
+                              `but the actual GPU memory footprint stayed far below what that would require -- only ` +
+                              `~${anyResult.gpu_layers_resident_est}/${anyResult.total_model_layers} layers were likely actually GPU-resident. ` +
+                              `The driver silently served the model from system RAM (Windows CUDA sysmem fallback); ` +
+                              `these speeds are CPU-class despite the full-offload claim.`
+                            }
+                          >
+                            ~{anyResult.gpu_layers_resident_est}/{anyResult.total_model_layers} ⚠
+                          </span>
+                        ) : anyResult?.gpu_layers_loaded != null && anyResult?.total_model_layers != null
                           ? `${anyResult.gpu_layers_loaded}/${anyResult.total_model_layers}`
                           : isTerminal
                             ? "n/a"

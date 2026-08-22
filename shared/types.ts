@@ -450,6 +450,19 @@ export interface ResultRow {
   // interchangeable.
   gpu_layers_loaded_draft?: number | null;
   total_model_layers_draft?: number | null;
+  // Worker-derived ESTIMATE of how many of gpu_layers_loaded's layers were
+  // actually VRAM-resident -- computed only when the post-run discrepancy
+  // check fired (claimed > 0 but observed vram_peak_mib implausibly below
+  // what that many resident layers would need, see shared/vramEstimate.ts's
+  // estimateResidentGpuLayers). llama.cpp's own count above reflects buffer
+  // *assignment*, never residency, and Windows' NVIDIA driver can silently
+  // back those assignments with system RAM (CUDA sysmem fallback) -- this is
+  // the "~" figure shown next to such a claim so logs/UI can say "claimed
+  // 33/33, ~=0 actually resident" instead of endorsing the claim. Null or
+  // undefined whenever the claim wasn't contradicted (nothing to correct)
+  // or no pre-run baseline existed to attribute the peak against. Base model
+  // only -- the draft companion isn't separately verified.
+  gpu_layers_resident_est?: number | null;
   // Only ever populated by the llama-server/MTP path (worker/src/serverBench.ts)
   // -- the llama-bench-CLI path (bench.ts) does its own internal repeat
   // averaging and never sees individual readings, so these stay undefined
@@ -539,6 +552,13 @@ export interface IngestResultInput {
   // total_model_layers above (always the base model's).
   gpu_layers_loaded_draft?: number | null;
   total_model_layers_draft?: number | null;
+  // Optional (like n_gpu_layers_draft/n_cpu_moe above) so a version-skewed
+  // worker that predates this field simply won't send it -- and null when a
+  // current worker ran the discrepancy check but had nothing to flag. Only
+  // ever non-null when the item's claimed offload was contradicted by its
+  // own VRAM telemetry -- see ResultRow.gpu_layers_resident_est and
+  // shared/vramEstimate.ts.
+  gpu_layers_resident_est?: number | null;
   sample_count?: number;
   suspect_count?: number;
   suspect_samples?: number[];

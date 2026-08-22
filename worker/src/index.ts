@@ -23,7 +23,12 @@ import { runBench, matchOffloadLine, type BenchResult, type OffloadResult } from
 import { runServerBench } from "./serverBench.js";
 import { MemorySampler, captureFreeMemoryBaseline, type SampleStats, type FreeMemoryBaseline } from "./sampler.js";
 import { readGpuMemory } from "./vram.js";
-import { estimateVramNeededMib, isVramDiscrepancy } from "../../shared/vramEstimate.js";
+import {
+  estimateResidentGpuLayers,
+  estimateResidentGpuLayersFromBufferSizes,
+  estimateVramNeededMib,
+  isVramDiscrepancy,
+} from "../../shared/vramEstimate.js";
 import {
   writeRawJson,
   postRunItemUpdate,
@@ -934,11 +939,48 @@ function formatDeviceSelection(backend: Backend, mainGpu: number | undefined): s
     : `main_gpu=${mainGpu} is OUT OF RANGE -- only ${visible.length} ${backend}-visible GPU(s) detected`;
 }
 
-function formatOffloadLine(offload: OffloadResult): string {
+export interface OffloadDiscrepancy {
+  estimatedMib: number;
+  observedMib: number;
+  residentEst: number | null;
+  // Which telemetry this was judged against -- llama_cpp_buffer means
+  // finalizeSweepItemResult found llama.cpp's own "model buffer size" lines
+  // (see bench.ts's parseModelBufferSizes) and trusted those as ground truth
+  // over the external VRAM sample; vram_sample means that line was never
+  // seen (old build, or the item failed before tensor loading finished) and
+  // this fell back to the original vram_peak_mib-vs-estimate heuristic.
+  // Purely cosmetic here -- only changes which noun this log line uses for
+  // observedMib.
+  source: "llama_cpp_buffer" | "vram_sample";
+}
+
+function formatOffloadLine(
+  offload: OffloadResult,
+  // Only ever passed on the success path, and only when finalizeSweepItem-
+  // Result's VRAM-discrepancy check fired for this item -- i.e. llama.cpp's
+  // own X/Y above was contradicted by other telemetry from the same run.
+  // residentEst itself is null when there wasn't enough to attribute the
+  // shortfall against (see estimateResidentGpuLayers/
+  // estimateResidentGpuLayersFromBufferSizes); the line then says UNVERIFIED
+  // instead of inventing a layer count.
+  discrepancy?: OffloadDiscrepancy
+): string {
   if (!offload.main) return "offload: unknown (no offload line seen in output)";
   const main = `main=${offload.main.gpu_layers_loaded}/${offload.main.total_model_layers}`;
   const draft = offload.draft ? ` draft=${offload.draft.gpu_layers_loaded}/${offload.draft.total_model_layers}` : "";
-  return `offload: ${main}${draft}`;
+  let note = "";
+  if (discrepancy && offload.main) {
+    const observedLabel =
+      discrepancy.source === "llama_cpp_buffer"
+        ? `llama.cpp's own GPU buffer only ${discrepancy.observedMib}MiB`
+        : `VRAM peaked ${discrepancy.observedMib}MiB`;
+    note =
+      discrepancy.residentEst != null
+        ? ` -- CLAIMED ONLY: ~=${discrepancy.residentEst}/${offload.main.total_model_layers} actually resident` +
+          ` (${observedLabel} vs ~${discrepancy.estimatedMib}MiB expected)`
+        : ` -- UNVERIFIED: ${observedLabel} vs ~${discrepancy.estimatedMib}MiB expected`;
+  }
+  return `offload: ${main}${draft}${note}`;
 }
 
 // Mirrors the ram/vram columns RunDetail.tsx's results table shows (free,
@@ -1078,31 +1120,80 @@ async function finalizeSweepItemResult(
   // the required verbosity flag).
   const offload: OffloadResult = bench.offload ?? { main: null, draft: null };
   // llama.cpp's own "offloaded X/Y layers to GPU" line only ever reflects
-  // buffer *assignment*, never actual VRAM residency (see
-  // shared/vramEstimate.ts's top comment) -- so a claimed-full offload with
-  // an implausibly low observed vram_peak_mib means the model likely never
-  // really left system RAM (Windows CUDA sysmem fallback), regardless of
-  // what llama.cpp itself believes happened. Only checked once there's
-  // something real to compare: a positive offload claim and an actual VRAM
-  // sample (both null/0 on a cpu-backend or -ngl 0 run -- nothing to flag).
-  // Also skipped whenever item.n_cpu_moe > 0: a deliberate partial MoE-to-CPU
-  // placement *correctly* produces lower VRAM than this estimate expects
-  // (that's the whole point of --n-cpu-moe, see shared/sweep.ts's
-  // SweepItem.n_cpu_moe) -- without this guard, every legitimate cpu-moe run
-  // would false-positive against the exact warning built to catch the
-  // opposite problem.
+  // buffer *assignment* -- the ggml scheduler's plan, printed before any
+  // buffer is actually allocated -- never confirmed residency (see
+  // shared/vramEstimate.ts's top comment). A claimed-full offload can still
+  // mean the model never really left system RAM (Windows CUDA sysmem
+  // fallback), regardless of what llama.cpp's own plan-stage line says.
+  // Checked two ways, in order of trust:
+  //   1. bench.modelBufferSizes -- llama.cpp's own POST-allocation report of
+  //      which backend buffer it actually created for the weights (see
+  //      bench.ts's parseModelBufferSizes). Ground truth about the
+  //      scheduler's real decision, independent of the external VRAM
+  //      sampler entirely -- so it still catches a scheduler-level CPU
+  //      fallback even when readGpuMemory's nvidia-smi pid-matching (see
+  //      vram.ts, unverified live) missed this process, or a sample landed
+  //      at an unlucky moment.
+  //   2. The original vram_peak_mib-vs-estimate heuristic -- only reached
+  //      when (1) found nothing, i.e. an older llama.cpp build without
+  //      -v/-lv 4 support for the buffer-size line, or an item that failed
+  //      before tensor loading finished.
+  // Neither path runs at all unless there's something real to compare: a
+  // positive offload claim (both null/0 on a cpu-backend or -ngl 0 run --
+  // nothing to flag). Also skipped whenever item.n_cpu_moe > 0: a deliberate
+  // partial MoE-to-CPU placement *correctly* produces a smaller GPU share
+  // than either check expects (that's the whole point of --n-cpu-moe, see
+  // shared/sweep.ts's SweepItem.n_cpu_moe) -- without this guard, every
+  // legitimate cpu-moe run would false-positive against the exact warning
+  // built to catch the opposite problem.
   let vramDiscrepancyWarning: string | undefined;
-  if (item.n_cpu_moe === 0 && offload.main && offload.main.gpu_layers_loaded > 0 && stats.vram_peak_mib != null) {
+  // Structured sibling of the string below, carrying the same numbers onward
+  // to formatOffloadLine (the log's offload line) and each result row's
+  // gpu_layers_resident_est -- so a silently-sysmem-backed run shows
+  // "claimed 33/33, ~=0 actually resident" everywhere, not just in this
+  // warning paragraph.
+  let offloadDiscrepancy: OffloadDiscrepancy | undefined;
+  if (item.n_cpu_moe === 0 && offload.main && offload.main.gpu_layers_loaded > 0) {
     const estimatedMib = estimateVramNeededMib({
       modelSizeBytes,
       totalModelLayers: offload.main.total_model_layers,
       requestedNgl: offload.main.gpu_layers_loaded,
     });
-    if (estimatedMib != null && isVramDiscrepancy(estimatedMib, stats.vram_peak_mib)) {
+    if (estimatedMib != null && bench.modelBufferSizes) {
+      const { gpuMib, cpuMib } = bench.modelBufferSizes;
+      if (isVramDiscrepancy(estimatedMib, gpuMib)) {
+        vramDiscrepancyWarning =
+          `claimed offload ${offload.main.gpu_layers_loaded}/${offload.main.total_model_layers} layers to GPU, ` +
+          `but llama.cpp's own allocator put only ~${Math.round(gpuMib)}MiB of model weights on the GPU buffer ` +
+          `(~${Math.round(cpuMib)}MiB landed on CPU instead, ~${estimatedMib}MiB expected on GPU) -- likely ` +
+          `silently running from system RAM (Windows CUDA sysmem fallback), not actual GPU offload`;
+        offloadDiscrepancy = {
+          estimatedMib,
+          observedMib: Math.round(gpuMib),
+          residentEst: estimateResidentGpuLayersFromBufferSizes(offload.main.gpu_layers_loaded, gpuMib, cpuMib),
+          source: "llama_cpp_buffer",
+        };
+      }
+    } else if (estimatedMib != null && stats.vram_peak_mib != null && isVramDiscrepancy(estimatedMib, stats.vram_peak_mib)) {
       vramDiscrepancyWarning =
         `claimed offload ${offload.main.gpu_layers_loaded}/${offload.main.total_model_layers} layers to GPU ` +
         `(~${estimatedMib}MiB expected) but observed VRAM peaked at only ${stats.vram_peak_mib}MiB -- likely ` +
         `silently running from system RAM (Windows CUDA sysmem fallback), not actual GPU offload`;
+      offloadDiscrepancy = {
+        estimatedMib,
+        observedMib: stats.vram_peak_mib,
+        residentEst: estimateResidentGpuLayers({
+          modelSizeBytes,
+          totalModelLayers: offload.main.total_model_layers,
+          claimedNgl: offload.main.gpu_layers_loaded,
+          observedPeakMib: stats.vram_peak_mib,
+          baselineUsedMib:
+            baseline.gpu_memory_total_mib != null && baseline.vram_free_before_mib != null
+              ? Math.max(0, baseline.gpu_memory_total_mib - baseline.vram_free_before_mib)
+              : null,
+        }),
+        source: "vram_sample",
+      };
     }
   }
   if (bench.code === 0 && bench.results.length > 0) {
@@ -1136,6 +1227,10 @@ async function finalizeSweepItemResult(
       total_model_layers: offload.main?.total_model_layers ?? null,
       gpu_layers_loaded_draft: offload.draft?.gpu_layers_loaded ?? null,
       total_model_layers_draft: offload.draft?.total_model_layers ?? null,
+      // Only ever non-null when the discrepancy check above fired -- see
+      // shared/types.ts's ResultRow.gpu_layers_resident_est. The UI renders
+      // this as "~N/total ⚠" in place of the raw claim.
+      gpu_layers_resident_est: offloadDiscrepancy ? offloadDiscrepancy.residentEst : null,
     }));
     // One structured block per test, covering everything RunDetail.tsx's
     // results table shows for this row (params, actual offload, pp/tg
@@ -1143,7 +1238,7 @@ async function finalizeSweepItemResult(
     // plus which engine produced it -- see the format* helpers above. This
     // replaces the previous single-line "done: pp=...tok/s ram_peak=..."
     // summary, which dropped most of that detail on the floor.
-    const summaryLines = [`${label}: TEST SUMMARY -- engine=${processName} status=done`, `  params: ${formatItemParams(item)}`, `  ${formatOffloadLine(offload)}`, `  results: ${formatResultsLine(results)}`];
+    const summaryLines = [`${label}: TEST SUMMARY -- engine=${processName} status=done`, `  params: ${formatItemParams(item)}`, `  ${formatOffloadLine(offload, offloadDiscrepancy)}`, `  results: ${formatResultsLine(results)}`];
     const ttftLine = formatTtftLine(results);
     if (ttftLine) summaryLines.push(`  ${ttftLine}`);
     for (const line of formatMemoryLines(stats, baseline)) summaryLines.push(`  ${line}`);
@@ -1314,7 +1409,13 @@ async function runSweepItem(input: RunSweepItemInput): Promise<TerminalRunItemSt
           const offloadHit = matchOffloadLine(line);
           if (offloadHit) {
             loggedLiveOffload = true;
-            log.info(`${label}: offload: main=${offloadHit.gpu_layers_loaded}/${offloadHit.total_model_layers}`);
+            // "(claimed)" -- llama.cpp's line reflects buffer assignment only,
+            // never actual VRAM residency; whether that claim held is verified
+            // against the sampler's telemetry and reported in this item's TEST
+            // SUMMARY (see formatOffloadLine's discrepancy note there).
+            log.info(
+              `${label}: offload: main=${offloadHit.gpu_layers_loaded}/${offloadHit.total_model_layers} (claimed)`
+            );
           }
         }
 

@@ -129,6 +129,17 @@ function validateIngestResult(value: unknown): string | null {
   if (row.n_cpu_moe !== undefined && (typeof row.n_cpu_moe !== "number" || !Number.isFinite(row.n_cpu_moe as number))) {
     return "n_cpu_moe must be a number";
   }
+  // Same optional-field reasoning as n_gpu_layers_draft/n_cpu_moe above --
+  // plus nullable: a current worker sends null on every ordinary row (offload
+  // claim not contradicted), a number only when its VRAM-discrepancy check
+  // fired. See shared/types.ts's ResultRow.gpu_layers_resident_est.
+  if (
+    row.gpu_layers_resident_est !== undefined &&
+    row.gpu_layers_resident_est !== null &&
+    (typeof row.gpu_layers_resident_est !== "number" || !Number.isFinite(row.gpu_layers_resident_est as number))
+  ) {
+    return "gpu_layers_resident_est must be a number or null";
+  }
   for (const field of ["suspect_samples", "repeat_samples"] as const) {
     const v = row[field];
     if (v !== undefined && (!Array.isArray(v) || !v.every((x) => typeof x === "number" && Number.isFinite(x)))) {
