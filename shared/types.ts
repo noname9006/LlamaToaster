@@ -707,6 +707,19 @@ export interface InstalledBuild {
 export interface ModelDirFile {
   path: string;
   size_bytes: number;
+  // SHA-256 of the file contents, computed by the worker on heartbeat.
+  // Optional: absent for workers running old code that doesn't hash.
+  sha256?: string;
+  // Local model state, set by the worker's local-cache flow.
+  // Absent for workers running old code (no state machine yet).
+  state?: LocalModelState;
+  // Hugging Face match metadata, resolved via the hash-lookup API.
+  // Absent when no match found or worker is old code.
+  // deleted is true once the worker has confirmed (via periodic
+  // re-verification, see worker/src/model-scanner.ts) that this match's HF
+  // source has since been removed -- absent/false for a live match or a
+  // worker running old code.
+  hf_match?: { repo_id: string; filename: string; revision: string; deleted?: boolean } | null;
 }
 
 export interface HardwareInfo {
@@ -1000,6 +1013,8 @@ export type QueueJob =
   | { job_id: string; type: "delete_build"; payload: DeleteBuildJobPayload }
   | { job_id: string; type: "download_model"; payload: DownloadModelJobPayload }
   | { job_id: string; type: "delete_model_file"; payload: { filename: string } }
+  // Triggers a full model directory reconciliation on the worker
+  | { job_id: string; type: "refresh_models"; payload: Record<string, never> }
   // No payload -- just a signal. Queued (not sent via HeartbeatResponse.control
   // like cancel/pause) so it takes its place behind whatever job is already
   // running instead of yanking the process mid-benchmark.
@@ -1212,4 +1227,54 @@ export interface CommunityFacets {
   backends: CommunityFacetValue[];
   platforms: CommunityFacetValue[];
   gpuModels: CommunityFacetValue[];
+  // When this facets snapshot was computed (ISO string). Absent for rows
+  // predating the field -- the client treats that as "stale, refresh".
+  lastUpdated?: string;
 }
+
+// Hugging Face GGUF index entry -- one row per (sha256, repo_id, filename)
+// combination in the server's hf_gguf_index table. The composite primary key
+// is (sha256, repo_id, filename) so mirrored content across repos keeps
+// distinct rows; sha256 is the lookup target (the worker sends hashes, the
+// server returns metadata). See server/src/hf-index.ts for the full flow.
+export interface HfGgufIndexEntry {
+  sha256: string;
+  repo_id: string;
+  filename: string;
+  revision: string;
+  file_size: number;
+  last_seen: number;
+  // Set when server/src/hf-index.ts confirmed this file/repo no longer
+  // exists on Hugging Face. Rows are soft-deleted, never hard-removed, so a
+  // match that's since been removed can still be reported as such (rather
+  // than silently vanishing) -- see hf-index.ts's module doc comment.
+  deleted_at: number | null;
+}
+
+// Worker-local persistent cache of model file hashes and their HF
+// mappings. See worker/src/local-cache.ts for the full scan/validate/
+// hash/resolve flow. sha256 and hf_model_id are optional: a file that
+// hasn't been hashed yet has neither, and a hashed file with no HF
+// match has sha256 but no hf_model_id.
+export interface LocalModelCacheEntry {
+  path: string;
+  size: number;
+  mtime: number;
+  sha256?: string;
+  hf_model_id?: string;
+  last_verified: number;
+}
+
+// Local model state machine -- see worker/src/local-cache.ts for the full
+// flow. Each state is a distinct UI signal on the Models page.
+export const LOCAL_MODEL_STATES = [
+  "detected",   // File discovered locally, hash not yet computed
+  "hashing",    // SHA-256 calculation in progress
+  "verified",   // Exact Hugging Face match found
+  "unknown",    // No matching SHA-256 found in the HF index
+  "modified",   // File changed since last verification
+  "corrupted",  // Download verification failed
+  "missing",    // Cached file no longer exists on disk
+] as const;
+
+export type LocalModelState = (typeof LOCAL_MODEL_STATES)[number];

@@ -1,4 +1,5 @@
 import type { Backend, LlamaCppRelease } from "../../shared/types.js";
+import { log } from "./log.js";
 
 const GITHUB_REPO = "ggml-org/llama.cpp";
 const RELEASES_URL = `https://api.github.com/repos/${GITHUB_REPO}/releases?per_page=15`;
@@ -93,7 +94,7 @@ export async function getReleases(): Promise<LlamaCppRelease[]> {
     return releases;
   } catch (err) {
     if (cache) {
-      console.error(
+      log.error(
         `[github-releases] refresh failed, serving stale cache from ${new Date(cache.fetchedAt).toISOString()}:`,
         err
       );

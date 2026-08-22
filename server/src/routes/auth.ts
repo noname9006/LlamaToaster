@@ -250,7 +250,16 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
           const mainUrl = process.env.PUBLIC_URL ?? "/";
           return reply.redirect(`${mainUrl}/login?error=not_authorized`);
         }
-        const { token } = repo.sessionRepo.create(account.id, { label: describeUserAgent(req) });
+        // §2.8: reuse an existing active browser session for this user if one
+        // exists -- every admin-origin login would otherwise mint a new
+        // session row per page refresh, the same noise the main callback
+        // below now avoids. No touch() here: the session's own last_seen_at
+        // already tracks activity, and this is a one-shot setCookie, not a
+        // request that needs sliding expiry.
+        const existing = repo.sessionRepo.getActiveBrowserSession(account.id);
+        const token = existing
+          ? repo.sessionRepo.regenerateToken(existing.id).token
+          : repo.sessionRepo.create(account.id, { label: describeUserAgent(req) }).token;
         // HOST-ONLY cookie -- no `domain` option set, same as every other
         // setCookie in this file. That absence is the entire isolation
         // mechanism: a Domain=llamatoaster.com attribute here would make
@@ -308,7 +317,13 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
         req.log.info({ user_id: user.id, provider: provider.id }, "legacy pre-auth history claimed");
       }
 
-      const { token } = repo.sessionRepo.create(user.id, { label: describeUserAgent(req) });
+      // §2.8: reuse an existing active browser session for this user if one
+      // exists, instead of minting a new session row on every OAuth callback
+      // (every page refresh). First login ever falls through to create().
+      const existing = repo.sessionRepo.getActiveBrowserSession(user.id);
+      const token = existing
+        ? repo.sessionRepo.regenerateToken(existing.id).token
+        : repo.sessionRepo.create(user.id, { label: describeUserAgent(req) }).token;
       reply.setCookie("lt_session", token, {
         httpOnly: true,
         secure: cookiesSecure(),

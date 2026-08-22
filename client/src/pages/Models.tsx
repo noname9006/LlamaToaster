@@ -302,6 +302,8 @@ export function Models() {
   const [paramsHiIndex, setParamsHiIndex] = useState(PARAMS_STOPS.length - 1);
   const [sortField, setSortField] = useState<SortField>("created");
   const [sortDir, setSortDir] = useState<SortDir>("desc");
+  const [refreshingModels, setRefreshingModels] = useState(false);
+  const [refreshModelsMsg, setRefreshModelsMsg] = useState("");
 
   const enrichedModels = useMemo(
     () =>
@@ -372,6 +374,52 @@ export function Models() {
       // Best-effort, same posture as NewRun's hfUpdates fetch -- if this
       // route is unreachable every worker section just shows no models
       // rather than breaking the page.
+    }
+  }
+
+  async function handleRefreshModels() {
+    if (!downloadWorker) {
+      setRefreshModelsMsg("Please select a worker first");
+      return;
+    }
+    setRefreshingModels(true);
+    setRefreshModelsMsg("");
+    try {
+      const res = await api.refreshModels(downloadWorker);
+      setRefreshModelsMsg(res.message);
+      // Poll job status until refresh finishes (may take minutes for large files),
+      // then reload models/locations. Fallback to fixed interval if job endpoint fails.
+      const jobId = res.job_id;
+      const workerId = downloadWorker;
+      const maxPolls = 60; // ~60 * 2s = 2 minutes max
+      let polls = 0;
+      const poll = async () => {
+        polls++;
+        try {
+          const job = await api.getJobStatus(workerId, jobId);
+          if (job.status === "completed" || job.status === "failed" || job.status === "cancelled") {
+            await Promise.all([loadModels(), loadLocations()]);
+            setRefreshingModels(false);
+            setRefreshModelsMsg(
+              job.status === "completed" ? "Refresh complete" : `Refresh ended with: ${job.status}`
+            );
+            return;
+          }
+        } catch {
+          // Job not found or transient -- fall back to reloading anyway after a few polls
+        }
+        if (polls >= maxPolls) {
+          await Promise.all([loadModels(), loadLocations()]);
+          setRefreshingModels(false);
+          setRefreshModelsMsg("Refresh polling timed out — reloaded available data");
+          return;
+        }
+        setTimeout(poll, 2000);
+      };
+      setTimeout(poll, 2000);
+    } catch (err) {
+      setRefreshModelsMsg(`Error: ${err instanceof Error ? err.message : String(err)}`);
+      setRefreshingModels(false);
     }
   }
 
@@ -787,6 +835,12 @@ export function Models() {
   function renderModelRow(m: Model, worker: Worker, indent: boolean) {
     const paramsB = modelParamsB(m);
     const key = `${m.id}:${worker.id}`;
+    
+    // Find the model file info with state from the worker's modelFiles
+    const workerModelFile = worker.modelFiles?.find(f => f.path === (m.source === "local" ? m.filename : m.hf_file));
+    const modelState = workerModelFile?.state;
+    const hfMatch = workerModelFile?.hf_match;
+
     return (
       <div
         key={key}
@@ -800,6 +854,9 @@ export function Models() {
               <span title="Standalone MTP/draft companion file -- not benchmarkable on its own, only usable as an MTP model paired with a base model on New Run">
                 <StatusPill label="MTP draft" tone="accent" />
               </span>
+            )}
+            {modelState && (
+              <StatusPill label={modelState} tone={getStateTone(modelState)} />
             )}
           </div>
           <div className="mt-0.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted">
@@ -825,7 +882,21 @@ export function Models() {
             </span>
             <span>{formatBytes(m.size_bytes)}</span>
             <StatusPill label={m.source} tone="muted" />
-            {m.hf_repo && m.hf_file && (
+            {hfMatch && hfMatch.deleted && (
+              <span
+                className="flex items-center gap-1.5 text-xs text-muted line-through decoration-muted/50"
+                title={`${hfMatch.repo_id}/${hfMatch.filename} was removed from Hugging Face`}
+              >
+                {hfMatch.repo_id}/{hfMatch.filename}
+                <StatusPill label="removed from HF" tone="warning" />
+              </span>
+            )}
+            {hfMatch && !hfMatch.deleted && (
+              <span className="text-xs text-accent">
+                {hfMatch.repo_id}/{hfMatch.filename}
+              </span>
+            )}
+            {m.hf_repo && m.hf_file && !hfMatch && (
               <a href={hfFileUrl(m.hf_repo, m.hf_file)} target="_blank" rel="noreferrer" className="text-accent hover:underline">
                 {m.hf_repo}/{m.hf_file}
               </a>
@@ -845,6 +916,19 @@ export function Models() {
         </button>
       </div>
     );
+  }
+
+  function getStateTone(state: string): "muted" | "accent" | "warning" | "danger" | "success" {
+    switch (state) {
+      case "verified": return "success";
+      case "hashing": return "accent";
+      case "detected": return "muted";
+      case "unknown": return "warning";
+      case "modified": return "warning";
+      case "corrupted": return "danger";
+      case "missing": return "danger";
+      default: return "muted";
+    }
   }
 
   function renderModelGroup(group: ModelGroup, worker: Worker) {
@@ -959,6 +1043,14 @@ export function Models() {
                   Clear filters
                 </button>
               )}
+              <button
+                type="button"
+                onClick={handleRefreshModels}
+                disabled={refreshingModels}
+                className="rounded-lg border border-border px-3 py-1.5 text-sm text-muted hover:border-accent/40 hover:text-accent disabled:opacity-50"
+              >
+                {refreshingModels ? "Refreshing..." : "Refresh Models"}
+              </button>
             </div>
 
             {unreachableLocationWorkers.length > 0 && (
@@ -997,6 +1089,7 @@ export function Models() {
               ))}
             </div>
             {modelsMsg && <p className="mt-3 text-sm text-muted">{modelsMsg}</p>}
+            {refreshModelsMsg && <p className="mt-3 text-sm text-muted">{refreshModelsMsg}</p>}
           </>
         )}
       </section>
