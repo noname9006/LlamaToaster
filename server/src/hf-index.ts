@@ -99,16 +99,21 @@ export function getRecentBatchSize(): number {
   return HF_INDEX_RECENT_BATCH_SIZE;
 }
 
-// How often a tick runs. Default 5 minutes to align with HF's 5-minute fixed
-// windows (see https://huggingface.co/docs/hub/rate-limits). Overridable via
-// HF_INDEX_TICK_INTERVAL_MS env (raw ms).
+// How often a tick runs. HF's rate limit is a true sliding window tracked in
+// hf-rate-limit.ts's module state (persists across ticks, not reset by tick
+// boundaries), so a 5-minute cadence just leaves the window's throughput
+// idle between ticks once a tick finishes early (which it now does --
+// runIndexTick's per-repo loop no longer has an artificial delay, only the
+// real rate-limit throttling). Default 1 minute (the floor this env also
+// enforces) to keep feeding that window instead of bursting-then-idling.
+// Overridable via HF_INDEX_TICK_INTERVAL_MS env (raw ms).
 export const HF_INDEX_TICK_INTERVAL_MS = (() => {
   const env = process.env.HF_INDEX_TICK_INTERVAL_MS?.trim();
   if (env) {
     const n = Number(env);
     if (Number.isFinite(n) && n >= 60_000) return n;
   }
-  return 5 * 60 * 1000; // 5 minutes (HF window)
+  return 60 * 1000; // 1 minute (floor) -- see comment above
 })();
 
 // Fresh key names, deliberately NOT reusing the pre-redesign keys
@@ -688,10 +693,17 @@ export async function runIndexTick(): Promise<{ indexed: number; repos: number }
     const staleRepos = findStaleRepos(now - HF_INDEX_REFRESH_INTERVAL_MS, maxStale);
     for (const repoId of staleRepos) toScan.add(repoId);
 
+    // No fixed inter-repo delay here: acquireRateLimitSlot() (invoked by
+    // every hfFetch() call inside scanHfRepo) already throttles precisely
+    // against HF's real published quota via the RateLimit/RateLimit-Policy
+    // headers. A flat sleep on top of that just wastes wall-clock time --
+    // with hundreds of repos queued per tick it could push a tick past its
+    // 5-minute interval, causing the next scheduled tick to be skipped
+    // entirely (see runIndexTick's isRunning guard), which silently halves
+    // real throughput.
     for (const repoId of toScan) {
       const result = await scanHfRepo(repoId, HF_INDEX_TIMEOUT_MS);
       indexedTotal += result.indexed;
-      await sleep(200);
     }
 
     lastTickAt = now;
@@ -707,6 +719,18 @@ export async function runIndexTick(): Promise<{ indexed: number; repos: number }
 // HF_INDEX_TICK_INTERVAL_MS.
 export function startHfIndexService(): void {
   if (refreshTimer) return; // already started
+
+  // Logged at info level (not gated behind LOG_LEVEL=debug) so a restart
+  // makes it immediately visible whether HF_TOKEN (or its accepted aliases,
+  // see hf-rate-limit.ts's getHfToken) was actually picked up by this
+  // process's env -- the common failure mode is editing orchestrator.env /
+  // .env without restarting the service, or editing the wrong file for how
+  // this process was launched (see .env.example / orchestrator.env.example).
+  if (isHfTokenConfigured()) {
+    log.info(`[hf-index] HF_TOKEN loaded -- using authenticated quotas (backlog batch ${getBacklogBatchSize()}, stale cap ${getMaxReposPerTick()})`);
+  } else {
+    log.info(`[hf-index] HF_TOKEN not loaded -- using anonymous quotas (backlog batch ${getBacklogBatchSize()}, stale cap ${getMaxReposPerTick()})`);
+  }
 
   const runTick = () => {
     runIndexTick()

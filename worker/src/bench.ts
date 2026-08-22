@@ -181,6 +181,13 @@ export interface BenchResult {
   // the llama-bench path (this file) and the llama-server/MTP path
   // (serverBench.ts) share one parser and one BenchResult shape.
   offload?: OffloadResult;
+  // Read from llama.cpp's own runtime output (see parseModelBufferSizes
+  // below) -- undefined for the exact same reasons offload above can be:
+  // never populated on a build too old for the required verbosity flag, or
+  // an item that failed before tensor loading finished. Ground truth for
+  // worker/src/index.ts's VRAM-discrepancy check, preferred over the
+  // external-VRAM-sample-based estimate whenever present.
+  modelBufferSizes?: ModelBufferSizes;
 }
 
 // llama.cpp's own one-line model-load summary, printed once *per model
@@ -264,6 +271,62 @@ export function matchOffloadLine(line: string): OffloadInfo | null {
   const m = OFFLOAD_LAYERS_LINE_RE.exec(line);
   if (!m) return null;
   return { gpu_layers_loaded: Number(m[1]), total_model_layers: Number(m[2]) };
+}
+
+// llama.cpp's own per-backend-buffer allocation summary, printed once per
+// buffer type actually *created* while loading a model's tensors, e.g.:
+//   load_tensors:   CPU_Mapped model buffer size =   137.42 MiB
+//   load_tensors:        CUDA0 model buffer size =  4368.51 MiB
+// Unlike OFFLOAD_LAYERS_RE above -- which reflects the ggml scheduler's
+// *plan* for where each layer should go, printed before any buffer is
+// actually allocated -- this line is emitted after allocation, so a weight
+// buffer the scheduler assigned to the GPU but that a backend-level failure
+// bounced back to the CPU shows up here as CPU_Mapped, not CUDA0. This is
+// the ground-truth signal worker/src/index.ts's finalizeSweepItemResult
+// prefers for its VRAM-discrepancy check over the external VRAM-sample-based
+// estimate, when available. NOT verified against a real captured transcript
+// from this repo's own llama.cpp build -- no raw JSON dump was available
+// locally when this was written, so the exact device-name/spacing here is
+// from llama.cpp's public source and widely-seen pasted logs, not a live
+// run. Verify against one real raw JSON dump before fully trusting the
+// regex, same as every other "not run live" caveat in this file. `g` flag:
+// multiple GPU-visible devices, or an MTP item's base+draft pair, each print
+// their own line.
+const MODEL_BUFFER_SIZE_RE = /^load_tensors:\s*(\S+) model buffer size\s*=\s*([\d.]+)\s*MiB/gm;
+const CPU_BUFFER_NAME_RE = /^CPU(_Mapped)?$/;
+
+export interface ModelBufferSizes {
+  // Sum of every non-CPU buffer (CUDA0, CUDA1, ROCm0, Vulkan0, Metal, ...).
+  gpuMib: number;
+  // Sum of every CPU/CPU_Mapped buffer -- includes weights the scheduler
+  // itself assigned to the CPU (e.g. the untouched remainder of a partial
+  // offload), not just a sysmem-fallback bounce off a GPU assignment.
+  cpuMib: number;
+}
+
+// Aggregated across every "model buffer size" line in the whole stderr --
+// for an MTP item this sums the base model's and its --model-draft
+// companion's buffers together rather than separating them (unlike
+// parseOffloadLayers, which disambiguates by total_model_layers). The draft
+// model is always far smaller than the base, so this is a minor precision
+// loss, not a correctness one: it can only ever make a real GPU shortfall
+// look slightly less severe, never invent one. Null (not zero) when the line
+// was never seen at all -- an older build without -v/-lv 4 support, or the
+// item failed before tensor loading finished -- so callers can tell "no GPU
+// buffer, confirmed" apart from "we have no idea," exactly like
+// OffloadResult's own null already does for the layer-count line.
+export function parseModelBufferSizes(stderr: string): ModelBufferSizes | null {
+  const matches = [...stderr.matchAll(MODEL_BUFFER_SIZE_RE)];
+  if (matches.length === 0) return null;
+  let gpuMib = 0;
+  let cpuMib = 0;
+  for (const m of matches) {
+    const mib = Number(m[2]);
+    if (!Number.isFinite(mib)) continue;
+    if (CPU_BUFFER_NAME_RE.test(m[1])) cpuMib += mib;
+    else gpuMib += mib;
+  }
+  return { gpuMib, cpuMib };
 }
 
 // llama-bench's -v/--verbose (see supportsVerboseFlag above) and
@@ -398,11 +461,14 @@ export async function runBench(input: BenchRunInput): Promise<BenchResult> {
       // false: llama-bench has no --model-draft/MTP support at all, so this
       // path only ever loads one model.
       const offload = parseOffloadLayers(stderr, false);
-      // After offload parsing (which needs the real line-by-line stderr,
-      // unaffected by this anyway) but before returning -- this is the
-      // stderr a failed item's `error` field is built from verbatim.
+      // Same raw, pre-collapse stderr offload parsing needs -- see
+      // parseModelBufferSizes's own doc comment.
+      const modelBufferSizes = parseModelBufferSizes(stderr) ?? undefined;
+      // After offload/buffer-size parsing (which needs the real line-by-line
+      // stderr, unaffected by this anyway) but before returning -- this is
+      // the stderr a failed item's `error` field is built from verbatim.
       stderr = collapseTensorLoadSpam(stderr);
-      resolve({ stdout, stderr, code, signal, timedOut, results, gpu_info, cpu_info, offload });
+      resolve({ stdout, stderr, code, signal, timedOut, results, gpu_info, cpu_info, offload, modelBufferSizes });
     });
   });
 }

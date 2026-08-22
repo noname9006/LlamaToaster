@@ -153,6 +153,9 @@ interface ResultRowRaw {
   total_model_layers: number | null;
   gpu_layers_loaded_draft: number | null;
   total_model_layers_draft: number | null;
+  // See shared/types.ts's ResultRow.gpu_layers_resident_est -- worker-derived
+  // residency estimate, only ever non-null on a sysmem-fallback-flagged row.
+  gpu_layers_resident_est: number | null;
   sample_count: number | null;
   suspect_count: number | null;
   suspect_samples: string | null;
@@ -602,6 +605,7 @@ function mapResult(row: ResultRowRaw): ResultRow {
     total_model_layers: row.total_model_layers,
     gpu_layers_loaded_draft: row.gpu_layers_loaded_draft ?? undefined,
     total_model_layers_draft: row.total_model_layers_draft ?? undefined,
+    gpu_layers_resident_est: row.gpu_layers_resident_est ?? undefined,
     sample_count: row.sample_count ?? undefined,
     suspect_count: row.suspect_count ?? undefined,
     // Stored as JSON text (SQLite has no array column type) -- tolerate a
@@ -974,9 +978,10 @@ export const repo = {
               gpu_memory_model_avg_accuracy, gpu_memory_model_avg_source,
               gpu_memory_model_peak_accuracy, gpu_memory_model_peak_source,
               gpu_layers_loaded, total_model_layers, gpu_layers_loaded_draft, total_model_layers_draft,
+              gpu_layers_resident_est,
               sample_count, suspect_count, suspect_samples, repeat_samples, spec_drafted, spec_accepted,
               raw_json_path, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         );
         // Up to two rows for one idx (a pp row and a tg row from the same
         // benchmark process) -- distinguished by test_type, see
@@ -1024,6 +1029,7 @@ export const repo = {
             row.total_model_layers,
             row.gpu_layers_loaded_draft ?? null,
             row.total_model_layers_draft ?? null,
+            row.gpu_layers_resident_est ?? null,
             row.sample_count ?? null,
             row.suspect_count ?? null,
             row.suspect_samples ? JSON.stringify(row.suspect_samples) : null,
@@ -2593,6 +2599,10 @@ function buildResultRow(
     total_model_layers: r.total_model_layers,
     gpu_layers_loaded_draft: r.gpu_layers_loaded_draft ?? null,
     total_model_layers_draft: r.total_model_layers_draft ?? null,
+    // Version-skew tolerant like every optional IngestResultInput field:
+    // absent on an older worker, null from a current one whose discrepancy
+    // check didn't fire.
+    gpu_layers_resident_est: r.gpu_layers_resident_est ?? null,
     sample_count: r.sample_count,
     suspect_count: r.suspect_count,
     suspect_samples: r.suspect_samples,

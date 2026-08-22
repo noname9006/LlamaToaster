@@ -4,7 +4,14 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { IngestResultInput } from "../../shared/types.js";
 import type { SweepItem } from "../../shared/sweep.js";
-import { collapseTensorLoadSpam, parseOffloadLayers, type BenchLogger, type BenchResult, type OffloadResult } from "./bench.js";
+import {
+  collapseTensorLoadSpam,
+  parseModelBufferSizes,
+  parseOffloadLayers,
+  type BenchLogger,
+  type BenchResult,
+  type OffloadResult,
+} from "./bench.js";
 
 // Drives llama-server over HTTP to benchmark MTP (multi-token-prediction)
 // speculative decoding -- llama-bench itself has no --spec-type/--model-draft
@@ -673,7 +680,16 @@ export async function runServerBench(input: ServerBenchRunInput): Promise<BenchR
     // final stderr at the end -- offload lines only ever appear during model
     // load, so nothing later in this run could add or change a match.
     const offload = parseOffloadLayers(stderr, Boolean(input.mtpModelPath));
-    log?.info(`${label}: offload: ${formatOffloadForLog(offload)}`);
+    // Same early-stderr-snapshot timing as offload above -- see
+    // bench.ts's parseModelBufferSizes doc comment for why this is the
+    // preferred ground truth for the VRAM-discrepancy check.
+    const modelBufferSizes = parseModelBufferSizes(stderr) ?? undefined;
+    // "(claimed)" -- same honesty rule as the llama-bench path's live line
+    // (worker/src/index.ts's matchOffloadLine handler): llama.cpp's own
+    // "offloaded X/Y" reflects buffer assignment only, never actual VRAM
+    // residency; this item's TEST SUMMARY annotates it with the verified
+    // figure once the sampler's telemetry is in.
+    log?.info(`${label}: offload: ${formatOffloadForLog(offload)} (claimed)`);
 
     const offsetStorePath = input.offsetStorePath ?? DEFAULT_OFFSET_STORE_PATH;
     const offsetKey = offsetStoreKey(input.modelPath, input.mtpModelPath);
@@ -955,6 +971,7 @@ export async function runServerBench(input: ServerBenchRunInput): Promise<BenchR
       results,
       warning,
       offload,
+      modelBufferSizes,
     };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
