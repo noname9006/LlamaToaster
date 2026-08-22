@@ -326,6 +326,24 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
     }
   );
 
+  // Generic job status (used for refresh_models polling); kept alongside the
+  // legacy download-specific one for backwards compat. The refresh_models job
+  // may be pending/claimed for a while (hashing large files), so the Models
+  // page polls this instead of a fixed 2s timeout.
+  app.get<{ Params: { id: string; jobId: string } }>(
+    "/api/workers/:id/jobs/:jobId",
+    async (request, reply) => {
+      const worker = repo.workerRepo.getWorker(request.params.id);
+      if (!worker) throw new NotFoundError("unknown machine");
+      assertOwnsWorker(resolveAuthUser(request)?.user.id, worker.id);
+      const job = repo.queueRepo.getJob(request.params.jobId);
+      if (!job || job.workerId !== worker.id) {
+        throw new NotFoundError("unknown job");
+      }
+      return reply.code(200).send({ status: job.status, job_type: job.jobType });
+    }
+  );
+
   // Lets the client tell a download that's genuinely gone (completed, failed,
   // cancelled, or never existed) apart from one that's still queued behind
   // the worker's max_concurrent_downloads cap -- such a job never appears in

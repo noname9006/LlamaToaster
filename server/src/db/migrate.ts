@@ -2,6 +2,7 @@ import Database from "better-sqlite3";
 import { readFileSync, mkdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { log } from "../log.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -28,9 +29,11 @@ function migrate(database: Database.Database): void {
   const sql = readFileSync(join(__dirname, "schema.sql"), "utf8");
   database.exec(sql);
   applyColumnMigrations(database);
+  migrateHfGgufIndexPk(database);
   createResultsItemUniqueIndex(database);
   createWorkerEnrolmentIndexes(database);
   createMultiTenancyIndexes(database);
+  createHfGgufIndexSha256Index(database);
 }
 
 interface ColumnSpec {
@@ -48,6 +51,7 @@ interface ColumnSpec {
 // this on every boot (including against a DB that already has the column) is
 // safe.
 const COLUMN_MIGRATIONS: ColumnSpec[] = [
+  { table: "local_model_cache", column: "state", ddlType: "TEXT NOT NULL DEFAULT 'detected'" },
   { table: "run_items", column: "ram_avg_mib", ddlType: "INTEGER" },
   { table: "run_items", column: "vram_avg_mib", ddlType: "INTEGER" },
   { table: "run_items", column: "ram_free_before_mib", ddlType: "INTEGER" },
@@ -155,6 +159,10 @@ const COLUMN_MIGRATIONS: ColumnSpec[] = [
   // worker/src/index.ts's discard handling). Meaningless for any other job
   // type; only ever read/set for 'download_model' rows.
   { table: "worker_jobs", column: "discard_requested", ddlType: "INTEGER DEFAULT 0" },
+  // Soft-delete marker for the HF gguf index -- see server/src/hf-index.ts's
+  // module doc comment. Nullable: NULL means live, non-null means confirmed
+  // gone from Hugging Face as of that timestamp.
+  { table: "hf_gguf_index", column: "deleted_at", ddlType: "INTEGER" },
 ];
 
 function applyColumnMigrations(database: Database.Database): void {
@@ -249,7 +257,7 @@ function createResultsItemUniqueIndex(database: Database.Database): void {
     const tx = database.transaction(() => {
       for (const g of dupeGroups) {
         const result = keepEarliestExceptStmt.run(g.run_id, g.idx, g.test_type, g.run_id, g.idx, g.test_type);
-        console.warn(
+        log.warn(
           `[migrate] idx_results_item: deduped ${result.changes} duplicate result row(s) for ` +
             `run_id=${g.run_id} idx=${g.idx} test_type=${g.test_type} (kept earliest by created_at)`
         );
@@ -274,6 +282,39 @@ function createWorkerEnrolmentIndexes(database: Database.Database): void {
   database.exec(
     `CREATE UNIQUE INDEX IF NOT EXISTS idx_workers_user_code_pending ON workers(user_code) WHERE approved_at IS NULL`
   );
+}
+
+// Migrate legacy hf_gguf_index primary key from sha256-only to
+// composite (sha256, repo_id, filename). Old tables have
+// `pk=1` only on sha256 column; new schema has pk on three columns.
+// If legacy detected, recreate table preserving data (deduplicate via
+// REPLACE semantics -- last_seen wins, same as upsert).
+function migrateHfGgufIndexPk(database: Database.Database): void {
+  const tableInfo = database.prepare(`PRAGMA table_info(hf_gguf_index)`).all() as { name: string; pk: number }[];
+  if (tableInfo.length === 0) return;
+  const pkCols = tableInfo.filter((c) => c.pk > 0).map((c) => c.name).sort();
+  const needsMigration = pkCols.length === 1 && pkCols[0] === "sha256";
+  if (!needsMigration) return;
+  // Legacy table -- recreate with composite PK
+  database.exec(`
+    CREATE TABLE hf_gguf_index_new (
+      sha256 TEXT NOT NULL,
+      repo_id TEXT NOT NULL,
+      filename TEXT NOT NULL,
+      revision TEXT,
+      file_size INTEGER,
+      last_seen INTEGER NOT NULL,
+      PRIMARY KEY (sha256, repo_id, filename)
+    );
+    INSERT OR REPLACE INTO hf_gguf_index_new (sha256, repo_id, filename, revision, file_size, last_seen)
+      SELECT sha256, repo_id, filename, revision, file_size, last_seen FROM hf_gguf_index;
+    DROP TABLE hf_gguf_index;
+    ALTER TABLE hf_gguf_index_new RENAME TO hf_gguf_index;
+  `);
+}
+
+function createHfGgufIndexSha256Index(database: Database.Database): void {
+  database.exec(`CREATE INDEX IF NOT EXISTS idx_hf_gguf_index_sha256 ON hf_gguf_index(sha256)`);
 }
 
 // Multi-user Stage 4 (MULTIUSER_PLAN.md §4.1) -- same "must run after

@@ -1,3 +1,3 @@
 @echo off
-cd /d F:\BOT\GitHub\LlamaToaster
+cd /d "%~dp0.."
 npm run worker
