@@ -38,12 +38,16 @@ export interface HfFileEntry {
 }
 
 export const HF_REPO_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.-]*\/[A-Za-z0-9][A-Za-z0-9_.-]*$/;
-const QUANT_PATTERN = /(?:^|[-_.])((?:IQ|Q)[0-9]+(?:_[A-Z0-9]+)*|F16|F32|BF16)(?=[-_.]|$)/i;
+// Group 1 is unsloth's "Dynamic" quant prefix (UD-Q4_K_XL, UD-IQ2_M, ...) --
+// optional; group 2 is the actual quant code. Mirrored in
+// client/src/modelGrouping.ts's own QUANT_PATTERN.
+const QUANT_PATTERN = /(?:^|[-_.])(UD[-_])?((?:IQ|Q)[0-9]+(?:_[A-Z0-9]+)*|F16|F32|BF16)(?=[-_.]|$)/i;
 
 export function parseQuant(filename: string): string | null {
   const base = filename.split("/").pop() ?? filename;
   const m = base.match(QUANT_PATTERN);
-  return m ? m[1].toUpperCase() : null;
+  if (!m) return null;
+  return (m[1] ? "UD-" : "") + m[2].toUpperCase();
 }
 
 // HF's own accepted values for its search API's `sort` param -- confirmed
