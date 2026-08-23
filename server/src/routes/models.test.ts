@@ -237,6 +237,36 @@ describe("worker-derived model routes cross-user isolation (§4.5)", () => {
     expect(body.locations[sha]).toEqual([workerA.id]);
   });
 
+  it("locations ignores files the worker reports as missing (deleted locally)", async () => {
+    // The worker's cache keeps deleted files around (state "missing") for
+    // re-download bookkeeping -- that must not keep locating the model on the
+    // machine it was just deleted from.
+    const ownerA = await sessionWithId("locations-missing-owner-a");
+    const sha = "e".repeat(64);
+    const workerA = await createWorkerWithModelFile("locations-missing-machine-a", ownerA, "gone.gguf");
+    const db = (await import("../db/migrate.js")).getDb();
+    db.prepare(`UPDATE workers SET model_files_json = ? WHERE id = ?`).run(
+      JSON.stringify([
+        { path: "gone.gguf", size_bytes: 123, sha256: sha, state: "missing" },
+        { path: "live.gguf", size_bytes: 5, sha256: "f".repeat(64), state: "verified" },
+      ]),
+      workerA.id
+    );
+
+    await registerModel({
+      id: sha,
+      filename: "gone.gguf",
+      size_bytes: 123,
+      source: "huggingface",
+      hf_repo: "org/repo",
+      hf_file: "gone.gguf",
+    });
+
+    const res = await fetch(`${baseUrl}/api/models/locations`, { headers: authed(ownerA.token) });
+    const body = (await res.json()) as { locations: Record<string, string[]> };
+    expect(body.locations[sha]).toBeUndefined();
+  });
+
   it("backfill-layer-count only reads n_layer from the CALLER's own machine's cache", async () => {
     const ownerA = await sessionWithId("backfill-owner-a");
     await createWorkerWithModelFile("backfill-machine-a", ownerA, "backfill-target.gguf");
@@ -262,5 +292,24 @@ describe("worker-derived model routes cross-user isolation (§4.5)", () => {
     });
     const bodyB = (await resB.json()) as { n_layer: number | null };
     expect(bodyB.n_layer).toBeNull();
+  });
+
+  it("backfill-layer-count does not read n_layer from a missing (deleted) file's stale cache", async () => {
+    const ownerA = await sessionWithId("backfill-missing-owner-a");
+    const workerA = await createWorkerWithModelFile("backfill-missing-machine-a", ownerA, "backfill-gone.gguf");
+    const db = (await import("../db/migrate.js")).getDb();
+    db.prepare(`UPDATE workers SET model_files_json = ? WHERE id = ?`).run(
+      JSON.stringify([{ path: "backfill-gone.gguf", size_bytes: 123, n_layer: 42, mtp_layers: null, state: "missing" }]),
+      workerA.id
+    );
+
+    await registerModel({ id: "backfill-missing-model", filename: "backfill-gone.gguf", size_bytes: 1, source: "local" });
+
+    const res = await fetch(`${baseUrl}/api/models/backfill-missing-model/backfill-layer-count`, {
+      method: "POST",
+      headers: authed(ownerA.token),
+    });
+    const body = (await res.json()) as { n_layer: number | null };
+    expect(body.n_layer).toBeNull();
   });
 });
