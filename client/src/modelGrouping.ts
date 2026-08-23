@@ -16,6 +16,17 @@ const QUANT_PATTERN = /(?:^|[-_.])((?:IQ|Q)[0-9]+(?:_[A-Z0-9]+)*|F16|F32|BF16)(?
 // trailing "-GGUF" convention-suffix stripped; for a manually-registered
 // local model (no repo to key off) it's the filename with its extension and
 // any quant token removed.
+// Extracts just the quant token a filename carries (e.g. "Q4_K_M"), for
+// display as its own badge -- unlike modelBaseLabel below, which strips it.
+// Neither the worker's GGUF parsing nor the download-callback route ever
+// populates metadata.quant, so this filename regex (mirrors server/src/hf.ts's
+// parseQuant, used for the HF search file list) is the only source there is
+// for a registered model.
+export function extractQuant(filename: string): string | null {
+  const m = filename.match(QUANT_PATTERN);
+  return m ? m[1].toUpperCase() : null;
+}
+
 export function modelBaseLabel(m: Model): string {
   if (m.hf_repo) {
     const repoName = m.hf_repo.split("/")[1] ?? m.hf_repo;

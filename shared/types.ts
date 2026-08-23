@@ -867,6 +867,17 @@ export interface ModelDownloadCallbackInput {
   expert_count?: number | null;
 }
 
+// Worker -> server callback for the "read_gguf_info" backfill job above --
+// no retry-safety caveat needed the way ModelDownloadCallbackInput has one:
+// repo.updateModelMetadata is a plain field merge, so applying the same
+// result twice is already harmless.
+export interface GgufInfoCallbackInput {
+  model_id: string;
+  n_layer: number | null;
+  mtp_layers: number | null;
+  expert_count: number | null;
+}
+
 // --- Pull queue (MULTIUSER_PLAN.md Stage 1) ---
 //
 // The worker pulls all work over one outbound connection and pushes all
@@ -1035,6 +1046,15 @@ export type QueueJob =
   | { job_id: string; type: "delete_model_file"; payload: { filename: string } }
   // Triggers a full model directory reconciliation on the worker
   | { job_id: string; type: "refresh_models"; payload: Record<string, never> }
+  // On-demand backfill for a model registered before n_layer/expert_count
+  // collection existed (or scanned in some other way that never ran
+  // worker/src/gguf.ts at all) -- re-reads an already-downloaded file's own
+  // GGUF header (the only reliable source; confirmed live that Hugging
+  // Face's own model API can't tell dense from MoE either) and reports the
+  // result via POST /api/models/gguf-info-callback. model_id travels in the
+  // payload purely to be echoed back in that callback -- the worker itself
+  // only ever needs filename to find the file on disk.
+  | { job_id: string; type: "read_gguf_info"; payload: { model_id: string; filename: string } }
   // No payload -- just a signal. Queued (not sent via HeartbeatResponse.control
   // like cancel/pause) so it takes its place behind whatever job is already
   // running instead of yanking the process mid-benchmark.
@@ -1162,11 +1182,26 @@ export type DeviceApproveResponse =
 // shared shape would risk a field meant only for admin eyes (userDisplayName,
 // workerDisplayName) leaking into a response type the main app also uses.
 export interface AdminStats {
+  // Unique accounts -- one row per provider-independent user (schema.sql's
+  // users table), so the row count IS the distinct-user count.
   users: number;
+  // Unique machine configurations ever connected -- one row per machine_id.
   machines: number;
-  runs: number;
+  // Unique models ACTUALLY TESTED -- distinct models referenced by at least
+  // one run, NOT the full registered-models list (a downloaded-but-never-run
+  // model must not inflate this).
+  modelsTested: number;
+  // Unique quant variants among ONLY the tested models above -- metadata.quant
+  // where present, else parsed off the model filename (same pattern as
+  // server/src/hf.ts's parseQuant / client/src/modelGrouping.ts's extractQuant).
+  quants: number;
+  // Individual sweep tests that reached a FINAL outcome (done/failed/
+  // failed_oom/cancelled) -- pre-created-but-still-'queued'/in-flight items
+  // must not count as performed yet. Includes partial runs' items per the
+  // "at least partially completed" reading.
   tests: number;
-  models: number;
+  // Every run row ever created (runs are inserted at trigger time).
+  runs: number;
 }
 
 export interface AdminRunSummary {
