@@ -164,6 +164,38 @@ describe("POST /api/worker/heartbeat", () => {
       jobId,
     ]);
   });
+
+  it("registers a hash-verified model file into the catalog on heartbeat (manual-drop flow)", async () => {
+    const sha = "c".repeat(64);
+    const files = [
+      {
+        path: "dropped.gguf",
+        size_bytes: 456,
+        sha256: sha,
+        state: "verified",
+        hf_match: { repo_id: "org/repo", filename: "dropped.gguf", revision: "main", deleted: false },
+      },
+      // Not registered: no hash match yet.
+      { path: "unidentified.gguf", size_bytes: 1 },
+      // Not registered: the HF match was soft-deleted (removed from HF).
+      {
+        path: "gone-from-hf.gguf",
+        size_bytes: 2,
+        sha256: "d".repeat(64),
+        state: "verified",
+        hf_match: { repo_id: "org/gone", filename: "gone.gguf", revision: "main", deleted: true },
+      },
+    ];
+
+    await postJson("/api/worker/heartbeat", { ...hardwareState("hb-hash-register", "idle"), model_files: files });
+    expect(repo.getModel(sha)).toBeTruthy();
+    expect(repo.getModel("d".repeat(64))).toBeUndefined();
+
+    // Idempotent across beats -- a second identical heartbeat must not throw
+    // or duplicate (models.id is the primary key).
+    await postJson("/api/worker/heartbeat", { ...hardwareState("hb-hash-register", "idle"), model_files: files });
+    expect(repo.listModels().filter((m) => m.id === sha)).toHaveLength(1);
+  });
 });
 
 describe("POST /api/worker/jobs/:jobId/complete", () => {

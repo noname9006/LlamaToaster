@@ -348,8 +348,14 @@ export async function resolveHfMetadata(
   // just never-matched ones -- otherwise a match found once was cached
   // forever and a server-side soft-delete would never reach this worker
   // (see HF_MATCH_RECHECK_INTERVAL_MS above).
+  //
+  // Gated on sha256 presence, NOT on state: HashingQueue persists each
+  // digest with state "hashing" and relies on THIS pass to transition those
+  // entries to verified/unknown afterward -- excluding "hashing" here
+  // deadlocked freshly-hashed files in that state forever (they'd never be
+  // rehashed as unchanged on later scans, so nothing ever re-visited them).
   const needsLookup = (entry: LocalCacheEntry) =>
-    entry.sha256 != null && entry.state !== "hashing" && (!entry.hf_model_id || isHfCheckStale(entry.hf_checked_at));
+    entry.sha256 != null && (!entry.hf_model_id || isHfCheckStale(entry.hf_checked_at));
 
   for (const entry of entries) {
     if (needsLookup(entry)) {

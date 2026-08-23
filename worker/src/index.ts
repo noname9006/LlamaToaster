@@ -496,30 +496,61 @@ function getWorkerHfHeaders(extra?: Record<string, string>): Record<string, stri
 }
 
 // Fetched BEFORE download to obtain expected SHA256 (LFS oid) for verification.
-// Mirrors server/src/hf-index.ts's fetchHfFileSha256 but runs on the worker
-// so verification doesn't depend on HF index freshness. Returns null if hash
+// Same source of truth as server/src/hf.ts's listHfGgufFiles: HF's tree API
+// (/api/models/{repo}/tree/main?recursive=true) returns a JSON *ARRAY* of
+// {type, path, lfs:{oid}} entries paginated via Link headers. There is no
+// single-file form of this endpoint -- appending the filename to the path
+// (/tree/main/{file}) 404s even for existing root-level files, and parsing
+// the response as a lone {lfs} object can never work. Returns null if hash
 // can't be determined (non-LFS, API error, timeout) -- callers fall back to
 // post-hash index existence check and treat as unknown.
 // Uses Bearer token when HF_TOKEN is set -- bumps from anonymous 500->1000 api
 // and 3000->5000 resolvers limits per 5-minute window (PRO 2500/12000 etc),
 // and handles 429 by respecting the RateLimit t= header.
+function parseHfNextLink(header: string | null): string | null {
+  if (!header) return null;
+  const m = header.match(/<([^>]+)>;\s*rel="next"/i);
+  return m?.[1] ?? null;
+}
+
 async function fetchExpectedSha256(repoId: string, filename: string, timeoutMs = 15_000): Promise<string | null> {
   try {
-    const encoded = filename.split("/").map(encodeURIComponent).join("/");
-    const url = `https://huggingface.co/api/models/${repoId}/tree/main/${encoded}`;
-    let res = await fetch(url, { headers: getWorkerHfHeaders(), signal: AbortSignal.timeout(timeoutMs) });
-    if (res.status === 429) {
-      const tRaw = res.headers.get("ratelimit") ?? res.headers.get("RateLimit") ?? "";
-      const tm = tRaw.match(/t\s*=\s*(\d+)/i) ?? res.headers.get("retry-after")?.match(/(\d+)/);
-      const waitSec = tm ? Number(tm[1]) : 15;
-      const waitMs = Number.isFinite(waitSec) && waitSec > 0 && waitSec <= 300 ? waitSec * 1000 : 15000;
-      log.warn(`[hf] fetchExpectedSha256 429 for ${repoId}/${filename} -- retrying after ${Math.ceil(waitMs / 1000)}s`);
-      await new Promise((r) => setTimeout(r, waitMs));
-      res = await fetch(url, { headers: getWorkerHfHeaders(), signal: AbortSignal.timeout(timeoutMs) });
+    const encRepo = repoId.split("/").map(encodeURIComponent).join("/");
+    let url: string | null = `https://huggingface.co/api/models/${encRepo}/tree/main?recursive=true`;
+    let pages = 0;
+    while (url) {
+      let res = await fetch(url, { headers: getWorkerHfHeaders(), signal: AbortSignal.timeout(timeoutMs) });
+      if (res.status === 429) {
+        const tRaw = res.headers.get("ratelimit") ?? res.headers.get("RateLimit") ?? "";
+        const tm = tRaw.match(/t\s*=\s*(\d+)/i) ?? res.headers.get("retry-after")?.match(/(\d+)/);
+        const waitSec = tm ? Number(tm[1]) : 15;
+        const waitMs = Number.isFinite(waitSec) && waitSec > 0 && waitSec <= 300 ? waitSec * 1000 : 15000;
+        log.warn(`[hf] fetchExpectedSha256 429 for ${repoId}/${filename} -- retrying after ${Math.ceil(waitMs / 1000)}s`);
+        await new Promise((r) => setTimeout(r, waitMs));
+        res = await fetch(url, { headers: getWorkerHfHeaders(), signal: AbortSignal.timeout(timeoutMs) });
+      }
+      if (!res.ok) return null;
+      // A non-array body here means HF changed its response shape or an error
+      // object slipped through with a 2xx status -- either way we can't trust it.
+      const data = (await res.json()) as Array<{ type?: string; path?: string; lfs?: { oid?: string } }>;
+      if (!Array.isArray(data)) return null;
+      for (const e of data) {
+        // hf_file comes straight from HF's own listings, so exact case should
+        // match; the lowercase fallback just tolerates clients that hand us a
+        // differently-cased path.
+        if (
+          (e.type ?? "file") === "file" &&
+          e.path != null &&
+          (e.path === filename || e.path.toLowerCase() === filename.toLowerCase())
+        ) {
+          return e.lfs?.oid ?? null;
+        }
+      }
+      url = parseHfNextLink(res.headers.get("link"));
+      pages++;
+      if (pages > 500) return null; // defensive cap, mirrors server/src/hf.ts
     }
-    if (!res.ok) return null;
-    const data = (await res.json()) as { lfs?: { oid?: string } };
-    return data.lfs?.oid ?? null;
+    return null;
   } catch {
     return null;
   }
@@ -1973,25 +2004,30 @@ async function executeDownloadModelJob(
         `expert_count=${expert_count ?? "unknown"}`
     );
 
-    // Update local cache with the new file info
+    // Update local cache with the new file info. Identity (hf_model_id) and
+    // integrity (state) are recorded independently: this file came from
+    // payload.hf_repo/payload.hf_file by construction, so that provenance is
+    // stamped even when the hash couldn't be verified against anything yet
+    // (no expected SHA + not indexed) -- previously an "unknown"-state
+    // download lost its identity until a much later scan re-derived it.
     await localModelCache.upsert({
       path: payload.hf_file,
       size: byteLength,
       mtime: statSync(target).mtimeMs,
       sha256,
-      hf_model_id: verificationState === "verified" ? `${payload.hf_repo}/${payload.hf_file}` : undefined,
-      // This upsert *is* a fresh verification (the hash lookup a few lines
-      // above just ran), so stamp hf_checked_at now -- otherwise this entry
-      // would look stale on the very next scan and trigger a redundant
-      // re-lookup.
-      hf_checked_at: verificationState === "verified" ? Date.now() : undefined,
+      hf_model_id: `${payload.hf_repo}/${payload.hf_file}`,
+      // This upsert *is* a fresh identity stamp -- stamping hf_checked_at now
+      // means the entry won't look stale (and trigger a redundant re-lookup)
+      // until the usual 24h re-verify window elapses.
+      hf_checked_at: Date.now(),
       last_verified: Date.now(),
       state: verificationState,
     });
 
-    // Reflect the new file immediately rather than waiting for the periodic
-    // refresh -- see refreshModelDirFilesCache above.
-    refreshModelDirFilesCache();
+    // No explicit "refresh" call needed here: collectState reads model_files
+    // straight from localModelCache on every heartbeat/queue poll
+    // (getModelFilesWithState), so the upsert above is visible to the server
+    // within one beat.
 
     // Only verified (and unknown where no expected hash was available) downloads
     // are considered successfully imported per spec. Corrupted means the file

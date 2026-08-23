@@ -1,5 +1,12 @@
 import { BadRequestError } from "./errors.js";
-import type { WorkerStatePush, HardwareInfo, InstalledBuild, ModelDirFile, ActiveJobReport } from "../../shared/types.js";
+import type {
+  WorkerStatePush,
+  HardwareInfo,
+  InstalledBuild,
+  ModelDirFile,
+  ActiveJobReport,
+} from "../../shared/types.js";
+import { LOCAL_MODEL_STATES } from "../../shared/types.js";
 
 // A worker is a semi-trusted client, not part of the server -- MULTIUSER_PLAN.md
 // §1.8. Everything here is validated and capped before it's ever persisted or
@@ -111,11 +118,46 @@ function parseModelFiles(
     .map((f, i) => {
       if (typeof f !== "object" || f === null) throw new BadRequestError(`model_files[${i}] must be an object`);
       const row = f as Record<string, unknown>;
+
+      // sha256/state/hf_match carry the worker's hash-based identification of
+      // each file (see worker/src/model-scanner.ts's resolveHfMetadata). They
+      // used to be silently dropped here, so the server never learned HOW a
+      // local file was identified -- hash-lookup results dead-ended at the
+      // worker and the Models page could only ever match by filename.
+      const rawSha = optionalString(row.sha256, `model_files[${i}].sha256`, 64);
+      // Optional, but when present it must actually look like a SHA-256 hex
+      // digest -- it keys catalog registration (models.id), not just display.
+      if (rawSha != null && !/^[0-9a-f]{64}$/i.test(rawSha)) {
+        throw new BadRequestError(`model_files[${i}].sha256 must be a 64-char hex digest`);
+      }
+      const state = optionalString(row.state, `model_files[${i}].state`, 16);
+      if (state != null && !LOCAL_MODEL_STATES.includes(state as (typeof LOCAL_MODEL_STATES)[number])) {
+        throw new BadRequestError(
+          `model_files[${i}].state must be one of: ${LOCAL_MODEL_STATES.join(", ")}`
+        );
+      }
+      let hf_match: ModelDirFile["hf_match"];
+      if (row.hf_match === undefined || row.hf_match === null) {
+        hf_match = null;
+      } else {
+        if (typeof row.hf_match !== "object") throw new BadRequestError(`model_files[${i}].hf_match must be an object`);
+        const m = row.hf_match as Record<string, unknown>;
+        hf_match = {
+          repo_id: sanitizeString(m.repo_id, `model_files[${i}].hf_match.repo_id`),
+          filename: sanitizeString(m.filename, `model_files[${i}].hf_match.filename`, 512),
+          revision: sanitizeString(m.revision ?? "main", `model_files[${i}].hf_match.revision`),
+          deleted: m.deleted === true,
+        };
+      }
+
       return {
         path: sanitizeString(row.path, `model_files[${i}].path`),
         size_bytes: requireNumber(row.size_bytes, `model_files[${i}].size_bytes`),
         n_layer: optionalNumber(row.n_layer, `model_files[${i}].n_layer`) ?? null,
         mtp_layers: optionalNumber(row.mtp_layers, `model_files[${i}].mtp_layers`) ?? null,
+        ...(rawSha != null ? { sha256: rawSha.toLowerCase() } : {}),
+        ...(state != null ? { state: state as ModelDirFile["state"] } : {}),
+        hf_match,
       };
     });
 }

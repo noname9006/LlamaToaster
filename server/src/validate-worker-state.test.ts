@@ -63,6 +63,48 @@ describe("parseWorkerState", () => {
     expect(state.model_files).toHaveLength(2000);
   });
 
+  it("preserves sha256, state, and hf_match from model_files instead of dropping them", () => {
+    const sha = "a".repeat(64);
+    const state = parseWorkerState(
+      validBody({
+        model_files: [
+          {
+            path: "m.gguf",
+            size_bytes: 1,
+            sha256: sha.toUpperCase(),
+            state: "verified",
+            hf_match: { repo_id: "org/repo", filename: "m.gguf", revision: "main", deleted: false },
+          },
+        ],
+      })
+    );
+    expect(state.model_files[0]?.sha256).toBe(sha); // normalized to lowercase
+    expect(state.model_files[0]?.state).toBe("verified");
+    expect(state.model_files[0]?.hf_match).toEqual({
+      repo_id: "org/repo",
+      filename: "m.gguf",
+      revision: "main",
+      deleted: false,
+    });
+  });
+
+  it("rejects a malformed model file sha256 or state rather than silently dropping it", () => {
+    expect(() =>
+      parseWorkerState(validBody({ model_files: [{ path: "m.gguf", size_bytes: 1, sha256: "not-a-digest" }] }))
+    ).toThrow(BadRequestError);
+    expect(() =>
+      parseWorkerState(validBody({ model_files: [{ path: "m.gguf", size_bytes: 1, state: "bogus" }] }))
+    ).toThrow(BadRequestError);
+  });
+
+  it("still accepts model files without hash fields (old worker binaries)", () => {
+    const state = parseWorkerState(validBody());
+    expect(state.model_files[0]).toMatchObject({ path: "model.gguf", size_bytes: 5_000_000_000 });
+    expect(state.model_files[0]?.sha256).toBeUndefined();
+    expect(state.model_files[0]?.state).toBeUndefined();
+    expect(state.model_files[0]?.hf_match).toBeNull();
+  });
+
   it("caps installed_builds to maxBuilds", () => {
     const builds = Array.from({ length: 500 }, (_, i) => ({
       tag: `b${i}`,

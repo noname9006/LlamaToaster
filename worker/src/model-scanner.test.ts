@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { scanModelDirectory, hashFile, HashingQueue, lookupHashes, resolveHfMetadata, runStartupReconciliation } from "./model-scanner.js";
 import { LocalModelCache } from "./local-cache.js";
-import type { LocalModelState } from "../../../shared/types.js";
+import type { LocalModelState } from "../../shared/types.js";
 
 // Use vi.hoisted to define mocks at the top level
 const mockFs = vi.hoisted(() => ({
@@ -305,6 +305,31 @@ describe("model-scanner", () => {
       expect(mockCache.updateState).toHaveBeenCalledWith("model3.gguf", "unknown");
       expect(mockCache.updateHfMatch).not.toHaveBeenCalledWith("model2.gguf", expect.anything(), expect.anything());
       expect(mockCache.updateState).not.toHaveBeenCalledWith("model2.gguf", expect.anything());
+    });
+
+    it("should resolve entries still in state 'hashing' (freshly hashed by the queue)", async () => {
+      // HashingQueue persists each digest with state "hashing" and leaves
+      // transitioning those entries to verified/unknown to THIS pass --
+      // skipping "hashing" here deadlocked freshly-hashed files in that
+      // state forever.
+      const mockCache = {
+        getAll: vi.fn().mockResolvedValue([
+          { path: "model1.gguf", sha256: "hash1", hf_model_id: undefined, state: "hashing" },
+        ]),
+        updateHfMatch: vi.fn().mockResolvedValue(undefined),
+        updateState: vi.fn().mockResolvedValue(undefined),
+      } as unknown as LocalModelCache;
+
+      global.fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        json: vi.fn().mockResolvedValue({
+          results: [{ sha256: "hash1", repo_id: "repo1", filename: "model1.gguf", revision: "main", deleted_at: null }],
+        }),
+      });
+
+      await resolveHfMetadata(mockCache, "http://localhost", "token");
+
+      expect(mockCache.updateHfMatch).toHaveBeenCalledWith("model1.gguf", "repo1/model1.gguf", null);
     });
 
     it("should re-verify an already-matched entry once its check has gone stale", async () => {
