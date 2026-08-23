@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { LocalModelCache, createLocalModelCache } from "./local-cache.js";
-import type { LocalModelState } from "../../../shared/types.js";
+import type { LocalModelState } from "../../shared/types.js";
 
 // better-sqlite3's constructor returns a Database whose statement objects
 // (from .prepare()) carry the actual .get()/.all()/.run() methods -- mock

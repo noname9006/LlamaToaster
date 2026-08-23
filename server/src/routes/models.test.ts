@@ -210,6 +210,33 @@ describe("worker-derived model routes cross-user isolation (§4.5)", () => {
     expect(body.locations["locations-anon-model"]?.sort()).toEqual([workerA.id, workerB.id].sort());
   });
 
+  it("locations also match hash-keyed models by the worker-reported sha256 when paths differ", async () => {
+    // A manually-dropped copy whose local filename differs from the canonical
+    // HF one must still be located via its digest -- model ids ARE sha256s for
+    // every download/hash-identified registration.
+    const ownerA = await sessionWithId("locations-sha-owner-a");
+    const sha = "b".repeat(64);
+    const workerA = await createWorkerWithModelFile("locations-sha-machine-a", ownerA, "renamed-copy.gguf");
+    const db = (await import("../db/migrate.js")).getDb();
+    db.prepare(`UPDATE workers SET model_files_json = ? WHERE id = ?`).run(
+      JSON.stringify([{ path: "renamed-copy.gguf", size_bytes: 123, sha256: sha, state: "verified" }]),
+      workerA.id
+    );
+
+    await registerModel({
+      id: sha,
+      filename: "canonical-name.gguf",
+      size_bytes: 123,
+      source: "huggingface",
+      hf_repo: "org/repo",
+      hf_file: "canonical-name.gguf",
+    });
+
+    const res = await fetch(`${baseUrl}/api/models/locations`, { headers: authed(ownerA.token) });
+    const body = (await res.json()) as { locations: Record<string, string[]> };
+    expect(body.locations[sha]).toEqual([workerA.id]);
+  });
+
   it("backfill-layer-count only reads n_layer from the CALLER's own machine's cache", async () => {
     const ownerA = await sessionWithId("backfill-owner-a");
     await createWorkerWithModelFile("backfill-machine-a", ownerA, "backfill-target.gguf");

@@ -231,11 +231,24 @@ export async function modelsRoutes(app: FastifyInstance): Promise<void> {
     const locations: Record<string, string[]> = {};
     for (const model of repo.listModels()) {
       const filename = model.source === "local" ? model.filename : model.hf_file;
-      if (!filename) continue;
+      // Hash-keyed catalog rows (id == the file's SHA-256 -- every download and
+      // hash-identified scan registers this way) can be located even when the
+      // local copy's path differs from the canonical HF filename (a manually
+      // renamed/dropped file), since workers report each file's digest.
+      const shaId = /^[0-9a-f]{64}$/.test(model.id) ? model.id : null;
+      if (!filename && !shaId) continue;
       // Keyed by id, not display_name -- display names are only guaranteed
       // unique per user (MULTIUSER_PLAN.md §3.3), and the client matches
       // this against the worker it has selected by id, not by name.
-      const owners = workers.filter((w) => w.modelFiles.some((f) => f.path === filename)).map((w) => w.id);
+      const owners = workers
+        .filter((w) =>
+          w.modelFiles.some(
+            (f) =>
+              (filename != null && filename !== "" && f.path === filename) ||
+              (shaId != null && f.sha256 != null && f.sha256.toLowerCase() === shaId)
+          )
+        )
+        .map((w) => w.id);
       if (owners.length > 0) locations[model.id] = owners;
     }
     const unreachable = workers.filter((w) => w.status === "offline").map((w) => w.id);
