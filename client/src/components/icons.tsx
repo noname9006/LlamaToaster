@@ -212,6 +212,14 @@ export function IconAlertTriangle(props: SVGProps<SVGSVGElement>) {
   );
 }
 
+export function IconDash(props: SVGProps<SVGSVGElement>) {
+  return (
+    <Icon {...props}>
+      <path d="M5 12h14" />
+    </Icon>
+  );
+}
+
 export function IconPause(props: SVGProps<SVGSVGElement>) {
   return (
     <Icon {...props}>
