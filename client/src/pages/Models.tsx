@@ -607,9 +607,21 @@ export function Models() {
           setProgress((prev) => ({ ...prev, [key]: { bytes, total } }));
           const prevSample = prevSampleRef.current[key];
           const now = Date.now();
-          if (prevSample && now > prevSample.time) {
+          // The server-side number only moves once per worker heartbeat
+          // (worker/src/index.ts's HEARTBEAT_INTERVAL_MS/_ACTIVE_DOWNLOAD_MS),
+          // which can still be slower than this 2s poll. Only recompute speed
+          // when bytes actually advanced since the last real sample --
+          // treating an unchanged poll as "0 B/s just now" (the old
+          // behavior) fed a false near-zero reading into the EMA below on
+          // every poll that re-read stale data, then a compensating spike
+          // (delta measured over just the last ~2s) the moment fresh data
+          // landed, which is exactly the "speed drops then jumps" jitter.
+          // Leaving prevSample untouched on a no-change poll instead keeps
+          // the window anchored to the last genuine reading, so the next
+          // real delta is measured over its true elapsed time.
+          if (prevSample && now > prevSample.time && bytes !== prevSample.bytes) {
             const instantBytesPerSec = Math.max(0, ((bytes - prevSample.bytes) / (now - prevSample.time)) * 1000);
-            // EMA with alpha ~0.25 -- smooths poll-to-poll jitter without
+            // EMA with alpha ~0.25 -- smooths sample-to-sample jitter without
             // lagging too far behind a real step change.
             const SPEED_SMOOTHING_ALPHA = 0.25;
             const prevSmoothed = smoothedSpeedRef.current[key];
@@ -619,8 +631,10 @@ export function Models() {
                 : prevSmoothed + SPEED_SMOOTHING_ALPHA * (instantBytesPerSec - prevSmoothed);
             smoothedSpeedRef.current[key] = smoothed;
             setSpeeds((s) => ({ ...s, [key]: smoothed }));
+            prevSampleRef.current[key] = { bytes, time: now };
+          } else if (!prevSample) {
+            prevSampleRef.current[key] = { bytes, time: now };
           }
-          prevSampleRef.current[key] = { bytes, time: now };
         } else if (seenRef.current[key]) {
           // Was actively downloading and just dropped out of activeDownloads
           // -- a genuine finish (success or failure), not a queued job, so no
