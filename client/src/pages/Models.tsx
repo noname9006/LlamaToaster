@@ -12,7 +12,7 @@ import {
   IconX,
 } from "../components/icons";
 import { ParamsRangeSlider, PARAMS_STOPS, paramsInRange } from "../components/ParamsRangeSlider";
-import { buildModelGroups, extractQuant, groupQuantsByTier, type ModelGroup } from "../modelGrouping";
+import { buildModelGroups, resolveQuant, groupQuantsByTier, type ModelGroup } from "../modelGrouping";
 import {
   formatBytes,
   formatParamsB,
@@ -1043,7 +1043,7 @@ export function Models() {
     const workerModelFile = findWorkerModelFile(m, worker);
     const modelState = workerModelFile?.state;
     const hfMatch = workerModelFile?.hf_match;
-    const quant = extractQuant(m.hf_file ?? m.filename) ?? "?";
+    const quant = resolveQuant(m) ?? "?";
     // The worker's live hash-verified match takes priority over the model's
     // own stored hf_repo/hf_file (which can point at a since-renamed/moved
     // file the hash lookup would catch).

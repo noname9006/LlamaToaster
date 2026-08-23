@@ -159,6 +159,56 @@ class GgufReader {
   }
 }
 
+// Maps GGUF's general.file_type integer (llama.cpp's llama_ftype enum,
+// baked into every GGUF file at conversion time by the tool that produced
+// it -- independent of whatever the file happens to be named) to the same
+// quant-code strings HF filenames use (Q4_K_M, Q8_0, F16, ...). This is the
+// authoritative source: a file's *name* carrying no quant token (e.g. an
+// unsloth MTP drafter like "mtp-gemma-4-E2B-it.gguf") doesn't mean the file
+// has no quantization, just that the filename doesn't advertise it.
+// See llama.cpp's include/llama.h llama_ftype enum. Only covers currently-
+// live values -- a handful of historic IDs (4,5,6,33,34,35) were retired
+// quant formats and are deliberately absent, as is 1024
+// (LLAMA_FTYPE_GUESSED, meaning llama.cpp itself couldn't determine one).
+const FTYPE_QUANT_LABEL: Record<number, string> = {
+  0: "F32",
+  1: "F16",
+  2: "Q4_0",
+  3: "Q4_1",
+  7: "Q8_0",
+  8: "Q5_0",
+  9: "Q5_1",
+  10: "Q2_K",
+  11: "Q3_K_S",
+  12: "Q3_K_M",
+  13: "Q3_K_L",
+  14: "Q4_K_S",
+  15: "Q4_K_M",
+  16: "Q5_K_S",
+  17: "Q5_K_M",
+  18: "Q6_K",
+  19: "IQ2_XXS",
+  20: "IQ2_XS",
+  21: "Q2_K_S",
+  22: "IQ3_XS",
+  23: "IQ3_XXS",
+  24: "IQ1_S",
+  25: "IQ4_NL",
+  26: "IQ3_S",
+  27: "IQ3_M",
+  28: "IQ2_S",
+  29: "IQ2_M",
+  30: "IQ4_XS",
+  31: "IQ1_M",
+  32: "BF16",
+  36: "TQ1_0",
+  37: "TQ2_0",
+};
+
+export function quantLabelFromFileType(fileType: number): string | null {
+  return FTYPE_QUANT_LABEL[fileType] ?? null;
+}
+
 export interface GgufInfo {
   n_layer: number | null;
   // GGUF's <architecture>.nextn_predict_layers -- >0 means this file has a
@@ -174,6 +224,10 @@ export interface GgufInfo {
   // "absent means unknown/not applicable" convention as mtp_layers above).
   // See shared/types.ts's ModelMetadata.expert_count.
   expert_count: number | null;
+  // Quant code derived from general.file_type (see FTYPE_QUANT_LABEL above),
+  // not from the filename -- null when the key is absent (very old/foreign
+  // conversion tools) or its value isn't one of the currently-live ftypes.
+  quant: string | null;
   // Local-only diagnostic for why n_layer/mtp_layers/expert_count came back
   // null -- never sent over the wire (worker/src/index.ts logs it, nothing
   // else reads it), purely so a failed lookup says WHY instead of leaving
@@ -183,7 +237,7 @@ export interface GgufInfo {
 }
 
 function emptyGgufInfo(debugReason: string): GgufInfo {
-  return { n_layer: null, mtp_layers: null, expert_count: null, debugReason };
+  return { n_layer: null, mtp_layers: null, expert_count: null, quant: null, debugReason };
 }
 
 // Reads a GGUF file's metadata header to find the model's transformer layer
@@ -207,6 +261,7 @@ export async function readGgufInfo(filePath: string): Promise<GgufInfo> {
     if (kvCount < 0 || kvCount > MAX_KV_COUNT) return emptyGgufInfo(`implausible kv_count ${kvCount}`);
 
     let architecture: string | undefined;
+    let fileType: number | undefined;
     const blockCounts = new Map<string, number>();
     const mtpLayerCounts = new Map<string, number>();
     const expertCounts = new Map<string, number>();
@@ -228,6 +283,8 @@ export async function readGgufInfo(filePath: string): Promise<GgufInfo> {
       const valueType = await reader.u32();
       if (key === "general.architecture" && valueType === GGUF_TYPE.STRING) {
         architecture = await reader.string();
+      } else if (key === "general.file_type" && valueType !== GGUF_TYPE.ARRAY && valueType !== GGUF_TYPE.STRING) {
+        fileType = await reader.numeric(valueType);
       } else if (key.endsWith(".block_count") && valueType !== GGUF_TYPE.ARRAY && valueType !== GGUF_TYPE.STRING) {
         blockCounts.set(key, await reader.numeric(valueType));
       } else if (
@@ -248,6 +305,7 @@ export async function readGgufInfo(filePath: string): Promise<GgufInfo> {
       n_layer,
       mtp_layers: mtpLayerCounts.get(`${architecture}.nextn_predict_layers`) ?? null,
       expert_count: expertCounts.get(`${architecture}.expert_count`) ?? null,
+      quant: fileType != null ? quantLabelFromFileType(fileType) : null,
       debugReason:
         n_layer === null ? `architecture "${architecture}" found but no ${architecture}.block_count key` : undefined,
     };
