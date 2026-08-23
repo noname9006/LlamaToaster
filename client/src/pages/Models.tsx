@@ -3,7 +3,6 @@ import { api, ApiError } from "../api/client";
 import { StatusPill } from "../components/StatusPill";
 import {
   IconAlertTriangle,
-  IconBrain,
   IconChevronDown,
   IconCloud,
   IconDownload,
@@ -23,9 +22,7 @@ import {
   formatShortRelativeTime,
   hfFileUrl,
   hfRepoUrl,
-  modelArchType,
   modelAuthor,
-  modelExpertCount,
   modelFamily,
   modelParamsB,
   paramsBFromText,
@@ -353,12 +350,6 @@ export function Models() {
   // looked up around the same time.
   const [paramLookupBusyId, setParamLookupBusyId] = useState<string | null>(null);
   const [paramLookupErr, setParamLookupErr] = useState<Record<string, string>>({});
-  // Per-row state for the "look up architecture info" (dense/MoE) backfill
-  // action -- see lookupArchInfo below. Unlike param count, this queues a
-  // worker job rather than resolving immediately, so busy stays true across
-  // the whole poll.
-  const [archLookupBusyId, setArchLookupBusyId] = useState<string | null>(null);
-  const [archLookupErr, setArchLookupErr] = useState<Record<string, string>>({});
 
   // Live "which worker(s) have this model's file" map -- see
   // server/src/routes/models.ts's /api/models/locations. Drives the
@@ -370,7 +361,6 @@ export function Models() {
 
   const [authorFilter, setAuthorFilter] = useState("");
   const [familyFilter, setFamilyFilter] = useState("");
-  const [archTypeFilter, setArchTypeFilter] = useState<"" | "dense" | "moe">("");
   const [paramsLoIndex, setParamsLoIndex] = useState(0);
   const [paramsHiIndex, setParamsHiIndex] = useState(PARAMS_STOPS.length - 1);
   const [sortField, setSortField] = useState<SortField>("created");
@@ -385,7 +375,6 @@ export function Models() {
         author: modelAuthor(m),
         family: modelFamily(m),
         paramsB: modelParamsB(m),
-        archType: modelArchType(m),
       })),
     [models]
   );
@@ -409,10 +398,9 @@ export function Models() {
     let list = enrichedModels;
     if (authorFilter) list = list.filter((e) => e.author === authorFilter);
     if (familyFilter) list = list.filter((e) => e.family === familyFilter);
-    if (archTypeFilter) list = list.filter((e) => e.archType === archTypeFilter);
     list = list.filter((e) => paramsInRange(e.paramsB, paramsLoIndex, paramsHiIndex));
     return list.map((e) => e.model);
-  }, [enrichedModels, authorFilter, familyFilter, archTypeFilter, paramsLoIndex, paramsHiIndex]);
+  }, [enrichedModels, authorFilter, familyFilter, paramsLoIndex, paramsHiIndex]);
 
   // Buckets the filtered models by where their file actually lives -- one
   // entry per configured worker plus a trailing "not found anywhere" bucket,
@@ -560,49 +548,6 @@ export function Models() {
       setParamLookupErr((s) => ({ ...s, [m.id]: err instanceof Error ? err.message : String(err) }));
     } finally {
       setParamLookupBusyId(null);
-    }
-  }
-
-  // Backfills dense-vs-MoE info for a model registered before n_layer/
-  // expert_count collection existed -- unlike lookupParamCount above, this
-  // needs a worker (the file's own GGUF header is the only reliable source;
-  // Hugging Face's API has no equivalent field, confirmed live) and queues a
-  // job rather than resolving immediately, so it polls the same way
-  // handleRefreshModels does.
-  async function lookupArchInfo(m: Model, worker: Worker) {
-    setArchLookupBusyId(m.id);
-    setArchLookupErr((s) => ({ ...s, [m.id]: "" }));
-    try {
-      const { job_id } = await api.backfillArchInfo(worker.id, m.id);
-      const maxPolls = 30; // ~30 * 2s = 1 minute -- just a header read, not a download
-      let polls = 0;
-      const poll = async () => {
-        polls++;
-        try {
-          const job = await api.getJobStatus(worker.id, job_id);
-          if (job.status === "completed" || job.status === "failed" || job.status === "cancelled") {
-            setArchLookupBusyId(null);
-            if (job.status !== "completed") {
-              setArchLookupErr((s) => ({ ...s, [m.id]: `Lookup ended with: ${job.status}` }));
-            }
-            await loadModels();
-            return;
-          }
-        } catch {
-          // Job not found or transient -- fall back to reloading anyway after a few polls
-        }
-        if (polls >= maxPolls) {
-          setArchLookupBusyId(null);
-          setArchLookupErr((s) => ({ ...s, [m.id]: "Lookup timed out." }));
-          await loadModels();
-          return;
-        }
-        setTimeout(poll, 2000);
-      };
-      setTimeout(poll, 2000);
-    } catch (err) {
-      setArchLookupErr((s) => ({ ...s, [m.id]: err instanceof Error ? err.message : String(err) }));
-      setArchLookupBusyId(null);
     }
   }
 
@@ -1056,8 +1001,6 @@ export function Models() {
     const modelState = workerModelFile?.state;
     const hfMatch = workerModelFile?.hf_match;
     const quant = extractQuant(m.hf_file ?? m.filename);
-    const expertCount = modelExpertCount(m);
-    const archType = modelArchType(m);
     const isEstimatedParams = paramsB !== null && typeof m.metadata.param_count !== "number";
     // Actions column's HF link target: the worker's live hash-verified match
     // takes priority over the model's own stored hf_repo/hf_file (which can
@@ -1073,8 +1016,6 @@ export function Models() {
             {m.filename}
           </span>
           {quant && <MiniChip label={quant} />}
-          {archType === "moe" && <MiniChip label={`MoE·${expertCount}`} tone="warning" />}
-          {archType === "dense" && <MiniChip label="Dense" />}
           {isMtpDraftModel(m) && (
             <span title="Standalone MTP/draft companion file -- not benchmarkable on its own, only usable as an MTP model paired with a base model on New Run">
               <MiniChip label="MTP" tone="accent" />
@@ -1127,18 +1068,6 @@ export function Models() {
               <IconRefreshCw width={13} height={13} className={paramLookupBusyId === m.id ? "animate-spin" : undefined} />
             </button>
           )}
-          {archType === "unknown" && (
-            <button
-              type="button"
-              disabled={archLookupBusyId === m.id}
-              onClick={() => lookupArchInfo(m, worker)}
-              className="flex h-6 w-6 items-center justify-center rounded text-muted hover:bg-surface hover:text-accent disabled:opacity-50"
-              title={`Look up whether ${m.filename} is dense or MoE (re-reads the file's own GGUF header on ${worker.displayName})`}
-              aria-label={`Look up architecture info for ${m.filename}`}
-            >
-              <IconBrain width={13} height={13} className={archLookupBusyId === m.id ? "animate-pulse" : undefined} />
-            </button>
-          )}
           {hfMatch?.deleted ? (
             <span
               className="flex h-6 w-6 items-center justify-center rounded text-warning"
@@ -1174,7 +1103,6 @@ export function Models() {
         </div>
 
         {paramLookupErr[m.id] && <div className="col-span-full pl-1 pt-1 text-xs text-danger">{paramLookupErr[m.id]}</div>}
-        {archLookupErr[m.id] && <div className="col-span-full pl-1 pt-1 text-xs text-danger">{archLookupErr[m.id]}</div>}
       </div>
     );
   }
@@ -1265,18 +1193,6 @@ export function Models() {
                 </select>
               </label>
               <label className="flex flex-col gap-1.5 text-sm">
-                <span className="text-muted">Type</span>
-                <select
-                  value={archTypeFilter}
-                  onChange={(e) => setArchTypeFilter(e.target.value as "" | "dense" | "moe")}
-                  className="rounded-lg border border-border bg-surface px-3 py-1.5 text-fg outline-none focus:border-accent"
-                >
-                  <option value="">All</option>
-                  <option value="dense">Dense</option>
-                  <option value="moe">MoE</option>
-                </select>
-              </label>
-              <label className="flex flex-col gap-1.5 text-sm">
                 <span className="text-muted">Parameters</span>
                 <ParamsRangeSlider
                   loIndex={paramsLoIndex}
@@ -1312,13 +1228,12 @@ export function Models() {
                   </button>
                 </div>
               </label>
-              {(authorFilter || familyFilter || archTypeFilter || paramsLoIndex !== 0 || paramsHiIndex !== PARAMS_STOPS.length - 1) && (
+              {(authorFilter || familyFilter || paramsLoIndex !== 0 || paramsHiIndex !== PARAMS_STOPS.length - 1) && (
                 <button
                   type="button"
                   onClick={() => {
                     setAuthorFilter("");
                     setFamilyFilter("");
-                    setArchTypeFilter("");
                     setParamsLoIndex(0);
                     setParamsHiIndex(PARAMS_STOPS.length - 1);
                   }}

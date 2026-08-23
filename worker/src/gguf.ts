@@ -174,9 +174,17 @@ export interface GgufInfo {
   // "absent means unknown/not applicable" convention as mtp_layers above).
   // See shared/types.ts's ModelMetadata.expert_count.
   expert_count: number | null;
+  // Local-only diagnostic for why n_layer/mtp_layers/expert_count came back
+  // null -- never sent over the wire (worker/src/index.ts logs it, nothing
+  // else reads it), purely so a failed lookup says WHY instead of leaving
+  // "unknown" to guess at (bad magic? unreadable file? architecture key
+  // never found? found but no matching block_count key?).
+  debugReason?: string;
 }
 
-const EMPTY_GGUF_INFO: GgufInfo = { n_layer: null, mtp_layers: null, expert_count: null };
+function emptyGgufInfo(debugReason: string): GgufInfo {
+  return { n_layer: null, mtp_layers: null, expert_count: null, debugReason };
+}
 
 // Reads a GGUF file's metadata header to find the model's transformer layer
 // count and (if present) its MTP/nextn layer count. Returns nulls on any
@@ -190,30 +198,33 @@ export async function readGgufInfo(filePath: string): Promise<GgufInfo> {
     const reader = new GgufReader(fh);
 
     const magic = await reader.u32();
-    if (magic !== GGUF_MAGIC) return EMPTY_GGUF_INFO;
+    if (magic !== GGUF_MAGIC) return emptyGgufInfo(`bad magic 0x${magic.toString(16)}`);
     const version = await reader.u32();
-    if (version < 2) return EMPTY_GGUF_INFO; // v1 used uint32 counts; no current build produces it
+    if (version < 2) return emptyGgufInfo(`gguf version ${version} < 2`); // v1 used uint32 counts; no current build produces it
 
     await reader.u64(); // tensor_count -- unused here, consumed only to advance the cursor
     const kvCount = await reader.u64();
-    if (kvCount < 0 || kvCount > MAX_KV_COUNT) return EMPTY_GGUF_INFO;
+    if (kvCount < 0 || kvCount > MAX_KV_COUNT) return emptyGgufInfo(`implausible kv_count ${kvCount}`);
 
     let architecture: string | undefined;
     const blockCounts = new Map<string, number>();
     const mtpLayerCounts = new Map<string, number>();
     const expertCounts = new Map<string, number>();
 
+    // Deliberately walks every KV pair rather than stopping at the first
+    // "tokenizer."-prefixed key: a llama.cpp-produced GGUF always puts
+    // hyperparameter keys (general.*, <arch>.*, including block_count)
+    // before tokenizer.* ones, but files from other conversion pipelines
+    // (observed live: NVIDIA Nemotron GGUFs) don't reliably follow that
+    // ordering -- stopping early there silently reported every field
+    // "unknown" for an otherwise perfectly normal file. This does mean
+    // reading through the (often multi-MB) vocab/merges arrays that follow,
+    // via skip()'s cheap discard-without-allocating path -- an acceptable
+    // cost since both call sites (a download's one-time metadata read, and
+    // the on-demand backfill button) are already one-off actions, not
+    // something run per file on every heartbeat.
     for (let i = 0; i < kvCount; i++) {
       const key = await reader.string();
-      // Hyperparameter keys (general.*, <arch>.*, including block_count and
-      // nextn_predict_layers) always precede tokenizer.* keys in a
-      // llama.cpp-produced GGUF -- stop here rather than walking the (often
-      // multi-MB) vocab/merges arrays that follow, which hold nothing this
-      // function needs. A file that somehow doesn't follow that convention
-      // just falls through to the post-loop lookup below with whatever was
-      // found so far, rather than getting a wrong answer.
-      if (key.startsWith("tokenizer.")) break;
-
       const valueType = await reader.u32();
       if (key === "general.architecture" && valueType === GGUF_TYPE.STRING) {
         architecture = await reader.string();
@@ -231,13 +242,17 @@ export async function readGgufInfo(filePath: string): Promise<GgufInfo> {
         await reader.skip(valueType);
       }
     }
+    if (!architecture) return emptyGgufInfo("no general.architecture key found in the whole file");
+    const n_layer = blockCounts.get(`${architecture}.block_count`) ?? null;
     return {
-      n_layer: architecture ? blockCounts.get(`${architecture}.block_count`) ?? null : null,
-      mtp_layers: architecture ? mtpLayerCounts.get(`${architecture}.nextn_predict_layers`) ?? null : null,
-      expert_count: architecture ? expertCounts.get(`${architecture}.expert_count`) ?? null : null,
+      n_layer,
+      mtp_layers: mtpLayerCounts.get(`${architecture}.nextn_predict_layers`) ?? null,
+      expert_count: expertCounts.get(`${architecture}.expert_count`) ?? null,
+      debugReason:
+        n_layer === null ? `architecture "${architecture}" found but no ${architecture}.block_count key` : undefined,
     };
-  } catch {
-    return EMPTY_GGUF_INFO;
+  } catch (err) {
+    return emptyGgufInfo(`parse threw: ${err instanceof Error ? err.message : String(err)}`);
   } finally {
     await fh?.close().catch(() => {});
   }

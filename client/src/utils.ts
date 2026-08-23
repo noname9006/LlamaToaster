@@ -250,24 +250,3 @@ export function modelParamsB(m: Model): number | null {
 export function formatParamsB(b: number | null): string {
   return b === null ? "—" : `${b}B`;
 }
-
-export type ModelArchType = "moe" | "dense" | "unknown";
-
-// Whether a registered model is Mixture-of-Experts, confirmed dense, or
-// unknown. MoE is confirmed by metadata.expert_count > 0 -- worker/src/gguf.ts
-// only ever sets it when the GGUF's <arch>.expert_count key is actually
-// present. "dense" is only claimed when metadata.n_layer is *also* present
-// (meaning GGUF header parsing genuinely ran for this file) and expert_count
-// came back absent -- an absent n_layer means the file was never parsed at
-// all (registered before this existed, or a manually-added "local" model
-// with no bytes to read), so dense-vs-MoE is truly unknown there, not a safe
-// default to assume.
-export function modelArchType(m: Model): ModelArchType {
-  if (typeof m.metadata.expert_count === "number" && m.metadata.expert_count > 0) return "moe";
-  if (typeof m.metadata.n_layer === "number") return "dense";
-  return "unknown";
-}
-
-export function modelExpertCount(m: Model): number | null {
-  return typeof m.metadata.expert_count === "number" && m.metadata.expert_count > 0 ? m.metadata.expert_count : null;
-}

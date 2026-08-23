@@ -11,7 +11,6 @@ import type {
   HfFileEntry,
   ModelMetadata,
   ModelDownloadCallbackInput,
-  GgufInfoCallbackInput,
   LlamaCppRelease,
   WorkerVramInfo,
 } from "../../../shared/types.js";
@@ -279,30 +278,6 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
     }
   );
 
-  // On-demand backfill for a model registered before n_layer/expert_count
-  // collection existed -- Models page's per-row "look up architecture info"
-  // action (shown only when modelArchType(m) is "unknown"). filename is
-  // resolved from the model row itself so the client only has to say which
-  // model, not where its file lives; the worker reports back via
-  // POST /api/models/gguf-info-callback below, same shape as the download
-  // job's own callback.
-  app.post<{ Params: { id: string; modelId: string } }>(
-    "/api/workers/:id/models/:modelId/gguf-info",
-    async (request, reply) => {
-      const worker = requireOnlineWorker(resolveAuthUser(request)?.user.id, request.params.id);
-      const model = repo.getModel(request.params.modelId);
-      if (!model) throw new NotFoundError("unknown model");
-      const filename = model.source === "local" ? model.filename : model.hf_file;
-      if (!filename) throw new BadRequestError("model has no filename to look up");
-      const jobId = repo.queueRepo.enqueueJob(worker.id, {
-        type: "read_gguf_info",
-        payload: { model_id: model.id, filename },
-      });
-      queueEvents.emit(worker.id);
-      return reply.code(202).send({ ok: true, queued: true, job_id: jobId });
-    }
-  );
-
   // Pauses an in-flight (or still-queued) download -- flags the same
   // cancel_requested column a benchmark job's Stop button already uses
   // (requestCancel), delivered to the worker on its next heartbeat
@@ -473,48 +448,4 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
     }
   );
 
-  // Worker -> server callback for the "read_gguf_info" backfill job (see
-  // /api/workers/:id/models/:modelId/gguf-info above). Unlike the download
-  // callback, applying the same result twice is already harmless
-  // (repo.updateModelMetadata is a plain field merge), so there's no
-  // upsert-safety caveat to call out here.
-  app.post<{ Body: GgufInfoCallbackInput }>(
-    "/api/models/gguf-info-callback",
-    { logLevel: "silent" },
-    async (request, reply) => {
-      // Worker credential, not a browser session -- same pattern as
-      // /api/models/download-callback above (see auth-middleware.ts's
-      // WORKER_AUTHENTICATED_ROUTES entry for this route).
-      await authenticateWorker(request);
-      const validationError = validateGgufInfoCallback(request.body);
-      if (validationError) {
-        app.log.warn({ error: validationError }, "gguf info callback rejected: invalid payload");
-        return reply.code(400).send({ error: validationError });
-      }
-      const { model_id, n_layer, mtp_layers, expert_count } = request.body;
-      const model = repo.getModel(model_id);
-      if (!model) {
-        // The model could have been deleted between the job being queued and
-        // the worker finishing it -- nothing left to update, not an error.
-        return reply.code(200).send({ ok: true });
-      }
-      repo.updateModelMetadata(model_id, {
-        ...(typeof n_layer === "number" ? { n_layer } : {}),
-        ...(typeof mtp_layers === "number" && mtp_layers > 0 ? { mtp_layers } : {}),
-        ...(typeof expert_count === "number" && expert_count > 0 ? { expert_count } : {}),
-      });
-      app.log.info({ model_id, n_layer, mtp_layers, expert_count }, "gguf info backfilled");
-      return reply.code(200).send({ ok: true });
-    }
-  );
-}
-
-function validateGgufInfoCallback(payload: unknown): string | null {
-  if (!payload || typeof payload !== "object") return "payload must be an object";
-  const p = payload as Record<string, unknown>;
-  if (typeof p.model_id !== "string" || !p.model_id) return "model_id must be a non-empty string";
-  for (const key of ["n_layer", "mtp_layers", "expert_count"] as const) {
-    if (p[key] !== undefined && p[key] !== null && typeof p[key] !== "number") return `${key} must be a number or null`;
-  }
-  return null;
 }
