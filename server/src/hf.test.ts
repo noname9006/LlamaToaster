@@ -1,5 +1,27 @@
 import { describe, expect, it } from "vitest";
-import { parseNextLink, parseNextCursor } from "./hf.js";
+import { parseNextLink, parseNextCursor, parseQuant } from "./hf.js";
+
+describe("parseQuant", () => {
+  it("extracts a plain quant code", () => {
+    expect(parseQuant("Llama-3.1-8B-Instruct-Q4_K_M.gguf")).toBe("Q4_K_M");
+  });
+
+  it("extracts an IQ code", () => {
+    expect(parseQuant("model-IQ2_XS.gguf")).toBe("IQ2_XS");
+  });
+
+  it("prefixes an unsloth Dynamic quant with UD-", () => {
+    expect(parseQuant("gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf")).toBe("UD-Q4_K_XL");
+  });
+
+  it("handles an underscore-separated UD prefix too", () => {
+    expect(parseQuant("model_UD_IQ2_M.gguf")).toBe("UD-IQ2_M");
+  });
+
+  it("returns null when no quant token is present", () => {
+    expect(parseQuant("some-random-file.gguf")).toBeNull();
+  });
+});
 
 describe("parseNextLink", () => {
   it("extracts the full next URL from a Link header", () => {

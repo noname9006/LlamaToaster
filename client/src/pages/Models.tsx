@@ -195,9 +195,12 @@ function persistHfSearch(state: PersistedHfSearch): void {
 }
 
 // Shared between the "My models" section's column header and every data/
-// draft row so their cells always line up: Name (flexible) | Params | Size |
-// State | Src | Added | Actions.
-const ROW_GRID = "grid grid-cols-[minmax(220px,1fr)_56px_72px_96px_24px_48px_64px] items-center gap-x-3";
+// draft row so their cells always line up: Name | Size | State | Src |
+// Added | Actions. Params isn't a column here -- it's the same value for
+// every quant sibling in a group (same underlying model, just quantized
+// differently), so it's shown once on the group header instead of
+// repeated on every single row.
+const ROW_GRID = "grid grid-cols-[minmax(220px,1fr)_72px_96px_24px_48px_64px] items-center gap-x-3";
 
 function MiniChip({ label, tone = "muted" }: { label: string; tone?: "muted" | "warning" | "accent" }) {
   const toneClass =
@@ -511,7 +514,7 @@ export function Models() {
     if (!filename) return;
     if (
       !window.confirm(
-        `Delete ${m.filename} from ${worker.displayName}? This only removes the file on that machine -- the model stays registered.`
+        `Delete ${m.filename} from ${worker.displayName}? This removes it from that machine and from this list -- you can re-download or re-import it later.`
       )
     ) {
       return;
@@ -852,39 +855,52 @@ export function Models() {
     await runFreshHfSearch(hfSortField, hfSortDir);
   }
 
-  // Ensures the filtered buffer covers the NEXT display page, fetching
-  // further raw HF pages on demand (via the last page's cursor) until it
-  // does, or until the cursor runs out, or a safety cap is hit -- a filter
-  // that matches almost nothing in the whole result set should eventually
-  // give up and say so rather than hammering HF's API in a loop. Because
-  // display pages are built FROM the filtered set (filteredHfResults above),
-  // this is what actually "groups items onto pages according to the
-  // filter": Next can only ever land on a page that's provably non-empty,
-  // instead of a raw HF page that then turns out empty once filtered.
+  // Safety cap on how many raw HF pages one fill attempt will fetch through
+  // -- a filter that matches almost nothing in the whole result set should
+  // eventually give up rather than hammering HF's API in a loop.
   const MAX_AUTO_FETCH_PAGES = 8;
+
+  // Fetches further raw HF pages (via the last page's cursor) until the
+  // filtered buffer covers a FULL display page at targetIndex, or the cursor
+  // runs out, or the fetch cap is hit. This is what actually "groups items
+  // onto pages according to the filter": a display page is built FROM the
+  // filtered set (filteredHfResults above), so as long as this keeps that
+  // set topped up, a page can only ever be non-full at the true end of the
+  // results, never because a raw HF page happened to filter down to nothing.
+  //
+  // Called from two places: goToNextHfPage (targeting the page it's about
+  // to advance to) and the effect below (targeting whatever page is
+  // *already* current -- covers landing on an under-filled page without any
+  // Next click at all, e.g. right after a fresh search or a filter change,
+  // which is exactly the "empty page" bug this whole redesign exists to fix).
+  async function ensurePageFilled(targetIndex: number): Promise<{ pages: HfPage[]; filteredCount: number }> {
+    let pages = hfPages;
+    const filterFn = (r: HfRepoSearchResult) => paramsInRange(paramsBFromText(r.id), hfParamsLoIndex, hfParamsHiIndex);
+    let filteredCount = pages.flatMap((p) => p.results).filter(filterFn).length;
+    const needed = (targetIndex + 1) * HF_PAGE_SIZE;
+    let attempts = 0;
+    while (filteredCount < needed && pages[pages.length - 1]?.nextCursor && attempts < MAX_AUTO_FETCH_PAGES) {
+      const cursor = pages[pages.length - 1].nextCursor!;
+      const { results, nextCursor } = await api.searchHf({
+        q: hfQuery,
+        sort: HF_SORT_SERVER_FIELD[hfSortField],
+        direction: hfSortField === "relevance" ? undefined : hfSortDir === "asc" ? 1 : -1,
+        cursor,
+      });
+      pages = [...pages, { results, nextCursor }];
+      filteredCount = pages.flatMap((p) => p.results).filter(filterFn).length;
+      attempts++;
+    }
+    return { pages, filteredCount };
+  }
 
   async function goToNextHfPage() {
     setHfMsg("");
     setSearching(true);
     try {
-      let pages = hfPages;
       const newIndex = hfPageIndex + 1;
-      const filterFn = (r: HfRepoSearchResult) => paramsInRange(paramsBFromText(r.id), hfParamsLoIndex, hfParamsHiIndex);
-      let filteredCount = pages.flatMap((p) => p.results).filter(filterFn).length;
-      let attempts = 0;
-      while (filteredCount <= newIndex * HF_PAGE_SIZE && pages[pages.length - 1]?.nextCursor && attempts < MAX_AUTO_FETCH_PAGES) {
-        const cursor = pages[pages.length - 1].nextCursor!;
-        const { results, nextCursor } = await api.searchHf({
-          q: hfQuery,
-          sort: HF_SORT_SERVER_FIELD[hfSortField],
-          direction: hfSortField === "relevance" ? undefined : hfSortDir === "asc" ? 1 : -1,
-          cursor,
-        });
-        pages = [...pages, { results, nextCursor }];
-        filteredCount = pages.flatMap((p) => p.results).filter(filterFn).length;
-        attempts++;
-      }
-      setHfPages(pages);
+      const { pages, filteredCount } = await ensurePageFilled(newIndex);
+      if (pages !== hfPages) setHfPages(pages);
       if (filteredCount > newIndex * HF_PAGE_SIZE) {
         setHfPageIndex(newIndex);
       } else {
@@ -896,6 +912,27 @@ export function Models() {
       setSearching(false);
     }
   }
+
+  // Proactively tops up whatever page is *currently* shown -- without this,
+  // only clicking Next ever filled a page, so the page you land on right
+  // after a fresh search or a filter change (still index 0, or wherever a
+  // sort/filter change reset to) could show a sparse or fully empty page
+  // despite plenty of matches being just one more fetch away.
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const { pages } = await ensurePageFilled(hfPageIndex);
+        if (!cancelled) setHfPages((prev) => (pages === prev ? prev : pages));
+      } catch {
+        // transient -- the user can still hit Next/Prev manually, which retries
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hfPageIndex, hfParamsLoIndex, hfParamsHiIndex, hfPages]);
 
   // No skip logic needed backward: filteredHfResults only ever grows (more
   // raw pages fetched, same filter), and Next above only ever advances
@@ -989,19 +1026,21 @@ export function Models() {
     }
   }
 
-  // One line per file: Name (+quant/MoE/MTP chips) | Params | Size | State |
-  // Src | Added | Actions -- see ROW_GRID above. Replaces the old two-line
-  // flex-wrap row, whose metadata line grew a new wrapped line per badge.
+  // One line per file: Name (+quant/MoE/MTP chips) | Size | State | Src |
+  // Added | Actions -- see ROW_GRID above. Params isn't shown per row (same
+  // value for every quant sibling -- see renderModelGroup's header instead),
+  // but the real-count lookup is still a genuinely per-file action (each
+  // quant's own registered row gets backfilled independently), so it stays
+  // in the Actions column even without a number next to it on this row.
   function renderModelRow(m: Model, worker: Worker, indent: boolean) {
-    const paramsB = modelParamsB(m);
     const key = `${m.id}:${worker.id}`;
+    const isEstimatedParams = modelParamsB(m) !== null && typeof m.metadata.param_count !== "number";
 
     // Find the model file info with state from the worker's modelFiles
     const workerModelFile = worker.modelFiles?.find((f) => f.path === (m.source === "local" ? m.filename : m.hf_file));
     const modelState = workerModelFile?.state;
     const hfMatch = workerModelFile?.hf_match;
     const quant = extractQuant(m.hf_file ?? m.filename);
-    const isEstimatedParams = paramsB !== null && typeof m.metadata.param_count !== "number";
     // Actions column's HF link target: the worker's live hash-verified match
     // takes priority over the model's own stored hf_repo/hf_file (which can
     // point at a since-renamed/moved file the hash lookup would catch).
@@ -1020,19 +1059,6 @@ export function Models() {
             <span title="Standalone MTP/draft companion file -- not benchmarkable on its own, only usable as an MTP model paired with a base model on New Run">
               <MiniChip label="MTP" tone="accent" />
             </span>
-          )}
-        </div>
-
-        <div className="text-right font-mono text-xs tabular-nums text-fg">
-          {isEstimatedParams ? (
-            <span
-              className="cursor-help text-muted underline decoration-dotted underline-offset-2"
-              title="Estimated from the filename -- may be inaccurate"
-            >
-              {formatParamsB(paramsB)}
-            </span>
-          ) : (
-            formatParamsB(paramsB)
           )}
         </div>
 
@@ -1096,7 +1122,7 @@ export function Models() {
             onClick={() => handleDeleteModelFile(m, worker)}
             className="flex h-6 w-6 items-center justify-center rounded text-muted hover:bg-danger-bg hover:text-danger disabled:opacity-50"
             aria-label={`Delete ${m.filename} from ${worker.displayName}`}
-            title={`Delete this file from ${worker.displayName} only -- the model stays registered`}
+            title={`Delete this file from ${worker.displayName} -- you can re-download or re-import it later`}
           >
             <IconTrash width={13} height={13} />
           </button>
@@ -1122,6 +1148,12 @@ export function Models() {
     const totalFiles = group.quants.length + uniqueDrafts.length;
     const totalBytes =
       group.quants.reduce((n, q) => n + q.base.size_bytes, 0) + uniqueDrafts.reduce((n, d) => n + d.size_bytes, 0);
+    // Params is the same across every quant sibling (same underlying model,
+    // just quantized differently) -- shown once here instead of repeating it
+    // on every row. The smallest quant (quants[0], after buildModelGroups'
+    // own sort) stands in as the group's representative value, same
+    // convention sortModelGroups already uses for author/family/size sorts.
+    const groupParamsB = modelParamsB(group.quants[0].base);
     return (
       // border-t (not just the individual rows' own hairline) is what
       // actually separates one group from the next -- without it here, a
@@ -1131,6 +1163,9 @@ export function Models() {
         <div className="flex items-baseline gap-2 px-4 pt-2.5 pb-1 text-[11px] text-muted">
           <span>
             <span className="font-semibold text-fg">{group.author}</span> · {group.family} · {group.label}
+            {groupParamsB !== null && (
+              <span className="ml-2 font-mono tabular-nums text-muted/80">{formatParamsB(groupParamsB)}</span>
+            )}
           </span>
           <span className="ml-auto font-mono text-[10.5px] tabular-nums text-muted/70">
             {totalFiles} file{totalFiles === 1 ? "" : "s"} · {formatBytes(totalBytes)}
@@ -1139,6 +1174,11 @@ export function Models() {
         {group.quants.map(({ base }) => (
           <div key={base.id}>{renderModelRow(base, worker, false)}</div>
         ))}
+        {uniqueDrafts.length > 0 && (
+          <div className="ml-4 border-l-2 border-border py-1 pl-3 text-[10px] font-semibold uppercase tracking-wide text-accent/80">
+            MTP companion{uniqueDrafts.length === 1 ? "" : "s"}
+          </div>
+        )}
         {uniqueDrafts.map((draft) => (
           <div key={draft.id}>{renderModelRow(draft, worker, true)}</div>
         ))}
@@ -1282,7 +1322,6 @@ export function Models() {
                       <>
                         <div className={`${ROW_GRID} border-b border-border bg-surface-raised px-4 py-1.5 text-[10px] font-semibold uppercase tracking-wide text-muted/70`}>
                           <div>Name</div>
-                          <div className="text-right">Params</div>
                           <div className="text-right">Size</div>
                           <div className="text-right">State</div>
                           <div className="text-center">Src</div>
@@ -1290,7 +1329,24 @@ export function Models() {
                           <div />
                         </div>
                         {groups.map((group) => renderModelGroup(group, worker))}
-                        {orphans.map((d) => renderModelRow(d, worker, false))}
+                        {orphans.length > 0 && (
+                          // Every entry here is an MTP draft whose paired base isn't
+                          // in this worker's subset (orphanDrafts) -- most often
+                          // because its hf_repo doesn't match any registered base's,
+                          // so buildModelGroups never nested it under a group at all.
+                          // Still gets its own labeled subsection rather than
+                          // rendering as anonymous standalone rows indistinguishable
+                          // from a normal quant file.
+                          <div className="border-t-2 border-border/80">
+                            <div className="flex items-baseline gap-2 px-4 pt-2.5 pb-1 text-[11px] text-muted">
+                              <span className="font-semibold text-fg">MTP companions</span>
+                              <span className="text-muted/70">— no matching base model on this worker</span>
+                            </div>
+                            {orphans.map((d) => (
+                              <div key={d.id}>{renderModelRow(d, worker, false)}</div>
+                            ))}
+                          </div>
+                        )}
                       </>
                     )}
                   </div>
