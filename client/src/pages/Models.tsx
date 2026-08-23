@@ -906,9 +906,14 @@ export function Models() {
               </span>
             )}
             {hfMatch && !hfMatch.deleted && (
-              <span className="text-xs text-accent">
+              <a
+                href={hfFileUrl(hfMatch.repo_id, hfMatch.filename)}
+                target="_blank"
+                rel="noreferrer"
+                className="text-xs text-accent hover:underline"
+              >
                 {hfMatch.repo_id}/{hfMatch.filename}
-              </span>
+              </a>
             )}
             {m.hf_repo && m.hf_file && !hfMatch && (
               <a href={hfFileUrl(m.hf_repo, m.hf_file)} target="_blank" rel="noreferrer" className="text-accent hover:underline">
