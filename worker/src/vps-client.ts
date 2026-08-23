@@ -3,7 +3,6 @@ import { join } from "node:path";
 import type {
   RunItemUpdateInput,
   ModelDownloadCallbackInput,
-  GgufInfoCallbackInput,
   WorkerStatePush,
   ActiveJobReport,
   HeartbeatResponse,
@@ -74,29 +73,6 @@ export async function postModelDownloadResult(
   if (!res.ok) {
     const text = await res.text();
     throw new HttpError(res.status, `model download callback failed (${res.status}): ${text}`);
-  }
-}
-
-// Reports the "read_gguf_info" backfill job's result (worker/src/index.ts's
-// executeReadGgufInfoJob) -- a lightweight re-read of a file the worker
-// already has on disk, for a model that predates n_layer/expert_count
-// collection. Same shape/posture as postModelDownloadResult above, just a
-// smaller payload.
-export async function postGgufInfoResult(
-  vpsUrl: string,
-  token: string,
-  payload: GgufInfoCallbackInput,
-  timeoutMs = 10_000
-): Promise<void> {
-  const res = await fetch(`${vpsUrl}/api/models/gguf-info-callback`, {
-    method: "POST",
-    headers: { "content-type": "application/json", ...authHeader(token) },
-    body: JSON.stringify(payload),
-    signal: AbortSignal.timeout(timeoutMs),
-  });
-  if (!res.ok) {
-    const text = await res.text();
-    throw new HttpError(res.status, `gguf info callback failed (${res.status}): ${text}`);
   }
 }
 
