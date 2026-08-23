@@ -178,6 +178,48 @@ export function IconBrain(props: SVGProps<SVGSVGElement>) {
   );
 }
 
+export function IconCloud(props: SVGProps<SVGSVGElement>) {
+  return (
+    <Icon {...props}>
+      <path d="M7 18a4.5 4.5 0 01-.5-8.98A5.5 5.5 0 0117.3 8.1 4 4 0 0117 18H7z" />
+    </Icon>
+  );
+}
+
+export function IconHardDrive(props: SVGProps<SVGSVGElement>) {
+  return (
+    <Icon {...props}>
+      <rect x="3" y="4" width="18" height="16" rx="2" />
+      <path d="M3 10h18M8 4v4" />
+    </Icon>
+  );
+}
+
+export function IconExternalLink(props: SVGProps<SVGSVGElement>) {
+  return (
+    <Icon {...props}>
+      <path d="M14 5h5v5M9 15L19 5M12 5H7a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-5" />
+    </Icon>
+  );
+}
+
+export function IconAlertTriangle(props: SVGProps<SVGSVGElement>) {
+  return (
+    <Icon {...props}>
+      <path d="M12 3.5 21.5 20h-19L12 3.5z" />
+      <path d="M12 10v4M12 17h.01" />
+    </Icon>
+  );
+}
+
+export function IconPause(props: SVGProps<SVGSVGElement>) {
+  return (
+    <Icon {...props}>
+      <path d="M8 5v14M16 5v14" />
+    </Icon>
+  );
+}
+
 export function IconSettings(props: SVGProps<SVGSVGElement>) {
   return (
     <Icon {...props}>

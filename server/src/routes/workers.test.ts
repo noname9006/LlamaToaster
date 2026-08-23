@@ -394,6 +394,113 @@ describe("POST /api/models/download-callback (worker credential, not a user sess
   });
 });
 
+describe("POST /api/workers/:id/models/:modelId/gguf-info", () => {
+  it("enqueues a read_gguf_info job carrying the model's filename", async () => {
+    const id = await heartbeatWorker("gguf-info-worker");
+    repo.registerModel({
+      id: "m-gguf-info-hf",
+      filename: "model-Q4_K_M.gguf",
+      size_bytes: 1,
+      source: "huggingface",
+      hf_repo: "org/repo",
+      hf_file: "model-Q4_K_M.gguf",
+    });
+
+    const res = await fetch(`${baseUrl}/api/workers/${id}/models/m-gguf-info-hf/gguf-info`, { method: "POST" });
+    expect(res.status).toBe(202);
+    const body = (await res.json()) as { job_id: string };
+    const row = getDb().prepare(`SELECT job_type, payload_json FROM worker_jobs WHERE id = ?`).get(body.job_id) as {
+      job_type: string;
+      payload_json: string;
+    };
+    expect(row.job_type).toBe("read_gguf_info");
+    expect(JSON.parse(row.payload_json)).toEqual(
+      expect.objectContaining({ model_id: "m-gguf-info-hf", filename: "model-Q4_K_M.gguf" })
+    );
+  });
+
+  it("resolves filename from the local-source filename field, not hf_file", async () => {
+    const id = await heartbeatWorker("gguf-info-worker-local");
+    repo.registerModel({ id: "m-gguf-info-local", filename: "local-model.gguf", size_bytes: 1, source: "local" });
+
+    const res = await fetch(`${baseUrl}/api/workers/${id}/models/m-gguf-info-local/gguf-info`, { method: "POST" });
+    expect(res.status).toBe(202);
+  });
+
+  it("404s an unknown model id", async () => {
+    const id = await heartbeatWorker("gguf-info-worker-unknown-model");
+    const res = await fetch(`${baseUrl}/api/workers/${id}/models/not-a-real-model/gguf-info`, { method: "POST" });
+    expect(res.status).toBe(404);
+  });
+});
+
+// Same regression rationale as the download-callback suite above: a
+// worker->server call, must authenticate via authenticateWorker()
+// unconditionally, not gated on AUTH_ENABLED.
+describe("POST /api/models/gguf-info-callback (worker credential, not a user session)", () => {
+  it("rejects a request with no worker credential at all", async () => {
+    const res = await fetch(`${baseUrl}/api/models/gguf-info-callback`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model_id: "m-x", n_layer: 32, mtp_layers: null, expert_count: null }),
+    });
+    expect(res.status).toBe(401);
+  });
+
+  it("merges n_layer/expert_count into the model's existing metadata without disturbing other fields", async () => {
+    repo.registerModel({
+      id: "m-gguf-info-callback",
+      filename: "model.gguf",
+      size_bytes: 1,
+      source: "local",
+      metadata: { arch: "llama" },
+    });
+    const id = await heartbeatWorker("gguf-info-callback-worker");
+    const { userId } = await sessionFor("gguf-info-callback-owner");
+    const { token } = repo.sessionRepo.create(userId, { isWorker: true, workerId: id });
+
+    const res = await fetch(`${baseUrl}/api/models/gguf-info-callback`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...authed(token) },
+      body: JSON.stringify({ model_id: "m-gguf-info-callback", n_layer: 32, mtp_layers: null, expert_count: null }),
+    });
+    expect(res.status).toBe(200);
+    const model = repo.getModel("m-gguf-info-callback");
+    expect(model?.metadata.arch).toBe("llama"); // untouched
+    expect(model?.metadata.n_layer).toBe(32);
+    expect(model?.metadata.expert_count).toBeUndefined(); // null/0 never gets stored, same as the download callback
+  });
+
+  it("reports back a MoE model's expert_count", async () => {
+    repo.registerModel({ id: "m-gguf-info-moe", filename: "moe.gguf", size_bytes: 1, source: "local" });
+    const id = await heartbeatWorker("gguf-info-callback-worker-moe");
+    const { userId } = await sessionFor("gguf-info-callback-owner-moe");
+    const { token } = repo.sessionRepo.create(userId, { isWorker: true, workerId: id });
+
+    const res = await fetch(`${baseUrl}/api/models/gguf-info-callback`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...authed(token) },
+      body: JSON.stringify({ model_id: "m-gguf-info-moe", n_layer: 48, mtp_layers: null, expert_count: 128 }),
+    });
+    expect(res.status).toBe(200);
+    const model = repo.getModel("m-gguf-info-moe");
+    expect(model?.metadata.expert_count).toBe(128);
+  });
+
+  it("200s harmlessly when the model was deleted before the worker's result arrived", async () => {
+    const id = await heartbeatWorker("gguf-info-callback-worker-gone");
+    const { userId } = await sessionFor("gguf-info-callback-owner-gone");
+    const { token } = repo.sessionRepo.create(userId, { isWorker: true, workerId: id });
+
+    const res = await fetch(`${baseUrl}/api/models/gguf-info-callback`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...authed(token) },
+      body: JSON.stringify({ model_id: "m-never-existed", n_layer: 32, mtp_layers: null, expert_count: null }),
+    });
+    expect(res.status).toBe(200);
+  });
+});
+
 describe("POST /api/workers/:id/downloads/:jobId/pause", () => {
   it("flags cancel_requested on a claimed download_model job, without discard_requested", async () => {
     const id = await heartbeatWorker("pause-worker");

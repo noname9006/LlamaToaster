@@ -1,20 +1,34 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { api, ApiError } from "../api/client";
 import { StatusPill } from "../components/StatusPill";
-import { IconChevronDown, IconDownload, IconRefreshCw, IconTrash } from "../components/icons";
+import {
+  IconAlertTriangle,
+  IconBrain,
+  IconChevronDown,
+  IconCloud,
+  IconDownload,
+  IconExternalLink,
+  IconHardDrive,
+  IconPause,
+  IconRefreshCw,
+  IconTrash,
+  IconX,
+} from "../components/icons";
 import { ParamsRangeSlider, PARAMS_STOPS, paramsInRange } from "../components/ParamsRangeSlider";
-import { buildModelGroups, type ModelGroup } from "../modelGrouping";
+import { buildModelGroups, extractQuant, type ModelGroup } from "../modelGrouping";
 import {
   formatBytes,
   formatParamsB,
   formatRelativeTime,
+  formatShortRelativeTime,
   hfFileUrl,
   hfRepoUrl,
+  modelArchType,
   modelAuthor,
+  modelExpertCount,
   modelFamily,
   modelParamsB,
   paramsBFromText,
-  shortId,
 } from "../utils";
 import { isMtpDraftModel } from "../types";
 import type {
@@ -143,6 +157,12 @@ interface HfPage {
   nextCursor: string | null;
 }
 
+// Display page size for the params-filtered results view -- matches HF's own
+// raw per-request page size (server/src/hf.ts's "top 15"), just applied to
+// the filtered list instead of the raw one. See filteredHfResults/
+// visibleHfResults/goToNextHfPage below.
+const HF_PAGE_SIZE = 15;
+
 // Session-scoped (not localStorage) -- a search is "current" for as long as
 // the tab lives, but stale HF result counts/likes shouldn't linger forever
 // across separate visits the way a remembered sweep should.
@@ -174,6 +194,45 @@ function persistHfSearch(state: PersistedHfSearch): void {
     sessionStorage.setItem(HF_SEARCH_STORAGE_KEY, JSON.stringify(state));
   } catch {
     /* sessionStorage unavailable -- search just won't survive a refresh */
+  }
+}
+
+// Shared between the "My models" section's column header and every data/
+// draft row so their cells always line up: Name (flexible) | Params | Size |
+// State | Src | Added | Actions.
+const ROW_GRID = "grid grid-cols-[minmax(220px,1fr)_56px_72px_96px_24px_48px_64px] items-center gap-x-3";
+
+function MiniChip({ label, tone = "muted" }: { label: string; tone?: "muted" | "warning" | "accent" }) {
+  const toneClass =
+    tone === "warning"
+      ? "border-warning/30 bg-warning-bg text-warning"
+      : tone === "accent"
+        ? "border-accent/30 bg-accent/10 text-accent"
+        : "border-border bg-surface text-muted";
+  return (
+    <span className={`shrink-0 rounded border px-1.5 py-px font-mono text-[10px] font-semibold ${toneClass}`}>
+      {label}
+    </span>
+  );
+}
+
+// Maps a worker-reported local model state to the app's existing .status-dot
+// tone classes (index.css) -- reused as-is rather than inventing new ones, so
+// this row's state indicator matches every other status dot in the app.
+function stateDotClass(state: string): string {
+  switch (state) {
+    case "verified":
+      return "status-dot--solid";
+    case "hashing":
+      return "status-dot--blink";
+    case "unknown":
+    case "modified":
+      return "status-dot--warn";
+    case "corrupted":
+    case "missing":
+      return "status-dot--red";
+    default:
+      return "status-dot--grey"; // "detected"
   }
 }
 
@@ -235,16 +294,16 @@ export function Models() {
   const [manualAddOpen, setManualAddOpen] = useState(loadManualAddOpen);
 
   const [hfQuery, setHfQuery] = useState(() => loadPersistedHfSearch()?.query ?? "");
-  // One entry per fetched page, indexed by page number -- pageIndex points
-  // at which one is currently shown. "Prev" just moves the index back (no
-  // refetch, already cached); "Next" moves forward if that page is already
-  // cached, otherwise fetches using the current page's nextCursor. HF's
-  // search API paginates via a forward-only opaque cursor, not an
-  // offset/page number, so there's no way to jump directly to an arbitrary
-  // page -- see server/src/hf.ts.
+  // hfPages holds every raw HF search page fetched so far (each with its own
+  // nextCursor), purely as a fetch cache -- it is NOT what's displayed.
+  // hfPageIndex instead indexes into the FILTERED, flattened, re-chunked view
+  // built below (filteredHfResults/visibleHfResults): "Prev" just moves the
+  // index back (already-fetched raw pages are re-sliced, never refetched);
+  // "Next" (goToNextHfPage) fetches more raw pages on demand, via HF's
+  // forward-only opaque cursor (server/src/hf.ts), until the filtered buffer
+  // covers the next display page or the cursor runs out.
   const [hfPages, setHfPages] = useState<HfPage[]>(() => loadPersistedHfSearch()?.pages ?? []);
   const [hfPageIndex, setHfPageIndex] = useState(() => loadPersistedHfSearch()?.pageIndex ?? 0);
-  const hfResults = hfPages[hfPageIndex]?.results ?? [];
   const [expandedRepo, setExpandedRepo] = useState<string | null>(() => loadPersistedHfSearch()?.expandedRepo ?? null);
   const [filesByRepo, setFilesByRepo] = useState<Record<string, HfFileEntry[]>>(
     () => loadPersistedHfSearch()?.filesByRepo ?? {}
@@ -258,6 +317,13 @@ export function Models() {
   // reports Content-Length.
   const [progress, setProgress] = useState<Record<string, { bytes: number; total: number | null }>>({});
   const [speeds, setSpeeds] = useState<Record<string, number>>({});
+  // True while a download job sits behind the worker's max_concurrent_downloads
+  // cap (worker_jobs.status still 'pending', never claimed) -- set/cleared by
+  // the poll effect below. Drives showing "Queued" with a static bar instead
+  // of "Starting…" with the indeterminate animation, which used to show for
+  // both cases identically even though "queued, worker hasn't touched it yet"
+  // and "claimed, about to report its first byte" are different states.
+  const [queuedKeys, setQueuedKeys] = useState<Record<string, boolean>>({});
   const prevSampleRef = useRef<Record<string, { bytes: number; time: number }>>({});
   // Exponential moving average of each download's speed, keyed by path --
   // the raw poll-to-poll delta (see the effect below) is noisy on its own:
@@ -287,6 +353,12 @@ export function Models() {
   // looked up around the same time.
   const [paramLookupBusyId, setParamLookupBusyId] = useState<string | null>(null);
   const [paramLookupErr, setParamLookupErr] = useState<Record<string, string>>({});
+  // Per-row state for the "look up architecture info" (dense/MoE) backfill
+  // action -- see lookupArchInfo below. Unlike param count, this queues a
+  // worker job rather than resolving immediately, so busy stays true across
+  // the whole poll.
+  const [archLookupBusyId, setArchLookupBusyId] = useState<string | null>(null);
+  const [archLookupErr, setArchLookupErr] = useState<Record<string, string>>({});
 
   // Live "which worker(s) have this model's file" map -- see
   // server/src/routes/models.ts's /api/models/locations. Drives the
@@ -298,6 +370,7 @@ export function Models() {
 
   const [authorFilter, setAuthorFilter] = useState("");
   const [familyFilter, setFamilyFilter] = useState("");
+  const [archTypeFilter, setArchTypeFilter] = useState<"" | "dense" | "moe">("");
   const [paramsLoIndex, setParamsLoIndex] = useState(0);
   const [paramsHiIndex, setParamsHiIndex] = useState(PARAMS_STOPS.length - 1);
   const [sortField, setSortField] = useState<SortField>("created");
@@ -312,6 +385,7 @@ export function Models() {
         author: modelAuthor(m),
         family: modelFamily(m),
         paramsB: modelParamsB(m),
+        archType: modelArchType(m),
       })),
     [models]
   );
@@ -335,9 +409,10 @@ export function Models() {
     let list = enrichedModels;
     if (authorFilter) list = list.filter((e) => e.author === authorFilter);
     if (familyFilter) list = list.filter((e) => e.family === familyFilter);
+    if (archTypeFilter) list = list.filter((e) => e.archType === archTypeFilter);
     list = list.filter((e) => paramsInRange(e.paramsB, paramsLoIndex, paramsHiIndex));
     return list.map((e) => e.model);
-  }, [enrichedModels, authorFilter, familyFilter, paramsLoIndex, paramsHiIndex]);
+  }, [enrichedModels, authorFilter, familyFilter, archTypeFilter, paramsLoIndex, paramsHiIndex]);
 
   // Buckets the filtered models by where their file actually lives -- one
   // entry per configured worker plus a trailing "not found anywhere" bucket,
@@ -353,13 +428,29 @@ export function Models() {
     [workers, filteredModels, locations, sortField, sortDir]
   );
 
-  // Sort is applied server-side now (server/src/hf.ts) -- this only
-  // client-side-filters the current page's 15 results by parameter count, a
-  // refinement that doesn't need to be globally correct the way a sort does.
-  const visibleHfResults = useMemo(
-    () => hfResults.filter((r) => paramsInRange(paramsBFromText(r.id), hfParamsLoIndex, hfParamsHiIndex)),
-    [hfResults, hfParamsLoIndex, hfParamsHiIndex]
+  // Sort is applied server-side now (server/src/hf.ts) -- params filtering
+  // stays client-side (HF's search API has no equivalent). Pages are built
+  // FROM the filtered results, not the other way around: every fetched raw
+  // HF page (hfPages) is flattened and filtered first, then re-chunked into
+  // display pages of HF_PAGE_SIZE -- so a display page the user actually
+  // navigates to always holds only matches, never a raw page's worth of
+  // results that then turn out empty once filtered. goToNextHfPage below is
+  // what keeps this buffer topped up as the user pages forward.
+  const filteredHfResults = useMemo(
+    () => hfPages.flatMap((p) => p.results).filter((r) => paramsInRange(paramsBFromText(r.id), hfParamsLoIndex, hfParamsHiIndex)),
+    [hfPages, hfParamsLoIndex, hfParamsHiIndex]
   );
+  const visibleHfResults = useMemo(
+    () => filteredHfResults.slice(hfPageIndex * HF_PAGE_SIZE, (hfPageIndex + 1) * HF_PAGE_SIZE),
+    [filteredHfResults, hfPageIndex]
+  );
+  // Whether Next could land on *something* -- either the filtered buffer
+  // already holds enough for another page, or there's an unfetched raw
+  // cursor that might. Shared by the Next button's disabled state and the
+  // "no results" message, so that message never tells the user to "try
+  // Next" when Next is actually a dead end.
+  const hasMoreHfPages =
+    filteredHfResults.length > (hfPageIndex + 1) * HF_PAGE_SIZE || !!hfPages[hfPages.length - 1]?.nextCursor;
 
   async function loadModels() {
     setModels(await api.listModels());
@@ -472,6 +563,49 @@ export function Models() {
     }
   }
 
+  // Backfills dense-vs-MoE info for a model registered before n_layer/
+  // expert_count collection existed -- unlike lookupParamCount above, this
+  // needs a worker (the file's own GGUF header is the only reliable source;
+  // Hugging Face's API has no equivalent field, confirmed live) and queues a
+  // job rather than resolving immediately, so it polls the same way
+  // handleRefreshModels does.
+  async function lookupArchInfo(m: Model, worker: Worker) {
+    setArchLookupBusyId(m.id);
+    setArchLookupErr((s) => ({ ...s, [m.id]: "" }));
+    try {
+      const { job_id } = await api.backfillArchInfo(worker.id, m.id);
+      const maxPolls = 30; // ~30 * 2s = 1 minute -- just a header read, not a download
+      let polls = 0;
+      const poll = async () => {
+        polls++;
+        try {
+          const job = await api.getJobStatus(worker.id, job_id);
+          if (job.status === "completed" || job.status === "failed" || job.status === "cancelled") {
+            setArchLookupBusyId(null);
+            if (job.status !== "completed") {
+              setArchLookupErr((s) => ({ ...s, [m.id]: `Lookup ended with: ${job.status}` }));
+            }
+            await loadModels();
+            return;
+          }
+        } catch {
+          // Job not found or transient -- fall back to reloading anyway after a few polls
+        }
+        if (polls >= maxPolls) {
+          setArchLookupBusyId(null);
+          setArchLookupErr((s) => ({ ...s, [m.id]: "Lookup timed out." }));
+          await loadModels();
+          return;
+        }
+        setTimeout(poll, 2000);
+      };
+      setTimeout(poll, 2000);
+    } catch (err) {
+      setArchLookupErr((s) => ({ ...s, [m.id]: err instanceof Error ? err.message : String(err) }));
+      setArchLookupBusyId(null);
+    }
+  }
+
   useEffect(() => {
     void loadModels();
     void loadLocations();
@@ -539,6 +673,12 @@ export function Models() {
       delete next[key];
       return next;
     });
+    setQueuedKeys((q) => {
+      if (!(key in q)) return q;
+      const next = { ...q };
+      delete next[key];
+      return next;
+    });
     delete prevSampleRef.current[key];
     delete smoothedSpeedRef.current[key];
     delete seenRef.current[key];
@@ -602,6 +742,9 @@ export function Models() {
         if (active) {
           seenRef.current[key] = true;
           missesRef.current[key] = 0;
+          // Real progress data exists -- definitely not merely queued anymore
+          // (covers a job that was pending a moment ago and just got claimed).
+          setQueuedKeys((q) => (q[key] ? { ...q, [key]: false } : q));
           const bytes = active.bytes ?? 0;
           const total = active.total_bytes ?? null;
           setProgress((prev) => ({ ...prev, [key]: { bytes, total } }));
@@ -636,15 +779,36 @@ export function Models() {
             prevSampleRef.current[key] = { bytes, time: now };
           }
         } else if (seenRef.current[key]) {
-          // Was actively downloading and just dropped out of activeDownloads
-          // -- a genuine finish (success or failure), not a queued job, so no
-          // need to consult job status. A short grace period since the
-          // worker's heartbeat cadence means "just changed" and "genuinely
-          // done" look identical for a tick or two.
+          // Was actively downloading and just dropped out of activeDownloads.
+          // A short grace period first, since the worker's heartbeat cadence
+          // means "just changed" and "genuinely done" look identical for a
+          // tick or two -- but past that grace period, confirm with the
+          // server (same getDownloadStatus check the "never seen" branch
+          // below always used) instead of trusting the miss count alone. A
+          // job can legitimately vanish from activeDownloads while still
+          // genuinely in progress -- e.g. its lease got reaped back to
+          // 'pending' for retry (server/src/reaper.ts) while the worker
+          // itself is still actually mid-transfer -- and blindly finalizing
+          // after 3 misses used to drop a real in-progress download from the
+          // UI (most visible right after a page reload, when seenRef has
+          // just been freshly re-established and hasn't built up any slack).
           const misses = (missesRef.current[key] ?? 0) + 1;
           missesRef.current[key] = misses;
           const SEEN_GRACE_MISSES = 3;
-          if (misses >= SEEN_GRACE_MISSES) finalizeDownload(key);
+          if (misses < SEEN_GRACE_MISSES) continue;
+          try {
+            const { status } = await api.getDownloadStatus(state.workerId, state.jobId);
+            if (status === "pending" || status === "claimed") {
+              missesRef.current[key] = 0; // confirmed still alive -- a future real gap gets its own fresh grace window
+              continue;
+            }
+            finalizeDownload(key); // completed/failed/cancelled
+          } catch (err) {
+            if (err instanceof ApiError && err.status === 404) {
+              finalizeDownload(key); // job/worker genuinely gone
+            }
+            // otherwise transient (network hiccup, server restart) -- try again next tick, still missing
+          }
         } else {
           // Never seen active yet -- could be queued behind the worker's
           // max_concurrent_downloads cap (a pending job never appears in
@@ -654,7 +818,16 @@ export function Models() {
           // download doesn't get wrongly finalized as "dropped".
           try {
             const { status } = await api.getDownloadStatus(state.workerId, state.jobId);
-            if (status === "pending" || status === "claimed") continue; // still queued/just claimed -- keep waiting
+            if (status === "pending") {
+              setQueuedKeys((q) => (q[key] ? q : { ...q, [key]: true }));
+              continue;
+            }
+            if (status === "claimed") {
+              // Claimed but still absent from activeDownloads (e.g. it hasn't
+              // reported its first byte yet) -- no longer merely queued.
+              setQueuedKeys((q) => (q[key] ? { ...q, [key]: false } : q));
+              continue;
+            }
             finalizeDownload(key); // completed/failed/cancelled
           } catch (err) {
             if (err instanceof ApiError && err.status === 404) {
@@ -734,24 +907,44 @@ export function Models() {
     await runFreshHfSearch(hfSortField, hfSortDir);
   }
 
+  // Ensures the filtered buffer covers the NEXT display page, fetching
+  // further raw HF pages on demand (via the last page's cursor) until it
+  // does, or until the cursor runs out, or a safety cap is hit -- a filter
+  // that matches almost nothing in the whole result set should eventually
+  // give up and say so rather than hammering HF's API in a loop. Because
+  // display pages are built FROM the filtered set (filteredHfResults above),
+  // this is what actually "groups items onto pages according to the
+  // filter": Next can only ever land on a page that's provably non-empty,
+  // instead of a raw HF page that then turns out empty once filtered.
+  const MAX_AUTO_FETCH_PAGES = 8;
+
   async function goToNextHfPage() {
-    if (hfPageIndex + 1 < hfPages.length) {
-      setHfPageIndex(hfPageIndex + 1);
-      return;
-    }
-    const cursor = hfPages[hfPageIndex]?.nextCursor;
-    if (!cursor) return;
-    setSearching(true);
     setHfMsg("");
+    setSearching(true);
     try {
-      const { results, nextCursor } = await api.searchHf({
-        q: hfQuery,
-        sort: HF_SORT_SERVER_FIELD[hfSortField],
-        direction: hfSortField === "relevance" ? undefined : hfSortDir === "asc" ? 1 : -1,
-        cursor,
-      });
-      setHfPages((pages) => [...pages, { results, nextCursor }]);
-      setHfPageIndex(hfPageIndex + 1);
+      let pages = hfPages;
+      const newIndex = hfPageIndex + 1;
+      const filterFn = (r: HfRepoSearchResult) => paramsInRange(paramsBFromText(r.id), hfParamsLoIndex, hfParamsHiIndex);
+      let filteredCount = pages.flatMap((p) => p.results).filter(filterFn).length;
+      let attempts = 0;
+      while (filteredCount <= newIndex * HF_PAGE_SIZE && pages[pages.length - 1]?.nextCursor && attempts < MAX_AUTO_FETCH_PAGES) {
+        const cursor = pages[pages.length - 1].nextCursor!;
+        const { results, nextCursor } = await api.searchHf({
+          q: hfQuery,
+          sort: HF_SORT_SERVER_FIELD[hfSortField],
+          direction: hfSortField === "relevance" ? undefined : hfSortDir === "asc" ? 1 : -1,
+          cursor,
+        });
+        pages = [...pages, { results, nextCursor }];
+        filteredCount = pages.flatMap((p) => p.results).filter(filterFn).length;
+        attempts++;
+      }
+      setHfPages(pages);
+      if (filteredCount > newIndex * HF_PAGE_SIZE) {
+        setHfPageIndex(newIndex);
+      } else {
+        setHfMsg("No further results match your parameter filter.");
+      }
     } catch (err) {
       setHfMsg(`Search error: ${err instanceof Error ? err.message : String(err)}`);
     } finally {
@@ -759,7 +952,12 @@ export function Models() {
     }
   }
 
+  // No skip logic needed backward: filteredHfResults only ever grows (more
+  // raw pages fetched, same filter), and Next above only ever advances
+  // hfPageIndex to a position it already proved non-empty -- so re-slicing
+  // an earlier window is always safe without touching the network.
   function goToPrevHfPage() {
+    setHfMsg("");
     setHfPageIndex((i) => Math.max(0, i - 1));
   }
 
@@ -846,122 +1044,176 @@ export function Models() {
     }
   }
 
+  // One line per file: Name (+quant/MoE/MTP chips) | Params | Size | State |
+  // Src | Added | Actions -- see ROW_GRID above. Replaces the old two-line
+  // flex-wrap row, whose metadata line grew a new wrapped line per badge.
   function renderModelRow(m: Model, worker: Worker, indent: boolean) {
     const paramsB = modelParamsB(m);
     const key = `${m.id}:${worker.id}`;
-    
+
     // Find the model file info with state from the worker's modelFiles
-    const workerModelFile = worker.modelFiles?.find(f => f.path === (m.source === "local" ? m.filename : m.hf_file));
+    const workerModelFile = worker.modelFiles?.find((f) => f.path === (m.source === "local" ? m.filename : m.hf_file));
     const modelState = workerModelFile?.state;
     const hfMatch = workerModelFile?.hf_match;
+    const quant = extractQuant(m.hf_file ?? m.filename);
+    const expertCount = modelExpertCount(m);
+    const archType = modelArchType(m);
+    const isEstimatedParams = paramsB !== null && typeof m.metadata.param_count !== "number";
+    // Actions column's HF link target: the worker's live hash-verified match
+    // takes priority over the model's own stored hf_repo/hf_file (which can
+    // point at a since-renamed/moved file the hash lookup would catch).
+    const hfLinkRepo = hfMatch && !hfMatch.deleted ? hfMatch.repo_id : !hfMatch ? m.hf_repo : undefined;
+    const hfLinkFile = hfMatch && !hfMatch.deleted ? hfMatch.filename : !hfMatch ? m.hf_file : undefined;
 
     return (
-      <div
-        key={key}
-        className={`flex flex-wrap items-center justify-between gap-3 px-4 py-2.5 ${indent ? "ml-6 border-l-2 border-border pl-3" : ""}`}
-      >
-        <div className="min-w-0 flex-1">
-          <div className="flex items-center gap-1.5">
-            {indent && !/^mtp\//i.test(m.filename) && <span className="text-xs text-muted">MTP/</span>}
-            <span className="truncate text-fg">{m.filename}</span>
-            {isMtpDraftModel(m) && (
-              <span title="Standalone MTP/draft companion file -- not benchmarkable on its own, only usable as an MTP model paired with a base model on New Run">
-                <StatusPill label="MTP draft" tone="accent" />
-              </span>
-            )}
-            {modelState && (
-              <StatusPill label={modelState} tone={getStateTone(modelState)} />
-            )}
-          </div>
-          <div className="mt-0.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted">
-            <code>{shortId(m.id)}</code>
-            <span>{modelAuthor(m)}</span>
-            <span>{modelFamily(m)}</span>
-            <span className="flex items-center gap-1">
-              <span title={typeof m.metadata.param_count !== "number" ? "Estimated from the filename -- may be inaccurate" : undefined}>
-                {formatParamsB(paramsB)}
-              </span>
-              {typeof m.metadata.param_count !== "number" && m.hf_repo && (
-                <button
-                  type="button"
-                  disabled={paramLookupBusyId === m.id}
-                  onClick={() => lookupParamCount(m)}
-                  className="text-muted hover:text-accent disabled:opacity-50"
-                  title="Look up the real parameter count from Hugging Face"
-                  aria-label={`Look up real parameter count for ${m.filename}`}
-                >
-                  <IconRefreshCw width={12} height={12} className={paramLookupBusyId === m.id ? "animate-spin" : undefined} />
-                </button>
-              )}
+      <div key={key} className={`group/row ${ROW_GRID} border-t border-border/60 px-4 py-1.5 hover:bg-surface-raised`}>
+        <div className={`flex min-w-0 items-center gap-1.5 ${indent ? "ml-4 border-l-2 border-border pl-3" : ""}`}>
+          {indent && !/^mtp\//i.test(m.filename) && <span className="shrink-0 text-[11px] text-muted">MTP/</span>}
+          <span className={`truncate text-[13px] ${indent ? "text-muted" : "text-fg"}`} title={m.filename}>
+            {m.filename}
+          </span>
+          {quant && <MiniChip label={quant} />}
+          {archType === "moe" && <MiniChip label={`MoE·${expertCount}`} tone="warning" />}
+          {archType === "dense" && <MiniChip label="Dense" />}
+          {isMtpDraftModel(m) && (
+            <span title="Standalone MTP/draft companion file -- not benchmarkable on its own, only usable as an MTP model paired with a base model on New Run">
+              <MiniChip label="MTP" tone="accent" />
             </span>
-            <span>{formatBytes(m.size_bytes)}</span>
-            <StatusPill label={m.source} tone="muted" />
-            {hfMatch && hfMatch.deleted && (
-              <span
-                className="flex items-center gap-1.5 text-xs text-muted line-through decoration-muted/50"
-                title={`${hfMatch.repo_id}/${hfMatch.filename} was removed from Hugging Face`}
-              >
-                {hfMatch.repo_id}/{hfMatch.filename}
-                <StatusPill label="removed from HF" tone="warning" />
-              </span>
-            )}
-            {hfMatch && !hfMatch.deleted && (
+          )}
+        </div>
+
+        <div className="text-right font-mono text-xs tabular-nums text-fg">
+          {isEstimatedParams ? (
+            <span
+              className="cursor-help text-muted underline decoration-dotted underline-offset-2"
+              title="Estimated from the filename -- may be inaccurate"
+            >
+              {formatParamsB(paramsB)}
+            </span>
+          ) : (
+            formatParamsB(paramsB)
+          )}
+        </div>
+
+        <div className="text-right font-mono text-xs tabular-nums text-fg">{formatBytes(m.size_bytes)}</div>
+
+        <div className="flex items-center justify-end gap-1.5 text-[11px] text-muted">
+          {modelState ? (
+            <>
+              <span className={`status-dot ${stateDotClass(modelState)}`} />
+              {modelState}
+            </>
+          ) : (
+            <span className="text-muted/60">—</span>
+          )}
+        </div>
+
+        <div className="flex items-center justify-center text-muted/70" title={m.source}>
+          {m.source === "huggingface" ? <IconCloud width={13} height={13} /> : <IconHardDrive width={13} height={13} />}
+        </div>
+
+        <div className="text-right text-[11px] text-muted/70">{formatShortRelativeTime(m.created_at)}</div>
+
+        <div className="flex items-center justify-end gap-0.5 opacity-60 transition-opacity group-hover/row:opacity-100">
+          {isEstimatedParams && m.hf_repo && (
+            <button
+              type="button"
+              disabled={paramLookupBusyId === m.id}
+              onClick={() => lookupParamCount(m)}
+              className="flex h-6 w-6 items-center justify-center rounded text-muted hover:bg-surface hover:text-accent disabled:opacity-50"
+              title="Look up the real parameter count from Hugging Face"
+              aria-label={`Look up real parameter count for ${m.filename}`}
+            >
+              <IconRefreshCw width={13} height={13} className={paramLookupBusyId === m.id ? "animate-spin" : undefined} />
+            </button>
+          )}
+          {archType === "unknown" && (
+            <button
+              type="button"
+              disabled={archLookupBusyId === m.id}
+              onClick={() => lookupArchInfo(m, worker)}
+              className="flex h-6 w-6 items-center justify-center rounded text-muted hover:bg-surface hover:text-accent disabled:opacity-50"
+              title={`Look up whether ${m.filename} is dense or MoE (re-reads the file's own GGUF header on ${worker.displayName})`}
+              aria-label={`Look up architecture info for ${m.filename}`}
+            >
+              <IconBrain width={13} height={13} className={archLookupBusyId === m.id ? "animate-pulse" : undefined} />
+            </button>
+          )}
+          {hfMatch?.deleted ? (
+            <span
+              className="flex h-6 w-6 items-center justify-center rounded text-warning"
+              title={`${hfMatch.repo_id}/${hfMatch.filename} was removed from Hugging Face`}
+            >
+              <IconAlertTriangle width={13} height={13} />
+            </span>
+          ) : (
+            hfLinkRepo &&
+            hfLinkFile && (
               <a
-                href={hfFileUrl(hfMatch.repo_id, hfMatch.filename)}
+                href={hfFileUrl(hfLinkRepo, hfLinkFile)}
                 target="_blank"
                 rel="noreferrer"
-                className="text-xs text-accent hover:underline"
+                className="flex h-6 w-6 items-center justify-center rounded text-muted hover:bg-surface hover:text-accent"
+                title={`${hfLinkRepo}/${hfLinkFile}`}
+                aria-label={`View ${m.filename} on Hugging Face`}
               >
-                {hfMatch.repo_id}/{hfMatch.filename}
+                <IconExternalLink width={13} height={13} />
               </a>
-            )}
-            {m.hf_repo && m.hf_file && !hfMatch && (
-              <a href={hfFileUrl(m.hf_repo, m.hf_file)} target="_blank" rel="noreferrer" className="text-accent hover:underline">
-                {m.hf_repo}/{m.hf_file}
-              </a>
-            )}
-          </div>
-          {paramLookupErr[m.id] && <div className="text-xs text-danger">{paramLookupErr[m.id]}</div>}
+            )
+          )}
+          <button
+            type="button"
+            disabled={deletingKey === key}
+            onClick={() => handleDeleteModelFile(m, worker)}
+            className="flex h-6 w-6 items-center justify-center rounded text-muted hover:bg-danger-bg hover:text-danger disabled:opacity-50"
+            aria-label={`Delete ${m.filename} from ${worker.displayName}`}
+            title={`Delete this file from ${worker.displayName} only -- the model stays registered`}
+          >
+            <IconTrash width={13} height={13} />
+          </button>
         </div>
-        <button
-          type="button"
-          disabled={deletingKey === key}
-          onClick={() => handleDeleteModelFile(m, worker)}
-          className="rounded-md border border-border p-1.5 text-muted hover:border-danger/40 hover:text-danger disabled:opacity-50"
-          aria-label={`Delete ${m.filename} from ${worker.displayName}`}
-          title={`Delete this file from ${worker.displayName} only -- the model stays registered`}
-        >
-          <IconTrash width={14} height={14} />
-        </button>
+
+        {paramLookupErr[m.id] && <div className="col-span-full pl-1 pt-1 text-xs text-danger">{paramLookupErr[m.id]}</div>}
+        {archLookupErr[m.id] && <div className="col-span-full pl-1 pt-1 text-xs text-danger">{archLookupErr[m.id]}</div>}
       </div>
     );
   }
 
-  function getStateTone(state: string): "muted" | "accent" | "warning" | "danger" | "success" {
-    switch (state) {
-      case "verified": return "success";
-      case "hashing": return "accent";
-      case "detected": return "muted";
-      case "unknown": return "warning";
-      case "modified": return "warning";
-      case "corrupted": return "danger";
-      case "missing": return "danger";
-      default: return "muted";
-    }
-  }
-
   function renderModelGroup(group: ModelGroup, worker: Worker) {
+    // A companion MTP draft file that shares its hf_repo with more than one
+    // quant in this group is attached to each of those quants' own
+    // ModelQuantEntry.drafts (buildModelGroups) so ModelPicker.tsx can offer
+    // it as a pairing for any of them -- but it's still just one physical
+    // file on disk, so de-dupe by id before listing/counting it here. Without
+    // this, a 2-quant group sharing 1 draft rendered that draft's row twice
+    // (with a duplicate React key) and double-counted it in the aggregate.
+    const seenDraftIds = new Set<string>();
+    const uniqueDrafts = group.quants
+      .flatMap((q) => q.drafts)
+      .filter((d) => (seenDraftIds.has(d.id) ? false : (seenDraftIds.add(d.id), true)));
+    const totalFiles = group.quants.length + uniqueDrafts.length;
+    const totalBytes =
+      group.quants.reduce((n, q) => n + q.base.size_bytes, 0) + uniqueDrafts.reduce((n, d) => n + d.size_bytes, 0);
     return (
-      <div key={`${group.key}:${worker.id}`} className="py-1">
-        <div className="px-4 pt-2 pb-1 text-xs font-semibold uppercase tracking-wide text-muted">
-          {group.author} · {group.family} · {group.label}
+      // border-t (not just the individual rows' own hairline) is what
+      // actually separates one group from the next -- without it here, a
+      // group header sat flush against the previous group's last row with
+      // nothing visually marking the boundary between them.
+      <div key={`${group.key}:${worker.id}`} className="border-t-2 border-border/80 first:border-t-0">
+        <div className="flex items-baseline gap-2 px-4 pt-2.5 pb-1 text-[11px] text-muted">
+          <span>
+            <span className="font-semibold text-fg">{group.author}</span> · {group.family} · {group.label}
+          </span>
+          <span className="ml-auto font-mono text-[10.5px] tabular-nums text-muted/70">
+            {totalFiles} file{totalFiles === 1 ? "" : "s"} · {formatBytes(totalBytes)}
+          </span>
         </div>
         {group.quants.map(({ base }) => (
           <div key={base.id}>{renderModelRow(base, worker, false)}</div>
         ))}
-        {group.quants.map(({ drafts }) =>
-          drafts.map((draft) => <div key={draft.id}>{renderModelRow(draft, worker, true)}</div>)
-        )}
+        {uniqueDrafts.map((draft) => (
+          <div key={draft.id}>{renderModelRow(draft, worker, true)}</div>
+        ))}
       </div>
     );
   }
@@ -1013,6 +1265,18 @@ export function Models() {
                 </select>
               </label>
               <label className="flex flex-col gap-1.5 text-sm">
+                <span className="text-muted">Type</span>
+                <select
+                  value={archTypeFilter}
+                  onChange={(e) => setArchTypeFilter(e.target.value as "" | "dense" | "moe")}
+                  className="rounded-lg border border-border bg-surface px-3 py-1.5 text-fg outline-none focus:border-accent"
+                >
+                  <option value="">All</option>
+                  <option value="dense">Dense</option>
+                  <option value="moe">MoE</option>
+                </select>
+              </label>
+              <label className="flex flex-col gap-1.5 text-sm">
                 <span className="text-muted">Parameters</span>
                 <ParamsRangeSlider
                   loIndex={paramsLoIndex}
@@ -1048,12 +1312,13 @@ export function Models() {
                   </button>
                 </div>
               </label>
-              {(authorFilter || familyFilter || paramsLoIndex !== 0 || paramsHiIndex !== PARAMS_STOPS.length - 1) && (
+              {(authorFilter || familyFilter || archTypeFilter || paramsLoIndex !== 0 || paramsHiIndex !== PARAMS_STOPS.length - 1) && (
                 <button
                   type="button"
                   onClick={() => {
                     setAuthorFilter("");
                     setFamilyFilter("");
+                    setArchTypeFilter("");
                     setParamsLoIndex(0);
                     setParamsHiIndex(PARAMS_STOPS.length - 1);
                   }}
@@ -1089,16 +1354,26 @@ export function Models() {
                     <span className="flex items-center gap-2">
                       {worker.displayName}
                       <span className="text-xs font-normal text-muted">
-                        ({subset.length} file{subset.length === 1 ? "" : "s"})
+                        ({subset.length} file{subset.length === 1 ? "" : "s"}
+                        {subset.length > 0 ? ` · ${formatBytes(subset.reduce((n, m) => n + m.size_bytes, 0))}` : ""})
                       </span>
                     </span>
                     <IconChevronDown width={16} height={16} className="transition-transform group-open:rotate-180" />
                   </summary>
-                  <div className="divide-y divide-border border-t border-border">
+                  <div className="border-t border-border">
                     {subset.length === 0 ? (
                       <p className="px-4 py-3 text-sm text-muted">No models on this worker.</p>
                     ) : (
                       <>
+                        <div className={`${ROW_GRID} border-b border-border bg-surface-raised px-4 py-1.5 text-[10px] font-semibold uppercase tracking-wide text-muted/70`}>
+                          <div>Name</div>
+                          <div className="text-right">Params</div>
+                          <div className="text-right">Size</div>
+                          <div className="text-right">State</div>
+                          <div className="text-center">Src</div>
+                          <div className="text-right">Added</div>
+                          <div />
+                        </div>
                         {groups.map((group) => renderModelGroup(group, worker))}
                         {orphans.map((d) => renderModelRow(d, worker, false))}
                       </>
@@ -1116,77 +1391,80 @@ export function Models() {
       {Object.keys(downloading).length > 0 && (
         <section className="mt-8">
           <h2 className="text-sm font-semibold uppercase tracking-wide text-muted">Active downloads</h2>
-          <div className="mt-3 flex flex-col gap-2">
-            {Object.entries(downloading).map(([key, state]) => {
+          <div className="mt-3 flex flex-col overflow-hidden rounded-lg border border-border bg-surface">
+            {Object.entries(downloading).map(([key, state], i) => {
               const prog = progress[key];
               const speed = speeds[key];
+              const isQueued = !!queuedKeys[key];
               const pct = prog?.total != null ? Math.min(100, Math.round((prog.bytes / prog.total) * 100)) : null;
               const totalBytes = prog?.total ?? state.file.size_bytes ?? null;
+              const statLabel = state.paused
+                ? "Paused"
+                : isQueued
+                  ? "Queued"
+                  : pct !== null
+                    ? `${pct}% · ${formatBytes(prog?.bytes ?? 0)}${totalBytes != null ? ` / ${formatBytes(totalBytes)}` : ""}`
+                    : "Starting…";
               return (
                 <div
                   key={key}
-                  className="flex flex-col gap-2 rounded-lg border border-border bg-surface px-4 py-2.5 text-sm"
+                  className={`grid grid-cols-[minmax(200px,1fr)_auto_auto_auto] items-center gap-x-4 px-4 py-2 ${i > 0 ? "border-t border-border" : ""}`}
                 >
-                  <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="min-w-0">
                     <div className="flex items-center gap-2">
-                      <IconDownload width={14} height={14} className="text-accent" />
-                      <span className="text-fg">{state.file.path}</span>
-                      <span className="text-xs text-muted">
-                        {state.repoId} · {workers.find((w) => w.id === state.workerId)?.displayName ?? state.workerId}
+                      <IconDownload width={13} height={13} className="shrink-0 text-accent" />
+                      <span className="truncate text-[13px] text-fg">{state.file.path}</span>
+                      <span className="shrink-0 truncate text-[11px] text-muted">
+                        {state.repoId} → {workers.find((w) => w.id === state.workerId)?.displayName ?? state.workerId}
                       </span>
                     </div>
-                    <div className="flex items-center gap-2">
-                      <span className="text-xs text-muted">
-                        {state.paused ? "Paused" : pct !== null ? `${pct}%` : "Starting…"}
-                      </span>
-                      {state.paused ? (
-                        <button
-                          type="button"
-                          onClick={() => void handleResumeDownload(key)}
-                          className="rounded-md border border-border px-2 py-0.5 text-xs text-fg hover:border-accent/40 hover:text-accent"
-                        >
-                          Resume
-                        </button>
+                    <div className="mt-1 h-1 w-full overflow-hidden rounded-full bg-surface-raised">
+                      {state.paused || isQueued ? (
+                        <div className="h-full w-full rounded-full bg-surface-raised" />
+                      ) : pct !== null ? (
+                        <div className="h-full rounded-full bg-accent transition-[width]" style={{ width: `${pct}%` }} />
                       ) : (
-                        <button
-                          type="button"
-                          onClick={() => void handlePauseDownload(key)}
-                          className="rounded-md border border-border px-2 py-0.5 text-xs text-muted hover:border-accent/40 hover:text-accent"
-                        >
-                          Pause
-                        </button>
+                        <div className="progress-indeterminate h-full w-full rounded-full" />
                       )}
+                    </div>
+                  </div>
+                  <div className="whitespace-nowrap font-mono text-xs tabular-nums text-muted">{statLabel}</div>
+                  <div className="whitespace-nowrap font-mono text-xs tabular-nums text-muted/70">
+                    {!state.paused && speed !== undefined ? `${formatBytes(speed)}/s` : ""}
+                  </div>
+                  <div className="flex items-center justify-end gap-1">
+                    {state.paused ? (
                       <button
                         type="button"
-                        onClick={() => {
-                          if (window.confirm(`Cancel downloading ${state.file.path}? The partial file will be deleted.`)) {
-                            void handleCancelDownload(key);
-                          }
-                        }}
-                        className="rounded-md border border-border px-2 py-0.5 text-xs text-muted hover:border-danger/40 hover:text-danger"
+                        onClick={() => void handleResumeDownload(key)}
+                        className="whitespace-nowrap rounded border border-border px-1.5 py-1 text-[11px] text-fg hover:border-accent/40 hover:text-accent"
                       >
-                        Cancel
+                        Resume
                       </button>
-                    </div>
-                  </div>
-                  <div className="h-1.5 w-full overflow-hidden rounded-full bg-surface-raised">
-                    {state.paused ? (
-                      <div className="h-full w-full rounded-full bg-surface-raised" />
-                    ) : pct !== null ? (
-                      <div
-                        className="h-full rounded-full bg-accent transition-[width]"
-                        style={{ width: `${pct}%` }}
-                      />
                     ) : (
-                      <div className="progress-indeterminate h-full w-full rounded-full" />
+                      <button
+                        type="button"
+                        onClick={() => void handlePauseDownload(key)}
+                        className="flex h-6 w-6 items-center justify-center rounded text-muted hover:bg-surface hover:text-accent"
+                        title="Pause"
+                        aria-label={`Pause downloading ${state.file.path}`}
+                      >
+                        <IconPause width={13} height={13} />
+                      </button>
                     )}
-                  </div>
-                  <div className="flex items-center gap-2 text-xs text-muted">
-                    <span>
-                      {formatBytes(prog?.bytes ?? 0)}
-                      {totalBytes != null ? ` / ${formatBytes(totalBytes)}` : ""}
-                    </span>
-                    {!state.paused && speed !== undefined && <span>· {formatBytes(speed)}/s</span>}
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (window.confirm(`Cancel downloading ${state.file.path}? The partial file will be deleted.`)) {
+                          void handleCancelDownload(key);
+                        }
+                      }}
+                      className="flex h-6 w-6 items-center justify-center rounded text-muted hover:bg-danger-bg hover:text-danger"
+                      title="Cancel"
+                      aria-label={`Cancel downloading ${state.file.path}`}
+                    >
+                      <IconX width={13} height={13} />
+                    </button>
                   </div>
                 </div>
               );
@@ -1346,7 +1624,7 @@ export function Models() {
           )}
         </form>
 
-        {hfResults.length > 0 && (
+        {hfPages.length > 0 && (
           <>
             <div className="mt-4 flex flex-wrap items-end gap-3">
               <label className="flex flex-col gap-1.5 text-sm">
@@ -1357,6 +1635,10 @@ export function Models() {
                   onChange={(lo, hi) => {
                     setHfParamsLoIndex(lo);
                     setHfParamsHiIndex(hi);
+                    // A page index chosen under the old filter can point past
+                    // what the new, narrower filter leaves in the buffer --
+                    // back to page 1, same as changing sort already does.
+                    setHfPageIndex(0);
                   }}
                 />
               </label>
@@ -1401,6 +1683,7 @@ export function Models() {
                   onClick={() => {
                     setHfParamsLoIndex(0);
                     setHfParamsHiIndex(PARAMS_STOPS.length - 1);
+                    setHfPageIndex(0);
                   }}
                   className="rounded-lg border border-border px-3 py-1.5 text-sm text-muted hover:border-accent/40 hover:text-accent"
                 >
@@ -1408,6 +1691,15 @@ export function Models() {
                 </button>
               )}
             </div>
+          {/* Since pages are now built FROM the filtered results (see filteredHfResults above),
+              this can now only be empty right at the start -- nothing fetched yet has matched.
+              hfMsg covers the "Next looked and found nothing further" case with a more precise
+              message, so this is skipped whenever hfMsg already has something more specific up. */}
+          {visibleHfResults.length === 0 && !hfMsg && (
+            <p className="mt-4 text-sm text-muted">
+              No results match your parameter filter{hasMoreHfPages ? " yet -- try Next, or widen the filter above." : " -- widen the filter above."}
+            </p>
+          )}
           <div className="mt-4 flex flex-col gap-2">
             {visibleHfResults.map((r) => (
               <div key={r.id} className="overflow-hidden rounded-lg border border-border">
@@ -1522,7 +1814,7 @@ export function Models() {
             <button
               type="button"
               onClick={() => void goToNextHfPage()}
-              disabled={searching || (hfPageIndex + 1 >= hfPages.length && !hfPages[hfPageIndex]?.nextCursor)}
+              disabled={searching || !hasMoreHfPages}
               className="rounded-lg border border-border px-3 py-1.5 text-muted hover:border-accent/40 hover:text-accent disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:border-border disabled:hover:text-muted"
             >
               Next →

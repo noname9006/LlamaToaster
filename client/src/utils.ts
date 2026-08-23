@@ -71,6 +71,28 @@ export function formatRelativeTime(iso: string | null | undefined): string | nul
   return `${diffYears} year${diffYears > 1 ? "s" : ""} ago`;
 }
 
+// Ultra-short "3d" / "2w" / "1mo" style relative label for a dense table
+// column, distinct from formatRelativeTime's prose "3 days ago" (which needs
+// the room a card/list description line has, not a fixed-width cell) --
+// takes an epoch-ms number since that's what Model.created_at actually is,
+// not the ISO string formatRelativeTime expects from HF search results.
+export function formatShortRelativeTime(ms: number): string {
+  const diffSeconds = Math.max(0, Math.floor((Date.now() - ms) / 1000));
+  if (diffSeconds < 60) return "now";
+  const diffMinutes = Math.floor(diffSeconds / 60);
+  if (diffMinutes < 60) return `${diffMinutes}m`;
+  const diffHours = Math.floor(diffMinutes / 60);
+  if (diffHours < 24) return `${diffHours}h`;
+  const diffDays = Math.floor(diffHours / 24);
+  if (diffDays < 7) return `${diffDays}d`;
+  const diffWeeks = Math.floor(diffDays / 7);
+  if (diffDays < 30) return `${diffWeeks}w`;
+  const diffMonths = Math.floor(diffDays / 30);
+  if (diffMonths < 12) return `${diffMonths}mo`;
+  const diffYears = Math.floor(diffMonths / 12);
+  return `${diffYears}y`;
+}
+
 export function formatElapsed(ms: number): string {
   const totalSeconds = Math.max(0, Math.floor(ms / 1000));
   const h = Math.floor(totalSeconds / 3600);
@@ -227,4 +249,25 @@ export function modelParamsB(m: Model): number | null {
 
 export function formatParamsB(b: number | null): string {
   return b === null ? "—" : `${b}B`;
+}
+
+export type ModelArchType = "moe" | "dense" | "unknown";
+
+// Whether a registered model is Mixture-of-Experts, confirmed dense, or
+// unknown. MoE is confirmed by metadata.expert_count > 0 -- worker/src/gguf.ts
+// only ever sets it when the GGUF's <arch>.expert_count key is actually
+// present. "dense" is only claimed when metadata.n_layer is *also* present
+// (meaning GGUF header parsing genuinely ran for this file) and expert_count
+// came back absent -- an absent n_layer means the file was never parsed at
+// all (registered before this existed, or a manually-added "local" model
+// with no bytes to read), so dense-vs-MoE is truly unknown there, not a safe
+// default to assume.
+export function modelArchType(m: Model): ModelArchType {
+  if (typeof m.metadata.expert_count === "number" && m.metadata.expert_count > 0) return "moe";
+  if (typeof m.metadata.n_layer === "number") return "dense";
+  return "unknown";
+}
+
+export function modelExpertCount(m: Model): number | null {
+  return typeof m.metadata.expert_count === "number" && m.metadata.expert_count > 0 ? m.metadata.expert_count : null;
 }
