@@ -135,7 +135,14 @@ export function ModelPicker({
               {group.quants.map(({ base, drafts }) =>
                 drafts.map((draft) => (
                   <button
-                    key={draft.id}
+                    // A shared draft file paired with more than one quant in
+                    // this group is intentionally repeated here (each row is
+                    // a distinct base+draft pairing you can pick), unlike
+                    // Models.tsx's own listing of drafts -- but draft.id
+                    // alone would still collide as a React key across those
+                    // repeats, so it's compounded with which base this
+                    // particular row pairs it with.
+                    key={`${base.id}:${draft.id}`}
                     type="button"
                     onClick={() => pick(base.id, draft.id)}
                     title={`Select ${base.filename} with ${draft.filename} as its MTP draft model`}

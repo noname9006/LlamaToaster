@@ -33,6 +33,7 @@ import {
   writeRawJson,
   postRunItemUpdate,
   postModelDownloadResult,
+  postGgufInfoResult,
   postHeartbeat,
   pollQueue,
   reportJobResult,
@@ -65,6 +66,7 @@ import {
   type RunItemTickInput,
   type RunItemTerminalInput,
   type ModelDownloadCallbackInput,
+  type GgufInfoCallbackInput,
   type TerminalRunItemStatus,
   type ModelDirFile,
   type WorkerStatePush,
@@ -809,6 +811,51 @@ async function safeReportDownloadResult(payload: ModelDownloadCallbackInput): Pr
       log.warn(`download callback attempt ${attempt + 1} failed for ${key}, retrying in ${delay}ms: ${message}`);
       await sleep(delay);
     }
+  }
+}
+
+// Same retry-with-backoff posture as safeReportDownloadResult above -- a
+// user explicitly asked for this lookup (Models page's per-row "look up
+// architecture info" action), so losing the result to one flaky request
+// would silently leave the button looking like it did nothing.
+async function safeReportGgufInfoResult(payload: GgufInfoCallbackInput): Promise<boolean> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await withAuth((token) => postGgufInfoResult(config.vps_url, token, payload, 10_000));
+      log.info(`gguf info callback ok for model ${payload.model_id} (attempt ${attempt + 1})`);
+      return true;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (attempt >= ITEM_RETRY_DELAYS_MS.length) {
+        log.error(`gguf info callback failed for model ${payload.model_id} after ${attempt + 1} attempts, giving up: ${message}`);
+        return false;
+      }
+      const delay = ITEM_RETRY_DELAYS_MS[attempt];
+      log.warn(`gguf info callback attempt ${attempt + 1} failed for model ${payload.model_id}, retrying in ${delay}ms: ${message}`);
+      await sleep(delay);
+    }
+  }
+}
+
+// Backfill job: re-reads an already-downloaded file's own GGUF header for a
+// model that predates n_layer/expert_count collection (or was registered
+// some other way that never ran this at all) -- see shared/types.ts's
+// QueueJob "read_gguf_info" variant for why this is the only reliable
+// source. Throws (marking the job failed, same as any other executeJob
+// case) only when the callback itself couldn't be delivered; a file that
+// simply doesn't parse just reports back all-null, which is still a useful,
+// successful answer ("genuinely unknown"), not a job failure.
+async function executeReadGgufInfoJob(payload: { model_id: string; filename: string }): Promise<void> {
+  validateHfFile(payload.filename);
+  const target = resolveDownloadTarget(payload.filename);
+  const { n_layer, mtp_layers, expert_count } = await readGgufInfo(target);
+  log.info(
+    `gguf info backfill for ${payload.filename}: n_layer=${n_layer ?? "unknown"} mtp_layers=${mtp_layers ?? "unknown"} ` +
+      `expert_count=${expert_count ?? "unknown"}`
+  );
+  const reported = await safeReportGgufInfoResult({ model_id: payload.model_id, n_layer, mtp_layers, expert_count });
+  if (!reported) {
+    throw new Error(`gguf info callback delivery failed for model ${payload.model_id}`);
   }
 }
 
@@ -2169,6 +2216,8 @@ async function executeJob(job: SerialQueueJob): Promise<void> {
       return executeDeleteModelFileJob(job.payload);
     case "refresh_models":
       return executeRefreshModelsJob();
+    case "read_gguf_info":
+      return executeReadGgufInfoJob(job.payload);
     case "shutdown_worker":
       return executeShutdownWorkerJob();
   }
