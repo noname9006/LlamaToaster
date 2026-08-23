@@ -6,6 +6,8 @@ import { authenticateWorker } from "../worker-auth.js";
 import { parseWorkerState, parseActiveJobReport, parseActiveDownloads } from "../validate-worker-state.js";
 import { LEASE_MS } from "../liveness.js";
 import { NotFoundError } from "../errors.js";
+import { getHfGgufMeta } from "../hf.js";
+import { log } from "../log.js";
 import type { QueueJob, HeartbeatResponse, WorkerStatePush } from "../../../shared/types.js";
 
 // 25s keeps the hanging long-poll comfortably under Caddy's/any intermediary's
@@ -15,6 +17,35 @@ import type { QueueJob, HeartbeatResponse, WorkerStatePush } from "../../../shar
 const LONG_POLL_MS = 25_000;
 const BACKSTOP_MS = 5_000; // safety net only; the queueEvents emit is the primary wake-up
 const WORKER_BODY_LIMIT = 1_000_000; // 1 MB -- see MULTIUSER_PLAN.md §1.8
+const HF_META_TIMEOUT_MS = 15_000;
+
+// A model dropped into a worker's model_dir by hand (hash-matched via the
+// catalog rather than downloaded through this app -- see
+// registerHashVerifiedModelFiles below) never goes through
+// workers.ts's download-callback route, so it misses that route's inline
+// getHfGgufMeta call and would otherwise sit with no param_count forever,
+// showing "—" on the Models page until someone clicks the manual backfill
+// button. Fetches in the background (never awaited by the heartbeat/queue
+// handlers that call this) since HF can take up to HF_META_TIMEOUT_MS and a
+// heartbeat response must stay fast; deduped per model id so a slow lookup
+// isn't re-fired every ~10s until it resolves.
+const paramLookupInFlight = new Set<string>();
+function backfillParamCountInBackground(modelId: string, hfRepo: string): void {
+  if (paramLookupInFlight.has(modelId)) return;
+  paramLookupInFlight.add(modelId);
+  getHfGgufMeta(hfRepo, HF_META_TIMEOUT_MS)
+    .then(({ param_count }) => {
+      if (typeof param_count === "number") {
+        repo.updateModelMetadata(modelId, { param_count });
+      }
+    })
+    .catch((err) => {
+      log.warn(`[queue] background param_count lookup failed for ${hfRepo}: ${err instanceof Error ? err.message : String(err)}`);
+    })
+    .finally(() => {
+      paramLookupInFlight.delete(modelId);
+    });
+}
 
 // A worker's reconciliation just told us, per model_dir file, whether its
 // SHA-256 matched the server's HF index (state "verified" + hf_match -- see
@@ -24,22 +55,39 @@ const WORKER_BODY_LIMIT = 1_000_000; // 1 MB -- see MULTIUSER_PLAN.md §1.8
 // a model dropped into a worker's model_dir by hand -- never downloaded
 // through the app -- show up on the Models page under the machine that has it.
 // Existence-checked first because heartbeats arrive every ~10s: re-upserting
-// unchanged rows each beat would be pure write churn. Never throws -- catalog
+// an already-correct row each beat would be pure write churn. Still
+// re-registers when the stored hf_repo/hf_file disagree with this beat's
+// hf_match (e.g. a row written by a since-fixed reconstruction bug) so a
+// worker code fix self-heals previously-corrupted catalog rows on their next
+// scan instead of leaving them wrong forever. Never throws -- catalog
 // bookkeeping must not break heartbeat ingestion.
 function registerHashVerifiedModelFiles(files: WorkerStatePush["model_files"]): void {
   for (const f of files) {
     if (!f.sha256 || f.state !== "verified" || !f.hf_match || f.hf_match.deleted) continue;
     try {
-      if (repo.getModel(f.sha256)) continue;
-      repo.registerModel({
-        id: f.sha256,
-        filename: f.hf_match.filename,
-        size_bytes: f.size_bytes,
-        source: "huggingface",
-        hf_repo: f.hf_match.repo_id,
-        hf_file: f.hf_match.filename,
-        metadata: {},
-      });
+      const existing = repo.getModel(f.sha256);
+      const upToDate = existing && existing.hf_repo === f.hf_match.repo_id && existing.hf_file === f.hf_match.filename;
+      if (!upToDate) {
+        repo.registerModel({
+          id: f.sha256,
+          filename: f.hf_match.filename,
+          size_bytes: f.size_bytes,
+          source: "huggingface",
+          hf_repo: f.hf_match.repo_id,
+          hf_file: f.hf_match.filename,
+          // Preserve whatever metadata (param_count, n_layer, ...) an
+          // existing row already carries -- this branch also runs for the
+          // hf_repo/hf_file self-heal case above, which must not wipe out
+          // fields a prior lookup already filled in.
+          metadata: existing?.metadata ?? {},
+        });
+      }
+      // Unlike workers.ts's download-callback route, a scan-discovered match
+      // never goes through a path that fetches param_count -- do it here,
+      // in the background, for any row (fresh or pre-existing) missing it.
+      if (typeof existing?.metadata.param_count !== "number") {
+        backfillParamCountInBackground(f.sha256, f.hf_match.repo_id);
+      }
     } catch {
       // duplicate registration race or a transient DB hiccup -- the next
       // beat simply retries; nothing downstream depends on this insert.
