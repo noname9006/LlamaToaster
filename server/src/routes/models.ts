@@ -240,12 +240,17 @@ export async function modelsRoutes(app: FastifyInstance): Promise<void> {
       // Keyed by id, not display_name -- display names are only guaranteed
       // unique per user (MULTIUSER_PLAN.md §3.3), and the client matches
       // this against the worker it has selected by id, not by name.
+      // state "missing" means the worker's own reconciliation confirmed the
+      // file is gone from disk (its cache keeps the row for re-download
+      // bookkeeping) -- that must not count as "this machine has it", or a
+      // deleted model keeps showing under its former machine forever.
       const owners = workers
         .filter((w) =>
           w.modelFiles.some(
             (f) =>
-              (filename != null && filename !== "" && f.path === filename) ||
-              (shaId != null && f.sha256 != null && f.sha256.toLowerCase() === shaId)
+              f.state !== "missing" &&
+              ((filename != null && filename !== "" && f.path === filename) ||
+                (shaId != null && f.sha256 != null && f.sha256.toLowerCase() === shaId))
           )
         )
         .map((w) => w.id);

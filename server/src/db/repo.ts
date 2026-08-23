@@ -230,6 +230,9 @@ interface ModelDirFileMeta {
   n_layer?: number | null;
   mtp_layers?: number | null;
   expert_count?: number | null;
+  // Present in stored model_files_json now that the heartbeat validator
+  // persists it -- see validate-worker-state.ts's parseModelFiles.
+  state?: string;
 }
 
 interface WorkerJobRow {
@@ -1276,7 +1279,10 @@ export const repo = {
       for (const row of rows) {
         if (!row.model_files_json) continue;
         const files = safeParseJson<(ModelDirFileMeta)[]>(row.model_files_json, []);
-        const match = files.find((f) => f.path === filename);
+        // state "missing" entries are kept by the worker's cache for
+        // re-download bookkeeping after the file was deleted -- their stale
+        // n_layer/mtp_layers must not satisfy a lookup for a live file.
+        const match = files.find((f) => f.path === filename && f.state !== "missing");
         if (
           match &&
           (typeof match.n_layer === "number" ||
