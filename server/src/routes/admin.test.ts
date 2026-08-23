@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Fastify, { type FastifyInstance } from "fastify";
 import fastifyCookie from "@fastify/cookie";
+import type { AdminStats } from "../../../shared/types.js";
 
 // Multi-user Stage 5 (MULTIUSER_PLAN.md §5.1): the admin surface's own two
 // gates -- hostname (404 on mismatch, checked first) and isSuperadmin (403).
@@ -126,6 +127,64 @@ describe("admin routes, cross-tenant by design", () => {
     // exact count depends on test execution order across this file, so this
     // just asserts it's NOT scoped down to "1" (the caller alone).
     expect(body.users).toBeGreaterThanOrEqual(3);
+  });
+
+  it("GET /api/admin/stats counts only TESTED models/quants and TERMINAL tests, never raw table rows", async () => {
+    const adminToken = await superadminSession();
+    const headers = withHost(ADMIN_HOST, { authorization: `Bearer ${adminToken}` });
+    const fetchStats = async (): Promise<AdminStats> =>
+      (await (await fetch(`${baseUrl}/api/admin/stats`, { headers })).json()) as AdminStats;
+    // Delta-based assertions -- this suite shares one DB across its tests, so
+    // absolute counts depend on execution order; the DELTA each fixture below
+    // contributes must be exact regardless.
+    const before = await fetchStats();
+
+    // Registered but never referenced by any run -- must NOT count toward
+    // modelsTested (and its Q4_K_M filename must NOT count toward quants).
+    repo.registerModel({ id: "admin-stats-never-run", filename: "unused-Q4_K_M.gguf", size_bytes: 1, source: "local", metadata: {} });
+    // Tested model whose quant is only parseable from the filename.
+    repo.registerModel({ id: "admin-stats-model-a", filename: "Llama-3-8B-Q4_K_M.gguf", size_bytes: 1, source: "local", metadata: {} });
+    // Tested model with an unparseable filename -- falls back to metadata.quant.
+    repo.registerModel({ id: "admin-stats-model-b", filename: "opaque-name.gguf", size_bytes: 1, source: "local", metadata: { quant: "Q8_0" } });
+
+    const owner = repo.userRepo.upsertByIdentity("github", { providerUserId: "admin-stats-owner", login: "stats-owner", avatarUrl: null });
+    const baseRun = {
+      worker_name: "stats-worker",
+      llama_cpp_build: "b1",
+      llama_cpp_backend: "cpu",
+      status: "running" as const,
+      started_at: Date.now(),
+    };
+    repo.createRun(owner.id, { ...baseRun, id: "admin-stats-run-a", model_id: "admin-stats-model-a", config: { model_id: "admin-stats-model-a" } as never });
+    // Second run so model-b counts as tested too -- its quant can only come
+    // from metadata.quant, since "opaque-name.gguf" parses to nothing.
+    repo.createRun(owner.id, { ...baseRun, id: "admin-stats-run-b", model_id: "admin-stats-model-b", config: { model_id: "admin-stats-model-b" } as never });
+    const sweepItem = (idx: number) => ({
+      idx,
+      n_prompt: 512,
+      n_gen: 128,
+      threads: 4,
+      n_gpu_layers: 99,
+      batch_size: 512,
+      ubatch_size: 512,
+      cache_type_k: "f16",
+      cache_type_v: "f16",
+      flash_attn: "off",
+      mtp: "off",
+      n_gpu_layers_draft: 0,
+      n_cpu_moe: 0,
+    });
+    repo.createRunItems(undefined, "admin-stats-run-a", [sweepItem(0), sweepItem(1), sweepItem(2)]);
+    repo.recordRunItemTerminal("admin-stats-run-a", 0, { status: "done" });
+    repo.recordRunItemTerminal("admin-stats-run-a", 1, { status: "failed_oom" });
+    // idx 2 stays 'queued' -- planned but never performed, so tests must not
+    // count it.
+
+    const after = await fetchStats();
+    expect(after.runs - before.runs).toBe(2);
+    expect(after.modelsTested - before.modelsTested).toBe(2);
+    expect(after.quants - before.quants).toBe(2);
+    expect(after.tests - before.tests).toBe(2);
   });
 
   it("GET /api/admin/runs sees a run belonging to a DIFFERENT user (cross-tenant, by design)", async () => {

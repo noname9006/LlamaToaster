@@ -3,6 +3,10 @@ import { createHash } from "node:crypto";
 import { getDb } from "./migrate.js";
 import { deriveWorkerStatus, LEASE_MS } from "../liveness.js";
 import { generateSessionId, generateRefreshToken, hashToken } from "../session.js";
+// Only the pure filename parser is used from here -- adminRepo.stats()'s
+// quant card needs it and it must match what the client's model picker shows
+// (client/src/modelGrouping.ts's extractQuant mirrors this same pattern).
+import { parseQuant } from "../hf.js";
 import type {
   Model,
   ModelMetadata,
@@ -2281,16 +2285,52 @@ export const repo = {
   // whole point, gated at the ROUTE layer (routes/admin.ts's hostname +
   // isSuperadmin hook), not here. Read-only in v1: no promote/demote/ban/edit.
   adminRepo: {
+    // Each card's definition lives in shared/types.ts's AdminStats doc
+    // comment -- this query set mirrors it exactly. Deliberately NOT one big
+    // COUNT(*)-per-table pass: "tested" and "performed" are filtered/distinct
+    // subsets of the tables, not raw row counts.
     stats(): AdminStats {
       const db = getDb();
-      const count = (table: string): number => (db.prepare(`SELECT COUNT(*) as n FROM ${table}`).get() as { n: number }).n;
-      return {
-        users: count("users"),
-        machines: count("workers"),
-        runs: count("runs"),
-        tests: count("run_items"),
-        models: count("models"),
-      };
+      const scalar = (sql: string): number => (db.prepare(sql).get() as { n: number }).n;
+
+      const users = scalar(`SELECT COUNT(*) AS n FROM users`);
+      const machines = scalar(`SELECT COUNT(DISTINCT machine_id) AS n FROM workers`);
+      const runs = scalar(`SELECT COUNT(*) AS n FROM runs`);
+
+      // Models tested + quants tested share the same tested-model universe:
+      // distinct models referenced by at least one run (GROUP BY m.id collapses
+      // the join's per-run duplicates before quant parsing).
+      const modelsTested = scalar(`SELECT COUNT(DISTINCT model_id) AS n FROM runs`);
+      const testedModelRows = db
+        .prepare(
+          `SELECT m.filename AS filename, m.hf_file AS hf_file, m.metadata AS metadata
+           FROM runs r JOIN models m ON m.id = r.model_id
+           GROUP BY m.id`
+        )
+        .all() as { filename: string | null; hf_file: string | null; metadata: string }[];
+      const quants = new Set<string>();
+      for (const row of testedModelRows) {
+        let meta: ModelMetadata | undefined;
+        try {
+          meta = JSON.parse(row.metadata || "{}") as ModelMetadata;
+        } catch {
+          // corrupt metadata blob -- fall through to the filename parse below
+        }
+        const quant =
+          typeof meta?.quant === "string" && meta.quant.trim()
+            ? meta.quant.trim().toUpperCase()
+            : parseQuant(row.filename ?? row.hf_file ?? "");
+        if (quant) quants.add(quant);
+      }
+
+      // Terminal outcomes only -- the same finished set countUnfinishedItems
+      // defines ('done','failed','failed_oom','cancelled'); still-'queued' or
+      // in-flight items haven't been performed yet.
+      const tests = scalar(
+        `SELECT COUNT(*) AS n FROM run_items WHERE status IN ('done','failed','failed_oom','cancelled')`
+      );
+
+      return { users, machines, modelsTested, quants: quants.size, tests, runs };
     },
 
     // Filterable global runs table (§5.1's own "the filterable global runs
