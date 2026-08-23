@@ -99,17 +99,6 @@ export const api = {
   backfillModelParamCount: (id: string): Promise<{ ok: true; param_count: number | null }> =>
     request(`/api/models/${encodeURIComponent(id)}/backfill-param-count`, { method: "POST" }),
 
-  // Backfills dense-vs-MoE info (n_layer/expert_count) for a model
-  // registered before that collection existed -- unlike param count above,
-  // this DOES need a worker: it re-reads the file's own GGUF header (Hugging
-  // Face's API has no equivalent field to fall back on, confirmed live).
-  // Resolves once the job is queued, not once the worker finishes reading --
-  // see handleBackfillArchInfo's polling in Models.tsx.
-  backfillArchInfo: (workerId: string, modelId: string): Promise<{ ok: true; queued: true; job_id: string }> =>
-    request(`/api/workers/${encodeURIComponent(workerId)}/models/${encodeURIComponent(modelId)}/gguf-info`, {
-      method: "POST",
-    }),
-
   // Which machine(s) currently have each model's file, per their last
   // heartbeat -- powers the Models page's Local/Remote split.
   getModelLocations: (): Promise<{ locations: Record<string, string[]>; unreachable: string[] }> =>

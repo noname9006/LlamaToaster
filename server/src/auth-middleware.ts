@@ -52,9 +52,6 @@ const WORKER_AUTHENTICATED_ROUTES = new Set([
   // "no session" under AUTH_ENABLED (the download itself succeeded, but the
   // model never got registered since the callback never got through).
   "POST /api/models/download-callback",
-  // Worker -> server callback for the "read_gguf_info" backfill job -- same
-  // rationale as download-callback just above.
-  "POST /api/models/gguf-info-callback",
 ]);
 
 // Cast target for req.user/req.session once authMiddleware (or a route that
