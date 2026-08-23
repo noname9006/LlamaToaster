@@ -187,10 +187,11 @@ export default function App() {
       <h1 className="text-2xl font-semibold text-fg">LlamaToaster Admin</h1>
       <p className="mt-1 text-sm text-muted">Cross-tenant read view — every user's machines and runs.</p>
 
-      <section className="mt-6 grid grid-cols-2 gap-4 md:grid-cols-5">
+      <section className="mt-6 grid grid-cols-2 gap-4 md:grid-cols-3 lg:grid-cols-6">
         <StatCard label="Users" value={stats!.users} />
         <StatCard label="Machines" value={stats!.machines} />
-        <StatCard label="Models tested" value={stats!.models} />
+        <StatCard label="Models tested" value={stats!.modelsTested} />
+        <StatCard label="Quants options" value={stats!.quants} />
         <StatCard label="Tests performed" value={stats!.tests} />
         <StatCard label="Total runs" value={stats!.runs} />
       </section>
