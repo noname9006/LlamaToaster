@@ -35,7 +35,15 @@ async function fetchReleases(): Promise<LlamaCppRelease[]> {
   }
   const data = (await res.json()) as GithubReleaseApi[];
   return data
-    .filter((r) => !r.draft && !r.prerelease)
+    // NOT filtering out prerelease here: verified live against the real repo
+    // (checked 2026-08-23) that ggml-org/llama.cpp marks *every* one of its
+    // per-commit build releases (the only kind it publishes -- there's no
+    // separate "stable" GitHub release for this repo) as prerelease=true.
+    // Excluding those excluded every release that exists, for every
+    // platform/backend, which is exactly the "nothing available to install"
+    // bug this comment is here to prevent regressing. Actual drafts (r.draft)
+    // are still excluded -- those are genuinely unfinished/unpublished.
+    .filter((r) => !r.draft)
     .map((r) => ({
       tag: r.tag_name,
       published_at: r.published_at,
