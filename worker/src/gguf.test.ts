@@ -2,7 +2,7 @@ import { describe, it, expect, afterAll } from "vitest";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { readGgufInfo } from "./gguf.js";
+import { readGgufInfo, quantLabelFromFileType } from "./gguf.js";
 
 // Minimal GGUF byte-level writer -- just enough to exercise readGgufInfo's
 // own reader, independent of any real model file. Type ids mirror gguf.ts's
@@ -86,6 +86,39 @@ describe("readGgufInfo", () => {
     expect(info.expert_count).toBeNull();
   });
 
+  // Regression coverage for a file whose name carries no quant token at all
+  // (real-world case: unsloth's "mtp-gemma-4-E2B-it.gguf" drafter) -- the
+  // Models page fell back to filename parsing alone and showed "?" for it
+  // even though the file's own header says exactly what quant it is.
+  it("resolves quant from general.file_type independent of any filename", async () => {
+    const path = writeTempGguf([
+      ["general.architecture", T.STRING, "gemma3"],
+      ["general.file_type", T.UINT32, 7], // LLAMA_FTYPE_MOSTLY_Q8_0
+      ["gemma3.block_count", T.UINT32, 4],
+    ]);
+    const info = await readGgufInfo(path);
+    expect(info.quant).toBe("Q8_0");
+  });
+
+  it("returns null quant for a file_type value with no known mapping", async () => {
+    const path = writeTempGguf([
+      ["general.architecture", T.STRING, "gemma3"],
+      ["general.file_type", T.UINT32, 1024], // LLAMA_FTYPE_GUESSED
+      ["gemma3.block_count", T.UINT32, 4],
+    ]);
+    const info = await readGgufInfo(path);
+    expect(info.quant).toBeNull();
+  });
+
+  it("returns null quant when general.file_type is absent", async () => {
+    const path = writeTempGguf([
+      ["general.architecture", T.STRING, "gemma3"],
+      ["gemma3.block_count", T.UINT32, 4],
+    ]);
+    const info = await readGgufInfo(path);
+    expect(info.quant).toBeNull();
+  });
+
   it("returns null with a debugReason when no general.architecture key exists at all", async () => {
     const path = writeTempGguf([["some.other.key", T.UINT32, 1]]);
     const info = await readGgufInfo(path);
@@ -112,6 +145,20 @@ describe("readGgufInfo", () => {
     const info = await readGgufInfo(join(tmpDir, "does-not-exist.gguf"));
     expect(info.n_layer).toBeNull();
     expect(info.debugReason).toMatch(/parse threw/);
+  });
+});
+
+describe("quantLabelFromFileType", () => {
+  it("maps known llama_ftype values to their filename-style quant codes", () => {
+    expect(quantLabelFromFileType(0)).toBe("F32");
+    expect(quantLabelFromFileType(1)).toBe("F16");
+    expect(quantLabelFromFileType(15)).toBe("Q4_K_M");
+    expect(quantLabelFromFileType(32)).toBe("BF16");
+  });
+
+  it("returns null for retired/unrecognized ftype ids", () => {
+    expect(quantLabelFromFileType(4)).toBeNull();
+    expect(quantLabelFromFileType(1024)).toBeNull();
   });
 });
 

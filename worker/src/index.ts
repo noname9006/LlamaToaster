@@ -1998,10 +1998,10 @@ async function executeDownloadModelJob(
     }
 
     updateDownloadReport(jobId, { detail: "reading GGUF metadata" });
-    const { n_layer, mtp_layers, expert_count, debugReason } = await readGgufInfo(target);
+    const { n_layer, mtp_layers, expert_count, quant, debugReason } = await readGgufInfo(target);
     log.info(
       `gguf metadata for ${progressKey}: n_layer=${n_layer ?? "unknown"} mtp_layers=${mtp_layers ?? "unknown"} ` +
-        `expert_count=${expert_count ?? "unknown"}${debugReason ? ` (${debugReason})` : ""}`
+        `expert_count=${expert_count ?? "unknown"} quant=${quant ?? "unknown"}${debugReason ? ` (${debugReason})` : ""}`
     );
 
     // Update local cache with the new file info. Identity (hf_model_id) and
@@ -2058,6 +2058,7 @@ async function executeDownloadModelJob(
       n_layer,
       mtp_layers,
       expert_count,
+      quant,
     });
     if (!reported) {
       // The file is on disk and hashed, but the server never learned about

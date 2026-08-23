@@ -392,7 +392,7 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
         app.log.warn({ error: validationError }, "model download callback rejected: invalid payload");
         return reply.code(400).send({ error: validationError });
       }
-      const { worker, hf_repo, hf_file, ok, error, sha256, size_bytes, n_layer, mtp_layers, expert_count } =
+      const { worker, hf_repo, hf_file, ok, error, sha256, size_bytes, n_layer, mtp_layers, expert_count, quant } =
         request.body;
       if (!ok) {
         app.log.error({ worker, hf_repo, hf_file, error }, "model download failed");
@@ -412,6 +412,7 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
           ...(typeof param_count === "number" ? { param_count } : {}),
           ...(typeof mtp_layers === "number" && mtp_layers > 0 ? { mtp_layers } : {}),
           ...(typeof expert_count === "number" && expert_count > 0 ? { expert_count } : {}),
+          ...(typeof quant === "string" && quant ? { quant } : {}),
         };
         if (isMtpDraftModel({ metadata, hf_file, filename: hf_file })) {
           metadata.mtp_role = "draft";
@@ -426,6 +427,7 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
             param_count,
             mtp_layers,
             expert_count,
+            quant,
             mtp_role: metadata.mtp_role,
           },
           "model download complete"

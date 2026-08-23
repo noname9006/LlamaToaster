@@ -865,6 +865,12 @@ export interface ModelDownloadCallbackInput {
   n_layer?: number | null;
   mtp_layers?: number | null;
   expert_count?: number | null;
+  // Quant code read from the downloaded file's own general.file_type header
+  // (see worker/src/gguf.ts's quantLabelFromFileType), independent of
+  // hf_file's naming -- some real files (e.g. unsloth's MTP drafters, named
+  // like "mtp-gemma-4-E2B-it.gguf") carry no quant token in their filename
+  // at all, so ModelMetadata.quant would otherwise stay unset for them.
+  quant?: string | null;
 }
 
 // --- Pull queue (MULTIUSER_PLAN.md Stage 1) ---
