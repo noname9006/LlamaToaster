@@ -32,6 +32,22 @@ export function extractQuant(filename: string): string | null {
   return (m[1] ? "UD-" : "") + m[2].toUpperCase();
 }
 
+// Resolves the quant code to use for grouping/sorting/display: the file's
+// own metadata.quant (read from its general.file_type GGUF header at
+// download time -- see worker/src/gguf.ts's quantLabelFromFileType) takes
+// priority over filename parsing. A file whose name carries no quant token
+// (e.g. unsloth's MTP drafters, "mtp-gemma-4-E2B-it.gguf") isn't necessarily
+// unquantized, just unlabeled in its name. Falls back to extractQuant for
+// models registered before metadata.quant existed. Every call site that
+// ranks/groups/displays a quant must go through this one function -- using
+// extractQuant directly in some places and this in others would let the sort
+// order (buildModelGroups) and the tier grouping (groupQuantsByTier, which
+// relies on that sort already clustering same-tier entries together) recognize
+// a different quant for the same file and silently break that invariant.
+export function resolveQuant(m: Model): string | null {
+  return m.metadata.quant ?? extractQuant(m.hf_file ?? m.filename);
+}
+
 export function modelBaseLabel(m: Model): string {
   if (m.hf_repo) {
     const repoName = m.hf_repo.split("/")[1] ?? m.hf_repo;
@@ -71,7 +87,7 @@ function quantBitRank(quant: string | null): number {
 // derived from the same rank quantBitRank sorts by, just rendered as a
 // label. "Other" covers a file extractQuant couldn't parse at all.
 export function quantTierLabel(m: Model): string {
-  const rank = quantBitRank(extractQuant(m.hf_file ?? m.filename));
+  const rank = quantBitRank(resolveQuant(m));
   return Number.isFinite(rank) ? `${rank}-bit` : "Other";
 }
 
@@ -111,8 +127,8 @@ export function buildModelGroups(models: Model[]): ModelGroup[] {
   }
   for (const group of groups.values()) {
     group.quants.sort((a, b) => {
-      const ra = quantBitRank(extractQuant(a.base.hf_file ?? a.base.filename));
-      const rb = quantBitRank(extractQuant(b.base.hf_file ?? b.base.filename));
+      const ra = quantBitRank(resolveQuant(a.base));
+      const rb = quantBitRank(resolveQuant(b.base));
       return ra !== rb ? ra - rb : a.base.size_bytes - b.base.size_bytes;
     });
   }
