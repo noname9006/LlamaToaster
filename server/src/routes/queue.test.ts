@@ -196,6 +196,41 @@ describe("POST /api/worker/heartbeat", () => {
     await postJson("/api/worker/heartbeat", { ...hardwareState("hb-hash-register", "idle"), model_files: files });
     expect(repo.listModels().filter((m) => m.id === sha)).toHaveLength(1);
   });
+
+  it("self-heals a catalog row whose hf_repo/hf_file were mis-split by the old buildHfMatch bug, without wiping its existing metadata", async () => {
+    const sha = "e".repeat(64);
+    // Simulate a row written before the model-scanner.ts buildHfMatch fix:
+    // repo_id truncated to just the namespace, the real repo name dumped
+    // into hf_file -- and it already carries a backfilled param_count that
+    // must survive the correction.
+    repo.registerModel({
+      id: sha,
+      filename: "repo-name-GGUF/model.Q4_K_M.gguf",
+      size_bytes: 789,
+      source: "huggingface",
+      hf_repo: "org",
+      hf_file: "repo-name-GGUF/model.Q4_K_M.gguf",
+      metadata: { param_count: 8_000_000_000 },
+    });
+
+    await postJson("/api/worker/heartbeat", {
+      ...hardwareState("hb-hash-selfheal", "idle"),
+      model_files: [
+        {
+          path: "model.Q4_K_M.gguf",
+          size_bytes: 789,
+          sha256: sha,
+          state: "verified",
+          hf_match: { repo_id: "org/repo-name-GGUF", filename: "model.Q4_K_M.gguf", revision: "main", deleted: false },
+        },
+      ],
+    });
+
+    const healed = repo.getModel(sha);
+    expect(healed?.hf_repo).toBe("org/repo-name-GGUF");
+    expect(healed?.hf_file).toBe("model.Q4_K_M.gguf");
+    expect(healed?.metadata.param_count).toBe(8_000_000_000);
+  });
 });
 
 describe("POST /api/worker/jobs/:jobId/complete", () => {

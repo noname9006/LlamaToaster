@@ -1,5 +1,13 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { scanModelDirectory, hashFile, HashingQueue, lookupHashes, resolveHfMetadata, runStartupReconciliation } from "./model-scanner.js";
+import {
+  scanModelDirectory,
+  hashFile,
+  HashingQueue,
+  lookupHashes,
+  resolveHfMetadata,
+  runStartupReconciliation,
+  getModelFilesWithState,
+} from "./model-scanner.js";
 import { LocalModelCache } from "./local-cache.js";
 import type { LocalModelState } from "../../shared/types.js";
 
@@ -391,6 +399,37 @@ describe("model-scanner", () => {
       expect(result).toHaveProperty("hashed");
       expect(result).toHaveProperty("resolved");
       expect(result).toHaveProperty("missing");
+    });
+  });
+
+  describe("getModelFilesWithState hf_match reconstruction", () => {
+    it("splits a namespace/repo/filename hf_model_id into a 2-segment repo_id, not just the namespace", async () => {
+      const mockCache = {
+        getAll: vi.fn().mockResolvedValue([
+          {
+            path: "model.gguf",
+            size: 1000,
+            mtime: 1000,
+            sha256: "abc123",
+            hf_model_id: "mradermacher/Qwen3.5-9B-Abliterated-HSAQ-v2-GGUF/Qwen3.5-9B-Abliterated-HSAQ-v2.Q2_K.gguf",
+            hf_deleted_at: null,
+            state: "verified",
+          },
+        ]),
+      } as unknown as LocalModelCache;
+
+      // Missing-on-disk is the shortest path through getModelFilesWithState
+      // to buildHfMatch -- no statSync mocking needed.
+      mockFs.existsSync.mockReturnValue(false);
+
+      const [file] = await getModelFilesWithState(mockCache, "/models");
+
+      expect(file.hf_match).toEqual({
+        repo_id: "mradermacher/Qwen3.5-9B-Abliterated-HSAQ-v2-GGUF",
+        filename: "Qwen3.5-9B-Abliterated-HSAQ-v2.Q2_K.gguf",
+        revision: "main",
+        deleted: false,
+      });
     });
   });
 });

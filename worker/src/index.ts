@@ -2316,35 +2316,70 @@ async function withAuth<T>(fn: (token: string) => Promise<T>): Promise<T> {
 }
 
 const HEARTBEAT_INTERVAL_MS = 10_000;
+// While a download is active, this is the only channel that carries its
+// progress to the server (see activeDownloadReports/updateDownloadReport
+// above and the client's poll comment in Models.tsx) -- 10s made the
+// progress bar sit at 0 for up to 10s after a download starts and made
+// speed look like it's stalling/spiking, since the client's 2s poll was
+// mostly re-reading the same stale sample. A short cadence specifically
+// while downloads are in flight fixes both without changing the idle-worker
+// heartbeat rate (and its server-load characteristics) at all.
+const HEARTBEAT_INTERVAL_ACTIVE_DOWNLOAD_MS = 2_000;
+// How soon kickHeartbeatSoon() (called the instant a download job is
+// claimed) fires an out-of-cycle heartbeat -- short enough that the client's
+// first 2s progress poll after starting a download has real data to show,
+// long enough to not race the fetch() that's still resolving headers/status.
+const HEARTBEAT_KICK_DELAY_MS = 300;
+
+let heartbeatTimer: ReturnType<typeof setTimeout> | undefined;
 
 // Runs forever, independent of job execution (MULTIUSER_PLAN.md §1.9) --
 // this is what lets the server see this worker as "busy" with live progress
 // for the whole duration of a job, and what delivers cancel/pause control
-// directives with a worst-case ~10s latency.
-function startHeartbeatLoop(): void {
-  setInterval(async () => {
-    try {
-      const state = await collectState();
-      const res = await withAuth((token) =>
-        postHeartbeat(config.vps_url, token, state, currentJobReport, Array.from(activeDownloadReports.values()), 10_000)
-      );
-      // discard_job_ids is a subset of cancel_job_ids -- mark discards FIRST
-      // so executeDownloadModelJob's abort handler (which may run
-      // synchronously off the abort() call inside requestDownloadStop) sees
-      // discardRequestedJobIds already populated for this job.
-      for (const jobId of res.control.discard_job_ids) requestDownloadDiscard(jobId);
-      for (const jobId of res.control.cancel_job_ids) {
-        requestStop(jobId);
-        requestDownloadStop(jobId);
-      }
-      pauseRequested = res.control.pause;
-    } catch (err) {
-      // Transient -- the server's lease is 6 heartbeats wide (LEASE_MS), so
-      // one or two missed heartbeats in a row is recoverable without any
-      // action here.
-      log.debug(`heartbeat failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+// directives with a worst-case ~10s latency (or ~2s while a download is
+// active -- see HEARTBEAT_INTERVAL_ACTIVE_DOWNLOAD_MS above). A
+// self-rescheduling setTimeout rather than setInterval so the delay can
+// react to activeDownloadReports each tick, and so kickHeartbeatSoon() below
+// can pull the next tick forward instead of waiting on a fixed schedule.
+async function heartbeatTick(): Promise<void> {
+  try {
+    const state = await collectState();
+    const res = await withAuth((token) =>
+      postHeartbeat(config.vps_url, token, state, currentJobReport, Array.from(activeDownloadReports.values()), 10_000)
+    );
+    // discard_job_ids is a subset of cancel_job_ids -- mark discards FIRST
+    // so executeDownloadModelJob's abort handler (which may run
+    // synchronously off the abort() call inside requestDownloadStop) sees
+    // discardRequestedJobIds already populated for this job.
+    for (const jobId of res.control.discard_job_ids) requestDownloadDiscard(jobId);
+    for (const jobId of res.control.cancel_job_ids) {
+      requestStop(jobId);
+      requestDownloadStop(jobId);
     }
-  }, HEARTBEAT_INTERVAL_MS).unref();
+    pauseRequested = res.control.pause;
+  } catch (err) {
+    // Transient -- the server's lease is 6 heartbeats wide (LEASE_MS), so
+    // one or two missed heartbeats in a row is recoverable without any
+    // action here.
+    log.debug(`heartbeat failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+  } finally {
+    const delay = activeDownloadReports.size > 0 ? HEARTBEAT_INTERVAL_ACTIVE_DOWNLOAD_MS : HEARTBEAT_INTERVAL_MS;
+    heartbeatTimer = setTimeout(heartbeatTick, delay).unref();
+  }
+}
+
+function startHeartbeatLoop(): void {
+  heartbeatTimer = setTimeout(heartbeatTick, HEARTBEAT_INTERVAL_MS).unref();
+}
+
+// Pulls the next heartbeat forward instead of leaving a freshly-started
+// download waiting on whatever's left of the current (possibly ~10s, idle)
+// interval -- called the moment runDownloadJob claims a job. Harmless no-op
+// if called before startHeartbeatLoop has run once.
+function kickHeartbeatSoon(): void {
+  if (!heartbeatTimer) return;
+  clearTimeout(heartbeatTimer);
+  heartbeatTimer = setTimeout(heartbeatTick, HEARTBEAT_KICK_DELAY_MS).unref();
 }
 
 // Comfortably above the server's own ~25s long-poll window (LONG_POLL_MS,
@@ -2373,6 +2408,7 @@ async function runDownloadJob(job: { job_id: string; payload: DownloadModelJobPa
   const controller = new AbortController();
   activeDownloadControllers.set(job.job_id, controller);
   activeDownloadReports.set(job.job_id, { job_id: job.job_id, phase: "downloading" });
+  kickHeartbeatSoon();
   log.info(`claimed job ${job.job_id} (download_model)`);
   try {
     await executeDownloadModelJob(job.job_id, job.payload, controller.signal);

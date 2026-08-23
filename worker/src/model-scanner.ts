@@ -540,11 +540,18 @@ export async function refreshModels(
 
 // Reconstructs the reported hf_match shape from a cache entry's compact
 // "repo_id/filename" hf_model_id string. Shared by every call site below.
+//
+// HF repo ids are always exactly "namespace/name" (two segments) -- so the
+// first two segments are the repo id and everything after is the filename.
+// Splitting on just the first "/" (the old behavior) truncated repo_id down
+// to the bare namespace and dumped the real repo name into the filename,
+// producing broken /blob/main/ links.
 function buildHfMatch(entry: LocalCacheEntry): ModelDirFile["hf_match"] {
   if (!entry.hf_model_id) return null;
+  const parts = entry.hf_model_id.split("/");
   return {
-    repo_id: entry.hf_model_id.split("/")[0],
-    filename: entry.hf_model_id.split("/").slice(1).join("/"),
+    repo_id: parts.slice(0, 2).join("/"),
+    filename: parts.slice(2).join("/"),
     revision: "main",
     deleted: Boolean(entry.hf_deleted_at),
   };
