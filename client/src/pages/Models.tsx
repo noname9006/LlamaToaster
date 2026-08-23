@@ -3,18 +3,16 @@ import { api, ApiError } from "../api/client";
 import { StatusPill } from "../components/StatusPill";
 import {
   IconAlertTriangle,
+  IconCheck,
   IconChevronDown,
-  IconCloud,
+  IconDash,
   IconDownload,
-  IconExternalLink,
-  IconHardDrive,
   IconPause,
   IconRefreshCw,
-  IconTrash,
   IconX,
 } from "../components/icons";
 import { ParamsRangeSlider, PARAMS_STOPS, paramsInRange } from "../components/ParamsRangeSlider";
-import { buildModelGroups, extractQuant, type ModelGroup } from "../modelGrouping";
+import { buildModelGroups, extractQuant, groupQuantsByTier, type ModelGroup } from "../modelGrouping";
 import {
   formatBytes,
   formatParamsB,
@@ -30,6 +28,7 @@ import {
 import { isMtpDraftModel } from "../types";
 import type {
   Model,
+  ModelDirFile,
   ModelMetadata,
   ModelSource,
   HfRepoSearchResult,
@@ -194,45 +193,45 @@ function persistHfSearch(state: PersistedHfSearch): void {
   }
 }
 
-// Shared between the "My models" section's column header and every data/
-// draft row so their cells always line up: Name | Size | State | Src |
-// Added | Actions. Params isn't a column here -- it's the same value for
-// every quant sibling in a group (same underlying model, just quantized
-// differently), so it's shown once on the group header instead of
-// repeated on every single row.
-const ROW_GRID = "grid grid-cols-[minmax(220px,1fr)_72px_96px_24px_48px_64px] items-center gap-x-3";
-
-function MiniChip({ label, tone = "muted" }: { label: string; tone?: "muted" | "warning" | "accent" }) {
-  const toneClass =
-    tone === "warning"
-      ? "border-warning/30 bg-warning-bg text-warning"
-      : tone === "accent"
-        ? "border-accent/30 bg-accent/10 text-accent"
-        : "border-border bg-surface text-muted";
+// Finds the ModelDirFile a worker actually reports for a given registered
+// model. Path match first (the common case), then a SHA-256 fallback for
+// hash-keyed models (id == the file's content hash, see deriveModelId/
+// registerModel in server/src/db/repo.ts) -- mirrors server/src/routes/
+// models.ts's /api/models/locations ownership check, which is how a worker
+// ends up counted as an "owner" in the first place once the on-disk file has
+// been manually renamed/moved (same content, different path). Without this
+// fallback, callers that only matched by path would silently miss a renamed
+// file's real entry -- see renderQuantBadge (used to show "no state
+// reported") and handleDeleteModelFile (used to send a stale path that no
+// longer exists on disk, making the delete job a silent no-op).
+function findWorkerModelFile(m: Model, worker: Worker): ModelDirFile | undefined {
+  const filename = m.source === "local" ? m.filename : m.hf_file;
   return (
-    <span className={`shrink-0 rounded border px-1.5 py-px font-mono text-[10px] font-semibold ${toneClass}`}>
-      {label}
-    </span>
+    worker.modelFiles?.find((f) => f.path === filename) ??
+    (/^[0-9a-f]{64}$/.test(m.id) ? worker.modelFiles?.find((f) => f.sha256?.toLowerCase() === m.id) : undefined)
   );
 }
 
-// Maps a worker-reported local model state to the app's existing .status-dot
-// tone classes (index.css) -- reused as-is rather than inventing new ones, so
-// this row's state indicator matches every other status dot in the app.
-function stateDotClass(state: string): string {
+// Maps a worker-reported local model state (or its absence) to a small icon
+// + tone for a compact quant badge -- same states worker/src's local-cache
+// state machine defines (shared/types.ts's LocalModelState), just an icon
+// glyph instead of a StatusPill/dot, since a badge only has room for one.
+function badgeState(state: string | undefined): { Icon: typeof IconCheck; className: string; label: string } {
   switch (state) {
     case "verified":
-      return "status-dot--solid";
+      return { Icon: IconCheck, className: "text-success", label: "verified" };
     case "hashing":
-      return "status-dot--blink";
+      return { Icon: IconRefreshCw, className: "text-accent animate-spin", label: "hashing" };
     case "unknown":
     case "modified":
-      return "status-dot--warn";
+      return { Icon: IconDash, className: "text-warning", label: state };
     case "corrupted":
     case "missing":
-      return "status-dot--red";
+      return { Icon: IconAlertTriangle, className: "text-danger", label: state };
+    case "detected":
+      return { Icon: IconDash, className: "text-muted", label: "detected" };
     default:
-      return "status-dot--grey"; // "detected"
+      return { Icon: IconDash, className: "text-muted/50", label: "no state reported" };
   }
 }
 
@@ -510,7 +509,13 @@ export function Models() {
   // the "N run result(s) reference it" conflict the old whole-registry
   // delete could -- there's no DB data being removed here at all.
   async function handleDeleteModelFile(m: Model, worker: Worker) {
-    const filename = m.source === "local" ? m.filename : m.hf_file;
+    // Prefer the worker's own reported path over the model's registered
+    // filename -- for a file manually renamed/moved on disk after download,
+    // those differ (see findWorkerModelFile), and sending the stale
+    // registered filename here would have the worker look for a path that
+    // no longer exists, silently no-opping the delete instead of removing
+    // the file that's actually there.
+    const filename = findWorkerModelFile(m, worker)?.path ?? (m.source === "local" ? m.filename : m.hf_file);
     if (!filename) return;
     if (
       !window.confirm(
@@ -1026,109 +1031,85 @@ export function Models() {
     }
   }
 
-  // One line per file: Name (+quant/MoE/MTP chips) | Size | State | Src |
-  // Added | Actions -- see ROW_GRID above. Params isn't shown per row (same
-  // value for every quant sibling -- see renderModelGroup's header instead),
-  // but the real-count lookup is still a genuinely per-file action (each
-  // quant's own registered row gets backfilled independently), so it stays
-  // in the Actions column even without a number next to it on this row.
-  function renderModelRow(m: Model, worker: Worker, indent: boolean) {
+  // Compact quant badge: state icon + quant code + size, nothing else --
+  // matches Hugging Face's own quant-table style rather than a filename-first
+  // row. The whole badge is the link to that exact file's HF page when one
+  // exists; a manually-registered local file (no hf_repo, nothing to link to)
+  // renders as a plain dashed-border span instead. Delete lives in a small
+  // hover-revealed corner button, since a badge has no room for a persistent
+  // one.
+  function renderQuantBadge(m: Model, worker: Worker, isFirstInTier: boolean) {
     const key = `${m.id}:${worker.id}`;
-    const isEstimatedParams = modelParamsB(m) !== null && typeof m.metadata.param_count !== "number";
-
-    // Find the model file info with state from the worker's modelFiles
-    const workerModelFile = worker.modelFiles?.find((f) => f.path === (m.source === "local" ? m.filename : m.hf_file));
+    const workerModelFile = findWorkerModelFile(m, worker);
     const modelState = workerModelFile?.state;
     const hfMatch = workerModelFile?.hf_match;
-    const quant = extractQuant(m.hf_file ?? m.filename);
-    // Actions column's HF link target: the worker's live hash-verified match
-    // takes priority over the model's own stored hf_repo/hf_file (which can
-    // point at a since-renamed/moved file the hash lookup would catch).
+    const quant = extractQuant(m.hf_file ?? m.filename) ?? "?";
+    // The worker's live hash-verified match takes priority over the model's
+    // own stored hf_repo/hf_file (which can point at a since-renamed/moved
+    // file the hash lookup would catch).
     const hfLinkRepo = hfMatch && !hfMatch.deleted ? hfMatch.repo_id : !hfMatch ? m.hf_repo : undefined;
     const hfLinkFile = hfMatch && !hfMatch.deleted ? hfMatch.filename : !hfMatch ? m.hf_file : undefined;
+    // A confirmed-gone HF source overrides whatever the worker's own local
+    // state says -- "the exact file HF served this hash from is gone" is the
+    // more important thing to surface than "still verified locally".
+    const { Icon: StateIcon, className: stateClassName, label: stateLabel } = hfMatch?.deleted
+      ? { Icon: IconAlertTriangle, className: "text-warning", label: "removed from Hugging Face" }
+      : badgeState(modelState);
+    const title = `${m.filename} · ${formatBytes(m.size_bytes)} · ${stateLabel} · added ${formatShortRelativeTime(m.created_at)}`;
+
+    const content = (
+      <>
+        <StateIcon width={11} height={11} className={`shrink-0 ${stateClassName}`} />
+        <span className="font-mono text-xs font-semibold">{quant}</span>
+        <span className="font-mono text-[11px] tabular-nums text-muted">{formatBytes(m.size_bytes)}</span>
+      </>
+    );
+    const badgeClassName =
+      hfLinkRepo && hfLinkFile
+        ? "inline-flex items-center gap-1.5 rounded-md border border-border bg-surface px-2 py-1 text-xs text-fg no-underline transition-colors hover:border-accent/30 hover:bg-surface-raised hover:text-accent"
+        : "inline-flex items-center gap-1.5 rounded-md border border-dashed border-border bg-surface px-2 py-1 text-xs text-fg";
 
     return (
-      <div key={key} className={`group/row ${ROW_GRID} border-t border-border/60 px-4 py-1.5 hover:bg-surface-raised`}>
-        <div className={`flex min-w-0 items-center gap-1.5 ${indent ? "ml-4 border-l-2 border-border pl-3" : ""}`}>
-          {indent && !/^mtp\//i.test(m.filename) && <span className="shrink-0 text-[11px] text-muted">MTP/</span>}
-          <span className={`truncate text-[13px] ${indent ? "text-muted" : "text-fg"}`} title={m.filename}>
-            {m.filename}
+      <div
+        key={key}
+        className={`group/badge relative inline-flex items-stretch ${isFirstInTier ? "" : "border-l border-border pl-2.5"}`}
+      >
+        {hfLinkRepo && hfLinkFile ? (
+          <a href={hfFileUrl(hfLinkRepo, hfLinkFile)} target="_blank" rel="noreferrer" className={badgeClassName} title={title}>
+            {content}
+          </a>
+        ) : (
+          <span className={badgeClassName} title={`${title} · no Hugging Face page to link to`}>
+            {content}
           </span>
-          {quant && <MiniChip label={quant} />}
-          {isMtpDraftModel(m) && (
-            <span title="Standalone MTP/draft companion file -- not benchmarkable on its own, only usable as an MTP model paired with a base model on New Run">
-              <MiniChip label="MTP" tone="accent" />
-            </span>
-          )}
+        )}
+        <button
+          type="button"
+          disabled={deletingKey === key}
+          onClick={() => handleDeleteModelFile(m, worker)}
+          className="absolute -right-1.5 -top-1.5 flex h-4 w-4 items-center justify-center rounded-full border border-bg bg-danger-bg text-danger opacity-0 transition-opacity group-hover/badge:opacity-100 disabled:opacity-50"
+          aria-label={`Delete ${m.filename} from ${worker.displayName}`}
+          title={`Delete this file from ${worker.displayName} -- you can re-download or re-import it later`}
+        >
+          <IconX width={9} height={9} />
+        </button>
+      </div>
+    );
+  }
+
+  // One tier's worth of badges: a bit-width band (see modelGrouping.ts's
+  // groupQuantsByTier) or the "MTP" band for draft/companion files, which
+  // don't get bit-width-sorted alongside real quants.
+  function renderTierRow(label: string, subtitle: string, quants: Model[], worker: Worker) {
+    return (
+      <div key={label} className="flex items-start gap-3.5 border-t border-border/60 px-4 py-2 first:border-t-0">
+        <div className="w-14 shrink-0 pt-0.5 text-[11px] font-semibold text-muted">
+          {label}
+          <span className="block text-[9.5px] font-medium uppercase tracking-wide text-muted/60">{subtitle}</span>
         </div>
-
-        <div className="text-right font-mono text-xs tabular-nums text-fg">{formatBytes(m.size_bytes)}</div>
-
-        <div className="flex items-center justify-end gap-1.5 text-[11px] text-muted">
-          {modelState ? (
-            <>
-              <span className={`status-dot ${stateDotClass(modelState)}`} />
-              {modelState}
-            </>
-          ) : (
-            <span className="text-muted/60">—</span>
-          )}
+        <div className="flex flex-1 flex-wrap content-start gap-y-2">
+          {quants.map((m, i) => renderQuantBadge(m, worker, i === 0))}
         </div>
-
-        <div className="flex items-center justify-center text-muted/70" title={m.source}>
-          {m.source === "huggingface" ? <IconCloud width={13} height={13} /> : <IconHardDrive width={13} height={13} />}
-        </div>
-
-        <div className="text-right text-[11px] text-muted/70">{formatShortRelativeTime(m.created_at)}</div>
-
-        <div className="flex items-center justify-end gap-0.5 opacity-60 transition-opacity group-hover/row:opacity-100">
-          {isEstimatedParams && m.hf_repo && (
-            <button
-              type="button"
-              disabled={paramLookupBusyId === m.id}
-              onClick={() => lookupParamCount(m)}
-              className="flex h-6 w-6 items-center justify-center rounded text-muted hover:bg-surface hover:text-accent disabled:opacity-50"
-              title="Look up the real parameter count from Hugging Face"
-              aria-label={`Look up real parameter count for ${m.filename}`}
-            >
-              <IconRefreshCw width={13} height={13} className={paramLookupBusyId === m.id ? "animate-spin" : undefined} />
-            </button>
-          )}
-          {hfMatch?.deleted ? (
-            <span
-              className="flex h-6 w-6 items-center justify-center rounded text-warning"
-              title={`${hfMatch.repo_id}/${hfMatch.filename} was removed from Hugging Face`}
-            >
-              <IconAlertTriangle width={13} height={13} />
-            </span>
-          ) : (
-            hfLinkRepo &&
-            hfLinkFile && (
-              <a
-                href={hfFileUrl(hfLinkRepo, hfLinkFile)}
-                target="_blank"
-                rel="noreferrer"
-                className="flex h-6 w-6 items-center justify-center rounded text-muted hover:bg-surface hover:text-accent"
-                title={`${hfLinkRepo}/${hfLinkFile}`}
-                aria-label={`View ${m.filename} on Hugging Face`}
-              >
-                <IconExternalLink width={13} height={13} />
-              </a>
-            )
-          )}
-          <button
-            type="button"
-            disabled={deletingKey === key}
-            onClick={() => handleDeleteModelFile(m, worker)}
-            className="flex h-6 w-6 items-center justify-center rounded text-muted hover:bg-danger-bg hover:text-danger disabled:opacity-50"
-            aria-label={`Delete ${m.filename} from ${worker.displayName}`}
-            title={`Delete this file from ${worker.displayName} -- you can re-download or re-import it later`}
-          >
-            <IconTrash width={13} height={13} />
-          </button>
-        </div>
-
-        {paramLookupErr[m.id] && <div className="col-span-full pl-1 pt-1 text-xs text-danger">{paramLookupErr[m.id]}</div>}
       </div>
     );
   }
@@ -1150,38 +1131,68 @@ export function Models() {
       group.quants.reduce((n, q) => n + q.base.size_bytes, 0) + uniqueDrafts.reduce((n, d) => n + d.size_bytes, 0);
     // Params is the same across every quant sibling (same underlying model,
     // just quantized differently) -- shown once here instead of repeating it
-    // on every row. The smallest quant (quants[0], after buildModelGroups'
+    // on every badge. The smallest quant (quants[0], after buildModelGroups'
     // own sort) stands in as the group's representative value, same
-    // convention sortModelGroups already uses for author/family/size sorts.
-    const groupParamsB = modelParamsB(group.quants[0].base);
+    // convention sortModelGroups already uses for author/family/size sorts --
+    // its own param-count lookup/backfill button lives here too, for the
+    // same reason.
+    const repModel = group.quants[0].base;
+    const groupParamsB = modelParamsB(repModel);
+    const isEstimatedGroupParams = groupParamsB !== null && typeof repModel.metadata.param_count !== "number";
+    const tiers = groupQuantsByTier(group.quants);
+
     return (
       // border-t (not just the individual rows' own hairline) is what
       // actually separates one group from the next -- without it here, a
       // group header sat flush against the previous group's last row with
       // nothing visually marking the boundary between them.
       <div key={`${group.key}:${worker.id}`} className="border-t-2 border-border/80 first:border-t-0">
-        <div className="flex items-baseline gap-2 px-4 pt-2.5 pb-1 text-[11px] text-muted">
-          <span>
-            <span className="font-semibold text-fg">{group.author}</span> · {group.family} · {group.label}
-            {groupParamsB !== null && (
-              <span className="ml-2 font-mono tabular-nums text-muted/80">{formatParamsB(groupParamsB)}</span>
-            )}
-          </span>
-          <span className="ml-auto font-mono text-[10.5px] tabular-nums text-muted/70">
+        <div className="flex flex-wrap items-center gap-2 px-4 pt-3 pb-2">
+          <span className="text-[13.5px] font-semibold text-fg">{group.label}</span>
+          <span className="text-xs text-muted">· {group.author} · {group.family}</span>
+          {groupParamsB !== null && (
+            <span className="inline-flex items-center rounded border border-border bg-surface-raised px-1.5 py-0.5 font-mono text-xs font-bold text-fg">
+              {formatParamsB(groupParamsB)}
+            </span>
+          )}
+          {isEstimatedGroupParams && repModel.hf_repo && (
+            <button
+              type="button"
+              disabled={paramLookupBusyId === repModel.id}
+              onClick={() => lookupParamCount(repModel)}
+              className="flex h-5 w-5 items-center justify-center rounded text-muted hover:bg-surface hover:text-accent disabled:opacity-50"
+              title="Look up the real parameter count from Hugging Face"
+              aria-label={`Look up real parameter count for ${group.label}`}
+            >
+              <IconRefreshCw width={12} height={12} className={paramLookupBusyId === repModel.id ? "animate-spin" : undefined} />
+            </button>
+          )}
+          <span className="flex-1" />
+          {repModel.hf_repo && (
+            <a
+              href={hfRepoUrl(repModel.hf_repo)}
+              target="_blank"
+              rel="noreferrer"
+              className="inline-flex items-center gap-1 rounded-md border border-transparent px-2 py-1 text-xs text-accent hover:border-accent/30 hover:bg-accent/10"
+            >
+              View on HF ↗
+            </a>
+          )}
+          <span className="font-mono text-[10.5px] text-muted/70">
             {totalFiles} file{totalFiles === 1 ? "" : "s"} · {formatBytes(totalBytes)}
           </span>
         </div>
-        {group.quants.map(({ base }) => (
-          <div key={base.id}>{renderModelRow(base, worker, false)}</div>
-        ))}
-        {uniqueDrafts.length > 0 && (
-          <div className="ml-4 border-l-2 border-border py-1 pl-3 text-[10px] font-semibold uppercase tracking-wide text-accent/80">
-            MTP companion{uniqueDrafts.length === 1 ? "" : "s"}
-          </div>
+        {paramLookupErr[repModel.id] && <div className="px-4 pb-1.5 text-xs text-danger">{paramLookupErr[repModel.id]}</div>}
+        {tiers.map((tier) =>
+          renderTierRow(
+            tier.label,
+            `${tier.quants.length} quant${tier.quants.length === 1 ? "" : "s"}`,
+            tier.quants.map((q) => q.base),
+            worker
+          )
         )}
-        {uniqueDrafts.map((draft) => (
-          <div key={draft.id}>{renderModelRow(draft, worker, true)}</div>
-        ))}
+        {uniqueDrafts.length > 0 &&
+          renderTierRow("MTP", `${uniqueDrafts.length} file${uniqueDrafts.length === 1 ? "" : "s"}`, uniqueDrafts, worker)}
       </div>
     );
   }
@@ -1320,14 +1331,6 @@ export function Models() {
                       <p className="px-4 py-3 text-sm text-muted">No models on this worker.</p>
                     ) : (
                       <>
-                        <div className={`${ROW_GRID} border-b border-border bg-surface-raised px-4 py-1.5 text-[10px] font-semibold uppercase tracking-wide text-muted/70`}>
-                          <div>Name</div>
-                          <div className="text-right">Size</div>
-                          <div className="text-right">State</div>
-                          <div className="text-center">Src</div>
-                          <div className="text-right">Added</div>
-                          <div />
-                        </div>
                         {groups.map((group) => renderModelGroup(group, worker))}
                         {orphans.length > 0 && (
                           // Every entry here is an MTP draft whose paired base isn't
@@ -1335,16 +1338,14 @@ export function Models() {
                           // because its hf_repo doesn't match any registered base's,
                           // so buildModelGroups never nested it under a group at all.
                           // Still gets its own labeled subsection rather than
-                          // rendering as anonymous standalone rows indistinguishable
+                          // rendering as anonymous standalone badges indistinguishable
                           // from a normal quant file.
                           <div className="border-t-2 border-border/80">
-                            <div className="flex items-baseline gap-2 px-4 pt-2.5 pb-1 text-[11px] text-muted">
+                            <div className="px-4 pt-3 pb-1 text-[11px] text-muted">
                               <span className="font-semibold text-fg">MTP companions</span>
-                              <span className="text-muted/70">— no matching base model on this worker</span>
+                              <span className="text-muted/70"> — no matching base model on this worker</span>
                             </div>
-                            {orphans.map((d) => (
-                              <div key={d.id}>{renderModelRow(d, worker, false)}</div>
-                            ))}
+                            {renderTierRow("MTP", `${orphans.length} file${orphans.length === 1 ? "" : "s"}`, orphans, worker)}
                           </div>
                         )}
                       </>

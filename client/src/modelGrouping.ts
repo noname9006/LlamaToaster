@@ -66,6 +66,15 @@ function quantBitRank(quant: string | null): number {
   return m ? Number(m[1]) : Infinity;
 }
 
+// "N-bit" tier label for the Models page's badge-grid view (groups quant
+// siblings by bit-width the way Hugging Face's own quant tables do) --
+// derived from the same rank quantBitRank sorts by, just rendered as a
+// label. "Other" covers a file extractQuant couldn't parse at all.
+export function quantTierLabel(m: Model): string {
+  const rank = quantBitRank(extractQuant(m.hf_file ?? m.filename));
+  return Number.isFinite(rank) ? `${rank}-bit` : "Other";
+}
+
 export interface ModelQuantEntry {
   base: Model;
   // Draft/MTP companion files sharing the base model's hf_repo -- there's no
@@ -108,4 +117,27 @@ export function buildModelGroups(models: Model[]): ModelGroup[] {
     });
   }
   return Array.from(groups.values());
+}
+
+export interface QuantTier {
+  label: string;
+  quants: ModelQuantEntry[];
+}
+
+// Buckets an already-sorted quants array (buildModelGroups' own bit-rank-then-
+// size sort) into consecutive same-tier runs for the Models page's badge-grid
+// view -- cheap since that sort order already guarantees every same-tier
+// entry is adjacent, so this never needs to re-sort or group by a Map.
+export function groupQuantsByTier(quants: ModelQuantEntry[]): QuantTier[] {
+  const tiers: QuantTier[] = [];
+  for (const q of quants) {
+    const label = quantTierLabel(q.base);
+    const last = tiers[tiers.length - 1];
+    if (last && last.label === label) {
+      last.quants.push(q);
+    } else {
+      tiers.push({ label, quants: [q] });
+    }
+  }
+  return tiers;
 }
