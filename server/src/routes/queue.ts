@@ -6,7 +6,7 @@ import { authenticateWorker } from "../worker-auth.js";
 import { parseWorkerState, parseActiveJobReport, parseActiveDownloads } from "../validate-worker-state.js";
 import { LEASE_MS } from "../liveness.js";
 import { NotFoundError } from "../errors.js";
-import type { QueueJob, HeartbeatResponse } from "../../../shared/types.js";
+import type { QueueJob, HeartbeatResponse, WorkerStatePush } from "../../../shared/types.js";
 
 // 25s keeps the hanging long-poll comfortably under Caddy's/any intermediary's
 // 30s idle default. 10s heartbeat (worker/src/index.ts) gives cancel/pause a
@@ -15,6 +15,37 @@ import type { QueueJob, HeartbeatResponse } from "../../../shared/types.js";
 const LONG_POLL_MS = 25_000;
 const BACKSTOP_MS = 5_000; // safety net only; the queueEvents emit is the primary wake-up
 const WORKER_BODY_LIMIT = 1_000_000; // 1 MB -- see MULTIUSER_PLAN.md §1.8
+
+// A worker's reconciliation just told us, per model_dir file, whether its
+// SHA-256 matched the server's HF index (state "verified" + hf_match -- see
+// worker/src/model-scanner.ts's resolveHfMetadata). Any such file whose hash
+// isn't in the catalog yet gets registered here, keyed by sha256 exactly like
+// download-callback registrations are (routes/workers.ts). This is what makes
+// a model dropped into a worker's model_dir by hand -- never downloaded
+// through the app -- show up on the Models page under the machine that has it.
+// Existence-checked first because heartbeats arrive every ~10s: re-upserting
+// unchanged rows each beat would be pure write churn. Never throws -- catalog
+// bookkeeping must not break heartbeat ingestion.
+function registerHashVerifiedModelFiles(files: WorkerStatePush["model_files"]): void {
+  for (const f of files) {
+    if (!f.sha256 || f.state !== "verified" || !f.hf_match || f.hf_match.deleted) continue;
+    try {
+      if (repo.getModel(f.sha256)) continue;
+      repo.registerModel({
+        id: f.sha256,
+        filename: f.hf_match.filename,
+        size_bytes: f.size_bytes,
+        source: "huggingface",
+        hf_repo: f.hf_match.repo_id,
+        hf_file: f.hf_match.filename,
+        metadata: {},
+      });
+    } catch {
+      // duplicate registration race or a transient DB hiccup -- the next
+      // beat simply retries; nothing downstream depends on this insert.
+    }
+  }
+}
 
 // Resolves as soon as a job is claimable for this worker (woken by
 // queueEvents) or LONG_POLL_MS elapses, whichever comes first. Resolves
@@ -54,6 +85,7 @@ export async function queueRoutes(app: FastifyInstance): Promise<void> {
     const worker = await authenticateWorker(req);
     const state = parseWorkerState(req.body);
     repo.workerRepo.recordHeartbeat(worker.id, state, null);
+    registerHashVerifiedModelFiles(state.model_files);
 
     // A worker that says it is busy must never be handed a second job --
     // it should be heartbeating, not queue-polling, while active.
@@ -80,6 +112,7 @@ export async function queueRoutes(app: FastifyInstance): Promise<void> {
       const activeDownloads = parseActiveDownloads(req.body);
 
       repo.workerRepo.recordHeartbeat(worker.id, state, active?.job_id ?? null);
+      registerHashVerifiedModelFiles(state.model_files);
 
       const control: HeartbeatResponse["control"] = {
         cancel_job_ids: [],
