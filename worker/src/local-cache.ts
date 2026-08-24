@@ -17,6 +17,23 @@ export interface LocalCacheEntry {
   // (hf-index.ts's deleted_at). Cleared back to undefined once a
   // re-verification finds the match live again.
   hf_deleted_at?: number;
+  // Per-file GGUF header metadata, read once by model-scanner.ts's
+  // backfillGgufMetadata (and stamped at download time) -- the same fields
+  // a download reports to the server's catalog, so a file dropped into
+  // model_dir by hand (never downloaded through the app) can still get its
+  // real quant/param_count/layer-count reported on the heartbeat instead of
+  // sitting at "?" / "—". See worker/src/gguf.ts's readGgufInfo for what
+  // each field means; all absent for a file whose header couldn't be parsed.
+  n_layer?: number;
+  mtp_layers?: number;
+  expert_count?: number;
+  quant?: string;
+  param_count?: number;
+  // When this entry's GGUF header was last (successfully or unsuccessfully)
+  // read -- gates backfillGgufMetadata's re-read window the same way
+  // hf_checked_at gates HF re-verification, so a header that came back null
+  // (unreadable/corrupt file) isn't re-read on every single reconciliation.
+  gguf_checked_at?: number;
   last_verified: number;
   state: LocalModelState;
 }
@@ -141,16 +158,40 @@ export class LocalModelCache {
     if (!cols.some((c) => c.name === "hf_deleted_at")) {
       this.db.exec(`ALTER TABLE local_model_cache ADD COLUMN hf_deleted_at INTEGER`);
     }
+    // GGUF header metadata (see LocalCacheEntry's doc comments) -- added
+    // together so a single PRAGMA check covers all five.
+    if (!cols.some((c) => c.name === "n_layer")) {
+      this.db.exec(`ALTER TABLE local_model_cache ADD COLUMN n_layer INTEGER`);
+    }
+    if (!cols.some((c) => c.name === "mtp_layers")) {
+      this.db.exec(`ALTER TABLE local_model_cache ADD COLUMN mtp_layers INTEGER`);
+    }
+    if (!cols.some((c) => c.name === "expert_count")) {
+      this.db.exec(`ALTER TABLE local_model_cache ADD COLUMN expert_count INTEGER`);
+    }
+    if (!cols.some((c) => c.name === "quant")) {
+      this.db.exec(`ALTER TABLE local_model_cache ADD COLUMN quant TEXT`);
+    }
+    if (!cols.some((c) => c.name === "param_count")) {
+      this.db.exec(`ALTER TABLE local_model_cache ADD COLUMN param_count INTEGER`);
+    }
+    if (!cols.some((c) => c.name === "gguf_checked_at")) {
+      this.db.exec(`ALTER TABLE local_model_cache ADD COLUMN gguf_checked_at INTEGER`);
+    }
   }
+
+  // Every column, shared by all three SELECT sites (get/getAll/getBySha256)
+  // and the mapRow read below -- one source of truth so a future column
+  // addition can't silently drift between the reader and the writer.
+  private static readonly SELECT_COLS =
+    "path, size, mtime, sha256, hf_model_id, hf_checked_at, hf_deleted_at, " +
+    "n_layer, mtp_layers, expert_count, quant, param_count, gguf_checked_at, last_verified, state";
 
   async get(path: string): Promise<LocalCacheEntry | null> {
     if (!this.db) throw new Error("Database not initialized");
 
     const row = this.db
-      .prepare(
-        `SELECT path, size, mtime, sha256, hf_model_id, hf_checked_at, hf_deleted_at, last_verified, state
-         FROM local_model_cache WHERE path = ?`
-      )
+      .prepare(`SELECT ${LocalModelCache.SELECT_COLS} FROM local_model_cache WHERE path = ?`)
       .get(path);
 
     return row ? this.mapRow(row as Parameters<LocalModelCache["mapRow"]>[0]) : null;
@@ -160,10 +201,7 @@ export class LocalModelCache {
     if (!this.db) throw new Error("Database not initialized");
 
     const rows = this.db
-      .prepare(
-        `SELECT path, size, mtime, sha256, hf_model_id, hf_checked_at, hf_deleted_at, last_verified, state
-         FROM local_model_cache`
-      )
+      .prepare(`SELECT ${LocalModelCache.SELECT_COLS} FROM local_model_cache`)
       .all();
 
     return (rows as Parameters<LocalModelCache["mapRow"]>[0][]).map((r) => this.mapRow(r));
@@ -173,10 +211,7 @@ export class LocalModelCache {
     if (!this.db) throw new Error("Database not initialized");
 
     const row = this.db
-      .prepare(
-        `SELECT path, size, mtime, sha256, hf_model_id, hf_checked_at, hf_deleted_at, last_verified, state
-         FROM local_model_cache WHERE sha256 = ?`
-      )
+      .prepare(`SELECT ${LocalModelCache.SELECT_COLS} FROM local_model_cache WHERE sha256 = ?`)
       .get(sha256);
 
     return row ? this.mapRow(row as Parameters<LocalModelCache["mapRow"]>[0]) : null;
@@ -187,8 +222,8 @@ export class LocalModelCache {
 
     this.db
       .prepare(
-        `INSERT INTO local_model_cache (path, size, mtime, sha256, hf_model_id, hf_checked_at, hf_deleted_at, last_verified, state)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO local_model_cache (path, size, mtime, sha256, hf_model_id, hf_checked_at, hf_deleted_at, n_layer, mtp_layers, expert_count, quant, param_count, gguf_checked_at, last_verified, state)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(path) DO UPDATE SET
            size = excluded.size,
            mtime = excluded.mtime,
@@ -196,6 +231,12 @@ export class LocalModelCache {
            hf_model_id = excluded.hf_model_id,
            hf_checked_at = excluded.hf_checked_at,
            hf_deleted_at = excluded.hf_deleted_at,
+           n_layer = excluded.n_layer,
+           mtp_layers = excluded.mtp_layers,
+           expert_count = excluded.expert_count,
+           quant = excluded.quant,
+           param_count = excluded.param_count,
+           gguf_checked_at = excluded.gguf_checked_at,
            last_verified = excluded.last_verified,
            state = excluded.state`
       )
@@ -207,6 +248,12 @@ export class LocalModelCache {
         entry.hf_model_id ?? null,
         entry.hf_checked_at ?? null,
         entry.hf_deleted_at ?? null,
+        entry.n_layer ?? null,
+        entry.mtp_layers ?? null,
+        entry.expert_count ?? null,
+        entry.quant ?? null,
+        entry.param_count ?? null,
+        entry.gguf_checked_at ?? null,
         entry.last_verified,
         entry.state
       );
@@ -279,6 +326,12 @@ export class LocalModelCache {
     hf_model_id: string | null;
     hf_checked_at: number | null;
     hf_deleted_at: number | null;
+    n_layer: number | null;
+    mtp_layers: number | null;
+    expert_count: number | null;
+    quant: string | null;
+    param_count: number | null;
+    gguf_checked_at: number | null;
     last_verified: number;
     state: string;
   }): LocalCacheEntry {
@@ -290,6 +343,12 @@ export class LocalModelCache {
       hf_model_id: row.hf_model_id ?? undefined,
       hf_checked_at: row.hf_checked_at ?? undefined,
       hf_deleted_at: row.hf_deleted_at ?? undefined,
+      n_layer: row.n_layer ?? undefined,
+      mtp_layers: row.mtp_layers ?? undefined,
+      expert_count: row.expert_count ?? undefined,
+      quant: row.quant ?? undefined,
+      param_count: row.param_count ?? undefined,
+      gguf_checked_at: row.gguf_checked_at ?? undefined,
       last_verified: row.last_verified,
       state: row.state as LocalModelState,
     };

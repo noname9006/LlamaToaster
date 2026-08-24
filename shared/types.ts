@@ -740,6 +740,17 @@ export interface ModelDirFile {
   // source has since been removed -- absent/false for a live match or a
   // worker running old code.
   hf_match?: { repo_id: string; filename: string; revision: string; deleted?: boolean } | null;
+  // Per-file GGUF header metadata (see worker/src/gguf.ts's readGgufInfo) --
+  // read once at download/reconciliation time and carried on the heartbeat so
+  // the server can populate a model's catalog metadata for files that were
+  // dropped into model_dir by hand (never downloaded through the app). Null
+  // (not absent) when the field was checked and came back empty; absent for
+  // workers running old code that never reads GGUF headers per file.
+  n_layer?: number | null;
+  mtp_layers?: number | null;
+  expert_count?: number | null;
+  quant?: string | null;
+  param_count?: number | null;
 }
 
 export interface HardwareInfo {
@@ -871,6 +882,15 @@ export interface ModelDownloadCallbackInput {
   // like "mtp-gemma-4-E2B-it.gguf") carry no quant token in their filename
   // at all, so ModelMetadata.quant would otherwise stay unset for them.
   quant?: string | null;
+  // Total parameter count read from the downloaded file's own tensor_info
+  // section (see worker/src/gguf.ts's readGgufInfo) -- per-FILE and
+  // authoritative, unlike HF's repo-level gguf.total which reports one
+  // (often the first) file's count for an entire repo and is simply wrong
+  // for a multi-model repo (e.g. Ex0bit's PRISM-DQ repos shipping
+  // 0.8B/2B/4B/9B files under one repo id). When present the server stores
+  // it straight into ModelMetadata.param_count instead of calling
+  // getHfGgufMeta.
+  param_count?: number | null;
 }
 
 // --- Pull queue (MULTIUSER_PLAN.md Stage 1) ---
@@ -935,7 +955,7 @@ export interface WorkerStatePush {
   backend: Backend;
   hardware: HardwareInfo;
   installed_builds: InstalledBuild[];
-  model_files: (ModelDirFile & { n_layer?: number | null; mtp_layers?: number | null })[];
+  model_files: ModelDirFile[];
   status: "idle" | "busy";
   // See WorkerVramInfo's doc comment -- omitted (not just null) while busy,
   // since collectState() skips the read entirely rather than reporting a

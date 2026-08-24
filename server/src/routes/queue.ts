@@ -8,7 +8,8 @@ import { LEASE_MS } from "../liveness.js";
 import { NotFoundError } from "../errors.js";
 import { getHfGgufMeta } from "../hf.js";
 import { log } from "../log.js";
-import type { QueueJob, HeartbeatResponse, WorkerStatePush } from "../../../shared/types.js";
+import type { QueueJob, HeartbeatResponse, WorkerStatePush, ModelMetadata, ModelDirFile } from "../../../shared/types.js";
+import { isMtpDraftModel } from "../../../shared/types.js";
 
 // 25s keeps the hanging long-poll comfortably under Caddy's/any intermediary's
 // 30s idle default. 10s heartbeat (worker/src/index.ts) gives cancel/pause a
@@ -66,8 +67,23 @@ function registerHashVerifiedModelFiles(files: WorkerStatePush["model_files"]): 
     if (!f.sha256 || f.state !== "verified" || !f.hf_match || f.hf_match.deleted) continue;
     try {
       const existing = repo.getModel(f.sha256);
-      const upToDate = existing && existing.hf_repo === f.hf_match.repo_id && existing.hf_file === f.hf_match.filename;
-      if (!upToDate) {
+
+      // The file's own GGUF header metadata rides along on the heartbeat (see
+      // ModelDirFile's doc comments and worker/src/model-scanner.ts's
+      // backfillGgufMetadata) -- the per-file authoritative source for a
+      // hand-dropped file's quant/param_count/layer-count, adopted here the
+      // way the download-callback route adopts it for an in-app download.
+      // Without this, a hand-dropped file would keep its "?" quant and a
+      // filename/HF-derived (often wrong -- see getHfGgufMeta's repo-level
+      // total) param count forever.
+      const patch = ggufMetadataPatch(f);
+      const merged = { ...(existing?.metadata ?? {}), ...patch };
+      if (isMtpDraftModel({ metadata: merged, hf_file: f.hf_match.filename, filename: f.hf_match.filename })) {
+        merged.mtp_role = "draft";
+      }
+      const identityOk =
+        existing && existing.hf_repo === f.hf_match.repo_id && existing.hf_file === f.hf_match.filename;
+      if (!identityOk) {
         repo.registerModel({
           id: f.sha256,
           filename: f.hf_match.filename,
@@ -75,17 +91,26 @@ function registerHashVerifiedModelFiles(files: WorkerStatePush["model_files"]): 
           source: "huggingface",
           hf_repo: f.hf_match.repo_id,
           hf_file: f.hf_match.filename,
-          // Preserve whatever metadata (param_count, n_layer, ...) an
-          // existing row already carries -- this branch also runs for the
-          // hf_repo/hf_file self-heal case above, which must not wipe out
-          // fields a prior lookup already filled in.
-          metadata: existing?.metadata ?? {},
+          metadata: merged,
         });
       }
+      // Adoption-only: adjust metadata without touching identity. Identity
+      // updates are ownership-gated (registerModel's ON CONFLICT WHERE -- a
+      // foreign-owner row can block the whole statement, metadata included),
+      // but filling in a derived metadata field must stay open:
+      // updateModelMetadata is that always-open path. Re-reads the row so the
+      // check sees the post-registration truth in both branches, and passes
+      // the fully-merged shape (a superset of what's stored) -- equivalent to
+      // applying just the diff and immune to field-by-field drift.
+      const fresh = repo.getModel(f.sha256);
+      if (fresh && JSON.stringify(fresh.metadata) !== JSON.stringify(merged)) {
+        repo.updateModelMetadata(f.sha256, merged);
+      }
       // Unlike workers.ts's download-callback route, a scan-discovered match
-      // never goes through a path that fetches param_count -- do it here,
-      // in the background, for any row (fresh or pre-existing) missing it.
-      if (typeof existing?.metadata.param_count !== "number") {
+      // used to have no file-derived param_count -- fetch one from HF's
+      // repo-level API in the background for any row (fresh or pre-existing)
+      // still missing it. Skipped when the worker supplied its own count.
+      if (typeof merged.param_count !== "number") {
         backfillParamCountInBackground(f.sha256, f.hf_match.repo_id);
       }
     } catch {
@@ -93,6 +118,20 @@ function registerHashVerifiedModelFiles(files: WorkerStatePush["model_files"]): 
       // beat simply retries; nothing downstream depends on this insert.
     }
   }
+}
+
+// Maps a verified model file's heartbeat-reported GGUF header fields onto the
+// ModelMetadata shape (see ModelDirFile / worker/src/gguf.ts). Only fields
+// with a real value are included, so calling it with a file whose header
+// couldn't be parsed produces an empty patch (a no-op for the caller).
+function ggufMetadataPatch(f: ModelDirFile): Partial<ModelMetadata> {
+  const patch: Partial<ModelMetadata> = {};
+  if (typeof f.n_layer === "number") patch.n_layer = f.n_layer;
+  if (typeof f.mtp_layers === "number" && f.mtp_layers > 0) patch.mtp_layers = f.mtp_layers;
+  if (typeof f.expert_count === "number" && f.expert_count > 0) patch.expert_count = f.expert_count;
+  if (typeof f.param_count === "number") patch.param_count = f.param_count;
+  if (typeof f.quant === "string" && f.quant) patch.quant = f.quant;
+  return patch;
 }
 
 // Resolves as soon as a job is claimable for this worker (woken by

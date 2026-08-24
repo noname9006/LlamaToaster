@@ -15,6 +15,12 @@ const MAX_READ_BYTES = 64 * 1024 * 1024;
 const MAX_STRING_BYTES = 8 * 1024 * 1024;
 const MAX_ARRAY_LEN = 50_000_000;
 const MAX_KV_COUNT = 1_000_000;
+// Bounds for the tensor_info walk's own counters -- generous enough for any
+// real model (the largest current checkpoints stay in the tens of thousands
+// of tensors, each with at most 4-5 dims) but enough to reject a corrupt
+// length field that would otherwise drive a wild, potentially multi-GB read.
+const MAX_TENSOR_COUNT = 50_000_000;
+const MAX_TENSOR_DIMS = 8;
 
 const GGUF_TYPE = {
   UINT8: 0,
@@ -228,6 +234,14 @@ export interface GgufInfo {
   // not from the filename -- null when the key is absent (very old/foreign
   // conversion tools) or its value isn't one of the currently-live ftypes.
   quant: string | null;
+  // Total element count across every tensor (sum of product(dimensions) over
+  // the file's tensor_info section) -- the real parameter count, read from
+  // the file itself. This is the same number HF's own API computes from the
+  // tensor shapes; unlike HF's repo-level gguf.total it is per-FILE, so a
+  // multi-model repo (e.g. Ex0bit's PRISM-DQ repos shipping 0.8B/2B/4B/9B
+  // files under one repo id) can't report one file's count for another's.
+  // null on any parse failure -- fail-soft, same as every other field here.
+  param_count: number | null;
   // Local-only diagnostic for why n_layer/mtp_layers/expert_count came back
   // null -- never sent over the wire (worker/src/index.ts logs it, nothing
   // else reads it), purely so a failed lookup says WHY instead of leaving
@@ -237,7 +251,7 @@ export interface GgufInfo {
 }
 
 function emptyGgufInfo(debugReason: string): GgufInfo {
-  return { n_layer: null, mtp_layers: null, expert_count: null, quant: null, debugReason };
+  return { n_layer: null, mtp_layers: null, expert_count: null, quant: null, param_count: null, debugReason };
 }
 
 // Reads a GGUF file's metadata header to find the model's transformer layer
@@ -256,7 +270,7 @@ export async function readGgufInfo(filePath: string): Promise<GgufInfo> {
     const version = await reader.u32();
     if (version < 2) return emptyGgufInfo(`gguf version ${version} < 2`); // v1 used uint32 counts; no current build produces it
 
-    await reader.u64(); // tensor_count -- unused here, consumed only to advance the cursor
+    const tensorCount = await reader.u64(); // tensor_count -- needed only to bound the tensor_info walk below
     const kvCount = await reader.u64();
     if (kvCount < 0 || kvCount > MAX_KV_COUNT) return emptyGgufInfo(`implausible kv_count ${kvCount}`);
 
@@ -301,11 +315,51 @@ export async function readGgufInfo(filePath: string): Promise<GgufInfo> {
     }
     if (!architecture) return emptyGgufInfo("no general.architecture key found in the whole file");
     const n_layer = blockCounts.get(`${architecture}.block_count`) ?? null;
+
+    // Real per-file parameter count from the tensor_info section that
+    // directly follows the KV metadata. Best-effort and deliberately
+    // isolated from the KV parsing above: a pathological/corrupt file (or a
+    // reader bug) that trips this walk must not nuke the n_layer/quant/etc.
+    // already resolved -- it just leaves param_count null, same fail-soft
+    // posture as every other field here.
+    let param_count: number | null = null;
+    try {
+      // No tensor_info_count field exists: the tensor_infos array follows the
+      // KV metadata directly and is counted by the header's tensor_count
+      // (spec's gguf_file_t: tensor_infos[header.tensor_count]). Reading an
+      // extra u64 here (as an earlier version did, assuming the count was
+      // duplicated) silently misaligned the whole walk on every real file --
+      // the "count" read was actually the first tensor's name-length prefix.
+      if (tensorCount < 0 || tensorCount > MAX_TENSOR_COUNT) {
+        throw new Error(`implausible tensor_count ${tensorCount}`);
+      }
+      let total = 0n;
+      for (let i = 0; i < tensorCount; i++) {
+        await reader.string(); // tensor name -- advanced past, not retained
+        const nDims = await reader.u32();
+        if (nDims > MAX_TENSOR_DIMS) throw new Error(`implausible tensor dim count ${nDims}`);
+        let elements = 1n;
+        for (let d = 0; d < nDims; d++) {
+          elements *= BigInt(await reader.u64());
+        }
+        await reader.u32(); // tensor type -- not needed for the element count
+        await reader.u64(); // tensor offset -- not needed for the element count
+        total += elements;
+      }
+      param_count = total <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(total) : null;
+    } catch (tensorErr) {
+      // Leave param_count null; the fields resolved above still stand.
+      // n_layer==null is not the trigger for logging this -- the KV walk's own
+      // debugReason already covers that -- so just swallow the detail here.
+      void tensorErr;
+    }
+
     return {
       n_layer,
       mtp_layers: mtpLayerCounts.get(`${architecture}.nextn_predict_layers`) ?? null,
       expert_count: expertCounts.get(`${architecture}.expert_count`) ?? null,
       quant: fileType != null ? quantLabelFromFileType(fileType) : null,
+      param_count,
       debugReason:
         n_layer === null ? `architecture "${architecture}" found but no ${architecture}.block_count key` : undefined,
     };

@@ -231,6 +231,72 @@ describe("POST /api/worker/heartbeat", () => {
     expect(healed?.hf_file).toBe("model.Q4_K_M.gguf");
     expect(healed?.metadata.param_count).toBe(8_000_000_000);
   });
+
+  it("adopts per-file GGUF metadata (quant/param_count/n_layer) into a hash-verified model's catalog row", async () => {
+    const sha = "f".repeat(64);
+    // Simulate the user's real-world row: a hand-dropped file whose
+    // param_count was backfilled from HF's repo-level gguf.total -- wrong for
+    // a multi-model repo (HF reports the 0.8B file's count for the 9B file).
+    repo.registerModel({
+      id: sha,
+      filename: "Qwen3.5-9B/Qwen3.5-9B-PRISM-DQ.gguf",
+      size_bytes: 4_651_885_536,
+      source: "huggingface",
+      hf_repo: "Ex0bit/Qwen3.5-PRISM-Dynamic-Quant-GGUF",
+      hf_file: "Qwen3.5-9B/Qwen3.5-9B-PRISM-DQ.gguf",
+      metadata: { param_count: 752_393_024 },
+    });
+
+    await postJson("/api/worker/heartbeat", {
+      ...hardwareState("hb-hash-gguf-adopt", "idle"),
+      model_files: [
+        {
+          path: "Qwen3.5-9B-PRISM-DQ.gguf", // flat, not in the HF subfolder
+          size_bytes: 4_651_885_536,
+          sha256: sha,
+          state: "verified",
+          n_layer: 32,
+          param_count: 8_953_803_264,
+          quant: "Q3_K_M",
+          hf_match: {
+            repo_id: "Ex0bit/Qwen3.5-PRISM-Dynamic-Quant-GGUF",
+            filename: "Qwen3.5-9B/Qwen3.5-9B-PRISM-DQ.gguf",
+            revision: "main",
+            deleted: false,
+          },
+        },
+      ],
+    });
+
+    const adopted = repo.getModel(sha);
+    expect(adopted?.metadata.param_count).toBe(8_953_803_264);
+    expect(adopted?.metadata.quant).toBe("Q3_K_M");
+    expect(adopted?.metadata.n_layer).toBe(32);
+
+    // Idempotent: a second identical heartbeat must not keep rewriting (no
+    // throw, and values stay the same).
+    await postJson("/api/worker/heartbeat", {
+      ...hardwareState("hb-hash-gguf-adopt", "idle"),
+      model_files: [
+        {
+          path: "Qwen3.5-9B-PRISM-DQ.gguf",
+          size_bytes: 4_651_885_536,
+          sha256: sha,
+          state: "verified",
+          n_layer: 32,
+          param_count: 8_953_803_264,
+          quant: "Q3_K_M",
+          hf_match: {
+            repo_id: "Ex0bit/Qwen3.5-PRISM-Dynamic-Quant-GGUF",
+            filename: "Qwen3.5-9B/Qwen3.5-9B-PRISM-DQ.gguf",
+            revision: "main",
+            deleted: false,
+          },
+        },
+      ],
+    });
+    expect(repo.getModel(sha)?.metadata.param_count).toBe(8_953_803_264);
+  });
 });
 
 describe("POST /api/worker/jobs/:jobId/complete", () => {
