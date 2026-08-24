@@ -10,8 +10,12 @@ import {
   parseOffloadLayers,
   type BenchLogger,
   type BenchResult,
+  type ModelBufferSizes,
+  type ModelBufferSizesByModel,
+  type OffloadInfo,
   type OffloadResult,
 } from "./bench.js";
+import { estimateResidentGpuLayersFromBufferSizes } from "../../shared/vramEstimate.js";
 
 // Drives llama-server over HTTP to benchmark MTP (multi-token-prediction)
 // speculative decoding -- llama-bench itself has no --spec-type/--model-draft
@@ -111,10 +115,21 @@ function isRetryableServerParseFailure(err: unknown): boolean {
   return err instanceof Error && RETRYABLE_SERVER_PARSE_FAILURE.test(err.message);
 }
 
-function formatOffloadForLog(offload: OffloadResult): string {
+function formatOffloadForLog(
+  offload: OffloadResult,
+  modelBufferSizes: ModelBufferSizesByModel | null | undefined
+): string {
   if (!offload.main) return "unknown (no offload line seen)";
-  const main = `main=${offload.main.gpu_layers_loaded}/${offload.main.total_model_layers}`;
-  const draft = offload.draft ? ` draft=${offload.draft.gpu_layers_loaded}/${offload.draft.total_model_layers}` : "";
+  const residentSuffix = (info: OffloadInfo | null | undefined, buffers: ModelBufferSizes | null | undefined): string => {
+    if (!info || info.gpu_layers_loaded <= 0 || !buffers) return "";
+    const resident = estimateResidentGpuLayersFromBufferSizes(info.gpu_layers_loaded, buffers.gpuMib, buffers.cpuMib);
+    if (resident == null || resident === info.gpu_layers_loaded) return "";
+    return `[~${resident}/${info.total_model_layers} resident]`;
+  };
+  const main = `main=${offload.main.gpu_layers_loaded}/${offload.main.total_model_layers}${residentSuffix(offload.main, modelBufferSizes?.main ?? null)}`;
+  const draft = offload.draft
+    ? ` draft=${offload.draft.gpu_layers_loaded}/${offload.draft.total_model_layers}${residentSuffix(offload.draft, modelBufferSizes?.draft ?? null)}`
+    : "";
   return `${main}${draft}`;
 }
 
@@ -687,9 +702,11 @@ export async function runServerBench(input: ServerBenchRunInput): Promise<BenchR
     // "(claimed)" -- same honesty rule as the llama-bench path's live line
     // (worker/src/index.ts's matchOffloadLine handler): llama.cpp's own
     // "offloaded X/Y" reflects buffer assignment only, never actual VRAM
-    // residency; this item's TEST SUMMARY annotates it with the verified
-    // figure once the sampler's telemetry is in.
-    log?.info(`${label}: offload: ${formatOffloadForLog(offload)} (claimed)`);
+    // residency. The post-allocation buffer report (modelBufferSizes) is
+    // already in hand here, so each model's actual-resident estimate is
+    // shown right next to the claim; the item's TEST SUMMARY annotates it
+    // further once the sampler's telemetry is in.
+    log?.info(`${label}: offload: ${formatOffloadForLog(offload, modelBufferSizes)} (claimed)`);
 
     const offsetStorePath = input.offsetStorePath ?? DEFAULT_OFFSET_STORE_PATH;
     const offsetKey = offsetStoreKey(input.modelPath, input.mtpModelPath);

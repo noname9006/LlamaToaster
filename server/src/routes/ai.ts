@@ -490,11 +490,11 @@ function resultsSummary(userId: string | undefined): string {
   const sorted = [...rows].sort((a, b) => b.created_at - a.created_at);
   const capped = sorted.slice(0, MAX_CONTEXT_RESULT_ROWS);
   const header =
-    "worker | backend | model | test | n_prompt | n_gen | threads | ngl (loaded/total) | batch | ubatch | ctk | ctv | fa | avg_tps | ram_peak_mib | vram_peak_mib | vram_total_mib";
+    "worker | backend | model | test | n_prompt | n_gen | threads | ngl (claimed/actual) | batch | ubatch | ctk | ctv | fa | avg_tps | ram_peak_mib | vram_peak_mib | vram_total_mib";
   const lines = capped.map(
     (r) =>
       `${r.worker_name} | ${r.backend_type}${r.backend_device_name ? ` (${r.backend_device_name})` : ""} | ${r.model_filename} | ${r.test_type} | ${r.n_prompt} | ${r.n_gen} | ${r.n_threads} | ` +
-      `${r.n_gpu_layers} (${r.gpu_layers_loaded ?? "?"}/${r.total_model_layers ?? "?"}) | ${r.batch_size} | ${r.ubatch_size} | ${r.cache_type_k} | ${r.cache_type_v} | ${formatFlashAttn(r.flash_attn)} | ` +
+      `${r.n_gpu_layers} (${r.gpu_layers_loaded ?? "?"}/${r.total_model_layers ?? "?"}${r.gpu_layers_resident_est != null ? `, ~${r.gpu_layers_resident_est} resident` : ""}) | ${r.batch_size} | ${r.ubatch_size} | ${r.cache_type_k} | ${r.cache_type_v} | ${formatFlashAttn(r.flash_attn)} | ` +
       `${r.avg_tps.toFixed(2)} | ${r.ram_peak_mib} | ${r.vram_peak_mib ?? "n/a"} | ${r.gpu_memory_total_mib ?? "n/a"}`
   );
   const scope = rows.length > capped.length ? `most recent ${capped.length} of ${rows.length} total` : `${rows.length} total`;
