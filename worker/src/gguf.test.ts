@@ -33,23 +33,41 @@ function kvBuffer([key, type, value]: Kv): Buffer {
   return Buffer.concat(parts);
 }
 
-// tensorCount is irrelevant to readGgufInfo (consumed only to advance the
-// cursor) -- always 0 here.
-function buildGguf(kvs: Kv[]): Buffer {
+// tensorCount is irrelevant to readGgufInfo's KV parsing (consumed only to
+// advance the cursor); the tensor_info walk below uses it to know how many
+// entries to read, and the test builder writes tensor infos only when the
+// caller supplies them.
+function buildGguf(
+  kvs: Kv[],
+  tensors: { name: string; dims: number[]; type?: number; offset?: number }[] = []
+): Buffer {
+  const tensorInfos = tensors.map((t) =>
+    Buffer.concat([
+      ggufString(t.name),
+      u32(t.dims.length),
+      ...t.dims.map(u64),
+      u32(t.type ?? 0),
+      u64(t.offset ?? 0),
+    ])
+  );
   return Buffer.concat([
     u32(0x46554747), // magic "GGUF"
     u32(3), // version
-    u64(0), // tensor_count
+    u64(tensors.length), // tensor_count
     u64(kvs.length), // kv_count
     ...kvs.map(kvBuffer),
+    ...tensorInfos,
   ]);
 }
 
 const tmpDir = mkdtempSync(join(tmpdir(), "llamatoaster-gguf-test-"));
 let counter = 0;
-function writeTempGguf(kvs: Kv[]): string {
+function writeTempGguf(
+  kvs: Kv[],
+  tensors: { name: string; dims: number[]; type?: number; offset?: number }[] = []
+): string {
   const path = join(tmpDir, `test-${counter++}.gguf`);
-  writeFileSync(path, buildGguf(kvs));
+  writeFileSync(path, buildGguf(kvs, tensors));
   return path;
 }
 
@@ -116,6 +134,53 @@ describe("readGgufInfo", () => {
       ["gemma3.block_count", T.UINT32, 4],
     ]);
     const info = await readGgufInfo(path);
+    expect(info.quant).toBeNull();
+  });
+
+  // The tensor_info section directly follows the KV metadata (there is NO
+  // tensor_info_count field -- reading one as an earlier implementation did
+  // misaligned the whole walk, consuming the first tensor's name-length as a
+  // count). param_count is the sum of product(dims) over every tensor, and
+  // must be per-file rather than the repo-level guess HF's own API reports.
+  it("computes param_count as the total element count across every tensor", async () => {
+    const path = writeTempGguf(
+      [
+        ["general.architecture", T.STRING, "qwen35"],
+        ["general.file_type", T.UINT32, 12], // LLAMA_FTYPE_MOSTLY_Q3_K_M
+        ["qwen35.block_count", T.UINT32, 32],
+      ],
+      [
+        { name: "token_embd.weight", dims: [16, 1000] }, // 16_000
+        { name: "blk.0.attn_q.weight", dims: [16, 16] }, // 256
+        { name: "output.weight", dims: [16, 1000] }, // 16_000
+      ]
+    );
+    const info = await readGgufInfo(path);
+    expect(info.param_count).toBe(16_000 + 256 + 16_000);
+    expect(info.quant).toBe("Q3_K_M");
+    expect(info.n_layer).toBe(32);
+  });
+
+  it("returns null param_count when the tensor_info walk runs off the end of the file", async () => {
+    // tensor_count advertises 2 tensors but only 1 is written -- the walk
+    // throws on the second, and must leave the already-resolved fields intact
+    // rather than wiping them (param_count is best-effort, isolated from the
+    // KV parsing).
+    const path = writeTempGguf(
+      [
+        ["general.architecture", T.STRING, "qwen35"],
+        ["qwen35.block_count", T.UINT32, 32],
+      ],
+      [{ name: "token_embd.weight", dims: [16, 1000] }]
+    );
+    // Overwrite tensor_count to 2 in the header (bytes 8..16).
+    const data = Buffer.from(await import("node:fs/promises").then((m) => m.readFile(path)));
+    u64(2).copy(data, 8);
+    await import("node:fs/promises").then((m) => m.writeFile(path, data));
+
+    const info = await readGgufInfo(path);
+    expect(info.param_count).toBeNull();
+    expect(info.n_layer).toBe(32);
     expect(info.quant).toBeNull();
   });
 

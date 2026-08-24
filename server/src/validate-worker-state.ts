@@ -110,9 +110,7 @@ function parseInstalledBuilds(value: unknown): InstalledBuild[] {
     });
 }
 
-function parseModelFiles(
-  value: unknown
-): (ModelDirFile & { n_layer?: number | null; mtp_layers?: number | null })[] {
+function parseModelFiles(value: unknown): ModelDirFile[] {
   return requireArray(value, "model_files")
     .slice(0, LIMITS.maxModelFiles)
     .map((f, i) => {
@@ -150,11 +148,26 @@ function parseModelFiles(
         };
       }
 
+      // Per-file GGUF header metadata (see ModelDirFile's doc comments and
+      // worker/src/gguf.ts's readGgufInfo). Each field is included ONLY when
+      // the worker actually reported a value -- "checked and got null" is
+      // deliberately indistinguishable from "never reported" here, so the
+      // catalog-adoption code (routes/queue.ts) can tell "a real value to
+      // store" from "nothing to store" without a second presence flag.
+      const nLayer = optionalNumber(row.n_layer, `model_files[${i}].n_layer`);
+      const mtpLayers = optionalNumber(row.mtp_layers, `model_files[${i}].mtp_layers`);
+      const expertCount = optionalNumber(row.expert_count, `model_files[${i}].expert_count`);
+      const paramCount = optionalNumber(row.param_count, `model_files[${i}].param_count`);
+      const quant = optionalString(row.quant, `model_files[${i}].quant`, 32);
+
       return {
         path: sanitizeString(row.path, `model_files[${i}].path`),
         size_bytes: requireNumber(row.size_bytes, `model_files[${i}].size_bytes`),
-        n_layer: optionalNumber(row.n_layer, `model_files[${i}].n_layer`) ?? null,
-        mtp_layers: optionalNumber(row.mtp_layers, `model_files[${i}].mtp_layers`) ?? null,
+        ...(nLayer != null ? { n_layer: nLayer } : {}),
+        ...(mtpLayers != null ? { mtp_layers: mtpLayers } : {}),
+        ...(expertCount != null ? { expert_count: expertCount } : {}),
+        ...(paramCount != null ? { param_count: paramCount } : {}),
+        ...(quant != null ? { quant } : {}),
         ...(rawSha != null ? { sha256: rawSha.toLowerCase() } : {}),
         ...(state != null ? { state: state as ModelDirFile["state"] } : {}),
         hf_match,

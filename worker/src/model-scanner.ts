@@ -6,6 +6,7 @@ import { pipeline } from "node:stream/promises";
 import { Readable, Transform } from "node:stream";
 import { log } from "./log.js";
 import { LocalModelCache, type LocalCacheEntry } from "./local-cache.js";
+import { readGgufInfo } from "./gguf.js";
 import type { ModelDirFile, LocalModelState } from "../../shared/types.js";
 
 // How often an already-matched entry gets re-verified against the server
@@ -17,6 +18,15 @@ const HF_MATCH_RECHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
 function isHfCheckStale(checkedAt: number | undefined): boolean {
   return checkedAt == null || Date.now() - checkedAt > HF_MATCH_RECHECK_INTERVAL_MS;
+}
+
+// Same staleness window as HF matching (a GGUF header read is a one-time
+// cost per file; only a file whose header came back empty/unreadable is worth
+// re-attempting, and not on every single reconciliation).
+const GGUF_RECHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
+
+function isGgufCheckStale(checkedAt: number | undefined): boolean {
+  return checkedAt == null || Date.now() - checkedAt > GGUF_RECHECK_INTERVAL_MS;
 }
 
 interface ScannedFile {
@@ -393,6 +403,39 @@ export async function resolveHfMetadata(
 }
 
 /**
+ * One-time per-file GGUF header read, backfilling n_layer/mtp_layers/
+ * expert_count/quant/param_count onto each cache entry (see
+ * worker/src/gguf.ts's readGgufInfo). Gated on a staleness window so a
+ * header that came back empty (unreadable/corrupt file) isn't re-read on
+ * every reconciliation, and so a real model's header gets a fresh look at
+ * most once a day -- not because it's likely to change, but so a file
+ * replaced in place (new bytes, same path, e.g. a re-download) doesn't keep
+ * stale metadata forever.
+ */
+export async function backfillGgufMetadata(modelDir: string, cache: LocalModelCache): Promise<void> {
+  const entries = await cache.getAll();
+  for (const entry of entries) {
+    if (!isGgufCheckStale(entry.gguf_checked_at)) continue;
+    const fullPath = resolve(modelDir, entry.path);
+    if (!existsSync(fullPath)) continue;
+    const info = await readGgufInfo(fullPath);
+    await cache.upsert({
+      ...entry,
+      n_layer: info.n_layer ?? entry.n_layer,
+      mtp_layers: info.mtp_layers ?? entry.mtp_layers,
+      expert_count: info.expert_count ?? entry.expert_count,
+      quant: info.quant ?? entry.quant,
+      param_count: info.param_count ?? entry.param_count,
+      gguf_checked_at: Date.now(),
+      last_verified: entry.last_verified,
+    });
+    if (info.debugReason) {
+      log.warn(`[model-scan] GGUF metadata for ${entry.path} incomplete: ${info.debugReason}`);
+    }
+  }
+}
+
+/**
  * Full startup reconciliation flow
  * Scans, validates cache, hashes new/modified files, resolves HF metadata
  */
@@ -505,6 +548,13 @@ export async function runStartupReconciliation(
   // Step 5: Resolve HF metadata for all hashed files
   await resolveHfMetadata(cache, apiBaseUrl, authToken);
 
+  // Step 5b: Read each file's GGUF header once (n_layer/quant/param_count/
+  // ...) into the cache, so a file dropped into model_dir by hand gets the
+  // same per-file metadata a download reports to the server's catalog --
+  // without this its Models-page badge shows "?" for quant and a filename-
+  // guess (or HF's repo-level, possibly-wrong value) for params.
+  await backfillGgufMetadata(modelDir, cache);
+
   // Count results
   const finalEntries = await cache.getAll();
   const hashed = finalEntries.filter((e) => e.sha256 && (scanResult.newFiles.some((f) => f.path === e.path) || scanResult.modifiedFiles.some((f) => f.path === e.path))).length;
@@ -605,12 +655,27 @@ export async function getModelFilesWithState(
       currentState = "modified";
     }
 
+    // GGUF header metadata rides along so the server can adopt it for a
+    // hand-dropped (never-downloaded) file -- see backfillGgufMetadata. Only
+    // fields with a real value are sent; absent fields stay absent so the
+    // server can distinguish "checked, was null" from "not checked at all".
+    const ggufFields: Pick<
+      ModelDirFile,
+      "n_layer" | "mtp_layers" | "expert_count" | "quant" | "param_count"
+    > = {};
+    if (entry.n_layer != null) ggufFields.n_layer = entry.n_layer;
+    if (entry.mtp_layers != null) ggufFields.mtp_layers = entry.mtp_layers;
+    if (entry.expert_count != null) ggufFields.expert_count = entry.expert_count;
+    if (entry.quant != null) ggufFields.quant = entry.quant;
+    if (entry.param_count != null) ggufFields.param_count = entry.param_count;
+
     results.push({
       path: entry.path,
       size_bytes: stat.size,
       sha256: entry.sha256,
       state: currentState,
       hf_match: buildHfMatch(entry),
+      ...ggufFields,
     });
   }
 

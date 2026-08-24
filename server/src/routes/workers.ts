@@ -392,7 +392,7 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
         app.log.warn({ error: validationError }, "model download callback rejected: invalid payload");
         return reply.code(400).send({ error: validationError });
       }
-      const { worker, hf_repo, hf_file, ok, error, sha256, size_bytes, n_layer, mtp_layers, expert_count, quant } =
+      const { worker, hf_repo, hf_file, ok, error, sha256, size_bytes, n_layer, mtp_layers, expert_count, quant, param_count } =
         request.body;
       if (!ok) {
         app.log.error({ worker, hf_repo, hf_file, error }, "model download failed");
@@ -406,10 +406,18 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
         // own metadata so it can be persisted, but every *read* site
         // recomputes it live from stored metadata too rather than trusting
         // this stored flag alone.
-        const { param_count } = await getHfGgufMeta(hf_repo, WORKER_READ_TIMEOUT_MS);
+        // param_count from the worker is the file's own tensor_info total --
+        // per-file and authoritative (a multi-model repo's HF gguf.total is
+        // one file's count for the whole repo, observed wrong live). Only
+        // fall back to the HF repo-level lookup when the worker couldn't
+        // read a count (non-standard/corrupt file, or an old worker that
+        // never sends it).
+        const { param_count: hfParamCount } =
+          typeof param_count === "number" ? { param_count: null } : await getHfGgufMeta(hf_repo, WORKER_READ_TIMEOUT_MS);
+        const resolvedParamCount = typeof param_count === "number" ? param_count : hfParamCount;
         const metadata: ModelMetadata = {
           ...(typeof n_layer === "number" ? { n_layer } : {}),
-          ...(typeof param_count === "number" ? { param_count } : {}),
+          ...(typeof resolvedParamCount === "number" ? { param_count: resolvedParamCount } : {}),
           ...(typeof mtp_layers === "number" && mtp_layers > 0 ? { mtp_layers } : {}),
           ...(typeof expert_count === "number" && expert_count > 0 ? { expert_count } : {}),
           ...(typeof quant === "string" && quant ? { quant } : {}),
@@ -424,7 +432,7 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
             hf_file,
             size_bytes,
             n_layer,
-            param_count,
+            param_count: resolvedParamCount,
             mtp_layers,
             expert_count,
             quant,
