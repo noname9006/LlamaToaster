@@ -288,6 +288,31 @@ async function readNvidiaSmiProcessUsed(pid: number): Promise<number | null> {
   }
 }
 
+export interface NvidiaDriverInfo {
+  driverVersion: string;
+  // The maximum CUDA version this DRIVER supports -- not the CUDA runtime
+  // version the llama.cpp binary was built against (that side shows up in
+  // the process's own stderr, see bench.ts's extractCudaDiagnosticLines).
+  // Juxtaposing both is how a too-old-driver-for-this-build mismatch gets
+  // ruled in/out from the log alone.
+  cudaVersion: string;
+}
+
+// Plain `nvidia-smi` (no args) banner, e.g.
+//   | NVIDIA-SMI 566.36       Driver Version: 566.36       CUDA Version: 12.7 |
+// parsed for exactly those two figures. Best-effort diagnostics for the
+// VRAM-discrepancy postmortem -- null whenever nvidia-smi is missing/fails
+// (non-NVIDIA worker) or the banner shape ever changes.
+export async function readNvidiaDriverInfo(): Promise<NvidiaDriverInfo | null> {
+  try {
+    const { stdout } = await execFileAsync("nvidia-smi", [], { timeout: EXEC_TIMEOUT_MS });
+    const m = /Driver Version:\s*(\S+)\s+CUDA Version:\s*(\S+)/.exec(stdout);
+    return m ? { driverVersion: m[1], cudaVersion: m[2] } : null;
+  } catch {
+    return null;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // ROCm: deliberately no process-specific reading attempted (see the plan's
 // "Deviations from the literal spec" -- unlike NVML's --query-compute-apps,

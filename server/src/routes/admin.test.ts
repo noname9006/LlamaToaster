@@ -295,6 +295,42 @@ describe("admin settings (AppSettings toggles)", () => {
     expect(res.status).toBe(400);
   });
 
+  it("workerVramDiscrepancyPolicy defaults to warn and persists an accepted value", async () => {
+    const adminToken = await superadminSession();
+    const headers = { "content-type": "application/json", ...withHost(ADMIN_HOST, { authorization: `Bearer ${adminToken}` }) };
+
+    const res1 = await fetch(`${baseUrl}/api/admin/settings`, { headers: withHost(ADMIN_HOST, { authorization: `Bearer ${adminToken}` }) });
+    expect(res1.status).toBe(200);
+    // Fresh DB -- the documented default is the shipped v1 behavior.
+    expect(((await res1.json()) as { workerVramDiscrepancyPolicy?: string }).workerVramDiscrepancyPolicy ?? "warn").toBe("warn");
+
+    const res2 = await fetch(`${baseUrl}/api/admin/settings`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ workerVramDiscrepancyPolicy: "retry_once_then_fail" }),
+    });
+    expect(res2.status).toBe(200);
+    const body2 = (await res2.json()) as { workerVramDiscrepancyPolicy: string };
+    expect(body2.workerVramDiscrepancyPolicy).toBe("retry_once_then_fail");
+
+    // Restore the default for later tests in this file/process.
+    await fetch(`${baseUrl}/api/admin/settings`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ workerVramDiscrepancyPolicy: "warn" }),
+    });
+  });
+
+  it("400s a policy value outside the whitelist instead of storing it", async () => {
+    const adminToken = await superadminSession();
+    const res = await fetch(`${baseUrl}/api/admin/settings`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...withHost(ADMIN_HOST, { authorization: `Bearer ${adminToken}` }) },
+      body: JSON.stringify({ workerVramDiscrepancyPolicy: "yolo" }),
+    });
+    expect(res.status).toBe(400);
+  });
+
   it("404s on the main hostname, same as every other admin route", async () => {
     const adminToken = await superadminSession();
     const res = await fetch(`${baseUrl}/api/admin/settings`, { headers: withHost(MAIN_HOST, { authorization: `Bearer ${adminToken}` }) });

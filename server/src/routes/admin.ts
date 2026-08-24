@@ -4,7 +4,7 @@ import { resolveAuthUser } from "../auth-middleware.js";
 import type { AuthenticatedRequest } from "../auth-middleware.js";
 import { NotFoundError, ForbiddenError } from "../errors.js";
 import { loadExportRows, formatResultsExport } from "./results.js";
-import type { AdminRunFilters, AppSettings } from "../../../shared/types.js";
+import { isVramDiscrepancyPolicy, type AdminRunFilters, type AppSettings } from "../../../shared/types.js";
 
 // Multi-user Stage 5 (MULTIUSER_PLAN.md §5.1): the ONLY cross-tenant read
 // surface in this app, reachable exclusively from its own origin --
@@ -77,11 +77,17 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
     if (body.accountDeletionAllowed !== undefined && typeof body.accountDeletionAllowed !== "boolean") {
       return reply.code(400).send({ error: "accountDeletionAllowed must be a boolean" });
     }
+    if (body.workerVramDiscrepancyPolicy !== undefined && !isVramDiscrepancyPolicy(body.workerVramDiscrepancyPolicy)) {
+      return reply.code(400).send({ error: "workerVramDiscrepancyPolicy must be one of: warn, retry_once_then_fail, fail" });
+    }
     if (body.communitySharingAllowed !== undefined) {
       repo.appSettingsRepo.setCommunitySharingAllowed(body.communitySharingAllowed);
     }
     if (body.accountDeletionAllowed !== undefined) {
       repo.appSettingsRepo.setAccountDeletionAllowed(body.accountDeletionAllowed);
+    }
+    if (body.workerVramDiscrepancyPolicy !== undefined) {
+      repo.appSettingsRepo.setWorkerVramDiscrepancyPolicy(body.workerVramDiscrepancyPolicy);
     }
     return repo.appSettingsRepo.get();
   });

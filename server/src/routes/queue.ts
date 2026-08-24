@@ -226,7 +226,17 @@ export async function queueRoutes(app: FastifyInstance): Promise<void> {
           if (flags.discard_requested) control.discard_job_ids.push(report.job_id);
         }
       }
-      return { worker_id: worker.id, control, lease_until: Date.now() + LEASE_MS };
+      // Operator-controlled settings ride along on every beat (see
+      // HeartbeatResponse.app_settings) -- the heartbeat cadence doubles as
+      // the settings-propagation channel, so flipping a policy on the
+      // supervise dashboard reaches an already-running worker within one
+      // interval without any restart.
+      return {
+        worker_id: worker.id,
+        control,
+        lease_until: Date.now() + LEASE_MS,
+        app_settings: repo.appSettingsRepo.get(),
+      };
     }
   );
 

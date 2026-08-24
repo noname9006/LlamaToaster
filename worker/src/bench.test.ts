@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseModelBufferSizes } from "./bench.js";
+import { parseModelBufferSizes, extractCudaDiagnosticLines, MAX_CUDA_DIAGNOSTIC_LINES } from "./bench.js";
 
 describe("parseModelBufferSizes", () => {
   it("returns null when the line was never seen at all (older build, or failed pre-load)", () => {
@@ -94,5 +94,62 @@ describe("parseModelBufferSizes", () => {
       main: { gpuMib: 1290.62, cpuMib: 1756 },
       draft: null,
     });
+  });
+});
+
+describe("extractCudaDiagnosticLines", () => {
+  it("pulls device enumeration, claim, buffer split and allocation failures from realistic stderr while skipping per-tensor noise", () => {
+    const stderr = [
+      "ggml_cuda_init: GGML_CUDA_FORCE_MMQ:   no",
+      "ggml_cuda_init: found 1 CUDA devices:",
+      "  Device 0: NVIDIA GeForce RTX 3090, compute capability (8, 6), VMM: yes",
+      "load_tensors: tensor 'blk.0.attn_q.weight' loaded in 1.23 ms", // noise
+      "load_tensors: offloaded 43/43 layers to GPU",
+      "load_tensors:   CPU_Mapped model buffer size = 14341.00 MiB",
+      "llm_layer_count: 42", // noise
+      "ggml_backend_cuda_buffer_type_alloc_buffer: failed to allocate 14868.00 MiB on device 0: out of memory",
+    ].join("\n");
+    expect(extractCudaDiagnosticLines(stderr)).toEqual([
+      "ggml_cuda_init: GGML_CUDA_FORCE_MMQ:   no",
+      "ggml_cuda_init: found 1 CUDA devices:",
+      "Device 0: NVIDIA GeForce RTX 3090, compute capability (8, 6), VMM: yes",
+      "load_tensors: offloaded 43/43 layers to GPU",
+      "load_tensors:   CPU_Mapped model buffer size = 14341.00 MiB",
+      "ggml_backend_cuda_buffer_type_alloc_buffer: failed to allocate 14868.00 MiB on device 0: out of memory",
+    ]);
+  });
+
+  it("matches llama-server's logger-prefixed diagnostic lines too", () => {
+    const stderr = [
+      "0.02.100 I ggml_cuda_init: found 1 CUDA devices:",
+      "0.02.101 I load_tensors: offloaded 5/5 layers to GPU",
+    ].join("\n");
+    expect(extractCudaDiagnosticLines(stderr)).toEqual([
+      "0.02.100 I ggml_cuda_init: found 1 CUDA devices:",
+      "0.02.101 I load_tensors: offloaded 5/5 layers to GPU",
+    ]);
+  });
+
+  it("returns nothing for a clean transcript with no matching lines", () => {
+    expect(extractCudaDiagnosticLines("some unrelated line\nanother one\n")).toEqual([]);
+    expect(extractCudaDiagnosticLines("")).toEqual([]);
+  });
+
+  it("caps output with an elision marker when over the limit", () => {
+    const stderr = Array.from({ length: MAX_CUDA_DIAGNOSTIC_LINES + 4 }, (_, i) => `ggml_cuda_init: line ${i}`).join("\n");
+    const result = extractCudaDiagnosticLines(stderr);
+    expect(result).toHaveLength(MAX_CUDA_DIAGNOSTIC_LINES + 1);
+    expect(result[MAX_CUDA_DIAGNOSTIC_LINES]).toBe(
+      "…[4 more diagnostic lines elided -- see the raw JSON dump]"
+    );
+  });
+
+  it("catches host-fallback wording and CUDA API names", () => {
+    const stderr = [
+      "load_tensors: falling back to CPU buffer for blk.0",
+      "cudaMalloc failed: unspecified driver error",
+      "cuMemCreate returned CUDA_ERROR_OUT_OF_MEMORY",
+    ].join("\n");
+    expect(extractCudaDiagnosticLines(stderr)).toEqual(stderr.split("\n"));
   });
 });

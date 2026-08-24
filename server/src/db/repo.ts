@@ -36,7 +36,9 @@ import type {
   PossibleDuplicateWorker,
   HardwareInfo,
   AppSettings,
+  VramDiscrepancyPolicy,
 } from "../../../shared/types.js";
+import { isVramDiscrepancyPolicy } from "../../../shared/types.js";
 import type { SweepItem } from "../../../shared/sweep.js";
 
 interface ModelRow {
@@ -2548,18 +2550,22 @@ export const repo = {
   },
 
   // Operator-controlled feature gates -- see shared/types.ts's AppSettings
-  // doc comment for what each flag does. Backed by the `meta` key-value
-  // table (schema.sql) rather than a dedicated table: there are only ever
-  // these two flags, and `meta` already exists for exactly this kind of
-  // single-row/small-key-count setting.
+  // doc comment for what each field does. Backed by the `meta` key-value
+  // table (schema.sql) rather than a dedicated table: a handful of
+  // single-row/small-key-count settings, and `meta` already exists for
+  // exactly this kind of thing.
   appSettingsRepo: {
     get(): AppSettings {
       const db = getDb();
       const read = (key: string): string | undefined =>
         (db.prepare(`SELECT value FROM meta WHERE key = ?`).get(key) as { value: string } | undefined)?.value;
+      const rawPolicy = read("worker_vram_discrepancy_policy");
       return {
         communitySharingAllowed: read("community_sharing_allowed") === "1",
         accountDeletionAllowed: read("account_deletion_allowed") !== "0",
+        workerVramDiscrepancyPolicy: isVramDiscrepancyPolicy(rawPolicy)
+          ? rawPolicy
+          : "warn", // documented default -- the shipped v1 record-with-warning behavior
       };
     },
 
@@ -2580,6 +2586,16 @@ export const repo = {
            ON CONFLICT(key) DO UPDATE SET value = excluded.value`
         )
         .run(allowed ? "1" : "0");
+      return repo.appSettingsRepo.get();
+    },
+
+    setWorkerVramDiscrepancyPolicy(policy: VramDiscrepancyPolicy): AppSettings {
+      getDb()
+        .prepare(
+          `INSERT INTO meta (key, value) VALUES ('worker_vram_discrepancy_policy', ?)
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value`
+        )
+        .run(policy);
       return repo.appSettingsRepo.get();
     },
   },
