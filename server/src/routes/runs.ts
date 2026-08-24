@@ -195,6 +195,53 @@ function validateIngestResult(value: unknown): string | null {
       return `${field} must be one of ${GPU_MEMORY_MEASUREMENT_SOURCES.join("/")} or null`;
     }
   }
+  // Whole-adapter/per-process VRAM usage + whole-system RAM usage avg/peak
+  // -- all optional (an older worker that predates these fields won't send
+  // them) and nullable (a stream the backend couldn't measure), same
+  // version-skew posture as n_gpu_layers_draft/n_cpu_moe above.
+  for (const field of [
+    "gpu_memory_used_avg_mib",
+    "gpu_memory_used_peak_mib",
+    "gpu_memory_process_avg_mib",
+    "gpu_memory_process_peak_mib",
+    "ram_total_used_avg_mib",
+    "ram_total_used_peak_mib",
+  ] as const) {
+    if (
+      row[field] !== undefined &&
+      row[field] !== null &&
+      (typeof row[field] !== "number" || !Number.isFinite(row[field] as number))
+    ) {
+      return `${field} must be a number, null, or absent`;
+    }
+  }
+  for (const field of [
+    "gpu_memory_used_avg_accuracy",
+    "gpu_memory_used_peak_accuracy",
+    "gpu_memory_process_avg_accuracy",
+    "gpu_memory_process_peak_accuracy",
+  ] as const) {
+    if (
+      row[field] !== undefined &&
+      !GPU_MEMORY_ACCURACY_LEVELS.includes(row[field] as (typeof GPU_MEMORY_ACCURACY_LEVELS)[number])
+    ) {
+      return `${field} must be one of ${GPU_MEMORY_ACCURACY_LEVELS.join("/")} or absent`;
+    }
+  }
+  for (const field of [
+    "gpu_memory_used_avg_source",
+    "gpu_memory_used_peak_source",
+    "gpu_memory_process_avg_source",
+    "gpu_memory_process_peak_source",
+  ] as const) {
+    if (
+      row[field] !== undefined &&
+      row[field] !== null &&
+      !GPU_MEMORY_MEASUREMENT_SOURCES.includes(row[field] as (typeof GPU_MEMORY_MEASUREMENT_SOURCES)[number])
+    ) {
+      return `${field} must be one of ${GPU_MEMORY_MEASUREMENT_SOURCES.join("/")}, null, or absent`;
+    }
+  }
   return null;
 }
 

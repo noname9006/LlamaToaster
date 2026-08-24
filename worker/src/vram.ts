@@ -37,8 +37,21 @@ export interface GpuMemoryValue {
 }
 
 export interface GpuMemoryReading {
+  // Capacity (whole adapter).
   total: GpuMemoryValue;
+  // Whole-adapter usage -- every process on the GPU combined (the desktop,
+  // other apps, this benchmark), never process-isolated.
   used: GpuMemoryValue;
+  // This worker's own benchmark child process's usage -- only present on
+  // backends/platforms with a per-process reading (nvidia-smi compute-apps,
+  // Windows' WDDM "GPU Process Memory" counter, rocm-smi --showpids /
+  // amdgpu fdinfo), and only once a pid exists AND the driver has caught up
+  // to that process's allocations. Absent = "no per-process reading
+  // available" (which is different from a measured 0, and is why this is an
+  // optional field rather than a nullable one: a fallback that silently
+  // reports the whole adapter as "the process's usage" is exactly the
+  // mislabeling the accuracy/source fields exist to prevent).
+  process?: GpuMemoryValue;
 }
 
 function unavailable(): GpuMemoryValue {
@@ -59,7 +72,10 @@ const UNAVAILABLE_READING: GpuMemoryReading = { total: unavailable(), used: unav
 // the spawned llama-bench/llama-server child's pid when known (the interval
 // sampler has one; the pre-spawn baseline capture never does, since the
 // process doesn't exist yet -- which is exactly why free_start can never be
-// "exact"/process_gpu_usage for any backend, only model_avg/model_peak can).
+// "exact"/process_gpu_usage for any backend, only the per-process reading
+// below can). Every backend returns `used` (whole adapter) unconditionally
+// when measurable; `process` is only ever present when a pid was given AND
+// the driver exposes per-process accounting for it.
 export async function readGpuMemory(backend: Backend, pid: number | undefined): Promise<GpuMemoryReading> {
   try {
     // No subprocess call at all on the cpu backend -- both correctness (the
@@ -67,9 +83,19 @@ export async function readGpuMemory(backend: Backend, pid: number | undefined): 
     // Windows PDH cost (see readGenericGpuMemory below) on every CPU item.
     if (backend === "cpu") return UNAVAILABLE_READING;
     if (backend === "cuda") return await readCudaGpuMemory(pid);
-    if (backend === "rocm") return await readRocmGpuMemory();
+    // ROCm collection (rocm-smi CLI, amdgpu sysfs) is Linux-only -- neither
+    // exists on a Windows box running a win-rocm/win-hip llama.cpp build
+    // (the HIP SDK/TheRock tarball ships no rocm-smi; /sys/class/drm is a
+    // Linux path), so every probe silently returned "unavailable" there and
+    // the UI showed n/a for all VRAM columns. Route win32 through the same
+    // vendor-agnostic WDDM "GPU Adapter Memory" counter the vulkan/generic
+    // path uses -- confirmed live against a Radeon RX 6600 XT on Windows --
+    // rather than letting the ROCm-only probes dead-end.
+    if (backend === "rocm") {
+      return osPlatform() === "win32" ? await readGenericGpuMemory(pid) : await readRocmGpuMemory(pid);
+    }
     if (backend === "metal" || osPlatform() === "darwin") return await readDarwinGpuMemory();
-    return await readGenericGpuMemory();
+    return await readGenericGpuMemory(pid);
   } catch {
     return UNAVAILABLE_READING;
   }
@@ -98,14 +124,22 @@ const NULL_SAMPLE: VramSample = { totalMib: null, usedMib: null };
 // which this environment can't implement (no native-addon compilation
 // available) and which was never actually built -- what runs here is a
 // genuine driver counter, a real reading, not a budget heuristic.
-async function readGenericGpuMemory(): Promise<GpuMemoryReading> {
+async function readGenericGpuMemory(pid: number | undefined): Promise<GpuMemoryReading> {
   const plat = osPlatform();
   let sample: VramSample = NULL_SAMPLE;
-  if (plat === "win32") sample = await readWindowsVram();
-  else if (plat === "linux") sample = await readLinuxVram();
+  let processReading: GpuMemoryValue | undefined;
+  if (plat === "win32") {
+    const w = await readWindowsVram(pid);
+    sample = w.sample;
+    if (w.processMib != null) processReading = reading(w.processMib, "exact", "process_gpu_usage");
+  } else if (plat === "linux") {
+    sample = await readLinuxVram();
+    if (pid != null) processReading = (await readLinuxProcessVram(pid)) ?? undefined;
+  }
   return {
     total: reading(sample.totalMib, "high", "driver_reported_memory"),
     used: reading(sample.usedMib, "high", "driver_reported_memory"),
+    ...(processReading ? { process: processReading } : {}),
   };
 }
 
@@ -119,9 +153,11 @@ async function readGenericGpuMemory(): Promise<GpuMemoryReading> {
 // a worker process's lifetime.
 let cachedWindowsTotalMib: number | null | undefined;
 
-async function readWindowsVram(): Promise<VramSample> {
-  const [totalMib, usedMib] = await Promise.all([readWindowsTotalMib(), readWindowsUsedMib()]);
-  return { totalMib, usedMib };
+async function readWindowsVram(
+  pid: number | undefined
+): Promise<{ sample: VramSample; processMib: number | null }> {
+  const [totalMib, usedAndProcess] = await Promise.all([readWindowsTotalMib(), readWindowsUsedMib(pid)]);
+  return { sample: { totalMib, usedMib: usedAndProcess.usedMib }, processMib: usedAndProcess.processMib };
 }
 
 async function readWindowsTotalMib(): Promise<number | null> {
@@ -140,24 +176,46 @@ async function readWindowsTotalMib(): Promise<number | null> {
   return cachedWindowsTotalMib;
 }
 
-async function readWindowsUsedMib(): Promise<number | null> {
+function parseMiB(raw: string | undefined): number | null {
+  const bytes = Number(raw?.trim());
+  return Number.isFinite(bytes) && bytes > 0 ? Math.round(bytes / BYTES_PER_MIB) : null;
+}
+
+// One powershell.exe spawn for BOTH readings (each Get-Counter call pays the
+// same ~1-1.5s PDH cold-start cost, so two separate spawns would double it):
+//   1. the whole-adapter "GPU Adapter Memory" Dedicated Usage sum (used),
+//   2. the per-process "GPU Process Memory" Dedicated Usage for the spawned
+//      child's pid -- the same VidMm data Task Manager's per-process "GPU
+//      memory" column reads. The counter instances are named
+//      `pid_<pid>_luid_0x..._phys_<n>` (one per memory segment), so the
+//      wildcard matches and Measure-Object sums them. Caveats: the instance
+//      only exists while the process actually holds GPU allocations (a
+//      freshly-spawned llama-bench may not have one yet -- fine, the sampler
+//      just falls back to the whole-adapter reading that tick), and
+//      "Dedicated Usage" is VidMm's *committed* accounting (what the driver
+//      charged the process), not hardware residency -- same semantics as
+//      nvidia-smi's per-process used_memory.
+async function readWindowsUsedMib(pid: number | undefined): Promise<{ usedMib: number | null; processMib: number | null }> {
   try {
-    const { stdout } = await execFileAsync(
-      "powershell.exe",
-      [
-        "-NoProfile",
-        "-NonInteractive",
-        "-Command",
-        "(Get-Counter '\\GPU Adapter Memory(*)\\Dedicated Usage' -ErrorAction Stop).CounterSamples | " +
-          "Measure-Object -Property CookedValue -Sum | Select-Object -ExpandProperty Sum",
-      ],
-      { timeout: EXEC_TIMEOUT_MS, windowsHide: true }
-    );
-    const bytes = Number(stdout.trim());
-    return Number.isFinite(bytes) ? Math.round(bytes / BYTES_PER_MIB) : null;
+    const lines = [
+      `$u = (Get-Counter '\\GPU Adapter Memory(*)\\Dedicated Usage' -ErrorAction SilentlyContinue).CounterSamples | Measure-Object -Property CookedValue -Sum | Select-Object -ExpandProperty Sum`,
+      pid != null
+        ? `$p = (Get-Counter '\\GPU Process Memory(pid_${pid}*)\\Dedicated Usage' -ErrorAction SilentlyContinue).CounterSamples | Measure-Object -Property CookedValue -Sum | Select-Object -ExpandProperty Sum`
+        : null,
+      `Write-Output $u`,
+      pid != null ? `Write-Output $p` : null,
+    ].filter(Boolean);
+    const { stdout } = await execFileAsync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", lines.join("; ")], {
+      timeout: EXEC_TIMEOUT_MS,
+      windowsHide: true,
+    });
+    // Two lines, one per Write-Output -- the second is blank when the pid
+    // has no GPU Process Memory instance yet (or pid-less runs).
+    const [usedRaw, processRaw] = stdout.trim().split("\n");
+    return { usedMib: parseMiB(usedRaw), processMib: pid != null ? parseMiB(processRaw) : null };
   } catch {
     // No counter provider, no GPU, or the call timed out -- best-effort.
-    return null;
+    return { usedMib: null, processMib: null };
   }
 }
 
@@ -201,8 +259,55 @@ async function readNvidiaSmiVram(): Promise<VramSample | null> {
   }
 }
 
+// Per-process VRAM on Linux, vendor-agnostic (used by the generic/vulkan
+// path, where the box can be NVIDIA or AMD): nvidia-smi's own per-process
+// compute-apps accounting first (identical mechanism to the cuda backend),
+// then amdgpu's /proc/<pid>/fdinfo drm-memory-vram entries (the standard DRM
+// fdinfo interface -- what amdgpu_top's per-process mode reads; works with
+// just the stock amdgpu kernel driver, no ROCm install needed). Null when
+// neither vendor's source knows the process.
+async function readLinuxProcessVram(pid: number): Promise<GpuMemoryValue | null> {
+  const nvidiaMib = await readNvidiaSmiProcessUsed(pid);
+  if (nvidiaMib != null) return reading(nvidiaMib, "exact", "process_gpu_usage");
+  const amd = await readAmdgpuFdinfoVram(pid);
+  if (amd) return amd;
+  return null;
+}
+
 const DRM_CARD_DIR = "/sys/class/drm";
 const CARD_DIR_RE = /^card\d+$/;
+
+// Per-process VRAM via amdgpu's fdinfo accounting: every fd open on a DRM
+// render node gets a `drm-memory-vram: <bytes>` line in /proc/<pid>/fdinfo,
+// summed across fds -- same data amdgpu_top's per-process mode reads. Works
+// on a stock kernel/amdgpu driver with no ROCm install at all (matching the
+// sysfs fallback above for the whole-adapter side). Returns null when the
+// process has no GPU fds or none of the entries are readable -- a process
+// that never touched the GPU reports nothing, not 0.
+async function readAmdgpuFdinfoVram(pid: number): Promise<GpuMemoryValue | null> {
+  try {
+    const fdinfoDir = `/proc/${pid}/fdinfo`;
+    const entries = await readdir(fdinfoDir);
+    let totalBytes = 0;
+    for (const entry of entries) {
+      let content: string;
+      try {
+        content = await readFile(`${fdinfoDir}/${entry}`, "utf8");
+      } catch {
+        // fd closed between readdir and read -- skip it.
+        continue;
+      }
+      for (const line of content.split("\n")) {
+        if (!line.startsWith("drm-memory-vram:")) continue;
+        const bytes = Number(line.slice(line.indexOf(":") + 1).trim());
+        if (Number.isFinite(bytes)) totalBytes += bytes;
+      }
+    }
+    return totalBytes > 0 ? reading(Math.round(totalBytes / BYTES_PER_MIB), "exact", "process_gpu_usage") : null;
+  } catch {
+    return null;
+  }
+}
 
 async function readAmdgpuSysfsVram(): Promise<VramSample | null> {
   try {
@@ -242,20 +347,27 @@ async function readAmdgpuSysfsVram(): Promise<VramSample | null> {
 // the whole-adapter reading per the spec's own "prefer process-specific"
 // requirement. Not run live this session -- no NVIDIA hardware available --
 // verify against a real CUDA worker before fully trusting the PID-matching
-// behavior in practice.
+// behavior in practice. `used` stays the whole-adapter reading (reported
+// separately from `process` below -- the two are different numbers, and
+// collapsing them into one hybrid field is what made the old "vram_peak"
+// mean different things on different backends).
 async function readCudaGpuMemory(pid: number | undefined): Promise<GpuMemoryReading> {
   const wholeAdapter = await readNvidiaSmiWholeAdapter();
   const totalReading = reading(wholeAdapter?.totalMib ?? null, "exact", "driver_reported_memory");
+  const usedReading = reading(wholeAdapter?.usedMib ?? null, "high", "driver_reported_memory");
+  let processReading: GpuMemoryValue | undefined;
   if (pid != null) {
     const processUsedMib = await readNvidiaSmiProcessUsed(pid);
-    if (processUsedMib != null) {
-      return { total: totalReading, used: reading(processUsedMib, "exact", "process_gpu_usage") };
-    }
+    // null = this process hasn't shown up in nvidia-smi's own compute-apps
+    // list yet (its polling lags a fresh spawn) -- no process reading this
+    // tick, not a measured 0.
+    if (processUsedMib != null) processReading = reading(processUsedMib, "exact", "process_gpu_usage");
   }
-  // No pid yet (pre-spawn baseline), or this process hasn't shown up in
-  // nvidia-smi's own compute-apps list yet -- fall back to whole-adapter
-  // usage: a real driver reading, just not process-isolated.
-  return { total: totalReading, used: reading(wholeAdapter?.usedMib ?? null, "high", "driver_reported_memory") };
+  return {
+    total: totalReading,
+    used: usedReading,
+    ...(processReading ? { process: processReading } : {}),
+  };
 }
 
 async function readNvidiaSmiWholeAdapter(): Promise<VramSample | null> {
@@ -314,22 +426,26 @@ export async function readNvidiaDriverInfo(): Promise<NvidiaDriverInfo | null> {
 }
 
 // ---------------------------------------------------------------------------
-// ROCm: deliberately no process-specific reading attempted (see the plan's
-// "Deviations from the literal spec" -- unlike NVML's --query-compute-apps,
-// there's no verified-reliable per-process equivalent in classic rocm-smi,
-// and guessing at one risks mislabeling accuracy, which "never fabricate"
-// forbids just as much as fabricating a number would). Falls back to the
-// same amdgpu sysfs files the generic Linux path already reads when
-// rocm-smi itself isn't installed -- same underlying kernel data either way,
-// ROCm and Vulkan both sit on top of the same amdgpu driver on Linux. Not
-// run live this session -- no ROCm install available -- verify against a
-// real ROCm worker before fully trusting, especially the exact rocm-smi
-// JSON key names below.
-async function readRocmGpuMemory(): Promise<GpuMemoryReading> {
+// ROCm (Linux): whole-adapter side reads rocm-smi's meminfo (or the same
+// amdgpu sysfs files the generic Linux path already reads when rocm-smi
+// isn't installed -- same underlying kernel data either way, ROCm and Vulkan
+// both sit on top of the same amdgpu driver on Linux). Per-process side uses
+// rocm-smi --showpids (KFD's per-PID VRAM accounting, reliable since ROCm
+// 6.1/6.3 -- earlier releases reported UNKNOWN on some cards), falling back
+// to /proc/<pid>/fdinfo drm-memory-vram when rocm-smi itself is missing.
+// Neither path has been run live this session -- no ROCm install available --
+// verify against a real ROCm worker before fully trusting, especially the
+// exact rocm-smi JSON/key/column names below.
+async function readRocmGpuMemory(pid: number | undefined): Promise<GpuMemoryReading> {
   const sample = (await readRocmSmiVram()) ?? (await readAmdgpuSysfsVram());
+  let processReading: GpuMemoryValue | undefined;
+  if (pid != null) {
+    processReading = (await readRocmSmiProcessVram(pid)) ?? (await readAmdgpuFdinfoVram(pid)) ?? undefined;
+  }
   return {
     total: reading(sample?.totalMib ?? null, "exact", "driver_reported_memory"),
     used: reading(sample?.usedMib ?? null, "high", "driver_reported_memory"),
+    ...(processReading ? { process: processReading } : {}),
   };
 }
 
@@ -358,6 +474,37 @@ async function readRocmSmiVram(): Promise<VramSample | null> {
   } catch {
     // rocm-smi missing (not installed, or this is actually a plain Vulkan
     // box rather than a ROCm one) -- not an error, fall back to sysfs.
+    return null;
+  }
+}
+
+// Per-process VRAM from `rocm-smi --showpids` -- KFD's per-PID accounting:
+//   PID PROCESS NAME GPU(s) VRAM USED SDMA USED CU OCCUPANCY
+//   132174 llama-server 2 31923675136 0 0
+// VRAM USED is bytes (0 when the process isn't actually holding VRAM right
+// now) and may read UNKNOWN on old ROCm releases / unsupported archs (a
+// real "no data" answer, never fabricated). Columns are whitespace-split and
+// read from the END (last three tokens are VRAM USED / SDMA USED / CU
+// OCCUPANCY) so a process name containing spaces can't shift them.
+async function readRocmSmiProcessVram(pid: number): Promise<GpuMemoryValue | null> {
+  try {
+    const { stdout } = await execFileAsync("rocm-smi", ["--showpids"], { timeout: EXEC_TIMEOUT_MS });
+    let bestMib: number | null = null;
+    for (const rawLine of stdout.split("\n")) {
+      const tokens = rawLine.trim().split(/\s+/);
+      if (tokens.length < 4) continue;
+      if (tokens[0] === "PID" || !/^\d+$/.test(tokens[0])) continue; // header / prose
+      if (Number(tokens[0]) !== pid) continue;
+      const vramUsed = tokens[tokens.length - 3];
+      if (vramUsed === "UNKNOWN" || vramUsed === "N/A") continue;
+      const bytes = Number(vramUsed);
+      if (!Number.isFinite(bytes)) continue;
+      const mib = Math.round(bytes / BYTES_PER_MIB);
+      if (bestMib == null || mib > bestMib) bestMib = mib;
+    }
+    return bestMib != null ? reading(bestMib, "exact", "process_gpu_usage") : null;
+  } catch {
+    // rocm-smi missing -- fall back to amdgpu fdinfo (see readRocmGpuMemory).
     return null;
   }
 }

@@ -423,6 +423,38 @@ export interface ResultRow {
   gpu_memory_model_avg_source: GpuMemoryMeasurementSource | null;
   gpu_memory_model_peak_accuracy: GpuMemoryAccuracyLevel;
   gpu_memory_model_peak_source: GpuMemoryMeasurementSource | null;
+  // Whole-adapter ("every process on the GPU combined") VRAM usage sampled
+  // around the test -- avg and peak over the same interval that produced
+  // vram_avg_mib/vram_peak_mib above. Always whole-GPU, never isolated to
+  // the benchmark process; distinct from the gpu_memory_process_* pair
+  // below, which is the benchmark process's own reading over that same
+  // interval. All optional + undefined on rows from workers predating these
+  // fields (older rows fall back to the vram_avg/vram_peak hybrid in the UI
+  // and read "n/a" in the CSV) -- see the accuracy/source fields for the
+  // honest labeling of what each stream actually measures.
+  gpu_memory_used_avg_mib?: number | null;
+  gpu_memory_used_peak_mib?: number | null;
+  gpu_memory_used_avg_accuracy?: GpuMemoryAccuracyLevel;
+  gpu_memory_used_avg_source?: GpuMemoryMeasurementSource | null;
+  gpu_memory_used_peak_accuracy?: GpuMemoryAccuracyLevel;
+  gpu_memory_used_peak_source?: GpuMemoryMeasurementSource | null;
+  // The benchmark process's own VRAM usage (worker/src/vram.ts's per-backend
+  // per-process readers: nvidia-smi --query-compute-apps, Windows' WDDM
+  // "GPU Process Memory" counter, rocm-smi --showpids / amdgpu fdinfo).
+  // Null + accuracy "unavailable" whenever the backend has no per-process
+  // reading (Metal) or the driver never caught up to the process.
+  gpu_memory_process_avg_mib?: number | null;
+  gpu_memory_process_peak_mib?: number | null;
+  gpu_memory_process_avg_accuracy?: GpuMemoryAccuracyLevel;
+  gpu_memory_process_avg_source?: GpuMemoryMeasurementSource | null;
+  gpu_memory_process_peak_accuracy?: GpuMemoryAccuracyLevel;
+  gpu_memory_process_peak_source?: GpuMemoryMeasurementSource | null;
+  // Whole-system RAM usage (every process combined, si.mem().active) sampled
+  // over the same interval as ram_avg_mib/ram_peak_mib (which remain the
+  // benchmark process's own figures). Plain numbers -- RAM has no
+  // accuracy/source metadata, same as every other RAM figure on this row.
+  ram_total_used_avg_mib?: number | null;
+  ram_total_used_peak_mib?: number | null;
   // Actual GPU layers loaded and the model's real total layer count, both
   // read from llama.cpp's own runtime output (worker/src/index.ts's
   // parseOffloadLayers, scraping "load_tensors: offloaded X/Y layers to
@@ -552,6 +584,25 @@ export interface IngestResultInput {
   gpu_memory_model_avg_source: GpuMemoryMeasurementSource | null;
   gpu_memory_model_peak_accuracy: GpuMemoryAccuracyLevel;
   gpu_memory_model_peak_source: GpuMemoryMeasurementSource | null;
+  // Whole-adapter and per-process VRAM usage avg/peak, plus whole-system RAM
+  // usage avg/peak -- see the matching fields on ResultRow above. All
+  // optional (an older worker that predates these fields simply won't send
+  // them), and each value is nullable when the stream couldn't be measured
+  // on that backend (e.g. no per-process reading on Metal).
+  gpu_memory_used_avg_mib?: number | null;
+  gpu_memory_used_peak_mib?: number | null;
+  gpu_memory_used_avg_accuracy?: GpuMemoryAccuracyLevel;
+  gpu_memory_used_avg_source?: GpuMemoryMeasurementSource | null;
+  gpu_memory_used_peak_accuracy?: GpuMemoryAccuracyLevel;
+  gpu_memory_used_peak_source?: GpuMemoryMeasurementSource | null;
+  gpu_memory_process_avg_mib?: number | null;
+  gpu_memory_process_peak_mib?: number | null;
+  gpu_memory_process_avg_accuracy?: GpuMemoryAccuracyLevel;
+  gpu_memory_process_avg_source?: GpuMemoryMeasurementSource | null;
+  gpu_memory_process_peak_accuracy?: GpuMemoryAccuracyLevel;
+  gpu_memory_process_peak_source?: GpuMemoryMeasurementSource | null;
+  ram_total_used_avg_mib?: number | null;
+  ram_total_used_peak_mib?: number | null;
   gpu_layers_loaded: number | null;
   total_model_layers: number | null;
   // See the matching fields on ResultRow above -- the MTP/draft companion

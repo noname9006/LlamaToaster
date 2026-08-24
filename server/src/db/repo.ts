@@ -155,6 +155,23 @@ interface ResultRowRaw {
   gpu_memory_model_avg_source: string | null;
   gpu_memory_model_peak_accuracy: string | null;
   gpu_memory_model_peak_source: string | null;
+  // Whole-adapter/per-process VRAM usage + whole-system RAM usage avg/peak --
+  // see shared/types.ts's ResultRow doc comments. Same raw-nullable storage
+  // and pre-migration coalescing rules as the gpu_memory_* fields above.
+  gpu_memory_used_avg_mib: number | null;
+  gpu_memory_used_peak_mib: number | null;
+  gpu_memory_used_avg_accuracy: string | null;
+  gpu_memory_used_avg_source: string | null;
+  gpu_memory_used_peak_accuracy: string | null;
+  gpu_memory_used_peak_source: string | null;
+  gpu_memory_process_avg_mib: number | null;
+  gpu_memory_process_peak_mib: number | null;
+  gpu_memory_process_avg_accuracy: string | null;
+  gpu_memory_process_avg_source: string | null;
+  gpu_memory_process_peak_accuracy: string | null;
+  gpu_memory_process_peak_source: string | null;
+  ram_total_used_avg_mib: number | null;
+  ram_total_used_peak_mib: number | null;
   gpu_layers_loaded: number | null;
   total_model_layers: number | null;
   gpu_layers_loaded_draft: number | null;
@@ -613,6 +630,25 @@ function mapResult(row: ResultRowRaw): ResultRow {
     gpu_memory_model_avg_source: row.gpu_memory_model_avg_source as ResultRow["gpu_memory_model_avg_source"],
     gpu_memory_model_peak_accuracy: coalesceAccuracy(row.gpu_memory_model_peak_accuracy),
     gpu_memory_model_peak_source: row.gpu_memory_model_peak_source as ResultRow["gpu_memory_model_peak_source"],
+    // Whole-adapter/per-process/whole-RAM streams are optional on the public
+    // type (version-skew tolerance for old workers) -- mapped with ?? instead
+    // of coalesceAccuracy so a pre-migration row reads as plain "absent"
+    // (undefined), while a current row's null keeps its "unavailable"
+    // accuracy pair as-is.
+    gpu_memory_used_avg_mib: row.gpu_memory_used_avg_mib ?? undefined,
+    gpu_memory_used_peak_mib: row.gpu_memory_used_peak_mib ?? undefined,
+    gpu_memory_used_avg_accuracy: coalesceAccuracy(row.gpu_memory_used_avg_accuracy),
+    gpu_memory_used_avg_source: row.gpu_memory_used_avg_source as ResultRow["gpu_memory_used_avg_source"],
+    gpu_memory_used_peak_accuracy: coalesceAccuracy(row.gpu_memory_used_peak_accuracy),
+    gpu_memory_used_peak_source: row.gpu_memory_used_peak_source as ResultRow["gpu_memory_used_peak_source"],
+    gpu_memory_process_avg_mib: row.gpu_memory_process_avg_mib ?? undefined,
+    gpu_memory_process_peak_mib: row.gpu_memory_process_peak_mib ?? undefined,
+    gpu_memory_process_avg_accuracy: coalesceAccuracy(row.gpu_memory_process_avg_accuracy),
+    gpu_memory_process_avg_source: row.gpu_memory_process_avg_source as ResultRow["gpu_memory_process_avg_source"],
+    gpu_memory_process_peak_accuracy: coalesceAccuracy(row.gpu_memory_process_peak_accuracy),
+    gpu_memory_process_peak_source: row.gpu_memory_process_peak_source as ResultRow["gpu_memory_process_peak_source"],
+    ram_total_used_avg_mib: row.ram_total_used_avg_mib ?? undefined,
+    ram_total_used_peak_mib: row.ram_total_used_peak_mib ?? undefined,
     gpu_layers_loaded: row.gpu_layers_loaded,
     total_model_layers: row.total_model_layers,
     gpu_layers_loaded_draft: row.gpu_layers_loaded_draft ?? undefined,
@@ -990,11 +1026,18 @@ export const repo = {
               gpu_memory_free_start_accuracy, gpu_memory_free_start_source,
               gpu_memory_model_avg_accuracy, gpu_memory_model_avg_source,
               gpu_memory_model_peak_accuracy, gpu_memory_model_peak_source,
+              gpu_memory_used_avg_mib, gpu_memory_used_peak_mib,
+              gpu_memory_used_avg_accuracy, gpu_memory_used_avg_source,
+              gpu_memory_used_peak_accuracy, gpu_memory_used_peak_source,
+              gpu_memory_process_avg_mib, gpu_memory_process_peak_mib,
+              gpu_memory_process_avg_accuracy, gpu_memory_process_avg_source,
+              gpu_memory_process_peak_accuracy, gpu_memory_process_peak_source,
+              ram_total_used_avg_mib, ram_total_used_peak_mib,
               gpu_layers_loaded, total_model_layers, gpu_layers_loaded_draft, total_model_layers_draft,
               gpu_layers_resident_est, gpu_layers_resident_est_draft,
               sample_count, suspect_count, suspect_samples, repeat_samples, spec_drafted, spec_accepted,
               raw_json_path, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         );
         // Up to two rows for one idx (a pp row and a tg row from the same
         // benchmark process) -- distinguished by test_type, see
@@ -1038,6 +1081,20 @@ export const repo = {
             row.gpu_memory_model_avg_source,
             row.gpu_memory_model_peak_accuracy,
             row.gpu_memory_model_peak_source,
+            row.gpu_memory_used_avg_mib,
+            row.gpu_memory_used_peak_mib,
+            row.gpu_memory_used_avg_accuracy,
+            row.gpu_memory_used_avg_source,
+            row.gpu_memory_used_peak_accuracy,
+            row.gpu_memory_used_peak_source,
+            row.gpu_memory_process_avg_mib,
+            row.gpu_memory_process_peak_mib,
+            row.gpu_memory_process_avg_accuracy,
+            row.gpu_memory_process_avg_source,
+            row.gpu_memory_process_peak_accuracy,
+            row.gpu_memory_process_peak_source,
+            row.ram_total_used_avg_mib,
+            row.ram_total_used_peak_mib,
             row.gpu_layers_loaded,
             row.total_model_layers,
             row.gpu_layers_loaded_draft ?? null,
@@ -2662,6 +2719,26 @@ function buildResultRow(
     gpu_memory_model_avg_source: r.gpu_memory_model_avg_source,
     gpu_memory_model_peak_accuracy: r.gpu_memory_model_peak_accuracy,
     gpu_memory_model_peak_source: r.gpu_memory_model_peak_source,
+    // Version-skew tolerant like every optional IngestResultInput field --
+    // absent on an older worker, null from a current one with nothing to
+    // measure on that backend (e.g. no per-process reading on Metal).
+    gpu_memory_used_avg_mib: r.gpu_memory_used_avg_mib ?? null,
+    gpu_memory_used_peak_mib: r.gpu_memory_used_peak_mib ?? null,
+    // accuracy is always a concrete level, never null -- "unavailable" is
+    // itself the valid value for "nothing measured", matching every other
+    // accuracy field on this row (see shared/types.ts's GpuMemoryAccuracyLevel).
+    gpu_memory_used_avg_accuracy: r.gpu_memory_used_avg_accuracy ?? "unavailable",
+    gpu_memory_used_avg_source: r.gpu_memory_used_avg_source ?? null,
+    gpu_memory_used_peak_accuracy: r.gpu_memory_used_peak_accuracy ?? "unavailable",
+    gpu_memory_used_peak_source: r.gpu_memory_used_peak_source ?? null,
+    gpu_memory_process_avg_mib: r.gpu_memory_process_avg_mib ?? null,
+    gpu_memory_process_peak_mib: r.gpu_memory_process_peak_mib ?? null,
+    gpu_memory_process_avg_accuracy: r.gpu_memory_process_avg_accuracy ?? "unavailable",
+    gpu_memory_process_avg_source: r.gpu_memory_process_avg_source ?? null,
+    gpu_memory_process_peak_accuracy: r.gpu_memory_process_peak_accuracy ?? "unavailable",
+    gpu_memory_process_peak_source: r.gpu_memory_process_peak_source ?? null,
+    ram_total_used_avg_mib: r.ram_total_used_avg_mib ?? null,
+    ram_total_used_peak_mib: r.ram_total_used_peak_mib ?? null,
     gpu_layers_loaded: r.gpu_layers_loaded,
     total_model_layers: r.total_model_layers,
     gpu_layers_loaded_draft: r.gpu_layers_loaded_draft ?? null,

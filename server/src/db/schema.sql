@@ -66,6 +66,26 @@ CREATE TABLE IF NOT EXISTS results (
   gpu_memory_model_avg_source TEXT,
   gpu_memory_model_peak_accuracy TEXT,   -- pairs with vram_peak_mib above
   gpu_memory_model_peak_source TEXT,
+  -- Whole-adapter and per-process VRAM usage avg/peak, plus whole-system RAM
+  -- usage avg/peak -- see shared/types.ts's ResultRow doc comments and
+  -- worker/src/vram.ts's per-backend readers for what populates these.
+  -- vram_avg_mib/vram_peak_mib above remain the best-available hybrid
+  -- (process when readable, else whole adapter). NULL on every row inserted
+  -- before this migration, which correctly reads as "unavailable".
+  gpu_memory_used_avg_mib INTEGER,
+  gpu_memory_used_peak_mib INTEGER,
+  gpu_memory_used_avg_accuracy TEXT,
+  gpu_memory_used_avg_source TEXT,
+  gpu_memory_used_peak_accuracy TEXT,
+  gpu_memory_used_peak_source TEXT,
+  gpu_memory_process_avg_mib INTEGER,
+  gpu_memory_process_peak_mib INTEGER,
+  gpu_memory_process_avg_accuracy TEXT,
+  gpu_memory_process_avg_source TEXT,
+  gpu_memory_process_peak_accuracy TEXT,
+  gpu_memory_process_peak_source TEXT,
+  ram_total_used_avg_mib INTEGER,
+  ram_total_used_peak_mib INTEGER,
   -- Read from llama.cpp's own runtime output, never inferred -- see
   -- worker/src/index.ts's parseOffloadLayers. n_gpu_layers above is already
   -- the *requested* value; these are what actually happened. Always the

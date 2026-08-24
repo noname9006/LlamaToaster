@@ -1118,17 +1118,21 @@ function formatOffloadLine(
 function formatMemoryLines(stats: SampleStats, baseline: FreeMemoryBaseline): string[] {
   const ramParts = [
     `free_before=${baseline.ram_free_before_mib}MiB`,
-    `avg=${stats.ram_avg_mib}MiB`,
-    `peak=${stats.ram_peak_mib}MiB`,
+    `proc_avg=${stats.ram_avg_mib}MiB`,
+    `proc_peak=${stats.ram_peak_mib}MiB`,
   ];
+  if (stats.ram_total_avg_mib != null) ramParts.push(`used_avg=${stats.ram_total_avg_mib}MiB`);
+  if (stats.ram_total_peak_mib != null) ramParts.push(`used_peak=${stats.ram_total_peak_mib}MiB`);
   if (baseline.system_memory_total_mib != null) ramParts.push(`total=${baseline.system_memory_total_mib}MiB`);
   const ramLine = `ram: ${ramParts.join(" ")}`;
 
   const vramParts: string[] = [];
   if (baseline.gpu_memory_total_mib != null) vramParts.push(`total=${baseline.gpu_memory_total_mib}MiB`);
   if (baseline.vram_free_before_mib != null) vramParts.push(`free_before=${baseline.vram_free_before_mib}MiB`);
-  if (stats.vram_avg_mib != null) vramParts.push(`avg=${stats.vram_avg_mib}MiB`);
-  if (stats.vram_peak_mib != null) vramParts.push(`peak=${stats.vram_peak_mib}MiB`);
+  if (stats.vram_total_used_avg_mib != null) vramParts.push(`used_avg=${stats.vram_total_used_avg_mib}MiB`);
+  if (stats.vram_total_used_peak_mib != null) vramParts.push(`used_peak=${stats.vram_total_used_peak_mib}MiB`);
+  if (stats.vram_process_avg_mib != null) vramParts.push(`proc_avg=${stats.vram_process_avg_mib}MiB`);
+  if (stats.vram_process_peak_mib != null) vramParts.push(`proc_peak=${stats.vram_process_peak_mib}MiB`);
   if (vramParts.length === 0) return [ramLine, "vram: unavailable"];
   const accuracy = stats.vram_peak_mib != null ? stats.vram_peak_accuracy : baseline.gpu_memory_total_accuracy;
   const source = stats.vram_peak_source ?? baseline.gpu_memory_total_source;
@@ -1391,6 +1395,24 @@ async function finalizeSweepItemResult(
       gpu_memory_model_avg_source: stats.vram_avg_source,
       gpu_memory_model_peak_accuracy: stats.vram_peak_accuracy,
       gpu_memory_model_peak_source: stats.vram_peak_source,
+      // Whole-adapter and per-process VRAM usage (avg+peak share one
+      // accuracy/source pair per stream -- see sampler.ts's SampleStats) and
+      // whole-system RAM usage. All optional on IngestResultInput, so an
+      // always-set null just reads as "this stream couldn't be measured".
+      gpu_memory_used_avg_mib: stats.vram_total_used_avg_mib,
+      gpu_memory_used_peak_mib: stats.vram_total_used_peak_mib,
+      gpu_memory_used_avg_accuracy: stats.vram_total_used_accuracy,
+      gpu_memory_used_avg_source: stats.vram_total_used_source,
+      gpu_memory_used_peak_accuracy: stats.vram_total_used_accuracy,
+      gpu_memory_used_peak_source: stats.vram_total_used_source,
+      gpu_memory_process_avg_mib: stats.vram_process_avg_mib,
+      gpu_memory_process_peak_mib: stats.vram_process_peak_mib,
+      gpu_memory_process_avg_accuracy: stats.vram_process_accuracy,
+      gpu_memory_process_avg_source: stats.vram_process_source,
+      gpu_memory_process_peak_accuracy: stats.vram_process_accuracy,
+      gpu_memory_process_peak_source: stats.vram_process_source,
+      ram_total_used_avg_mib: stats.ram_total_avg_mib,
+      ram_total_used_peak_mib: stats.ram_total_peak_mib,
       gpu_layers_loaded: offload.main?.gpu_layers_loaded ?? null,
       total_model_layers: offload.main?.total_model_layers ?? null,
       gpu_layers_loaded_draft: offload.draft?.gpu_layers_loaded ?? null,

@@ -3,13 +3,34 @@ import { readGpuMemory } from "./vram.js";
 import type { Backend, GpuMemoryAccuracyLevel, GpuMemoryMeasurementSource } from "../../shared/types.js";
 
 export interface SampleStats {
+  // The benchmark process's own RAM usage (systeminformation's per-pid RSS).
   ram_peak_mib: number;
-  vram_peak_mib: number | null;
   ram_avg_mib: number;
+  // Whole-system RAM usage (si.mem().active -- every process combined),
+  // sampled on the same interval.
+  ram_total_peak_mib: number;
+  ram_total_avg_mib: number;
+  // Best-available VRAM usage stream (legacy meaning, kept for the existing
+  // vram_avg/vram_peak columns, CSV names, and the VRAM-discrepancy
+  // heuristic): per-process when the backend could read it that tick,
+  // whole-adapter otherwise.
+  vram_peak_mib: number | null;
   vram_avg_mib: number | null;
-  // Both peak and avg get the *same* accuracy/source -- they're two views
-  // over the same sample stream (see MemorySampler's worst-tier-wins
-  // tracking below), not independently measured.
+  // Whole-adapter VRAM usage (every process on the GPU combined) -- one
+  // accuracy/source pair shared by avg+peak, since they're two views over
+  // the same sample stream (worst-tier-wins tracking below).
+  vram_total_used_peak_mib: number | null;
+  vram_total_used_avg_mib: number | null;
+  vram_total_used_accuracy: GpuMemoryAccuracyLevel;
+  vram_total_used_source: GpuMemoryMeasurementSource | null;
+  // The benchmark process's own VRAM usage (only when the backend exposes a
+  // per-process reading -- nvidia-smi compute-apps, Windows GPU Process
+  // Memory, rocm-smi --showpids / amdgpu fdinfo). Same shared
+  // accuracy/source pair convention as the whole-adapter stream above.
+  vram_process_peak_mib: number | null;
+  vram_process_avg_mib: number | null;
+  vram_process_accuracy: GpuMemoryAccuracyLevel;
+  vram_process_source: GpuMemoryMeasurementSource | null;
   vram_peak_accuracy: GpuMemoryAccuracyLevel;
   vram_peak_source: GpuMemoryMeasurementSource | null;
   vram_avg_accuracy: GpuMemoryAccuracyLevel;
@@ -98,35 +119,74 @@ const ACCURACY_RANK: Record<GpuMemoryAccuracyLevel, number> = {
 export class MemorySampler {
   private timer: NodeJS.Timeout | null = null;
   private backend: Backend = "cpu";
+  private pid: number | undefined;
+  private vramTickCount = 0;
+
+  // The benchmark process's own RAM (per-pid RSS) -- the legacy stream.
   private ramPeakBytes = 0;
-  private vramPeakBytes = 0;
   private ramCurrentBytes = 0;
-  private vramCurrentBytes = 0;
   private ramSumBytes = 0;
   private ramSampleCount = 0;
+  // Whole-system RAM (si.mem().active -- every process combined).
+  private ramTotalPeakBytes = 0;
+  private ramTotalSumBytes = 0;
+  private ramTotalSampleCount = 0;
+  // Best-available VRAM (process when the backend could read it this tick,
+  // else whole adapter) -- the legacy stream, keeps vram_peak_mib/vram_avg_mib
+  // semantics stable for every existing consumer (CSV names, the
+  // VRAM-discrepancy heuristic in worker/src/index.ts).
+  private vramPeakBytes = 0;
+  private vramCurrentBytes = 0;
   private vramSumBytes = 0;
   private vramSampleCount = 0;
   private vramMeasured = false;
-  private vramTickCount = 0;
   private vramWorstAccuracy: GpuMemoryAccuracyLevel = "exact";
   private vramWorstSource: GpuMemoryMeasurementSource | null = null;
-  private pid: number | undefined;
+  // Whole-adapter VRAM usage (every process on the GPU combined).
+  private vramTotalPeakBytes = 0;
+  private vramTotalSumBytes = 0;
+  private vramTotalSampleCount = 0;
+  private vramTotalMeasured = false;
+  private vramTotalWorstAccuracy: GpuMemoryAccuracyLevel = "exact";
+  private vramTotalWorstSource: GpuMemoryMeasurementSource | null = null;
+  // The benchmark process's own VRAM usage.
+  private vramProcessPeakBytes = 0;
+  private vramProcessSumBytes = 0;
+  private vramProcessSampleCount = 0;
+  private vramProcessMeasured = false;
+  private vramProcessWorstAccuracy: GpuMemoryAccuracyLevel = "exact";
+  private vramProcessWorstSource: GpuMemoryMeasurementSource | null = null;
 
   start(pid: number | undefined, backend: Backend, intervalMs = 2000): void {
     this.pid = pid;
     this.backend = backend;
+    this.vramTickCount = 0;
     this.ramPeakBytes = 0;
-    this.vramPeakBytes = 0;
     this.ramCurrentBytes = 0;
-    this.vramCurrentBytes = 0;
     this.ramSumBytes = 0;
     this.ramSampleCount = 0;
+    this.ramTotalPeakBytes = 0;
+    this.ramTotalSumBytes = 0;
+    this.ramTotalSampleCount = 0;
+    this.vramPeakBytes = 0;
+    this.vramCurrentBytes = 0;
     this.vramSumBytes = 0;
     this.vramSampleCount = 0;
     this.vramMeasured = false;
-    this.vramTickCount = 0;
     this.vramWorstAccuracy = "exact";
     this.vramWorstSource = null;
+    this.vramTotalPeakBytes = 0;
+    this.vramTotalSumBytes = 0;
+    this.vramTotalSampleCount = 0;
+    this.vramTotalMeasured = false;
+    this.vramTotalWorstAccuracy = "exact";
+    this.vramTotalWorstSource = null;
+    this.vramProcessPeakBytes = 0;
+    this.vramProcessSumBytes = 0;
+    this.vramProcessSampleCount = 0;
+    this.vramProcessMeasured = false;
+    this.vramProcessWorstAccuracy = "exact";
+    this.vramProcessWorstSource = null;
     this.sample();
     this.timer = setInterval(() => this.sample(), intervalMs);
   }
@@ -142,6 +202,10 @@ export class MemorySampler {
   get stats(): SampleStats {
     const accuracy = this.vramMeasured ? this.vramWorstAccuracy : "unavailable";
     const source = this.vramMeasured ? this.vramWorstSource : null;
+    const totalAccuracy = this.vramTotalMeasured ? this.vramTotalWorstAccuracy : "unavailable";
+    const totalSource = this.vramTotalMeasured ? this.vramTotalWorstSource : null;
+    const processAccuracy = this.vramProcessMeasured ? this.vramProcessWorstAccuracy : "unavailable";
+    const processSource = this.vramProcessMeasured ? this.vramProcessWorstSource : null;
     return {
       ram_peak_mib: Math.round(this.ramPeakBytes / BYTES_PER_MIB),
       vram_peak_mib: this.vramMeasured ? Math.round(this.vramPeakBytes / BYTES_PER_MIB) : null,
@@ -151,6 +215,24 @@ export class MemorySampler {
         this.vramMeasured && this.vramSampleCount > 0
           ? Math.round(this.vramSumBytes / this.vramSampleCount / BYTES_PER_MIB)
           : null,
+      ram_total_peak_mib:
+        this.ramTotalSampleCount > 0 ? Math.round(this.ramTotalPeakBytes / BYTES_PER_MIB) : 0,
+      ram_total_avg_mib:
+        this.ramTotalSampleCount > 0 ? Math.round(this.ramTotalSumBytes / this.ramTotalSampleCount / BYTES_PER_MIB) : 0,
+      vram_total_used_peak_mib: this.vramTotalMeasured ? Math.round(this.vramTotalPeakBytes / BYTES_PER_MIB) : null,
+      vram_total_used_avg_mib:
+        this.vramTotalMeasured && this.vramTotalSampleCount > 0
+          ? Math.round(this.vramTotalSumBytes / this.vramTotalSampleCount / BYTES_PER_MIB)
+          : null,
+      vram_total_used_accuracy: totalAccuracy,
+      vram_total_used_source: totalSource,
+      vram_process_peak_mib: this.vramProcessMeasured ? Math.round(this.vramProcessPeakBytes / BYTES_PER_MIB) : null,
+      vram_process_avg_mib:
+        this.vramProcessMeasured && this.vramProcessSampleCount > 0
+          ? Math.round(this.vramProcessSumBytes / this.vramProcessSampleCount / BYTES_PER_MIB)
+          : null,
+      vram_process_accuracy: processAccuracy,
+      vram_process_source: processSource,
       vram_peak_accuracy: accuracy,
       vram_peak_source: source,
       vram_avg_accuracy: accuracy,
@@ -188,17 +270,28 @@ export class MemorySampler {
       this.ramSumBytes += ramBytes;
       this.ramSampleCount++;
 
+      // Whole-system RAM used (every process combined) -- one extra cheap
+      // si.mem() call per tick, independent of whether a child pid exists.
+      const mem = await si.mem();
+      if (typeof mem.active === "number" && Number.isFinite(mem.active)) {
+        if (mem.active > this.ramTotalPeakBytes) this.ramTotalPeakBytes = mem.active;
+        this.ramTotalSumBytes += mem.active;
+        this.ramTotalSampleCount++;
+      }
+
       const dueForVram = this.vramTickCount % VRAM_SAMPLE_EVERY_N_TICKS === 0;
       this.vramTickCount++;
       if (!dueForVram) return;
 
       try {
-        const { used } = await readGpuMemory(this.backend, this.pid);
+        const { used, process: processUsed } = await readGpuMemory(this.backend, this.pid);
         // used.mib === null means "couldn't measure" (missing tool/driver/
         // permission, or the cpu backend's unconditional short-circuit); 0
         // is a legitimate reading and must still count.
         if (used.mib != null) {
           const vramBytes = used.mib * BYTES_PER_MIB;
+          // Legacy best-available stream: the process's own reading when the
+          // backend produced one this tick, else the whole adapter.
           this.vramMeasured = true;
           this.vramCurrentBytes = vramBytes;
           if (vramBytes > this.vramPeakBytes) this.vramPeakBytes = vramBytes;
@@ -207,6 +300,31 @@ export class MemorySampler {
           if (ACCURACY_RANK[used.accuracy] > ACCURACY_RANK[this.vramWorstAccuracy]) {
             this.vramWorstAccuracy = used.accuracy;
             this.vramWorstSource = used.source;
+          }
+          // Whole-adapter stream (always separate from the process stream --
+          // they're different numbers and the report shows both).
+          this.vramTotalMeasured = true;
+          if (vramBytes > this.vramTotalPeakBytes) this.vramTotalPeakBytes = vramBytes;
+          this.vramTotalSumBytes += vramBytes;
+          this.vramTotalSampleCount++;
+          if (ACCURACY_RANK[used.accuracy] > ACCURACY_RANK[this.vramTotalWorstAccuracy]) {
+            this.vramTotalWorstAccuracy = used.accuracy;
+            this.vramTotalWorstSource = used.source;
+          }
+        }
+        // processUsed is absent (not null) when this backend/platform has no
+        // per-process reading at all -- e.g. Metal -- or the driver hadn't
+        // caught up to this process yet that tick. Either way the whole
+        // process stream just doesn't grow this tick.
+        if (processUsed?.mib != null) {
+          const processBytes = processUsed.mib * BYTES_PER_MIB;
+          this.vramProcessMeasured = true;
+          if (processBytes > this.vramProcessPeakBytes) this.vramProcessPeakBytes = processBytes;
+          this.vramProcessSumBytes += processBytes;
+          this.vramProcessSampleCount++;
+          if (ACCURACY_RANK[processUsed.accuracy] > ACCURACY_RANK[this.vramProcessWorstAccuracy]) {
+            this.vramProcessWorstAccuracy = processUsed.accuracy;
+            this.vramProcessWorstSource = processUsed.source;
           }
         }
       } catch {
