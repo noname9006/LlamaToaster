@@ -297,6 +297,27 @@ export function matchOffloadLine(line: string): OffloadInfo | null {
 const MODEL_BUFFER_SIZE_LINE_RE = /^.*?load_tensors:\s*(\S+) model buffer size\s*=\s*([\d.]+)\s*MiB/;
 const CPU_BUFFER_NAME_RE = /^CPU(_Mapped)?$/;
 
+// llama.cpp's EXACT per-layer placement decision, printed once per layer at
+// DEBUG log level -- and llama-bench runs at DEBUG whenever this app's own
+// -v flag probe passes (llama-bench maps -v to GGML_LOG_LEVEL_DEBUG, verified
+// against b10612's tools/llama-bench/llama-bench.cpp), so these lines are
+// already in every stderr we capture:
+//   load_tensors: layer  0 assigned to device CPU, is_swa = 0
+//   load_tensors: layer 30 assigned to device CUDA0, is_swa = 0
+// This is the ground truth the "~N/M resident" estimate could only ever
+// approximate: unlike the "offloaded X/Y" claim (computed from -ngl alone,
+// before any allocation, and pure fiction when e.g. cuInit failed and no
+// CUDA device exists at all), these lines reflect where the loader ACTUALLY
+// routed each individual layer. Counting non-CPU assignments gives an exact
+// resident-on-GPU layer count. Tolerates an optional logger prefix (llama-
+// server prefixes every line); the trailing ", is_swa = N" is not required --
+// older builds printed this line without it.
+const LAYER_DEVICE_LINE_RE = /^.*?load_tensors:\s*layer\s+\d+\s+assigned to device\s+([^\s,]+)/;
+// ggml's CPU backend device/buffer name -- anything else on a layer line
+// (CUDA0, CUDA1, ROCm0, Vulkan, Metal, SYCL, ...) means that layer was
+// assigned to an accelerator.
+const CPU_DEVICE_NAME_RE = /^CPU$/i;
+
 export interface ModelBufferSizes {
   // Sum of every non-CPU buffer (CUDA0, CUDA1, ROCm0, Vulkan0, Metal, ...).
   gpuMib: number;
@@ -304,6 +325,13 @@ export interface ModelBufferSizes {
   // itself assigned to the CPU (e.g. the untouched remainder of a partial
   // offload), not just a sysmem-fallback bounce off a GPU assignment.
   cpuMib: number;
+  // EXACT number of layers this model's own loader assigned to a GPU device,
+  // counted from the per-layer "assigned to device" lines above -- not a
+  // proportional split of buffer bytes like the old estimate. Null when this
+  // build/item produced no layer lines at all (pre-DEBUG builds, or the item
+  // died before tensor creation started): callers then fall back to the
+  // byte-ratio estimate instead of inventing precision.
+  gpu_layers_exact: number | null;
 }
 
 // Per-model split of ModelBufferSizes, one entry per model actually loaded.
@@ -332,22 +360,45 @@ export interface ModelBufferSizesByModel {
 // so callers can tell "no GPU buffer, confirmed" apart from "we have no
 // idea," exactly like OffloadResult's own null already does for the
 // layer-count line.
+//
+// Per-model stderr ordering (verified against b10612's llama-model.cpp):
+// the per-layer "assigned to device" DEBUG lines stream out DURING tensor
+// creation, then the model's "offloaded X/Y" claim line, then its buffer-size
+// lines. So each group's exact layer count comes from the layer lines that
+// accumulated since the previous claim line, clamped to that claim's X.
 export function parseModelBufferSizes(stderr: string): ModelBufferSizesByModel | null {
   const groups: ModelBufferSizes[] = [];
   const groupTotalLayers: number[] = [];
   let current = -1;
+  // Layer-device lines seen since the last claim line -- flushed into the
+  // next claim's group. GPU-assigned ones are counted as they arrive.
+  let pendingLayerLinesSeen = false;
+  let pendingGpuLayers = 0;
   for (const line of stderr.split("\n")) {
+    const layerMatch = LAYER_DEVICE_LINE_RE.exec(line);
+    if (layerMatch) {
+      if (!CPU_DEVICE_NAME_RE.test(layerMatch[1])) pendingGpuLayers++;
+      pendingLayerLinesSeen = true;
+      continue;
+    }
     const offloadMatch = OFFLOAD_LAYERS_LINE_RE.exec(line);
     if (offloadMatch) {
-      groups.push({ gpuMib: 0, cpuMib: 0 });
+      const claimed = Number(offloadMatch[1]);
+      groups.push({
+        gpuMib: 0,
+        cpuMib: 0,
+        gpu_layers_exact: pendingLayerLinesSeen ? Math.min(pendingGpuLayers, claimed) : null,
+      });
       groupTotalLayers.push(Number(offloadMatch[2]));
       current = groups.length - 1;
+      pendingGpuLayers = 0;
+      pendingLayerLinesSeen = false;
       continue;
     }
     const bufferMatch = MODEL_BUFFER_SIZE_LINE_RE.exec(line);
     if (!bufferMatch) continue;
     if (current === -1) {
-      groups.push({ gpuMib: 0, cpuMib: 0 });
+      groups.push({ gpuMib: 0, cpuMib: 0, gpu_layers_exact: null });
       groupTotalLayers.push(-1);
       current = 0;
     }
@@ -357,13 +408,16 @@ export function parseModelBufferSizes(stderr: string): ModelBufferSizesByModel |
     else groups[current].gpuMib += mib;
   }
   const withBuffers = groups
-    .map((g, i) => ({ gpuMib: g.gpuMib, cpuMib: g.cpuMib, totalLayers: groupTotalLayers[i] }))
-    .filter((g) => g.gpuMib > 0 || g.cpuMib > 0);
+    .map((g, i) => ({ ...g, totalLayers: groupTotalLayers[i] }))
+    .filter((g) => g.gpuMib > 0 || g.cpuMib > 0 || g.gpu_layers_exact != null);
   if (withBuffers.length === 0) return null;
   const sorted = [...withBuffers].sort((a, b) => b.totalLayers - a.totalLayers);
   return {
-    main: { gpuMib: sorted[0].gpuMib, cpuMib: sorted[0].cpuMib },
-    draft: sorted.length > 1 ? { gpuMib: sorted[1].gpuMib, cpuMib: sorted[1].cpuMib } : null,
+    main: { gpuMib: sorted[0].gpuMib, cpuMib: sorted[0].cpuMib, gpu_layers_exact: sorted[0].gpu_layers_exact },
+    draft:
+      sorted.length > 1
+        ? { gpuMib: sorted[1].gpuMib, cpuMib: sorted[1].cpuMib, gpu_layers_exact: sorted[1].gpu_layers_exact }
+        : null,
   };
 }
 
