@@ -560,10 +560,20 @@ export function WorkerCard({ worker, onRefresh }: { worker: Worker; onRefresh: (
               <p className="mt-1.5 text-sm text-muted">No builds installed yet.</p>
             ) : (
               <ul className="mt-1.5 flex flex-col gap-1.5">
-                {worker.installedBuilds.map((b) => (
+                {worker.installedBuilds.map((b) => {
+                  // Same driver-vs-build check as the install list, applied to
+                  // what's ALREADY on disk -- an installed CUDA build newer
+                  // than the driver stays usable-looking but is flagged: GPU
+                  // tests against it will die at cuInit until the driver
+                  // catches up.
+                  const variant = extractCudaVariant(b.asset_name);
+                  const needsDriverUpdate = variant != null && !cudaDriverSupports(driverCudaVersion, variant);
+                  return (
                   <li
                     key={b.tag}
-                    className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-border bg-surface-raised px-3 py-2"
+                    className={`flex flex-wrap items-center justify-between gap-2 rounded-lg border px-3 py-2 ${
+                      needsDriverUpdate ? "border-warning/40 bg-warning/5" : "border-border"
+                    } bg-surface-raised`}
                   >
                     <div className="flex items-center gap-2 text-sm">
                       {b.active ? (
@@ -579,6 +589,11 @@ export function WorkerCard({ worker, onRefresh }: { worker: Worker; onRefresh: (
                       </span>
                     </div>
                     <div className="flex items-center gap-2">
+                      {needsDriverUpdate && (
+                        <span className="text-xs font-medium text-warning">
+                          GPU tests may fail — update NVIDIA driver
+                        </span>
+                      )}
                       {b.active ? (
                         <StatusPill label="active" tone="accent" />
                       ) : (
@@ -617,7 +632,8 @@ export function WorkerCard({ worker, onRefresh }: { worker: Worker; onRefresh: (
                       )}
                     </div>
                   </li>
-                ))}
+                  );
+                })}
               </ul>
             )}
           </div>
@@ -631,19 +647,21 @@ export function WorkerCard({ worker, onRefresh }: { worker: Worker; onRefresh: (
                 {availableToInstall.map((rel) => {
                   const asset = rel.assets[0];
                   // CUDA variants are ordered best-first by the server (see
-                  // sortAssetsForWorker), so assets[0] is the one to offer --
-                  // but a variant newer than this machine's NVIDIA driver can
-                  // never load, so surface that instead of letting the
-                  // install fail at bench time with missing-DLL errors.
+                  // sortAssetsForWorker), so assets[0] is the one to offer.
+                  // A variant newer than this machine's NVIDIA driver will
+                  // install fine but fail the moment a benchmark tries to use
+                  // the GPU (cuInit dies with an unsupported-driver error) --
+                  // that's allowed, just loudly flagged here and on the
+                  // Downloaded list below rather than blocked.
                   const variant = extractCudaVariant(asset.name);
-                  const incompatible = variant != null && !cudaDriverSupports(driverCudaVersion, variant);
+                  const needsDriverUpdate = variant != null && !cudaDriverSupports(driverCudaVersion, variant);
                   const cudart = rel.cudart_assets?.[asset.name];
                   const totalSize = asset.size_bytes + (cudart?.size_bytes ?? 0);
                   return (
                     <li
                       key={rel.tag}
                       className={`flex flex-wrap items-center justify-between gap-2 rounded-lg border px-3 py-2 ${
-                        incompatible ? "border-warning/40 bg-warning/5" : "border-border"
+                        needsDriverUpdate ? "border-warning/40 bg-warning/5" : "border-border"
                       }`}
                     >
                       <div className="text-sm">
@@ -652,16 +670,25 @@ export function WorkerCard({ worker, onRefresh }: { worker: Worker; onRefresh: (
                           {asset.name} · {formatBytes(totalSize)}
                           {cudart ? " (incl. CUDA runtime DLLs)" : ""}
                         </span>
-                        {incompatible && (
+                        {needsDriverUpdate && (
                           <div className="text-xs text-warning">
-                            Needs driver supporting CUDA {variant!.major}.{variant!.minor}
-                            {driverCudaVersion ? ` -- this machine runs up to ${driverCudaVersion}` : ""}
+                            NVIDIA driver update needed: this build runs CUDA up to{" "}
+                            <b>
+                              {variant!.major}.{variant!.minor}
+                            </b>
+                            {driverCudaVersion ? (
+                              <>
+                                , machine supports{" "}
+                                <b>{driverCudaVersion}</b>
+                              </>
+                            ) : null}{" "}
+                            — GPU tests may fail until it's updated
                           </div>
                         )}
                       </div>
                       <button
                         type="button"
-                        disabled={busyTag === rel.tag || incompatible}
+                        disabled={busyTag === rel.tag}
                         onClick={() =>
                           withBusy(
                             rel.tag,
@@ -669,7 +696,7 @@ export function WorkerCard({ worker, onRefresh }: { worker: Worker; onRefresh: (
                             `Queued: install ${rel.tag}`
                           )
                         }
-                        className="flex items-center gap-1.5 rounded-md border border-border px-2.5 py-1 text-xs font-semibold text-fg hover:border-accent/40 hover:text-accent disabled:opacity-50 disabled:hover:border-border disabled:hover:text-fg"
+                        className="flex items-center gap-1.5 rounded-md border border-border px-2.5 py-1 text-xs font-semibold text-fg hover:border-accent/40 hover:text-accent disabled:opacity-50"
                       >
                         <IconDownload width={14} height={14} />
                         {busyTag === rel.tag ? "Queuing…" : "Install"}
