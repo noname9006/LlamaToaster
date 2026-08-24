@@ -22,10 +22,14 @@ const QUANT_PATTERN = /(?:^|[-_.])(UD[-_])?((?:IQ|Q)[0-9]+(?:_[A-Z0-9]+)*|F16|F3
 // any quant token removed.
 // Extracts the quant token a filename carries (e.g. "Q4_K_M", or "UD-Q4_K_XL"
 // for an unsloth Dynamic quant), for display as its own badge -- unlike
-// modelBaseLabel below, which strips it. Neither the worker's GGUF parsing
-// nor the download-callback route ever populates metadata.quant, so this
-// filename regex (mirrors server/src/hf.ts's parseQuant, used for the HF
-// search file list) is the only source there is for a registered model.
+// modelBaseLabel below, which strips it. Only a fallback now: metadata.quant
+// is the authoritative source (read from the file's own general.file_type
+// header -- see resolveQuant below), populated at download time and, for a
+// file dropped into model_dir by hand, adopted from the worker's GGUF read
+// (server/src/routes/queue.ts's registerHashVerifiedModelFiles). This regex
+// (mirrors server/src/hf.ts's parseQuant, used for the HF search file list)
+// is what a model's metadata.quant falls back to when the header was never
+// read (old worker) or came back unparseable.
 export function extractQuant(filename: string): string | null {
   const m = filename.match(QUANT_PATTERN);
   if (!m) return null;

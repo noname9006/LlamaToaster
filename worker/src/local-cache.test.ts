@@ -100,6 +100,12 @@ describe("LocalModelCache", () => {
       entry.hf_model_id,
       null, // hf_checked_at
       null, // hf_deleted_at
+      null, // n_layer
+      null, // mtp_layers
+      null, // expert_count
+      null, // quant
+      null, // param_count
+      null, // gguf_checked_at
       entry.last_verified,
       entry.state
     );

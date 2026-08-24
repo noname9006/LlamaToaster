@@ -1,7 +1,7 @@
 import { createServer } from "node:http";
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { dirname, join, resolve, relative, isAbsolute, sep } from "node:path";
+import { dirname, join, resolve, relative, isAbsolute, sep, basename } from "node:path";
 import {
   readFileSync,
   writeFileSync,
@@ -345,18 +345,68 @@ if (!activeBuild) {
   );
 }
 
-function resolveModelPath(model: Model): string {
+// Resolves a registered Model to a concrete file path under model_dir. The
+// naive resolve (model.hf_file/model.filename joined onto model_dir) is tried
+// first; if that file doesn't exist, the local model cache is consulted to
+// find the file that actually matches this model on disk (see
+// resolveModelPathFromCache). A hand-dropped file commonly lives at a
+// different path than the canonical HF one -- e.g. "Qwen3.5-9B-PRISM-DQ.gguf"
+// at the repo root while its HF filename is "Qwen3.5-9B/Qwen3.5-9B-PRISM-DQ.gguf"
+// (subfolder) -- and resolving straight from hf_file alone is what produced
+// the "model file not found at F:\...\Qwen3.5-9B\Qwen3.5-9B-PRISM-DQ.gguf"
+// benchmark failure. Throws when nothing can be resolved.
+async function resolveModelPath(model: Model): Promise<string> {
   const name = model.source === "local" ? model.filename : model.hf_file ?? model.filename;
   if (!name) {
     throw new Error(`model ${model.id} has no filename to resolve (source=${model.source})`);
   }
   const root = resolve(config.model_dir);
-  const resolved = resolve(root, name);
-  const rel = relative(root, resolved);
+  const direct = resolve(root, name);
+  const rel = relative(root, direct);
   if (rel.startsWith("..") || isAbsolute(rel)) {
     throw new Error(`model filename resolves outside model_dir: ${name}`);
   }
-  return resolved;
+  if (existsSync(direct)) return direct;
+
+  const cached = await resolveModelPathFromCache(model, name);
+  if (cached) {
+    log.info(
+      `model ${model.id}: direct path ${direct} not present, resolved to cached path ${cached} ` +
+        `(model_dir-relative) instead`
+    );
+    return resolve(root, cached);
+  }
+  return direct;
+}
+
+// Finds the cache entry whose local path corresponds to a registered Model,
+// when the model's own hf_file/filename doesn't directly map onto disk. Three
+// match keys, in priority order:
+//   1. model.id is a SHA-256 (every download and hash-identified scan
+//      registers by digest) -- exact sha256 match.
+//   2. hf provenance -- an entry whose hf_model_id ("repo_id/filename") equals
+//      this model's "hf_repo/hf_file". Covers a file stored at its canonical
+//      HF path under a different name than the catalog row.
+//   3. basename -- an entry whose file basename equals the requested
+//      filename's basename (the "flat instead of subfolder" hand-dropped case
+//      above). Lowest priority on purpose: a basename collision (two files
+//      with the same name in different folders) resolves to the first match,
+//      which is no worse than the old behavior's silent hard failure.
+// Returns the cache entry's model_dir-relative path, or null.
+async function resolveModelPathFromCache(model: Model, name: string): Promise<string | null> {
+  const entries = await localModelCache.getAll();
+  const shaId = /^[0-9a-f]{64}$/.test(model.id) ? model.id.toLowerCase() : null;
+  const wantHfId = model.hf_repo && model.hf_file ? `${model.hf_repo}/${model.hf_file}` : null;
+  const wantBase = basename(name);
+
+  let baseMatch: string | null = null;
+  for (const e of entries) {
+    if (e.state === "missing") continue;
+    if (shaId && e.sha256 && e.sha256.toLowerCase() === shaId) return e.path;
+    if (wantHfId && e.hf_model_id === wantHfId) return e.path;
+    if (!baseMatch && basename(e.path) === wantBase) baseMatch = e.path;
+  }
+  return baseMatch;
 }
 
 // Same containment rule as resolveModelPath, applied to a raw filename
@@ -1685,13 +1735,13 @@ async function pushRunLogIfPresent(runId: string): Promise<void> {
 // condition (missing model file, requested build not installed) -- caught by
 // workerMain, which reports the job itself failed and reconciles the run.
 async function executeBenchmarkJob(payload: BenchmarkJob): Promise<void> {
-  const modelPath = resolveModelPath(payload.model);
+  const modelPath = await resolveModelPath(payload.model);
   if (!existsSync(modelPath)) {
     throw new Error(`model file not found at ${modelPath} (source=${payload.model.source})`);
   }
   let mtpModelPath: string | undefined;
   if (payload.mtp_model) {
-    mtpModelPath = resolveModelPath(payload.mtp_model);
+    mtpModelPath = await resolveModelPath(payload.mtp_model);
     if (!existsSync(mtpModelPath)) {
       throw new Error(`mtp model file not found at ${mtpModelPath} (source=${payload.mtp_model.source})`);
     }
@@ -1998,10 +2048,11 @@ async function executeDownloadModelJob(
     }
 
     updateDownloadReport(jobId, { detail: "reading GGUF metadata" });
-    const { n_layer, mtp_layers, expert_count, quant, debugReason } = await readGgufInfo(target);
+    const { n_layer, mtp_layers, expert_count, quant, param_count, debugReason } = await readGgufInfo(target);
     log.info(
       `gguf metadata for ${progressKey}: n_layer=${n_layer ?? "unknown"} mtp_layers=${mtp_layers ?? "unknown"} ` +
-        `expert_count=${expert_count ?? "unknown"} quant=${quant ?? "unknown"}${debugReason ? ` (${debugReason})` : ""}`
+        `expert_count=${expert_count ?? "unknown"} quant=${quant ?? "unknown"} ` +
+        `param_count=${param_count ?? "unknown"}${debugReason ? ` (${debugReason})` : ""}`
     );
 
     // Update local cache with the new file info. Identity (hf_model_id) and
@@ -2009,7 +2060,12 @@ async function executeDownloadModelJob(
     // payload.hf_repo/payload.hf_file by construction, so that provenance is
     // stamped even when the hash couldn't be verified against anything yet
     // (no expected SHA + not indexed) -- previously an "unknown"-state
-    // download lost its identity until a much later scan re-derived it.
+    // download lost its identity until a much later scan re-derived it. GGUF
+    // header metadata is stamped here too (with gguf_checked_at so a later
+    // reconciliation's backfillGgufMetadata doesn't re-read it) -- the same
+    // fields go to the server's catalog via the callback below, and keeping
+    // a copy in the cache means this file's heartbeat reports them even if
+    // the callback registration raced a scan.
     await localModelCache.upsert({
       path: payload.hf_file,
       size: byteLength,
@@ -2020,6 +2076,12 @@ async function executeDownloadModelJob(
       // means the entry won't look stale (and trigger a redundant re-lookup)
       // until the usual 24h re-verify window elapses.
       hf_checked_at: Date.now(),
+      n_layer: n_layer ?? undefined,
+      mtp_layers: mtp_layers ?? undefined,
+      expert_count: expert_count ?? undefined,
+      quant: quant ?? undefined,
+      param_count: param_count ?? undefined,
+      gguf_checked_at: Date.now(),
       last_verified: Date.now(),
       state: verificationState,
     });
@@ -2059,6 +2121,7 @@ async function executeDownloadModelJob(
       mtp_layers,
       expert_count,
       quant,
+      param_count,
     });
     if (!reported) {
       // The file is on disk and hashed, but the server never learned about
