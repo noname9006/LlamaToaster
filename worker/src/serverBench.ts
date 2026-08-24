@@ -120,11 +120,18 @@ function formatOffloadForLog(
   modelBufferSizes: ModelBufferSizesByModel | null | undefined
 ): string {
   if (!offload.main) return "unknown (no offload line seen)";
+  // Exact per-layer count when the build printed its assignment lines, byte-
+  // ratio estimate otherwise -- mirrors index.ts's computeResidentLayers.
   const residentSuffix = (info: OffloadInfo | null | undefined, buffers: ModelBufferSizes | null | undefined): string => {
     if (!info || info.gpu_layers_loaded <= 0 || !buffers) return "";
-    const resident = estimateResidentGpuLayersFromBufferSizes(info.gpu_layers_loaded, buffers.gpuMib, buffers.cpuMib);
-    if (resident == null || resident === info.gpu_layers_loaded) return "";
-    return `[~${resident}/${info.total_model_layers} resident]`;
+    const resident =
+      buffers.gpu_layers_exact != null
+        ? { layers: Math.min(buffers.gpu_layers_exact, info.gpu_layers_loaded), exact: true }
+        : { layers: estimateResidentGpuLayersFromBufferSizes(info.gpu_layers_loaded, buffers.gpuMib, buffers.cpuMib), exact: false };
+    if (resident.layers == null || resident.layers === info.gpu_layers_loaded) return "";
+    return resident.exact
+      ? `[${resident.layers}/${info.total_model_layers} layers on GPU]`
+      : `[~${resident.layers}/${info.total_model_layers} resident]`;
   };
   const main = `main=${offload.main.gpu_layers_loaded}/${offload.main.total_model_layers}${residentSuffix(offload.main, modelBufferSizes?.main ?? null)}`;
   const draft = offload.draft
