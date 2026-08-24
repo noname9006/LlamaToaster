@@ -71,6 +71,23 @@ export interface ResultExportRow {
   gpu_memory_model_avg_source: string | null;
   gpu_memory_model_peak_accuracy: string | null;
   gpu_memory_model_peak_source: string | null;
+  // Whole-adapter/per-process VRAM usage + whole-system RAM usage avg/peak
+  // -- see shared/types.ts's ResultRow doc comments. Raw DB columns, NULL
+  // on rows from workers predating these fields (read "n/a" in the export).
+  gpu_memory_used_avg_mib: number | null;
+  gpu_memory_used_peak_mib: number | null;
+  gpu_memory_used_avg_accuracy: string | null;
+  gpu_memory_used_avg_source: string | null;
+  gpu_memory_used_peak_accuracy: string | null;
+  gpu_memory_used_peak_source: string | null;
+  gpu_memory_process_avg_mib: number | null;
+  gpu_memory_process_peak_mib: number | null;
+  gpu_memory_process_avg_accuracy: string | null;
+  gpu_memory_process_avg_source: string | null;
+  gpu_memory_process_peak_accuracy: string | null;
+  gpu_memory_process_peak_source: string | null;
+  ram_total_used_avg_mib: number | null;
+  ram_total_used_peak_mib: number | null;
   // Only ever populated by the llama-server/MTP path -- see shared/types.ts's
   // ResultRow doc comment. suspect_samples comes straight out of the DB as
   // JSON text (SQLite has no array column type), NULL when there were none.
@@ -204,7 +221,7 @@ export function formatResultsExport(
 ): { contentType: string; filename: string; body: string } {
   if (format === "csv") {
     const header =
-      "run_id,worker_name,backend_type,backend_device_name,model_id,model_filename,test_type,n_prompt,n_gen,n_threads,n_gpu_layers,gpu_layers_loaded,total_model_layers,gpu_layers_resident_est,n_gpu_layers_draft,gpu_layers_loaded_draft,total_model_layers_draft,gpu_layers_resident_est_draft,n_cpu_moe,batch_size,ubatch_size,cache_type_k,cache_type_v,flash_attn,mtp,avg_tps,stddev_tps,ram_peak_mib,vram_peak_mib,system_memory_total_mib,gpu_memory_total_mib,gpu_memory_total_accuracy,gpu_memory_total_source,gpu_memory_free_start_accuracy,gpu_memory_free_start_source,gpu_memory_model_avg_accuracy,gpu_memory_model_avg_source,gpu_memory_model_peak_accuracy,gpu_memory_model_peak_source,sample_count,suspect_count,suspect_samples,repeat_samples,spec_accepted_drafted";
+      "run_id,worker_name,backend_type,backend_device_name,model_id,model_filename,test_type,n_prompt,n_gen,n_threads,n_gpu_layers,gpu_layers_loaded,total_model_layers,gpu_layers_resident_est,n_gpu_layers_draft,gpu_layers_loaded_draft,total_model_layers_draft,gpu_layers_resident_est_draft,n_cpu_moe,batch_size,ubatch_size,cache_type_k,cache_type_v,flash_attn,mtp,avg_tps,stddev_tps,ram_peak_mib,vram_peak_mib,system_memory_total_mib,gpu_memory_total_mib,gpu_memory_total_accuracy,gpu_memory_total_source,gpu_memory_free_start_accuracy,gpu_memory_free_start_source,gpu_memory_model_avg_accuracy,gpu_memory_model_avg_source,gpu_memory_model_peak_accuracy,gpu_memory_model_peak_source,ram_total_used_avg_mib,ram_total_used_peak_mib,gpu_memory_used_avg_mib,gpu_memory_used_peak_mib,gpu_memory_used_avg_accuracy,gpu_memory_used_avg_source,gpu_memory_used_peak_accuracy,gpu_memory_used_peak_source,gpu_memory_process_avg_mib,gpu_memory_process_peak_mib,gpu_memory_process_avg_accuracy,gpu_memory_process_avg_source,gpu_memory_process_peak_accuracy,gpu_memory_process_peak_source,sample_count,suspect_count,suspect_samples,repeat_samples,spec_accepted_drafted";
     const lines = rows.map((r) =>
       [
         neutralizeFormula(r.run_id),
@@ -246,6 +263,20 @@ export function formatResultsExport(
         fmtNullableStr(r.gpu_memory_model_avg_source),
         fmtNullableStr(r.gpu_memory_model_peak_accuracy),
         fmtNullableStr(r.gpu_memory_model_peak_source),
+        fmtNullable(r.ram_total_used_avg_mib),
+        fmtNullable(r.ram_total_used_peak_mib),
+        fmtNullable(r.gpu_memory_used_avg_mib),
+        fmtNullable(r.gpu_memory_used_peak_mib),
+        fmtNullableStr(r.gpu_memory_used_avg_accuracy),
+        fmtNullableStr(r.gpu_memory_used_avg_source),
+        fmtNullableStr(r.gpu_memory_used_peak_accuracy),
+        fmtNullableStr(r.gpu_memory_used_peak_source),
+        fmtNullable(r.gpu_memory_process_avg_mib),
+        fmtNullable(r.gpu_memory_process_peak_mib),
+        fmtNullableStr(r.gpu_memory_process_avg_accuracy),
+        fmtNullableStr(r.gpu_memory_process_avg_source),
+        fmtNullableStr(r.gpu_memory_process_peak_accuracy),
+        fmtNullableStr(r.gpu_memory_process_peak_source),
         fmtNullable(r.sample_count),
         fmtNullable(r.suspect_count),
         fmtSampleList(r.suspect_samples),
@@ -268,12 +299,12 @@ export function formatResultsExport(
     // (already fewer/combined columns even before this change), not a
     // complete dump; reach for CSV or JSON for full provenance detail.
     const header =
-      "| run | worker | backend | model | test | n_prompt | n_gen | threads | ngls | layers | batch | ubatch | ctk | ctv | fa | mtp | ngld | cpu_moe | avg_tps | stddev | ram_mib | vram_mib | vram total | suspect | suspect raw | per-run samples | mtp accepted/drafted |";
+      "| run | worker | backend | model | test | n_prompt | n_gen | threads | ngls | layers | batch | ubatch | ctk | ctv | fa | mtp | ngld | cpu_moe | avg_tps | stddev | ram_mib | ram used avg | ram used max | vram_mib | vram used avg | vram used max | vram proc avg | vram proc max | vram total | suspect | suspect raw | per-run samples | mtp accepted/drafted |";
     const sep =
-      "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |";
+      "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |";
     const lines = rows.map(
       (r) =>
-        `| ${neutralizeFormula(r.run_id.slice(0, 8))} | ${neutralizeFormula(r.worker_name)} | ${neutralizeFormula(`${r.backend_type}${r.backend_device_name ? ` (${r.backend_device_name})` : ""}`)} | ${neutralizeFormula(r.model_filename)} | ${r.test_type} | ${r.n_prompt} | ${r.n_gen} | ${r.n_threads} | ${r.n_gpu_layers} | ${fmtNullable(r.gpu_layers_loaded)}/${fmtNullable(r.total_model_layers)}${r.gpu_layers_resident_est != null ? ` (claimed; ~${r.gpu_layers_resident_est} actual)` : ""} | ${r.batch_size} | ${r.ubatch_size} | ${r.cache_type_k} | ${r.cache_type_v} | ${r.flash_attn} | ${r.mtp} | ${fmtNgldCell(r.n_gpu_layers_draft, r.gpu_layers_loaded_draft, r.total_model_layers_draft, r.gpu_layers_resident_est_draft)} | ${r.n_cpu_moe > 0 ? r.n_cpu_moe : "—"} | ${r.avg_tps.toFixed(2)} | ${r.stddev_tps.toFixed(2)} | ${r.ram_peak_mib} | ${fmtNullable(r.vram_peak_mib)} | ${fmtNullable(r.gpu_memory_total_mib)} | ${fmtNullable(r.suspect_count)}/${fmtNullable(r.sample_count)} | ${fmtSampleList(r.suspect_samples)} | ${fmtSampleList(r.repeat_samples)} | ${fmtSpecDecode(r.spec_drafted, r.spec_accepted)} |`
+        `| ${neutralizeFormula(r.run_id.slice(0, 8))} | ${neutralizeFormula(r.worker_name)} | ${neutralizeFormula(`${r.backend_type}${r.backend_device_name ? ` (${r.backend_device_name})` : ""}`)} | ${neutralizeFormula(r.model_filename)} | ${r.test_type} | ${r.n_prompt} | ${r.n_gen} | ${r.n_threads} | ${r.n_gpu_layers} | ${fmtNullable(r.gpu_layers_loaded)}/${fmtNullable(r.total_model_layers)}${r.gpu_layers_resident_est != null ? ` (claimed; ~${r.gpu_layers_resident_est} actual)` : ""} | ${r.batch_size} | ${r.ubatch_size} | ${r.cache_type_k} | ${r.cache_type_v} | ${r.flash_attn} | ${r.mtp} | ${fmtNgldCell(r.n_gpu_layers_draft, r.gpu_layers_loaded_draft, r.total_model_layers_draft, r.gpu_layers_resident_est_draft)} | ${r.n_cpu_moe > 0 ? r.n_cpu_moe : "—"} | ${r.avg_tps.toFixed(2)} | ${r.stddev_tps.toFixed(2)} | ${r.ram_peak_mib} | ${fmtNullable(r.ram_total_used_avg_mib)} | ${fmtNullable(r.ram_total_used_peak_mib)} | ${fmtNullable(r.vram_peak_mib)} | ${fmtNullable(r.gpu_memory_used_avg_mib)} | ${fmtNullable(r.gpu_memory_used_peak_mib)} | ${fmtNullable(r.gpu_memory_process_avg_mib)} | ${fmtNullable(r.gpu_memory_process_peak_mib)} | ${fmtNullable(r.gpu_memory_total_mib)} | ${fmtNullable(r.suspect_count)}/${fmtNullable(r.sample_count)} | ${fmtSampleList(r.suspect_samples)} | ${fmtSampleList(r.repeat_samples)} | ${fmtSpecDecode(r.spec_drafted, r.spec_accepted)} |`
     );
     const md = ["# Benchmark results", "", header, sep, ...lines].join("\n");
     return { contentType: "text/markdown", filename: "results.md", body: md };

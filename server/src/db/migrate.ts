@@ -96,6 +96,26 @@ const COLUMN_MIGRATIONS: ColumnSpec[] = [
   { table: "results", column: "gpu_memory_model_avg_source", ddlType: "TEXT" },
   { table: "results", column: "gpu_memory_model_peak_accuracy", ddlType: "TEXT" },
   { table: "results", column: "gpu_memory_model_peak_source", ddlType: "TEXT" },
+  // Whole-adapter and per-process VRAM usage avg/peak, plus whole-system RAM
+  // usage avg/peak -- see shared/types.ts's ResultRow doc comments and
+  // worker/src/vram.ts's per-backend readers (nvidia-smi compute-apps,
+  // Windows' GPU Process Memory counter, rocm-smi --showpids / amdgpu
+  // fdinfo) for what populates these. NULL on every row inserted before this
+  // migration, which correctly reads as "unavailable".
+  { table: "results", column: "gpu_memory_used_avg_mib", ddlType: "INTEGER" },
+  { table: "results", column: "gpu_memory_used_peak_mib", ddlType: "INTEGER" },
+  { table: "results", column: "gpu_memory_used_avg_accuracy", ddlType: "TEXT" },
+  { table: "results", column: "gpu_memory_used_avg_source", ddlType: "TEXT" },
+  { table: "results", column: "gpu_memory_used_peak_accuracy", ddlType: "TEXT" },
+  { table: "results", column: "gpu_memory_used_peak_source", ddlType: "TEXT" },
+  { table: "results", column: "gpu_memory_process_avg_mib", ddlType: "INTEGER" },
+  { table: "results", column: "gpu_memory_process_peak_mib", ddlType: "INTEGER" },
+  { table: "results", column: "gpu_memory_process_avg_accuracy", ddlType: "TEXT" },
+  { table: "results", column: "gpu_memory_process_avg_source", ddlType: "TEXT" },
+  { table: "results", column: "gpu_memory_process_peak_accuracy", ddlType: "TEXT" },
+  { table: "results", column: "gpu_memory_process_peak_source", ddlType: "TEXT" },
+  { table: "results", column: "ram_total_used_avg_mib", ddlType: "INTEGER" },
+  { table: "results", column: "ram_total_used_peak_mib", ddlType: "INTEGER" },
   { table: "results", column: "gpu_layers_loaded", ddlType: "INTEGER" },
   { table: "results", column: "total_model_layers", ddlType: "INTEGER" },
   // The MTP/draft companion model's own actual offload -- see
