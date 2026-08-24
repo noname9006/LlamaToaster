@@ -185,9 +185,12 @@ export interface BenchResult {
   // below) -- undefined for the exact same reasons offload above can be:
   // never populated on a build too old for the required verbosity flag, or
   // an item that failed before tensor loading finished. Ground truth for
-  // worker/src/index.ts's VRAM-discrepancy check, preferred over the
-  // external-VRAM-sample-based estimate whenever present.
-  modelBufferSizes?: ModelBufferSizes;
+  // worker/src/index.ts's VRAM-discrepancy check and its always-on
+  // claimed-vs-actual offload figures, preferred over the
+  // external-VRAM-sample-based estimate whenever present. Split per model
+  // (main vs MTP draft companion) so each model's own residency is
+  // attributable independently.
+  modelBufferSizes?: ModelBufferSizesByModel;
 }
 
 // llama.cpp's own one-line model-load summary, printed once *per model
@@ -284,15 +287,14 @@ export function matchOffloadLine(line: string): OffloadInfo | null {
 // bounced back to the CPU shows up here as CPU_Mapped, not CUDA0. This is
 // the ground-truth signal worker/src/index.ts's finalizeSweepItemResult
 // prefers for its VRAM-discrepancy check over the external VRAM-sample-based
-// estimate, when available. NOT verified against a real captured transcript
-// from this repo's own llama.cpp build -- no raw JSON dump was available
-// locally when this was written, so the exact device-name/spacing here is
-// from llama.cpp's public source and widely-seen pasted logs, not a live
-// run. Verify against one real raw JSON dump before fully trusting the
-// regex, same as every other "not run live" caveat in this file. `g` flag:
-// multiple GPU-visible devices, or an MTP item's base+draft pair, each print
-// their own line.
-const MODEL_BUFFER_SIZE_RE = /^load_tensors:\s*(\S+) model buffer size\s*=\s*([\d.]+)\s*MiB/gm;
+// estimate, when available. VERIFIED against real captured transcripts from
+// this repo's own b10605 build (llama-bench and llama-server with a real
+// base+draft MTP pair): llama-bench prints these un-prefixed while
+// llama-server prefixes every line with its own logger header
+// ("00.02.638.073 I load_tensors: ..."), so the regex tolerates an optional
+// prefix rather than anchoring at column 0. Applied per line (no `g`/`m`
+// statefulness to leak lastIndex across repeated .exec calls).
+const MODEL_BUFFER_SIZE_LINE_RE = /^.*?load_tensors:\s*(\S+) model buffer size\s*=\s*([\d.]+)\s*MiB/;
 const CPU_BUFFER_NAME_RE = /^CPU(_Mapped)?$/;
 
 export interface ModelBufferSizes {
@@ -304,29 +306,65 @@ export interface ModelBufferSizes {
   cpuMib: number;
 }
 
-// Aggregated across every "model buffer size" line in the whole stderr --
-// for an MTP item this sums the base model's and its --model-draft
-// companion's buffers together rather than separating them (unlike
-// parseOffloadLayers, which disambiguates by total_model_layers). The draft
-// model is always far smaller than the base, so this is a minor precision
-// loss, not a correctness one: it can only ever make a real GPU shortfall
-// look slightly less severe, never invent one. Null (not zero) when the line
-// was never seen at all -- an older build without -v/-lv 4 support, or the
-// item failed before tensor loading finished -- so callers can tell "no GPU
-// buffer, confirmed" apart from "we have no idea," exactly like
-// OffloadResult's own null already does for the layer-count line.
-export function parseModelBufferSizes(stderr: string): ModelBufferSizes | null {
-  const matches = [...stderr.matchAll(MODEL_BUFFER_SIZE_RE)];
-  if (matches.length === 0) return null;
-  let gpuMib = 0;
-  let cpuMib = 0;
-  for (const m of matches) {
-    const mib = Number(m[2]);
+// Per-model split of ModelBufferSizes, one entry per model actually loaded.
+// An MTP item (llama-server + --model-draft) loads two models, each printing
+// its own "offloaded X/Y" line followed by its own buffer-size lines (order
+// verified live against the real binary); a plain llama-bench item loads one.
+// Each buffer-size line is attributed to whichever model's "offloaded X/Y"
+// line most recently preceded it, then the resulting groups are assigned
+// main-vs-draft by total layer count -- the larger transformer stack is
+// always the base model, the same rule parseOffloadLayers uses, so this is
+// robust regardless of load order. Null members mean "no buffer lines
+// captured for that model" (draft is null on every single-model run).
+export interface ModelBufferSizesByModel {
+  main: ModelBufferSizes | null;
+  draft: ModelBufferSizes | null;
+}
+
+// Parses the whole stderr, grouping each run of buffer-size lines under the
+// "offloaded X/Y" line that precedes it -- so an MTP item's base-model
+// buffers and draft-model buffers are reported separately instead of the old
+// aggregated-together behavior (which the draft's tiny footprint made only
+// mildly wrong for the base model but impossible to report at all for the
+// draft itself -- see estimateResidentGpuLayersFromBufferSizes). Null (not
+// zero) when no buffer line was ever seen -- an older build without
+// -v/-lv 4 support, or an item that failed before tensor loading finished --
+// so callers can tell "no GPU buffer, confirmed" apart from "we have no
+// idea," exactly like OffloadResult's own null already does for the
+// layer-count line.
+export function parseModelBufferSizes(stderr: string): ModelBufferSizesByModel | null {
+  const groups: ModelBufferSizes[] = [];
+  const groupTotalLayers: number[] = [];
+  let current = -1;
+  for (const line of stderr.split("\n")) {
+    const offloadMatch = OFFLOAD_LAYERS_LINE_RE.exec(line);
+    if (offloadMatch) {
+      groups.push({ gpuMib: 0, cpuMib: 0 });
+      groupTotalLayers.push(Number(offloadMatch[2]));
+      current = groups.length - 1;
+      continue;
+    }
+    const bufferMatch = MODEL_BUFFER_SIZE_LINE_RE.exec(line);
+    if (!bufferMatch) continue;
+    if (current === -1) {
+      groups.push({ gpuMib: 0, cpuMib: 0 });
+      groupTotalLayers.push(-1);
+      current = 0;
+    }
+    const mib = Number(bufferMatch[2]);
     if (!Number.isFinite(mib)) continue;
-    if (CPU_BUFFER_NAME_RE.test(m[1])) cpuMib += mib;
-    else gpuMib += mib;
+    if (CPU_BUFFER_NAME_RE.test(bufferMatch[1])) groups[current].cpuMib += mib;
+    else groups[current].gpuMib += mib;
   }
-  return { gpuMib, cpuMib };
+  const withBuffers = groups
+    .map((g, i) => ({ gpuMib: g.gpuMib, cpuMib: g.cpuMib, totalLayers: groupTotalLayers[i] }))
+    .filter((g) => g.gpuMib > 0 || g.cpuMib > 0);
+  if (withBuffers.length === 0) return null;
+  const sorted = [...withBuffers].sort((a, b) => b.totalLayers - a.totalLayers);
+  return {
+    main: { gpuMib: sorted[0].gpuMib, cpuMib: sorted[0].cpuMib },
+    draft: sorted.length > 1 ? { gpuMib: sorted[1].gpuMib, cpuMib: sorted[1].cpuMib } : null,
+  };
 }
 
 // llama-bench's -v/--verbose (see supportsVerboseFlag above) and
