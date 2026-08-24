@@ -31,7 +31,11 @@ export default function App() {
         setAuthStatus({
           user: null,
           authEnabled: false,
-          appSettings: { communitySharingAllowed: false, accountDeletionAllowed: true },
+          appSettings: {
+            communitySharingAllowed: false,
+            accountDeletionAllowed: true,
+            workerVramDiscrepancyPolicy: "warn",
+          },
         })
       );
   }, []);
