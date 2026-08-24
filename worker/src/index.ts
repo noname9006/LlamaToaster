@@ -19,7 +19,7 @@ import { gzipSync } from "node:zlib";
 import { hostname as osHostname } from "node:os";
 import { pipeline } from "node:stream/promises";
 import { Readable, Transform } from "node:stream";
-import { runBench, matchOffloadLine, type BenchResult, type OffloadResult } from "./bench.js";
+import { runBench, matchOffloadLine, type BenchResult, type OffloadResult, type OffloadInfo, type ModelBufferSizes } from "./bench.js";
 import { runServerBench } from "./serverBench.js";
 import { MemorySampler, captureFreeMemoryBaseline, type SampleStats, type FreeMemoryBaseline } from "./sampler.js";
 import { readGpuMemory } from "./vram.js";
@@ -1035,8 +1035,24 @@ export interface OffloadDiscrepancy {
   source: "llama_cpp_buffer" | "vram_sample";
 }
 
+// The actual-residency estimate for one model, as a "[~N/total resident]"
+// suffix on the claimed "main=X/Y" text. Omitted when there's no estimate
+// to show (no claim, or no buffer report/baseline to derive one from) and
+// when the estimate matches the claim -- the claimed "X/Y" already says it
+// all in that case, same "only flag disagreement" convention the UI uses.
+// resident is the worker-derived figure from shared/vramEstimate.ts (see
+// estimateResidentGpuLayersFromBufferSizes), which this file computes for
+// the base model and -- on an MTP item with a separate --model-draft file --
+// the draft companion too.
+function formatResidentSuffix(info: OffloadInfo | null | undefined, resident: number | null): string {
+  if (!info || resident == null || resident === info.gpu_layers_loaded) return "";
+  return `[~${resident}/${info.total_model_layers} resident]`;
+}
+
 function formatOffloadLine(
   offload: OffloadResult,
+  mainResidentEst: number | null,
+  draftResidentEst: number | null,
   // Only ever passed on the success path, and only when finalizeSweepItem-
   // Result's VRAM-discrepancy check fired for this item -- i.e. llama.cpp's
   // own X/Y above was contradicted by other telemetry from the same run.
@@ -1047,8 +1063,10 @@ function formatOffloadLine(
   discrepancy?: OffloadDiscrepancy
 ): string {
   if (!offload.main) return "offload: unknown (no offload line seen in output)";
-  const main = `main=${offload.main.gpu_layers_loaded}/${offload.main.total_model_layers}`;
-  const draft = offload.draft ? ` draft=${offload.draft.gpu_layers_loaded}/${offload.draft.total_model_layers}` : "";
+  const main = `main=${offload.main.gpu_layers_loaded}/${offload.main.total_model_layers}${formatResidentSuffix(offload.main, mainResidentEst)}`;
+  const draft = offload.draft
+    ? ` draft=${offload.draft.gpu_layers_loaded}/${offload.draft.total_model_layers}${formatResidentSuffix(offload.draft, draftResidentEst)}`
+    : "";
   let note = "";
   if (discrepancy && offload.main) {
     const observedLabel =
@@ -1234,14 +1252,36 @@ async function finalizeSweepItemResult(
   // "claimed 33/33, ~=0 actually resident" everywhere, not just in this
   // warning paragraph.
   let offloadDiscrepancy: OffloadDiscrepancy | undefined;
+
+  // Always-on "actual GPU layers" estimate for the base model -- how many of
+  // the layers llama.cpp's own "offloaded X/Y" line *claimed* actually
+  // landed in a GPU buffer, from llama.cpp's own post-allocation "model
+  // buffer size" report (see bench.ts's parseModelBufferSizes). The claim is
+  // the scheduler's pre-allocation plan; the buffer split is where the
+  // allocator really put the weights, so the two can diverge without any
+  // error (Windows' NVIDIA driver silently backing an overcommitted CUDA
+  // allocation with system RAM -- sysmem fallback -- produces a full
+  // "offloaded 33/33" claim with ~0 bytes on the GPU buffer). Computed for
+  // every item, not just suspicious ones, so logs/UI/CSV can always show
+  // claimed-vs-actual side by side. Null when nothing was claimed (ngl=0 /
+  // cpu backend) or no buffer report was captured to divide against.
+  const mainResidentEst = computeResidentLayers(offload.main, bench.modelBufferSizes?.main ?? null);
+  // Draft-model sibling of mainResidentEst above -- the MTP/draft companion's
+  // own claimed-vs-actual, from its own separately-attributed buffer lines
+  // (see parseModelBufferSizes). Only meaningful on an MTP item with a
+  // separate --model-draft file. No VRAM-sample fallback here: the external
+  // sampler attributes its peak to the process as a whole and can't split
+  // base vs draft, so llama.cpp's own buffer split is the only honest source.
+  const draftResidentEst = computeResidentLayers(offload.draft, bench.modelBufferSizes?.draft ?? null);
+
   if (item.n_cpu_moe === 0 && offload.main && offload.main.gpu_layers_loaded > 0) {
     const estimatedMib = estimateVramNeededMib({
       modelSizeBytes,
       totalModelLayers: offload.main.total_model_layers,
       requestedNgl: offload.main.gpu_layers_loaded,
     });
-    if (estimatedMib != null && bench.modelBufferSizes) {
-      const { gpuMib, cpuMib } = bench.modelBufferSizes;
+    if (estimatedMib != null && bench.modelBufferSizes?.main) {
+      const { gpuMib, cpuMib } = bench.modelBufferSizes.main;
       if (isVramDiscrepancy(estimatedMib, gpuMib)) {
         vramDiscrepancyWarning =
           `claimed offload ${offload.main.gpu_layers_loaded}/${offload.main.total_model_layers} layers to GPU, ` +
@@ -1251,7 +1291,7 @@ async function finalizeSweepItemResult(
         offloadDiscrepancy = {
           estimatedMib,
           observedMib: Math.round(gpuMib),
-          residentEst: estimateResidentGpuLayersFromBufferSizes(offload.main.gpu_layers_loaded, gpuMib, cpuMib),
+          residentEst: mainResidentEst,
           source: "llama_cpp_buffer",
         };
       }
@@ -1308,10 +1348,12 @@ async function finalizeSweepItemResult(
       total_model_layers: offload.main?.total_model_layers ?? null,
       gpu_layers_loaded_draft: offload.draft?.gpu_layers_loaded ?? null,
       total_model_layers_draft: offload.draft?.total_model_layers ?? null,
-      // Only ever non-null when the discrepancy check above fired -- see
+      // Always set (not only when the discrepancy check fired) -- see
       // shared/types.ts's ResultRow.gpu_layers_resident_est. The UI renders
-      // this as "~N/total ⚠" in place of the raw claim.
-      gpu_layers_resident_est: offloadDiscrepancy ? offloadDiscrepancy.residentEst : null,
+      // this as the actual-resident figure, yellow-highlighted whenever it
+      // disagrees with the claimed gpu_layers_loaded above.
+      gpu_layers_resident_est: mainResidentEst,
+      gpu_layers_resident_est_draft: draftResidentEst,
     }));
     // One structured block per test, covering everything RunDetail.tsx's
     // results table shows for this row (params, actual offload, pp/tg
@@ -1319,7 +1361,7 @@ async function finalizeSweepItemResult(
     // plus which engine produced it -- see the format* helpers above. This
     // replaces the previous single-line "done: pp=...tok/s ram_peak=..."
     // summary, which dropped most of that detail on the floor.
-    const summaryLines = [`${label}: TEST SUMMARY -- engine=${processName} status=done`, `  params: ${formatItemParams(item)}`, `  ${formatOffloadLine(offload, offloadDiscrepancy)}`, `  results: ${formatResultsLine(results)}`];
+    const summaryLines = [`${label}: TEST SUMMARY -- engine=${processName} status=done`, `  params: ${formatItemParams(item)}`, `  ${formatOffloadLine(offload, mainResidentEst, draftResidentEst, offloadDiscrepancy)}`, `  results: ${formatResultsLine(results)}`];
     const ttftLine = formatTtftLine(results);
     if (ttftLine) summaryLines.push(`  ${ttftLine}`);
     for (const line of formatMemoryLines(stats, baseline)) summaryLines.push(`  ${line}`);
@@ -1375,7 +1417,7 @@ async function finalizeSweepItemResult(
   const failureLines = [
     `${label}: TEST SUMMARY -- engine=${processName} status=${status}`,
     `  params: ${formatItemParams(item)}`,
-    `  ${formatOffloadLine(offload)}`,
+    `  ${formatOffloadLine(offload, null, null)}`,
     ...formatMemoryLines(stats, baseline).map((line) => `  ${line}`),
     `  error (code ${bench.code}, signal ${bench.signal ?? "none"}): ${errorMessage}`,
   ];
@@ -1389,6 +1431,20 @@ async function finalizeSweepItemResult(
     vram_avg_mib: stats.vram_avg_mib,
   });
   return status;
+}
+
+// The always-on "how many of the claimed layers actually landed in a GPU
+// buffer" figure for one model. Ground truth is llama.cpp's own post-
+// allocation "model buffer size" lines (see bench.ts's parseModelBufferSizes
+// and shared/vramEstimate.ts's estimateResidentGpuLayersFromBufferSizes) --
+// the claim ("offloaded X/Y") is the scheduler's pre-allocation plan, while
+// the buffer split is where the allocator actually put the weights. Null
+// when there's nothing to estimate (no claim -- ngl=0/cpu backend -- or no
+// buffer report to divide against: build too old for -v/-lv 4, or the item
+// failed before tensor loading finished).
+function computeResidentLayers(info: OffloadInfo | null | undefined, buffers: ModelBufferSizes | null): number | null {
+  if (!info || info.gpu_layers_loaded <= 0 || !buffers) return null;
+  return estimateResidentGpuLayersFromBufferSizes(info.gpu_layers_loaded, buffers.gpuMib, buffers.cpuMib);
 }
 
 // Runs exactly one sweep combination as its own llama-bench process, reports

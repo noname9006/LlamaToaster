@@ -29,11 +29,16 @@ export interface ResultExportRow {
   gpu_layers_loaded_draft: number | null;
   total_model_layers_draft: number | null;
   // Worker-derived ESTIMATE of actually-VRAM-resident base-model layers --
-  // only ever non-null when the item's VRAM telemetry contradicted
-  // gpu_layers_loaded (Windows CUDA sysmem fallback detection), see
-  // shared/types.ts's ResultRow.gpu_layers_resident_est. Raw DB column via
-  // SELECT r.* -- NULL on pre-migration rows and unchallenged claims alike.
+  // written on every row where it was computable (llama.cpp's own
+  // post-allocation buffer split, or the VRAM-discrepancy heuristic when
+  // that report was missing), see shared/types.ts's
+  // ResultRow.gpu_layers_resident_est. Raw DB column via SELECT r.* -- NULL
+  // on pre-migration rows and rows with nothing to estimate.
   gpu_layers_resident_est: number | null;
+  // The MTP/draft companion model's own actually-resident estimate -- see
+  // shared/types.ts's ResultRow.gpu_layers_resident_est_draft. NULL on every
+  // non-MTP row and pre-migration rows.
+  gpu_layers_resident_est_draft: number | null;
   batch_size: number;
   ubatch_size: number;
   cache_type_k: string;
@@ -127,9 +132,14 @@ function fmtSpecDecode(drafted: number | null, accepted: number | null): string 
 // only ever populated on an MTP row whose draft model's own runtime offload
 // line was captured (see shared/types.ts's ResultRow doc comment) -- suffix
 // omitted entirely rather than printing "n/a/n/a" on every ordinary non-MTP
-// row.
-function fmtNgldCell(requested: number, loaded: number | null, total: number | null): string {
-  return loaded !== null && total !== null ? `${requested} (${loaded}/${total} loaded)` : String(requested);
+// row. resident (when present) is the worker's actually-resident estimate
+// for the draft model -- see gpu_layers_resident_est_draft.
+function fmtNgldCell(requested: number, loaded: number | null, total: number | null, resident: number | null): string {
+  if (loaded !== null && total !== null) {
+    const actual = resident !== null ? `; ~${resident} actual` : "";
+    return `${requested} (${loaded}/${total} loaded${actual})`;
+  }
+  return String(requested);
 }
 
 function fmtSampleList(json: string | null): string {
@@ -194,7 +204,7 @@ export function formatResultsExport(
 ): { contentType: string; filename: string; body: string } {
   if (format === "csv") {
     const header =
-      "run_id,worker_name,backend_type,backend_device_name,model_id,model_filename,test_type,n_prompt,n_gen,n_threads,n_gpu_layers,gpu_layers_loaded,total_model_layers,gpu_layers_resident_est,n_gpu_layers_draft,gpu_layers_loaded_draft,total_model_layers_draft,n_cpu_moe,batch_size,ubatch_size,cache_type_k,cache_type_v,flash_attn,mtp,avg_tps,stddev_tps,ram_peak_mib,vram_peak_mib,system_memory_total_mib,gpu_memory_total_mib,gpu_memory_total_accuracy,gpu_memory_total_source,gpu_memory_free_start_accuracy,gpu_memory_free_start_source,gpu_memory_model_avg_accuracy,gpu_memory_model_avg_source,gpu_memory_model_peak_accuracy,gpu_memory_model_peak_source,sample_count,suspect_count,suspect_samples,repeat_samples,spec_accepted_drafted";
+      "run_id,worker_name,backend_type,backend_device_name,model_id,model_filename,test_type,n_prompt,n_gen,n_threads,n_gpu_layers,gpu_layers_loaded,total_model_layers,gpu_layers_resident_est,n_gpu_layers_draft,gpu_layers_loaded_draft,total_model_layers_draft,gpu_layers_resident_est_draft,n_cpu_moe,batch_size,ubatch_size,cache_type_k,cache_type_v,flash_attn,mtp,avg_tps,stddev_tps,ram_peak_mib,vram_peak_mib,system_memory_total_mib,gpu_memory_total_mib,gpu_memory_total_accuracy,gpu_memory_total_source,gpu_memory_free_start_accuracy,gpu_memory_free_start_source,gpu_memory_model_avg_accuracy,gpu_memory_model_avg_source,gpu_memory_model_peak_accuracy,gpu_memory_model_peak_source,sample_count,suspect_count,suspect_samples,repeat_samples,spec_accepted_drafted";
     const lines = rows.map((r) =>
       [
         neutralizeFormula(r.run_id),
@@ -214,6 +224,7 @@ export function formatResultsExport(
         r.n_gpu_layers_draft,
         fmtNullable(r.gpu_layers_loaded_draft),
         fmtNullable(r.total_model_layers_draft),
+        fmtNullable(r.gpu_layers_resident_est_draft),
         r.n_cpu_moe,
         r.batch_size,
         r.ubatch_size,
@@ -262,7 +273,7 @@ export function formatResultsExport(
       "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |";
     const lines = rows.map(
       (r) =>
-        `| ${neutralizeFormula(r.run_id.slice(0, 8))} | ${neutralizeFormula(r.worker_name)} | ${neutralizeFormula(`${r.backend_type}${r.backend_device_name ? ` (${r.backend_device_name})` : ""}`)} | ${neutralizeFormula(r.model_filename)} | ${r.test_type} | ${r.n_prompt} | ${r.n_gen} | ${r.n_threads} | ${r.n_gpu_layers} | ${fmtNullable(r.gpu_layers_loaded)}/${fmtNullable(r.total_model_layers)}${r.gpu_layers_resident_est != null ? ` (claimed; ~${r.gpu_layers_resident_est} actual)` : ""} | ${r.batch_size} | ${r.ubatch_size} | ${r.cache_type_k} | ${r.cache_type_v} | ${r.flash_attn} | ${r.mtp} | ${fmtNgldCell(r.n_gpu_layers_draft, r.gpu_layers_loaded_draft, r.total_model_layers_draft)} | ${r.n_cpu_moe > 0 ? r.n_cpu_moe : "—"} | ${r.avg_tps.toFixed(2)} | ${r.stddev_tps.toFixed(2)} | ${r.ram_peak_mib} | ${fmtNullable(r.vram_peak_mib)} | ${fmtNullable(r.gpu_memory_total_mib)} | ${fmtNullable(r.suspect_count)}/${fmtNullable(r.sample_count)} | ${fmtSampleList(r.suspect_samples)} | ${fmtSampleList(r.repeat_samples)} | ${fmtSpecDecode(r.spec_drafted, r.spec_accepted)} |`
+        `| ${neutralizeFormula(r.run_id.slice(0, 8))} | ${neutralizeFormula(r.worker_name)} | ${neutralizeFormula(`${r.backend_type}${r.backend_device_name ? ` (${r.backend_device_name})` : ""}`)} | ${neutralizeFormula(r.model_filename)} | ${r.test_type} | ${r.n_prompt} | ${r.n_gen} | ${r.n_threads} | ${r.n_gpu_layers} | ${fmtNullable(r.gpu_layers_loaded)}/${fmtNullable(r.total_model_layers)}${r.gpu_layers_resident_est != null ? ` (claimed; ~${r.gpu_layers_resident_est} actual)` : ""} | ${r.batch_size} | ${r.ubatch_size} | ${r.cache_type_k} | ${r.cache_type_v} | ${r.flash_attn} | ${r.mtp} | ${fmtNgldCell(r.n_gpu_layers_draft, r.gpu_layers_loaded_draft, r.total_model_layers_draft, r.gpu_layers_resident_est_draft)} | ${r.n_cpu_moe > 0 ? r.n_cpu_moe : "—"} | ${r.avg_tps.toFixed(2)} | ${r.stddev_tps.toFixed(2)} | ${r.ram_peak_mib} | ${fmtNullable(r.vram_peak_mib)} | ${fmtNullable(r.gpu_memory_total_mib)} | ${fmtNullable(r.suspect_count)}/${fmtNullable(r.sample_count)} | ${fmtSampleList(r.suspect_samples)} | ${fmtSampleList(r.repeat_samples)} | ${fmtSpecDecode(r.spec_drafted, r.spec_accepted)} |`
     );
     const md = ["# Benchmark results", "", header, sep, ...lines].join("\n");
     return { contentType: "text/markdown", filename: "results.md", body: md };

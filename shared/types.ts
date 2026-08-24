@@ -451,18 +451,25 @@ export interface ResultRow {
   gpu_layers_loaded_draft?: number | null;
   total_model_layers_draft?: number | null;
   // Worker-derived ESTIMATE of how many of gpu_layers_loaded's layers were
-  // actually VRAM-resident -- computed only when the post-run discrepancy
-  // check fired (claimed > 0 but observed vram_peak_mib implausibly below
-  // what that many resident layers would need, see shared/vramEstimate.ts's
-  // estimateResidentGpuLayers). llama.cpp's own count above reflects buffer
+  // actually VRAM-resident -- computed on EVERY run (not just suspicious
+  // ones) whenever llama.cpp's own post-allocation buffer report is
+  // available (see worker/src/bench.ts's parseModelBufferSizes), or from the
+  // VRAM-discrepancy heuristic on a run where that report was missing and
+  // the claim looked wrong. llama.cpp's own count above reflects buffer
   // *assignment*, never residency, and Windows' NVIDIA driver can silently
   // back those assignments with system RAM (CUDA sysmem fallback) -- this is
-  // the "~" figure shown next to such a claim so logs/UI can say "claimed
-  // 33/33, ~=0 actually resident" instead of endorsing the claim. Null or
-  // undefined whenever the claim wasn't contradicted (nothing to correct)
-  // or no pre-run baseline existed to attribute the peak against. Base model
-  // only -- the draft companion isn't separately verified.
+  // the "~" figure shown next to such a claim so logs/UI/CSV can say
+  // "claimed 33/33, ~=30 actually resident" instead of endorsing the claim.
+  // Null whenever nothing was claimed (ngl=0 / cpu backend) or no buffer
+  // report/baseline existed to derive a figure from. Base model only -- the
+  // draft companion has its own gpu_layers_resident_est_draft.
   gpu_layers_resident_est?: number | null;
+  // The MTP/draft companion model's own actually-resident estimate -- see
+  // gpu_layers_resident_est above for the general meaning; this is the draft
+  // model's own figure, derived only from its separately-attributed buffer
+  // lines (the external VRAM sample can't split base vs draft). Optional +
+  // undefined on every non-MTP row, same as gpu_layers_loaded_draft.
+  gpu_layers_resident_est_draft?: number | null;
   // Only ever populated by the llama-server/MTP path (worker/src/serverBench.ts)
   // -- the llama-bench-CLI path (bench.ts) does its own internal repeat
   // averaging and never sees individual readings, so these stay undefined
@@ -554,11 +561,16 @@ export interface IngestResultInput {
   total_model_layers_draft?: number | null;
   // Optional (like n_gpu_layers_draft/n_cpu_moe above) so a version-skewed
   // worker that predates this field simply won't send it -- and null when a
-  // current worker ran the discrepancy check but had nothing to flag. Only
-  // ever non-null when the item's claimed offload was contradicted by its
-  // own VRAM telemetry -- see ResultRow.gpu_layers_resident_est and
-  // shared/vramEstimate.ts.
+  // current worker had nothing to estimate (no offload claim, or no buffer
+  // report to derive the figure from). Sent on every ordinary row whenever
+  // an actual-resident estimate was computable -- see
+  // ResultRow.gpu_layers_resident_est and shared/vramEstimate.ts.
   gpu_layers_resident_est?: number | null;
+  // See the matching fields on ResultRow above -- the draft companion's own
+  // actually-resident estimate, sent only by the llama-server/MTP path and
+  // only when the draft model's own buffer lines were captured. Optional
+  // like gpu_layers_resident_est above (version-skew tolerant).
+  gpu_layers_resident_est_draft?: number | null;
   sample_count?: number;
   suspect_count?: number;
   suspect_samples?: number[];

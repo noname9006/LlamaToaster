@@ -70,7 +70,9 @@ const MERGED_COLUMN_DEFS: ColDef[] = [
   {
     label: "offload",
     description:
-      "Base model: layers actually loaded onto the GPU / this model's total transformer layer count, both read from llama.cpp's own runtime output (not calculated) — loaded may be less than ngl if the model has fewer layers than requested. On an MTP row this is always the base model's own figures, never the draft model's — see the ngld column for the draft's.",
+      "Base model: layers actually loaded onto the GPU / this model's total transformer layer count, both read from llama.cpp's own runtime output (not calculated) — loaded may be less than ngl if the model has fewer layers than requested. " +
+      "When llama.cpp's own post-allocation buffer report contradicts the claim, the cell shows the actually-GPU-resident estimate instead (~N/total, highlighted yellow) — the claim is the scheduler's plan, the estimate is where the weights really landed. " +
+      "On an MTP row this is always the base model's own figures, never the draft model's — see the ngld column for the draft's.",
     sortKey: "layers_loaded",
   },
   {
@@ -100,7 +102,9 @@ const MERGED_COLUMN_DEFS: ColDef[] = [
   {
     label: "offload d",
     description:
-      "Draft model: layers actually loaded onto the GPU / this model's total transformer layer count, both read from llama.cpp's own runtime output (not calculated) — loaded may be less than ngld if the draft model has fewer layers than requested. Only meaningful for an \"on\" mtp combination with a separate --model-draft file.",
+      "Draft model: layers actually loaded onto the GPU / this model's total transformer layer count, both read from llama.cpp's own runtime output (not calculated) — loaded may be less than ngld if the draft model has fewer layers than requested. " +
+      "When llama.cpp's own post-allocation buffer report contradicts the claim, the cell shows the actually-GPU-resident estimate instead (~N/total, highlighted yellow). " +
+      "Only meaningful for an \"on\" mtp combination with a separate --model-draft file.",
     sortKey: "layers_loaded_draft",
   },
   {
@@ -1022,40 +1026,42 @@ export function RunDetail() {
                       <td className="pl-1 pr-0.5 py-1.5 text-muted">{it.n_threads}</td>
                       <td className="pl-0.5 pr-1 py-1.5 text-muted">{it.n_gpu_layers}</td>
                       <td className="px-1 py-1.5 text-muted">
-                        {/* gpu_layers_resident_est is only ever non-null when
-                            other telemetry from the same run contradicted
-                            llama.cpp's claimed offload (Windows CUDA sysmem
-                            fallback) -- see shared/types.ts's
-                            ResultRow.gpu_layers_resident_est. That telemetry
-                            is either llama.cpp's own post-allocation buffer
-                            report (preferred, see worker/src/bench.ts's
-                            parseModelBufferSizes) or, when that line wasn't
-                            available, a VRAM-sample-based estimate -- the DB
-                            doesn't record which, so this tooltip is worded to
-                            hold for either. The cell shows the estimated
-                            actually-resident figure instead of endorsing a
-                            claim that never really happened; the full
-                            claimed-vs-actual story goes in the tooltip,
-                            matching the warning already shown in this row's
-                            status column. */}
-                        {anyResult?.gpu_layers_resident_est != null && anyResult?.total_model_layers != null ? (
-                          <span
-                            className="text-warning"
-                            title={
-                              `llama.cpp reported ${anyResult.gpu_layers_loaded}/${anyResult.total_model_layers} layers offloaded to GPU, ` +
-                              `but the actual GPU memory footprint stayed far below what that would require -- only ` +
-                              `~${anyResult.gpu_layers_resident_est}/${anyResult.total_model_layers} layers were likely actually GPU-resident. ` +
-                              `The driver silently served the model from system RAM (Windows CUDA sysmem fallback); ` +
-                              `these speeds are CPU-class despite the full-offload claim.`
-                            }
-                          >
-                            ~{anyResult.gpu_layers_resident_est}/{anyResult.total_model_layers} ⚠
-                          </span>
-                        ) : anyResult?.gpu_layers_loaded != null && anyResult?.total_model_layers != null
-                          ? `${anyResult.gpu_layers_loaded}/${anyResult.total_model_layers}`
-                          : isTerminal
-                            ? "n/a"
-                            : "—"}
+                        {/* gpu_layers_resident_est is the worker's
+                            actually-GPU-resident estimate, written on every
+                            row where it was computable from llama.cpp's own
+                            post-allocation buffer report (preferred, see
+                            worker/src/bench.ts's parseModelBufferSizes) or
+                            the VRAM-sample heuristic -- see shared/types.ts's
+                            ResultRow.gpu_layers_resident_est. The claimed
+                            gpu_layers_loaded figure is the scheduler's
+                            pre-allocation plan; the estimate is where the
+                            weights really landed, so when the two disagree
+                            (yellow highlight) the claim was only partially
+                            (or not at all -- Windows CUDA sysmem fallback)
+                            fulfilled. The cell shows the estimate instead of
+                            endorsing the claim; the full story goes in the
+                            tooltip. */}
+                        {anyResult?.gpu_layers_loaded != null && anyResult?.total_model_layers != null ? (
+                          anyResult.gpu_layers_resident_est != null &&
+                          anyResult.gpu_layers_resident_est !== anyResult.gpu_layers_loaded ? (
+                            <span
+                              className="text-warning"
+                              title={
+                                `llama.cpp claimed ${anyResult.gpu_layers_loaded}/${anyResult.total_model_layers} layers offloaded to GPU, ` +
+                                `but its own post-allocation buffer report shows only ~${anyResult.gpu_layers_resident_est}/${anyResult.total_model_layers} ` +
+                                `actually GPU-resident -- the rest of the weights landed in CPU/system memory. ` +
+                                `A large gap means the driver may be silently serving the model from system RAM ` +
+                                `(Windows CUDA sysmem fallback); these speeds can then be CPU-class despite the claim.`
+                              }
+                            >
+                              ~{anyResult.gpu_layers_resident_est}/{anyResult.total_model_layers} ⚠
+                            </span>
+                          ) : (
+                            `${anyResult.gpu_layers_loaded}/${anyResult.total_model_layers}`
+                          )
+                        ) : isTerminal
+                          ? "n/a"
+                          : "—"}
                       </td>
                       <td className="px-1 py-1.5 text-muted">{it.n_cpu_moe > 0 ? it.n_cpu_moe : "—"}</td>
                       <td className="px-1 py-1.5 text-muted">{it.batch_size}</td>
@@ -1074,13 +1080,27 @@ export function RunDetail() {
                       </td>
                       <td className="px-1 py-1.5 text-muted">{it.mtp === "on" ? it.n_gpu_layers_draft : "—"}</td>
                       <td className="px-1 py-1.5 text-muted">
-                        {it.mtp !== "on"
-                          ? "—"
-                          : anyResult?.gpu_layers_loaded_draft != null && anyResult?.total_model_layers_draft != null
-                            ? `${anyResult.gpu_layers_loaded_draft}/${anyResult.total_model_layers_draft}`
-                            : isTerminal
-                              ? "n/a"
-                              : "—"}
+                        {it.mtp !== "on" ? (
+                          "—"
+                        ) : anyResult?.gpu_layers_loaded_draft != null && anyResult?.total_model_layers_draft != null ? (
+                          anyResult.gpu_layers_resident_est_draft != null &&
+                          anyResult.gpu_layers_resident_est_draft !== anyResult.gpu_layers_loaded_draft ? (
+                            <span
+                              className="text-warning"
+                              title={
+                                `llama.cpp claimed ${anyResult.gpu_layers_loaded_draft}/${anyResult.total_model_layers_draft} draft-model layers offloaded to GPU, ` +
+                                `but its own post-allocation buffer report shows only ~${anyResult.gpu_layers_resident_est_draft}/${anyResult.total_model_layers_draft} ` +
+                                `actually GPU-resident -- the rest landed in CPU/system memory.`
+                              }
+                            >
+                              ~{anyResult.gpu_layers_resident_est_draft}/{anyResult.total_model_layers_draft} ⚠
+                            </span>
+                          ) : (
+                            `${anyResult.gpu_layers_loaded_draft}/${anyResult.total_model_layers_draft}`
+                          )
+                        ) : isTerminal
+                          ? "n/a"
+                          : "—"}
                       </td>
                       <td className="px-1 py-1.5">
                         {showLivePp ? (

@@ -7,7 +7,7 @@ describe("parseModelBufferSizes", () => {
     expect(parseModelBufferSizes("")).toBeNull();
   });
 
-  it("sums a CPU_Mapped + CUDA0 pair from a genuine full-offload run", () => {
+  it("sums a CPU_Mapped + CUDA0 pair from a genuine full-offload run, attributed to main", () => {
     const stderr = [
       "load_tensors: loading model tensors, type = q4_K",
       "load_tensors: offloading 32 repeating layers to GPU",
@@ -16,7 +16,7 @@ describe("parseModelBufferSizes", () => {
       "load_tensors:        CUDA0 model buffer size =  4368.51 MiB",
     ].join("\n");
     const result = parseModelBufferSizes(stderr);
-    expect(result).toEqual({ gpuMib: 4368.51, cpuMib: 137.42 });
+    expect(result).toEqual({ main: { gpuMib: 4368.51, cpuMib: 137.42 }, draft: null });
   });
 
   it("reproduces the diagnosed sysmem-fallback fingerprint: claimed GPU, everything actually landed on CPU_Mapped", () => {
@@ -29,12 +29,12 @@ describe("parseModelBufferSizes", () => {
       "load_tensors:   CPU_Mapped model buffer size =  5880.00 MiB",
     ].join("\n");
     const result = parseModelBufferSizes(stderr);
-    expect(result).toEqual({ gpuMib: 0, cpuMib: 5880 });
+    expect(result).toEqual({ main: { gpuMib: 0, cpuMib: 5880 }, draft: null });
   });
 
   it("treats a bare CPU buffer name (non-mmap) the same as CPU_Mapped", () => {
     const stderr = "load_tensors:          CPU model buffer size =   256.00 MiB";
-    expect(parseModelBufferSizes(stderr)).toEqual({ gpuMib: 0, cpuMib: 256 });
+    expect(parseModelBufferSizes(stderr)).toEqual({ main: { gpuMib: 0, cpuMib: 256 }, draft: null });
   });
 
   it("sums multiple GPU devices from a multi-GPU split", () => {
@@ -43,37 +43,56 @@ describe("parseModelBufferSizes", () => {
       "load_tensors:        CUDA1 model buffer size =  1500.50 MiB",
       "load_tensors:   CPU_Mapped model buffer size =    50.00 MiB",
     ].join("\n");
-    expect(parseModelBufferSizes(stderr)).toEqual({ gpuMib: 3500.5, cpuMib: 50 });
+    expect(parseModelBufferSizes(stderr)).toEqual({ main: { gpuMib: 3500.5, cpuMib: 50 }, draft: null });
   });
 
   it("recognizes non-CUDA backend device names as GPU buffers (ROCm, Vulkan, Metal)", () => {
     expect(parseModelBufferSizes("load_tensors:        ROCm0 model buffer size =  1000.00 MiB")).toEqual({
-      gpuMib: 1000,
-      cpuMib: 0,
+      main: { gpuMib: 1000, cpuMib: 0 },
+      draft: null,
     });
     expect(parseModelBufferSizes("load_tensors:      Vulkan0 model buffer size =  1000.00 MiB")).toEqual({
-      gpuMib: 1000,
-      cpuMib: 0,
+      main: { gpuMib: 1000, cpuMib: 0 },
+      draft: null,
     });
     expect(parseModelBufferSizes("load_tensors:        Metal model buffer size =  1000.00 MiB")).toEqual({
-      gpuMib: 1000,
-      cpuMib: 0,
+      main: { gpuMib: 1000, cpuMib: 0 },
+      draft: null,
     });
   });
 
   it("a plain -ngl 0 run reports everything on CPU", () => {
     const stderr = "load_tensors:   CPU_Mapped model buffer size =  5880.00 MiB";
-    expect(parseModelBufferSizes(stderr)).toEqual({ gpuMib: 0, cpuMib: 5880 });
+    expect(parseModelBufferSizes(stderr)).toEqual({ main: { gpuMib: 0, cpuMib: 5880 }, draft: null });
   });
 
-  it("aggregates base+draft MTP buffers together rather than separating them", () => {
-    // Known, documented simplification -- see parseModelBufferSizes's own
-    // comment. The draft's tiny buffer just adds a little noise, never masks
-    // a real base-model shortfall.
+  it("splits base+draft MTP buffers apart by their preceding offload line", () => {
+    // Ordering verified live against the b10605 llama-server binary: each
+    // model prints its own "offloaded X/Y" line, then its own buffer lines.
     const stderr = [
-      "load_tensors:        CUDA0 model buffer size =  4000.00 MiB", // base
-      "load_tensors:        CUDA0 model buffer size =    50.00 MiB", // draft
+      "load_tensors: offloaded 36/36 layers to GPU", // base
+      "load_tensors:   CPU_Mapped model buffer size =  1756.00 MiB", // base
+      "load_tensors:      Vulkan0 model buffer size =  1290.62 MiB", // base
+      "load_tensors: offloaded 5/5 layers to GPU", // draft
+      "load_tensors:   CPU_Mapped model buffer size =    68.00 MiB", // draft
+      "load_tensors:      Vulkan0 model buffer size =    78.25 MiB", // draft
     ].join("\n");
-    expect(parseModelBufferSizes(stderr)).toEqual({ gpuMib: 4050, cpuMib: 0 });
+    const result = parseModelBufferSizes(stderr);
+    expect(result).toEqual({
+      main: { gpuMib: 1290.62, cpuMib: 1756 },
+      draft: { gpuMib: 78.25, cpuMib: 68 },
+    });
+  });
+
+  it("tolerates llama-server's logger prefix on every line", () => {
+    const stderr = [
+      "0.02.638.073 I load_tensors: offloaded 36/36 layers to GPU",
+      "0.02.638.078 I load_tensors:   CPU_Mapped model buffer size =  1756.00 MiB",
+      "0.02.638.079 I load_tensors:      Vulkan0 model buffer size =  1290.62 MiB",
+    ].join("\n");
+    expect(parseModelBufferSizes(stderr)).toEqual({
+      main: { gpuMib: 1290.62, cpuMib: 1756 },
+      draft: null,
+    });
   });
 });

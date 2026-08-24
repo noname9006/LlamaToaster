@@ -103,14 +103,20 @@ const COLUMN_MIGRATIONS: ColumnSpec[] = [
   // parseOffloadLayers.
   { table: "results", column: "gpu_layers_loaded_draft", ddlType: "INTEGER" },
   { table: "results", column: "total_model_layers_draft", ddlType: "INTEGER" },
-  // Estimated actually-VRAM-resident base-model layer count, written only by
-  // a worker whose post-run VRAM-discrepancy check fired for this item (the
-  // Windows CUDA sysmem-fallback case) -- see shared/types.ts's ResultRow
-  // doc comment and shared/vramEstimate.ts's estimateResidentGpuLayers.
-  // NULL on every row inserted before this migration and on every row whose
-  // offload claim wasn't contradicted -- both correctly read as "no
-  // independent residency estimate, claim stands".
+  // Estimated actually-VRAM-resident base-model layer count, written by a
+  // current worker on every row where it was computable (llama.cpp's own
+  // post-allocation buffer split, or the VRAM-discrepancy heuristic when
+  // that report was missing) -- see shared/types.ts's ResultRow doc comment
+  // and shared/vramEstimate.ts's estimateResidentGpuLayers(FromBufferSizes).
+  // NULL on every row inserted before this migration and on any row with
+  // nothing to estimate (no offload claim, or no buffer report/baseline).
   { table: "results", column: "gpu_layers_resident_est", ddlType: "INTEGER" },
+  // The MTP/draft companion model's own actually-resident estimate -- see
+  // shared/types.ts's ResultRow.gpu_layers_resident_est_draft. NULL on every
+  // row inserted before this migration and on any non-MTP row (the draft
+  // model's buffer lines only exist on an MTP item with a separate
+  // --model-draft file).
+  { table: "results", column: "gpu_layers_resident_est_draft", ddlType: "INTEGER" },
   // -ngld for the MTP/draft companion model -- see shared/sweep.ts's
   // SweepItem.n_gpu_layers_draft. DEFAULT 0 (not NULL) so a row/item
   // predating this column reads the same as "not applicable", matching
