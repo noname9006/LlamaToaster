@@ -26,7 +26,7 @@ import {
   GPU_MEMORY_MEASUREMENT_SOURCES,
 } from "../../../shared/types.js";
 import { expandSweep } from "../../../shared/sweep.js";
-import { getReleases, filterReleasesForWorker, assetMatchesWorker } from "../github-releases.js";
+import { getReleases, filterReleasesForWorker, assetMatchesWorker, buildInstallPayload } from "../github-releases.js";
 
 const NUMERIC_SWEEP_FIELDS = [
   "n_prompt",
@@ -315,7 +315,16 @@ async function resolveBuildForRun(
       }`,
     };
   }
-  const matching = filterReleasesForWorker(releases, platform, arch, backend).filter((r) => r.assets.length > 0);
+  // driver's max CUDA version (HardwareInfo.nvidia_driver) orders variants
+  // best-first, so assets[0] below is the newest toolkit this box can
+  // actually load -- see shared/types.ts's sortAssetsForWorker.
+  const matching = filterReleasesForWorker(
+    releases,
+    platform,
+    arch,
+    backend,
+    worker.hardware?.nvidia_driver?.cuda_version ?? null
+  ).filter((r) => r.assets.length > 0);
   if (matching.length === 0) {
     return { error: `no installable llama.cpp release found for backend "${backend}" on ${platform}/${arch}` };
   }
@@ -325,7 +334,9 @@ async function resolveBuildForRun(
     tag: release.tag,
     deviceName,
     alreadyInstalled: false,
-    installPayload: { tag: release.tag, asset_name: asset.name, download_url: asset.download_url },
+    // buildInstallPayload carries the matching cudart redistributable for
+    // CUDA builds -- identical to the Workers page's manual-install route.
+    installPayload: buildInstallPayload(release, asset),
   };
 }
 

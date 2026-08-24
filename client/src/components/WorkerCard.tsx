@@ -1,6 +1,7 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api } from "../api/client";
-import type { Worker, Run, LlamaCppRelease } from "../types";
+import type { Worker, Run, LlamaCppRelease, ActiveJobReport } from "../types";
+import { extractCudaVariant, cudaDriverSupports } from "../types";
 import { StatusPill, WorkerStatusPill, ElapsedSince } from "./StatusPill";
 import { IconCheck, IconChevronDown, IconDownload, IconPencil, IconTrash } from "./icons";
 import { Tooltip } from "./Tooltip";
@@ -132,11 +133,71 @@ export function CopyCommandButton({ text }: { text: string }) {
   );
 }
 
+// Slow background refresh of the "Available to install" list -- the GitHub
+// lookup behind it is cached server-side for 5 minutes, so polling faster
+// than this would only re-serve the same payload.
+const AVAILABLE_BUILDS_POLL_MS = 30_000;
+
+// Live progress bar for an in-flight build install (or any serial job in its
+// downloading/extracting phase) -- same treatment as the Models page's active
+// downloads: percent, bytes/total, and an EMA-smoothed speed. Samples arrive
+// via the workers poll (~5s apart, carried on worker.activeJobProgress), so
+// speed is computed from consecutive samples rather than per-chunk.
+function InstallProgressBar({ progress }: { progress: ActiveJobReport }) {
+  const [speed, setSpeed] = useState<number | undefined>(undefined);
+  const prevRef = useRef<{ t: number; bytes: number } | null>(null);
+  useEffect(() => {
+    if (progress.phase !== "downloading" || typeof progress.bytes !== "number") return;
+    const now = Date.now();
+    const prev = prevRef.current;
+    if (prev && now > prev.t && progress.bytes > prev.bytes) {
+      const instant = ((progress.bytes - prev.bytes) * 1000) / (now - prev.t);
+      // EMA alpha ~0.35 over a ~5s sampling cadence: responsive enough to
+      // move within a few polls, smooth enough not to strobe on jitter.
+      setSpeed((s) => (s === undefined ? instant : s * 0.65 + instant * 0.35));
+    }
+    prevRef.current = { t: now, bytes: progress.bytes };
+  }, [progress.bytes, progress.phase]);
+
+  const total = typeof progress.total_bytes === "number" && progress.total_bytes > 0 ? progress.total_bytes : null;
+  const pct = total !== null ? Math.min(100, Math.round(((progress.bytes ?? 0) / total) * 100)) : null;
+  return (
+    <div className="mt-3 rounded-lg border border-border bg-surface-raised px-3 py-2">
+      <div className="flex items-center justify-between gap-2 text-[13px]">
+        <div className="flex min-w-0 items-center gap-2">
+          <IconDownload width={13} height={13} className="shrink-0 text-accent" />
+          <span className="truncate text-fg">{progress.detail || "llama.cpp build"}</span>
+        </div>
+        <div className="whitespace-nowrap font-mono text-xs tabular-nums text-muted">
+          {pct !== null && total !== null
+            ? `${pct}% · ${formatBytes(progress.bytes ?? 0)} / ${formatBytes(total)}`
+            : formatBytes(progress.bytes ?? 0)}
+          {progress.phase !== "downloading" ? ` · ${progress.phase}` : ""}
+        </div>
+      </div>
+      <div className="mt-1.5 h-1 w-full overflow-hidden rounded-full bg-bg">
+        {pct !== null ? (
+          <div className="h-full rounded-full bg-accent transition-[width]" style={{ width: `${pct}%` }} />
+        ) : (
+          <div className="progress-indeterminate h-full w-full rounded-full" />
+        )}
+      </div>
+      <div className="mt-1 text-right font-mono text-xs tabular-nums text-muted/70">
+        {progress.phase === "downloading" && speed !== undefined ? `${formatBytes(speed)}/s` : ""}
+      </div>
+    </div>
+  );
+}
+
 export function WorkerCard({ worker, onRefresh }: { worker: Worker; onRefresh: () => void }) {
   const [busyTag, setBusyTag] = useState<string | null>(null);
   const [msg, setMsg] = useState("");
   const [available, setAvailable] = useState<LlamaCppRelease[]>([]);
   const [updateAvailable, setUpdateAvailable] = useState(false);
+  // Bumped after every queued action (install/activate/delete/...) so the
+  // available-builds fetch below re-runs immediately instead of waiting for
+  // its next periodic tick.
+  const [buildsNonce, setBuildsNonce] = useState(0);
   const [activeRun, setActiveRun] = useState<Run | undefined>(undefined);
   const [renaming, setRenaming] = useState(false);
   const [nameDraft, setNameDraft] = useState(worker.displayName);
@@ -152,20 +213,34 @@ export function WorkerCard({ worker, onRefresh }: { worker: Worker; onRefresh: (
   // (cached server-side), not something the worker reports about itself, so
   // it's its own small fetch rather than inline on the Worker object (see
   // server/src/routes/workers.ts's GET /api/workers/:id/available-builds).
+  // Auto-updates two ways: a slow periodic poll keeps update_available fresh
+  // while the page sits open, and a change in the worker's INSTALLED tag set
+  // (its heartbeat already refreshes every ~5s via useWorkerStatuses) refires
+  // immediately -- that's what pulls a just-installed build out of the
+  // "Available to install" list without a manual reload.
+  const installedSignature = worker.installedBuilds.map((b) => b.tag).join("|");
   useEffect(() => {
     let cancelled = false;
-    api
-      .getAvailableBuilds(worker.id)
-      .then((d) => {
-        if (cancelled) return;
-        setAvailable(d.available);
-        setUpdateAvailable(d.update_available);
-      })
-      .catch(() => {});
+    let timer: number | undefined;
+    const load = () => {
+      api
+        .getAvailableBuilds(worker.id)
+        .then((d) => {
+          if (cancelled) return;
+          setAvailable(d.available);
+          setUpdateAvailable(d.update_available);
+        })
+        .catch(() => {})
+        .finally(() => {
+          if (!cancelled) timer = window.setTimeout(load, AVAILABLE_BUILDS_POLL_MS);
+        });
+    };
+    void load();
     return () => {
       cancelled = true;
+      if (timer) window.clearTimeout(timer);
     };
-  }, [worker.id]);
+  }, [worker.id, installedSignature, buildsNonce]);
 
   // Worker.activeRunId only names the run (MULTIUSER_PLAN.md §1.16's "no
   // outbound HTTP" also means no inline model_filename/started_at without
@@ -237,12 +312,30 @@ export function WorkerCard({ worker, onRefresh }: { worker: Worker; onRefresh: (
       setMsg(`Error: ${err instanceof Error ? err.message : String(err)}`);
     } finally {
       setBusyTag(null);
+      // Re-pull the available-builds list right away (e.g. an install that
+      // already finished by the time the queue accepted the job) rather than
+      // waiting for its next periodic tick.
+      setBuildsNonce((n) => n + 1);
       onRefresh();
     }
   }
 
   const installedTags = new Set(worker.installedBuilds.map((b) => b.tag));
   const availableToInstall = available.filter((rel) => !installedTags.has(rel.tag) && rel.assets.length > 0);
+
+  // This worker's own reported NVIDIA driver capability -- decides whether a
+  // cuda-13.x variant is installable here or would fail to load at all.
+  const driverCudaVersion = worker.hardware?.nvidia_driver?.cuda_version ?? null;
+
+  // A serial job in its downloading/extracting phase with no run attached is
+  // a build install in flight (benchmark jobs always carry activeRunId) --
+  // render it as a real progress bar instead of the plain busy text.
+  const installProgress =
+    !inaccessible && !worker.activeRunId && worker.activeJobProgress
+      ? worker.activeJobProgress.phase === "downloading" || worker.activeJobProgress.phase === "extracting"
+        ? worker.activeJobProgress
+        : undefined
+      : undefined;
 
   return (
     <div className="rounded-xl border border-border bg-surface p-5">
@@ -376,23 +469,25 @@ export function WorkerCard({ worker, onRefresh }: { worker: Worker; onRefresh: (
         </div>
       </details>
       {!inaccessible && worker.status === "busy" && (
-        <p className="mt-3 text-sm text-fg">
+        <>
           {activeRun ? (
-            <>
+            <p className="mt-3 text-sm text-fg">
               Running <span className="font-medium">{activeRun.model_filename ?? activeRun.model_id}</span>{" "}
               <span className="text-muted">
                 — <ElapsedSince startedAt={activeRun.started_at} />
               </span>
-            </>
+            </p>
+          ) : installProgress ? (
+            <InstallProgressBar progress={installProgress} />
           ) : worker.activeJobProgress ? (
-            <>
+            <p className="mt-3 text-sm text-fg">
               {worker.activeJobProgress.phase}
               {worker.activeJobProgress.detail ? <span className="text-muted"> — {worker.activeJobProgress.detail}</span> : null}
-            </>
+            </p>
           ) : (
-            <span className="text-muted">Busy</span>
+            <p className="mt-3 text-sm text-muted">Busy</p>
           )}
-        </p>
+        </>
       )}
 
       {!inaccessible && (
@@ -434,6 +529,23 @@ export function WorkerCard({ worker, onRefresh }: { worker: Worker; onRefresh: (
                   <span className="text-muted">unknown</span>
                 )}
               </dd>
+              {worker.hardware?.nvidia_driver && (
+                <>
+                  <dt className="text-muted">NVIDIA driver</dt>
+                  <dd className="text-fg">
+                    {worker.hardware.nvidia_driver.version}
+                    <span className="text-muted">
+                      {" "}
+                      · runs CUDA up to{" "}
+                      <Tooltip text="Reported by nvidia-smi on the machine itself -- this is what decides which llama.cpp CUDA build variant (cuda-12.x vs cuda-13.x) can load here.">
+                        <span className="cursor-help underline decoration-dotted underline-offset-2">
+                          {worker.hardware.nvidia_driver.cuda_version}
+                        </span>
+                      </Tooltip>
+                    </span>
+                  </dd>
+                </>
+              )}
             </dl>
           </div>
           {updateAvailable && (
@@ -463,6 +575,7 @@ export function WorkerCard({ worker, onRefresh }: { worker: Worker; onRefresh: (
                       )}
                       <span className="text-xs text-muted">
                         {b.asset_name} · installed {formatDate(b.installed_at)}
+                        {b.cudart_name ? " · CUDA runtime DLLs included" : ""}
                       </span>
                     </div>
                     <div className="flex items-center gap-2">
@@ -517,20 +630,38 @@ export function WorkerCard({ worker, onRefresh }: { worker: Worker; onRefresh: (
               <ul className="mt-1.5 flex max-h-64 flex-col gap-1.5 overflow-y-auto">
                 {availableToInstall.map((rel) => {
                   const asset = rel.assets[0];
+                  // CUDA variants are ordered best-first by the server (see
+                  // sortAssetsForWorker), so assets[0] is the one to offer --
+                  // but a variant newer than this machine's NVIDIA driver can
+                  // never load, so surface that instead of letting the
+                  // install fail at bench time with missing-DLL errors.
+                  const variant = extractCudaVariant(asset.name);
+                  const incompatible = variant != null && !cudaDriverSupports(driverCudaVersion, variant);
+                  const cudart = rel.cudart_assets?.[asset.name];
+                  const totalSize = asset.size_bytes + (cudart?.size_bytes ?? 0);
                   return (
                     <li
                       key={rel.tag}
-                      className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-border px-3 py-2"
+                      className={`flex flex-wrap items-center justify-between gap-2 rounded-lg border px-3 py-2 ${
+                        incompatible ? "border-warning/40 bg-warning/5" : "border-border"
+                      }`}
                     >
                       <div className="text-sm">
                         <span className="text-fg">{rel.tag}</span>{" "}
                         <span className="text-xs text-muted">
-                          {asset.name} · {formatBytes(asset.size_bytes)}
+                          {asset.name} · {formatBytes(totalSize)}
+                          {cudart ? " (incl. CUDA runtime DLLs)" : ""}
                         </span>
+                        {incompatible && (
+                          <div className="text-xs text-warning">
+                            Needs driver supporting CUDA {variant!.major}.{variant!.minor}
+                            {driverCudaVersion ? ` -- this machine runs up to ${driverCudaVersion}` : ""}
+                          </div>
+                        )}
                       </div>
                       <button
                         type="button"
-                        disabled={busyTag === rel.tag}
+                        disabled={busyTag === rel.tag || incompatible}
                         onClick={() =>
                           withBusy(
                             rel.tag,
@@ -538,7 +669,7 @@ export function WorkerCard({ worker, onRefresh }: { worker: Worker; onRefresh: (
                             `Queued: install ${rel.tag}`
                           )
                         }
-                        className="flex items-center gap-1.5 rounded-md border border-border px-2.5 py-1 text-xs font-semibold text-fg hover:border-accent/40 hover:text-accent disabled:opacity-50"
+                        className="flex items-center gap-1.5 rounded-md border border-border px-2.5 py-1 text-xs font-semibold text-fg hover:border-accent/40 hover:text-accent disabled:opacity-50 disabled:hover:border-border disabled:hover:text-fg"
                       >
                         <IconDownload width={14} height={14} />
                         {busyTag === rel.tag ? "Queuing…" : "Install"}

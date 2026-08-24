@@ -1,6 +1,7 @@
 import si from "systeminformation";
 import { platform as osPlatform, arch as osArch } from "node:os";
 import { detectBackend } from "../../shared/types.js";
+import { readNvidiaDriverInfo } from "./vram.js";
 
 // Re-exported for this file's existing callers (worker/src/index.ts imports
 // both detectHardware and detectBackend from here) -- the implementation
@@ -28,6 +29,13 @@ export interface HardwareInfo {
   // see si.mem().total in detectHardware below. Kept in sync with the
   // mirrored copy of this interface in shared/types.ts.
   mem_total_bytes?: number;
+  // Best-effort nvidia-smi probe (driver version + the max CUDA toolkit it
+  // runs) -- present only when an NVIDIA GPU was detected and nvidia-smi
+  // answered. This is what lets the server pick between llama.cpp's
+  // cuda-12.x/cuda-13.x build variants for this box; see shared/types.ts's
+  // HardwareInfo.nvidia_driver for why cuda_version (not driverVersion) is
+  // the field that matters there. Kept optional for old-worker tolerance.
+  nvidia_driver?: { version: string; cuda_version: string } | null;
 }
 
 // Diagnostic only -- nothing reads `flags` to pick between build variants.
@@ -39,6 +47,21 @@ export interface HardwareInfo {
 // no AVX-tiered variants to choose between (see github-releases.ts).
 export async function detectHardware(): Promise<HardwareInfo> {
   const [cpu, graphics, mem] = await Promise.all([si.cpu(), si.graphics(), si.mem()]);
+  const gpu = graphics.controllers
+    .filter((c) => c.vendor)
+    .map((c) => ({
+      vendor: c.vendor ?? "",
+      model: c.model ?? "",
+      vram_mb: typeof c.vram === "number" && c.vram > 0 ? c.vram : null,
+      vram_dynamic: c.vramDynamic ?? false,
+    }));
+  // Only boxes that actually have an NVIDIA GPU pay the ~200-500ms nvidia-smi
+  // round trip (once per process -- detectHardware runs once at startup).
+  // Null on failure (nvidia-smi missing/not on PATH, driver too old to
+  // report a CUDA version, ...): the server then treats CUDA compatibility
+  // as unknown and just orders variants conservatively instead.
+  const hasNvidia = gpu.some((g) => /nvidia/i.test(g.vendor));
+  const nvidiaDriverInfo = hasNvidia ? await readNvidiaDriverInfo().catch(() => null) : null;
   return {
     platform: osPlatform(),
     arch: osArch(),
@@ -53,14 +76,10 @@ export async function detectHardware(): Promise<HardwareInfo> {
       // the real ceiling for llama-bench's -t, including SMT/hyperthreads.
       cores: typeof cpu.cores === "number" && cpu.cores > 0 ? cpu.cores : 0,
     },
-    gpu: graphics.controllers
-      .filter((c) => c.vendor)
-      .map((c) => ({
-        vendor: c.vendor ?? "",
-        model: c.model ?? "",
-        vram_mb: typeof c.vram === "number" && c.vram > 0 ? c.vram : null,
-        vram_dynamic: c.vramDynamic ?? false,
-      })),
+    gpu,
     mem_total_bytes: typeof mem.total === "number" && mem.total > 0 ? mem.total : undefined,
+    nvidia_driver: nvidiaDriverInfo
+      ? { version: nvidiaDriverInfo.driverVersion, cuda_version: nvidiaDriverInfo.cudaVersion }
+      : null,
   };
 }

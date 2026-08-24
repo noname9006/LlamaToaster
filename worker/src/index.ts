@@ -50,6 +50,7 @@ import {
   installBuild,
   deleteBuild,
   validateTag,
+  reconcileBuildsDir,
 } from "./llama-builds.js";
 import { detectHardware, detectBackend } from "./hardware.js";
 import { readGgufInfo } from "./gguf.js";
@@ -2082,13 +2083,32 @@ async function executeBenchmarkJob(payload: BenchmarkJob): Promise<void> {
 }
 
 async function executeInstallBuildJob(payload: InstallBuildJobPayload): Promise<void> {
-  updateJobReport({ phase: "downloading", detail: `${payload.tag} (${payload.asset_name})` });
-  log.info(`installing llama.cpp build ${payload.tag} (${payload.asset_name})`);
+  updateJobReport({ phase: "downloading", detail: payload.asset_name, bytes: 0 });
+  log.info(
+    `installing llama.cpp build ${payload.tag} (${payload.asset_name})` +
+      (payload.cudart_url ? ` + CUDA runtime ${payload.cudart_name}` : "")
+  );
   const installed = await installBuild({
     buildsDir,
     tag: payload.tag,
     assetName: payload.asset_name,
     downloadUrl: payload.download_url,
+    sizeBytes: payload.size_bytes,
+    cudartName: payload.cudart_name,
+    cudartUrl: payload.cudart_url,
+    cudartSizeBytes: payload.cudart_size_bytes,
+    // Byte-level progress rides the serial job's own ActiveJobReport (the
+    // same channel a benchmark's phase ticks use) -- the heartbeat loop
+    // drops to its fast 2s cadence while this phase is live, and the
+    // Workers page renders it exactly like the Models page renders model
+    // download progress.
+    onProgress: (p) =>
+      updateJobReport({
+        phase: p.phase,
+        bytes: p.bytes,
+        ...(p.total_bytes !== undefined ? { total_bytes: p.total_bytes } : {}),
+        detail: p.detail,
+      }),
   });
   log.info(`installed llama.cpp build ${payload.tag} -> ${installed.bench_path}`);
 }
@@ -2643,7 +2663,15 @@ async function heartbeatTick(): Promise<void> {
     // action here.
     log.debug(`heartbeat failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
   } finally {
-    const delay = activeDownloadReports.size > 0 ? HEARTBEAT_INTERVAL_ACTIVE_DOWNLOAD_MS : HEARTBEAT_INTERVAL_MS;
+    // Fast lane while anything byte-progress-shaped is live: the concurrent
+    // model downloads (activeDownloadReports) AND a serial install_build in
+    // its downloading/extracting phases -- both feed client progress bars
+    // that read stale samples as stalling/spiking at the idle 10s cadence.
+    const fastLane =
+      activeDownloadReports.size > 0 ||
+      currentJobReport?.phase === "downloading" ||
+      currentJobReport?.phase === "extracting";
+    const delay = fastLane ? HEARTBEAT_INTERVAL_ACTIVE_DOWNLOAD_MS : HEARTBEAT_INTERVAL_MS;
     heartbeatTimer = setTimeout(heartbeatTick, delay).unref();
   }
 }
@@ -2755,6 +2783,10 @@ async function workerMain(): Promise<void> {
       stopRequested = false;
       activeBenchProc = null;
       log.info(`claimed job ${job.job_id} (${job.type})`);
+      // Same instant-visibility kick a download job gets: without it the
+      // first progress beat (and the client's busy/progress banner) waits on
+      // whatever's left of the current idle heartbeat interval.
+      kickHeartbeatSoon();
       try {
         await executeJob(job);
         await withAuth((token) => reportJobResult(config.vps_url, token, config.machine_id!, job.job_id, { ok: true }));
@@ -2840,6 +2872,33 @@ void runStartupReconciliation(
 ).catch((err) => {
   log.error(`Startup reconciliation failed: ${err instanceof Error ? err.message : String(err)}`);
 });
+
+// On load: check what llama.cpp builds are already present on disk so the
+// Workers page reflects reality from the very first heartbeat -- including
+// builds dropped into the folder by hand (no manifest yet), which
+// reconcileBuildsDir adopts by synthesizing one. listInstalledBuilds then
+// re-scans on every heartbeat, but doing this once up front (with logs)
+// makes the startup state explicit in the worker's own console too.
+try {
+  const imported = reconcileBuildsDir(buildsDir);
+  const builds = listInstalledBuilds(buildsDir);
+  if (builds.length === 0) {
+    log.info(`llama.cpp builds dir ${buildsDir}: no builds installed yet`);
+  } else {
+    const activeTag = activeBuild?.tag;
+    log.info(
+      `llama.cpp builds dir ${buildsDir}: ${builds.length} build(s) -- ` +
+        builds
+          .map((b) => `${b.tag}${b.cudart_name ? " (+cudart)" : ""}${b.tag === activeTag ? " [active]" : ""}`)
+          .join(", ")
+    );
+    if (imported.length > 0) {
+      log.info(`adopted ${imported.length} hand-dropped build(s): ${imported.map((b) => b.tag).join(", ")}`);
+    }
+  }
+} catch (err) {
+  log.warn(`llama.cpp builds dir scan failed: ${err instanceof Error ? err.message : String(err)}`);
+}
 
 startHeartbeatLoop();
 void workerMain();

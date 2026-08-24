@@ -5,13 +5,14 @@ import {
   readdirSync,
   readFileSync,
   rmSync,
+  statSync,
   writeFileSync,
   chmodSync,
 } from "node:fs";
 import { join, relative } from "node:path";
 import { platform as osPlatform } from "node:os";
 import { pipeline } from "node:stream/promises";
-import { Readable } from "node:stream";
+import { Readable, Transform } from "node:stream";
 import { spawn } from "node:child_process";
 import AdmZip from "adm-zip";
 
@@ -81,6 +82,24 @@ export interface InstalledBuildInfo {
   // Unavailability is surfaced at run-trigger time instead (see
   // server/src/routes/runs.ts).
   server_path?: string;
+  // Set when the matching cudart redistributable (CUDA runtime DLLs) was
+  // downloaded and extracted alongside the binaries -- see installBuild's
+  // opts.cudartUrl. Informational (surfaced on the Workers page); absence
+  // just means the build wasn't a CUDA one, or its release shipped no cudart.
+  cudart_name?: string;
+}
+
+// Live byte-level progress of an in-flight install, reported through the
+// heartbeat's ActiveJobReport (phase "downloading"/"extracting") so the
+// Workers page can render the same progress-bar/speed treatment the Models
+// page gives model downloads. bytes/total_bytes are CUMULATIVE across every
+// archive the install pulls (a CUDA install is two: the llama zip plus its
+// ~390 MB cudart zip) so one bar covers the whole job.
+export interface InstallProgress {
+  phase: "downloading" | "extracting";
+  bytes: number;
+  total_bytes?: number;
+  detail: string;
 }
 
 const MANIFEST_NAME = "manifest.json";
@@ -159,6 +178,7 @@ export function listInstalledBuilds(buildsDir: string): InstalledBuildInfo[] {
         tag: string;
         asset_name: string;
         installed_at: number;
+        cudart_name?: string;
       };
       const benchPath = findBenchBinary(dir);
       if (!benchPath) continue;
@@ -178,37 +198,154 @@ export function getInstalledBuild(
   return listInstalledBuilds(buildsDir).find((b) => b.tag === tag) ?? null;
 }
 
+// Streams one archive to dest, counting bytes per chunk. Returns the byte
+// count written (and the server-claimed total when the response had a
+// content-length). No retry/resume here on purpose: build archives are
+// fetched from GitHub's CDN which is fast and reliable, and an install that
+// dies mid-transfer is simply re-run from the Workers page -- unlike model
+// downloads there's no catalog row waiting on it.
+async function downloadArchive(
+  url: string,
+  dest: string,
+  label: string,
+  expectedSize: number | undefined,
+  signal: AbortSignal | undefined,
+  onChunk: (fileBytes: number, fileTotal: number | undefined) => void
+): Promise<void> {
+  const res = await fetch(url, {
+    headers: { "user-agent": "llamatoaster-worker" },
+    redirect: "follow",
+    signal,
+  });
+  if (!res.ok || !res.body) {
+    throw new Error(`download failed (${label}): ${res.status} ${res.statusText}`);
+  }
+  const contentLength = Number(res.headers.get("content-length"));
+  // Header total wins when present (GitHub always sends one for release
+  // assets); the payload's GitHub-reported size is the fallback so the very
+  // first chunks already have a denominator for the progress bar.
+  const fileTotal =
+    Number.isFinite(contentLength) && contentLength > 0 ? contentLength : expectedSize;
+  let bytes = 0;
+  const tracker = new Transform({
+    transform(chunk: Buffer, _enc, cb) {
+      bytes += chunk.length;
+      onChunk(bytes, fileTotal);
+      cb(null, chunk);
+    },
+  });
+  await pipeline(Readable.fromWeb(res.body as any), tracker, createWriteStream(dest));
+}
+
 export async function installBuild(opts: {
   buildsDir: string;
   tag: string;
   assetName: string;
   downloadUrl: string;
+  // GitHub-reported size of the main archive (optional -- only used to show
+  // a total before the response header arrives).
+  sizeBytes?: number;
+  // The matching cudart redistributable for CUDA builds (resolved
+  // server-side from its cached GitHub data; re-validated against this
+  // file's host allowlist below like any other URL). Extracted into the
+  // same directory as the main archive so llama-bench.exe finds the DLLs
+  // at load time. A CUDA install without these DLLs doesn't gracefully fall
+  // back to CPU -- the binary fails with missing-DLL errors -- so a cudart
+  // download/extract failure fails the whole install rather than leaving a
+  // build behind that can never run.
+  cudartName?: string;
+  cudartUrl?: string;
+  cudartSizeBytes?: number;
+  onProgress?: (p: InstallProgress) => void;
+  signal?: AbortSignal;
 }): Promise<InstalledBuildInfo> {
   validateTag(opts.tag);
   assertAllowedDownloadUrl(opts.downloadUrl);
+  if (opts.cudartUrl) assertAllowedDownloadUrl(opts.cudartUrl);
   if (!existsSync(opts.buildsDir)) mkdirSync(opts.buildsDir, { recursive: true });
   const targetDir = join(opts.buildsDir, opts.tag);
   if (existsSync(targetDir)) {
     throw new Error(`build ${opts.tag} is already installed`);
   }
 
-  const res = await fetch(opts.downloadUrl, {
-    headers: { "user-agent": "llamatoaster-worker" },
-    redirect: "follow",
-  });
-  if (!res.ok || !res.body) {
-    throw new Error(`download failed: ${res.status} ${res.statusText}`);
-  }
+  const report = opts.onProgress ?? (() => {});
+  // Cumulative accounting across both archives so ONE bar covers the whole
+  // job: totals come from the payload's GitHub-reported sizes until each
+  // response's own content-length confirms them.
+  let finishedBytes = 0; // bytes of archives fully downloaded
+  let mainTotal: number | undefined = opts.sizeBytes;
+  let cudartTotal: number | undefined = opts.cudartSizeBytes;
+  const hasCudart = Boolean(opts.cudartUrl);
+  const grandTotal = (): number | undefined => {
+    if (mainTotal === undefined) return undefined;
+    if (hasCudart && cudartTotal === undefined) return undefined;
+    return mainTotal + (cudartTotal ?? 0);
+  };
 
   const tmpArchive = join(
     opts.buildsDir,
     `.${opts.tag}.download${archiveExtension(opts.assetName)}`
   );
-  await pipeline(Readable.fromWeb(res.body as any), createWriteStream(tmpArchive));
+  const tmpCudartArchive = opts.cudartName
+    ? join(opts.buildsDir, `.${opts.tag}.download-cudart${archiveExtension(opts.cudartName)}`)
+    : null;
 
   try {
+    report({ phase: "downloading", bytes: 0, total_bytes: grandTotal(), detail: opts.assetName });
+    await downloadArchive(
+      opts.downloadUrl,
+      tmpArchive,
+      opts.assetName,
+      opts.sizeBytes,
+      opts.signal,
+      (fileBytes, fileTotal) => {
+        if (fileTotal !== undefined) mainTotal = fileTotal;
+        report({
+          phase: "downloading",
+          bytes: finishedBytes + fileBytes,
+          total_bytes: grandTotal(),
+          detail: opts.assetName,
+        });
+      }
+    );
+    finishedBytes += mainTotal ?? 0;
+
+    if (opts.cudartUrl && tmpCudartArchive && opts.cudartName) {
+      await downloadArchive(
+        opts.cudartUrl,
+        tmpCudartArchive,
+        opts.cudartName,
+        opts.cudartSizeBytes,
+        opts.signal,
+        (fileBytes, fileTotal) => {
+          if (fileTotal !== undefined) cudartTotal = fileTotal;
+          report({
+            phase: "downloading",
+            bytes: finishedBytes + fileBytes,
+            total_bytes: grandTotal(),
+            detail: opts.cudartName!,
+          });
+        }
+      );
+      finishedBytes += cudartTotal ?? 0;
+    }
+
     mkdirSync(targetDir, { recursive: true });
+    report({
+      phase: "extracting",
+      bytes: grandTotal() ?? finishedBytes,
+      detail: `extracting ${opts.assetName}`,
+    });
     const extractStderr = await extractArchive(tmpArchive, targetDir);
+
+    if (tmpCudartArchive && existsSync(tmpCudartArchive)) {
+      report({
+        phase: "extracting",
+        bytes: grandTotal() ?? finishedBytes,
+        detail: `extracting ${opts.cudartName}`,
+      });
+      await extractArchive(tmpCudartArchive, targetDir);
+    }
 
     const benchPath = findBenchBinary(targetDir);
     if (!benchPath) {
@@ -231,7 +368,12 @@ export async function installBuild(opts: {
     writeFileSync(
       join(targetDir, MANIFEST_NAME),
       JSON.stringify(
-        { tag: opts.tag, asset_name: opts.assetName, installed_at: installedAt },
+        {
+          tag: opts.tag,
+          asset_name: opts.assetName,
+          installed_at: installedAt,
+          ...(opts.cudartName ? { cudart_name: opts.cudartName } : {}),
+        },
         null,
         2
       ),
@@ -243,12 +385,14 @@ export async function installBuild(opts: {
       installed_at: installedAt,
       bench_path: benchPath,
       server_path: serverPath ?? undefined,
+      ...(opts.cudartName ? { cudart_name: opts.cudartName } : {}),
     };
   } catch (err) {
     rmSync(targetDir, { recursive: true, force: true });
     throw err;
   } finally {
     rmSync(tmpArchive, { force: true });
+    if (tmpCudartArchive) rmSync(tmpCudartArchive, { force: true });
   }
 }
 
@@ -259,4 +403,52 @@ export function deleteBuild(buildsDir: string, tag: string): void {
     throw new Error(`build ${tag} is not installed`);
   }
   rmSync(dir, { recursive: true, force: true });
+}
+
+// Startup reconciliation for builds that arrived outside installBuild --
+// someone unzips a llama.cpp release into llama-builds/<tag>/ by hand and
+// restarts the worker. listInstalledBuilds requires a manifest.json, so such
+// a build was invisible on the Workers page forever. This gives every
+// subdirectory that actually contains a llama-bench binary a synthesized
+// manifest (asset_name "(imported)", installed_at = dir mtime) so it shows
+// up -- and is activatable/benchmarkable -- like any downloaded build.
+// Dot-prefixed dirs (installBuild's own .<tag>.download temp files) are
+// skipped, as are dirs whose name can't be a valid tag.
+export function reconcileBuildsDir(buildsDir: string): InstalledBuildInfo[] {
+  if (!existsSync(buildsDir)) return [];
+  const imported: InstalledBuildInfo[] = [];
+  for (const entry of readdirSync(buildsDir, { withFileTypes: true })) {
+    if (!entry.isDirectory() || entry.name.startsWith(".")) continue;
+    const dir = join(buildsDir, entry.name);
+    if (existsSync(join(dir, MANIFEST_NAME))) continue; // already a real/known build
+    try {
+      validateTag(entry.name);
+    } catch {
+      continue;
+    }
+    const benchPath = findBenchBinary(dir);
+    if (!benchPath) continue; // not a build (or still being unpacked by hand)
+    try {
+      const installedAt = statSync(dir).mtimeMs;
+      writeFileSync(
+        join(dir, MANIFEST_NAME),
+        JSON.stringify(
+          { tag: entry.name, asset_name: "(imported)", installed_at: installedAt },
+          null,
+          2
+        ),
+        "utf8"
+      );
+      imported.push({
+        tag: entry.name,
+        asset_name: "(imported)",
+        installed_at: installedAt,
+        bench_path: benchPath,
+        server_path: findServerBinary(dir) ?? undefined,
+      });
+    } catch {
+      // unwritable/partial dir -- skip rather than fail startup over it
+    }
+  }
+  return imported;
 }
