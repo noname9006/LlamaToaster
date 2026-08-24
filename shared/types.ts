@@ -712,6 +712,18 @@ export interface LlamaCppRelease {
   tag: string;
   published_at: string;
   assets: LlamaCppAsset[];
+  // CUDA runtime redistributables ("cudart-llama-bin-win-cuda-12.4-x64.zip"
+  // etc.) keyed by the llama asset they belong to -- these zips carry the
+  // cublas/cudart DLLs a Windows CUDA build needs next llama-bench.exe, and
+  // without them a CUDA binary can't even load (it doesn't "fall back to
+  // CPU", it dies with a missing-DLL error). Deliberately NOT part of
+  // `assets` above: everything that iterates that list (install pickers,
+  // assetMatchesWorker, the client's per-release rows) expects exactly one
+  // installable binary per backend variant, and cudart is a companion
+  // download resolved server-side at enqueue time (see buildInstallPayload).
+  // Absent when a release ships no matching cudart zip (every non-Windows
+  // platform today).
+  cudart_assets?: Record<string, LlamaCppAsset>;
 }
 
 export interface InstalledBuild {
@@ -730,6 +742,10 @@ export interface InstalledBuild {
   // assetMatchesWorker), never by a stored backend string.
   bench_path?: string;
   server_path?: string;
+  // Set when this build was installed together with its matching CUDA
+  // runtime redistributable (cudart-*.zip extracted alongside the binaries) --
+  // informational only, see InstallBuildJobPayload.cudart_name.
+  cudart_name?: string;
 }
 
 // Walks model_dir recursively -- see worker/src/index.ts's listModelDirFiles.
@@ -780,6 +796,88 @@ export interface HardwareInfo {
   // keeps reporting a valid snapshot, just without this one value -- see
   // that same file's /hardware handler for why a restart is required at all.
   mem_total_bytes?: number;
+  // Best-effort NVIDIA driver probe (nvidia-smi's banner, see worker/src/
+  // hardware.ts) -- present only on boxes with an NVIDIA GPU where the probe
+  // succeeded. `cuda_version` is the MAXIMUM CUDA toolkit version this
+  // DRIVER can run (not what's installed system-wide) -- exactly the figure
+  // needed to pick between llama.cpp's cuda-12.x/cuda-13.x build variants,
+  // since a CUDA build only runs if its toolkit version is <= what the
+  // driver supports. Optional so older workers keep validating.
+  nvidia_driver?: { version: string; cuda_version: string } | null;
+}
+
+// --- CUDA asset-variant matching (which cudart/download variant fits a box) ---
+
+export interface CudaVariant {
+  major: number;
+  minor: number;
+}
+
+// "llama-b10612-bin-win-cuda-12.4-x64.zip" -> {major:12, minor:4}; null for
+// every non-CUDA asset (cpu/vulkan/rocm/...). Tolerant to where "cuda"
+// appears in the name, but requires a major.minor pair -- bare "cuda" tokens
+// don't exist in real release names.
+export function extractCudaVariant(assetName: string): CudaVariant | null {
+  const m = /(?:^|[-_.])cuda-(\d+)\.(\d+)(?:[-_.]|$)/i.exec(assetName);
+  return m ? { major: Number(m[1]), minor: Number(m[2]) } : null;
+}
+
+// Whether an installed driver can run a CUDA build of the given toolkit
+// version. driverCudaVersion is nvidia-smi's "CUDA Version: X.Y" -- the max
+// toolkit the driver itself supports (NOT whatever runtime happens to be
+// installed). Within one major version, newer-minor builds still run on
+// older-minor drivers via CUDA's forward-minor compatibility guarantees, so
+// the comparison that matters is: build's (major, minor) <= driver's.
+// Unknown/unparseable driver info conservatively reports true -- better to
+// offer everything than to wrongly hide installable builds; the server-side
+// sort (sortAssetsForWorker) keeps the safest variant first in that case.
+export function cudaDriverSupports(driverCudaVersion: string | null | undefined, v: CudaVariant): boolean {
+  if (!driverCudaVersion) return true;
+  const m = /^(\d+)\.(\d+)/.exec(driverCudaVersion.trim());
+  if (!m) return true;
+  const dmaj = Number(m[1]);
+  const dmin = Number(m[2]);
+  return v.major < dmaj || (v.major === dmaj && v.minor <= dmin);
+}
+
+// Orders a release's already platform/backend-filtered assets best-first for
+// one specific machine:
+//   1. CUDA variants the driver can run -- newest toolkit first, or OLDEST
+//      first when no driver info is known (an unprobed box is likelier to be
+//      old/misconfigured than bleeding-edge, and cuda-12.x loads on any
+//      driver >= ~527 while cuda-13.x needs >= ~580, so oldest-first is the
+//      safe default)
+//   2. everything else, original order preserved
+//   3. CUDA variants too new for the driver, oldest first
+// Callers that take assets[0] (install pickers, auto-install at run time)
+// then get the right variant with no further logic: e.g. with a CUDA-12.7
+// driver, cuda-13.3 drops below cuda-12.4 instead of being picked blind.
+// With no CUDA assets at all this is the identity (a fresh array copy).
+export function sortAssetsForWorker<T extends LlamaCppAsset>(assets: T[], driverCudaVersion?: string | null): T[] {
+  const known = typeof driverCudaVersion === "string" && /^(\d+)\.(\d+)/.test(driverCudaVersion.trim());
+  const rank = (a: T): number => {
+    const v = extractCudaVariant(a.name);
+    if (!v) return 1;
+    if (!known) return 0; // unknown driver: every variant is a candidate
+    return cudaDriverSupports(driverCudaVersion, v) ? 0 : 2;
+  };
+  // Newest-first once the driver is known, oldest-first when it isn't.
+  // Within the incompatible tail (rank 2) it's always oldest-first -- if
+  // nothing can run, the closest-to-running variant is the least useless
+  // one to look at.
+  const dirFor = (r: number): 1 | -1 => (r === 0 && !known ? 1 : r === 0 ? -1 : 1);
+  return [...assets].sort((x, y) => {
+    const rx = rank(x);
+    const ry = rank(y);
+    if (rx !== ry) return rx - ry;
+    if (rx === 1) return 0;
+    const dir = dirFor(rx);
+    const vx = extractCudaVariant(x.name)!;
+    const vy = extractCudaVariant(y.name)!;
+    if (vx.major !== vy.major) return vx.major > vy.major ? dir : -dir;
+    if (vx.minor !== vy.minor) return vx.minor > vy.minor ? dir : -dir;
+    return 0;
+  });
 }
 
 // Which of a worker's detected GPUs (HardwareInfo.gpu) a given backend build
@@ -1036,6 +1134,19 @@ export interface InstallBuildJobPayload {
   tag: string;
   asset_name: string;
   download_url: string;
+  // GitHub-reported size of asset_name's zip -- lets the worker show an
+  // accurate progress bar before the first response header arrives.
+  // Optional: an older server queueing a fresh install simply omits it.
+  size_bytes?: number;
+  // CUDA builds need their matching cudart redistributable (the cublas/
+  // cudart DLLs) extracted next to the binaries or they can't load at all
+  // (see LlamaCppRelease.cudart_assets). The server resolves the pairing
+  // from its cached GitHub data -- never from a browser-supplied URL --
+  // and the worker re-validates the host before downloading. Absent for
+  // every non-CUDA build and any platform without a cudart zip.
+  cudart_name?: string;
+  cudart_url?: string;
+  cudart_size_bytes?: number;
 }
 
 export interface DownloadModelJobPayload {
