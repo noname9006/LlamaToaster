@@ -79,6 +79,23 @@ function parseHardware(value: unknown): HardwareInfo {
     };
   });
 
+  // Best-effort NVIDIA driver probe (nvidia-smi banner -- the max CUDA
+  // toolkit version this driver runs, which is what picks between llama.cpp's
+  // cuda-12.x/cuda-13.x build variants). Optional; absent/null on non-NVIDIA
+  // boxes or workers running older code.
+  let nvidiaDriver: HardwareInfo["nvidia_driver"];
+  const rawNvidiaDriver = h.nvidia_driver;
+  if (rawNvidiaDriver === undefined || rawNvidiaDriver === null) {
+    nvidiaDriver = undefined;
+  } else {
+    if (typeof rawNvidiaDriver !== "object") throw new BadRequestError("hardware.nvidia_driver must be an object");
+    const nd = rawNvidiaDriver as Record<string, unknown>;
+    nvidiaDriver = {
+      version: sanitizeString(nd.version, "hardware.nvidia_driver.version", 64),
+      cuda_version: sanitizeString(nd.cuda_version, "hardware.nvidia_driver.cuda_version", 64),
+    };
+  }
+
   return {
     platform: sanitizeString(h.platform, "hardware.platform"),
     arch: sanitizeString(h.arch, "hardware.arch"),
@@ -90,6 +107,7 @@ function parseHardware(value: unknown): HardwareInfo {
     },
     gpu,
     mem_total_bytes: optionalNumber(h.mem_total_bytes, "hardware.mem_total_bytes"),
+    nvidia_driver: nvidiaDriver,
   };
 }
 
@@ -106,6 +124,7 @@ function parseInstalledBuilds(value: unknown): InstalledBuild[] {
         active: row.active === true,
         bench_path: optionalString(row.bench_path, `installed_builds[${i}].bench_path`),
         server_path: optionalString(row.server_path, `installed_builds[${i}].server_path`),
+        cudart_name: optionalString(row.cudart_name, `installed_builds[${i}].cudart_name`),
       };
     });
 }

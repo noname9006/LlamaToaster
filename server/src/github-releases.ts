@@ -1,4 +1,5 @@
-import type { Backend, LlamaCppRelease } from "../../shared/types.js";
+import type { Backend, InstallBuildJobPayload, LlamaCppAsset, LlamaCppRelease } from "../../shared/types.js";
+import { sortAssetsForWorker } from "../../shared/types.js";
 import { log } from "./log.js";
 
 const GITHUB_REPO = "ggml-org/llama.cpp";
@@ -44,17 +45,45 @@ async function fetchReleases(): Promise<LlamaCppRelease[]> {
     // bug this comment is here to prevent regressing. Actual drafts (r.draft)
     // are still excluded -- those are genuinely unfinished/unpublished.
     .filter((r) => !r.draft)
-    .map((r) => ({
-      tag: r.tag_name,
-      published_at: r.published_at,
-      assets: r.assets
-        .filter((a) => isBinaryAsset(a.name))
-        .map((a) => ({
+    .map((r) => {
+      // First pass: bucket cudart zips by their "-bin-" suffix so the second
+      // pass can pair each CUDA binary with its runtime by exact key lookup.
+      const cudartBySuffix = new Map<string, LlamaCppAsset>();
+      for (const a of r.assets) {
+        if (!isCudartAsset(a.name)) continue;
+        const suffix = assetBinSuffix(a.name);
+        if (suffix) {
+          cudartBySuffix.set(suffix, {
+            name: a.name,
+            download_url: a.browser_download_url,
+            size_bytes: a.size,
+          });
+        }
+      }
+      const assets: LlamaCppAsset[] = [];
+      const cudartAssets: Record<string, LlamaCppAsset> = {};
+      for (const a of r.assets) {
+        if (isCudartAsset(a.name)) continue; // handled above -- never an installable binary itself
+        if (!isBinaryAsset(a.name)) continue;
+        const mapped: LlamaCppAsset = {
           name: a.name,
           download_url: a.browser_download_url,
           size_bytes: a.size,
-        })),
-    }));
+        };
+        assets.push(mapped);
+        const suffix = assetBinSuffix(a.name);
+        const cudart = suffix ? cudartBySuffix.get(suffix) : undefined;
+        // Keyed by the BINARY's name -- that's what the install flow starts
+        // from ("install this cuda zip" -> "+ its cudart zip"), not vice versa.
+        if (cudart) cudartAssets[a.name] = cudart;
+      }
+      return {
+        tag: r.tag_name,
+        published_at: r.published_at,
+        assets,
+        ...(Object.keys(cudartAssets).length > 0 ? { cudart_assets: cudartAssets } : {}),
+      };
+    });
 }
 
 // Verified against the actual ggml-org/llama.cpp release assets (checked
@@ -79,11 +108,32 @@ const NON_BINARY_ASSET_MARKERS = [
 
 function isBinaryAsset(name: string): boolean {
   const lower = name.toLowerCase();
-  if (lower.startsWith("cudart-")) return false;
   if (!(lower.endsWith(".zip") || lower.endsWith(".tar.gz") || lower.endsWith(".tgz"))) {
     return false;
   }
   return !NON_BINARY_ASSET_MARKERS.some((m) => lower.includes(m));
+}
+
+// cudart zips ("cudart-llama-bin-win-cuda-12.4-x64.zip") are classified by
+// prefix, not by isBinaryAsset -- they'd otherwise pass the extension/marker
+// filters and pollute the installable-assets lists with a ~390 MB non-llama
+// download. They're kept (paired onto their binary, not dropped) because a
+// Windows CUDA build is unusable without them: the DLLs inside must sit next
+// to llama-bench.exe or it can't load its CUDA backend at all.
+function isCudartAsset(name: string): boolean {
+  return name.toLowerCase().startsWith("cudart-");
+}
+
+// The cudart naming convention (verified against real releases, e.g. b10612):
+//   binary:  llama-<tag>-bin-win-cuda-12.4-x64.zip
+//   cudart:  cudart-llama-bin-win-cuda-12.4-x64.zip
+// i.e. the cudart name is the binary name with the tag dropped from after
+// "llama-" -- so everything from "-bin-" on is identical between the pair,
+// which is exactly what this extracts as the pairing key (null when the name
+// has no "-bin-" at all).
+function assetBinSuffix(name: string): string | null {
+  const idx = name.toLowerCase().indexOf("-bin-");
+  return idx < 0 ? null : name.slice(idx + "-bin-".length);
 }
 
 // Checked every time a worker's llama-cpp info is requested (i.e. every time
@@ -180,10 +230,35 @@ export function filterReleasesForWorker(
   releases: LlamaCppRelease[],
   platform: string,
   arch: string,
-  backend: Backend
+  backend: Backend,
+  driverCudaVersion?: string | null
 ): LlamaCppRelease[] {
   return releases.map((r) => ({
     ...r,
-    assets: r.assets.filter((a) => assetMatchesWorker(a.name, platform, arch, backend)),
+    assets: sortAssetsForWorker(
+      r.assets.filter((a) => assetMatchesWorker(a.name, platform, arch, backend)),
+      driverCudaVersion
+    ),
   }));
+}
+
+// The single place an installable asset becomes an install_build job payload,
+// used by BOTH entry points that can queue an install (the Workers page's
+// install route and runs.ts's auto-install-at-trigger) so a CUDA build always
+// carries its cudart pairing along -- whichever path queued it.
+export function buildInstallPayload(release: LlamaCppRelease, asset: LlamaCppAsset): InstallBuildJobPayload {
+  const cudart = release.cudart_assets?.[asset.name];
+  return {
+    tag: release.tag,
+    asset_name: asset.name,
+    download_url: asset.download_url,
+    ...(asset.size_bytes > 0 ? { size_bytes: asset.size_bytes } : {}),
+    ...(cudart
+      ? {
+          cudart_name: cudart.name,
+          cudart_url: cudart.download_url,
+          cudart_size_bytes: cudart.size_bytes,
+        }
+      : {}),
+  };
 }

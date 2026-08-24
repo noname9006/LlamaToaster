@@ -1,7 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import { repo } from "../db/repo.js";
 import { queueEvents } from "../queue-events.js";
-import { getReleases, filterReleasesForWorker } from "../github-releases.js";
+import { getReleases, filterReleasesForWorker, buildInstallPayload } from "../github-releases.js";
 import { BadRequestError, ConflictError, NotFoundError } from "../errors.js";
 import { resolveAuthUser, assertOwnsWorker } from "../auth-middleware.js";
 import { authenticateWorker } from "../worker-auth.js";
@@ -88,7 +88,17 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
     let available: LlamaCppRelease[] = [];
     try {
       const releases = await getReleases();
-      available = filterReleasesForWorker(releases, worker.platform, worker.arch, worker.backend);
+      // The worker's own nvidia-smi-reported max CUDA version (see
+      // HardwareInfo.nvidia_driver) orders each release's variants
+      // best-first -- a cuda-13.x zip that this driver can't even load gets
+      // demoted below the cuda-12.x one instead of being assets[0].
+      available = filterReleasesForWorker(
+        releases,
+        worker.platform,
+        worker.arch,
+        worker.backend,
+        worker.hardware?.nvidia_driver?.cuda_version ?? null
+      );
     } catch (err) {
       // GitHub being unreachable shouldn't block viewing installed builds --
       // just report an empty "installable" list.
@@ -116,13 +126,21 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
       // this exact tag/asset pair.
       const releases = await getReleases();
       const release = releases.find((r) => r.tag === tag);
-      const downloadUrl = release?.assets.find((a) => a.name === asset_name)?.download_url;
-      if (!downloadUrl) throw new BadRequestError(`no matching asset ${asset_name} for tag ${tag}`);
+      const asset = release?.assets.find((a) => a.name === asset_name);
+      if (!release || !asset) throw new BadRequestError(`no matching asset ${asset_name} for tag ${tag}`);
 
-      request.log.info({ worker: worker.id, tag, asset_name }, "llama-cpp install queued");
+      // buildInstallPayload attaches the matching cudart redistributable for
+      // CUDA builds (the DLLs the binary can't load without) -- same pairing
+      // logic the auto-install path uses.
+      const payload = buildInstallPayload(release, asset);
+
+      request.log.info(
+        { worker: worker.id, tag, asset_name, cudart: payload.cudart_name ?? null },
+        "llama-cpp install queued"
+      );
       repo.queueRepo.enqueueJob(worker.id, {
         type: "install_build",
-        payload: { tag, asset_name, download_url: downloadUrl },
+        payload,
       });
       queueEvents.emit(worker.id);
       return reply.code(202).send({ ok: true, queued: true });

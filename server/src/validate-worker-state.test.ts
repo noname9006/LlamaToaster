@@ -128,6 +128,43 @@ describe("parseWorkerState", () => {
     delete hardware.cpu;
     expect(() => parseWorkerState({ ...body, hardware })).toThrow(BadRequestError);
   });
+
+  it("passes the NVIDIA driver probe through (and keeps it optional for old workers)", () => {
+    const without = parseWorkerState(validBody());
+    expect(without.hardware.nvidia_driver).toBeUndefined();
+
+    const body = validBody({
+      hardware: {
+        ...(validBody().hardware as object),
+        nvidia_driver: { version: "566.36", cuda_version: "12.7" },
+      },
+    });
+    const withProbe = parseWorkerState(body);
+    expect(withProbe.hardware.nvidia_driver).toEqual({ version: "566.36", cuda_version: "12.7" });
+  });
+
+  it("rejects a non-object nvidia_driver rather than coercing it", () => {
+    expect(() =>
+      parseWorkerState(validBody({ hardware: { ...(validBody().hardware as object), nvidia_driver: "566.36" } }))
+    ).toThrow(BadRequestError);
+  });
+
+  it("passes cudart_name through on installed_builds", () => {
+    const state = parseWorkerState(
+      validBody({
+        installed_builds: [
+          {
+            tag: "b10612",
+            asset_name: "llama-b10612-bin-win-cuda-12.4-x64.zip",
+            installed_at: 1000,
+            active: true,
+            cudart_name: "cudart-llama-bin-win-cuda-12.4-x64.zip",
+          },
+        ],
+      })
+    );
+    expect(state.installed_builds[0]?.cudart_name).toBe("cudart-llama-bin-win-cuda-12.4-x64.zip");
+  });
 });
 
 describe("parseActiveJobReport", () => {
