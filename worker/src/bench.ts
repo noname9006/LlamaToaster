@@ -367,6 +367,58 @@ export function parseModelBufferSizes(stderr: string): ModelBufferSizesByModel |
   };
 }
 
+// ---------------------------------------------------------------------------
+// VRAM-discrepancy postmortem extraction. When a claimed-full offload turns
+// out not-resident (index.ts's finalizeSweepItemResult discrepancy check),
+// the evidence explaining WHY is scattered through hundreds of per-tensor
+// stderr lines. These patterns pull out only the diagnostic ones -- device
+// enumeration, allocation failures, the claim line itself, the per-backend
+// buffer split -- so they can be logged at warn level directly instead of
+// leaving the reader to reopen the raw JSON dump (which still holds the full
+// transcript).
+
+export const MAX_CUDA_DIAGNOSTIC_LINES = 40;
+
+const CUDA_DIAGNOSTIC_LINE_RES: RegExp[] = [
+  // ggml-cuda's device-enumeration block ("found N CUDA devices" + its
+  // per-device detail lines) -- the "did it even see the right GPU, in what
+  // order, with what compute capability" evidence.
+  /ggml_cuda_init:/,
+  /\bDevice \d+:/,
+  // Allocation-failure fingerprints (the ggml backend bounce / driver OOM
+  // path): ggml's "failed to allocate ... buffer", anything naming a CUDA
+  // allocation entry point, and the failure verbatim.
+  /failed to allocate/i,
+  /\bcuda(Malloc|Free|HostAlloc|HostRegister)\b/i,
+  /\bcuMem(Create|Alloc)\w*\b/i,
+  /out of memory/i,
+  /\bCUDA error\b/i,
+  // Host-fallback wording some builds print when bouncing weights off the
+  // GPU ("falling back to CPU buffer", "sysmem fallback").
+  /fallback|falling back/i,
+  /sysmem/i,
+  // The plan-vs-reality pair this whole check exists to compare: the claim
+  // line and the post-allocation per-backend buffer sizes.
+  OFFLOAD_LAYERS_LINE_RE,
+  MODEL_BUFFER_SIZE_LINE_RE,
+];
+
+export function extractCudaDiagnosticLines(stderr: string): string[] {
+  const out: string[] = [];
+  let elided = 0;
+  for (const raw of stderr.split("\n")) {
+    const line = raw.trim();
+    if (!line || !CUDA_DIAGNOSTIC_LINE_RES.some((re) => re.test(line))) continue;
+    if (out.length >= MAX_CUDA_DIAGNOSTIC_LINES) {
+      elided++;
+      continue;
+    }
+    out.push(line);
+  }
+  if (elided > 0) out.push(`…[${elided} more diagnostic lines elided -- see the raw JSON dump]`);
+  return out;
+}
+
 // llama-bench's -v/--verbose (see supportsVerboseFlag above) and
 // llama-server's --verbosity 4 (see worker/src/serverBench.ts's buildArgs)
 // both print one line per tensor while a model loads, and (for a

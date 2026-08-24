@@ -153,6 +153,23 @@ export default function App() {
     }
   }
 
+  // Enum-valued sibling of handleToggleSetting above -- same optimistic-apply-
+  // revert-on-failure shape, but sends a specific value instead of boolean-
+  // flipping (the policy select below).
+  async function handleSetVramPolicy(value: AppSettings["workerVramDiscrepancyPolicy"]) {
+    if (settings === null) return;
+    const prev = settings;
+    setSettings({ ...settings, workerVramDiscrepancyPolicy: value });
+    setSettingsError(null);
+    try {
+      const result = await api.updateSettings({ workerVramDiscrepancyPolicy: value });
+      setSettings(result);
+    } catch (err) {
+      setSettings(prev);
+      setSettingsError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
   if (phase === "loading") {
     return <div className="flex min-h-screen items-center justify-center text-sm text-muted">Loading…</div>;
   }
@@ -234,6 +251,28 @@ export default function App() {
               onChange={() => void handleToggleSetting("accountDeletionAllowed")}
               disabled={settings === null}
             />
+          </div>
+          <div className="flex items-center justify-between gap-4 rounded-lg border border-border px-3 py-2.5">
+            <div>
+              <div className="text-sm font-medium text-fg">Worker VRAM fallback policy</div>
+              <div className="text-xs text-muted">
+                What machines do when a benchmark claims full GPU offload but provably ran from system RAM
+                (claimed X/Y layers, ~0 actually resident). warn: record results with a warning (default).
+                retry_once_then_fail: one silent re-run to rule out transient VRAM contention, then fail —
+                later items in the same run skip straight to failed. fail: never record such results.
+                Delivered to workers via their ~10s heartbeat; applies from the next item onward.
+              </div>
+            </div>
+            <select
+              value={settings?.workerVramDiscrepancyPolicy ?? "warn"}
+              onChange={(e) => void handleSetVramPolicy(e.target.value as AppSettings["workerVramDiscrepancyPolicy"])}
+              disabled={settings === null}
+              className="flex-none rounded-lg border border-border bg-surface px-2.5 py-1.5 text-sm text-fg"
+            >
+              <option value="warn">warn</option>
+              <option value="retry_once_then_fail">retry_once_then_fail</option>
+              <option value="fail">fail</option>
+            </select>
           </div>
         </div>
       </section>

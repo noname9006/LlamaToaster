@@ -998,6 +998,12 @@ export interface HeartbeatResponse {
   // worker/src/index.ts's discard handling).
   control: { cancel_job_ids: string[]; discard_job_ids: string[]; pause: boolean };
   lease_until: number;
+  // Operator-controlled settings (see AppSettings) piggybacked on every
+  // beat -- the worker's ~10s heartbeat cadence doubles as the settings
+  // propagation channel, so a policy flip on the supervise dashboard takes
+  // effect without touching the worker or restarting anything. Absent
+  // (older server) just means "keep whatever you had".
+  app_settings?: AppSettings;
 }
 
 // Multi-user Stage 3 (MULTIUSER_PLAN.md §3.1/§3.4/§3.5) -- RFC 8628-shaped
@@ -1111,6 +1117,29 @@ export interface AuthStatus {
 // key-value table (server/src/db/schema.sql) rather than a dedicated table --
 // there are only ever these two flags. Absent key reads as the documented
 // default on each field below (repo.ts's appSettingsRepo.get()).
+// How a worker's own post-run VRAM-discrepancy detection (finalizeSweepItemResult's
+// claimed-vs-actual offload check) translates into item outcomes:
+//   warn                 -- record results normally, attach the warning (original behavior)
+//   retry_once_then_fail -- re-run the item once (heals transient VRAM contention);
+//                           a reproduced discrepancy marks the item failed, and the
+//                           run-scoped persistent memo makes later items fail
+//                           immediately instead of each paying their own retry
+//   fail                 -- never record discrepancy results; mark the item failed
+// Only the unambiguous signature triggers the hard actions: llama.cpp's own
+// post-allocation buffer report contradicting the claim with ~0 bytes on the
+// GPU buffer (~0 layers actually resident). Softer shortfalls (partial
+// residency, or VRAM-sample-based detections without a buffer report) always
+// stay at warn level regardless of policy -- too estimate-noisy to fail a run over.
+export type VramDiscrepancyPolicy = "warn" | "retry_once_then_fail" | "fail";
+
+// Single whitelist for every boundary that accepts one of these from the
+// outside -- the admin settings POST, the meta-table read (a hand-edited DB
+// row must degrade to the documented default, not poison heartbeats), and
+// the worker's heartbeat ingestion.
+export function isVramDiscrepancyPolicy(value: unknown): value is VramDiscrepancyPolicy {
+  return value === "warn" || value === "retry_once_then_fail" || value === "fail";
+}
+
 export interface AppSettings {
   // Whether users are allowed to turn ON the "contribute to community
   // benchmark database" toggle in Settings at all -- default false (starts
@@ -1123,6 +1152,11 @@ export interface AppSettings {
   // hides the whole Danger zone section, and DELETE /api/auth/account
   // refuses server-side too.
   accountDeletionAllowed: boolean;
+  // What workers do when a benchmark claims full GPU offload but provably
+  // ran from system RAM -- default "warn" (record anyway with the warning,
+  // the shipped v1 behavior). Set from the supervise dashboard; reaches
+  // workers via HeartbeatResponse.app_settings.
+  workerVramDiscrepancyPolicy: VramDiscrepancyPolicy;
 }
 
 // GET /api/sessions -- one row per live session for the caller's own

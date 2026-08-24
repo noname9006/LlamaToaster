@@ -19,10 +19,10 @@ import { gzipSync } from "node:zlib";
 import { hostname as osHostname } from "node:os";
 import { pipeline } from "node:stream/promises";
 import { Readable, Transform } from "node:stream";
-import { runBench, matchOffloadLine, type BenchResult, type OffloadResult, type OffloadInfo, type ModelBufferSizes } from "./bench.js";
+import { runBench, matchOffloadLine, extractCudaDiagnosticLines, type BenchResult, type OffloadResult, type OffloadInfo, type ModelBufferSizes } from "./bench.js";
 import { runServerBench } from "./serverBench.js";
 import { MemorySampler, captureFreeMemoryBaseline, type SampleStats, type FreeMemoryBaseline } from "./sampler.js";
-import { readGpuMemory } from "./vram.js";
+import { readGpuMemory, readNvidiaDriverInfo, type NvidiaDriverInfo } from "./vram.js";
 import {
   estimateResidentGpuLayers,
   estimateResidentGpuLayersFromBufferSizes,
@@ -77,7 +77,10 @@ import {
   type DownloadModelJobPayload,
   type WorkerVramInfo,
   type LocalModelState,
+  isVramDiscrepancyPolicy,
+  type VramDiscrepancyPolicy,
 } from "../../shared/types.js";
+import { resolveVramDiscrepancyAction } from "./vram-policy.js";
 import { expandSweep, deriveTestType, type SweepItem } from "../../shared/sweep.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -879,6 +882,11 @@ interface RunSweepItemInput {
   timeoutMs: number | undefined;
   vpsUrl: string;
   rawJsonDir: string;
+  // 0 on the first run of this item; >=1 on a policy-driven retry (see
+  // SweepItemOutcome.retryForVramFallback). Suffixes the raw JSON dump
+  // filename so the retried attempt's transcript doesn't overwrite the
+  // first one's, and gates the retry decision in finalization.
+  attempt?: number;
 }
 
 // Marker lines llama-bench prints to stderr when run with --progress (see
@@ -1202,6 +1210,9 @@ function logDiagnosticOutput(label: string, processName: string, stderr: string)
 // (runSweepItemViaServer below) since both produce the same BenchResult
 // shape and this classification (success vs. OOM vs. plain failure vs.
 // user-cancelled, see classifyFailure) doesn't care which process ran.
+// `attempt` is 0 on the first run of an item and 1 on its policy-driven
+// retry (see SweepItemOutcome.retryForVramFallback) -- it gates the
+// retry_once_then_fail decision and annotates the recorded error text.
 async function finalizeSweepItemResult(
   runId: string,
   item: SweepItem,
@@ -1211,8 +1222,9 @@ async function finalizeSweepItemResult(
   stats: SampleStats,
   baseline: FreeMemoryBaseline,
   mainGpu: number | undefined,
-  modelSizeBytes: number
-): Promise<TerminalRunItemStatus> {
+  modelSizeBytes: number,
+  attempt = 0
+): Promise<SweepItemOutcome> {
   // Read from llama.cpp's own runtime output (see bench.ts's
   // parseOffloadLayers) -- both null when the line was never seen at all
   // (item failed before model load finished, or a build too old to support
@@ -1380,6 +1392,64 @@ async function finalizeSweepItemResult(
     // sysmem-fallback bug report) both looked identical to a clean run.
     const combinedWarning = [bench.warning, vramDiscrepancyWarning].filter(Boolean).join(" | ") || undefined;
     if (combinedWarning) log.warn(`${label} completed with warnings: ${combinedWarning}`);
+    // When the VRAM discrepancy fired, surface the root-cause evidence llama.cpp
+    // itself printed (device enumeration, allocation failures, the claim line,
+    // the per-backend buffer split) directly in the log at warn level, instead
+    // of leaving the reader to reopen the raw JSON dump for it -- see bench.ts's
+    // extractCudaDiagnosticLines. filterDiagnosticOutput keeps any pathologically
+    // long line from dumping prompt/response content into the text log.
+    if (vramDiscrepancyWarning) {
+      const diagnostics = filterDiagnosticOutput(extractCudaDiagnosticLines(bench.stderr).join("\n"));
+      if (diagnostics) {
+        log.warn(`${label} llama.cpp stderr diagnostics for the VRAM discrepancy:\n${diagnostics}`);
+      }
+    }
+    // Policy enforcement (shared/types.ts's VramDiscrepancyPolicy): only the
+    // unambiguous hard signature -- llama.cpp's own post-allocation buffer
+    // report showing ~0 bytes on the GPU (~0 layers resident) against a full
+    // claim -- escalates past warn. retry_once deliberately returns BEFORE any
+    // terminal report is posted: the caller re-invokes the item fresh and only
+    // the final attempt's outcome is ever recorded server-side, so a healed
+    // retry looks like a clean single run and a reproduced fallback carries
+    // both attempts' context in its error text.
+    const hardFallback = offloadDiscrepancy?.source === "llama_cpp_buffer" && offloadDiscrepancy.residentEst === 0;
+    const decision = resolveVramDiscrepancyAction(
+      vramDiscrepancyPolicy,
+      hardFallback,
+      attempt > 0,
+      vramFallbackConfirmedPersistent
+    );
+    if (decision.action === "retry_once") {
+      log.warn(
+        `${label}: claimed offload provably never landed on the GPU (~${offloadDiscrepancy?.observedMib}MiB on the ` +
+          `GPU buffer) with a clean exit -- re-running this item once ` +
+          `(vram_discrepancy_policy=retry_once_then_fail). Nothing recorded from this attempt.`
+      );
+      return { status: "failed", retryForVramFallback: true };
+    }
+    if (decision.action === "fail_item") {
+      const policyNote =
+        `item marked failed without recording results (vram_discrepancy_policy=${vramDiscrepancyPolicy}` +
+        `${attempt > 0 ? ", fallback reproduced on retry" : ""}` +
+        `${vramFallbackConfirmedPersistent ? ", persistent in this run" : ""})`;
+      const failError = [combinedWarning, policyNote].filter(Boolean).join(" -- ");
+      log.error(`${label} failed by VRAM-discrepancy policy: ${failError}`);
+      if (attempt > 0 && !vramFallbackConfirmedPersistent) {
+        vramFallbackConfirmedPersistent = true;
+        log.warn(
+          `${label}: VRAM fallback reproduced across a retry -- later items in this run will fail immediately instead of each paying their own retry`
+        );
+      }
+      await safeItemTerminal(runId, item.idx, {
+        status: "failed",
+        error: failError,
+        ram_peak_mib: stats.ram_peak_mib,
+        vram_peak_mib: stats.vram_peak_mib,
+        ram_avg_mib: stats.ram_avg_mib,
+        vram_avg_mib: stats.vram_avg_mib,
+      });
+      return { status: "failed" };
+    }
     await safeItemTerminal(runId, item.idx, {
       status: "done",
       error: combinedWarning,
@@ -1403,7 +1473,7 @@ async function finalizeSweepItemResult(
       // name (see backendDeviceName above) stays authoritative in that case.
       backend_device_name: mainGpu == null ? bench.gpu_info : undefined,
     });
-    return "done";
+    return { status: "done" };
   }
   // A user-requested stop kills this exact process (SIGKILL, via the
   // heartbeat's cancel_job_ids control) -- report it as "cancelled", not a
@@ -1430,7 +1500,7 @@ async function finalizeSweepItemResult(
     ram_avg_mib: stats.ram_avg_mib,
     vram_avg_mib: stats.vram_avg_mib,
   });
-  return status;
+  return { status };
 }
 
 // The always-on "how many of the claimed layers actually landed in a GPU
@@ -1447,26 +1517,71 @@ function computeResidentLayers(info: OffloadInfo | null | undefined, buffers: Mo
   return estimateResidentGpuLayersFromBufferSizes(info.gpu_layers_loaded, buffers.gpuMib, buffers.cpuMib);
 }
 
+// nvidia-smi's driver/CUDA-version banner (see vram.ts's readNvidiaDriverInfo),
+// fetched once per worker process and reused for every item-start log line --
+// the installed driver can't meaningfully change underneath a running worker,
+// and re-spawning nvidia-smi per item would just repay its cold-start cost for
+// an identical answer. Null (also cached, so a transient failure doesn't
+// retry-spawn on every item) on a non-NVIDIA worker.
+let nvidiaDriverInfoPromise: Promise<NvidiaDriverInfo | null> | null = null;
+
+function getNvidiaDriverInfo(): Promise<NvidiaDriverInfo | null> {
+  if (!nvidiaDriverInfoPromise) nvidiaDriverInfoPromise = readNvidiaDriverInfo();
+  return nvidiaDriverInfoPromise;
+}
+
+// Operator-set action for VRAM discrepancies (shared/types.ts's
+// VramDiscrepancyPolicy), refreshed from HeartbeatResponse.app_settings on
+// every beat -- flipping it on the supervise dashboard reaches an in-flight
+// run within one ~10s interval, applying from the next item onward.
+let vramDiscrepancyPolicy: VramDiscrepancyPolicy = "warn";
+
+// Run-scoped memo for retry_once_then_fail: set once a retry REPRODUCES the
+// hard fallback signature, proving the cause is deterministic on this machine
+// right now -- later items in the same run then fail immediately instead of
+// each paying their own extra bench just to re-confirm the same thing.
+// Reset at the start of every benchmark job, so a fix applied between runs
+// gets a fresh chance to heal items via retry.
+let vramFallbackConfirmedPersistent = false;
+
+// What runSweepItem/runSweepItemViaServer resolve to -- status as before,
+// plus a retry signal that only ever appears when finalizeSweepItemResult
+// decided (per vramDiscrepancyPolicy) that this item must be re-run ONCE and
+// deliberately posted no terminal report yet. The caller re-invokes with
+// attempt=1 and tallies whatever comes back.
+interface SweepItemOutcome {
+  status: TerminalRunItemStatus;
+  retryForVramFallback?: true;
+}
+
 // Runs exactly one sweep combination as its own llama-bench process, reports
 // its progress live, and always resolves (never throws) regardless of
 // outcome -- so the caller's loop over every item in the sweep can continue
 // unconditionally instead of one bad combination aborting the rest.
-async function runSweepItem(input: RunSweepItemInput): Promise<TerminalRunItemStatus> {
+async function runSweepItem(input: RunSweepItemInput): Promise<SweepItemOutcome> {
   const { runId, item, backend } = input;
   const label = `run ${runId} item ${item.idx}`;
   const itemStartedAt = Date.now();
+  const attempt = input.attempt ?? 0;
 
   const testType = deriveTestType(item.n_prompt, item.n_gen);
   const benchmarkingPhase: RunItemTickInput["status"] =
     testType === "pp" ? "processing" : testType === "tg" ? "generating" : "benchmarking";
 
-  log.info(`${label}: starting test -- engine=llama-bench params: ${formatItemParams(item)}`);
+  log.info(
+    `${label}: starting test -- engine=llama-bench params: ${formatItemParams(item)}` +
+      (attempt > 0 ? ` [retry ${attempt}]` : "")
+  );
   log.info(`${label}: device: ${formatDeviceSelection(backend, input.mainGpu)}`);
   const baseline = await captureFreeMemoryBaseline(backend);
   log.info(
     `${label}: free memory before start: ram=${baseline.ram_free_before_mib}MiB` +
       (baseline.vram_free_before_mib != null ? ` vram=${baseline.vram_free_before_mib}MiB` : "")
   );
+  if (backend === "cuda") {
+    const drv = await getNvidiaDriverInfo();
+    if (drv) log.info(`${label}: nvidia driver ${drv.driverVersion} (max CUDA ${drv.cudaVersion})`);
+  }
   sendTick(runId, item.idx, {
     status: "loading",
     ram_free_before_mib: baseline.ram_free_before_mib,
@@ -1610,10 +1725,14 @@ async function runSweepItem(input: RunSweepItemInput): Promise<TerminalRunItemSt
     activeBenchProc = null;
     const stats = sampler.stop();
     const outcome = bench.code === 0 && bench.results.length > 0 ? "ok" : "failed";
-    const rawJsonPath = writeRawJson(rawJsonSubdir(input.rawJsonDir, outcome), `${runId}-${item.idx}`, {
-      stdout: bench.stdout,
-      stderr: bench.stderr,
-    });
+    const rawJsonPath = writeRawJson(
+      rawJsonSubdir(input.rawJsonDir, outcome),
+      `${runId}-${item.idx}${attempt > 0 ? `-retry${attempt}` : ""}`,
+      {
+        stdout: bench.stdout,
+        stderr: bench.stderr,
+      }
+    );
     logDiagnosticOutput(label, "llama-bench", bench.stderr);
     const result = await finalizeSweepItemResult(
       runId,
@@ -1624,7 +1743,8 @@ async function runSweepItem(input: RunSweepItemInput): Promise<TerminalRunItemSt
       stats,
       baseline,
       input.mainGpu,
-      input.modelSizeBytes
+      input.modelSizeBytes,
+      attempt
     );
     // Printed last (after the TEST SUMMARY block above, whatever this item's
     // outcome) so anyone reading the log -- including a stopped/cancelled
@@ -1648,7 +1768,7 @@ async function runSweepItem(input: RunSweepItemInput): Promise<TerminalRunItemSt
       ram_avg_mib: stats.ram_avg_mib,
       vram_avg_mib: stats.vram_avg_mib,
     });
-    return "failed";
+    return { status: "failed" };
   }
 }
 
@@ -1668,6 +1788,8 @@ interface RunSweepItemViaServerInput {
   mainGpu?: number;
   timeoutMs: number | undefined;
   rawJsonDir: string;
+  // See RunSweepItemInput.attempt above.
+  attempt?: number;
 }
 
 // MTP-benchmarking sibling of runSweepItem above: same outer shape (baseline
@@ -1678,17 +1800,25 @@ interface RunSweepItemViaServerInput {
 // reporting is simpler here: serverBench.ts drives its own repeat loop
 // directly, so ticks come from a plain callback rather than regex-scraped
 // subprocess stderr.
-async function runSweepItemViaServer(input: RunSweepItemViaServerInput): Promise<TerminalRunItemStatus> {
+async function runSweepItemViaServer(input: RunSweepItemViaServerInput): Promise<SweepItemOutcome> {
   const { runId, item, backend } = input;
   const label = `run ${runId} item ${item.idx} (mtp)`;
+  const attempt = input.attempt ?? 0;
 
-  log.info(`${label}: starting test -- engine=llama-server params: ${formatItemParams(item)}`);
+  log.info(
+    `${label}: starting test -- engine=llama-server params: ${formatItemParams(item)}` +
+      (attempt > 0 ? ` [retry ${attempt}]` : "")
+  );
   log.info(`${label}: device: ${formatDeviceSelection(backend, input.mainGpu)}`);
   const baseline = await captureFreeMemoryBaseline(backend);
   log.info(
     `${label}: free memory before start: ram=${baseline.ram_free_before_mib}MiB` +
       (baseline.vram_free_before_mib != null ? ` vram=${baseline.vram_free_before_mib}MiB` : "")
   );
+  if (backend === "cuda") {
+    const drv = await getNvidiaDriverInfo();
+    if (drv) log.info(`${label}: nvidia driver ${drv.driverVersion} (max CUDA ${drv.cudaVersion})`);
+  }
   sendTick(runId, item.idx, {
     status: "loading",
     ram_free_before_mib: baseline.ram_free_before_mib,
@@ -1727,10 +1857,14 @@ async function runSweepItemViaServer(input: RunSweepItemViaServerInput): Promise
     activeBenchProc = null;
     const stats = sampler.stop();
     const outcome = bench.code === 0 && bench.results.length > 0 ? "ok" : "failed";
-    const rawJsonPath = writeRawJson(rawJsonSubdir(input.rawJsonDir, outcome), `${runId}-${item.idx}`, {
-      stdout: bench.stdout,
-      stderr: bench.stderr,
-    });
+    const rawJsonPath = writeRawJson(
+      rawJsonSubdir(input.rawJsonDir, outcome),
+      `${runId}-${item.idx}${attempt > 0 ? `-retry${attempt}` : ""}`,
+      {
+        stdout: bench.stdout,
+        stderr: bench.stderr,
+      }
+    );
     logDiagnosticOutput(label, "llama-server", bench.stderr);
     const result = await finalizeSweepItemResult(
       runId,
@@ -1741,7 +1875,8 @@ async function runSweepItemViaServer(input: RunSweepItemViaServerInput): Promise
       stats,
       baseline,
       input.mainGpu,
-      input.modelSizeBytes
+      input.modelSizeBytes,
+      attempt
     );
     // See runSweepItem's identical line above -- same reasoning, same
     // "always printed last, cancelled included" behavior.
@@ -1760,7 +1895,7 @@ async function runSweepItemViaServer(input: RunSweepItemViaServerInput): Promise
       ram_avg_mib: stats.ram_avg_mib,
       vram_avg_mib: stats.vram_avg_mib,
     });
-    return "failed";
+    return { status: "failed" };
   }
 }
 
@@ -1822,6 +1957,11 @@ async function executeBenchmarkJob(payload: BenchmarkJob): Promise<void> {
   pauseRequested = false;
   stopRequested = false;
   activeBenchProc = null;
+  // Fresh per-run chance for retry_once_then_fail to heal items -- a
+  // fallback confirmed persistent during an EARLIER run (then fixed, e.g. by
+  // freeing VRAM or changing the driver's sysmem-fallback policy) must not
+  // pre-fail this run's items without their own retry.
+  vramFallbackConfirmedPersistent = false;
 
   const items = expandSweep(payload.sweep);
   setRunLogFile(runLogFilePath(payload.run_id));
@@ -1882,38 +2022,47 @@ async function executeBenchmarkJob(payload: BenchmarkJob): Promise<void> {
           tally("failed");
           continue;
         }
-        tally(
-          await runSweepItemViaServer({
-            runId: payload.run_id,
-            item,
-            repeats: payload.sweep.repeats,
-            modelPath,
-            mtpModelPath,
-            llamaServerPath: effectiveBuild.serverPath,
-            port: config.mtp_server_port ?? DEFAULT_MTP_SERVER_PORT,
-            backend: effectiveBackend,
-            mainGpu: payload.main_gpu,
-            timeoutMs: config.bench_timeout_ms,
-            rawJsonDir: rawDir,
-            modelSizeBytes: payload.model.size_bytes,
-          })
-        );
+        const serverArgs = {
+          runId: payload.run_id,
+          item,
+          repeats: payload.sweep.repeats,
+          modelPath,
+          mtpModelPath,
+          llamaServerPath: effectiveBuild.serverPath,
+          port: config.mtp_server_port ?? DEFAULT_MTP_SERVER_PORT,
+          backend: effectiveBackend,
+          mainGpu: payload.main_gpu,
+          timeoutMs: config.bench_timeout_ms,
+          rawJsonDir: rawDir,
+          modelSizeBytes: payload.model.size_bytes,
+        };
+        let outcome = await runSweepItemViaServer({ ...serverArgs, attempt: 0 });
+        // retry_once_then_fail's single re-run (see SweepItemOutcome) --
+        // whatever this second attempt resolves to is what gets tallied and
+        // (via finalization) reported; the first attempt posted nothing.
+        if (outcome.retryForVramFallback) {
+          outcome = await runSweepItemViaServer({ ...serverArgs, attempt: 1 });
+        }
+        tally(outcome.status);
       } else {
-        tally(
-          await runSweepItem({
-            runId: payload.run_id,
-            item,
-            repeats: payload.sweep.repeats,
-            modelPath,
-            llamaBenchPath: effectiveBuild.path,
-            backend: effectiveBackend,
-            mainGpu: payload.main_gpu,
-            timeoutMs: config.bench_timeout_ms,
-            vpsUrl: config.vps_url,
-            rawJsonDir: rawDir,
-            modelSizeBytes: payload.model.size_bytes,
-          })
-        );
+        const benchArgs = {
+          runId: payload.run_id,
+          item,
+          repeats: payload.sweep.repeats,
+          modelPath,
+          llamaBenchPath: effectiveBuild.path,
+          backend: effectiveBackend,
+          mainGpu: payload.main_gpu,
+          timeoutMs: config.bench_timeout_ms,
+          vpsUrl: config.vps_url,
+          rawJsonDir: rawDir,
+          modelSizeBytes: payload.model.size_bytes,
+        };
+        let outcome = await runSweepItem({ ...benchArgs, attempt: 0 });
+        if (outcome.retryForVramFallback) {
+          outcome = await runSweepItem({ ...benchArgs, attempt: 1 });
+        }
+        tally(outcome.status);
       }
     }
     const breakdown =
@@ -2477,6 +2626,17 @@ async function heartbeatTick(): Promise<void> {
       requestDownloadStop(jobId);
     }
     pauseRequested = res.control.pause;
+    // Settings propagation channel (see HeartbeatResponse.app_settings) --
+    // an unrecognized/absent value keeps whatever policy is current, so an
+    // older server or a bad row can never reset a running worker to
+    // anything unexpected.
+    if (isVramDiscrepancyPolicy(res.app_settings?.workerVramDiscrepancyPolicy)) {
+      const next = res.app_settings.workerVramDiscrepancyPolicy;
+      if (next !== vramDiscrepancyPolicy) {
+        vramDiscrepancyPolicy = next;
+        log.info(`vram_discrepancy_policy updated from heartbeat: ${next}`);
+      }
+    }
   } catch (err) {
     // Transient -- the server's lease is 6 heartbeats wide (LEASE_MS), so
     // one or two missed heartbeats in a row is recoverable without any
