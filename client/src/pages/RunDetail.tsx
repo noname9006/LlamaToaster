@@ -126,8 +126,30 @@ const MERGED_COLUMN_DEFS: ColDef[] = [
     sortKey: "ttft",
   },
   { label: "free", description: "Free system RAM immediately before this test started.", sortKey: "ram_free", group: "ram" },
-  { label: "avg", description: "Average RAM used by the process while this test ran.", sortKey: "ram_avg", group: "ram" },
-  { label: "max", description: "Peak RAM used by the process during this test.", sortKey: "ram_max", group: "ram" },
+  {
+    label: "used avg",
+    description: "Whole-system RAM in use (all processes combined) averaged over this test -- distinct from proc avg, which is only this benchmark process.",
+    sortKey: "ram_used_avg",
+    group: "ram",
+  },
+  {
+    label: "used max",
+    description: "Peak whole-system RAM in use (all processes combined) during this test.",
+    sortKey: "ram_used_max",
+    group: "ram",
+  },
+  {
+    label: "proc avg",
+    description: "Average RAM used by this benchmark process alone while this test ran.",
+    sortKey: "ram_avg",
+    group: "ram",
+  },
+  {
+    label: "proc max",
+    description: "Peak RAM used by this benchmark process alone during this test.",
+    sortKey: "ram_max",
+    group: "ram",
+  },
   {
     label: "total",
     description: "Total GPU memory (VRAM) capacity reported by the backend.",
@@ -141,15 +163,29 @@ const MERGED_COLUMN_DEFS: ColDef[] = [
     group: "vram",
   },
   {
-    label: "avg",
-    description: "Average GPU memory used while this test ran (best-effort).",
-    sortKey: "vram_avg",
+    label: "used avg",
+    description:
+      "Whole-GPU VRAM in use (every process on the GPU combined -- the desktop and other apps included) averaged over this test.",
+    sortKey: "vram_used_avg",
     group: "vram",
   },
   {
-    label: "max",
-    description: "Peak GPU memory used during this test (best-effort).",
-    sortKey: "vram_max",
+    label: "used max",
+    description: "Peak whole-GPU VRAM in use (every process on the GPU combined) during this test.",
+    sortKey: "vram_used_max",
+    group: "vram",
+  },
+  {
+    label: "proc avg",
+    description:
+      "Average VRAM used by this benchmark process alone while this test ran — only available where the driver exposes per-process GPU memory (nvidia-smi, Windows GPU Process Memory, rocm-smi --showpids).",
+    sortKey: "vram_proc_avg",
+    group: "vram",
+  },
+  {
+    label: "proc max",
+    description: "Peak VRAM used by this benchmark process alone during this test.",
+    sortKey: "vram_proc_max",
     group: "vram",
   },
 ];
@@ -309,31 +345,46 @@ function AccuracyIcon({ title }: { title: string | undefined }) {
 
 interface MemoryCells {
   ramFree: string;
-  ramAvg: string;
-  ramMax: string;
+  ramUsedAvg: string;
+  ramUsedMax: string;
+  ramProcAvg: string;
+  ramProcMax: string;
   vramTotal: string;
   vramFree: string;
-  vramAvg: string;
-  vramMax: string;
+  vramUsedAvg: string;
+  vramUsedMax: string;
+  vramProcAvg: string;
+  vramProcMax: string;
 }
 
 // Once an item is terminal, its `results` row (matched by idx) has the true
 // final avg/peak/free-before figures. While still running, the ram/vram
-// "avg" column shows the sampler's current live reading as a live-updating
-// proxy instead -- ram/vram "max" isn't known until the item finishes.
-// vram total has no run_items live-tick column at all (it's a static
-// hardware fact, not something that needs sampling over time) -- it behaves
-// like ram/vram "max" here (dash while running, real value once terminal),
-// not like "free" (which run_items *does* track from the item's first tick).
+// "proc avg" column shows the sampler's current live reading as a
+// live-updating proxy instead -- ram/vram "max" isn't known until the item
+// finishes. vram total has no run_items live-tick column at all (it's a
+// static hardware fact, not something that needs sampling over time) -- it
+// behaves like ram/vram "max" here (dash while running, real value once
+// terminal), not like "free" (which run_items *does* track from the item's
+// first tick). The whole-system "used avg"/"used max" columns likewise have
+// no live-tick column -- dash while running, real value once terminal.
 function memoryCells(item: RunItem, result: ResultRow | undefined): MemoryCells {
   const terminal = TERMINAL_ITEM_STATUSES.has(item.status);
   const ramFree = result?.ram_free_before_mib ?? item.ram_free_before_mib;
-  const ramAvg = terminal ? result?.ram_avg_mib ?? item.ram_avg_mib : item.ram_mib;
-  const ramMax = result?.ram_peak_mib ?? item.ram_peak_mib;
+  // The proc avg/max columns keep the legacy per-process RAM behavior
+  // (result rows, live ticks) exactly as before.
+  const ramProcAvg = terminal ? result?.ram_avg_mib ?? item.ram_avg_mib : item.ram_mib;
+  const ramProcMax = result?.ram_peak_mib ?? item.ram_peak_mib;
+  const ramUsedAvg = result?.ram_total_used_avg_mib;
+  const ramUsedMax = result?.ram_total_used_peak_mib;
   const vramTotal = result?.gpu_memory_total_mb;
   const vramFree = result?.vram_free_before_mib ?? item.vram_free_before_mib;
-  const vramAvg = terminal ? result?.vram_avg_mib ?? item.vram_avg_mib : item.vram_mib;
-  const vramMax = result?.vram_peak_mib ?? item.vram_peak_mib;
+  const vramUsedAvg = result?.gpu_memory_used_avg_mib;
+  const vramUsedMax = result?.gpu_memory_used_peak_mib;
+  // proc columns prefer the new explicit per-process fields; rows from older
+  // workers only ever had the legacy best-available hybrid
+  // (vram_avg/vram_peak), which is what the fallback shows them as.
+  const vramProcAvg = result?.gpu_memory_process_avg_mib ?? result?.vram_avg_mib;
+  const vramProcMax = result?.gpu_memory_process_peak_mib ?? result?.vram_peak_mib;
 
   const dash = (v: number | null | undefined) => (v == null ? "—" : String(v));
   // VRAM: once terminal, still-null means genuinely unmeasured on this box
@@ -343,12 +394,16 @@ function memoryCells(item: RunItem, result: ResultRow | undefined): MemoryCells 
 
   return {
     ramFree: dash(ramFree),
-    ramAvg: dash(ramAvg),
-    ramMax: dash(ramMax),
+    ramUsedAvg: dash(ramUsedAvg),
+    ramUsedMax: dash(ramUsedMax),
+    ramProcAvg: dash(ramProcAvg),
+    ramProcMax: dash(ramProcMax),
     vramTotal: vramCell(vramTotal),
     vramFree: vramCell(vramFree),
-    vramAvg: vramCell(vramAvg),
-    vramMax: vramCell(vramMax),
+    vramUsedAvg: vramCell(vramUsedAvg),
+    vramUsedMax: vramCell(vramUsedMax),
+    vramProcAvg: vramCell(vramProcAvg),
+    vramProcMax: vramCell(vramProcMax),
   };
 }
 
@@ -402,6 +457,10 @@ function mergedSortValue(item: RunItem, results: ResultRow[] | undefined, key: s
       return ppResult && ppResult.n_prompt > 0 ? ppResult.n_prompt / ppResult.avg_tps : -1;
     case "ram_free":
       return anyResult?.ram_free_before_mib ?? item.ram_free_before_mib ?? -1;
+    case "ram_used_avg":
+      return anyResult?.ram_total_used_avg_mib ?? -1;
+    case "ram_used_max":
+      return anyResult?.ram_total_used_peak_mib ?? -1;
     case "ram_avg":
       return anyResult?.ram_avg_mib ?? item.ram_avg_mib ?? item.ram_mib ?? -1;
     case "ram_max":
@@ -410,10 +469,14 @@ function mergedSortValue(item: RunItem, results: ResultRow[] | undefined, key: s
       return anyResult?.gpu_memory_total_mb ?? -1;
     case "vram_free":
       return anyResult?.vram_free_before_mib ?? item.vram_free_before_mib ?? -1;
-    case "vram_avg":
-      return anyResult?.vram_avg_mib ?? item.vram_avg_mib ?? item.vram_mib ?? -1;
-    case "vram_max":
-      return anyResult?.vram_peak_mib ?? item.vram_peak_mib ?? -1;
+    case "vram_used_avg":
+      return anyResult?.gpu_memory_used_avg_mib ?? -1;
+    case "vram_used_max":
+      return anyResult?.gpu_memory_used_peak_mib ?? -1;
+    case "vram_proc_avg":
+      return anyResult?.gpu_memory_process_avg_mib ?? anyResult?.vram_avg_mib ?? item.vram_mib ?? -1;
+    case "vram_proc_max":
+      return anyResult?.gpu_memory_process_peak_mib ?? anyResult?.vram_peak_mib ?? -1;
     default:
       return item.idx;
   }
@@ -570,6 +633,10 @@ export function RunDetail() {
       gpuMemoryAccuracyTitle(r.gpu_memory_free_start_accuracy, r.gpu_memory_free_start_source),
       gpuMemoryAccuracyTitle(r.gpu_memory_model_avg_accuracy, r.gpu_memory_model_avg_source),
       gpuMemoryAccuracyTitle(r.gpu_memory_model_peak_accuracy, r.gpu_memory_model_peak_source),
+      gpuMemoryAccuracyTitle(r.gpu_memory_used_avg_accuracy, r.gpu_memory_used_avg_source),
+      gpuMemoryAccuracyTitle(r.gpu_memory_used_peak_accuracy, r.gpu_memory_used_peak_source),
+      gpuMemoryAccuracyTitle(r.gpu_memory_process_avg_accuracy, r.gpu_memory_process_avg_source),
+      gpuMemoryAccuracyTitle(r.gpu_memory_process_peak_accuracy, r.gpu_memory_process_peak_source),
     ]) {
       if (t) vramAccuracyNotes.add(t);
     }
@@ -1159,8 +1226,10 @@ export function RunDetail() {
                         {ttftSeconds != null ? `${ttftSeconds.toFixed(2)}s` : "—"}
                       </td>
                       <td className="px-1 py-1.5 text-muted">{mem.ramFree}</td>
-                      <td className="px-1 py-1.5 text-muted">{mem.ramAvg}</td>
-                      <td className="px-1 py-1.5 text-muted">{mem.ramMax}</td>
+                      <td className="px-1 py-1.5 text-muted">{mem.ramUsedAvg}</td>
+                      <td className="px-1 py-1.5 text-muted">{mem.ramUsedMax}</td>
+                      <td className="px-1 py-1.5 text-muted">{mem.ramProcAvg}</td>
+                      <td className="px-1 py-1.5 text-muted">{mem.ramProcMax}</td>
                       <td className="px-1 py-1.5 text-muted">
                         <span className="inline-flex items-center gap-0.5">
                           {mem.vramTotal}
@@ -1179,17 +1248,33 @@ export function RunDetail() {
                       </td>
                       <td className="px-1 py-1.5 text-muted">
                         <span className="inline-flex items-center gap-0.5">
-                          {mem.vramAvg}
+                          {mem.vramUsedAvg}
                           <AccuracyIcon
-                            title={gpuMemoryAccuracyTitle(anyResult?.gpu_memory_model_avg_accuracy, anyResult?.gpu_memory_model_avg_source)}
+                            title={gpuMemoryAccuracyTitle(anyResult?.gpu_memory_used_avg_accuracy, anyResult?.gpu_memory_used_avg_source)}
                           />
                         </span>
                       </td>
                       <td className="px-1 py-1.5 text-muted">
                         <span className="inline-flex items-center gap-0.5">
-                          {mem.vramMax}
+                          {mem.vramUsedMax}
                           <AccuracyIcon
-                            title={gpuMemoryAccuracyTitle(anyResult?.gpu_memory_model_peak_accuracy, anyResult?.gpu_memory_model_peak_source)}
+                            title={gpuMemoryAccuracyTitle(anyResult?.gpu_memory_used_peak_accuracy, anyResult?.gpu_memory_used_peak_source)}
+                          />
+                        </span>
+                      </td>
+                      <td className="px-1 py-1.5 text-muted">
+                        <span className="inline-flex items-center gap-0.5">
+                          {mem.vramProcAvg}
+                          <AccuracyIcon
+                            title={gpuMemoryAccuracyTitle(anyResult?.gpu_memory_process_avg_accuracy, anyResult?.gpu_memory_process_avg_source)}
+                          />
+                        </span>
+                      </td>
+                      <td className="px-1 py-1.5 text-muted">
+                        <span className="inline-flex items-center gap-0.5">
+                          {mem.vramProcMax}
+                          <AccuracyIcon
+                            title={gpuMemoryAccuracyTitle(anyResult?.gpu_memory_process_peak_accuracy, anyResult?.gpu_memory_process_peak_source)}
                           />
                         </span>
                       </td>
