@@ -3226,8 +3226,26 @@ async function enrolDevice(): Promise<void> {
     arch: detectedHardware.arch,
     hardware: detectedHardware,
   });
-  log.info(`[worker ${config.worker_name}] to connect this machine, visit ${config.vps_url}${start.verification_uri}`);
-  log.info(`[worker ${config.worker_name}] code: ${start.user_code}  (expires in ${Math.round(start.expires_in / 60)} minutes)`);
+  log.info(
+    `[worker ${config.worker_name}] to connect this machine, open the LlamaToaster site -> Workers page -> "Add a machine" (${config.vps_url}${start.verification_uri})`
+  );
+  // A one-time credential buried in a stream of INFO lines is easy to miss
+  // -- boxed banner so it's unmissable in both the console and the daily log
+  // file, plus the instruction of where the code actually goes.
+  const codeBanner = [
+    "",
+    "==================================================================",
+    "  ACTION REQUIRED -- CONNECT THIS MACHINE TO LLAMATOASTER",
+    "",
+    '  Enter this code on the Workers page ("Add a machine"):',
+    "",
+    `            ${start.user_code}`,
+    "",
+    `  (opens at: ${config.vps_url}${start.verification_uri})`,
+    `  (expires in ${Math.round(start.expires_in / 60)} minutes)`,
+    "==================================================================",
+  ].join("\n");
+  log.info(`[worker ${config.worker_name}]${codeBanner}`);
 
   const deadline = Date.now() + start.expires_in * 1000;
   while (Date.now() < deadline) {
@@ -3375,7 +3393,17 @@ async function heartbeatTick(): Promise<void> {
       const next = res.app_settings.workerVramDiscrepancyPolicy;
       if (next !== vramDiscrepancyPolicy) {
         vramDiscrepancyPolicy = next;
-        log.info(`vram_discrepancy_policy updated from heartbeat: ${next}`);
+        // Self-explanatory on its own -- the raw "updated from heartbeat:
+        // fail" line read like an error and sent people digging through
+        // source to learn what it even controls.
+        const policyMeaning: Record<typeof next, string> = {
+          warn: "results with a hard VRAM fallback keep a warning attached",
+          retry_once_then_fail: "hard VRAM fallback items are re-run once before failing",
+          fail: "items with a hard VRAM fallback are marked failed with no results recorded",
+        };
+        log.info(
+          `vram_discrepancy_policy updated from heartbeat: ${next} (${policyMeaning[next]})`
+        );
       }
     }
   } catch (err) {
