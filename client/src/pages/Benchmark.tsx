@@ -801,6 +801,16 @@ export function Benchmark() {
                       ? `${modelLayerCount}${expertCount != null && expertCount > 0 ? ` · ${expertCount} (MoE)` : " · dense"}`
                       : "not read from this file's header"
                   }
+                  read={modelLayerCount != null}
+                />
+                {/* Trained context sits right under size/layers because it's
+                    the model's own hard ceiling -- every context sizing path
+                    (M2's target clamp, N1's ladder) clamps to it, so it can
+                    never be raised by config no matter how much VRAM exists. */}
+                <Kv
+                  label="Context (trained)"
+                  value={trainedCtx != null ? trainedCtx.toLocaleString() : "not read"}
+                  read={trainedCtx != null}
                 />
                 <Kv
                   label="KV heads · head dim"
@@ -812,17 +822,13 @@ export function Benchmark() {
                   read={selectedModel.metadata.n_head_kv != null}
                 />
                 <Kv
-                  label="Trained context"
-                  value={trainedCtx != null ? trainedCtx.toLocaleString() : "not read"}
-                  read={trainedCtx != null}
-                />
-                <Kv
                   label="Sliding window"
                   value={
                     selectedModel.metadata.sliding_window != null && selectedModel.metadata.sliding_window > 0
                       ? selectedModel.metadata.sliding_window.toLocaleString()
                       : "none — plain GQA"
                   }
+                  read={selectedModel.metadata.sliding_window != null}
                 />
               </dl>
             </>
@@ -1225,7 +1231,12 @@ function Kv({ label, value, read, hint }: { label: string; value: string; read?:
   return (
     <div className="flex items-baseline justify-between gap-3" title={hint}>
       <dt className="shrink-0 text-muted">{label}</dt>
-      <dd className="text-right text-fg">
+      {/* Fail-soft display: an explicitly-unread value (`read === false`)
+          dims instead of looking authoritative -- the app never fabricates a
+          number, so "not read" must read as absence, not as data. Rows that
+          always have a real value (size, sliding-window "none") leave `read`
+          unset and render normally. */}
+      <dd className={`text-right ${read === false ? "text-muted" : "text-fg"}`}>
         {value}
         {read && (
           <span className="ml-1.5 rounded-full border border-accent/40 bg-accent/10 px-1.5 py-0.5 text-[10px] text-accent">

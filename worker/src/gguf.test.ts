@@ -85,6 +85,86 @@ describe("readGgufInfo", () => {
     expect(info.debugReason).toBeUndefined();
   });
 
+  // Trained context + KV geometry -- resolved via the same suffix-matching
+  // walk as block_count/expert_count, keyed off the file's own architecture,
+  // so keys that appear before general.architecture are still found.
+  it("resolves trained context and KV-cache geometry from architecture-prefixed keys", async () => {
+    const path = writeTempGguf([
+      ["general.architecture", T.STRING, "qwen3"],
+      ["qwen3.block_count", T.UINT32, 36],
+      ["qwen3.context_length", T.UINT32, 40960],
+      ["qwen3.attention.head_count", T.UINT32, 32],
+      ["qwen3.attention.head_count_kv", T.UINT32, 8],
+      ["qwen3.attention.key_length", T.UINT32, 128],
+      ["qwen3.attention.value_length", T.UINT32, 128],
+      ["qwen3.embedding_length", T.UINT32, 2560],
+      ["tokenizer.ggml.model", T.STRING, "gpt2"],
+    ]);
+    const info = await readGgufInfo(path);
+    expect(info.trained_ctx).toBe(40960);
+    expect(info.n_head).toBe(32);
+    expect(info.n_head_kv).toBe(8);
+    expect(info.head_dim_k).toBe(128);
+    expect(info.head_dim_v).toBe(128);
+    expect(info.n_embd).toBe(2560);
+    // Absence paths -- an architecture without sliding-window attention.
+    expect(info.sliding_window).toBeNull();
+    expect(info.n_layer).toBe(36);
+  });
+
+  it("reads sliding_window only for architectures that declare one", async () => {
+    const swPath = writeTempGguf([
+      ["general.architecture", T.STRING, "mistral"],
+      ["mistral.block_count", T.UINT32, 48],
+      ["mistral.context_length", T.UINT32, 131072],
+      ["mistral.attention.sliding_window", T.UINT32, 4096],
+    ]);
+    const swInfo = await readGgufInfo(swPath);
+    expect(swInfo.trained_ctx).toBe(131072);
+    expect(swInfo.sliding_window).toBe(4096);
+
+    const plainPath = writeTempGguf([
+      ["general.architecture", T.STRING, "llama"],
+      ["llama.block_count", T.UINT32, 32],
+      ["llama.context_length", T.UINT32, 8192],
+    ]);
+    const plainInfo = await readGgufInfo(plainPath);
+    expect(plainInfo.trained_ctx).toBe(8192);
+    expect(plainInfo.sliding_window).toBeNull();
+  });
+
+  // Same architecture-prefix discipline as block_count's map: a header whose
+  // hyperparameters precede general.architecture must still resolve them.
+  it("resolves context/KV keys written before the architecture key", async () => {
+    const path = writeTempGguf([
+      ["llama.context_length", T.UINT32, 32768],
+      ["llama.attention.head_count_kv", T.UINT32, 4],
+      ["llama.attention.head_count", T.UINT32, 28],
+      ["general.architecture", T.STRING, "llama"],
+      ["llama.block_count", T.UINT32, 28],
+    ]);
+    const info = await readGgufInfo(path);
+    expect(info.trained_ctx).toBe(32768);
+    expect(info.n_head_kv).toBe(4);
+    expect(info.n_head).toBe(28);
+  });
+
+  it("leaves trained context / KV fields null when their header keys are absent", async () => {
+    const path = writeTempGguf([
+      ["general.architecture", T.STRING, "qwen35"],
+      ["qwen35.block_count", T.UINT32, 12],
+    ]);
+    const info = await readGgufInfo(path);
+    expect(info.trained_ctx).toBeNull();
+    expect(info.n_head_kv).toBeNull();
+    expect(info.n_head).toBeNull();
+    expect(info.head_dim_k).toBeNull();
+    expect(info.head_dim_v).toBeNull();
+    expect(info.n_embd).toBeNull();
+    expect(info.sliding_window).toBeNull();
+    expect(info.n_layer).toBe(12);
+  });
+
   // Regression test: the original implementation stopped at the first
   // "tokenizer."-prefixed key on the assumption hyperparameter keys always
   // come first in a llama.cpp-produced GGUF. Real files from other

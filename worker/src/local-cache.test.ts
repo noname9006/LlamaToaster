@@ -107,7 +107,14 @@ describe("LocalModelCache", () => {
       null, // param_count
       null, // gguf_checked_at
       entry.last_verified,
-      entry.state
+      entry.state,
+      null, // trained_ctx
+      null, // n_head_kv
+      null, // head_dim_k
+      null, // head_dim_v
+      null, // n_embd
+      null, // n_head
+      null // sliding_window
     );
 
     await cache.close();

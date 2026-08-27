@@ -29,6 +29,15 @@ export interface LocalCacheEntry {
   expert_count?: number;
   quant?: string;
   param_count?: number;
+  // Trained context + KV geometry (see gguf.ts's GgufInfo) -- persisted
+  // alongside the fields above so heartbeats report the full set.
+  trained_ctx?: number;
+  n_head_kv?: number;
+  head_dim_k?: number;
+  head_dim_v?: number;
+  n_embd?: number;
+  n_head?: number;
+  sliding_window?: number;
   // When this entry's GGUF header was last (successfully or unsuccessfully)
   // read -- gates backfillGgufMetadata's re-read window the same way
   // hf_checked_at gates HF re-verification, so a header that came back null
@@ -178,6 +187,29 @@ export class LocalModelCache {
     if (!cols.some((c) => c.name === "gguf_checked_at")) {
       this.db.exec(`ALTER TABLE local_model_cache ADD COLUMN gguf_checked_at INTEGER`);
     }
+    // Trained context + KV geometry -- added together so a single PRAGMA
+    // check covers all seven (see LocalCacheEntry's doc comments).
+    if (!cols.some((c) => c.name === "trained_ctx")) {
+      this.db.exec(`ALTER TABLE local_model_cache ADD COLUMN trained_ctx INTEGER`);
+    }
+    if (!cols.some((c) => c.name === "n_head_kv")) {
+      this.db.exec(`ALTER TABLE local_model_cache ADD COLUMN n_head_kv INTEGER`);
+    }
+    if (!cols.some((c) => c.name === "head_dim_k")) {
+      this.db.exec(`ALTER TABLE local_model_cache ADD COLUMN head_dim_k INTEGER`);
+    }
+    if (!cols.some((c) => c.name === "head_dim_v")) {
+      this.db.exec(`ALTER TABLE local_model_cache ADD COLUMN head_dim_v INTEGER`);
+    }
+    if (!cols.some((c) => c.name === "n_embd")) {
+      this.db.exec(`ALTER TABLE local_model_cache ADD COLUMN n_embd INTEGER`);
+    }
+    if (!cols.some((c) => c.name === "n_head")) {
+      this.db.exec(`ALTER TABLE local_model_cache ADD COLUMN n_head INTEGER`);
+    }
+    if (!cols.some((c) => c.name === "sliding_window")) {
+      this.db.exec(`ALTER TABLE local_model_cache ADD COLUMN sliding_window INTEGER`);
+    }
   }
 
   // Every column, shared by all three SELECT sites (get/getAll/getBySha256)
@@ -185,7 +217,8 @@ export class LocalModelCache {
   // addition can't silently drift between the reader and the writer.
   private static readonly SELECT_COLS =
     "path, size, mtime, sha256, hf_model_id, hf_checked_at, hf_deleted_at, " +
-    "n_layer, mtp_layers, expert_count, quant, param_count, gguf_checked_at, last_verified, state";
+    "n_layer, mtp_layers, expert_count, quant, param_count, gguf_checked_at, last_verified, state, " +
+    "trained_ctx, n_head_kv, head_dim_k, head_dim_v, n_embd, n_head, sliding_window";
 
   async get(path: string): Promise<LocalCacheEntry | null> {
     if (!this.db) throw new Error("Database not initialized");
@@ -222,8 +255,8 @@ export class LocalModelCache {
 
     this.db
       .prepare(
-        `INSERT INTO local_model_cache (path, size, mtime, sha256, hf_model_id, hf_checked_at, hf_deleted_at, n_layer, mtp_layers, expert_count, quant, param_count, gguf_checked_at, last_verified, state)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO local_model_cache (path, size, mtime, sha256, hf_model_id, hf_checked_at, hf_deleted_at, n_layer, mtp_layers, expert_count, quant, param_count, gguf_checked_at, last_verified, state, trained_ctx, n_head_kv, head_dim_k, head_dim_v, n_embd, n_head, sliding_window)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(path) DO UPDATE SET
            size = excluded.size,
            mtime = excluded.mtime,
@@ -238,7 +271,14 @@ export class LocalModelCache {
            param_count = excluded.param_count,
            gguf_checked_at = excluded.gguf_checked_at,
            last_verified = excluded.last_verified,
-           state = excluded.state`
+           state = excluded.state,
+           trained_ctx = excluded.trained_ctx,
+           n_head_kv = excluded.n_head_kv,
+           head_dim_k = excluded.head_dim_k,
+           head_dim_v = excluded.head_dim_v,
+           n_embd = excluded.n_embd,
+           n_head = excluded.n_head,
+           sliding_window = excluded.sliding_window`
       )
       .run(
         entry.path,
@@ -255,7 +295,14 @@ export class LocalModelCache {
         entry.param_count ?? null,
         entry.gguf_checked_at ?? null,
         entry.last_verified,
-        entry.state
+        entry.state,
+        entry.trained_ctx ?? null,
+        entry.n_head_kv ?? null,
+        entry.head_dim_k ?? null,
+        entry.head_dim_v ?? null,
+        entry.n_embd ?? null,
+        entry.n_head ?? null,
+        entry.sliding_window ?? null
       );
   }
 
@@ -334,6 +381,13 @@ export class LocalModelCache {
     gguf_checked_at: number | null;
     last_verified: number;
     state: string;
+    trained_ctx: number | null;
+    n_head_kv: number | null;
+    head_dim_k: number | null;
+    head_dim_v: number | null;
+    n_embd: number | null;
+    n_head: number | null;
+    sliding_window: number | null;
   }): LocalCacheEntry {
     return {
       path: row.path,
@@ -351,6 +405,13 @@ export class LocalModelCache {
       gguf_checked_at: row.gguf_checked_at ?? undefined,
       last_verified: row.last_verified,
       state: row.state as LocalModelState,
+      trained_ctx: row.trained_ctx ?? undefined,
+      n_head_kv: row.n_head_kv ?? undefined,
+      head_dim_k: row.head_dim_k ?? undefined,
+      head_dim_v: row.head_dim_v ?? undefined,
+      n_embd: row.n_embd ?? undefined,
+      n_head: row.n_head ?? undefined,
+      sliding_window: row.sliding_window ?? undefined,
     };
   }
 }

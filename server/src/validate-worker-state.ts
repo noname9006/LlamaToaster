@@ -179,6 +179,16 @@ function parseModelFiles(value: unknown): ModelDirFile[] {
       const expertCount = optionalNumber(row.expert_count, `model_files[${i}].expert_count`);
       const paramCount = optionalNumber(row.param_count, `model_files[${i}].param_count`);
       const quant = optionalString(row.quant, `model_files[${i}].quant`, 32);
+      // Trained context + KV geometry (see ModelDirFile) -- same optional,
+      // presence-only convention: a field is included only when the worker
+      // actually reported a numeric value.
+      const trainedCtx = optionalNumber(row.trained_ctx, `model_files[${i}].trained_ctx`);
+      const nHeadKv = optionalNumber(row.n_head_kv, `model_files[${i}].n_head_kv`);
+      const headDimK = optionalNumber(row.head_dim_k, `model_files[${i}].head_dim_k`);
+      const headDimV = optionalNumber(row.head_dim_v, `model_files[${i}].head_dim_v`);
+      const nEmbd = optionalNumber(row.n_embd, `model_files[${i}].n_embd`);
+      const nHead = optionalNumber(row.n_head, `model_files[${i}].n_head`);
+      const slidingWindow = optionalNumber(row.sliding_window, `model_files[${i}].sliding_window`);
 
       return {
         path: sanitizeString(row.path, `model_files[${i}].path`),
@@ -188,6 +198,13 @@ function parseModelFiles(value: unknown): ModelDirFile[] {
         ...(expertCount != null ? { expert_count: expertCount } : {}),
         ...(paramCount != null ? { param_count: paramCount } : {}),
         ...(quant != null ? { quant } : {}),
+        ...(trainedCtx != null ? { trained_ctx: trainedCtx } : {}),
+        ...(nHeadKv != null ? { n_head_kv: nHeadKv } : {}),
+        ...(headDimK != null ? { head_dim_k: headDimK } : {}),
+        ...(headDimV != null ? { head_dim_v: headDimV } : {}),
+        ...(nEmbd != null ? { n_embd: nEmbd } : {}),
+        ...(nHead != null ? { n_head: nHead } : {}),
+        ...(slidingWindow != null ? { sliding_window: slidingWindow } : {}),
         ...(rawSha != null ? { sha256: rawSha.toLowerCase() } : {}),
         ...(state != null ? { state: state as ModelDirFile["state"] } : {}),
         hf_match,

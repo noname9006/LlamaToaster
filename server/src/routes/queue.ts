@@ -131,6 +131,15 @@ function ggufMetadataPatch(f: ModelDirFile): Partial<ModelMetadata> {
   if (typeof f.expert_count === "number" && f.expert_count > 0) patch.expert_count = f.expert_count;
   if (typeof f.param_count === "number") patch.param_count = f.param_count;
   if (typeof f.quant === "string" && f.quant) patch.quant = f.quant;
+  // Trained context + KV geometry -- adopted like the fields above so a
+  // hand-dropped file gets the same catalog metadata as an in-app download.
+  if (typeof f.trained_ctx === "number" && f.trained_ctx > 0) patch.trained_ctx = f.trained_ctx;
+  if (typeof f.n_head_kv === "number" && f.n_head_kv > 0) patch.n_head_kv = f.n_head_kv;
+  if (typeof f.head_dim_k === "number" && f.head_dim_k > 0) patch.head_dim_k = f.head_dim_k;
+  if (typeof f.head_dim_v === "number" && f.head_dim_v > 0) patch.head_dim_v = f.head_dim_v;
+  if (typeof f.n_embd === "number" && f.n_embd > 0) patch.n_embd = f.n_embd;
+  if (typeof f.n_head === "number" && f.n_head > 0) patch.n_head = f.n_head;
+  if (typeof f.sliding_window === "number" && f.sliding_window > 0) patch.sliding_window = f.sliding_window;
   return patch;
 }
 
