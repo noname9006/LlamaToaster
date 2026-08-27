@@ -4,6 +4,7 @@ import { Sidebar } from "./components/Sidebar";
 import { ChatPanel } from "./components/ChatPanel";
 import { Dashboard } from "./pages/Dashboard";
 import { Models } from "./pages/Models";
+import { Benchmark } from "./pages/Benchmark";
 import { NewRun } from "./pages/NewRun";
 import { Runs } from "./pages/Runs";
 import { RunDetail } from "./pages/RunDetail";
@@ -76,6 +77,7 @@ export default function App() {
           <Routes>
             <Route path="/" element={<Dashboard />} />
             <Route path="/models" element={<Models />} />
+            <Route path="/benchmark" element={<Benchmark />} />
             <Route path="/new-run" element={<NewRun />} />
             <Route path="/runs" element={<Runs />} />
             <Route path="/runs/:id" element={<RunDetail />} />

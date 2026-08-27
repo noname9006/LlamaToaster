@@ -1,6 +1,6 @@
 import { NavLink } from "react-router-dom";
 import type { ComponentType, SVGProps } from "react";
-import { IconGrid, IconBox, IconPlusCircle, IconList, IconBarChart, IconServer, IconSettings } from "./icons";
+import { IconGrid, IconBox, IconActivity, IconPlusCircle, IconList, IconBarChart, IconServer, IconSettings } from "./icons";
 
 interface NavItem {
   to: string;
@@ -12,6 +12,10 @@ interface NavItem {
 const NAV_ITEMS: NavItem[] = [
   { to: "/", label: "Dashboard", icon: IconGrid, end: true },
   { to: "/models", label: "Models", icon: IconBox },
+  // The v8 console (BENCHMARKING_PLAN_V8.md, docs/benchmark-page-mockup-v8.html):
+  // state the goal, the page derives the tuning->refine->sweep chain. "New Run"
+  // stays beside it as the hand-built single-grid path.
+  { to: "/benchmark", label: "Benchmark", icon: IconActivity },
   { to: "/new-run", label: "New Run", icon: IconPlusCircle },
   { to: "/runs", label: "Runs", icon: IconList },
   { to: "/compare", label: "Compare", icon: IconBarChart },
