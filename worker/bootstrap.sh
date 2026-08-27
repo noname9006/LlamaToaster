@@ -15,12 +15,15 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.sh | bash -s -- --vps-url https://llamatoaster.com --dir ~/LlamaToaster
 #
-# Safe to re-run: if --dir already has a checkout, the download step is
-# skipped; setup-worker.sh underneath is itself idempotent (skips writing
-# config.json if one already exists). So the same command works for first
-# setup, picking up code updates, and every plain restart after. To
-# re-approve a machine whose session was revoked, add --reconnect (needs an
-# existing --dir checkout with a config.json already in it).
+# Safe to re-run: if --dir already has a LlamaToaster install, it is updated
+# IN PLACE -- via git fetch + reset --hard when it is a git checkout, or a
+# fresh-tarball sync over just the same-named files otherwise. Everything
+# user-created survives untouched: config.json, models, .db files, logs,
+# node_modules, llama.cpp builds. setup-worker.sh underneath is itself
+# idempotent (skips writing config.json if one already exists). So the same
+# command works for first setup, picking up code updates, and every plain
+# restart after. To re-approve a machine whose session was revoked, add
+# --reconnect (needs an existing --dir install with a config.json in it).
 #
 # All setup-worker.sh overrides are forwarded -- see that script's own
 # header for what each one does: --worker-name --backend --vps-url
@@ -119,8 +122,56 @@ if [ ! -f "$DIR/package.json" ]; then
     rm -f "$TMP_TAR"
   fi
   echo "Downloaded to $DIR"
+elif [ -d "$DIR/.git" ] && command -v git >/dev/null 2>&1; then
+  # Re-run against an existing checkout -- hard-update tracked files to latest
+  # $BRANCH (same treatment bootstrap.ps1 gives). reset --hard only rewrites
+  # TRACKED files; everything this setup treats as user data lives outside
+  # git's view (.gitignore'd worker/config.json, *.db, logs/,
+  # mtp-offsets.json, or plain untracked dirs like models/, data/, node_modules),
+  # so none of it can be touched here.
+  echo "$DIR is already a git checkout -- updating to latest $BRANCH..."
+  cd "$DIR"
+  if ! git fetch origin "$BRANCH"; then
+    echo "git fetch failed -- check network access and the branch name ($BRANCH)." >&2
+    exit 1
+  fi
+  if ! git reset --hard FETCH_HEAD; then
+    echo "git reset --hard failed -- the checkout may be corrupt. Delete $DIR and re-run." >&2
+    exit 1
+  fi
+  echo "Updated $DIR to latest $BRANCH (config.json, models, and other local files kept)."
 else
-  echo "$DIR already has a LlamaToaster checkout -- skipping download."
+  # LlamaToaster files present but NOT a usable git checkout (originally
+  # installed from a tarball, or git was removed since): sync a fresh tarball
+  # over the folder instead. Only repo-shipped files get overwritten --
+  # config.json, models/, logs and DBs stay exactly as they are.
+  echo ""
+  echo "$DIR already has LlamaToaster files, but is not a git checkout." >&2
+  CONFIRM=""
+  if { exec 3</dev/tty; } 2>/dev/null; then
+    printf 'Extract fresh repo files over it? Same-named files are replaced; config.json, models, logs and DBs are kept. [y/N]: ' >&2
+    read -r CONFIRM < /dev/tty
+    exec 3<&-
+  fi
+  case "$CONFIRM" in
+    y|Y|yes|Yes|YES)
+      ;;
+    *)
+      echo "Aborted. (Delete $DIR by hand and re-run this command for a truly fresh install.)" >&2
+      exit 1
+      ;;
+  esac
+  echo "Syncing latest $BRANCH over $DIR..."
+  TMP_TAR="$(mktemp -t llamatoaster-XXXXXX).tar.gz"
+  TMP_EXTRACT="$(mktemp -d)"
+  curl -fsSL "https://github.com/$REPO_OWNER_SLASH/archive/refs/heads/$BRANCH.tar.gz" -o "$TMP_TAR"
+  tar -xzf "$TMP_TAR" -C "$TMP_EXTRACT" --strip-components=1
+  if ! cp -R "$TMP_EXTRACT"/. "$DIR"/; then
+    echo "Failed copying new files over $DIR -- check permissions and retry." >&2
+    exit 1
+  fi
+  rm -rf "$TMP_TAR" "$TMP_EXTRACT"
+  echo "Synced $DIR to latest $BRANCH."
 fi
 
 cd "$DIR"
