@@ -76,6 +76,29 @@ describe("LocalModelCache", () => {
     await cache.close();
   });
 
+  it("should invalidate previous GGUF reads when upgrading to the KV-geometry schema", async () => {
+    // PRAGMA table_info returns an empty list (mockStatement.all defaults to
+    // []), which means no column exists yet -- so every migration branch in
+    // createTables runs, including the one that adds trained_ctx and friends.
+    // This is exactly the on-disk state of a cache written by an older GGUF
+    // reader: those rows hold NULL KV-geometry columns but a fresh
+    // gguf_checked_at, which the scanner's 24h staleness gate would otherwise
+    // suppress from re-reading for up to a day. The migration must clear the
+    // gate once so backfillGgufMetadata re-reads every header with the richer
+    // reader and the Benchmark card stops showing "not read".
+    const cache = new LocalModelCache("/test/model/dir");
+    await cache.init();
+
+    expect(mockDb.exec).toHaveBeenCalledWith(
+      `ALTER TABLE local_model_cache ADD COLUMN trained_ctx INTEGER`
+    );
+    expect(mockDb.exec).toHaveBeenCalledWith(
+      `UPDATE local_model_cache SET gguf_checked_at = NULL`
+    );
+
+    await cache.close();
+  });
+
   it("should upsert a cache entry", async () => {
     const cache = new LocalModelCache("/test/model/dir");
     await cache.init();
