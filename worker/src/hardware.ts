@@ -14,16 +14,18 @@ export interface HardwareInfo {
   arch: string;
   cpu: { manufacturer: string; brand: string; flags: string[]; cores: number };
   // vram_mb is si.graphics().controllers[].vram (MB), null when the driver
-  // doesn't report it at all (confirmed happens on some Linux/Vulkan-only
-  // setups) -- optional (rather than always-present-but-nullable) so a
-  // worker process still running old code (hasn't been restarted since this
-  // field was added) keeps reporting a valid snapshot, same reasoning as
-  // mem_total_bytes below. vram_dynamic mirrors that same entry's
-  // vramDynamic -- true for shared/unified memory (typically an iGPU, e.g.
-  // Intel UHD 620) where vram_mb is an estimate/allocation rather than a
-  // fixed dedicated pool, so callers displaying it should label it as such
+  // doesn't report it at all (confirmed happens on some setups) -- optional
+  // (rather than always-present-but-nullable) so a worker process still
+  // running old code (hasn't been restarted since this field was added)
+  // keeps reporting a valid snapshot, same reasoning as mem_total_bytes
+  // below. vram_dynamic is true only for shared/unified memory (typically
+  // an iGPU, e.g. Intel UHD 620) where vram_mb is an estimate/allocation
+  // rather than a fixed dedicated pool, so callers should label it as such
   // rather than presenting it with the same confidence as a discrete GPU's
-  // real VRAM size.
+  // real VRAM size. It is NOT a verbatim copy of systeminformation's
+  // vramDynamic: that library's Windows derivation (VideoMemoryType === '2')
+  // flags *dedicated* VRAM as dynamic, so detectHardware below resets the
+  // flag to false whenever an actual dedicated pool (vram_mb > 0) exists.
   gpu: { vendor: string; model: string; vram_mb?: number | null; vram_dynamic?: boolean }[];
   // Total system RAM in bytes (on Apple Silicon, total unified memory) --
   // see si.mem().total in detectHardware below. Kept in sync with the
@@ -47,14 +49,25 @@ export interface HardwareInfo {
 // no AVX-tiered variants to choose between (see github-releases.ts).
 export async function detectHardware(): Promise<HardwareInfo> {
   const [cpu, graphics, mem] = await Promise.all([si.cpu(), si.graphics(), si.mem()]);
-  const gpu = graphics.controllers
-    .filter((c) => c.vendor)
-    .map((c) => ({
+  const gpu = graphics.controllers.filter((c) => c.vendor).map((c) => {
+    // A concrete dedicated VRAM budget (>0) is the ground truth that the
+    // card is NOT shared/unified memory. systeminformation's Windows
+    // vramDynamic derivation (graphics.js:1227, v5.32.0) treats
+    // Win32_VideoController.VideoMemoryType === '2' as dynamic, but '2' is
+    // the enum value for *dedicated* VRAM -- so it flags exactly the cards
+    // with the most on-die memory as "shared". Correct the verdict whenever
+    // a real dedicated pool was reported, keeping the tag only for adapters
+    // that genuinely have no dedicated VRAM of their own (macOS unified
+    // memory, Windows iGPUs that report no pool at all).
+    const vram_mb = typeof c.vram === "number" && c.vram > 0 ? c.vram : null;
+    const vram_dynamic = (c.vramDynamic ?? false) && vram_mb == null;
+    return {
       vendor: c.vendor ?? "",
       model: c.model ?? "",
-      vram_mb: typeof c.vram === "number" && c.vram > 0 ? c.vram : null,
-      vram_dynamic: c.vramDynamic ?? false,
-    }));
+      vram_mb,
+      vram_dynamic,
+    };
+  });
   // Only boxes that actually have an NVIDIA GPU pay the ~200-500ms nvidia-smi
   // round trip (once per process -- detectHardware runs once at startup).
   // Null on failure (nvidia-smi missing/not on PATH, driver too old to
