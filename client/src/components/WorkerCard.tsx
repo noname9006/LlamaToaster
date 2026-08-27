@@ -80,7 +80,7 @@ export function buildSetupScenarios(vpsUrl: string): SetupScenario[] {
   return [
     {
       title: "Fresh install",
-      desc: "Brand-new machine, nothing downloaded yet (no repo, no config, no llama.cpp) -- one command fetches the repo, installs dependencies, and starts the worker. It'll ask which drive/volume to use (showing free space -- models are often tens of GB each) and a folder name, then create it.",
+      desc: "Brand-new machine, nothing downloaded yet (no repo, no config, no llama.cpp) -- one command fetches the repo, installs dependencies, and starts the worker. It'll ask which drive/volume to use (showing free space -- models are often tens of GB each) and a folder name, then create it. Re-running the same command later updates an existing install in place -- config.json, models and all other local data are preserved.",
       cmd: {
         windows: `iex "& { $(irm https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.ps1) } -VpsUrl ${vpsUrl}"`,
         macos: `curl -fsSL https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.sh | bash -s -- --vps-url ${vpsUrl}`,

@@ -167,8 +167,11 @@ its history/display name. `--force`/`-Force` instead regenerates the whole
 file from scratch, including a fresh `machine_id` -- only use that if you
 actually want this to enrol as a brand-new machine.
 
-It's safe to re-run the same command any time: if the folder already has a
-checkout, the download step is skipped, and
+It's safe to re-run the same command any time to pull the latest code: an
+existing install is updated in place (git fetch + hard reset where it is a
+git checkout, a fresh-tarball sync over same-named files otherwise), leaving
+every user-local file alone -- config.json, models, .db files, logs,
+llama.cpp builds -- and
 [`worker/setup-worker.ps1`](worker/setup-worker.ps1) /
 [`.sh`](worker/setup-worker.sh) underneath only write `config.json` once —
 after that, the exact same command just (re)starts the worker (no prompt,
