@@ -100,6 +100,32 @@ function persistManualAddOpen(open: boolean): void {
   }
 }
 
+// Which worker the user has told THIS BROWSER is running on the same
+// physical machine -- there's no way for a web page to detect that on its
+// own (the browser and the worker process are unrelated to each other), so
+// it's a one-time manual pairing per browser/device rather than anything
+// derived from server data. Stored in localStorage (not sessionStorage) so
+// it survives across visits on the same machine -- a laptop's browser
+// should only need to be told once which worker is "this laptop".
+const THIS_MACHINE_WORKER_KEY = "llamatoaster:this-machine-worker-id";
+
+function loadThisMachineWorkerId(): string | null {
+  try {
+    return localStorage.getItem(THIS_MACHINE_WORKER_KEY);
+  } catch {
+    return null;
+  }
+}
+
+function persistThisMachineWorkerId(workerId: string | null): void {
+  try {
+    if (workerId) localStorage.setItem(THIS_MACHINE_WORKER_KEY, workerId);
+    else localStorage.removeItem(THIS_MACHINE_WORKER_KEY);
+  } catch {
+    /* localStorage unavailable -- pairing just won't survive a refresh */
+  }
+}
+
 // `downloading`/`progress`/`speeds` below used to be keyed by bare filename
 // alone, which collided whenever two downloads shared a filename -- common
 // for GGUF quants, since many uploaders reuse fixed names like
@@ -291,6 +317,7 @@ export function Models() {
   const [form, setForm] = useState(emptyForm);
   const [addMsg, setAddMsg] = useState("");
   const [manualAddOpen, setManualAddOpen] = useState(loadManualAddOpen);
+  const [thisMachineWorkerId, setThisMachineWorkerId] = useState<string | null>(loadThisMachineWorkerId);
 
   const [hfQuery, setHfQuery] = useState(() => loadPersistedHfSearch()?.query ?? "");
   // hfPages holds every raw HF search page fetched so far (each with its own
@@ -417,6 +444,32 @@ export function Models() {
       }),
     [workers, filteredModels, locations, sortField, sortDir]
   );
+
+  // Which machine counts as "in use" on page load, so its models section
+  // opens expanded while every other machine's stays collapsed (the flat
+  // list of every worker's models expanded at once got unwieldy once a user
+  // has more than one or two machines). The user's own pairing (this
+  // browser said "I'm the laptop") wins outright since it's an explicit,
+  // per-device statement -- nothing server-derived should override it. Only
+  // once that's unset (or points at a worker that's since been removed) do
+  // we fall back to guessing: a worker actually running a benchmark right
+  // now (status "busy") is the next-clearest signal, then whichever
+  // configured worker most recently heartbeated (idle machines heartbeat
+  // too, offline ones stop), then just the first configured worker so the
+  // page never opens with every section collapsed. Computed once workers
+  // are loaded -- workers isn't re-fetched after mount, so this stays stable
+  // and doesn't fight a user's own manual expand/collapse afterward.
+  const activeWorkerId = useMemo(() => {
+    if (workers.length === 0) return null;
+    if (thisMachineWorkerId && workers.some((w) => w.id === thisMachineWorkerId)) return thisMachineWorkerId;
+    const busy = workers.find((w) => w.status === "busy");
+    if (busy) return busy.id;
+    const heartbeating = workers.filter((w) => w.status !== "offline" && w.lastHeartbeatAt != null);
+    if (heartbeating.length > 0) {
+      return heartbeating.reduce((a, b) => (b.lastHeartbeatAt! > a.lastHeartbeatAt! ? b : a)).id;
+    }
+    return workers[0].id;
+  }, [workers, thisMachineWorkerId]);
 
   // Sort is applied server-side now (server/src/hf.ts) -- params filtering
   // stays client-side (HF's search API has no equivalent). Pages are built
@@ -1313,12 +1366,44 @@ export function Models() {
               </p>
             )}
 
+            {workers.length > 1 && (
+              <label className="mt-3 flex flex-wrap items-center gap-2 text-sm">
+                <span className="text-muted">This machine is</span>
+                <select
+                  value={thisMachineWorkerId && workers.some((w) => w.id === thisMachineWorkerId) ? thisMachineWorkerId : ""}
+                  onChange={(e) => {
+                    const id = e.target.value || null;
+                    setThisMachineWorkerId(id);
+                    persistThisMachineWorkerId(id);
+                  }}
+                  className="rounded-lg border border-border bg-surface px-3 py-1.5 text-fg outline-none focus:border-accent"
+                >
+                  <option value="">not set -- guess for me</option>
+                  {workers.map((w) => (
+                    <option key={w.id} value={w.id}>
+                      {w.displayName}
+                    </option>
+                  ))}
+                </select>
+                <span className="text-xs text-muted/70">
+                  Remembered on this browser only -- keeps its models section open by default.
+                </span>
+              </label>
+            )}
+
             <div className="mt-3 flex flex-col gap-3">
               {modelsByWorker.map(({ worker, subset, groups, orphans }) => (
-                <details key={worker.id} open className="group rounded-xl border border-border bg-surface">
+                <details
+                  key={worker.id}
+                  open={worker.id === activeWorkerId}
+                  className="group rounded-xl border border-border bg-surface"
+                >
                   <summary className="flex cursor-pointer items-center justify-between px-4 py-2.5 text-sm font-semibold text-fg">
                     <span className="flex items-center gap-2">
                       {worker.displayName}
+                      {worker.id === activeWorkerId && (
+                        <StatusPill label={worker.id === thisMachineWorkerId ? "this machine" : "in use"} tone="accent" />
+                      )}
                       <span className="text-xs font-normal text-muted">
                         ({subset.length} file{subset.length === 1 ? "" : "s"}
                         {subset.length > 0 ? ` · ${formatBytes(subset.reduce((n, m) => n + m.size_bytes, 0))}` : ""})

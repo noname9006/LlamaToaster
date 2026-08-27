@@ -189,6 +189,30 @@ function InstallProgressBar({ progress }: { progress: ActiveJobReport }) {
   );
 }
 
+// Animated "something is happening" card for any serial-job phase that
+// isn't a byte-progress download/extract (those keep InstallProgressBar's
+// percent treatment above): model loading, benchmarking without a run link,
+// finalizing, or simply "busy" before the first progress beat arrives.
+// Indeterminate bar + spinner so the page never looks frozen while a build
+// downloads, installs, or loads.
+function BusyPhaseCard({ phase, detail }: { phase?: string; detail?: string }) {
+  const label = detail || (phase ? `${phase}…` : "working…");
+  return (
+    <div className="mt-3 rounded-lg border border-border bg-surface-raised px-3 py-2">
+      <div className="flex items-center gap-2 text-[13px]">
+        <span
+          aria-hidden
+          className="h-3 w-3 flex-none animate-spin rounded-full border-2 border-accent border-t-transparent"
+        />
+        <span className="truncate capitalize text-fg">{label}</span>
+      </div>
+      <div className="mt-1.5 h-1 w-full overflow-hidden rounded-full bg-bg">
+        <div className="progress-indeterminate h-full w-full rounded-full" />
+      </div>
+    </div>
+  );
+}
+
 export function WorkerCard({ worker, onRefresh }: { worker: Worker; onRefresh: () => void }) {
   const [busyTag, setBusyTag] = useState<string | null>(null);
   const [msg, setMsg] = useState("");
@@ -501,12 +525,12 @@ export function WorkerCard({ worker, onRefresh }: { worker: Worker; onRefresh: (
           ) : installProgress ? (
             <InstallProgressBar progress={installProgress} />
           ) : worker.activeJobProgress ? (
-            <p className="mt-3 text-sm text-fg">
-              {worker.activeJobProgress.phase}
-              {worker.activeJobProgress.detail ? <span className="text-muted"> — {worker.activeJobProgress.detail}</span> : null}
-            </p>
+            <BusyPhaseCard phase={worker.activeJobProgress.phase} detail={worker.activeJobProgress.detail} />
           ) : (
-            <p className="mt-3 text-sm text-muted">Busy</p>
+            // Busy but no progress beat yet (job just claimed, or a build
+            // install still queued behind one) -- animated rather than the
+            // old static "Busy" text that read as stuck.
+            <BusyPhaseCard />
           )}
         </>
       )}

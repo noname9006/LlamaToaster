@@ -1,10 +1,22 @@
-import { Link } from "react-router-dom";
+import { useEffect, useState } from "react";
 import { useWorkerStatuses } from "../api/useWorkerStatus";
 import { WorkerCard } from "../components/WorkerCard";
-import { IconPlus } from "../components/icons";
+import { AddMachinePanel } from "../components/AddMachinePanel";
+import { IconChevronDown } from "../components/icons";
 
 export function Workers() {
   const { order, status, loaded, refresh } = useWorkerStatuses();
+  // Device enrolment needs AUTH_ENABLED (server-side routes + client gate);
+  // checked once here so the collapsible add-machine section simply doesn't
+  // exist on a Stage-1-only deployment rather than showing a dead panel.
+  const [authEnabled, setAuthEnabled] = useState<boolean | null>(null);
+
+  useEffect(() => {
+    import("../api/client")
+      .then(({ api }) => api.getAuthStatus())
+      .then((s) => setAuthEnabled(s.authEnabled))
+      .catch(() => setAuthEnabled(false));
+  }, []);
 
   return (
     <div>
@@ -18,14 +30,29 @@ export function Workers() {
             loads.
           </p>
         </div>
-        <Link
-          to="/device"
-          className="flex flex-none items-center gap-1.5 rounded-lg border border-border px-3 py-1.5 text-sm font-semibold text-fg hover:border-accent/40 hover:text-accent"
-        >
-          <IconPlus width={14} height={14} />
-          Add machine
-        </Link>
       </div>
+
+      {authEnabled && (
+        <details
+          className="group mt-4 rounded-xl border border-border bg-surface"
+          open={loaded && order.length === 0}
+        >
+          <summary className="flex cursor-pointer items-center gap-2 px-5 py-3 text-sm font-semibold text-fg select-none">
+            Add a machine
+            <span className="text-xs font-normal text-muted">
+              — connect a new GPU box by running one command on it
+            </span>
+            <IconChevronDown
+              width={14}
+              height={14}
+              className="ml-auto text-muted transition-transform group-open:rotate-180"
+            />
+          </summary>
+          <div className="border-t border-border px-5 py-4">
+            <AddMachinePanel />
+          </div>
+        </details>
+      )}
 
       {loaded && order.length === 0 && (
         <p className="mt-6 text-sm text-muted">No workers configured.</p>

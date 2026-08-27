@@ -236,3 +236,14 @@ export function IconSettings(props: SVGProps<SVGSVGElement>) {
     </Icon>
   );
 }
+
+// The Benchmark console's nav glyph -- a measurement trace, deliberately
+// distinct from IconBarChart (Compare, which reads stored results) and
+// IconPlusCircle (New Run, which builds one grid by hand).
+export function IconActivity(props: SVGProps<SVGSVGElement>) {
+  return (
+    <Icon {...props}>
+      <path d="M3 12h4l3 8 4-16 3 8h4" />
+    </Icon>
+  );
+}
