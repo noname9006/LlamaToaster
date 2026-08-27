@@ -111,7 +111,7 @@ import {
   type CurvePointSpec,
   type KneeSpec,
 } from "../../shared/types.js";
-import { detectThermalThrottle, detectSensorAvailability, type SensorAvailability } from "./sensors.js";
+import { detectThermalThrottle, detectSensorAvailability, LHM_HTTP_PORT, type SensorAvailability } from "./sensors.js";
 import { readCpuIsa } from "./binary-probe.js";
 import { resolveVramDiscrepancyAction } from "./vram-policy.js";
 import { ensureDefaultQualityCorpus } from "./qualityCorpus.js";
@@ -326,6 +326,24 @@ log.info(
       : "none detected"
   }`
 );
+
+// Windows AMD/Intel adapters have no vendor CLI for clock/temperature
+// (nvidia-smi is NVIDIA-only), so on win32 their adapter sensors come from
+// LibreHardwareMonitor alone (worker/src/sensors.ts's readLhmSensors): it must
+// be running elevated with its "Remote Web Server" enabled on the port below,
+// or the machine card reports "neither available on this platform". Stated
+// once at startup -- guidance, not a fault -- so the remedy is already in the
+// log when a user later wonders why clock/temp are missing.
+const lhmIsTheOnlySensorSource =
+  detectedHardware.platform === "win32" &&
+  backend !== "cpu" &&
+  backend !== "cuda" &&
+  detectedHardware.gpu.some((g) => !/nvidia/i.test(g.vendor || ""));
+if (lhmIsTheOnlySensorSource) {
+  log.info(
+    `[worker ${config.worker_name}] GPU clock/temperature on this Windows AMD/Intel machine are read from LibreHardwareMonitor only -- keep it running elevated (Remote Web Server on http://127.0.0.1:${LHM_HTTP_PORT}/data.json) to see them on the machine card.`
+  );
+}
 
 // Best-effort warm-up of the VRAM-reading path (worker/src/vram.ts). On
 // Windows the generic backend's free/used reading spawns `powershell.exe`
