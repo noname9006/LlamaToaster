@@ -794,8 +794,20 @@ async function collectState(): Promise<WorkerStatePush> {
     : await captureFreeMemoryBaseline(backend)
         .then((baseline): WorkerVramInfo => ({ ok: true, backend, ...baseline }))
         .catch(() => null);
-  if (!sensorAvailability && !busy) {
-    sensorAvailability = await detectSensorAvailability(backend).catch(() => null);
+  // M6/N7 -- probe availability while idle. v8 latched the FIRST result
+  // forever, so a worker started while its sensor source wasn't up yet (e.g.
+  // LibreHardwareMonitor launched after the service) stayed "neither available
+  // on this platform" until restart. Now a POSITIVE detection sticks
+  // permanently, but a negative one falls through here again after
+  // SENSOR_PROBE_BACKOFF_MS so a source coming online is picked up without
+  // operator intervention -- without paying for a fresh multi-source probe on
+  // every heartbeat either.
+  if (!busy && !sensorAvailability && Date.now() - sensorProbedAtMs >= SENSOR_PROBE_BACKOFF_MS) {
+    sensorProbedAtMs = Date.now();
+    const probed = await detectSensorAvailability(backend).catch(() => null);
+    if (probed && (probed.clock || probed.temp)) {
+      sensorAvailability = probed;
+    }
   }
   return {
     machine_id: config.machine_id!,
@@ -803,7 +815,10 @@ async function collectState(): Promise<WorkerStatePush> {
     // type this worker never heard of, so what it CAN do is said out loud
     // rather than discovered mid-fleet by a crash.
     capabilities: [...WORKER_CAPABILITIES],
-    sensors: sensorAvailability,
+    // Always the object form (never null): the client distinguishes "reported,
+    // unavailable" from "absent -- predates the field entirely", and this
+    // worker version always reports.
+    sensors: sensorAvailability ?? { clock: false, temp: false, source: null },
     cpu_isa: detectedCpuIsa,
     hostname: osHostname(),
     backend,
@@ -822,8 +837,12 @@ async function collectState(): Promise<WorkerStatePush> {
 let detectedCpuIsa: string | null = null;
 // M6 -- declared on every heartbeat so a machine card can say "clock · temp
 // available" up front; a later thermally_throttled flag must never surprise a
-// machine that could never have produced one.
+// machine that could never have produced one. See collectState() above: a
+// positive detection latches, a negative one is retried on this cadence --
+// bounded so each heartbeat doesn't pay a fresh probe cost indefinitely.
 let sensorAvailability: SensorAvailability | null = null;
+let sensorProbedAtMs = 0;
+const SENSOR_PROBE_BACKOFF_MS = 10 * 60 * 1000;
 
 const ITEM_RETRY_DELAYS_MS = [2000, 4000, 8000, 16000, 32000];
 

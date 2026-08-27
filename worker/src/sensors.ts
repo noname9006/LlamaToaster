@@ -57,11 +57,14 @@ export async function readGpuSensors(backend: Backend): Promise<SensorSample> {
       return (await readNvidiaSmiSensors()) ?? NO_SAMPLE;
     }
     if (plat === "win32") {
-      // NVIDIA ships nvidia-smi on Windows too; for AMD/Intel on Windows
-      // there is no vendor-agnostic source (WMI thermal zones are
-      // motherboard-level, PDH has no sensor counters), so v1 reports NULL
-      // with availability declared rather than guessing.
-      return (await readNvidiaSmiSensors()) ?? NO_SAMPLE;
+      // NVIDIA ships nvidia-smi on Windows too -- exact vendor CLI first, the
+      // same priority order every other branch uses. For AMD/Intel on Windows
+      // there is no vendor-agnostic CLI (WMI thermal zones are
+      // motherboard-level, PDH has no sensor counters), so the fallback is
+      // LibreHardwareMonitor (readLhmSensors below) and NULL with declared
+      // availability beyond that -- guessed motherboards temps were never
+      // acceptable, but a real adapter reading via LHM is.
+      return (await readNvidiaSmiSensors()) ?? (await readLhmSensors()) ?? NO_SAMPLE;
     }
     // Apple metal: powermetrics needs sudo. Declared unavailable in v1.
     return NO_SAMPLE;
@@ -200,6 +203,152 @@ function toFiniteNumber(raw: string | undefined): number | null {
   if (raw == null) return null;
   const value = Number(raw);
   return Number.isFinite(value) ? value : null;
+}
+
+// --- Windows-only LibreHardwareMonitor (sensor_lhm) --------------------------
+//
+// sensor_lhm has been reserved in SENSOR_MEASUREMENT_SOURCES for exactly the
+// pair this section serves: Windows + AMD/Intel graphics, where there is no
+// vendor CLI the way nvidia-smi/rocm-smi exist elsewhere (WMI thermal zones
+// are motherboard-level, PDH has no GPU sensor counters). LibreHardwareMonitor
+// reaches those adapters through their driver interfaces directly and exposes
+// two machine-readable views, tried here in cost order:
+//
+//   1. Its web server's /data.json tree (the feed its own UI renders from):
+//      one HTTP GET, far cheaper than anything shelled at the sampler's 2 s
+//      cadence. Requires "Remote Web Server" ticked in the app's options.
+//   2. Its WMI namespace root\LibreHardwareMonitor: works whenever the app is
+//      merely RUNNING, with no setting toggled, at the price of a ~1-3 s
+//      PowerShell spawn per read -- well inside EXEC_TIMEOUT_MS, just laggy.
+//
+// Either way the app itself must be running AND elevated: without admin its
+// GPU drivers are no more reachable from us than they are from anyone else.
+// The HTTP port is overridable via LHM_HTTP_PORT (default 8085).
+
+const LHM_HTTP_PORT = Number(process.env.LHM_HTTP_PORT ?? 8085);
+const LHM_HTTP_URL = `http://127.0.0.1:${LHM_HTTP_PORT}/data.json`;
+
+/** One candidate reading harvested from an LHM surface, pre-selection. */
+export interface LhmReading {
+  label: string;
+  kind: "temp" | "clock";
+  value: number;
+}
+
+export async function readLhmSensors(): Promise<SensorSample | null> {
+  return (await readLhmHttpSensors()) ?? (await readLhmWmiSensors());
+}
+
+// /data.json is the app's whole node tree: hardware nodes carry children, and
+// leaf values come with their UI icon (ImageURL) naming the sensor class --
+// images/temperature.png, images/clock.png and friends. Match the icon rather
+// than the display text, which varies by vendor/version exactly the way
+// rocm-smi's JSON keys did.
+interface LhmNode {
+  Text?: string;
+  Value?: string;
+  ImageURL?: string;
+  Children?: LhmNode[];
+}
+
+async function readLhmHttpSensors(): Promise<SensorSample | null> {
+  try {
+    const res = await fetch(LHM_HTTP_URL, { signal: AbortSignal.timeout(EXEC_TIMEOUT_MS) });
+    if (!res.ok) return null;
+    const root = (await res.json()) as LhmNode;
+    const readings: LhmReading[] = [];
+    collectLhmReadings(root, readings);
+    return sampleFromLhmReadings(readings);
+  } catch {
+    return null;
+  }
+}
+
+function collectLhmReadings(node: LhmNode, out: LhmReading[]): void {
+  const url = node.ImageURL ?? "";
+  const value = parseUnitValue(node.Value);
+  if (value != null && /temperature/i.test(url)) {
+    out.push({ label: node.Text ?? "", kind: "temp", value });
+  } else if (value != null && /clock/i.test(url)) {
+    out.push({ label: node.Text ?? "", kind: "clock", value });
+  }
+  for (const child of node.Children ?? []) collectLhmReadings(child, out);
+}
+
+// Selection rule, stated so it stays reproducible across app versions whose
+// sensor labels drift: a reading only counts when its OWN label says GPU
+// ("GPU Core", "GPU Hot Spot Temperature", ...) -- CPU/motherboard/mainboard
+// entries in the same tree are never promoted into adapter numbers, matching
+// this file's standing "declared rather than guessed" posture. Among
+// GPU-labelled candidates the first temperature wins; clocks prefer a core /
+// shader-clock label (what the M6 sag rule actually tracks) before falling
+// back to any other GPU-labelled clock (e.g. memory).
+export function sampleFromLhmReadings(readings: LhmReading[]): SensorSample | null {
+  const gpuTemps = readings.filter((r) => r.kind === "temp" && /gpu/i.test(r.label));
+  const gpuClocks = readings.filter((r) => r.kind === "clock" && /gpu/i.test(r.label));
+  const clock = gpuClocks.find((r) => /gpu\s*core/i.test(r.label)) ?? gpuClocks[0];
+  const tempC = gpuTemps[0]?.value ?? null;
+  const clockMhz = clock?.value ?? null;
+  if (tempC == null && clockMhz == null) return null;
+  return { tempC, clockMhz, source: "sensor_lhm" };
+}
+
+// Values arrive rendered with units ("45 °C", "1600 MHz"); same strip-and-parse
+// rocm text parsing does.
+function parseUnitValue(raw: string | undefined): number | null {
+  if (!raw) return null;
+  return toFiniteNumber(raw.replace(/[^0-9.\-]/g, ""));
+}
+
+// WMI fallback: typed columns instead of icon strings. Get-CimInstance filters
+// to GPU-classed hardware, joins Sensors onto it by Identifier/Parent, and
+// keeps only the two classes this file maps. ConvertTo-Json emits one object
+// for a single row and an array otherwise, hence the both-shapes parse.
+interface LhmWmiSensorRow {
+  Name?: unknown;
+  SensorType?: unknown;
+  Value?: unknown;
+}
+
+const LHM_WMI_SCRIPT = [
+  "$ErrorActionPreference='Stop'",
+  "$hw=@(Get-CimInstance -Namespace root/LibreHardwareMonitor -ClassName Hardware | Where-Object { $_.HardwareType -eq 'GPU' })",
+  "$s=Get-CimInstance -Namespace root/LibreHardwareMonitor -ClassName Sensor | Where-Object { $hw.Identifier -contains $_.Parent -and ($_.SensorType -eq 'Temperature' -or $_.SensorType -eq 'Clock') }",
+  "$s | Select-Object Name,SensorType,Value | ConvertTo-Json -Compress",
+].join("; ");
+
+async function readLhmWmiSensors(): Promise<SensorSample | null> {
+  try {
+    const { stdout } = await execFileAsync(
+      "powershell.exe",
+      ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", LHM_WMI_SCRIPT],
+      { timeout: EXEC_TIMEOUT_MS }
+    );
+    const trimmed = stdout.trim();
+    if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) return null;
+    const parsed = JSON.parse(trimmed) as LhmWmiSensorRow | LhmWmiSensorRow[];
+    const rows = Array.isArray(parsed) ? parsed : [parsed];
+    const readings: LhmReading[] = [];
+    for (const row of rows) {
+      const kindRaw = String(row.SensorType ?? "");
+      const kind = kindRaw === "Temperature" ? "temp" : kindRaw === "Clock" ? "clock" : null;
+      if (!kind || typeof row.Name !== "string") continue;
+      const value = wmiNumeric(row.Value);
+      if (value != null) readings.push({ label: row.Name, kind, value });
+    }
+    return sampleFromLhmReadings(readings);
+  } catch {
+    return null;
+  }
+}
+
+// Older OpenHardwareMonitor-lineage builds publish Value as a float ARRAY of
+// per-tick readings instead of a scalar; the last element is the current one.
+function wmiNumeric(raw: unknown): number | null {
+  if (Array.isArray(raw)) {
+    raw = raw[raw.length - 1];
+  }
+  return typeof raw === "number" && Number.isFinite(raw) ? raw : null;
 }
 
 // --- M6 detection rule (computable, deterministic) --------------------------
