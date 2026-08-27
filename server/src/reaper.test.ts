@@ -138,8 +138,48 @@ describe("workerRepo.pruneExpiredEnrolments", () => {
   });
 });
 
+describe("repo.pruneOldGpuClockSamples (M6)", () => {
+  it("nulls only the sample series on rows past 30 days, and only that column", () => {
+    const db = getDb();
+    const insertResult = (id: string, createdAt: number) =>
+      db
+        .prepare(
+          `INSERT INTO results
+             (id, gpu_temp_c_max, gpu_clock_mhz_min, gpu_clock_samples, caveat_flags, created_at)
+           VALUES (?, ?, ?, ?, ?, ?)`
+        )
+        .run(id, 89, 1200, JSON.stringify([1400, 1350, 1300, 1200]), JSON.stringify(["thermally_throttled"]), createdAt);
+
+    insertResult("result-old-thermal", Date.now() - 31 * DAY_MS);
+    insertResult("result-recent-thermal", Date.now() - 1 * DAY_MS);
+
+    const changed = repo.pruneOldGpuClockSamples(30);
+    expect(changed).toBe(1);
+
+    const old = db
+      .prepare(`SELECT gpu_temp_c_max, gpu_clock_mhz_min, gpu_clock_samples, caveat_flags FROM results WHERE id = ?`)
+      .get("result-old-thermal") as {
+      gpu_temp_c_max: number | null;
+      gpu_clock_mhz_min: number | null;
+      gpu_clock_samples: string | null;
+      caveat_flags: string | null;
+    };
+    // The bulky sample series is gone -- everything a later reader (scoring,
+    // N6 policy) actually consumes persists indefinitely.
+    expect(old.gpu_clock_samples).toBeNull();
+    expect(old.gpu_temp_c_max).toBe(89);
+    expect(old.gpu_clock_mhz_min).toBe(1200);
+    expect(JSON.parse(old.caveat_flags!)).toEqual(["thermally_throttled"]);
+
+    const recent = db.prepare(`SELECT gpu_clock_samples FROM results WHERE id = ?`).get("result-recent-thermal") as {
+      gpu_clock_samples: string | null;
+    };
+    expect(recent.gpu_clock_samples).not.toBeNull();
+  });
+});
+
 describe("runMaintenanceSweep", () => {
-  it("runs the job-lease reaper and all three prune sweeps together without throwing", () => {
+  it("runs the job-lease reaper and all four prune sweeps together without throwing", () => {
     const db = getDb();
     const user = repo.userRepo.upsertByIdentity("github", { providerUserId: "sweep-integration", login: "sweep", avatarUrl: null });
     db.prepare(`INSERT INTO sessions (id, user_id, token_hash, expires_at, created_at) VALUES (?, ?, ?, ?, ?)`).run(
@@ -149,10 +189,17 @@ describe("runMaintenanceSweep", () => {
       Date.now() - DAY_MS,
       Date.now() - 2 * DAY_MS
     );
+    db.prepare(
+      `INSERT INTO results (id, gpu_clock_samples, created_at) VALUES (?, ?, ?)`
+    ).run("result-sweep-old", JSON.stringify([1400, 1200]), Date.now() - 31 * DAY_MS);
 
     expect(() => runMaintenanceSweep(silentLog)).not.toThrow();
 
     const row = db.prepare(`SELECT id FROM sessions WHERE id = ?`).get("sess-sweep-expired");
     expect(row).toBeUndefined();
+    const result = db.prepare(`SELECT gpu_clock_samples FROM results WHERE id = ?`).get("result-sweep-old") as {
+      gpu_clock_samples: string | null;
+    };
+    expect(result.gpu_clock_samples).toBeNull();
   });
 });

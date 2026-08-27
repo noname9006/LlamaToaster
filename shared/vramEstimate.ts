@@ -133,3 +133,186 @@ export function estimateResidentGpuLayersFromBufferSizes(
   const layers = Math.round((claimedNgl * gpuMib) / totalMib);
   return Math.max(0, Math.min(claimedNgl, layers));
 }
+
+// --- M1 -- Affordability inversion: given this GPU, these weights, this KV
+// type -- what is the largest context that still fits and stays practical?
+// Same advisory-only posture as everything else in this file: it ranks and
+// annotates, it never gates a config out of a sweep.
+
+const DEFAULT_MAX_CTX_SCRATCH_MIB = 256;
+const DEFAULT_ACTIVATIONS_HEADROOM_FRAC = 0.1;
+
+export interface MaxCtxInput {
+  // VRAM total (RAM total for CPU workers).
+  totalMib: number;
+  // VRAM-resident weight share for the chosen placement (ngl / n-cpu-moe);
+  // null when only a full-offload number exists.
+  weightsMib: number | null;
+  // Graphs + driver scratch; default 256.
+  scratchMib?: number;
+  activationsHeadroomFrac?: number;
+  // Default 1; KV splits across slots.
+  parallelSlots?: number;
+  // Per-token KV inputs, identical fields to the forward estimator.
+  nLayer: number;
+  nHeadKv: number;
+  headDimK?: number;
+  headDimV?: number;
+  // Consumed only by the dK/dV fallback below; required together for it,
+  // absent => confidence drops a level.
+  nEmbd?: number;
+  nHead?: number;
+  cacheTypeK: string;
+  cacheTypeV: string;
+  slidingWindow?: number;
+  // M1's own stated fallback when confidence can only be "unknown": offer
+  // the full-trained_ctx load as a conservative floor candidate, explicitly
+  // labeled conservative -- never invent a weights number instead.
+  trainedCtx?: number | null;
+}
+
+export interface MaxCtxEstimate {
+  tokens: number;
+  confidence: "good" | "rough" | "unknown";
+  binding: "kv" | "weights-placement" | null;
+  // Populated only alongside confidence "unknown", when trainedCtx was
+  // supplied: the conservative floor candidate M1 names as the fallback.
+  // Never a substitute estimate -- callers must label it conservative.
+  conservativeFloorTokens?: number | null;
+}
+
+// Bytes per element per KV-cache value, from ggml's own block layouts
+// (block size 32 for every quantized type here). The M1 worked example pins
+// two of them: f16 = 2 B and q8_0 = 136/128 = 1.0625 B per element.
+function bytesPerVal(cacheType: string): number | null {
+  switch (cacheType) {
+    case "f32":
+      return 4;
+    case "bf16":
+    case "f16":
+      return 2;
+    case "q8_0":
+      return 34 / 32;
+    case "q5_1":
+      return 24 / 32;
+    case "q5_0":
+      return 22 / 32;
+    case "q4_1":
+      return 20 / 32;
+    case "q4_0":
+    case "iq4_nl":
+      return 18 / 32;
+    default:
+      return null;
+  }
+}
+
+export interface KvGeometry {
+  nLayer: number;
+  nHeadKv: number;
+  headDimK?: number;
+  headDimV?: number;
+  nEmbd?: number;
+  nHead?: number;
+  cacheTypeK: string;
+  cacheTypeV: string;
+}
+
+export interface KvBytesPerToken {
+  bytes: number | null;
+  confidence: "good" | "rough" | "unknown";
+}
+
+// The per-token KV cost both directions of the estimator share:
+//   kvBytesPerTok = nLayer * nHeadKv * (dK*bytesPerVal(K) + dV*bytesPerVal(V))
+// where dK = headDimK ?? nEmbd/nHead and dV = headDimV ?? headDimK ?? dK.
+// The nEmbd/nHead fallback is a both-or-neither input pair, and using it
+// drops confidence a level -- exactly as the forward estimator derives them.
+export function kvBytesPerToken(g: KvGeometry): KvBytesPerToken {
+  const bK = bytesPerVal(g.cacheTypeK);
+  const bV = bytesPerVal(g.cacheTypeV);
+  if (bK == null || bV == null || g.nLayer <= 0 || g.nHeadKv <= 0) {
+    return { bytes: null, confidence: "unknown" };
+  }
+  let dK = g.headDimK;
+  let dV = g.headDimV ?? g.headDimK;
+  if ((dK == null || dV == null) && g.nEmbd != null && g.nHead != null && g.nHead > 0) {
+    dK = dK ?? g.nEmbd / g.nHead;
+    dV = dV ?? dK;
+  }
+  if (dK == null || dV == null) return { bytes: null, confidence: "unknown" };
+  const confidence = g.headDimK == null || g.headDimV == null ? "rough" : "good";
+  return { bytes: g.nLayer * g.nHeadKv * (dK * bK + dV * bV), confidence };
+}
+
+// Forward direction, in MiB: what a KV cache of `tokens` tokens costs across
+// `parallelSlots` slots. Null when the geometry can't produce a number --
+// callers annotate with "unknown", never a fabricated figure.
+export function estimateKvCacheMib(
+  g: KvGeometry & { tokens: number; parallelSlots?: number }
+): number | null {
+  const perToken = kvBytesPerToken(g);
+  if (perToken.bytes == null || g.tokens <= 0) return null;
+  return (perToken.bytes * g.tokens * Math.max(1, g.parallelSlots ?? 1)) / BYTES_PER_MIB;
+}
+
+// M1's "weightsMib === null -> interpolate from any prior run's
+// vram_free_before_mib/gpu_memory_model_peak pair for this model+machine":
+// a measured peak minus that item's own KV cost and scratch is the
+// VRAM-resident weight share for the placement that produced it. Never
+// invents a weights number -- null in, null out.
+export function residentWeightsMibFromPeak(
+  input: KvGeometry & {
+    vramPeakMib: number | null;
+    contextTokens: number;
+    parallelSlots?: number;
+    scratchMib?: number;
+  }
+): number | null {
+  if (input.vramPeakMib == null || input.vramPeakMib <= 0) return null;
+  const kvMib = estimateKvCacheMib({ ...input, tokens: input.contextTokens });
+  if (kvMib == null) return null;
+  const scratch = input.scratchMib ?? DEFAULT_MAX_CTX_SCRATCH_MIB;
+  return Math.max(0, Math.round(input.vramPeakMib - kvMib - scratch));
+}
+
+export function maxAffordableContext(input: MaxCtxInput): MaxCtxEstimate {
+  const scratchMib = input.scratchMib ?? DEFAULT_MAX_CTX_SCRATCH_MIB;
+  const headroomFrac = input.activationsHeadroomFrac ?? DEFAULT_ACTIVATIONS_HEADROOM_FRAC;
+  const slots = Math.max(1, input.parallelSlots ?? 1);
+
+  // One formula for both directions -- see kvBytesPerToken above.
+  const perToken = kvBytesPerToken(input);
+  if (perToken.bytes == null || input.totalMib <= 0 || input.weightsMib == null) {
+    const conservativeFloorTokens =
+      input.trainedCtx != null && input.trainedCtx > 0 ? Math.floor(input.trainedCtx) : null;
+    return { tokens: 0, confidence: "unknown", binding: null, conservativeFloorTokens };
+  }
+  const confidence: MaxCtxEstimate["confidence"] = perToken.confidence;
+
+  const usableMib = input.totalMib * (1 - headroomFrac) - input.weightsMib - scratchMib;
+  const kvBytesPerTok = perToken.bytes;
+  if (usableMib <= 0 || kvBytesPerTok <= 0) {
+    const binding: MaxCtxEstimate["binding"] =
+      input.weightsMib + scratchMib > input.totalMib * (1 - headroomFrac) ? "weights-placement" : "kv";
+    return { tokens: 0, confidence, binding };
+  }
+
+  if (input.slidingWindow != null && input.slidingWindow > 0) {
+    // SWA -- direction matters because this is the inverse. The forward
+    // estimator's naive all-layers-full-context error overestimates cost;
+    // here the same naivety would overestimate affordable tokens, which is
+    // the unsafe direction. Assume the Gemma-style ~1 global : 5 local
+    // interleave: local layers contribute their window-bound bytes and the
+    // global budget is solved for.
+    const g = Math.ceil(input.nLayer / 6);
+    const rawTokens = (usableMib * 2 ** 20) / kvBytesPerTok;
+    const tokens = Math.max(0, rawTokens - (input.nLayer - g) * input.slidingWindow) / g;
+    return { tokens: Math.floor(tokens), confidence: "rough", binding: "kv" };
+  }
+
+  const tokens = Math.floor((usableMib * 2 ** 20) / (kvBytesPerTok * slots));
+  const binding: MaxCtxEstimate["binding"] =
+    input.weightsMib + scratchMib > input.totalMib * (1 - headroomFrac) ? "weights-placement" : "kv";
+  return { tokens, confidence, binding };
+}

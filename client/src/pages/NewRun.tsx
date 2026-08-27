@@ -11,6 +11,19 @@ import { isMtpDraftModel, backendVisibleGpus, detectBackend } from "../types";
 import type { Model, SweepConfig, Backend, WorkerVramInfo } from "../types";
 import { formatGpuLabel, formatBytes } from "../utils";
 import { estimateVramNeededMib, estimateSafeNgl } from "../vramEstimate";
+import { GoalQuestionnaire } from "../components/GoalQuestionnaire";
+import {
+  defaultGoals,
+  goalsEqualDefaults,
+  normalizeGoals,
+  pruneCacheTypes,
+  ensureUnquantizedPairSurvives,
+  DEFAULT_RECOMMENDED_KV_PAIRS,
+  type GoalsConfig,
+} from "../goals";
+import { expandSweep } from "../../../shared/sweep";
+import { priceMatrix, ETA_UNAVAILABLE } from "../../../shared/pricing";
+import type { ModelRatesResponse } from "../types";
 
 type Sweep = Omit<SweepConfig, "model_id">;
 
@@ -49,6 +62,30 @@ function loadRememberedSweep(modelId: string, workerId: string): Sweep | null {
     return raw ? sanitizeSweep(JSON.parse(raw) as Sweep) : null;
   } catch {
     return null;
+  }
+}
+
+// M5 -- the goals block is saved beside the grid, under its own key so a
+// preset written before this amendment simply has no entry and loads as
+// "unset" instead of silently gaining fabricated answers.
+function goalsStorageKey(modelId: string, workerId: string): string {
+  return `llamatoaster:goals:${modelId}:${workerId}`;
+}
+
+function loadRememberedGoals(modelId: string, workerId: string): GoalsConfig | null {
+  try {
+    const raw = localStorage.getItem(goalsStorageKey(modelId, workerId));
+    return raw ? (normalizeGoals(JSON.parse(raw)) ?? null) : null;
+  } catch {
+    return null;
+  }
+}
+
+function rememberGoals(modelId: string, workerId: string, goals: GoalsConfig): void {
+  try {
+    localStorage.setItem(goalsStorageKey(modelId, workerId), JSON.stringify(goals));
+  } catch {
+    /* localStorage unavailable -- not worth failing the run over */
   }
 }
 
@@ -247,6 +284,13 @@ export function NewRun() {
   // covers.
   const [gpuOverrideBackend, setGpuOverrideBackend] = useState<Backend | undefined>(undefined);
   const [sweep, setSweep] = useState<Sweep>(EMPTY_SWEEP);
+  // M2 -- the questionnaire's answers. Kept beside the sweep and saved with
+  // it (M5: goals are intent about the WORKLOAD, not a property of a machine,
+  // so they travel with presets exactly like grids do). `goalsUnset` marks a
+  // preset saved before this existed: the controls show defaults, MARKED as
+  // unset, and no answers are fabricated.
+  const [goals, setGoals] = useState<GoalsConfig>(defaultGoals());
+  const [goalsUnset, setGoalsUnset] = useState(true);
   const [jsonText, setJsonText] = useState("");
   const [jsonError, setJsonError] = useState("");
   const [msg, setMsg] = useState("");
@@ -589,8 +633,15 @@ export function NewRun() {
     const remembered = loadRememberedSweep(modelId, workerId);
     if (remembered) {
       setSweep(remembered);
+      // M5 -- a legacy preset lacks the goals key: treat goals as UNSET
+      // (defaults, marked) rather than inventing answers the user never gave.
+      const rememberedGoals = loadRememberedGoals(modelId, workerId);
+      setGoals(rememberedGoals ?? defaultGoals());
+      setGoalsUnset(rememberedGoals == null);
       return;
     }
+    setGoals(defaultGoals());
+    setGoalsUnset(true);
     // No remembered sweep: seed sensible defaults so the form is submittable.
     // CPU-only workers: n_gpu_layers must be 0 (input is disabled).
     // GPU workers: offer 0 and max (offload everything) as starting points.
@@ -704,9 +755,16 @@ export function NewRun() {
         mtp_model_id: mtpModelId || undefined,
         main_gpu: mainGpuForSubmit,
         main_gpu_backend: gpuOverrideBackend,
-        sweep,
+        // M4 -- the tolerance prunes forbidden pairs BEFORE expansion, so the
+        // live count, the cost estimate and what actually runs all agree.
+        sweep: prunedSweep,
+        // M2's "skippable by construction": an untouched questionnaire sends
+        // NO goals key at all, making the payload byte-identical to what this
+        // page sent before the amendment existed.
+        goals: goalsEqualDefaults(goals) && goalsUnset ? undefined : goals,
       });
       rememberSweep(modelId, workerId, sweep);
+      rememberGoals(modelId, workerId, goals);
       setLastRunId(run.id);
       // Every trigger comes back 'scheduled' now -- it only flips to
       // 'running' once the worker actually claims the job off its queue
@@ -720,6 +778,144 @@ export function NewRun() {
     }
   }
 
+  const [workflowMsg, setWorkflowMsg] = useState("");
+
+  // N6 -- the CPU-focused preset template. Threads are the DOMINANT variable
+  // on CPU-bound rows (M7 says so explicitly), so this is where -t stops being
+  // held and starts being an axis; ngl is pinned at 0 to keep it that way.
+  function applyCpuTemplate(): void {
+    const ladder = [...new Set([1, 2, 4, Math.max(1, threadsMax - 1), threadsMax])]
+      .filter((n) => n >= 1 && n <= threadsMax)
+      .sort((a, b) => a - b);
+    setSweep((current) => ({
+      ...current,
+      threads: ladder,
+      n_gpu_layers: [0],
+      n_cpu_moe: [0],
+      n_gpu_layers_draft: [0],
+      mtp: ["off"],
+    }));
+    setWorkflowMsg(
+      `CPU template applied: threads varied across ${ladder.join(", ")} with ngl pinned at 0. The running build's own ISA dispatch is recorded on these rows, so two CPUs on the same build tag are no longer silently comparable.`
+    );
+  }
+
+  // M2 -- Test B's prompt sizes are PRE-SELECTED around the stated target, so
+  // the default matrix is centred on the user's own question rather than a
+  // fixed ladder.
+  function applyTargetSizes(): void {
+    const target = goals.target_ctx;
+    if (target == null) {
+      setWorkflowMsg("State a target context first — that is what the sizes are anchored to.");
+      return;
+    }
+    const around = [...new Set([Math.round(target / 8), Math.round(target / 2), target])]
+      .filter((n) => n >= 128)
+      .sort((a, b) => a - b);
+    setSweep((current) => ({ ...current, n_prompt: around }));
+    setWorkflowMsg(`Prompt sizes pre-selected around your ${target.toLocaleString()} target: ${around.join(", ")}.`);
+  }
+
+  // N5 -- the concurrency ladder. Rows land as ordinary results with
+  // `concurrency` set; the knee is derived on read, never stored as a verdict.
+  async function startKneeLadder(): Promise<void> {
+    if (!modelId || !workerId) {
+      setWorkflowMsg("Pick a model and a machine first.");
+      return;
+    }
+    const nPrompt = goals.target_ctx ?? sweep.n_prompt[0] ?? 4096;
+    const nGen = sweep.n_gen[0] ?? 128;
+    setWorkflowMsg("Enqueueing the concurrency ladder…");
+    try {
+      const run = await api.triggerRun({
+        model_id: modelId,
+        worker_id: workerId,
+        kind: "runtime",
+        knee: { n_prompt: nPrompt, n_gen: nGen, slots: [1, 2, 4, 8], repeats: 1 },
+        sweep: prunedSweep,
+      });
+      setLastRunId(run.id);
+      setWorkflowMsg(
+        "Concurrency ladder scheduled at slots 1 · 2 · 4 · 8. The knee is the smallest slot count whose TTFT p95 exceeds 2× its slots = 1 value — derived from the stored rows, never asserted."
+      );
+    } catch (err) {
+      setWorkflowMsg(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  // M4 -- the KV-quality tolerance removes forbidden pairs at GRID-BUILD time,
+  // before expansion, so the live count, the cost estimate and the invalid-
+  // combination breakdown all reflect what will actually run. Uses the same
+  // shared, tested pruning primitives shared/goals.ts's recommendedKvGrid
+  // does, rather than a second hand-rolled copy of this logic: one rule is
+  // inviolable whatever the tolerance -- at least one UNQUANTIZED pair
+  // survives, so the flash-attention-off axis keeps something to vary
+  // against -- and expertMode:true here since this grid is always the flat
+  // cross-product NewRun builds, never the collapsed single-pair Recommended
+  // grid (this app has no Recommended/Expert mode toggle).
+  const prunedSweep = useMemo<Sweep>(() => {
+    const tolerance = goals.kv_tolerance ?? "q4_0_ok";
+    const prunedK = pruneCacheTypes(sweep.cache_type_k, tolerance);
+    const prunedV = pruneCacheTypes(sweep.cache_type_v, tolerance);
+    const { cache_type_k, cache_type_v } = ensureUnquantizedPairSurvives(
+      prunedK,
+      prunedV,
+      DEFAULT_RECOMMENDED_KV_PAIRS,
+      true
+    );
+    return { ...sweep, cache_type_k, cache_type_v };
+  }, [sweep, goals.kv_tolerance]);
+
+  const prunedPairs = useMemo(() => {
+    const removedK = sweep.cache_type_k.filter((t) => !prunedSweep.cache_type_k.includes(t));
+    const removedV = sweep.cache_type_v.filter((t) => !prunedSweep.cache_type_v.includes(t));
+    return [...new Set([...removedK, ...removedV])];
+  }, [sweep, prunedSweep]);
+
+  // The LIVE count is the post-prune expansion, not an estimate of it.
+  const expandedItems = useMemo(() => {
+    try {
+      return expandSweep(prunedSweep).length;
+    } catch {
+      return 0;
+    }
+  }, [prunedSweep]);
+
+  // §0.6 -- the ETA prices from a {server, spec:"off"} rate first, then a
+  // labeled llama-bench rate, then not at all. No number renders without its
+  // source, so the label travels with the rate.
+  const [rates, setRates] = useState<ModelRatesResponse | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    setRates(null);
+    if (!modelId || !workerId) return;
+    api
+      .getModelRates(modelId, workerId)
+      .then((r) => {
+        if (!cancelled) setRates(r);
+      })
+      .catch(() => {
+        /* pricing is advisory; a failed lookup renders "ETA unavailable" */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [modelId, workerId]);
+
+  const priced = useMemo(() => {
+    if (!rates) return { seconds: null, display: `${ETA_UNAVAILABLE} — no measured rates for this pairing yet` };
+    const items = expandSweep(prunedSweep);
+    return priceMatrix(
+      items.map((item) => ({
+        nPrompt: item.n_prompt,
+        nGen: item.n_gen,
+        repeats: prunedSweep.repeats,
+        ppRate: rates.pp,
+        tgRate: rates.tg,
+      }))
+    );
+  }, [rates, prunedSweep]);
+
   const inputCls =
     "rounded-lg border border-border bg-surface px-3 py-1.5 text-fg outline-none focus:border-accent";
 
@@ -732,6 +928,37 @@ export function NewRun() {
       </p>
 
       <form onSubmit={handleSubmit} className="mt-6 flex flex-col gap-6">
+        {/* M2 -- captured BEFORE the grid is built: everything downstream
+            (scoring weights, the KV axis, depth anchoring, which cards exist
+            at completion) derives from these answers. */}
+        <GoalQuestionnaire
+          goals={goals}
+          onChange={(next) => {
+            setGoals(next);
+            setGoalsUnset(false);
+          }}
+          trainedCtx={typeof selectedModel?.metadata.trained_ctx === "number" ? selectedModel.metadata.trained_ctx : null}
+          unset={goalsUnset}
+          affordability={{
+            totalMib: liveVram?.gpu_memory_total_mib ?? null,
+            weightsMib:
+              selectedModel && baseLayerCount != null
+                ? estimateVramNeededMib({
+                    modelSizeBytes: selectedModel.size_bytes,
+                    totalModelLayers: baseLayerCount,
+                    requestedNgl: Math.max(...(sweep.n_gpu_layers.length > 0 ? sweep.n_gpu_layers : [0])),
+                  })
+                : null,
+            nLayer: selectedModel?.metadata.n_layer,
+            nHeadKv: selectedModel?.metadata.n_head_kv,
+            headDimK: selectedModel?.metadata.head_dim_k,
+            headDimV: selectedModel?.metadata.head_dim_v,
+            nEmbd: selectedModel?.metadata.n_embd,
+            nHead: selectedModel?.metadata.n_head,
+            slidingWindow: selectedModel?.metadata.sliding_window,
+          }}
+        />
+
         <div className="flex flex-wrap gap-4">
           <label className="flex flex-col gap-1.5 text-sm">
             <span className="text-muted">Worker</span>
@@ -869,6 +1096,27 @@ export function NewRun() {
             hint="Tokens generated after the prompt (the tg test). 0 disables the tg phase."
             presets={[128, 256]}
             {...field(sweep, setSweep, "n_gen")}
+          />
+          {/* BENCHMARKING_PLAN_V8.md §0.2 -- the depth axis. -d prefills the
+              KV cache before each test, so TG measures a context already
+              populated to this depth. llama-bench ONLY: llama-server has no
+              KV-prefill flag, so the trigger rejects a non-zero depth on any
+              server-engine configuration and names the fix. Depth values are
+              anchored to the target context stated in Q2. */}
+          <ChipInput
+            label="KV depth (-d)"
+            hint={
+              goals.target_ctx != null
+                ? `Tokens already in the KV cache before each test — llama-bench only. Percentages of your ${goals.target_ctx.toLocaleString()} target: ${[0.25, 0.5, 0.75].map((f) => Math.round((goals.target_ctx ?? 0) * f)).join(", ")}.`
+                : "Tokens already in the KV cache before each test — llama-bench only, because llama-server has no KV-prefill flag. State a target context in Q2 to anchor the percentages."
+            }
+            presets={
+              goals.target_ctx != null
+                ? [0, ...[0.25, 0.5, 0.75].map((f) => Math.round((goals.target_ctx ?? 0) * f))]
+                : [0, 4096, 16384]
+            }
+            value={sweep.n_depth ?? []}
+            onChange={(value: number[]) => setSweep((current) => ({ ...current, n_depth: value }))}
           />
           <SliderChipInput
             label="Threads (-t)"
@@ -1051,6 +1299,13 @@ export function NewRun() {
               +
             </button>
           </div>
+          {sweep.repeats < 3 && (
+            <p className="mt-2 text-[11px] leading-relaxed text-warning" role="alert">
+              Fewer than 3 reports a standard deviation of exactly 0 — the stability gate would pass on a number
+              that was never measured. §0.3 requires n ≥ 3 for a config to score at all; below that, every
+              placement here will land in the "stability" rejection tally instead of a profile card.
+            </p>
+          )}
         </div>
 
         <details
@@ -1090,6 +1345,88 @@ export function NewRun() {
           </div>
         </details>
         </fieldset>
+
+        {/* The workflows v8 adds on top of an ordinary sweep. Each states what
+            it does to the grid rather than silently rewriting it. */}
+        <div className="rounded-xl border border-border bg-surface p-5">
+          <span className="text-sm font-medium text-fg">Workflows</span>
+          <div className="mt-3 flex flex-wrap gap-2">
+            <button
+              type="button"
+              onClick={applyCpuTemplate}
+              className="rounded-lg border border-border px-3 py-1.5 text-xs font-semibold text-fg hover:border-accent/40 hover:text-accent"
+            >
+              CPU-focused template
+            </button>
+            <button
+              type="button"
+              onClick={applyTargetSizes}
+              aria-disabled={goals.target_ctx == null}
+              title={
+                goals.target_ctx == null
+                  ? "State a target context in Q2 first — that is what the sizes anchor to"
+                  : "Pre-selects prompt sizes around your stated target"
+              }
+              className="rounded-lg border border-border px-3 py-1.5 text-xs font-semibold text-fg hover:border-accent/40 hover:text-accent"
+            >
+              Sizes around my target
+            </button>
+            <button
+              type="button"
+              onClick={() => void startKneeLadder()}
+              disabled={!modelId || !workerId}
+              className="rounded-lg border border-border px-3 py-1.5 text-xs font-semibold text-fg hover:border-accent/40 hover:text-accent disabled:opacity-50"
+            >
+              Start concurrency ladder
+            </button>
+          </div>
+          {workflowMsg && <p className="mt-2 text-xs leading-relaxed text-muted">{workflowMsg}</p>}
+        </div>
+
+        {/* The grid as it will actually run. M4's exit criterion is exactly
+            this: the LIVE COUNT equals the post-prune expansion, so the
+            number here and the number of tests that execute never disagree. */}
+        <div className="rounded-xl border border-border bg-surface p-5">
+          <div className="flex flex-wrap items-baseline justify-between gap-3">
+            <span className="text-sm font-medium text-fg">Grid as it will run</span>
+            <span className="font-mono text-xs text-muted">
+              {expandedItems} test{expandedItems === 1 ? "" : "s"} · {priced.display}
+            </span>
+          </div>
+          {prunedPairs.length > 0 && (
+            <p className="mt-2 text-xs leading-relaxed text-muted">
+              <b className="text-fg">Sweep axis after your tolerance:</b> {prunedPairs.join(", ")}{" "}
+              {prunedPairs.length === 1 ? "was" : "were"} removed before expansion — the count above already
+              reflects it. The axis shrank; the count does not have to imply it.
+            </p>
+          )}
+          <p className="mt-2 text-xs leading-relaxed text-muted">
+            <b className="text-fg">Held fields keep their reasons.</b> Threads are held at the machine default:
+            Test A targets fully offloaded configurations where <span className="font-mono">-t</span> barely
+            bites. On CPU-bound rows it is the dominant variable and stays an Expert-mode axis, with the running
+            build’s own ISA dispatch recorded alongside those rows.
+            {goals.target_ctx != null && (
+              <>
+                {" "}
+                Depth percentages are anchored to your target:{" "}
+                <span className="font-mono">depth % of your {goals.target_ctx.toLocaleString()} target</span>.
+              </>
+            )}
+          </p>
+          <p className="mt-2 text-xs leading-relaxed text-muted">
+            Once this finishes, cards are ranked for{" "}
+            <b className="text-fg">
+              {goals.goal === "max_context"
+                ? `Max context · ≥ ${Math.round((goals.speed_floor_frac ?? 0.5) * 100)} % TG`
+                : goals.goal === "max_speed"
+                  ? "Max tok/s"
+                  : "Balanced"}
+              {goals.target_ctx != null ? ` · ${goals.target_ctx.toLocaleString()}` : ""} ·{" "}
+              {goals.workload}
+            </b>
+            . Changing the goal later re-scores instantly over stored results — never re-measurement.
+          </p>
+        </div>
 
         <div className="flex items-center gap-4">
           <button

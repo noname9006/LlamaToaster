@@ -98,15 +98,20 @@ export const TERMINAL_JOB_RETENTION_DAYS = 7;
 // separate exported function (rather than folded into reapExpiredLeases
 // itself) so existing tests that call reapExpiredLeases directly for its
 // own job-lease behavior are unaffected by this addition.
+// M6's own retention rule -- see repo.ts's pruneOldGpuClockSamples doc
+// comment for what stays behind (everything except the raw sample series).
+export const GPU_CLOCK_SAMPLE_RETENTION_DAYS = 30;
+
 export function runMaintenanceSweep(log: ReaperLogger): void {
   reapExpiredLeases(log);
   const prunedSessions = repo.sessionRepo.pruneExpired();
   const prunedJobs = repo.queueRepo.pruneCompletedOlderThan(TERMINAL_JOB_RETENTION_DAYS);
   const prunedEnrolments = repo.workerRepo.pruneExpiredEnrolments();
-  if (prunedSessions || prunedJobs || prunedEnrolments) {
+  const prunedGpuClockSamples = repo.pruneOldGpuClockSamples(GPU_CLOCK_SAMPLE_RETENTION_DAYS);
+  if (prunedSessions || prunedJobs || prunedEnrolments || prunedGpuClockSamples) {
     log.warn(
-      { prunedSessions, prunedJobs, prunedEnrolments },
-      "maintenance sweep pruned expired sessions/terminal jobs/stale enrolment codes"
+      { prunedSessions, prunedJobs, prunedEnrolments, prunedGpuClockSamples },
+      "maintenance sweep pruned expired sessions/terminal jobs/stale enrolment codes/old GPU clock samples"
     );
   }
 }

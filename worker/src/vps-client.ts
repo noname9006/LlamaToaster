@@ -12,6 +12,8 @@ import type {
   DeviceTokenError,
   RefreshResponse,
   HardwareInfo,
+  ProbeResultInput,
+  QualityResultInput,
 } from "../../shared/types.js";
 
 export function writeRawJson(runDir: string, runId: string, data: unknown): string {
@@ -49,6 +51,48 @@ export async function postRunItemUpdate(
   if (!res.ok) {
     const text = await res.text();
     throw new HttpError(res.status, `item update failed (${res.status}): ${text}`);
+  }
+}
+
+// BENCHMARKING_PLAN_V8.md N2/N4 result ingestion. Both routes require an
+// ENROLLED WORKER SESSION server-side and refuse the shared deployment
+// secret, so the token passed here must be the per-worker credential -- the
+// same one every other authenticated call already uses.
+export async function postProbeResult(
+  vpsUrl: string,
+  token: string,
+  runId: string,
+  payload: ProbeResultInput,
+  timeoutMs = 15_000
+): Promise<void> {
+  const res = await fetch(`${vpsUrl}/api/runs/${runId}/probe-result`, {
+    method: "POST",
+    headers: { "content-type": "application/json", ...authHeader(token) },
+    body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new HttpError(res.status, `probe result failed (${res.status}): ${text}`);
+  }
+}
+
+export async function postQualityResult(
+  vpsUrl: string,
+  token: string,
+  runId: string,
+  payload: QualityResultInput,
+  timeoutMs = 15_000
+): Promise<void> {
+  const res = await fetch(`${vpsUrl}/api/runs/${runId}/quality-result`, {
+    method: "POST",
+    headers: { "content-type": "application/json", ...authHeader(token) },
+    body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new HttpError(res.status, `quality result failed (${res.status}): ${text}`);
   }
 }
 

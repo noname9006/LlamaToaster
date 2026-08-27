@@ -6,7 +6,8 @@ import type {
   ModelDirFile,
   ActiveJobReport,
 } from "../../shared/types.js";
-import { LOCAL_MODEL_STATES } from "../../shared/types.js";
+import { LOCAL_MODEL_STATES, SENSOR_MEASUREMENT_SOURCES } from "../../shared/types.js";
+import type { SensorMeasurementSource } from "../../shared/types.js";
 
 // A worker is a semi-trusted client, not part of the server -- MULTIUSER_PLAN.md
 // §1.8. Everything here is validated and capped before it's ever persisted or
@@ -215,7 +216,35 @@ export function parseWorkerState(body: unknown): WorkerStatePush {
     installed_builds: parseInstalledBuilds(b.installed_builds ?? []),
     model_files: parseModelFiles(b.model_files ?? []),
     status,
+    ...parseSensorsAndIsa(b),
   };
+}
+
+// M6/N6 -- sensor availability and ISA provenance are optional additions to
+// the state push (older workers simply don't send them).
+function parseSensorsAndIsa(b: Record<string, unknown>): Pick<WorkerStatePush, "sensors" | "cpu_isa"> {
+  let sensors: WorkerStatePush["sensors"];
+  const raw = b.sensors;
+  if (raw !== undefined && raw !== null) {
+    if (typeof raw !== "object") throw new BadRequestError("sensors must be an object");
+    const s = raw as Record<string, unknown>;
+    const sourceRaw = s.source;
+    if (sourceRaw !== undefined && sourceRaw !== null && typeof sourceRaw !== "string") {
+      throw new BadRequestError("sensors.source must be a string or null");
+    }
+    if (
+      sourceRaw != null &&
+      !(SENSOR_MEASUREMENT_SOURCES as readonly string[]).includes(sourceRaw)
+    ) {
+      throw new BadRequestError(`sensors.source must be one of ${SENSOR_MEASUREMENT_SOURCES.join("/")}`);
+    }
+    sensors = {
+      clock: s.clock === true,
+      temp: s.temp === true,
+      source: (sourceRaw as SensorMeasurementSource | null) ?? null,
+    };
+  }
+  return { sensors, cpu_isa: optionalString(b.cpu_isa, "cpu_isa", 128) ?? null };
 }
 
 const ACTIVE_JOB_PHASES = ["downloading", "extracting", "loading", "benchmarking", "finalizing"] as const;

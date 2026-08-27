@@ -5,6 +5,8 @@
 // for where this gets produced.
 export const WORKER_INACCESSIBLE_MESSAGE = "worker is inaccessible";
 
+import type { EngineKind } from "./engineSpec.js";
+
 // Well-known values used for auto-detection's own guess (see
 // worker/src/hardware.ts's detectBackend) and as UI suggestions -- NOT an
 // exhaustive allowlist. Backend itself is a plain string (below): any value
@@ -119,6 +121,78 @@ export const GPU_MEMORY_MEASUREMENT_SOURCES = [
 ] as const;
 export type GpuMemoryMeasurementSource = (typeof GPU_MEMORY_MEASUREMENT_SOURCES)[number];
 
+// M6 sensor provenance -- worst-source tracking across an item's samples,
+// exactly like the memory streams above.
+export const SENSOR_MEASUREMENT_SOURCES = [
+  "sensor_nvidia_smi",
+  "sensor_rocm_smi",
+  "sensor_amdgpu_hwmon",
+  "sensor_lhm",
+] as const;
+export type SensorMeasurementSource = (typeof SENSOR_MEASUREMENT_SOURCES)[number];
+
+export const WORKER_CAPABILITIES = ["benchmark", "probe-v1", "quality-v1", "curve-v1"] as const;
+export type WorkerCapability = (typeof WORKER_CAPABILITIES)[number];
+
+// BENCHMARKING_PLAN_V8.md §0.1 -- increments whenever measurement semantics
+// change (warmup added, TTFT derived→streamed, suspect filter applied to both
+// sides of a pair, stddev floor). Stamped by the worker on every ingested row;
+// rows of different vintages are surfaced together but never averaged together
+// in scoring or curves.
+export const METHOD_VERSION = 1;
+
+// N1's choreographed context-curve points (cold timed prefill + warm-repeat
+// statistics) are a real semantics change under §0.1, so they stamp this
+// instead -- which is also what keeps ordinary runtime rows' warm-biased TTFT
+// out of curves without a dedicated marker column.
+export const CURVE_METHOD_VERSION = 2;
+
+// N2 added 'probe'; N4's quality measurement gets its own kind too, for the
+// same reason -- a single perplexity measurement is not a sweep, and folding
+// it into the 'standalone' (NULL) bucket would make it collide with the
+// duplicate-trigger guard against unrelated standalone runs on the same
+// (user, model, worker) triple.
+export const RUN_KINDS = ["tuning", "refine", "sweep", "runtime", "probe", "quality"] as const;
+export type RunKind = (typeof RUN_KINDS)[number];
+
+// §0.5 budgets.
+export const MAX_SWEEP_ITEMS = 20_000;
+export const WARN_SWEEP_ITEMS = 4_096;
+export const MAX_AXIS_VALUES = 64;
+export const MIN_REPEATS = 1;
+export const MAX_REPEATS = 25;
+export const MAX_CHAIN_DEPTH = 3;
+export const MAX_ACTIVE_ROOTS_PER_USER = 3;
+export const CHAIN_WALL_CLOCK_MS = 48 * 60 * 60 * 1000;
+
+// §0.10 closed registry of caveat flags. Flagged rows are kept, never deleted;
+// consumers decide exclusions (e.g. scoring's TG reference-depth rule skips
+// `swa` rows).
+export const CAVEAT_FLAGS = [
+  "swa",
+  "context_unverified",
+  "kv_estimate_rough",
+  "spec_pair_prompt_mismatch",
+  "thermally_throttled",
+  "cache_evicted",
+  "context_shift",
+] as const;
+export type CaveatFlag = (typeof CAVEAT_FLAGS)[number];
+
+export function parseCaveatFlags(text: string | null | undefined): CaveatFlag[] {
+  if (!text) return [];
+  try {
+    const parsed = JSON.parse(text) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((f): f is CaveatFlag => typeof f === "string" && (CAVEAT_FLAGS as readonly string[]).includes(f));
+  } catch {
+    return [];
+  }
+}
+
+export const SPEEDUP_STATUSES = ["ok", "unverified", "unavailable"] as const;
+export type SpeedupStatus = (typeof SPEEDUP_STATUSES)[number];
+
 export type TestType = "pp" | "tg" | "pg";
 
 export type ModelSource = "local" | "huggingface";
@@ -127,11 +201,22 @@ export interface ModelMetadata {
   arch?: string;
   quant?: string;
   trained_ctx?: number;
+  // GGUF's <arch>.context_length -- read alongside n_layer at download time.
+  // Anchors M2's target-context clamp and N1's sizing-ladder ceiling.
+  // Undefined for models registered before this existed.
   // Transformer layer count (GGUF's <architecture>.block_count), read from
   // the file header on download -- see worker/src/gguf.ts. Undefined for
   // models registered before this existed, or for manually-registered
   // "local" models the app never had file bytes to parse.
   n_layer?: number;
+  // KV geometry consumed by shared/vramEstimate.ts's maxAffordableContext
+  // (M1) -- all read from the GGUF header at download time where present.
+  n_head_kv?: number;
+  head_dim_k?: number;
+  head_dim_v?: number;
+  n_embd?: number;
+  n_head?: number;
+  sliding_window?: number;
   // Total parameter count (raw element count across every tensor in the
   // GGUF, as Hugging Face itself computes it from the file's tensor shapes)
   // -- fetched from HF's model API at download time, see
@@ -250,6 +335,13 @@ export interface SweepConfig {
   n_gpu_layers_draft: number[];
   // llama.cpp's --n-cpu-moe N -- see shared/sweep.ts's SweepItem.n_cpu_moe.
   n_cpu_moe: number[];
+  // KV-prefill depth (llama-bench's -d) -- llama-bench only; sweep validation
+  // rejects n_depth > 0 for any server-engine pair (§0.2's depth rule).
+  // Optional so legacy payloads keep validating; expandSweep defaults [0].
+  n_depth?: number[];
+  // N5 -- concurrent streaming slots (server engine only; llama-bench has no
+  // request lifecycle). Optional so legacy payloads keep validating.
+  concurrency?: number[];
   repeats: number;
 }
 
@@ -285,6 +377,32 @@ export interface RunConfig {
   // the worker's own default backend," same as before this field existed.
   main_gpu_backend?: Backend;
   sweep: Omit<SweepConfig, "model_id">;
+  // M2 -- the questionnaire's answers, stored verbatim so results stay
+  // reproducible without reference to whatever the defaults were that day.
+  // A skipped questionnaire leaves this undefined (byte-identical legacy
+  // payload).
+  goals?: import("./goals.js").GoalsConfig;
+  // N6 -- steady-state option: discard the first M repeats at scoring time.
+  // Recorded in configuration (never post-hoc trimming outside it); only
+  // offered when repeats >= M + 3 so post-discard n still satisfies n >= 3.
+  discard_first_repeats?: number;
+  // N2 -- the probe spec this run verifies, stored verbatim so the ingestion
+  // route derives the KV pair and placement from the RUN, never the payload.
+  probe?: ProbeTriggerSpec;
+  // N4 -- the quality spec this run measures, stored verbatim as a record of
+  // intent (the ingestion route independently validates the worker's own
+  // reported ctx/kv/dataset -- see QualityTriggerSpec's doc comment).
+  quality?: QualityTriggerSpec;
+  // N1 -- the context-curve point(s) this runtime run measures. One run
+  // measures every uncovered ladder cell the "Measure missing points"
+  // trigger priced together, so a click never fans out into N separate
+  // runs that would collide with the §0.5 duplicate-trigger guard after
+  // the first.
+  curve_point?: CurvePointSpec;
+  // N5 -- the concurrency ladder this runtime run walks.
+  knee?: KneeSpec;
+  // §0.5 -- chain depth of this run under its root (roots are depth 1).
+  chain_depth?: number;
 }
 
 // "partial" -- some sweep items succeeded and some failed, distinct from a
@@ -299,6 +417,15 @@ export type RunStatus = "running" | "scheduled" | "done" | "partial" | "failed" 
 
 export interface Run {
   id: string;
+  // §0.5 -- denormalized at creation, immutable. Points at the run itself
+  // for standalone runs; chain children point at their root. Chain-scoped
+  // reads are indexed equality predicates (idx_runs_root).
+  root_run_id?: string | null;
+  // §0.5 -- 'tuning' | 'refine' | 'sweep' | 'runtime', NULL = standalone.
+  // N2 adds 'probe'. Undefined on runs predating the column.
+  kind?: RunKind | null;
+  // N3 -- groups model-vs-model comparison members; null otherwise.
+  comparison_id?: string | null;
   worker_name: string;
   // Which `workers` row dispatched this run -- see MULTIUSER_PLAN.md §1.2.
   // Undefined for runs predating the workers table, or whose worker was
@@ -357,7 +484,56 @@ export interface ResultRow {
   test_type: TestType;
   n_prompt: number;
   n_gen: number;
+  // KV-prefill depth (llama-bench -d) -- always 0 on server-engine rows
+  // (§0.2's depth rule). NULL on rows predating the column; reads as 0.
+  n_depth?: number | null;
   n_threads: number;
+  // §0.1 -- stamped by the worker on every ingested row. NULL = pre-v8-core
+  // methodology. Rows of different vintages are never averaged together in
+  // scoring or curves.
+  method_version?: number | null;
+  // §0.8 -- the canonical configuration hash (§0.4), which excludes spec
+  // fields; the exclusion is what makes twin joins work. Written by the
+  // server wherever the twin join needs it (speculative + baseline pairs).
+  config_hash?: string | null;
+  prompt_offset?: number | null;
+  spec_type?: string | null;
+  spec_n_max?: number | null;
+  spec_n_min?: number | null;
+  speedup?: number | null;
+  speedup_status?: SpeedupStatus | null;
+  caveat_flags?: CaveatFlag[];
+  // N5 -- concurrent streaming slots this row measured (1 = solo). NULL on
+  // ordinary rows.
+  concurrency?: number | null;
+  // M6 -- adapter peak temperature and lowest sampled sclk, plus the sample
+  // series itself (~6s cadence, JSON number[]; prunable 30 days after
+  // ingest -- detection already ran at ingest time, aggregates persist).
+  gpu_temp_c_max?: number | null;
+  gpu_clock_mhz_min?: number | null;
+  gpu_clock_samples?: number[] | null;
+  // N6 -- llama.cpp startup-banner ISA provenance for CPU-bound rows.
+  cpu_isa?: string | null;
+  // MEASURED streamed time-to-first-token, milliseconds. Null on llama-bench
+  // rows (no request lifecycle) and on rows predating the streamed clock --
+  // the UI falls back to the derived n_prompt/pp estimate there and says so.
+  // ttft_n is the sample count: a choreographed curve point (N1) is
+  // single-shot by construction and renders as such, never as a p50/p95.
+  ttft_ms_p50?: number | null;
+  ttft_ms_p95?: number | null;
+  ttft_n?: number | null;
+  e2e_ms_mean?: number | null;
+  // N7 -- non-null on a row that arrived through an import. Such rows are
+  // badged wherever they appear and never merge into local profile scoring
+  // unless the importer opted in for that specific bundle.
+  imported_bundle_id?: string | null;
+  import_opt_in?: boolean;
+  // Denormalized from the parent run at insert time so the curve read path
+  // (N1) can be an index range scan over its exact grouping keys
+  // (idx_results_curve) rather than a five-way JOIN. NULL on legacy rows.
+  worker_id?: string | null;
+  llama_cpp_build?: string | null;
+  engine?: EngineKind | null;
   // The requested -ngl value for this combination -- already equivalent to
   // the spec's "gpu_layers_requested", so that's not a separate field. See
   // gpu_layers_loaded/total_model_layers below for what actually happened.
@@ -543,6 +719,8 @@ export interface IngestResultInput {
   test_type: TestType;
   n_prompt: number;
   n_gen: number;
+  // Optional (version-skew tolerant): KV-prefill depth, llama-bench only.
+  n_depth?: number;
   n_threads: number;
   n_gpu_layers: number;
   batch_size: number;
@@ -628,6 +806,37 @@ export interface IngestResultInput {
   repeat_samples?: number[];
   spec_drafted?: number;
   spec_accepted?: number;
+  // §0.1 -- worker-stamped methodology version. Absent on an older worker;
+  // the server stores NULL then (pre-v8-core methodology).
+  method_version?: number;
+  // §0.8 -- pinned prompt-content offset each server row records (the
+  // working offset from serverBench's retry ladder). Both sides of a twin
+  // join must match on it.
+  prompt_offset?: number | null;
+  // §0.8 -- speculative configuration actually in force for this row.
+  spec_type?: string | null;
+  spec_n_max?: number | null;
+  spec_n_min?: number | null;
+  // Set by the llama-server path when a tg reading was recovered through
+  // the wall-clock fallback rather than the server's own timers -- any
+  // wall-clock-fallback side makes its speedup `unverified` (§0.8).
+  wall_clock_fallback?: boolean;
+  // M6 -- worker-derived at item end from its own sample buffer; the server
+  // stores these verbatim and never re-derives them (one writer per column).
+  gpu_temp_c_max?: number | null;
+  gpu_clock_mhz_min?: number | null;
+  gpu_clock_samples?: number[] | null;
+  // N6 -- llama.cpp startup-banner ISA provenance for CPU-bound rows.
+  cpu_isa?: string | null;
+  // N5 -- concurrent streaming slots this row measured.
+  concurrency?: number;
+  // Measured streamed TTFT / end-to-end latency (llama-server path only).
+  ttft_ms_p50?: number | null;
+  ttft_ms_p95?: number | null;
+  ttft_n?: number | null;
+  e2e_ms_mean?: number | null;
+  // §0.10 -- worker-derived caveat flags from the closed registry.
+  caveat_flags?: CaveatFlag[];
 }
 
 // --- Per-item live progress (one llama-bench process per sweep combo) ---
@@ -641,9 +850,13 @@ export type RunItemStatus =
   | "done"
   | "failed"
   | "failed_oom"
-  | "cancelled";
+  | "cancelled"
+  // §0.7 -- an unsupported flag disables its axis (items become skipped with
+  // a reason) rather than failing every item. Never measured; scoring's
+  // eligibility gates treat skipped items as non-disqualifying.
+  | "skipped";
 
-const TERMINAL_RUN_ITEM_STATUSES = ["done", "failed", "failed_oom", "cancelled"] as const;
+const TERMINAL_RUN_ITEM_STATUSES = ["done", "failed", "failed_oom", "cancelled", "skipped"] as const;
 export type TerminalRunItemStatus = (typeof TERMINAL_RUN_ITEM_STATUSES)[number];
 
 export function isTerminalRunItemStatus(status: RunItemStatus): status is TerminalRunItemStatus {
@@ -656,6 +869,8 @@ export interface RunItem {
   idx: number;
   n_prompt: number;
   n_gen: number;
+  n_depth: number;
+  concurrency: number;
   n_threads: number;
   n_gpu_layers: number;
   batch_size: number;
@@ -707,7 +922,10 @@ export interface RunItemTickInput {
 // what permanently records history: a "done" result becomes a `results` row,
 // a failure closes out that item with no result.
 export interface RunItemTerminalInput {
-  status: "done" | "failed" | "failed_oom" | "cancelled";
+  // "skipped" (§0.7): an unsupported flag disables its axis rather than
+  // failing every item -- never measured, so scoring's eligibility gates
+  // treat it as non-disqualifying.
+  status: TerminalRunItemStatus;
   error?: string;
   // Tier-2 device-name upgrade (see Run.backend_device_name) -- only ever
   // sent alongside status "done" from the llama-bench path, when that item's
@@ -749,6 +967,63 @@ export interface TriggerPayload {
   // unchanged.
   main_gpu_backend?: Backend;
   sweep: Omit<SweepConfig, "model_id">;
+  // M2 -- questionnaire answers, echoed on the created root run's config.
+  goals?: import("./goals.js").GoalsConfig;
+  // N6 -- steady-state discard, recorded in the stored configuration.
+  discard_first_repeats?: number;
+  // §0.5 -- run kind. Absent = standalone (NULL), byte-identical to legacy
+  // payloads. 'probe' rides the `probe` block below; 'runtime' rides
+  // `runtime_spec`.
+  kind?: RunKind;
+  // N2 -- probe-run trigger block (kind must be "probe"). Refused unless the
+  // target worker advertises `probe-v1`.
+  probe?: ProbeTriggerSpec;
+  // N4 -- quality-run trigger block (kind must be "quality"). Refused unless
+  // the target worker advertises `quality-v1`.
+  quality?: QualityTriggerSpec;
+  // N1 -- one context-curve point per runtime-kind run (kind must be
+  // "runtime"). Refused unless the target worker advertises `curve-v1`.
+  curve_point?: CurvePointSpec;
+  // N5 -- the concurrency ladder (kind must be "runtime"). Rows land as
+  // ordinary results with `concurrency` set; the knee is derived on read,
+  // never a stored verdict.
+  knee?: KneeSpec;
+  // N3 -- groups comparison members created through this same route; the
+  // caller supplies a stable id shared by every member.
+  comparison_id?: string;
+  // §0.5 chains -- links this run into an existing root's chain (tune→refine
+  // →sweep); the server resolves the parent's root and enforces depth ≤ 3.
+  parent_run_id?: string;
+}
+
+export interface ProbeTriggerSpec {
+  candidate_ctx: number;
+  placement: { ngl: number; n_cpu_moe?: number; slots?: number };
+  kv_pair: [string, string];
+}
+
+// N4 -- what a quality run was triggered to measure, echoed onto the run's
+// own config the same way probe/curve_point/knee are (a record of intent for
+// the UI/logs). The ingestion route (POST .../quality-result) still validates
+// the worker's own reported ctx/kv/dataset independently -- see its own doc
+// comment for why that's the §0.12-observable boundary, not this spec.
+export interface QualityTriggerSpec {
+  ctx_tokens: number;
+  kv_pair: [string, string];
+  dataset_hash: string;
+  dataset_license?: string | null;
+}
+
+export interface CurvePointSpec {
+  // A single number for one point (kept for back-compat with stored
+  // configs); an array measures every listed context within this ONE run,
+  // one run_item per context, so pricing/enqueueing "missing points" never
+  // has to split across runs.
+  effective_ctx: number | number[];
+  n_gen?: number;
+  repeats?: number;
+  placement?: { ngl: number; n_cpu_moe?: number };
+  kv_pair?: [string, string];
 }
 
 // --- llama.cpp build management ---
@@ -1071,12 +1346,20 @@ export interface Worker {
   platform: string | null;
   arch: string | null;
   hardware: HardwareInfo | null;
+  // §0.7/N2 version-skew gate -- what this worker binary supports
+  // ("benchmark", "probe-v1", "quality-v1", "curve-v1"). Absent for workers
+  // predating the column (reads as ["benchmark"] only).
+  capabilities: string[];
   installedBuilds: InstalledBuild[];
   modelFiles: ModelDirFile[];
   // Last-reported free-VRAM reading (see WorkerVramInfo below) -- null until
   // the worker's first idle heartbeat, or if it's currently busy (not
   // recomputed while running a benchmark).
   vram: WorkerVramInfo | null;
+  // M6 -- sensor availability declared up front.
+  sensors?: { clock: boolean; temp: boolean; source: SensorMeasurementSource | null } | null;
+  // N6 -- llama.cpp startup-banner ISA provenance.
+  cpuIsa?: string | null;
   status: "offline" | "idle" | "busy"; // DERIVED, never stored -- see server/src/liveness.ts
   lastHeartbeatAt: number | null;
   activeJobId: string | null;
@@ -1118,6 +1401,13 @@ export interface WorkerStatePush {
   installed_builds: InstalledBuild[];
   model_files: ModelDirFile[];
   status: "idle" | "busy";
+  // M6 -- sensor availability per backend, reported up front so machine
+  // cards can declare "clock · temp available" before any flag ever appears.
+  // Absent for workers predating the field (reads as unavailable).
+  sensors?: { clock: boolean; temp: boolean; source: SensorMeasurementSource | null } | null;
+  // N6 -- llama.cpp startup-banner ISA provenance (the running build's own
+  // dispatch), parsed once per binary identity. Absent for older workers.
+  cpu_isa?: string | null;
   // See WorkerVramInfo's doc comment -- omitted (not just null) while busy,
   // since collectState() skips the read entirely rather than reporting a
   // stale/meaningless-while-busy figure.
@@ -1214,6 +1504,98 @@ export interface BenchmarkJob {
   main_gpu?: number;
   llama_cpp_build: string; // tag; resolved to a path from installed_builds
   llama_cpp_backend: Backend;
+  // Set on runtime-kind runs: "context_curve" executes N1's server-path
+  // choreography for exactly one point; "knee" executes N5's load-driver
+  // ladder. Absent = ordinary sweep execution.
+  mode?: "sweep" | "context_curve" | "knee";
+  curve_point?: CurvePointSpec;
+  knee_spec?: KneeSpec;
+}
+
+// N5 -- concurrency-knee ladder. Prompt/gen cells are fixed from the M2
+// target; slots is Expert-editable ({1,2,4,8} default).
+export interface KneeSpec {
+  n_prompt: number;
+  n_gen: number;
+  repeats?: number;
+  slots?: number[];
+}
+
+// N2 -- one probe load at a candidate context. Success = no OOM, no spill,
+// gen tok/s above floor; retried once at candidate × 0.75 on failure; three
+// loads max ever.
+export interface RunProbeJobPayload {
+  run_id: string;
+  model_id: string;
+  // The full record, exactly as BenchmarkJob carries it: the worker resolves
+  // a path from filename/source/hf_* and cannot do that from an id alone.
+  model: Model;
+  candidateCtx: number;
+  placement: { ngl: number; nCpuMoe?: number; slots: number };
+  kvPair: [string, string];
+  llama_cpp_build: string;
+  llama_cpp_backend: Backend;
+  main_gpu?: number;
+  trained_ctx?: number | null;
+  gpu_total_mib?: number | null;
+}
+
+export interface ProbeAttemptReport {
+  candidate_ctx: number;
+  ok: boolean;
+  oom: boolean;
+  spill: boolean;
+  vram_peak_mib?: number | null;
+  gen_tps?: number | null;
+  error?: string;
+}
+
+export type ProbeResultStatus = "verified" | "failed" | "failed_oom";
+
+export interface ProbeResultInput {
+  status: ProbeResultStatus;
+  verified_ctx_tokens: number | null;
+  margin_observed_frac?: number | null;
+  method_version?: number;
+  attempts: ProbeAttemptReport[];
+  error?: string;
+}
+
+// N4's "bundled default corpus with a pinned hash" -- every worker
+// provisions this file into its corpora/ directory at startup (see
+// worker/assets/default-corpus.txt and worker/src/index.ts's
+// ensureDefaultQualityCorpus), so a quality run never needs a manually
+// placed dataset for the common case. Original composition written for this
+// project, not derived from any existing work -- licensing is unambiguous.
+export const DEFAULT_QUALITY_DATASET_HASH =
+  "sha256:ca4eb3719b9edc2ada8fce839fc31ea8664ba06a025692b48fd2255dfdf2a232";
+export const DEFAULT_QUALITY_DATASET_LABEL = "Bundled default corpus";
+export const DEFAULT_QUALITY_DATASET_LICENSE = "Original composition for this project (public domain / CC0)";
+
+// N4 -- one llama-perplexity measurement of quality as a labeled synthetic
+// proxy. Never feeds ranking until the calibration gate passes.
+export interface MeasureQualityJobPayload {
+  run_id: string;
+  model_id: string;
+  // See RunProbeJobPayload.model -- same reason.
+  model: Model;
+  ctxTokens: number;
+  kvPair: [string, string];
+  datasetHash: string;
+  datasetLicense?: string | null;
+  llama_cpp_build: string;
+  llama_cpp_backend: Backend;
+  main_gpu?: number;
+}
+
+export interface QualityResultInput {
+  ppl: number;
+  kld_vs_baseline?: number | null;
+  dataset_hash: string;
+  ctx_tokens: number;
+  cache_type_k: string;
+  cache_type_v: string;
+  method_version?: number;
 }
 
 // activate_build/delete_build aren't in the plan's own Appendix A QueueJob
@@ -1244,7 +1626,9 @@ export type QueueJob =
   // No payload -- just a signal. Queued (not sent via HeartbeatResponse.control
   // like cancel/pause) so it takes its place behind whatever job is already
   // running instead of yanking the process mid-benchmark.
-  | { job_id: string; type: "shutdown_worker"; payload: Record<string, never> };
+  | { job_id: string; type: "shutdown_worker"; payload: Record<string, never> }
+  | { job_id: string; type: "run_probe"; payload: RunProbeJobPayload }
+  | { job_id: string; type: "measure_quality"; payload: MeasureQualityJobPayload };
 
 // --- Multi-user Stage 2: auth (MULTIUSER_PLAN.md §2) ---
 

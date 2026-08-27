@@ -1,4 +1,9 @@
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
+import { ProfileCards } from "../components/ProfileCards";
+import { SustainedState } from "../components/SustainedState";
+import { CurvesPanel, KneeChart } from "../components/CurvesPanel";
+import { api as apiClient } from "../api/client";
+import { priceMatrix, ETA_UNAVAILABLE } from "../../../shared/pricing";
 import { useParams } from "react-router-dom";
 import type { ChartConfiguration } from "chart.js";
 import { api } from "../api/client";
@@ -122,8 +127,32 @@ const MERGED_COLUMN_DEFS: ColDef[] = [
   {
     label: "TTFT",
     description:
-      "Estimated time to first token, derived as prompt tokens ÷ PP speed. Not a directly measured request latency — this app benchmarks locally via llama-bench, not through a live serving request.",
+      "Time to first token. On llama-server rows this is MEASURED from the streamed response (p50/p95 across the item's requests, or a single-shot cold reading on a context-curve point, which is labelled as such). On llama-bench rows there is no request lifecycle, so it falls back to the derived prompt tokens ÷ PP speed and says so.",
     sortKey: "ttft",
+  },
+  {
+    label: "E2E",
+    description:
+      "Mean end-to-end request latency, measured on the llama-server path only. Blank on llama-bench rows, which have no request to time.",
+    sortKey: "e2e",
+  },
+  {
+    label: "clock min",
+    description:
+      "BENCHMARKING_PLAN_V8.md M6 — the lowest GPU shader clock sampled during this item's timed work, on the same ~6 s cadence as VRAM. Blank where the platform exposes no sensor; the machine card declares that up front.",
+    sortKey: "clock_min",
+  },
+  {
+    label: "temp max",
+    description:
+      "M6 — peak adapter temperature during this item. A thermally_throttled flag requires a real temperature reading, so a sensorless backend never produces one.",
+    sortKey: "temp_max",
+  },
+  {
+    label: "flags",
+    description:
+      "BENCHMARKING_PLAN_V8.md §0.10 caveat flags. Flagged rows are KEPT, never deleted — consumers decide exclusions. thermally_throttled means the clock sagged between repeat halves while the adapter was hot: burst versus sustained, which is data, not garbage.",
+    sortKey: "flags",
   },
   { label: "free", description: "Free system RAM immediately before this test started.", sortKey: "ram_free", group: "ram" },
   {
@@ -221,7 +250,24 @@ const LEGACY_COLUMN_DESCRIPTIONS: Record<string, string> = {
   "vram MiB": "Peak GPU memory used during this test (best-effort — n/a if not measurable on this box).",
 };
 
-const TERMINAL_ITEM_STATUSES = new Set(["done", "failed", "failed_oom", "cancelled"]);
+// BENCHMARKING_PLAN_V8.md §0.10 -- the closed registry, each rendered WITH
+// its reason. Flagged rows are kept, never deleted; consumers decide
+// exclusions.
+const CAVEAT_FLAG_REASON: Record<string, string> = {
+  swa: "depth exceeds the model's sliding window, so this reading is structurally misleading past that point -- excluded from the TG reference-depth comparison",
+  context_unverified: "the effective context could not be confirmed for this row",
+  kv_estimate_rough: "the KV memory estimate behind this row is rough rather than good",
+  spec_pair_prompt_mismatch:
+    "the speculative row and its baseline were measured at different prompt-content offsets, so their speedup is unverified",
+  thermally_throttled:
+    "the GPU clock sagged between the first and second halves of this item while the adapter was hot -- the row is KEPT, because burst versus sustained is exactly what this column exists to show",
+  cache_evicted:
+    "a warm repeat re-prefilled the prompt, so the prefix cache did not hold and this point drops out of the curve",
+  context_shift:
+    "a context shift appeared in the logs and this build has no --no-context-shift, which silently corrupts TTFT comparability",
+};
+
+const TERMINAL_ITEM_STATUSES = new Set(["done", "failed", "failed_oom", "cancelled", "skipped"]);
 const RUNNING_ITEM_STATUSES = new Set(["loading", "processing", "generating", "benchmarking"]);
 
 type StatusFilter = "all" | "queued" | "running" | "done" | "failed" | "cancelled";
@@ -453,8 +499,21 @@ function mergedSortValue(item: RunItem, results: ResultRow[] | undefined, key: s
       return ppResult?.avg_tps ?? -1;
     case "tg_tps":
       return tgResult?.avg_tps ?? -1;
-    case "ttft":
+    case "ttft": {
+      // Prefer the MEASURED streamed reading; fall back to the derived
+      // estimate only where no request lifecycle existed.
+      const measured = ppResult?.ttft_ms_p50 ?? tgResult?.ttft_ms_p50;
+      if (measured != null) return measured / 1000;
       return ppResult && ppResult.n_prompt > 0 ? ppResult.n_prompt / ppResult.avg_tps : -1;
+    }
+    case "e2e":
+      return (tgResult?.e2e_ms_mean ?? ppResult?.e2e_ms_mean ?? -1) as number;
+    case "clock_min":
+      return anyResult?.gpu_clock_mhz_min ?? -1;
+    case "temp_max":
+      return anyResult?.gpu_temp_c_max ?? -1;
+    case "flags":
+      return (anyResult?.caveat_flags ?? []).length;
     case "ram_free":
       return anyResult?.ram_free_before_mib ?? item.ram_free_before_mib ?? -1;
     case "ram_used_avg":
@@ -873,6 +932,61 @@ export function RunDetail() {
 
   const draftModel = run?.config.mtp_model_id ? models.find((m) => m.id === run.config.mtp_model_id) : undefined;
 
+  // M2's stored answers travel with the run, so the curve can draw the
+  // target marker without asking the user again.
+  const runGoals = (run?.config as { goals?: { target_ctx?: number | null } } | undefined)?.goals;
+  const [measureMsg, setMeasureMsg] = useState("");
+
+  // N1's trigger story: uncovered ladder cells are priced under §0.6, then
+  // enqueued as ONE runtime-kind run through the normal trigger route, so
+  // every §0.5 guard applies unchanged -- a run per context would 409 against
+  // itself past the first via the duplicate-trigger guard. Nothing auto-runs.
+  async function handleMeasureMissingPoints(contexts: number[]): Promise<void> {
+    if (!run?.worker_id) {
+      setMeasureMsg("This run has no machine attached, so there is nothing to enqueue against.");
+      return;
+    }
+    const config = run.config as { sweep?: { n_gen?: number[]; repeats?: number } } | undefined;
+    if (!config?.sweep) {
+      setMeasureMsg("This run stored no grid, so a curve point cannot inherit its placement.");
+      return;
+    }
+
+    setMeasureMsg("Pricing uncovered ladder cells…");
+    let priceLabel = "";
+    try {
+      const rates = await apiClient.getModelRates(run.model_id, run.worker_id);
+      const priced = priceMatrix(
+        contexts.map((ctx) => ({
+          nPrompt: ctx,
+          nGen: config.sweep!.n_gen?.[0] ?? 128,
+          repeats: config.sweep!.repeats ?? 1,
+          ppRate: rates.pp,
+          tgRate: rates.tg,
+        }))
+      );
+      priceLabel = ` — ${priced.display}`;
+    } catch {
+      priceLabel = ` — ${ETA_UNAVAILABLE}`;
+    }
+    setMeasureMsg(`Enqueueing ${contexts.length} curve point(s)${priceLabel}…`);
+
+    try {
+      await apiClient.triggerRun({
+        model_id: run.model_id,
+        worker_id: run.worker_id,
+        kind: "runtime",
+        curve_point: { effective_ctx: contexts },
+        sweep: config.sweep as never,
+      });
+      setMeasureMsg(
+        `Enqueued ${contexts.length} curve point(s) as one run${priceLabel}. Cells already covered were never re-measured.`
+      );
+    } catch (err) {
+      setMeasureMsg(`The points were refused — ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
   return (
     <div>
       <h1 className="text-2xl font-semibold text-fg">
@@ -923,6 +1037,71 @@ export function RunDetail() {
           </button>
           {controlError && <span className="text-sm text-danger">{controlError}</span>}
         </div>
+      )}
+
+      {/* M3 -- the scored cards. Only once measuring has stopped: scoring a
+          half-finished run would rank on a moving target. */}
+      {run && (run.status === "done" || run.status === "partial") && (
+        <section className="mt-6">
+          <h2 className="text-sm font-semibold uppercase tracking-wide text-muted">Scored profiles</h2>
+          <div className="mt-3">
+            <ProfileCards runId={id} refreshKey={run.status} modelId={run.model_id} workerId={run.worker_id ?? null} />
+          </div>
+        </section>
+      )}
+
+      {/* N1 + N5 -- the curve and the knee, both derived on read. */}
+      {run && (
+        <section className="mt-6">
+          <h2 className="text-sm font-semibold uppercase tracking-wide text-muted">Context curve &amp; concurrency</h2>
+          <div className="mt-3 flex flex-col gap-3">
+            <CurvesPanel
+              modelId={run.model_id}
+              workerId={run.worker_id ?? null}
+              build={run.llama_cpp_build}
+              targetCtx={runGoals?.target_ctx ?? null}
+              onMeasureMissing={handleMeasureMissingPoints}
+            />
+            <KneeChart runId={id} />
+            {measureMsg && <p className="text-xs text-muted">{measureMsg}</p>}
+          </div>
+        </section>
+      )}
+
+      {/* M6 measures, N6 decides -- both offered, never automatic. */}
+      {run && (run.status === "done" || run.status === "partial" || run.status === "failed") && (
+        <section className="mt-6">
+          <h2 className="text-sm font-semibold uppercase tracking-wide text-muted">Sustained state</h2>
+          <div className="mt-3">
+            <SustainedState runId={id} refreshKey={run.status} />
+          </div>
+          <p className="mt-3 text-xs leading-relaxed text-muted">
+            Provenance: rows are stamped with the methodology version that produced them; clock and temperature ride
+            the same sampler cadence as VRAM, with the same worst-source tracking. NULL wherever the platform exposes
+            no sensor — a machine that could never produce a flag says so on its own card first.
+          </p>
+          {/* N7 -- the bundle carries its own methods section, so every
+              shared number travels with the pipeline that produced it. */}
+          <div className="mt-3 flex flex-wrap items-center gap-3">
+            <a
+              href={apiClient.bundleExportUrl(id, "run")}
+              className="rounded-lg border border-border px-3 py-1.5 text-xs font-semibold text-fg hover:border-accent/40 hover:text-accent"
+            >
+              Export bundle ⤓
+            </a>
+            <a
+              href={apiClient.bundleExportUrl(id, "root")}
+              className="rounded-lg border border-border px-3 py-1.5 text-xs font-semibold text-muted hover:border-accent/40 hover:text-accent"
+            >
+              Export whole chain ⤓
+            </a>
+            <span className="text-[11px] leading-relaxed text-muted">
+              The export embeds a rendered summary of the pipeline keyed to its method version — warmup, streaming
+              clock, suspect filter, stddev floor — plus dataset hashes where quality rows exist. Imported rows are
+              badged and never merge into local scoring unless opted in.
+            </span>
+          </div>
+        </section>
       )}
 
       {items.length > 0 && (
@@ -1071,6 +1250,12 @@ export function RunDetail() {
                   // see buildItemRepeatUnits (queued = all grey, done = all
                   // solid, running = live per-repeat progress, etc.).
                   const statusUnits = buildItemRepeatUnits(it, repeats);
+                  // M6/§0.10 -- measured TTFT/E2E and the caveat registry.
+                  const measuredTtftMs = ppResult?.ttft_ms_p50 ?? tgResult?.ttft_ms_p50 ?? null;
+                  const ttftSampleCount = ppResult?.ttft_n ?? tgResult?.ttft_n ?? null;
+                  const e2eMs = tgResult?.e2e_ms_mean ?? ppResult?.e2e_ms_mean ?? null;
+                  const caveatFlags = anyResult?.caveat_flags ?? [];
+                  const throttled = caveatFlags.includes("thermally_throttled");
                   return (
                     <Fragment key={it.id}>
                     <tr className="!border-b-0">
@@ -1221,9 +1406,48 @@ export function RunDetail() {
                       </td>
                       <td
                         className="px-1 py-1.5 text-muted"
-                        title="Derived: prompt tokens ÷ PP speed -- not a directly measured request latency"
+                        title={
+                          measuredTtftMs != null
+                            ? ttftSampleCount === 1
+                              ? "Measured from the streamed response -- a single-shot cold reading on a context-curve point, deliberately not rendered as a p50/p95"
+                              : `Measured from the streamed responses -- p50 across ${ttftSampleCount ?? "several"} samples`
+                            : "Derived: prompt tokens ÷ PP speed -- not a directly measured request latency"
+                        }
                       >
-                        {ttftSeconds != null ? `${ttftSeconds.toFixed(2)}s` : "—"}
+                        {measuredTtftMs != null ? (
+                          <>
+                            {(measuredTtftMs / 1000).toFixed(2)}s
+                            {ttftSampleCount === 1 && (
+                              <span className="ml-0.5 text-[9px] uppercase tracking-wide text-muted">1-shot</span>
+                            )}
+                          </>
+                        ) : ttftSeconds != null ? (
+                          <span title="derived, not measured">~{ttftSeconds.toFixed(2)}s</span>
+                        ) : (
+                          "—"
+                        )}
+                      </td>
+                      <td className="px-1 py-1.5 text-muted">
+                        {e2eMs != null ? `${(e2eMs / 1000).toFixed(1)}s` : "—"}
+                      </td>
+                      <td className={`px-1 py-1.5 ${throttled ? "text-warning" : "text-muted"}`}>
+                        {anyResult?.gpu_clock_mhz_min != null ? `${anyResult.gpu_clock_mhz_min} MHz` : "—"}
+                      </td>
+                      <td className={`px-1 py-1.5 ${throttled ? "text-warning" : "text-muted"}`}>
+                        {anyResult?.gpu_temp_c_max != null ? `${anyResult.gpu_temp_c_max} °C` : "—"}
+                      </td>
+                      <td className="px-1 py-1.5 text-muted">
+                        {caveatFlags.length > 0
+                          ? caveatFlags.map((flag) => (
+                              <span
+                                key={flag}
+                                title={CAVEAT_FLAG_REASON[flag] ?? flag}
+                                className="mr-1 inline-block rounded-full bg-warning-bg px-1.5 py-0.5 text-[9px] font-bold text-warning"
+                              >
+                                {flag}
+                              </span>
+                            ))
+                          : "—"}
                       </td>
                       <td className="px-1 py-1.5 text-muted">{mem.ramFree}</td>
                       <td className="px-1 py-1.5 text-muted">{mem.ramUsedAvg}</td>
