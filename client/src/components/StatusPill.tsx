@@ -45,6 +45,9 @@ const RUN_ITEM_STATUS_TONE: Record<RunItemStatus, PillTone> = {
   failed: "danger",
   failed_oom: "danger",
   cancelled: "muted",
+  // §0.7 -- never measured (an unsupported flag disabled its axis), which is
+  // a different outcome from "failed" and reads as its own muted tone.
+  skipped: "muted",
 };
 
 const RUN_ITEM_STATUS_LABEL: Record<RunItemStatus, string> = {
@@ -57,6 +60,7 @@ const RUN_ITEM_STATUS_LABEL: Record<RunItemStatus, string> = {
   failed: "failed",
   failed_oom: "failed (oom)",
   cancelled: "cancelled",
+  skipped: "skipped",
 };
 
 export function RunItemStatusPill({ status }: { status: RunItemStatus }) {
@@ -114,7 +118,7 @@ export function describeItemPhase(item: RunItem): string {
   }
 }
 
-type DotState = "grey" | "blink" | "solid" | "red" | "cancelled";
+type DotState = "grey" | "blink" | "solid" | "red" | "cancelled" | "skipped";
 
 const RUN_ITEM_DOT_STATE: Record<RunItemStatus, DotState> = {
   queued: "grey",
@@ -126,6 +130,7 @@ const RUN_ITEM_DOT_STATE: Record<RunItemStatus, DotState> = {
   failed: "red",
   failed_oom: "red",
   cancelled: "cancelled",
+  skipped: "skipped",
 };
 
 // Compact status indicator for a dense per-row table (the full RunItemStatusPill

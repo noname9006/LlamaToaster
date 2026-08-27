@@ -6,6 +6,11 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { readFileSync, existsSync } from "node:fs";
 import { runsRoutes } from "./routes/runs.js";
+import { profilesRoutes } from "./routes/profiles.js";
+import { measurementRoutes } from "./routes/measurements.js";
+import { curveRoutes } from "./routes/curves.js";
+import { comparisonRoutes } from "./routes/comparisons.js";
+import { exchangeRoutes } from "./routes/exchange.js";
 import { modelsRoutes } from "./routes/models.js";
 import { resultsRoutes } from "./routes/results.js";
 import { workersRoutes } from "./routes/workers.js";
@@ -114,6 +119,18 @@ app.register(fastifyCookie);
 app.register(fastifyRateLimit, { global: false });
 
 app.register(runsRoutes);
+// BENCHMARKING_PLAN_V8.md M3 -- scored profile cards, pure post-processing
+// over stored results (changing goals never re-measures).
+app.register(profilesRoutes);
+// N2/N4 -- worker-authed, idempotent probe and quality ingestion.
+app.register(measurementRoutes);
+// N1/N5 -- context curves and the concurrency knee, both derived on read.
+app.register(curveRoutes);
+// N3 -- model-vs-model comparison view with its blocking fairness checks.
+app.register(comparisonRoutes);
+// N7 -- export bundles that carry their own methods section, and per-row
+// validated import.
+app.register(exchangeRoutes);
 app.register(modelsRoutes);
 app.register(resultsRoutes);
 app.register(workersRoutes);

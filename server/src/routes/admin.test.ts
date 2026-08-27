@@ -163,6 +163,8 @@ describe("admin routes, cross-tenant by design", () => {
       idx,
       n_prompt: 512,
       n_gen: 128,
+      n_depth: 0,
+      concurrency: 1,
       threads: 4,
       n_gpu_layers: 99,
       batch_size: 512,

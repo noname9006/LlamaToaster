@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { expandSweep, deriveTestType } from "./sweep.js";
+import { expandSweep, deriveTestType, validateDepthRule, validateConcurrencyRule } from "./sweep.js";
 import type { SweepConfig } from "./types.js";
 
 const baseSweep: Omit<SweepConfig, "model_id"> = {
@@ -75,5 +75,44 @@ describe("deriveTestType", () => {
     expect(deriveTestType(512, 0)).toBe("pp");
     expect(deriveTestType(0, 128)).toBe("tg");
     expect(deriveTestType(512, 128)).toBe("pg");
+  });
+});
+
+describe("n_depth axis (§0.2)", () => {
+  it("defaults an absent axis to [0], preserving legacy expansion order exactly", () => {
+    const withAxis = expandSweep({ ...baseSweep, n_depth: [0] });
+    const withoutAxis = expandSweep(baseSweep);
+    expect(withoutAxis).toEqual(withAxis);
+  });
+
+  it("expands the depth axis innermost of all", () => {
+    const items = expandSweep({ ...baseSweep, n_depth: [0, 4096] });
+    expect(items).toHaveLength(8);
+    expect(items.map((i) => i.n_depth)).toEqual([0, 4096, 0, 4096, 0, 4096, 0, 4096]);
+  });
+
+  it("rejects depth > 0 on server-engine items (llama-server has no KV-prefill flag)", () => {
+    const items = expandSweep({ ...baseSweep, mtp: ["on"], n_depth: [4096] });
+    expect(validateDepthRule(items)).toMatch(/n_depth is only supported on the llama-bench engine/);
+    expect(validateDepthRule(expandSweep({ ...baseSweep, mtp: ["off"], n_depth: [4096] }))).toBeNull();
+    expect(validateDepthRule(expandSweep(baseSweep))).toBeNull();
+  });
+});
+
+describe("concurrency axis (N5)", () => {
+  it("defaults to [1] for legacy payloads", () => {
+    const items = expandSweep(baseSweep);
+    for (const item of items) {
+      expect(item.concurrency).toBe(1);
+      // Legacy payloads keep producing identical items apart from the
+      // defaulted new fields.
+      expect(item).toMatchObject({ idx: item.idx, concurrency: 1, n_depth: 0 });
+    }
+  });
+
+  it("rejects slots > 1 on llama-bench items (no request lifecycle there)", () => {
+    const items = expandSweep({ ...baseSweep, concurrency: [4] });
+    expect(validateConcurrencyRule(items)).toMatch(/only supported on the llama-server engine/);
+    expect(validateConcurrencyRule(expandSweep({ ...baseSweep, mtp: ["on"], concurrency: [1, 2, 4, 8] }))).toBeNull();
   });
 });

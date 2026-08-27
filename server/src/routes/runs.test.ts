@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, existsSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -75,6 +75,18 @@ async function heartbeat(machineId: string, opts: { backend?: string; installed?
   });
 }
 
+// BENCHMARKING_PLAN_V8.md §0.5 caps a user at three active roots. These
+// tests each create their own run and never finish it, so without a drain
+// the fourth test in the file would start hitting that quota instead of
+// exercising the route it is actually about.
+function drainActiveRuns(): void {
+  for (const run of repo.listRuns(undefined)) {
+    if (run.status === "running" || run.status === "scheduled") {
+      repo.reconcileStaleRun(undefined, run.id, "test cleanup");
+    }
+  }
+}
+
 beforeAll(async () => {
   ({ repo } = await import("../db/repo.js"));
   const { runsRoutes } = await import("./runs.js");
@@ -98,6 +110,10 @@ beforeAll(async () => {
     source: "local",
     metadata: {},
   });
+});
+
+beforeEach(() => {
+  drainActiveRuns();
 });
 
 afterAll(async () => {
@@ -585,5 +601,144 @@ describe("POST /api/runs/:id/items/:idx worker auth (§4.3 fix)", () => {
     // one way or the other, never silently succeed.
     const res = await postItemUpdate(runId, 0, { status: "loading" }, token);
     expect(res.status).not.toBe(200);
+  });
+});
+
+// §0.12's observability convention: thermally_flagged_ratio fires "once per
+// completed run" (the plan's own words). It used to fire on every GET of
+// /api/runs/:id/sustained instead -- once per page view/poll, not once per
+// run -- so this covers the actual completion transition.
+describe("§0.12 thermally_flagged_ratio fires once, at run completion", () => {
+  it("logs exactly once from the item-terminal write that finalizes the run, never again on a later tick", async () => {
+    await heartbeat("thermal-log-machine", { backend: "cpu", installed: true });
+    const worker = repo.workerRepo.getByMachineId("thermal-log-machine")!;
+    const res = await postJson("/api/runs/trigger", { model_id: "model-1", worker_id: worker.id, sweep: baseSweep });
+    const { run } = (await res.json()) as { run: { id: string } };
+
+    const infoSpy = vi.spyOn(app.log, "info");
+    try {
+      const terminal = await fetch(`${baseUrl}/api/runs/${run.id}/items/0`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: "Bearer runs-test-secret" },
+        body: JSON.stringify({ status: "done" }),
+      });
+      expect(terminal.status).toBe(200);
+      const terminalBody = (await terminal.json()) as { run_status: string };
+      expect(terminalBody.run_status).toBe("done");
+
+      const ratioCalls = infoSpy.mock.calls.filter(([, msg]) => msg === "thermally_flagged_ratio");
+      expect(ratioCalls).toHaveLength(1);
+      expect(ratioCalls[0][0]).toMatchObject({
+        thermally_flagged_ratio: 0,
+        run_id: run.id,
+        flagged: 0,
+        denominator: 1,
+      });
+    } finally {
+      infoSpy.mockRestore();
+    }
+  });
+});
+
+function minimalResult(overrides: Record<string, unknown> = {}) {
+  return {
+    test_type: "tg",
+    n_prompt: 512,
+    n_gen: 128,
+    n_threads: 8,
+    n_gpu_layers: 0,
+    batch_size: 2048,
+    ubatch_size: 512,
+    avg_tps: 50,
+    stddev_tps: 0,
+    ram_peak_mib: 2000,
+    ram_avg_mib: 1800,
+    vram_peak_mib: null,
+    vram_avg_mib: null,
+    ram_free_before_mib: null,
+    vram_free_before_mib: null,
+    cache_type_k: "f16",
+    cache_type_v: "f16",
+    flash_attn: "on",
+    mtp: "off",
+    system_memory_total_mb: null,
+    gpu_memory_total_mb: null,
+    gpu_layers_loaded: null,
+    total_model_layers: null,
+    gpu_memory_total_accuracy: "unavailable",
+    gpu_memory_free_start_accuracy: "unavailable",
+    gpu_memory_model_avg_accuracy: "unavailable",
+    gpu_memory_model_peak_accuracy: "unavailable",
+    gpu_memory_total_source: null,
+    gpu_memory_free_start_source: null,
+    gpu_memory_model_avg_source: null,
+    gpu_memory_model_peak_source: null,
+    ...overrides,
+  };
+}
+
+// N3's fairness re-check must fire PER MEMBER at the moment its own results
+// land, not only when someone happens to open the comparison view -- a drift
+// like a mismatched method_version literally cannot be seen at trigger time
+// (both members carry method_version: null until something has actually been
+// measured), so this is the one place it can ever be caught.
+describe("N3 comparison_member_failed fires when a member's own results reveal drift", () => {
+  it("logs comparison_member_failed on the second member's completion when its method_version differs", async () => {
+    repo.registerModel({ id: "cmp-model-a", filename: "a.gguf", size_bytes: 1000, source: "local", metadata: {} });
+    repo.registerModel({ id: "cmp-model-b", filename: "b.gguf", size_bytes: 1000, source: "local", metadata: {} });
+    await heartbeat("cmp-recheck-machine", { backend: "cpu", installed: true });
+    const worker = repo.workerRepo.getByMachineId("cmp-recheck-machine")!;
+
+    const resA = await postJson("/api/runs/trigger", {
+      model_id: "cmp-model-a",
+      worker_id: worker.id,
+      kind: "sweep",
+      sweep: baseSweep,
+      comparison_id: "cmp-recheck-1",
+    });
+    expect(resA.status).toBe(201);
+    const runA = ((await resA.json()) as { run: { id: string } }).run;
+
+    const resB = await postJson("/api/runs/trigger", {
+      model_id: "cmp-model-b",
+      worker_id: worker.id,
+      kind: "sweep",
+      sweep: baseSweep,
+      comparison_id: "cmp-recheck-1",
+    });
+    expect(resB.status).toBe(201);
+    const runB = ((await resB.json()) as { run: { id: string } }).run;
+
+    // Member A completes first, with no sibling to compare against yet --
+    // no violation possible.
+    const terminalA = await fetch(`${baseUrl}/api/runs/${runA.id}/items/0`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Bearer runs-test-secret" },
+      body: JSON.stringify({ status: "done", results: [minimalResult({ method_version: 1 })] }),
+    });
+    expect(terminalA.status).toBe(200);
+
+    const warnSpy = vi.spyOn(app.log, "warn");
+    try {
+      // Member B completes with a DIFFERENT method_version -- a drift that
+      // was invisible at trigger time (both were null then) and only shows
+      // up now that both members have real measurements.
+      const terminalB = await fetch(`${baseUrl}/api/runs/${runB.id}/items/0`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: "Bearer runs-test-secret" },
+        body: JSON.stringify({ status: "done", results: [minimalResult({ method_version: 2 })] }),
+      });
+      expect(terminalB.status).toBe(200);
+
+      const failedCalls = warnSpy.mock.calls.filter(([, msg]) => msg === "comparison_member_failed");
+      expect(failedCalls.length).toBeGreaterThan(0);
+      expect(failedCalls[0][0]).toMatchObject({
+        comparison_member_failed: true,
+        member_run_id: runB.id,
+        reason: "method_version",
+      });
+    } finally {
+      warnSpy.mockRestore();
+    }
   });
 });

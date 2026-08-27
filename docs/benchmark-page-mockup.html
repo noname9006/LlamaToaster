@@ -1,0 +1,1109 @@
+<title>Two-Stage Benchmark Console</title>
+<style>
+  :root{
+    --bg:#0b0d12; --surface:#12151c; --raised:#171b24; --border:#262b36;
+    --fg:#e8e9ec; --muted:#8b92a3; --accent:#6ea8fe; --accent-fg:#0b0e14;
+    --success:#86ef9e; --success-bg:#143323;
+    --danger:#ff9b9b;  --danger-bg:#3a1f1f;
+    --warning:#ffd479; --warning-bg:#3a2f13;
+    --skip:#8b92a3;    --skip-bg:#1b1f28;
+    --mono:ui-monospace,SFMono-Regular,"Cascadia Code",Menlo,Consolas,monospace;
+    --sans:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  }
+  :root{color-scheme:dark}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font-family:var(--sans);
+       -webkit-font-smoothing:antialiased;line-height:1.5}
+  .mono{font-family:var(--mono);font-variant-numeric:tabular-nums}
+  .num{font-variant-numeric:tabular-nums}
+
+  /* ---------- page chrome ---------- */
+  .page{max-width:1180px;margin:0 auto;padding:34px 22px 90px}
+  .masthead{border-bottom:1px solid var(--border);padding-bottom:22px;margin-bottom:8px}
+  .eyebrow{font-size:11px;letter-spacing:.13em;text-transform:uppercase;color:var(--muted);
+           font-family:var(--mono)}
+  h1{font-size:29px;line-height:1.15;margin:10px 0 8px;text-wrap:balance;letter-spacing:-.015em}
+  .lede{color:var(--muted);font-size:14.5px;max-width:66ch;margin:0}
+  .tocbar{position:sticky;top:0;z-index:40;background:rgba(11,13,18,.93);
+          backdrop-filter:blur(8px);border-bottom:1px solid var(--border);
+          display:flex;gap:4px;flex-wrap:wrap;padding:9px 0;margin:22px 0 30px}
+  .tocbar a{font-size:12px;color:var(--muted);text-decoration:none;padding:5px 11px;
+            border-radius:7px;border:1px solid transparent}
+  .tocbar a:hover,.tocbar a:focus-visible{color:var(--fg);border-color:var(--border);background:var(--surface)}
+
+  /* ---------- screen frame ---------- */
+  .screen{margin:0 0 52px}
+  .screen > h2{font-size:17px;margin:0 0 4px;letter-spacing:-.01em}
+  .screen > .why{color:var(--muted);font-size:13px;margin:0 0 14px;max-width:72ch}
+  .frame{border:1px solid var(--border);border-radius:12px;overflow:hidden;background:var(--bg)}
+  .routebar{display:flex;align-items:center;gap:9px;padding:8px 13px;background:var(--surface);
+            border-bottom:1px solid var(--border);font-family:var(--mono);font-size:11.5px;color:var(--muted)}
+  .dots{display:flex;gap:5px}
+  .dots i{width:8px;height:8px;border-radius:9999px;background:var(--border);display:block}
+  .app{display:grid;grid-template-columns:172px 1fr}
+  @media (max-width:820px){.app{grid-template-columns:1fr}.rail{display:none}}
+  .rail{border-right:1px solid var(--border);background:var(--surface);padding:14px 10px;display:flex;
+        flex-direction:column;gap:2px}
+  .rail .logo{font-weight:700;font-size:13.5px;padding:4px 10px 14px}
+  .rail .logo span{color:var(--accent)}
+  .rail a{font-size:12.5px;color:var(--muted);text-decoration:none;padding:7px 10px;border-radius:8px}
+  .rail a.on{background:rgba(110,168,254,.14);color:var(--accent);font-weight:600}
+  .main{padding:18px;display:flex;flex-direction:column;gap:14px;min-width:0}
+
+  /* ---------- primitives (mirrors client/src/styles/index.css tokens) ---------- */
+  .card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:14px}
+  .card.tight{padding:11px 13px}
+  .lbl{font-size:10.5px;letter-spacing:.09em;text-transform:uppercase;color:var(--muted);
+       font-family:var(--mono);display:block;margin-bottom:7px}
+  .row{display:flex;gap:12px;flex-wrap:wrap}
+  .row.tight{gap:8px}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  @media (max-width:700px){.grid2{grid-template-columns:1fr}}
+  .between{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
+  .kv{display:flex;justify-content:space-between;gap:16px;font-size:12.5px;padding:3px 0}
+  .kv dt{color:var(--muted)} .kv dd{margin:0;font-family:var(--mono);font-variant-numeric:tabular-nums}
+  dl{margin:0}
+
+  .pill{display:inline-flex;align-items:center;gap:5px;border-radius:9999px;padding:2px 9px;
+        font-size:10.5px;font-weight:700;letter-spacing:.02em}
+  .pill.done{background:var(--success-bg);color:var(--success)}
+  .pill.run{background:var(--warning-bg);color:var(--warning)}
+  .pill.fail{background:var(--danger-bg);color:var(--danger)}
+  .pill.skip{background:var(--skip-bg);color:var(--skip);border:1px dashed var(--border)}
+  .pill.acc{background:rgba(110,168,254,.14);color:var(--accent)}
+  .pill.queue{background:var(--raised);color:var(--muted)}
+
+  .chip{border:1px solid var(--border);background:var(--raised);color:var(--muted);
+        border-radius:9999px;padding:4px 11px;font-size:12px;display:inline-block}
+  .chip.sel{border-color:var(--accent);color:var(--accent);background:rgba(110,168,254,.10);font-weight:600}
+  .chip.dis{opacity:.45}
+  .seg{display:inline-flex;border:1px solid var(--border);border-radius:9px;overflow:hidden}
+  .seg button{background:var(--raised);color:var(--muted);border:0;padding:7px 15px;font:inherit;
+              font-size:12.5px;cursor:pointer}
+  .seg button.on{background:var(--accent);color:var(--accent-fg);font-weight:650}
+  .btn{background:var(--accent);color:var(--accent-fg);border:0;border-radius:9px;padding:9px 20px;
+       font:inherit;font-size:13px;font-weight:700;cursor:pointer}
+  .btn.ghost{background:transparent;color:var(--muted);border:1px solid var(--border);font-weight:500}
+  .btn.sm{padding:5px 12px;font-size:11.5px;font-weight:600}
+  .btn:focus-visible,.seg button:focus-visible,.rail a:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+
+  .note{border-radius:9px;padding:10px 12px;font-size:12.5px;line-height:1.5;border:1px solid}
+  .note.warn{background:var(--warning-bg);border-color:rgba(255,212,121,.28);color:#f2ddb0}
+  .note.warn b{color:var(--warning)}
+  .note.info{background:rgba(110,168,254,.08);border-color:rgba(110,168,254,.24);color:#c6d6f2}
+  .note.info b{color:var(--accent)}
+  .note.muted{background:var(--raised);border-color:var(--border);color:var(--muted)}
+  .note.muted b{color:var(--fg)}
+
+  .sdot{display:inline-block;width:8px;height:8px;border-radius:9999px;flex:none}
+  .sdot.ok{background:var(--success)}
+  .sdot.run{background:var(--warning)}
+  .sdot.bad{background:var(--danger)}
+  .sdot.q{background:var(--muted);opacity:.4}
+  /* Deliberately larger than the filled dots and ringed, not dashed: a 1.5px
+     dash on a 9px circle does not read as dashed at any realistic zoom, which
+     would leave skipped and queued separated by opacity alone. */
+  .sdot.skip{width:12px;height:12px;background:var(--skip-bg);
+             border:2px solid var(--muted);opacity:.9}
+
+  table{width:100%;border-collapse:collapse;font-size:12.5px}
+  th{text-align:left;font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);
+     font-family:var(--mono);font-weight:600;padding:7px 9px;border-bottom:1px solid var(--border);white-space:nowrap}
+  td{padding:8px 9px;border-bottom:1px solid rgba(38,43,54,.55);vertical-align:middle}
+  td.n{font-family:var(--mono);font-variant-numeric:tabular-nums;text-align:right}
+  tr.child td:first-child{padding-left:26px}
+  .scroll{overflow-x:auto}
+
+  /* ---------- chain preview ---------- */
+  .chain{display:flex;align-items:stretch;gap:0;overflow-x:auto;padding-bottom:2px}
+  .stage{flex:1 1 0;min-width:148px;background:var(--raised);border:1px solid var(--border);
+         border-radius:10px;padding:11px 12px;display:flex;flex-direction:column;gap:5px}
+  .stage.opt{border-style:dashed}
+  .stage .st-name{font-size:12.5px;font-weight:650}
+  .stage .st-meta{font-size:11px;color:var(--muted);font-family:var(--mono)}
+  .stage.open{border-color:var(--accent);background:rgba(110,168,254,.09)}
+  button.stage{text-align:left;font:inherit;cursor:pointer;color:var(--fg)}
+  .arrow{align-self:center;color:var(--border);padding:0 7px;font-size:15px;flex:none}
+  .pips{display:flex;gap:4px;align-items:center}
+
+  /* ---------- stage editor ---------- */
+  .editor{border:1px solid var(--accent);border-radius:10px;margin-top:10px;
+          background:rgba(110,168,254,.05);overflow:hidden}
+  .editor > header{display:flex;align-items:center;justify-content:space-between;gap:12px;
+                   padding:10px 13px;border-bottom:1px solid var(--border);flex-wrap:wrap}
+  .editor .body{padding:13px;display:flex;flex-direction:column;gap:13px}
+  .tier{display:flex;flex-direction:column;gap:8px}
+  .tier > .tier-h{display:flex;align-items:baseline;gap:8px}
+  .tier-h b{font-size:11px;letter-spacing:.08em;text-transform:uppercase;font-family:var(--mono)}
+  .tier-h span{font-size:11.5px;color:var(--muted)}
+  .tier.varied .tier-h b{color:var(--accent)}
+  .tier.held   .tier-h b{color:var(--muted)}
+  .tier.req    .tier-h b{color:var(--warning)}
+  .field{display:grid;grid-template-columns:132px 1fr;gap:10px;align-items:start}
+  @media (max-width:640px){.field{grid-template-columns:1fr}}
+  .field > .fname{font-size:12px;color:var(--muted);padding-top:4px;font-family:var(--mono)}
+  .field .why{font-size:11px;color:var(--muted);margin-top:4px;line-height:1.45}
+  .bubprev{border-collapse:separate;border-spacing:4px;font-family:var(--mono);font-size:11px}
+  .bubprev th{font-size:10px;padding:0 4px;border:0;color:var(--muted)}
+  .bubprev td{background:var(--raised);border:1px solid var(--border);border-radius:6px;
+              padding:4px 8px;text-align:center;font-variant-numeric:tabular-nums}
+
+  /* ---------- ETA matrix ---------- */
+  .matrix td.cell{font-family:var(--mono);font-variant-numeric:tabular-nums;text-align:center;
+                  background:var(--raised);border-radius:6px}
+  .matrix td.over{color:var(--muted);background:var(--skip-bg);opacity:.65}
+  .matrix td.over::after{content:" · skip";color:var(--skip);font-size:10px}
+  .matrix th.rowh{font-family:var(--mono);text-transform:none;letter-spacing:0;font-size:12px;
+                  color:var(--fg);text-align:right;border-bottom:1px solid rgba(38,43,54,.55)}
+
+  /* ---------- profile cards ---------- */
+  .profiles{display:grid;grid-template-columns:repeat(3,1fr);gap:11px}
+  @media (max-width:820px){.profiles{grid-template-columns:1fr}}
+  .prof{background:var(--raised);border:1px solid var(--border);border-radius:10px;padding:13px;
+        display:flex;flex-direction:column;gap:9px}
+  .prof.sel{border-color:var(--accent);box-shadow:inset 0 0 0 1px rgba(110,168,254,.35)}
+  .prof h4{margin:0;font-size:13px;letter-spacing:-.005em}
+  .cmd{font-family:var(--mono);font-size:10.5px;line-height:1.45;color:var(--muted);
+       background:var(--bg);border:1px solid var(--border);border-radius:7px;padding:8px;
+       word-break:break-all}
+
+  /* ---------- callouts ---------- */
+  .tag{display:inline-flex;align-items:center;font-family:var(--mono);font-size:10px;font-weight:700;
+       letter-spacing:.03em;color:var(--accent);background:rgba(110,168,254,.13);
+       border:1px solid rgba(110,168,254,.32);border-radius:5px;padding:1px 5px;margin-left:7px;
+       vertical-align:middle;white-space:nowrap}
+  .legend{margin-top:12px;border-left:2px solid var(--border);padding:2px 0 2px 14px;
+          display:flex;flex-direction:column;gap:7px}
+  .legend div{font-size:12.5px;color:var(--muted);display:flex;gap:9px;align-items:baseline}
+  .legend code{font-family:var(--mono);font-size:10.5px;color:var(--accent);
+               background:rgba(110,168,254,.10);border:1px solid rgba(110,168,254,.26);
+               border-radius:5px;padding:1px 5px;flex:none;white-space:nowrap}
+  .legend b{color:var(--fg);font-weight:600}
+
+  .bar{height:5px;border-radius:9999px;background:var(--raised);overflow:hidden;border:1px solid var(--border)}
+  .bar i{display:block;height:100%;background:var(--accent)}
+
+  .close{border-top:1px solid var(--border);margin-top:14px;padding-top:26px}
+  .close h2{font-size:17px;margin:0 0 12px}
+  .delta{display:grid;grid-template-columns:1fr 1fr;gap:11px}
+  @media (max-width:760px){.delta{grid-template-columns:1fr}}
+  .delta .card h5{margin:0 0 5px;font-size:12.5px}
+  .delta .card p{margin:0;font-size:12.5px;color:var(--muted)}
+  a{color:var(--accent)}
+  @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+</style>
+
+<div class="page">
+
+  <div class="masthead">
+    <div class="eyebrow">LlamaToaster · interface proposal for BENCHMARKING_PLAN_V7.md</div>
+    <h1>Two-Stage Benchmark Console</h1>
+    <p class="lede">Four screens covering what the v7 plan changes on the surface: chained runs that read
+      as one thing, an engine/spec pair that finally makes “llama-server without speculation” expressible,
+      skipped as an outcome that isn’t failure, and every estimate labelled with how much to trust it.
+      Every element tagged <span class="tag">P0.0</span> maps to a numbered phase in the plan.
+      All figures shown are arithmetically consistent with the rates each screen states.</p>
+  </div>
+
+  <nav class="tocbar" aria-label="Screens">
+    <a href="#s1">1 · Test A, Recommended</a>
+    <a href="#s2">2 · Test B, Real-world</a>
+    <a href="#s3">3 · Runs, chain-grouped</a>
+    <a href="#s4">4 · Run detail</a>
+    <a href="#delta">What changed</a>
+  </nav>
+
+  <!-- ============================= SCREEN 1 ============================= -->
+  <section class="screen" id="s1">
+    <h2>1 · Test A — find the best engine config</h2>
+    <p class="why">The chain is shown before it starts, priced, and editable. Nothing here commits the user
+      to a multi-day run they can’t see the shape of.</p>
+
+    <div class="frame">
+      <div class="routebar"><span class="dots"><i></i><i></i><i></i></span> llamatoaster.local /benchmark</div>
+      <div class="app">
+        <aside class="rail">
+          <div class="logo">Llama<span>Toaster</span></div>
+          <a href="#s1">Dashboard</a><a href="#s1">Models</a>
+          <a href="#s1" class="on">Benchmark</a>
+          <a href="#s1">Runs</a><a href="#s1">Compare</a><a href="#s1">Machines</a>
+        </aside>
+
+        <div class="main">
+          <div class="between">
+            <div class="seg" role="tablist" aria-label="Test">
+              <button class="on" role="tab" aria-selected="true">Test&nbsp;A · Find best config</button>
+              <button role="tab" aria-selected="false">Test&nbsp;B · Real-world forecast</button>
+            </div>
+            <div class="seg" role="radiogroup" aria-label="Mode">
+              <button class="on" role="radio" aria-checked="true">Recommended</button>
+              <button role="radio" aria-checked="false">Expert</button>
+            </div>
+          </div>
+          <p class="note muted" style="margin:0">
+            <b>Expert</b> opens the existing sweep grid at <span class="mono">/new-run</span> — same page, same
+            controls, no chaining. Recommended lets the server pick each stage from the last one’s results.
+            <span class="tag">P6.1</span>
+          </p>
+
+          <div class="grid2">
+            <div class="card">
+              <span class="lbl">Model</span>
+              <div class="mono" style="font-size:12.5px">Qwen3-30B-A3B-Instruct-Q4_K_M.gguf</div>
+              <dl style="margin-top:9px">
+                <div class="kv"><dt>Size on disk</dt><dd>17.3 GB</dd></div>
+                <div class="kv"><dt>Layers · experts</dt><dd>48 · 128 (MoE)</dd></div>
+                <div class="kv"><dt>KV heads / head dim</dt><dd style="color:var(--muted)">not read yet</dd></div>
+                <div class="kv"><dt>Trained context</dt><dd style="color:var(--muted)">not read yet</dd></div>
+              </dl>
+              <div class="between" style="margin-top:10px">
+                <span style="font-size:11.5px;color:var(--muted)">Registered before v7 — header never parsed</span>
+                <button class="btn ghost sm">Re-read from GGUF</button>
+              </div>
+            </div>
+            <div class="card">
+              <span class="lbl">Machine</span>
+              <div class="mono" style="font-size:12.5px">toaster-01</div>
+              <dl style="margin-top:9px">
+                <div class="kv"><dt>GPU</dt><dd>RX 6600 XT · 8 192 MiB</dd></div>
+                <div class="kv"><dt>Backend · build</dt><dd>vulkan · b10516</dd></div>
+                <div class="kv"><dt>System RAM</dt><dd>32 768 MiB</dd></div>
+                <div class="kv"><dt>Status</dt><dd><span class="pill done">idle</span></dd></div>
+              </dl>
+            </div>
+          </div>
+
+          <div class="note muted">
+            <b>Header fields haven’t been read for this model.</b> This is the normal state for
+            everything registered before v7 — the GGUF header is only parsed at download time, and
+            these files live on the machine, not the server. Without them there is no KV estimate, no
+            sliding-window detection, and no context clamp for Test&nbsp;B. Re-reading takes a few
+            seconds and needs toaster-01 online. <span class="tag">P3.1</span>
+          </div>
+
+          <div class="note warn">
+            <b>After re-reading:</b> KV cache at 100 % depth ≈ 2 380 MiB ·
+            <b>confidence: rough</b>. This model reports a sliding window of 4 096, and the estimate
+            treats every layer as full-context — the real figure is likely 4–5× lower. Depth
+            combinations still run; rows measured past the window are flagged
+            <span class="mono">swa</span>. <span class="tag">P3.2</span> <span class="tag">P3.4</span>
+          </div>
+
+          <div class="card">
+            <div class="between" style="margin-bottom:11px">
+              <span class="lbl" style="margin:0">Chain — 3 stages, all llama-bench</span>
+              <span class="mono" style="font-size:11.5px;color:var(--muted)">70 tests · est. 2 h 13 m</span>
+            </div>
+            <div class="chain">
+              <button class="stage open" aria-expanded="true" aria-controls="ed-coarse">
+                <div class="st-name">Tune coarse ▾</div>
+                <div class="st-meta">16 tests · ~24 m</div>
+                <div class="st-meta" style="color:var(--muted)">PP only, batch/ubatch grid</div>
+              </button>
+              <span class="arrow" aria-hidden="true">›</span>
+              <button class="stage" aria-expanded="false">
+                <div class="st-name">Tune refine ▸</div>
+                <div class="st-meta">6 tests · ~9 m</div>
+                <div class="st-meta" style="color:var(--muted)">rules, not values</div>
+              </button>
+              <span class="arrow" aria-hidden="true">›</span>
+              <button class="stage" aria-expanded="false">
+                <div class="st-name">Sweep ▸</div>
+                <div class="st-meta">48 tests · ~1 h 40 m</div>
+                <div class="st-meta" style="color:var(--muted)">4 KV pairs × FA × ngl × depth</div>
+              </button>
+              <span class="arrow" aria-hidden="true">›</span>
+              <div class="stage" style="background:transparent;border-style:dashed;justify-content:center">
+                <div class="st-name" style="color:var(--accent)">3 profiles</div>
+                <div class="st-meta" style="color:var(--muted)">Max Speed · Balanced · Low Memory</div>
+              </div>
+            </div>
+
+            <!-- ============ stage editor ============ -->
+            <section class="editor" id="ed-coarse" aria-label="Tune coarse settings">
+              <header>
+                <div>
+                  <span style="font-size:12.5px;font-weight:650">Tune coarse</span>
+                  <span class="mono" style="font-size:11.5px;color:var(--muted);margin-left:9px">
+                    16 tests · ~24 m · 0 invalid
+                  </span>
+                  <span class="pill run" style="margin-left:7px">preset: MoE tuning · 24 GB</span>
+                </div>
+                <div class="row tight">
+                  <button class="btn ghost sm">Reset stage</button>
+                  <button class="btn ghost sm">Save preset</button>
+                </div>
+              </header>
+              <div class="body">
+
+                <div class="tier varied">
+                  <div class="tier-h"><b>Varied</b><span>the axes this stage sweeps</span></div>
+                  <div class="field">
+                    <span class="fname">ubatch</span>
+                    <div>
+                      <div class="row tight">
+                        <span class="chip sel">128</span><span class="chip sel">256</span>
+                        <span class="chip sel">512</span><span class="chip sel">1024</span>
+                        <span class="chip">2048</span><span class="chip">+ add</span>
+                      </div>
+                    </div>
+                  </div>
+                  <div class="field">
+                    <span class="fname">batch multiplier</span>
+                    <div>
+                      <div class="row tight">
+                        <span class="chip sel">×1</span><span class="chip sel">×2</span>
+                        <span class="chip sel">×4</span><span class="chip sel">×8</span>
+                        <span class="chip">×16</span>
+                      </div>
+                      <div class="why">Batch is generated relative to ubatch — what matters is the
+                        ratio, not either value alone.</div>
+                    </div>
+                  </div>
+                  <div class="field">
+                    <span class="fname">will run</span>
+                    <div class="scroll">
+                      <table class="bubprev">
+                        <thead><tr><th></th><th>×1</th><th>×2</th><th>×4</th><th>×8</th></tr></thead>
+                        <tbody>
+                          <tr><th>ub 128</th><td>128</td><td>256</td><td>512</td><td>1024</td></tr>
+                          <tr><th>ub 256</th><td>256</td><td>512</td><td>1024</td><td>2048</td></tr>
+                          <tr><th>ub 512</th><td>512</td><td>1024</td><td>2048</td><td>4096</td></tr>
+                          <tr><th>ub 1024</th><td>1024</td><td>2048</td><td>4096</td><td>8192</td></tr>
+                        </tbody>
+                      </table>
+                      <div class="why">The 16 actual batch values, so nothing has to be inferred from
+                        two separate lists.</div>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="tier held">
+                  <div class="tier-h"><b>Held constant</b><span>editable — each says why it is pinned</span></div>
+                  <div class="field">
+                    <span class="fname">KV cache</span>
+                    <div>
+                      <span class="chip sel">f16 / f16</span>
+                      <div class="why">Tuning isolates batch effects. KV precision is swept in stage 3,
+                        against a batch size that is settled by then.</div>
+                    </div>
+                  </div>
+                  <div class="field">
+                    <span class="fname">n_prompt</span>
+                    <div>
+                      <span class="chip sel">32768</span> <span class="pill queue">auto</span>
+                      <div class="why">4 × the largest batch candidate (8192). Below this, batching never
+                        reaches steady state and every large-batch candidate measures like a small one.</div>
+                    </div>
+                  </div>
+                  <div class="field">
+                    <span class="fname">n_gen</span>
+                    <div>
+                      <span class="chip sel">0</span>
+                      <div class="why">Prompt-processing only. A nonzero value is allowed here but adds
+                        generation time this stage does not rank on — tuning runs are excluded from
+                        profile scoring either way.</div>
+                    </div>
+                  </div>
+                  <div class="field">
+                    <span class="fname">GPU layers</span>
+                    <div>
+                      <span class="chip sel">48</span>
+                      <span class="pill run">from preset · saved as auto</span>
+                      <button class="btn ghost sm" style="margin-left:4px">Use 31 (this machine)</button>
+                      <div class="why">Loaded from <b>“MoE tuning · 24 GB”</b> unchanged. This machine
+                        derives 31. Nothing was silently rewritten — the offer is there, the decision
+                        isn’t made for you.</div>
+                    </div>
+                  </div>
+                  <div class="field">
+                    <span class="fname">threads · fa · repeats</span>
+                    <div>
+                      <span class="chip sel">6</span> <span class="chip sel">on</span> <span class="chip sel">3</span>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="row tight" style="justify-content:space-between;align-items:center">
+                  <span style="font-size:11.5px;color:var(--muted)">
+                    1 field differs from what this machine would derive
+                  </span>
+                  <button class="btn ghost sm">Adjust auto fields for this machine</button>
+                </div>
+
+                <p class="note muted" style="margin:0">
+                  <b>Reset re-derives, it does not restore.</b> GPU layers come from the VRAM estimate for
+                  this model on this machine, n_prompt from the largest batch you selected, threads from
+                  the machine’s own report — so resetting recomputes against current conditions rather
+                  than putting back whatever was on screen at page load. Loading a preset is the
+                  opposite: it applies saved values <b>verbatim</b>. <span class="tag">P6.4</span>
+                </p>
+              </div>
+            </section>
+
+            <div class="grid2" style="margin-top:9px">
+              <div class="card tight" style="background:var(--raised)">
+                <span class="lbl">Tune refine · rules, not values</span>
+                <div class="mono" style="font-size:11px;line-height:1.9;color:var(--fg)">
+                  batch multipliers &nbsp;
+                  <span class="chip sel" style="padding:1px 8px">0.75×</span>
+                  <span class="chip sel" style="padding:1px 8px">1.0×</span>
+                  <span class="chip sel" style="padding:1px 8px">1.25×</span>
+                  <span class="chip sel" style="padding:1px 8px">1.5×</span><br>
+                  cross-check top &nbsp;<span class="chip sel" style="padding:1px 8px">2</span>&nbsp; coarse tuples
+                </div>
+                <p style="font-size:11.5px;color:var(--muted);margin:9px 0 0">
+                  This stage’s numbers <b>do not exist yet</b> — they are computed from the coarse
+                  winner, which hasn’t run. So its editor shows the rule and looks deliberately unlike
+                  the other two. <b>1.0× can’t be removed:</b> the incumbent has to be re-measured
+                  inside this run, or the comparison spans two process lifetimes with different
+                  warm-up state. <span class="tag">P6.4</span> <span class="tag">A1</span>
+                </p>
+              </div>
+              <div class="card tight" style="background:var(--raised)">
+                <span class="lbl">Sweep · invalid combinations are shown</span>
+                <div class="mono" style="font-size:11px;color:var(--fg);line-height:1.7">
+                  60 combinations<br>
+                  <span style="color:var(--warning)">− 12 invalid</span>
+                  <span style="color:var(--muted)">(flash attention off requires an unquantized KV cache)</span><br>
+                  <b>= 48 tests · ~1 h 40 m</b>
+                </div>
+                <p style="font-size:11.5px;color:var(--muted);margin:9px 0 0">
+                  <span class="mono">expandSweep</span> drops those silently. A user who builds a grid
+                  implying 60 and is told “48” with no explanation assumes a bug — so the count shows
+                  its own arithmetic. <span class="tag">P6.4</span>
+                </p>
+              </div>
+            </div>
+
+            <div class="card tight" style="background:var(--raised);margin-top:9px">
+              <span class="lbl">Sweep · KV cache pairs</span>
+              <div class="row tight" style="align-items:center">
+                <span class="chip sel">f16 / f16 <span style="opacity:.7">1.00×</span></span>
+                <span class="chip sel">f16 / q8_0 <span style="opacity:.7">0.77×</span></span>
+                <span class="chip sel">q8_0 / q8_0 <span style="opacity:.7">0.53×</span></span>
+                <span class="chip sel">q8_0 / q4_0 <span style="opacity:.7">0.40×</span></span>
+                <span class="chip">q4_0 / q4_0 <span style="opacity:.7">0.28×</span></span>
+              </div>
+              <p style="font-size:11.5px;color:var(--muted);margin:9px 0 0">
+                Sizes are per KV token relative to f16/f16. The unquantized pair is mandatory — it is
+                the only one that can also run with flash attention <i>off</i>, so the FA axis
+                collapses without it. The two middle pairs decompose K-path from V-path cost.
+                V is compressed harder than K, never the reverse: errors in K pass through a softmax
+                that can amplify them, while errors in V are averaged and smooth out.
+                <span class="tag">A1b</span>
+              </p>
+            </div>
+
+            <p class="note muted" style="margin-top:11px">
+              <b>The first three ETAs come from this machine’s own llama-bench history.</b>
+              The last two don’t: nothing has measured llama-server prompt processing on toaster-01,
+              and the engine-to-engine gap has never been re-measured since single-slot mode landed —
+              published figures span 300 to 1 700 tok/s. Rather than pick one, the stage says so.
+              <span class="tag">P4.2</span>
+            </p>
+            <p class="note info" style="margin-top:9px">
+              Each stage is an ordinary run linked to the same root, and each one’s grid is
+              <b>computed from the previous stage’s results</b> — that derivation is the only reason
+              chaining exists. <b>Stop cancels the whole chain, including stages that haven’t been
+              created yet.</b> <span class="tag">P2.4</span> <span class="tag">A4</span>
+            </p>
+            <p class="note muted" style="margin-top:9px">
+              <b>Test A stops here.</b> It never starts llama-server. Real-world forecasting and
+              speculative decoding are Test&nbsp;B, triggered separately once these profiles exist —
+              partly because they’d otherwise run twice (chain <i>and</i> profile dropdown), and
+              partly because <b>their cost can’t be estimated until this finishes</b>: nothing has
+              measured llama-server prompt processing on toaster-01, and published figures for the
+              engine-to-engine gap span 300 to 1 700 tok/s. <span class="tag">A4</span> <span class="tag">P4.2</span>
+            </p>
+          </div>
+
+          <div class="grid2">
+            <div class="card tight">
+              <span class="lbl">Repeats per test</span>
+              <div class="row tight" role="radiogroup" aria-label="Repeats">
+                <span class="chip dis" aria-disabled="true">1</span>
+                <span class="chip dis" aria-disabled="true">2</span>
+                <span class="chip sel" role="radio" aria-checked="true">3</span>
+                <span class="chip" role="radio" aria-checked="false">5</span>
+                <span class="chip" role="radio" aria-checked="false">10</span>
+              </div>
+              <p style="font-size:11.5px;color:var(--muted);margin:9px 0 0">
+                Fewer than 3 reports a standard deviation of exactly 0, which would pass the stability
+                gate on a number that was never measured. <span class="tag">P0.5</span>
+              </p>
+            </div>
+            <div class="card tight">
+              <span class="lbl">Sweep size</span>
+              <div class="between" style="margin-bottom:7px">
+                <span class="mono" style="font-size:12.5px">70 tests</span>
+                <span class="mono" style="font-size:11.5px;color:var(--muted)">warn at 4 096 · max 20 000</span>
+              </div>
+              <div class="bar"><i style="width:0.4%"></i></div>
+              <p style="font-size:11.5px;color:var(--muted);margin:9px 0 0">
+                How many combinations the cross-product expands to — a count, not a clock. Past
+                4 096 the run still starts, with a warning about wall-clock cost; the hard rejection
+                sits at 20 000, high enough that expert sweeps which work today still work.
+                <span class="tag">P0.4</span>
+              </p>
+            </div>
+          </div>
+
+          <div class="between">
+            <span style="font-size:12px;color:var(--muted)">
+              Pause affects <b style="color:var(--fg)">this chain only</b>, not other jobs on toaster-01.
+              <span class="tag">P2.4</span>
+            </span>
+            <div class="row tight">
+              <button class="btn ghost">Reset all</button>
+              <button class="btn ghost">Load preset ▾</button>
+              <button class="btn ghost">Save preset…</button>
+              <button class="btn">Start Test A</button>
+            </div>
+          </div>
+          <p class="note muted" style="margin:0">
+            Editing anything puts the chain in <b>Recommended (modified)</b> — it still chains, the
+            grids are just yours. <b>A preset belongs to you, not to a machine:</b> every one is
+            offered on every machine you own, with no filtering by GPU, backend or build. A grid
+            worked out on one box is exactly the thing worth trying on another, and which of them
+            apply is your call. Loading applies the saved values <b>verbatim</b> — the VRAM banner
+            still fires if they don’t fit here, and a one-click adjustment is offered, never applied
+            on its own. <span class="tag">P6.4</span>
+          </p>
+
+          <div class="card" style="border-color:rgba(110,168,254,.35);background:rgba(110,168,254,.06)"
+               role="status">
+            <div class="between">
+              <div>
+                <div style="font-size:12.5px;font-weight:650">Once this finishes</div>
+                <div style="font-size:12px;color:var(--muted);margin-top:3px">
+                  3 profiles ready · forecast real-world performance — <span class="mono">est. 7 h 52 m</span>,
+                  priced from this chain’s own measured rates
+                </div>
+              </div>
+              <button class="btn">Set up Test&nbsp;B →</button>
+            </div>
+          </div>
+          <p style="font-size:11.5px;color:var(--muted);margin:0">
+            Preview of the completion state. Test&nbsp;B is a separate trigger and is offered
+            <b>with a real number attached</b> — the only point in the product where its cost is
+            knowable. <span class="tag">P6.1</span>
+          </p>
+        </div>
+      </div>
+    </div>
+
+    <div class="legend">
+      <div><code>P6.4</code><span>“Recommended” must not mean opaque. Each stage card is a disclosure button; opening one shows exactly what it will run, pre-filled and editable. Fields sit in three tiers — <b>varied</b>, <b>held constant</b> (each carrying its reason), and <b>required</b> (each carrying its consequence). Only three fields in all of Test A are genuinely required, and they all sit on the sweep stage.</span></div>
+      <div><code>P6.4</code><span>A loaded preset is applied <b>verbatim</b>, across any machine. Re-deriving on load would quietly turn a saved configuration into a different one; instead the disagreement is surfaced per field with the machine’s own value one click away. The advisory VRAM banner does the safety work, so nothing has to be taken away from the user to keep this safe.</span></div>
+      <div><code>P3.1</code><span>Unknown header fields are the <b>launch-day default</b>, not an edge case — the GGUF is parsed at download time only, and every model registered before v7 has none of it. The card is designed for that state first.</span></div>
+      <div><code>P3.2</code><span>The banner states a <b>confidence word</b>, not just a number. “rough” and “good” must never look alike — a gating check built on a rough estimate would silently delete valid data points.</span></div>
+      <div><code>A1b</code><span>The default KV cache set spends its four slots deliberately: one baseline that can also run flash-attention off, two that decompose K-path cost from V-path cost, and one asymmetric-aggressive pair — never the reverse asymmetry, since K errors pass through a softmax that can amplify them.</span></div>
+      <div><code>A4</code><span>Test A is <b>three stages, all llama-bench</b>. Chaining is justified only where a stage’s grid is derived from the previous stage’s results — which is true here and nowhere else. Test B is a separate trigger; folding it in as stages 4–5 would run it twice for anyone who also used the profile dropdown, and would ask the user to commit to the expensive half before anything could price it.</span></div>
+      <div><code>P6.1</code><span>The handoff is a completion call to action, not an automatic enqueue. By then the sweep has measured rates, so the offer carries an estimate instead of a shrug.</span></div>
+      <div><code>P0.4</code><span><b>Sweep size is a count, not a clock</b> — the per-test time limit is a different thing entirely (Screen 2). Past 4 096 tests the request still succeeds with a warning; the hard rejection is at 20 000, high enough not to break sweeps that work today.</span></div>
+      <div><code>P2.4</code><span>Stop is chain-scoped by construction: it sets a flag on the root, which is what stops stages that don’t exist yet.</span></div>
+    </div>
+  </section>
+
+  <!-- ============================= SCREEN 2 ============================= -->
+  <section class="screen" id="s2">
+    <h2>2 · Test B — what the user will actually experience</h2>
+    <p class="why">A separate trigger, enabled once Test A has produced profiles. Everything here is
+      already known the moment those profiles exist, so <b>Test B needs no chaining at all</b> — one
+      run per selected profile, all enqueued together, sharing a root for grouping and Stop. This
+      screen only exists because v7 splits <span class="mono">mtp</span> into an engine/spec pair;
+      until then there was no way to ask for llama-server without speculative decoding, which is the
+      entire measurement this test is about.</p>
+
+    <div class="frame">
+      <div class="routebar"><span class="dots"><i></i><i></i><i></i></span> llamatoaster.local /benchmark?test=b</div>
+      <div class="app">
+        <aside class="rail">
+          <div class="logo">Llama<span>Toaster</span></div>
+          <a href="#s2">Dashboard</a><a href="#s2">Models</a>
+          <a href="#s2" class="on">Benchmark</a>
+          <a href="#s2">Runs</a><a href="#s2">Compare</a><a href="#s2">Machines</a>
+        </aside>
+
+        <div class="main">
+          <div class="seg" role="tablist" aria-label="Test">
+            <button role="tab" aria-selected="false">Test&nbsp;A · Find best config</button>
+            <button class="on" role="tab" aria-selected="true">Test&nbsp;B · Real-world forecast</button>
+          </div>
+
+          <div class="card">
+            <span class="lbl">Config source</span>
+            <div class="card tight" role="listbox" aria-label="Config source" style="background:var(--raised);padding:0">
+              <div role="option" tabindex="0" aria-selected="true"
+                   style="padding:9px 12px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;gap:12px">
+                <span style="font-size:12.5px">Qwen3-30B-A3B · toaster-01 · b10516 <span class="pill acc">selected</span></span>
+                <span class="mono" style="font-size:11px;color:var(--muted)">chain #4f2a · 2 h ago</span>
+              </div>
+              <div role="option" tabindex="-1" aria-selected="false"
+                   style="padding:9px 12px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;gap:12px">
+                <span style="font-size:12.5px;color:var(--muted)">Qwen3-30B-A3B · toaster-01 · b10516</span>
+                <span class="mono" style="font-size:11px;color:var(--muted)">chain #1c07 · 3 d ago</span>
+              </div>
+              <div role="option" tabindex="-1" aria-selected="false"
+                   aria-disabled="true" aria-describedby="mm-1"
+                   style="padding:9px 12px;display:flex;justify-content:space-between;gap:12px;opacity:.55">
+                <span style="font-size:12.5px;color:var(--muted)">Qwen3-30B-A3B · toaster-02 · b10402</span>
+                <span id="mm-1" class="mono" style="font-size:11px;color:var(--warning)">different machine and build</span>
+              </div>
+            </div>
+            <p style="font-size:11.5px;color:var(--muted);margin:9px 0 0">
+              The mismatched entry is a real <span class="mono">role="option"</span> carrying
+              <span class="mono">aria-disabled</span> and <span class="mono">aria-describedby</span> —
+              still reachable, still announced, reason included. A native
+              <span class="mono">disabled</span> attribute would remove both the option and its
+              explanation from the accessibility tree. <span class="tag">P6.2</span>
+            </p>
+          </div>
+
+          <div>
+            <span class="lbl">Profiles to validate — 3 selected</span>
+            <div class="profiles" role="group" aria-label="Profiles">
+              <div class="prof sel">
+                <div class="between"><h4>Max Speed</h4><span class="pill acc">✓</span></div>
+                <dl>
+                  <div class="kv"><dt>PP</dt><dd>1 684 tok/s</dd></div>
+                  <div class="kv"><dt>TG @ 50 %</dt><dd>41.2 tok/s</dd></div>
+                  <div class="kv"><dt>Pressure</dt><dd>0.94</dd></div>
+                </dl>
+                <div class="cmd">-ngl 48 -b 4096 -ub 512 -ctk f16 -ctv f16 -fa on</div>
+              </div>
+              <div class="prof sel">
+                <div class="between"><h4>Balanced</h4><span class="pill acc">✓</span></div>
+                <dl>
+                  <div class="kv"><dt>PP</dt><dd>1 511 tok/s</dd></div>
+                  <div class="kv"><dt>TG @ 50 %</dt><dd>39.8 tok/s</dd></div>
+                  <div class="kv"><dt>Pressure</dt><dd>0.71</dd></div>
+                </dl>
+                <div class="cmd">-ngl 44 -b 2048 -ub 512 -ctk q8_0 -ctv q8_0 -fa on</div>
+              </div>
+              <div class="prof sel">
+                <div class="between"><h4>Low Memory</h4><span class="pill acc">✓</span></div>
+                <dl>
+                  <div class="kv"><dt>PP</dt><dd>1 402 tok/s</dd></div>
+                  <div class="kv"><dt>TG @ 50 %</dt><dd>38.1 tok/s</dd></div>
+                  <div class="kv"><dt>Pressure</dt><dd>0.52</dd></div>
+                </dl>
+                <div class="cmd">-ngl 40 -b 2048 -ub 256 -ctk q8_0 -ctv q4_0 -fa on --n-cpu-moe 8</div>
+                <p style="font-size:11px;color:var(--warning);margin:0;line-height:1.4">
+                  4-bit V cache — the smallest option measured, and the one most likely to affect
+                  output. Verify against your own workload before adopting it.
+                </p>
+              </div>
+            </div>
+            <p class="note warn" style="margin-top:10px">
+              <b>Ranked on speed and memory. Output quality was not measured.</b>
+              Nothing in either engine path computes perplexity or any accuracy proxy, and there is
+              no column for one. These cards carry a copyable launch command, which reads as a
+              recommendation — so the boundary is stated on the card itself, not in a tooltip.
+              <span class="tag">A2.1</span> <span class="tag">P6.2</span>
+            </p>
+            <p class="note muted" style="margin-top:10px">
+              <b>Degraded state.</b> On a machine reporting no VRAM totals, memory pressure can’t be
+              computed and only <b>Max Speed</b> is produced — the card row says so instead of showing
+              three identical cards. <span class="tag">A2</span>
+            </p>
+          </div>
+
+          <div class="card">
+            <span class="lbl">Engine &amp; speculation</span>
+            <div class="row tight">
+              <span class="chip dis">llama-bench</span>
+              <span class="chip sel">llama-server · no speculation</span>
+              <span class="chip sel">llama-server · MTP draft</span>
+              <span class="chip">llama-server · draft model</span>
+            </div>
+            <p class="note info" style="margin-top:10px">
+              Two llama-server modes selected, so every configuration produces a
+              <b>matched pair on the same binary, inside the same run</b> — the only way a speedup
+              ratio means anything. A llama-bench baseline would be measuring harness overhead, not
+              speculation. Speculation is a checkbox here, <b>not a stage</b>: both halves of every
+              pair share one process lifetime and one pinned prompt offset, which is what makes the
+              join sound. <span class="tag">P1.1</span> <span class="tag">P5.1</span>
+            </p>
+          </div>
+
+          <div class="card">
+            <div class="between" style="margin-bottom:4px">
+              <span class="lbl" style="margin:0">Prompt × generation matrix</span>
+              <span class="mono" style="font-size:11.5px;color:var(--muted)">48 of 60 cells · est. 7 h 52 m</span>
+            </div>
+            <p class="mono" style="font-size:10.5px;color:var(--muted);margin:0 0 10px">
+              priced from toaster-01’s measured 310 tok/s prefill · 39 tok/s generation · 50 s load · 5 repeats
+            </p>
+            <div class="scroll">
+              <table class="matrix">
+                <thead>
+                  <tr><th style="width:96px">prompt \ gen</th><th style="text-align:center">128</th>
+                      <th style="text-align:center">256</th><th style="text-align:center">512</th>
+                      <th style="text-align:center">1024</th></tr>
+                </thead>
+                <tbody>
+                  <tr><th class="rowh">4k</th><td class="cell">2m 13s</td><td class="cell">2m 29s</td><td class="cell">3m 02s</td><td class="cell">4m 07s</td></tr>
+                  <tr><th class="rowh">16k</th><td class="cell">5m 31s</td><td class="cell">5m 47s</td><td class="cell">6m 20s</td><td class="cell">7m 26s</td></tr>
+                  <tr><th class="rowh">32k</th><td class="cell">9m 55s</td><td class="cell">10m 11s</td><td class="cell">10m 44s</td><td class="cell">11m 50s</td></tr>
+                  <tr><th class="rowh">64k</th><td class="cell">18m 43s</td><td class="cell">19m 00s</td><td class="cell">19m 33s</td><td class="cell">20m 38s</td></tr>
+                  <tr><th class="rowh" style="color:var(--muted)">128k</th><td class="cell over">36m 21s</td><td class="cell over">36m 37s</td><td class="cell over">37m 10s</td><td class="cell over">38m 15s</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="note warn" style="margin-top:11px">
+              <b>The 128k row crosses the 30-minute per-test budget at 5 repeats</b> — 12 cells across the
+              three profiles, recorded as skipped rather than failed. It fits at 3 repeats
+              (≈ 22 m). Drop to 3, raise <span class="mono">bench_timeout_ms</span>, or leave the row out.
+              <span class="tag">P4.2</span> <span class="tag">P0.3</span>
+            </p>
+            <p class="note muted" style="margin-top:9px">
+              The budget is <b>per test</b>, and one test is one llama-server process covering all its
+              repeats — so a whole column’s runtime is never the number to compare against it. Every cell
+              above is <span class="mono">load + repeats × (prompt ÷ pp + gen ÷ tg)</span> against this
+              machine’s own measured rates, not a constant.
+            </p>
+          </div>
+
+          <div class="between">
+            <span style="font-size:12px;color:var(--muted)">
+              Creates <b style="color:var(--fg)">3 runs</b>, one per profile, sharing a root ·
+              sourced from chain <span class="mono">#4f2a</span>
+            </span>
+            <button class="btn">Start Test&nbsp;B</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="legend">
+      <div><code>P1.1</code><span>Engine and speculation are separate choices. <b>llama-server · no speculation</b> is the configuration that had no representation at all before v7 — and it is the baseline every speedup number depends on.</span></div>
+      <div><code>A4</code><span>No chaining here. Every run’s configuration is fully determined by the profile plus these axes, so all three are enqueued at once and the worker’s queue serializes them. The drainer exists for Test A alone.</span></div>
+      <div><code>P4.2</code><span>The matrix is priced from this machine’s <b>own measured</b> rates and shows them, so the over-budget row is known before the user spends the afternoon finding it. The per-test budget covers one process and all its repeats — comparing a column total against it, as an earlier draft of this plan did, makes runnable work look impossible.</span></div>
+      <div><code>A2</code><span>Profile scoring degrades explicitly. Three identical cards with no explanation is the failure mode this note prevents.</span></div>
+      <div><code>A2.1</code><span>The one place in the product where a measured number and an <b>unmeasured risk</b> sit in the same sentence. Speed was measured; the quality cost of a 4-bit KV cache was not, and cannot be by this harness. The copy has to carry that, since the command sitting next to it will be pasted into a terminal.</span></div>
+    </div>
+  </section>
+
+  <!-- ============================= SCREEN 3 ============================= -->
+  <section class="screen" id="s3">
+    <h2>3 · Runs — one trigger, one row</h2>
+    <p class="why">Test A is three runs in the database and Test B is up to three more. Flattening them
+      into six list rows is the direct cost of having no chain entity; grouping by root run restores the
+      thing the user actually started. The two tests group <b>separately</b> — different roots, different
+      engines — linked by the profile the second one names.</p>
+
+    <div class="frame">
+      <div class="routebar"><span class="dots"><i></i><i></i><i></i></span> llamatoaster.local /runs</div>
+      <div class="app">
+        <aside class="rail">
+          <div class="logo">Llama<span>Toaster</span></div>
+          <a href="#s3">Dashboard</a><a href="#s3">Models</a><a href="#s3">Benchmark</a>
+          <a href="#s3" class="on">Runs</a><a href="#s3">Compare</a><a href="#s3">Machines</a>
+        </aside>
+
+        <div class="main">
+          <div class="scroll">
+            <table>
+              <thead>
+                <tr><th style="width:36%">Run</th><th>Machine</th><th>Stages</th><th>Progress</th>
+                    <th>Status</th><th style="text-align:right">ETA</th><th></th></tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td>
+                    <strong style="font-size:12.5px">▾ Qwen3-30B-A3B · Q4_K_M <span class="pill badgeB" style="background:var(--success-bg);color:var(--success)">Test B</span></strong>
+                    <div class="mono" style="font-size:10.5px;color:var(--muted);margin-top:2px">#9b31 · 3 profiles · from #4f2a</div>
+                  </td>
+                  <td class="mono" style="font-size:11.5px">toaster-01</td>
+                  <td>
+                    <span class="pips" aria-label="One of three profiles running, two queued">
+                      <i class="sdot run"></i><i class="sdot q"></i><i class="sdot q"></i>
+                    </span>
+                  </td>
+                  <td class="n">22 / 144</td>
+                  <td><span class="pill run">running</span></td>
+                  <td class="n">6 h 41 m</td>
+                  <td style="text-align:right"><button class="btn ghost sm">Stop all 3</button></td>
+                </tr>
+                <tr class="child"><td>Max Speed <span class="pill queue">runtime</span></td><td class="mono" style="font-size:11.5px">toaster-01</td><td class="mono" style="font-size:11px;color:var(--muted)">48 tests · server·off + server·mtp</td><td class="n">22 / 48</td><td><span class="pill run">running</span></td><td class="n">1 h 52 m</td><td></td></tr>
+                <tr class="child"><td>Balanced <span class="pill queue">runtime</span></td><td class="mono" style="font-size:11.5px">toaster-01</td><td class="mono" style="font-size:11px;color:var(--muted)">48 tests</td><td class="n">0 / 48</td><td><span class="pill queue">queued</span></td><td class="n">2 h 24 m</td><td></td></tr>
+                <tr class="child"><td>Low Memory <span class="pill queue">runtime</span></td><td class="mono" style="font-size:11.5px">toaster-01</td><td class="mono" style="font-size:11px;color:var(--muted)">48 tests</td><td class="n">0 / 48</td><td><span class="pill queue">queued</span></td><td class="n">2 h 25 m</td><td></td></tr>
+                <tr>
+                  <td>
+                    <strong style="font-size:12.5px">▾ Qwen3-30B-A3B · Q4_K_M <span class="pill acc">Test A</span></strong>
+                    <div class="mono" style="font-size:10.5px;color:var(--muted);margin-top:2px">#4f2a · 3 stages · 3 profiles written</div>
+                  </td>
+                  <td class="mono" style="font-size:11.5px">toaster-01</td>
+                  <td>
+                    <span class="pips" aria-label="All three stages complete">
+                      <i class="sdot ok"></i><i class="sdot ok"></i><i class="sdot ok"></i>
+                    </span>
+                  </td>
+                  <td class="n">66 / 70</td>
+                  <td><span class="pill done">done</span> <span class="pill skip">4 skipped</span></td>
+                  <td class="n">—</td>
+                  <td style="text-align:right"><button class="btn ghost sm">Open</button></td>
+                </tr>
+                <tr class="child"><td>Tune coarse <span class="pill queue">tuning</span></td><td class="mono" style="font-size:11.5px">toaster-01</td><td class="mono" style="font-size:11px;color:var(--muted)">16 tests</td><td class="n">16 / 16</td><td><span class="pill done">done</span></td><td class="n">—</td><td></td></tr>
+                <tr class="child"><td>Tune refine <span class="pill queue">refine</span></td><td class="mono" style="font-size:11.5px">toaster-01</td><td class="mono" style="font-size:11px;color:var(--muted)">6 tests</td><td class="n">6 / 6</td><td><span class="pill done">done</span></td><td class="n">—</td><td></td></tr>
+                <tr class="child"><td>Sweep <span class="pill queue">sweep</span></td><td class="mono" style="font-size:11.5px">toaster-01</td><td class="mono" style="font-size:11px;color:var(--muted)">48 tests · 4 skipped</td><td class="n">44 / 48</td><td><span class="pill done">done</span> <span class="pill skip">4 skipped</span></td><td class="n">—</td><td></td></tr>
+                <tr>
+                  <td>
+                    <strong style="font-size:12.5px">Gemma-3-12B-it · Q5_K_M</strong>
+                    <div class="mono" style="font-size:10.5px;color:var(--muted);margin-top:2px">single run · expert sweep</div>
+                  </td>
+                  <td class="mono" style="font-size:11.5px">toaster-02</td>
+                  <td><span class="pips" aria-label="Single run, complete"><i class="sdot ok"></i></span></td>
+                  <td class="n">12 / 18</td>
+                  <td><span class="pill done">partial</span> <span class="pill skip">6 skipped</span></td>
+                  <td class="n">—</td>
+                  <td style="text-align:right"><button class="btn ghost sm">Open</button></td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p class="note muted" style="margin:0">
+            <b>Skipped is not a failure.</b> A combination the pre-flight check ruled out, or one that
+            outran its time budget, was never measured — it doesn’t make a run “partial” and it doesn’t
+            disqualify a configuration from being scored. Hollow dashed ring, its own count, reason on hover.
+            <span class="tag">P0.2</span> <span class="tag">P0.3</span>
+          </p>
+        </div>
+      </div>
+    </div>
+
+    <div class="legend">
+      <div><code>P2.1</code><span>Grouping keys on the denormalized <b>root run id</b> — an indexed equality predicate, not a recursive query re-implemented in six read paths.</span></div>
+      <div><code>A4</code><span>Two rows, not one. Test&nbsp;B carries the id of the Test&nbsp;A chain its profiles came from, so the link is visible without merging two things the user triggered separately. Its three runs are <b>queued, not “not created yet”</b> — nothing derives from anything, so all three existed the moment it started.</span></div>
+      <div><code>P2.4</code><span>A chained Test&nbsp;A does have stages that don’t exist yet, which is exactly why Stop sets a flag on the root rather than walking existing rows.</span></div>
+    </div>
+  </section>
+
+  <!-- ============================= SCREEN 4 ============================= -->
+  <section class="screen" id="s4">
+    <h2>4 · Run detail — measurements that admit what they are</h2>
+    <p class="why">Rows measured under different methodology end up in the same table. The column has to
+      say which is which, or the comparison is silently wrong.</p>
+
+    <div class="frame">
+      <div class="routebar"><span class="dots"><i></i><i></i><i></i></span> llamatoaster.local /runs/9b31-max-speed</div>
+      <div class="app">
+        <aside class="rail">
+          <div class="logo">Llama<span>Toaster</span></div>
+          <a href="#s4">Dashboard</a><a href="#s4">Models</a><a href="#s4">Benchmark</a>
+          <a href="#s4" class="on">Runs</a><a href="#s4">Compare</a><a href="#s4">Machines</a>
+        </aside>
+
+        <div class="main">
+          <div class="card tight">
+            <div class="between">
+              <div class="row tight" style="align-items:center;font-size:12px">
+                <span class="pill badgeB" style="background:var(--success-bg);color:var(--success)">Test B</span>
+                <span style="color:var(--muted)">#9b31 · Max Speed</span>
+                <span style="color:var(--muted)">›</span>
+                <span class="pill run">running</span>
+                <span style="color:var(--muted)">·</span>
+                <span class="pill queue">Balanced</span>
+                <span class="pill queue">Low Memory</span>
+              </div>
+              <button class="btn ghost sm">Stop all 3</button>
+            </div>
+            <div style="font-size:11.5px;color:var(--muted);margin-top:8px;border-top:1px solid var(--border);padding-top:8px">
+              Profile from <a href="#s3">Test&nbsp;A chain #4f2a</a> · Tune coarse › Tune refine › Sweep ·
+              all llama-bench, finished 2 h ago
+            </div>
+          </div>
+
+          <div class="note warn">
+            <b>One row carries a caveat.</b>
+            <span class="mono">swa</span> — its depth of 8 192 exceeds this model’s 4 096-token sliding
+            window, so the figure is structurally misleading and is excluded from profile scoring.
+            <span class="tag">P3.4</span>
+          </div>
+
+          <div class="scroll">
+            <table>
+              <thead>
+                <tr><th>Config</th><th style="text-align:right">PP</th><th style="text-align:right">TG</th>
+                    <th style="text-align:right">TTFT</th><th style="text-align:right">E2E p95</th>
+                    <th style="text-align:right">Speedup</th><th>Flags</th></tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td class="mono" style="font-size:11px">server·off · 4k/256</td>
+                  <td class="n">1 684 <span style="color:var(--muted)">±11</span></td>
+                  <td class="n">41.2 <span style="color:var(--muted)">±0.4</span></td>
+                  <td class="n">2 510 ms <span class="pill done">measured</span></td>
+                  <td class="n">8 990 ms</td>
+                  <td class="n" style="color:var(--muted)">baseline</td>
+                  <td></td>
+                </tr>
+                <tr>
+                  <td class="mono" style="font-size:11px">server·mtp · 4k/256</td>
+                  <td class="n">1 671 <span style="color:var(--muted)">±19</span></td>
+                  <td class="n">62.9 <span style="color:var(--muted)">±1.1</span></td>
+                  <td class="n">2 515 ms <span class="pill done">measured</span></td>
+                  <td class="n">6 810 ms</td>
+                  <td class="n" style="color:var(--success)">1.53× <span class="pill done">ok</span></td>
+                  <td><span class="pill acc">72 % accept</span></td>
+                </tr>
+                <tr>
+                  <td class="mono" style="font-size:11px">server·off · 16k/512</td>
+                  <td class="n">1 683 <span style="color:var(--muted)">±14</span></td>
+                  <td class="n">41.0 <span style="color:var(--muted)">±0.5</span></td>
+                  <td class="n">9 820 ms <span class="pill done">measured</span></td>
+                  <td class="n">22 890 ms</td>
+                  <td class="n" style="color:var(--muted)">baseline</td>
+                  <td></td>
+                </tr>
+                <tr>
+                  <td class="mono" style="font-size:11px">server·mtp · 16k/512</td>
+                  <td class="n">1 664 <span style="color:var(--muted)">±22</span></td>
+                  <td class="n">61.4 <span style="color:var(--muted)">±8.9</span></td>
+                  <td class="n">9 850 ms <span class="pill done">measured</span></td>
+                  <td class="n">18 740 ms</td>
+                  <td class="n" style="color:var(--warning)">1.50× <span class="pill run">unverified</span></td>
+                  <td><span class="pill fail">2 of 3 repeats implausible</span></td>
+                </tr>
+                <tr style="opacity:.62">
+                  <td class="mono" style="font-size:11px">server·off · 128k/256</td>
+                  <td class="n">—</td><td class="n">—</td>
+                  <td class="n">—</td><td class="n">—</td><td class="n">—</td>
+                  <td><span class="pill skip">skipped · over budget</span></td>
+                </tr>
+                <tr>
+                  <td class="mono" style="font-size:11px">bench · 4k/256 · d8192</td>
+                  <td class="n">1 290 <span style="color:var(--muted)">±9</span></td>
+                  <td class="n">33.4 <span style="color:var(--muted)">±0.2</span></td>
+                  <td class="n" style="color:var(--muted)">n/a</td>
+                  <td class="n" style="color:var(--muted)">n/a</td>
+                  <td class="n">—</td>
+                  <td><span class="pill skip">swa</span></td>
+                </tr>
+                <tr style="opacity:.62">
+                  <td class="mono" style="font-size:11px">bench · 4k/256 · d0 <span style="color:var(--muted)">(Mar 14)</span></td>
+                  <td class="n">1 702</td><td class="n">40.9</td>
+                  <td class="n">2 407 ms <span class="pill queue">derived</span></td>
+                  <td class="n">—</td><td class="n">—</td>
+                  <td><span class="pill queue">pre-v7 method</span></td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p class="note info" style="margin:0">
+            <b>Measured is higher than derived, and that’s the point.</b> The old estimate was prompt
+            tokens ÷ prompt-processing rate — pure engine time. A streamed reading also carries
+            tokenization, queueing and the network, so <span class="mono">2 510 ms</span> against a
+            derived <span class="mono">2 432 ms</span> for the same work is the overhead becoming
+            visible, not a regression. The two are never averaged together.
+            <span class="tag">P0.7</span> <span class="tag">P4.1</span>
+          </p>
+
+          <p class="note muted" style="margin:0">
+            llama-bench rows show <b>n/a</b> for TTFT and end-to-end latency rather than a dash — that
+            engine has no request lifecycle to time. Depth is llama-bench-only for the same reason in
+            reverse: llama-server has no KV-prefill flag, so a server row can never carry one.
+            <span class="tag">P3.3</span>
+          </p>
+
+          <div class="card tight">
+            <span class="lbl">Legend</span>
+            <div class="row" style="font-size:12px;color:var(--muted);align-items:center">
+              <span><i class="sdot ok"></i> done</span>
+              <span><i class="sdot run"></i> running</span>
+              <span><i class="sdot bad"></i> failed</span>
+              <span><i class="sdot skip"></i> skipped — not measured</span>
+              <span><i class="sdot q"></i> queued</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="legend">
+      <div><code>P5.3</code><span>Speedup carries a status, and <b>both halves of the pair are in the table</b>. A ratio whose baseline isn’t visible is unauditable — every twin is joined on a config hash that deliberately excludes the speculation fields, so the two rows differ in exactly one thing.</span></div>
+      <div><code>P0.7</code><span>A methodology version on every result row. Retrofitting one after the measurement semantics change is impossible, which is why it ships in the first phase rather than alongside the feature that needs it.</span></div>
+      <div><code>P3.3</code><span>Depth appears only on llama-bench rows and TTFT only on llama-server rows. Each engine reports what it can actually measure; neither is padded with a placeholder that looks like data.</span></div>
+    </div>
+  </section>
+
+  <!-- ============================= CLOSE ============================= -->
+  <section class="close" id="delta">
+    <h2>What this changes about the current UI</h2>
+    <div class="delta">
+      <div class="card">
+        <h5>New route <span class="mono" style="color:var(--accent)">/benchmark</span>, two tabs</h5>
+        <p><span class="mono">/new-run</span> stays exactly as it is and becomes Test A’s Expert mode.
+          Existing bookmarks keep working; the sidebar entry is renamed.</p>
+      </div>
+      <div class="card">
+        <h5>“Budget” split into two words</h5>
+        <p><b>Sweep size</b> is a count of tests. <b>Per-test time limit</b> is a clock. Calling both
+          “budget” is how an earlier draft came to compare a whole column’s runtime against a
+          per-test timeout and conclude that runnable work was impossible.</p>
+      </div>
+      <div class="card">
+        <h5>Recommended values are visible and editable</h5>
+        <p>Every stage opens into an editor pre-filled with what it will run. Held-constant fields
+          say why they’re pinned; the three genuinely required ones say what breaks. Reset re-derives
+          from the machine rather than restoring page-load values.</p>
+      </div>
+      <div class="card">
+        <h5>Presets are yours, not a machine’s</h5>
+        <p>Listed on every machine you own, with no hardware filtering, and loaded verbatim — nothing
+          silently re-derived. Where a saved value differs from what this machine would pick, the
+          editor says so and offers the swap. Taking it is your decision.</p>
+      </div>
+      <div class="card">
+        <h5>Two tests, two triggers</h5>
+        <p>Test A chains three llama-bench stages and ends at three profiles. Test B is started
+          separately from one of them and needs no chaining — its runs are all determined up front.
+          The drainer exists for Test A alone.</p>
+      </div>
+      <div class="card">
+        <h5>Runs list groups by root</h5>
+        <p>One expandable row per trigger, with stage pips, one aggregate progress figure, one ETA,
+          one Stop. Cursor pagination lands with it — this multiplies the row count 6×.</p>
+      </div>
+      <div class="card">
+        <h5>Skipped becomes a visible outcome</h5>
+        <p>Hollow dashed ring, its own count in every summary, a reason on hover, and no effect on
+          whether a run reads as done.</p>
+      </div>
+      <div class="card">
+        <h5>Every estimate is labelled</h5>
+        <p>KV size carries a confidence word. TTFT carries measured-vs-derived. Speedup carries
+          ok / unverified. Nothing presents a guess in the same visual register as a measurement —
+          and where nothing has been measured, the field says <b>unavailable</b> rather than
+          extrapolating.</p>
+      </div>
+      <div class="card">
+        <h5>Unknown metadata is a designed state</h5>
+        <p>Header fields are parsed at download time only, so every model registered before this work
+          has none of them. That is the launch-day default, not an edge case, and it gets a card
+          layout and a repair action rather than a row of dashes.</p>
+      </div>
+      <div class="card">
+        <h5>Profiles say what they didn’t measure</h5>
+        <p>Speed and memory only — no perplexity, no accuracy proxy, no column for one. A Low Memory
+          card recommending a 4-bit KV cache carries that boundary in its own copy, because the
+          launch command beside it reads as advice.</p>
+      </div>
+      <div class="card">
+        <h5>Run detail gains a chain rail</h5>
+        <p>Stage breadcrumbs across the top, so a sub-run is never orphaned from the thing it belongs to.</p>
+      </div>
+      <div class="card">
+        <h5>Accessibility bar, stated</h5>
+        <p>Stage pips have text alternatives, stage transitions announce politely, the sweep grid is
+          keyboard-navigable, profile cards are a radio group, mismatched options use
+          <span class="mono">aria-disabled</span> so their reason survives.</p>
+      </div>
+    </div>
+  </section>
+
+</div>

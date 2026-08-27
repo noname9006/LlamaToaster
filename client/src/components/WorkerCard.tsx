@@ -376,6 +376,27 @@ export function WorkerCard({ worker, onRefresh }: { worker: Worker; onRefresh: (
         )}
         <div className="flex items-center gap-2">
           {worker.backend && <StatusPill label={worker.backend} tone="muted" />}
+          {/* BENCHMARKING_PLAN_V8.md M6 -- sensor availability declared UP
+              FRONT, so a later thermally_throttled flag never surprises a
+              machine that could never have produced one, and its absence on a
+              sensorless box is stated rather than mysterious. */}
+          {worker.sensors ? (
+            <StatusPill
+              label={
+                worker.sensors.clock && worker.sensors.temp
+                  ? "clock · temp available"
+                  : worker.sensors.clock
+                    ? "clock only"
+                    : worker.sensors.temp
+                      ? "temp only"
+                      : "no sensors"
+              }
+              tone={worker.sensors.clock || worker.sensors.temp ? "accent" : "muted"}
+            />
+          ) : (
+            <StatusPill label="sensors unreported" tone="muted" />
+          )}
+          {worker.cpuIsa && <StatusPill label={worker.cpuIsa} tone="muted" />}
           <WorkerStatusPill inaccessible={inaccessible} />
           {!inaccessible && (
             <button

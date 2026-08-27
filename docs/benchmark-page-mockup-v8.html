@@ -1,0 +1,860 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Benchmark Console — v8 Amendment Layer</title>
+<style>
+  :root{
+    --bg:#0b0d12; --surface:#12151c; --raised:#171b24; --border:#262b36;
+    --fg:#e8e9ec; --muted:#8b92a3; --accent:#6ea8fe; --accent-fg:#0b0e14;
+    --success:#86ef9e; --success-bg:#143323;
+    --danger:#ff9b9b;  --danger-bg:#3a1f1f;
+    --warning:#ffd479; --warning-bg:#3a2f13;
+    --skip:#8b92a3;    --skip-bg:#1b1f28;
+    --mono:ui-monospace,SFMono-Regular,"Cascadia Code",Menlo,Consolas,monospace;
+    --sans:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  }
+  :root{color-scheme:dark}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font-family:var(--sans);
+       -webkit-font-smoothing:antialiased;line-height:1.5}
+  .mono{font-family:var(--mono);font-variant-numeric:tabular-nums}
+  .num{font-variant-numeric:tabular-nums}
+
+  .page{max-width:1180px;margin:0 auto;padding:34px 22px 90px}
+  .masthead{border-bottom:1px solid var(--border);padding-bottom:22px;margin-bottom:8px}
+  .eyebrow{font-size:11px;letter-spacing:.13em;text-transform:uppercase;color:var(--muted);
+           font-family:var(--mono)}
+  h1{font-size:29px;line-height:1.15;margin:10px 0 8px;text-wrap:balance;letter-spacing:-.015em}
+  .lede{color:var(--muted);font-size:14.5px;max-width:70ch;margin:0}
+  .tocbar{position:sticky;top:0;z-index:40;background:rgba(11,13,18,.93);
+          backdrop-filter:blur(8px);border-bottom:1px solid var(--border);
+          display:flex;gap:4px;flex-wrap:wrap;padding:9px 0;margin:22px 0 30px}
+  .tocbar a{font-size:12px;color:var(--muted);text-decoration:none;padding:5px 11px;
+            border-radius:7px;border:1px solid transparent}
+  .tocbar a:hover,.tocbar a:focus-visible{color:var(--fg);border-color:var(--border);background:var(--surface)}
+
+  .screen{margin:0 0 52px}
+  .screen > h2{font-size:17px;margin:0 0 4px;letter-spacing:-.01em}
+  .screen > .why{color:var(--muted);font-size:13px;margin:0 0 14px;max-width:72ch}
+  .frame{border:1px solid var(--border);border-radius:12px;overflow:hidden;background:var(--bg)}
+  .routebar{display:flex;align-items:center;gap:9px;padding:8px 13px;background:var(--surface);
+            border-bottom:1px solid var(--border);font-family:var(--mono);font-size:11.5px;color:var(--muted)}
+  .dots{display:flex;gap:5px}
+  .dots i{width:8px;height:8px;border-radius:9999px;background:var(--border);display:block}
+  .app{display:grid;grid-template-columns:172px 1fr}
+  @media (max-width:820px){.app{grid-template-columns:1fr}.rail{display:none}}
+  .rail{border-right:1px solid var(--border);background:var(--surface);padding:14px 10px;display:flex;
+        flex-direction:column;gap:2px}
+  .rail .logo{font-weight:700;font-size:13.5px;padding:4px 10px 14px}
+  .rail .logo span{color:var(--accent)}
+  .rail a{font-size:12.5px;color:var(--muted);text-decoration:none;padding:7px 10px;border-radius:8px}
+  .rail a.on{background:rgba(110,168,254,.14);color:var(--accent);font-weight:600}
+  .main{padding:18px;display:flex;flex-direction:column;gap:14px;min-width:0}
+
+  .card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:14px}
+  .card.tight{padding:11px 13px}
+  .lbl{font-size:10.5px;letter-spacing:.09em;text-transform:uppercase;color:var(--muted);
+       font-family:var(--mono);display:block;margin-bottom:7px}
+  .row{display:flex;gap:12px;flex-wrap:wrap}
+  .row.tight{gap:8px}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  @media (max-width:700px){.grid2{grid-template-columns:1fr}}
+  .between{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
+  .kv{display:flex;justify-content:space-between;gap:16px;font-size:12.5px;padding:3px 0}
+  .kv dt{color:var(--muted)} .kv dd{margin:0;font-family:var(--mono);font-variant-numeric:tabular-nums}
+  dl{margin:0}
+
+  .pill{display:inline-flex;align-items:center;gap:5px;border-radius:9999px;padding:2px 9px;
+        font-size:10.5px;font-weight:700;letter-spacing:.02em}
+  .pill.done{background:var(--success-bg);color:var(--success)}
+  .pill.run{background:var(--warning-bg);color:var(--warning)}
+  .pill.fail{background:var(--danger-bg);color:var(--danger)}
+  .pill.skip{background:var(--skip-bg);color:var(--skip);border:1px dashed var(--border)}
+  .pill.acc{background:rgba(110,168,254,.14);color:var(--accent)}
+  .pill.queue{background:var(--raised);color:var(--muted)}
+
+  .chip{border:1px solid var(--border);background:var(--raised);color:var(--muted);
+        border-radius:9999px;padding:4px 11px;font-size:12px;display:inline-block}
+  .chip.sel{border-color:var(--accent);color:var(--accent);background:rgba(110,168,254,.10);font-weight:600}
+  .chip.dis{opacity:.45}
+  .chip.off{text-decoration:line-through;opacity:.4}
+  .seg{display:inline-flex;border:1px solid var(--border);border-radius:9px;overflow:hidden}
+  .seg button{background:var(--raised);color:var(--muted);border:0;padding:7px 15px;font:inherit;
+              font-size:12.5px;cursor:pointer}
+  .seg button.on{background:var(--accent);color:var(--accent-fg);font-weight:650}
+  .btn{background:var(--accent);color:var(--accent-fg);border:0;border-radius:9px;padding:9px 20px;
+       font:inherit;font-size:13px;font-weight:700;cursor:pointer;text-decoration:none}
+  .btn.ghost{background:transparent;color:var(--muted);border:1px solid var(--border);font-weight:500}
+  .btn.sm{padding:5px 12px;font-size:11.5px;font-weight:600}
+  .btn:focus-visible,.seg button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+
+  .note{border-radius:9px;padding:10px 12px;font-size:12.5px;line-height:1.5;border:1px solid}
+  .note.warn{background:var(--warning-bg);border-color:rgba(255,212,121,.28);color:#f2ddb0}
+  .note.warn b{color:var(--warning)}
+  .note.info{background:rgba(110,168,254,.08);border-color:rgba(110,168,254,.24);color:#c6d6f2}
+  .note.info b{color:var(--accent)}
+  .note.muted{background:var(--raised);border-color:var(--border);color:var(--muted)}
+  .note.muted b{color:var(--fg)}
+
+  .sdot{display:inline-block;width:8px;height:8px;border-radius:9999px;flex:none}
+  .sdot.ok{background:var(--success)}
+  .sdot.run{background:var(--warning)}
+  .sdot.bad{background:var(--danger)}
+  .sdot.q{background:var(--muted);opacity:.4}
+  .sdot.skip{width:12px;height:12px;background:var(--skip-bg);
+             border:2px solid var(--muted);opacity:.9}
+
+  table{width:100%;border-collapse:collapse;font-size:12.5px}
+  th{text-align:left;font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);
+     font-family:var(--mono);font-weight:600;padding:7px 9px;border-bottom:1px solid var(--border);white-space:nowrap}
+  td{padding:8px 9px;border-bottom:1px solid rgba(38,43,54,.55);vertical-align:middle}
+  td.n{font-family:var(--mono);font-variant-numeric:tabular-nums;text-align:right}
+  .scroll{overflow-x:auto}
+
+  .tag{display:inline-flex;align-items:center;font-family:var(--mono);font-size:10px;font-weight:700;
+       letter-spacing:.03em;color:var(--accent);background:rgba(110,168,254,.13);
+       border:1px solid rgba(110,168,254,.32);border-radius:5px;padding:1px 5px;margin-left:7px;
+       vertical-align:middle;white-space:nowrap}
+  .tag.b{color:var(--success);background:rgba(134,239,158,.10);border-color:rgba(134,239,158,.30)}
+  .legend{margin-top:12px;border-left:2px solid var(--border);padding:2px 0 2px 14px;
+          display:flex;flex-direction:column;gap:7px}
+  .legend div{font-size:12.5px;color:var(--muted);display:flex;gap:9px;align-items:baseline}
+  .legend code{font-family:var(--mono);font-size:10.5px;color:var(--accent);
+               background:rgba(110,168,254,.10);border:1px solid rgba(110,168,254,.26);
+               border-radius:5px;padding:1px 5px;flex:none;white-space:nowrap}
+  .legend code.b{color:var(--success);background:rgba(134,239,158,.08);border-color:rgba(134,239,158,.24)}
+  .legend b{color:var(--fg);font-weight:600}
+
+  .bar{height:5px;border-radius:9999px;background:var(--raised);overflow:hidden;border:1px solid var(--border)}
+  .bar i{display:block;height:100%;background:var(--accent)}
+
+  .profiles{display:grid;grid-template-columns:repeat(3,1fr);gap:11px}
+  @media (max-width:860px){.profiles{grid-template-columns:1fr}}
+  .prof{background:var(--raised);border:1px solid var(--border);border-radius:10px;padding:13px;
+        display:flex;flex-direction:column;gap:9px}
+  .prof.sel{border-color:var(--accent);box-shadow:inset 0 0 0 1px rgba(110,168,254,.35)}
+  .prof h4{margin:0;font-size:13px;letter-spacing:-.005em}
+  .fitline{font-size:11.5px;line-height:1.45;border-left:2px solid var(--border);padding-left:9px;color:var(--muted)}
+  .fitline b{color:var(--fg)}
+  .cmd{font-family:var(--mono);font-size:10.5px;line-height:1.45;color:var(--muted);
+       background:var(--bg);border:1px solid var(--border);border-radius:7px;padding:8px;
+       word-break:break-all}
+
+  .qblock{display:flex;flex-direction:column;gap:11px}
+  .q{display:grid;grid-template-columns:150px 1fr;gap:10px;align-items:start}
+  @media (max-width:640px){.q{grid-template-columns:1fr}}
+  .q > .qt{font-size:12px;color:var(--fg);padding-top:6px}
+  .q > .qt small{display:block;color:var(--muted);font-size:10.5px;font-weight:400;margin-top:2px}
+  .reveal{border:1px dashed var(--border);border-radius:8px;padding:9px 11px;margin-top:8px;
+          font-size:11.5px;color:var(--muted)}
+
+  .kneecols{display:grid;grid-template-columns:1fr 1fr;gap:18px;align-items:end}
+  @media (max-width:700px){.kneecols{grid-template-columns:1fr}}
+  .vbars{display:flex;align-items:flex-end;gap:14px;height:120px;padding-top:6px}
+  .vbar{width:44px;border-radius:6px 6px 0 0;background:var(--raised);outline:1px solid var(--border);
+        display:flex;justify-content:center;color:var(--muted);font-size:10px;padding-top:3px}
+  .vbar.hot{background:rgba(255,155,155,.16);outline-color:rgba(255,155,155,.45);color:var(--danger)}
+  .vx{display:flex;gap:14px;margin-top:5px}
+  .vx span{width:44px;text-align:center;font-size:10.5px;color:var(--muted)}
+
+  .sw{width:36px;height:20px;border-radius:9999px;background:var(--border);position:relative;
+      display:inline-block;vertical-align:middle;cursor:pointer;flex:none}
+  .sw.on{background:var(--success)}
+  .sw::after{content:"";position:absolute;top:2px;left:2px;width:16px;height:16px;
+             border-radius:9999px;background:#fff;transition:.15s}
+  .sw.on::after{left:18px}
+
+  .annoswitch{margin-left:auto;display:inline-flex;align-items:center;gap:6px;font-family:var(--sans);
+              font-size:11.5px;color:var(--muted);cursor:pointer;padding:5px 11px;border-radius:7px;
+              border:1px solid transparent}
+  .annoswitch:hover,.annoswitch:focus-visible{color:var(--fg);border-color:var(--border);background:var(--surface)}
+  .annoswitch input{accent-color:var(--accent);margin:0}
+  body.hide-anno .frame .tag{display:none}
+
+  .field{display:inline-block;font-family:var(--mono);font-size:12px;color:var(--fg);background:var(--bg);
+         border:1px solid var(--border);border-radius:8px;padding:4px 10px}
+  .hint{font-size:11px;color:var(--muted);line-height:1.5;margin:7px 0 0}
+
+  .prof.ph{align-self:start;border-style:dashed;background:transparent}
+  .vbars{position:relative}
+  .kneeline{position:absolute;left:-4px;right:-4px;bottom:51.6%;border-top:1px dashed rgba(255,155,155,.65);
+            pointer-events:none}
+  .kneeline span{position:absolute;right:0;bottom:3px;font-size:9.5px;color:var(--danger);white-space:nowrap}
+  .vx span.hot{color:var(--danger);font-weight:700}
+
+  .close{border-top:1px solid var(--border);margin-top:14px;padding-top:26px}
+  .close h2{font-size:17px;margin:0 0 12px}
+  .delta{display:grid;grid-template-columns:1fr 1fr;gap:11px}
+  @media (max-width:760px){.delta{grid-template-columns:1fr}}
+  .delta .card h5{margin:0 0 5px;font-size:12.5px}
+  .delta .card p{margin:0;font-size:12.5px;color:var(--muted)}
+  a{color:var(--accent)}
+  @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+</style>
+</head>
+<body>
+
+<div class="page">
+
+  <div class="masthead">
+    <div class="eyebrow">LlamaToaster · interface proposal for BENCHMARKING_PLAN_V8.md</div>
+    <h1>Benchmark Console — the user-needs layer</h1>
+    <p class="lede">Four screens showing what Part A (amendments M1–M7) and the benchmark-visible part
+      of Part B (N1, N2, N5, N6, N7) add on top of the v7 console: a stated goal before anything runs,
+      estimates that answer the inverse question (“what fits?”), profile cards that rank on intent and
+      admit when they rank on estimates, thermal reality kept as data, and concurrency as a measured
+      knee instead of folklore. Tags <span class="tag">M2</span> mark amendments,
+      <span class="tag" style="color:var(--success);background:rgba(134,239,158,.10);border-color:rgba(134,239,158,.30)">N5</span>
+      marks capabilities. All figures are arithmetically consistent with the rates each screen states.</p>
+  </div>
+
+  <nav class="tocbar" aria-label="Screens">
+    <a href="#s1">1 · Goals + Test A trigger</a>
+    <a href="#s2">2 · Scored profiles</a>
+    <a href="#s3">3 · Run detail — sustained state</a>
+    <a href="#s4">4 · Test B — target, slots, curves</a>
+    <a href="#delta">What v8 changes</a>
+    <label class="annoswitch" title="Plan-reference tags inside the screens (M1–M7, N1–N7)">
+      <input type="checkbox" id="annoswitch" checked>plan annotations
+    </label>
+  </nav>
+
+  <!-- ============================= SCREEN 1 ============================= -->
+  <section class="screen" id="s1">
+    <h2>1 · Test A — the goal is captured before the grid is built</h2>
+    <p class="why">Everything downstream — scoring weights, the KV axis, depth anchoring, which cards
+      exist at completion — derives from three visible questions and one collapsed one. Skipping them
+      reproduces exactly the previous behavior.</p>
+
+    <div class="frame">
+      <div class="routebar"><span class="dots"><i></i><i></i><i></i></span> llamatoaster.local /benchmark</div>
+      <div class="app">
+        <aside class="rail">
+          <div class="logo">Llama<span>Toaster</span></div>
+          <a href="#s1">Dashboard</a><a href="#s1">Models</a>
+          <a href="#s1" class="on">Benchmark</a>
+          <a href="#s1">Runs</a><a href="#s1">Compare</a><a href="#s1">Machines</a>
+        </aside>
+
+        <div class="main">
+          <div class="grid2">
+            <div class="card">
+              <span class="lbl">Model</span>
+              <div class="mono" style="font-size:12.5px">Qwen3-30B-A3B-Instruct-Q4_K_M.gguf</div>
+              <dl style="margin-top:9px">
+                <div class="kv"><dt>Size on disk</dt><dd>17.3 GB</dd></div>
+                <div class="kv"><dt>Layers · experts</dt><dd>48 · 128 (MoE)</dd></div>
+                <div class="kv"><dt>KV heads · head dim</dt><dd>4 · 128 <span class="pill done">read ✓</span></dd></div>
+                <div class="kv"><dt>Trained context</dt><dd>32 768 <span class="pill done">read ✓</span></dd></div>
+                <div class="kv"><dt>Sliding window</dt><dd style="color:var(--muted)">none — plain GQA</dd></div>
+              </dl>
+            </div>
+            <div class="card">
+              <span class="lbl">Machine</span>
+              <div class="mono" style="font-size:12.5px">toaster-01</div>
+              <dl style="margin-top:9px">
+                <div class="kv"><dt>GPU</dt><dd>RX 6600 XT · 8 192 MiB</dd></div>
+                <div class="kv"><dt>Backend · build</dt><dd>vulkan · b10516</dd></div>
+                <div class="kv"><dt>Sensors</dt><dd><span class="pill acc">clock · temp available</span></dd></div>
+                <div class="kv"><dt>Status</dt><dd><span class="pill done">idle</span></dd></div>
+              </dl>
+            </div>
+          </div>
+
+          <div class="card">
+            <span class="lbl">What are you optimizing for? <span class="pill queue">skippable — “just optimize” keeps every default</span></span>
+            <div class="qblock" style="margin-top:6px">
+              <div class="q">
+                <span class="qt">Q1 · What matters most?<small>drives ranking and which cards appear</small></span>
+                <div>
+                  <div class="seg" role="radiogroup" aria-label="Goal">
+                    <button role="radio" aria-checked="false">Balanced</button>
+                    <button role="radio" aria-checked="false">Max tok/s</button>
+                    <button class="on" role="radio" aria-checked="true">Max context</button>
+                  </div>
+                  <div class="reveal">
+                    <b>Usable-speed floor</b> — without it, argmax-context degenerates into
+                    “quantize everything and crawl”:
+                    <span role="radiogroup" aria-label="Usable-speed floor">
+                      <span class="chip" role="radio" aria-checked="false">≥ 40 % of best TG</span>
+                      <span class="chip sel" role="radio" aria-checked="true">≥ 50 %</span>
+                      <span class="chip" role="radio" aria-checked="false">≥ 60 %</span>
+                    </span>
+                    <span class="tag">M2</span>
+                  </div>
+                </div>
+              </div>
+              <div class="q">
+                <span class="qt">Q2 · Target context?<small>anchors depth and Test B sizes</small></span>
+                <div>
+                  <div class="row tight" role="radiogroup" aria-label="Target context">
+                    <span class="field mono" aria-label="Typed target context">65 536</span>
+                    <span class="pill queue" style="align-self:center">clamped → 32 768</span>
+                    <span class="chip" role="radio" aria-checked="false">don’t know</span>
+                  </div>
+                  <div class="why" style="font-size:11px;color:var(--muted);margin-top:5px">
+                    Clamped by trained context (32 768). “don’t know” stores a <span class="mono">target_unverified</span>
+                    marker instead of a fit line. Live feasibility: affords 32 k —
+                    <b>yes (~2.5× at q8_0/q8_0)</b>; f16 tops out near 44 k.
+                    <span class="tag">M2</span> <span class="tag">M1</span>
+                  </div>
+                </div>
+              </div>
+              <div class="q">
+                <span class="qt">Q3 · Workload shape?<small>sets the pp/tg scoring weights</small></span>
+                <div>
+                  <div class="seg" role="radiogroup" aria-label="Workload shape">
+                    <button class="on" role="radio" aria-checked="true">Chat · gen-heavy</button>
+                    <button role="radio" aria-checked="false">Documents · prompt-heavy</button>
+                    <button role="radio" aria-checked="false">Even</button>
+                  </div>
+                  <div class="why" style="font-size:11px;color:var(--muted);margin-top:5px">
+                    Weights shown as they will be applied: <span class="mono">(wPP 0.25 · wTG 0.75)</span>.
+                    Answers are stored as configuration under the root run’s <span class="mono">goals</span>
+                    key — reproducible, never re-measured. <span class="tag">M2</span>
+                  </div>
+                </div>
+              </div>
+              <div class="q">
+                <span class="qt">KV quality tolerance<small>collapsed by default — prunes the grid before it runs</small></span>
+                <div>
+                  <div class="row tight" role="radiogroup" aria-label="KV quality tolerance">
+                    <span class="chip" role="radio" aria-checked="false">q4_0 ok</span>
+                    <span class="chip sel" role="radio" aria-checked="true">q8_0 ok</span>
+                    <span class="chip" role="radio" aria-checked="false">f16 only</span>
+                  </div>
+                  <div class="why" style="font-size:11px;color:var(--muted);margin-top:5px">
+                    Forbidden pairs are removed at grid-build time, so the live count and cost estimate
+                    below already reflect it. One unquantized pair always survives so flash-attention-off
+                    keeps something to vary against. <span class="tag">M4</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="card tight" style="background:var(--raised)">
+            <span class="lbl">Affordability — the inverse estimate</span>
+            <div class="row" style="align-items:baseline;gap:18px;flex-wrap:wrap">
+              <span style="font-size:12.5px">Given this card, these weights, this KV type —
+                <b>the largest context that still fits</b>:</span>
+              <span class="mono" style="font-size:12.5px">f16/f16 ≈ <b>44 000 tok</b></span>
+              <span class="mono" style="font-size:12.5px">q8_0/q8_0 ≈ <b>83 000 tok</b></span>
+              <span class="pill acc">confidence: good</span>
+            </div>
+            <p style="font-size:11.5px;color:var(--muted);margin:8px 0 0">
+              From this placement’s resident weights (~2 969 MiB), 10 % activation headroom and scratch,
+              against 96 KiB/token at f16 and 51 KiB/token at q8_0/q8_0. Binding constraint:
+              <span class="mono">kv</span>. Advisory only — it ranks and annotates, it never removes a
+              config from the sweep. <span class="tag">M1</span>
+            </p>
+          </div>
+
+          <div class="card">
+            <div class="between" style="margin-bottom:11px">
+              <span class="lbl" style="margin:0">Chain — 3 stages, all llama-bench</span>
+              <span class="mono" style="font-size:11.5px;color:var(--muted)">46 tests · est. 1 h 58 m</span>
+            </div>
+            <div class="row.tight row" style="gap:8px">
+              <div class="card tight" style="flex:1;background:var(--raised)">
+                <b style="font-size:12.5px">Tune coarse ▾</b>
+                <div class="mono" style="font-size:11px;color:var(--muted)">16 tests · PP only · batch/ubatch</div>
+              </div>
+              <div class="card tight" style="flex:1;background:var(--raised)">
+                <b style="font-size:12.5px">Tune refine ▸</b>
+                <div class="mono" style="font-size:11px;color:var(--muted)">6 tests · rules, not values yet</div>
+              </div>
+              <div class="card tight" style="flex:1;background:var(--raised)">
+                <b style="font-size:12.5px">Sweep ▾</b>
+                <div class="mono" style="font-size:11px;color:var(--muted)">24 tests · KV × FA × ngl × depth</div>
+              </div>
+              <div class="card tight" style="flex:1;background:transparent;border-style:dashed;text-align:center">
+                <b style="font-size:12.5px;color:var(--accent)">cards per goal</b>
+                <div class="mono" style="font-size:11px;color:var(--muted)">Max Context + Low Memory</div>
+              </div>
+            </div>
+
+            <p class="note muted" style="margin:11px 0 0">
+              <b>Sweep axis after your tolerance:</b>
+              <span class="chip sel">f16 / f16 · 1.00×</span>
+              <span class="chip sel">f16 / q8_0 · 0.77×</span>
+              <span class="chip sel">q8_0 / q8_0 · 0.53×</span>
+              <span class="chip off">q8_0 / q4_0 · 0.40×</span>
+              — removed by “q8_0 ok”, before expansion: the count above already shows 24, not 32.
+              The stage says the axis shrank rather than letting the count imply it.
+              <span class="tag">M4</span> <span class="tag">P6.4</span>
+            </p>
+            <p class="note muted" style="margin:9px 0 0">
+              <b>Held fields keep their reasons.</b> Threads read: <i>“held — fully offloaded configs
+              barely feel −t; dominant on CPU-bound rows, where it stays an Expert axis with ISA
+              provenance recorded.”</i> Depth percentages are anchored to your clamped target:
+              <span class="mono">“depth % of your 32k target”</span>. <span class="tag">M7</span> <span class="tag">M2</span>
+            </p>
+          </div>
+
+          <div class="grid2">
+            <div class="card tight">
+              <span class="lbl">Repeats per test</span>
+              <div class="row tight" role="radiogroup" aria-label="Repeats per test">
+                <span class="chip dis" role="radio" aria-checked="false" aria-disabled="true">1</span><span class="chip dis" role="radio" aria-checked="false" aria-disabled="true">2</span>
+                <span class="chip sel" role="radio" aria-checked="true">3</span><span class="chip" role="radio" aria-checked="false">5</span><span class="chip" role="radio" aria-checked="false">10</span>
+              </div>
+              <p style="font-size:11.5px;color:var(--muted);margin:9px 0 0">
+                Fewer than 3 reports a standard deviation of exactly 0 — the stability gate would pass
+                on a number that was never measured. <span class="tag">P0.5</span>
+              </p>
+            </div>
+            <div class="card tight">
+              <span class="lbl">Presets carry intent too</span>
+              <p style="font-size:12px;color:var(--muted);margin:4px 0 9px">
+                Saving now stores the goals block beside the grids — goal, target context, workload
+                shape, KV tolerance. They describe your workload, not a machine, so they load verbatim
+                everywhere, marked like any other loaded value.
+              </p>
+              <div class="row tight">
+                <button class="btn ghost sm">Reset all</button>
+                <button class="btn ghost sm">Load preset ▾</button>
+                <button class="btn ghost sm">Save preset…</button>
+                <button class="btn">Start Test A</button>
+              </div>
+              <div style="font-size:11px;color:var(--muted);margin-top:8px"><span class="tag">M5</span></div>
+            </div>
+          </div>
+
+          <div class="card" style="border-color:rgba(110,168,254,.35);background:rgba(110,168,254,.06)" role="status">
+            <div class="between">
+              <div>
+                <div style="font-size:12.5px;font-weight:650">Once this finishes</div>
+                <div style="font-size:12px;color:var(--muted);margin-top:3px">
+                  Cards ranked for <b>Max context · ≥ 50 % TG · chat</b> — change the goal later and
+                  re-scoring is instant post-processing over stored results, never re-measurement.
+                </div>
+              </div>
+              <a class="btn" href="#s2">Preview scored cards →</a>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="legend">
+      <div><code>M2</code><span>The questionnaire is skippable by construction — accepting defaults is byte-for-byte the previous behavior. Answers are intent stored as configuration, so a modified chain stays reproducible.</span></div>
+      <div><code>M1</code><span>P3.2 ran forward (config → bytes). This runs the inverse and inherits its confidence words verbatim. It never gates: unknown metadata yields confidence <b>unknown</b>, never a fabricated number.</span></div>
+      <div><code>M4</code><span>Pruning happens before expansion so live counts, cost estimates and the invalid-combination breakdown all agree with what will actually run. The unquantized pair is inviolable.</span></div>
+      <div><code>M5</code><span>Goals are intent about the workload — the same reasoning that keeps preset grids portable across machines applies to them verbatim.</span></div>
+      <div><code class="b">N6</code><span>Sensor availability is reported up front (clock · temp available) so a later <span class="mono">thermally_throttled</span> flag never surprises anyone whose machine can’t produce one.</span></div>
+    </div>
+  </section>
+
+  <!-- ============================= SCREEN 2 ============================= -->
+  <section class="screen" id="s2">
+    <h2>2 · Scored cards — ranked on intent, honest about estimates</h2>
+    <p class="why">Under the Max-context goal the card set itself changes: Max Context appears as the
+      lead card and ranks on affordability, saying so in its own copy. Every card carries a fit line
+      from M1, upgraded to a verified number where a probe has run.</p>
+
+    <div class="frame">
+      <div class="routebar"><span class="dots"><i></i><i></i><i></i></span> llamatoaster.local /runs/#r-a114 — sweep done</div>
+      <div class="app">
+        <aside class="rail">
+          <div class="logo">Llama<span>Toaster</span></div>
+          <a href="#s2">Dashboard</a><a href="#s2">Models</a>
+          <a href="#s2" class="on">Benchmark</a>
+          <a href="#s2">Runs</a><a href="#s2">Compare</a><a href="#s2">Machines</a>
+        </aside>
+
+        <div class="main">
+          <div class="card tight">
+            <div class="between">
+              <div style="font-size:12.5px">
+                Scored for: <b>Max context</b> · target 32 k (clamped) · chat <span class="pill queue">wPP 0.25 · wTG 0.75</span>
+              </div>
+              <button class="btn ghost sm">Change goal ▾</button>
+            </div>
+            <p class="hint">Switching the goal re-scores instantly over stored results — never re-measurement.</p>
+          </div>
+
+          <div class="profiles" role="group" aria-label="Profiles">
+            <div class="prof sel">
+              <div class="between"><h4>⬆ MAX CONTEXT</h4><span class="pill acc">this goal</span></div>
+              <div class="cfg mono dim" style="font-size:11px;line-height:1.55">
+                fa on · k/v q8_0<br>ngl 16 · n-cpu-moe 32 · b 2048/ub 512 · d est. 83 k → capped 32 768
+              </div>
+              <dl>
+                <div class="kv"><dt>TG @ 50 %</dt><dd>41.0 tok/s</dd></div>
+                <div class="kv"><dt>Affordable tokens (est.)</dt><dd>83 000</dd></div>
+                <div class="kv"><dt>Pressure</dt><dd>0.88</dd></div>
+              </dl>
+              <div class="fitline">
+                Fit line: affords your 32 k target — <b>yes, ~2.5× headroom</b> · confidence
+                <b>good</b> · binding kv
+              </div>
+              <div class="fitline" style="border-left-color:var(--success)">
+                Verified: <b>up to 30 100 tokens on toaster-01</b> · margin 6 % · probe #p-91
+                <span class="tag" style="color:var(--success);background:rgba(134,239,158,.10);border-color:rgba(134,239,158,.30)">N2</span>
+              </div>
+              <div class="cmd">llama-bench -m model.gguf -fa 1 -ctk q8_0 -ctv q8_0 -ngl 16 --n-cpu-moe 32 -b 2048 -ub 512 -c 32768</div>
+              <p style="font-size:11px;color:var(--warning);margin:0;line-height:1.45">
+                Ranked on estimated fit — not measured at your 32 k target. Verify with a probe run.
+              </p>
+            </div>
+
+            <div class="prof">
+              <div class="between"><h4>🪫 LOW MEMORY</h4><span class="pill queue">always shown</span></div>
+              <div class="cfg mono dim" style="font-size:11px;line-height:1.55">
+                fa on · k/v q8_0<br>ngl 8 · n-cpu-moe 40 · b 2048/ub 512 · d 16 384
+              </div>
+              <dl>
+                <div class="kv"><dt>PP</dt><dd>1 462 tok/s</dd></div>
+                <div class="kv"><dt>TG @ 50 %</dt><dd>38.9 tok/s</dd></div>
+                <div class="kv"><dt>Pressure</dt><dd>0.51</dd></div>
+              </dl>
+              <div class="fitline">
+                Fit line: affords your 32 k target — <b>yes (~2.5×)</b> · confidence <b>good</b>
+              </div>
+              <p style="font-size:11px;color:var(--muted);margin:0;line-height:1.45">
+                Your “q8_0 ok” tolerance removed the 4-bit pairs this card would otherwise consider —
+                the trade it used to offer is one you opted out of.
+              </p>
+              <div class="cmd">llama-bench -m model.gguf -fa 1 -ctk q8_0 -ctv q8_0 -ngl 8 --n-cpu-moe 40 -b 2048 -ub 512</div>
+            </div>
+
+            <div class="prof ph">
+              <div class="between"><h4 style="color:var(--muted)">⚡ MAX SPEED · ⚖ BALANCED</h4><span class="pill skip">hidden</span></div>
+              <p style="font-size:12px;color:var(--muted);line-height:1.5;margin:0">
+                Not produced under this goal — its rule ranks on estimated affordable tokens among
+                configs clearing your ≥ 50 % TG floor.
+              </p>
+              <button class="btn ghost sm">Show for “Balanced” goal</button>
+            </div>
+          </div>
+
+          <p class="hint" style="margin:0">
+            Every card ranks on measured speed and memory (Max Context additionally on estimated
+            fit) — output quality was not measured anywhere on this screen.
+          </p>
+
+          <p class="note muted" style="margin:0">
+            <b>Scoring rejected nothing silently:</b> 24 configs scored — 3 failed the stability gate
+            (n &lt; 3 after skips), 2 carried suspect samples. Tallies surface here because a silent
+            zero-profile outcome is indistinguishable from a bug. <span class="tag">A2</span>
+          </p>
+        </div>
+      </div>
+    </div>
+
+    <div class="legend">
+      <div><code>M3</code><span>Weights are user intent, not physics. The goal decides which cards exist at all; the workload shape sets (wPP, wTG) inside them; FIT redistributes its weight when no target was stated. Defaults hold exactly until usage data says otherwise.</span></div>
+      <div><code>M1</code><span>The fit line annotates; it reorders only the one card whose goal asked to be reordered — and that card’s copy states that an estimate is the criterion.</span></div>
+      <div><code class="b">N2</code><span>Estimate → verify. A probe loads the model at the candidate context and does a short timed interaction; three loads max ever. Verification is per machine+build+KV pair and carries its observed margin — changing any of them yields a fresh probe, never a reused verdict.</span></div>
+      <div><code>M4</code><span>Low Memory can no longer recommend a cache quality the user explicitly opted out of — the card names the removal rather than quietly substituting.</span></div>
+    </div>
+  </section>
+
+  <!-- ============================= SCREEN 3 ============================= -->
+  <section class="screen" id="s3">
+    <h2>3 · Run detail — sustained state is data, not garbage</h2>
+    <p class="why">Clock and temperature ride the same sampler as RAM/VRAM peaks. A throttled repeat
+      half is flagged and kept — a throttled run is information about sustained performance. Policy
+      (re-run offers, steady-state discard) sits on top and is never automatic.</p>
+
+    <div class="frame">
+      <div class="routebar"><span class="dots"><i></i><i></i><i></i></span> llamatoaster.local /runs/#r-b207</div>
+      <div class="app">
+        <aside class="rail">
+          <div class="logo">Llama<span>Toaster</span></div>
+          <a href="#s3">Dashboard</a><a href="#s3">Models</a>
+          <a href="#s3">Benchmark</a>
+          <a href="#s3" class="on">Runs</a><a href="#s3">Compare</a><a href="#s3">Machines</a>
+        </aside>
+
+        <div class="main">
+          <p class="note muted" style="margin:0 0 10px">
+            Why every TTFT here is large: ordinary Test&nbsp;B repeats do
+            <b>not</b> opt into prefix-cache reuse — each of the five repeats re-sends
+            and re-prefills the full prompt at this machine’s measured 310 tok/s, so
+            p50 and p95 are both cold and the run measures what a user actually gets,
+            every time. Warm-prefix generation numbers exist only on the Curves tab,
+            whose choreography enables reuse as a separate, clearly-stamped path.
+          </p>
+
+          <div class="scroll">
+            <table>
+              <thead>
+                <tr><th>Config</th><th style="text-align:right">TTFT p50/p95 · cold</th><th style="text-align:right">E2E mean</th>
+                    <th style="text-align:right">GPU clock min</th><th style="text-align:right">Temp max</th><th>Flags</th></tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td class="mono" style="font-size:11px">server·off · 8k/512</td>
+                  <td class="n">26.4 s / 26.7 s</td><td class="n">39.5 s</td>
+                  <td class="n">2 480 MHz</td><td class="n">78 °C</td><td></td>
+                </tr>
+                <tr>
+                  <td class="mono" style="font-size:11px">server·off · 16k/512</td>
+                  <td class="n">52.9 s / 53.2 s</td><td class="n">66.0 s</td>
+                  <td class="n">2 479 MHz</td><td class="n">81 °C</td><td></td>
+                </tr>
+                <tr>
+                  <td class="mono" style="font-size:11px">server·off · 32k/512</td>
+                  <td class="n">105.8 s / 106.3 s</td><td class="n">119.0 s</td>
+                  <td class="n" style="color:var(--warning)">1 971 MHz</td><td class="n" style="color:var(--warning)">89 °C</td>
+                  <td><span class="pill fail" style="background:var(--warning-bg);color:var(--warning)">thermally_throttled</span></td>
+                </tr>
+                <tr style="opacity:.62">
+                  <td class="mono" style="font-size:11px">server·off · 128k/512</td>
+                  <td class="n">—</td><td class="n">—</td>
+                  <td class="n">—</td><td class="n">—</td>
+                  <td><span class="pill skip">skipped · beyond trained ctx</span></td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p class="note warn" style="margin:10px 0 0">
+            <b>One row throttled mid-item.</b> Clock sagged from ~2 480 MHz across the first half of
+            repeats to 1 971 MHz in the second while temperature peaked at 89 °C. The row is
+            <b>kept, not failed</b> — burst vs sustained is exactly the distinction this column exists
+            to make visible. Kept in every aggregate by default. <span class="tag">M6</span>
+          </p>
+
+          <div class="grid2">
+            <div class="card tight">
+              <div class="between">
+                <span class="lbl" style="margin:0">Steady-state option</span>
+                <span class="sw on" role="switch" aria-checked="true" aria-label="Discard first repeat"></span>
+              </div>
+              <p style="font-size:12px;color:var(--muted);margin:8px 0 0">
+                Discard first <b>1</b> repeat on thermally volatile machines — implemented as a
+                scoring-side exclusion recorded in this run’s config, never post-hoc trimming outside
+                the stored configuration. Requires repeats ≥ 4 here: discarding from 3 would leave n = 2
+                and break the stability gate’s n ≥ 3 floor.
+                <span class="tag" style="color:var(--success);background:rgba(134,239,158,.10);border-color:rgba(134,239,158,.30)">N6</span>
+              </p>
+            </div>
+            <div class="card tight">
+              <span class="lbl">Throttle-aware follow-up</span>
+              <p style="font-size:12px;color:var(--muted);margin:4px 0 9px">
+                1 of 4 items flagged. When more than a third of a run flags, the completion screen
+                offers a priced re-run of just those items after cooldown. Never automatic.
+              </p>
+              <button class="btn ghost sm">Re-run flagged item · est. 14 m</button>
+              <p class="hint">Offered with a price estimate — never scheduled automatically.</p>
+            </div>
+          </div>
+
+          <div class="between">
+            <span style="font-size:12px;color:var(--muted)">
+              Provenance: rows stamped <span class="mono">method_version 1</span> · clock/temp sampled
+              on the same 6 s cadence as VRAM, worst-source tracking like memory
+            </span>
+            <button class="btn ghost sm">Export bundle ⤓</button>
+          </div>
+          <p class="note muted" style="margin:0">
+            The export embeds a rendered summary of the pipeline keyed to its method version — warmup,
+            streaming clock, suspect filter, stddev floor — plus dataset hashes where quality rows
+            exist, so every shared number carries its own methods section. Imported rows are badged
+            and never merge into local scoring unless opted in. <span class="tag" style="color:var(--success);background:rgba(134,239,158,.10);border-color:rgba(134,239,158,.30)">N7</span>
+          </p>
+        </div>
+      </div>
+    </div>
+
+    <div class="legend">
+      <div><code>M6</code><span>Two integer columns (clock min, temp max) plus a sampled series are enough to see sag-between-halves honestly; aggregates alone cannot detect a trend, which is why the series rides along. NULL where the platform exposes no sensors — availability is declared on the machine card first.</span></div>
+      <div><code class="b">N6</code><span>M6 measures; N6 decides. Both policies are recorded in configuration and offered, never automatic — trimming repeats outside the stored config would make results non-reproducible.</span></div>
+      <div><code class="b">N7</code><span>Round-trip fidelity: recomputed hashes per row, per-row validation on import (one tampered field rejects exactly that row), and community aggregates stay behind the existing k-anonymity floor.</span></div>
+    </div>
+  </section>
+
+  <!-- ============================= SCREEN 4 ============================= -->
+  <section class="screen" id="s4">
+    <h2>4 · Test B — anchored to the target, slots swept, curves delivered</h2>
+    <p class="why">The questionnaire pre-selects the prompt sizes around the stated target; the
+      concurrency ladder turns batching folklore into a measured knee; and the depth axis v7 deferred
+      for llama-server ships as a first-class curve artifact with its correctness questions answered.</p>
+
+    <div class="frame">
+      <div class="routebar"><span class="dots"><i></i><i></i><i></i></span> llamatoaster.local /benchmark?test=b</div>
+      <div class="app">
+        <aside class="rail">
+          <div class="logo">Llama<span>Toaster</span></div>
+          <a href="#s4">Dashboard</a><a href="#s4">Models</a>
+          <a href="#s4" class="on">Benchmark</a>
+          <a href="#s4">Runs</a><a href="#s4">Compare</a><a href="#s4">Machines</a>
+        </aside>
+
+        <div class="main">
+          <div class="card">
+            <span class="lbl">Prompt × generation matrix</span>
+            <div class="row tight" style="margin-bottom:8px">
+              <span role="radiogroup" aria-label="Prompt sizes" class="row tight" style="display:inline-flex;gap:8px">
+                <span class="chip sel" role="radio" aria-checked="true">4k</span><span class="chip sel" role="radio" aria-checked="true">16k</span><span class="chip sel" role="radio" aria-checked="true">32k</span>
+                <span class="chip" role="radio" aria-checked="false">64k</span>
+              </span>
+              <span class="pill queue" style="margin-left:6px">pre-selected around your 32k target</span>
+              <span class="tag">M2</span>
+            </div>
+            <p class="mono" style="font-size:10.5px;color:var(--muted);margin:0">
+              priced from toaster-01’s measured 310 tok/s cold prefill · 39 tok/s generation · 50 s load · 5 repeats
+            </p>
+          </div>
+
+          <div class="card">
+            <div class="between" style="margin-bottom:8px">
+              <span class="lbl" style="margin:0">Concurrency — where batching stops being free</span>
+              <span class="mono" style="font-size:11.5px;color:var(--muted)">slots {1 · 2 · 4 · 8} · cells fixed from your target</span>
+            </div>
+            <div class="kneecols">
+              <div>
+              <div class="vbars">
+                <div class="vbar" style="height:26%">107 s</div>
+                <div class="vbar" style="height:28%">118 s</div>
+                <div class="vbar hot" style="height:54%">226 s</div>
+                <div class="vbar hot" style="height:100%">415 s</div>
+                <div class="kneeline"><span>knee · 2 × slots=1 = 214 s</span></div>
+              </div>
+              <div class="vx"><span>1</span><span>2</span><span class="hot">4</span><span>8</span></div>
+                <div style="font-size:10.5px;color:var(--muted);margin-top:3px">TTFT p95, s</div>
+              </div>
+              <div style="font-size:12px;color:var(--muted);line-height:1.6">
+                <b style="color:var(--fg)">Knee at slots = 4</b> — the smallest slot count whose TTFT
+                p95 exceeds 2× its slots=1 value (226 s &gt; 2 × 107 s; cells are full
+                cold prefills at this machine’s measured 310 tok/s). Aggregate throughput
+                still rises (39 → 68 → 101 → 108 tok/s) but per-user latency has already
+                collapsed past this point. Stored as ordinary rows with <span class="mono">concurrency</span> set; the knee
+                is derived on read, not a stored verdict.
+                <span class="tag" style="color:var(--success);background:rgba(134,239,158,.10);border-color:rgba(134,239,158,.30)">N5</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="between" style="margin-bottom:8px">
+              <span class="lbl" style="margin:0">Context curve — this model · this machine · b10516 · server <span class="pill acc" style="margin-left:6px">method_version 2</span></span>
+              <span class="row tight">
+                <button class="btn ghost sm">Measure missing points</button>
+                <button class="btn ghost sm">Open Curves tab ↗</button>
+              </span>
+            </div>
+            <div class="scroll">
+              <table>
+                <thead><tr><th>effective ctx</th><th style="text-align:right">TG tok/s</th><th style="text-align:right">TTFT (cold)</th><th>status</th></tr></thead>
+                <tbody>
+                  <tr><td class="mono">8 192</td><td class="n">39.1</td><td class="n">26.4 s</td><td><span class="sdot ok"></span> measured</td></tr>
+                  <tr style="opacity:.5"><td class="mono">16 384</td><td class="n">38.2</td><td class="n">53.4 s</td><td><span class="pill skip">superseded — re-measured later</span></td></tr>
+                  <tr><td class="mono">16 384</td><td class="n">38.8</td><td class="n">52.9 s</td><td><span class="sdot ok"></span> measured</td></tr>
+                  <tr><td class="mono">32 768</td><td class="n">38.4</td><td class="n">105.8 s</td><td><span class="sdot ok"></span> measured <span class="pill queue">target marker ▸</span></td></tr>
+                  <tr style="opacity:.62"><td class="mono">65 536</td><td class="n">—</td><td class="n">—</td><td><span class="pill skip">unavailable — trained ctx 32 768</span></td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="note info" style="margin:10px 0 0">
+              Server-path points measure prefill cost once per point with a timed streamed request
+              (that reading <b>is</b> the TTFT column), then run remaining repeats against the warm
+              cache for clean generation numbers — the two clocks never average together. If the
+              server evicts mid-run the row flags <span class="mono">cache_evicted</span> and drops out
+              of the curve with a tooltip; if a context shift appears in logs and the binary lacks
+              <span class="mono">--no-context-shift</span>, the row flags too — shifted contexts
+              silently corrupt TTFT comparability. No new table: a curve is a deterministic grouping
+              over <span class="mono">results</span>.
+              <span class="tag" style="color:var(--success);background:rgba(134,239,158,.10);border-color:rgba(134,239,158,.30)">N1</span>
+            </p>
+          </div>
+
+          <div class="between">
+            <span style="font-size:12px;color:var(--muted)">
+              Creates 3 runs, one per selected card · sharing a root · sourced from chain <span class="mono">#4f2a</span>
+            </span>
+            <button class="btn">Start Test B</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="legend">
+      <div><code class="b">N5</code><span>Promotes v7’s deferred P5.4: the load driver extraction was already a prerequisite, the knee finder completes it. Non-goals hold — no think-time simulation, no network realism; this characterizes the server, not the LAN.</span></div>
+      <div><code class="b">N1</code><span>Closes P3.3’s explicit deferral. Cache reuse semantics differ from ordinary runs and ship as separate code paths — reuse may not silently turn on behind this feature’s flag.</span></div>
+      <div><code>M2</code><span>Target context anchors Test B size pre-selection, so the default matrix is centered on the user’s stated question rather than a fixed ladder.</span></div>
+    </div>
+  </section>
+
+  <!-- ============================= CLOSE ============================= -->
+  <section class="close" id="delta">
+    <h2>What v8 changes on top of the v7 console</h2>
+    <div class="delta">
+      <div class="card">
+        <h5><span class="tag" style="margin-left:0">M1</span> Affordability inversion</h5>
+        <p>“How fast” gains a sibling: “what’s the largest context that still fits?” Advisory-only,
+          confidence-worded, feeding fit lines everywhere and ranking exactly one card.</p>
+      </div>
+      <div class="card">
+        <h5><span class="tag" style="margin-left:0">M2</span> Goal questionnaire</h5>
+        <p>Three questions + one collapsed. Skippable by construction; answers stored as config;
+          re-scoring is instant post-processing, never re-measurement.</p>
+      </div>
+      <div class="card">
+        <h5><span class="tag" style="margin-left:0">M3</span> Goal-parameterized cards</h5>
+        <p>Fixed weights replaced by stated intent. Card membership follows the goal; Max Context
+          ranks on estimates and says so in its own copy.</p>
+      </div>
+      <div class="card">
+        <h5><span class="tag" style="margin-left:0">M4</span> Tolerance prunes the KV axis</h5>
+        <p>Forbidden pairs leave the grid before expansion — counts, costs and breakdowns agree with
+          what runs. One unquantized pair always survives.</p>
+      </div>
+      <div class="card">
+        <h5><span class="tag" style="margin-left:0">M5</span> Presets carry goals</h5>
+        <p>Intent about the workload travels with the grids, loaded verbatim and marked, on every
+          machine the preset owner has.</p>
+      </div>
+      <div class="card">
+        <h5><span class="tag" style="margin-left:0">M6</span> Thermal telemetry</h5>
+        <p>Clock-min and temp-max columns plus a sampled series; sag between halves flags
+          the row and keeps it — sustained performance is data. Vendor-split truth:
+          nvidia-smi · <b>rocm-smi</b> · amdgpu hwmon; unavailable platforms declare so.</p>
+      </div>
+      <div class="card">
+        <h5><span class="tag" style="margin-left:0">M7</span> Threads held, with the reason</h5>
+        <p>Held fields state why −t doesn’t vary on GPU-bound chains, and where it remains a first-
+          class axis instead.</p>
+      </div>
+      <div class="card">
+        <h5><span class="tag b" style="margin-left:0">N1</span>/<span class="tag b" style="margin-left:0">N2</span> Curves + verified limits</h5>
+        <p>The depth axis v7 deferred for llama-server becomes a deliverable; M1’s arithmetic becomes
+          a probed, margin-carrying verified number.</p>
+      </div>
+      <div class="card">
+        <h5><span class="tag b" style="margin-left:0">N5</span> Concurrency knee</h5>
+        <p>Slots ladder with a defined knee — smallest slot count where TTFT p95 exceeds 2× its
+          slots=1 value — derived from stored rows, never asserted.</p>
+      </div>
+      <div class="card">
+        <h5><span class="tag b" style="margin-left:0">N6</span>/<span class="tag b" style="margin-left:0">N7</span> Sustained policy + exchange</h5>
+        <p>Steady-state discard and priced throttle re-runs, both recorded in config; export bundles
+          that carry their own methods section and validate per row on import.</p>
+      </div>
+      <div class="card">
+        <h5><span class="tag b" style="margin-left:0">N3</span>/<span class="tag b" style="margin-left:0">N4</span> Live elsewhere</h5>
+        <p>Multi-model quant comparisons gain blocking fairness checks on their own flow; perplexity/
+          KLD arrives as a labeled synthetic proxy — a footnote and a comparison column, never inside
+          a ranking argmax until calibrated.</p>
+      </div>
+      <div class="card">
+        <h5>Boundary unchanged</h5>
+        <p>Speed and memory always measured; quality only as a labeled proxy; estimates annotate and
+          rank only where the goal asks; every policy is offered, none automatic.</p>
+      </div>
+    </div>
+  </section>
+
+</div>
+<script>
+  document.getElementById('annoswitch').addEventListener('change', function () {
+    document.body.classList.toggle('hide-anno', !this.checked);
+  });
+</script>
+</body>
+</html>

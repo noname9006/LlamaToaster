@@ -1,9 +1,18 @@
 import type { SweepConfig, TestType } from "./types.js";
+import { DEPTH_RULE_REJECTION_MESSAGE, engineFromItem } from "./engineSpec.js";
 
 export interface SweepItem {
   idx: number;
   n_prompt: number;
   n_gen: number;
+  // KV-prefill depth (llama-bench's -d): prefills KV before each test so
+  // TG measures a context already populated to n_depth. llama-bench only --
+  // always 0 on any item routed to llama-server (see validateDepthRule).
+  n_depth: number;
+  // N5 -- concurrent streaming slots (1 = solo; >1 rides the load driver
+  // against llama-server). Always present, defaulted to 1 by expandSweep for
+  // legacy payloads.
+  concurrency: number;
   threads: number;
   n_gpu_layers: number;
   batch_size: number;
@@ -77,6 +86,12 @@ function isValidCombo(cache_type_k: string, cache_type_v: string, flash_attn: st
 
 export function expandSweep(sweep: Omit<SweepConfig, "model_id">): SweepItem[] {
   const items: SweepItem[] = [];
+  // Defaulted (not required) so legacy sweep payloads without the axis keep
+  // expanding -- in the identical order, since n_depth/concurrency nest
+  // innermost of all.
+  const n_depthValues = Array.isArray(sweep.n_depth) && sweep.n_depth.length > 0 ? sweep.n_depth : [0];
+  const concurrencyValues =
+    Array.isArray(sweep.concurrency) && sweep.concurrency.length > 0 ? sweep.concurrency : [1];
   for (const n_prompt of sweep.n_prompt) {
     for (const n_gen of sweep.n_gen) {
       for (const threads of sweep.threads) {
@@ -90,21 +105,27 @@ export function expandSweep(sweep: Omit<SweepConfig, "model_id">): SweepItem[] {
                     for (const mtp of sweep.mtp) {
                       for (const n_gpu_layers_draft of sweep.n_gpu_layers_draft) {
                         for (const n_cpu_moe of sweep.n_cpu_moe) {
-                          items.push({
-                            idx: items.length,
-                            n_prompt,
-                            n_gen,
-                            threads,
-                            n_gpu_layers,
-                            batch_size,
-                            ubatch_size,
-                            cache_type_k,
-                            cache_type_v,
-                            flash_attn,
-                            mtp,
-                            n_gpu_layers_draft,
-                            n_cpu_moe,
-                          });
+                          for (const n_depth of n_depthValues) {
+                            for (const concurrency of concurrencyValues) {
+                              items.push({
+                                idx: items.length,
+                                n_prompt,
+                                n_gen,
+                                n_depth,
+                                concurrency,
+                                threads,
+                                n_gpu_layers,
+                                batch_size,
+                                ubatch_size,
+                                cache_type_k,
+                                cache_type_v,
+                                flash_attn,
+                                mtp,
+                                n_gpu_layers_draft,
+                                n_cpu_moe,
+                              });
+                            }
+                          }
                         }
                       }
                     }
@@ -118,6 +139,32 @@ export function expandSweep(sweep: Omit<SweepConfig, "model_id">): SweepItem[] {
     }
   }
   return items;
+}
+
+// §0.2's depth rule: -d prefills KV before each test and is llama-bench-only
+// (llama-server has no KV-prefill flag). A server row always carries
+// n_depth = 0; its effective context is n_prompt. Returns the rejection copy
+// naming the fix when violated.
+export function validateDepthRule(items: SweepItem[]): string | null {
+  for (const item of items) {
+    if (item.n_depth > 0 && engineFromItem(item) === "server") {
+      return DEPTH_RULE_REJECTION_MESSAGE;
+    }
+    // N5's corollary -- concurrent streaming slots need a request lifecycle,
+  }
+  return null;
+}
+
+export const CONCURRENCY_ON_BENCH_REJECTION_MESSAGE =
+  "concurrency > 1 is only supported on the llama-server engine — llama-bench has no request lifecycle. Use mtp:\"on\"-style server configurations or keep concurrency at 1.";
+
+export function validateConcurrencyRule(items: SweepItem[]): string | null {
+  for (const item of items) {
+    if (item.concurrency > 1 && engineFromItem(item) !== "server") {
+      return CONCURRENCY_ON_BENCH_REJECTION_MESSAGE;
+    }
+  }
+  return null;
 }
 
 // llama-bench's JSON output has no "test_type" field at all -- pp/tg/pg is

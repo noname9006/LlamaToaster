@@ -21,6 +21,22 @@ import { pipeline } from "node:stream/promises";
 import { Readable, Transform } from "node:stream";
 import { runBench, matchOffloadLine, extractCudaDiagnosticLines, type BenchResult, type OffloadResult, type OffloadInfo, type ModelBufferSizes } from "./bench.js";
 import { runServerBench } from "./serverBench.js";
+import { spawn } from "node:child_process";
+// N1/N2/N5 -- the {engine:"server", spec:"off"} execution paths.
+import {
+  spawnRuntimeServer,
+  streamedCompletion,
+  executeCurvePoint,
+  executeKneeLadder,
+  nextProbeStep,
+  probeSucceeded,
+  toBenchResult,
+  PROBE_GEN_TOKENS,
+  PROBE_MAX_LOADS,
+  type ProbeAttemptOutcome,
+} from "./runtimeBench.js";
+import { buildPromptTokens, DEFAULT_KNEE_SLOTS } from "./loadDriver.js";
+import { supportsFlag } from "./binary-probe.js";
 import { MemorySampler, captureFreeMemoryBaseline, type SampleStats, type FreeMemoryBaseline } from "./sampler.js";
 import { readGpuMemory, readNvidiaDriverInfo, type NvidiaDriverInfo } from "./vram.js";
 import {
@@ -41,6 +57,8 @@ import {
   pollDeviceToken,
   refreshWorkerSession,
   HttpError,
+  postProbeResult,
+  postQualityResult,
 } from "./vps-client.js";
 import { log, configureLogging, setRunLogFile } from "./log.js";
 import {
@@ -80,8 +98,23 @@ import {
   type LocalModelState,
   isVramDiscrepancyPolicy,
   type VramDiscrepancyPolicy,
+  // BENCHMARKING_PLAN_V8.md: §0.1 methodology stamp, §0.10 caveat registry,
+  // §0.7/N1/N2/N4 capability advertisement.
+  type CaveatFlag,
+  METHOD_VERSION,
+  WORKER_CAPABILITIES,
+  type RunProbeJobPayload,
+  type ProbeResultInput,
+  type ProbeAttemptReport,
+  type MeasureQualityJobPayload,
+  type QualityResultInput,
+  type CurvePointSpec,
+  type KneeSpec,
 } from "../../shared/types.js";
+import { detectThermalThrottle, detectSensorAvailability, type SensorAvailability } from "./sensors.js";
+import { readCpuIsa } from "./binary-probe.js";
 import { resolveVramDiscrepancyAction } from "./vram-policy.js";
+import { ensureDefaultQualityCorpus } from "./qualityCorpus.js";
 import { expandSweep, deriveTestType, type SweepItem } from "../../shared/sweep.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -230,6 +263,10 @@ try {
       `(per-run log files will be unavailable)`
   );
 }
+
+// N4 -- ships the bundled default quality corpus into corpora/ so a quality
+// run never needs a manually placed dataset for the common case.
+ensureDefaultQualityCorpus(join(config.model_dir, "corpora"), join(__dirname, "..", "assets", "default-corpus.txt"), log);
 
 // run_id is always a uuid (server/src/routes/runs.ts's uuid()), but this is
 // also used to build a filesystem path -- validated defensively rather than
@@ -757,9 +794,17 @@ async function collectState(): Promise<WorkerStatePush> {
     : await captureFreeMemoryBaseline(backend)
         .then((baseline): WorkerVramInfo => ({ ok: true, backend, ...baseline }))
         .catch(() => null);
+  if (!sensorAvailability && !busy) {
+    sensorAvailability = await detectSensorAvailability(backend).catch(() => null);
+  }
   return {
     machine_id: config.machine_id!,
-    capabilities: ["benchmark"],
+    // §0.7/N1/N2/N4 version-skew gates -- dispatch refuses to enqueue a job
+    // type this worker never heard of, so what it CAN do is said out loud
+    // rather than discovered mid-fleet by a crash.
+    capabilities: [...WORKER_CAPABILITIES],
+    sensors: sensorAvailability,
+    cpu_isa: detectedCpuIsa,
     hostname: osHostname(),
     backend,
     hardware: detectedHardware,
@@ -769,6 +814,16 @@ async function collectState(): Promise<WorkerStatePush> {
     vram,
   };
 }
+
+// N6 -- the ISA the CURRENTLY-EXECUTING build dispatches on, parsed once per
+// binary identity when a benchmark job resolves its build (see
+// binary-probe.ts). Recorded on this run's result rows so a > 2x PP gap
+// between two machines on the same build tag has an explanation attached.
+let detectedCpuIsa: string | null = null;
+// M6 -- declared on every heartbeat so a machine card can say "clock · temp
+// available" up front; a later thermally_throttled flag must never surprise a
+// machine that could never have produced one.
+let sensorAvailability: SensorAvailability | null = null;
 
 const ITEM_RETRY_DELAYS_MS = [2000, 4000, 8000, 16000, 32000];
 
@@ -1242,7 +1297,16 @@ async function finalizeSweepItemResult(
   baseline: FreeMemoryBaseline,
   mainGpu: number | undefined,
   modelSizeBytes: number,
-  attempt = 0
+  attempt = 0,
+  // BENCHMARKING_PLAN_V8.md M6 -- the repeat count this item ran. The
+  // thermally_throttled flag needs >= 4 repeats to be eligible at all (each
+  // half of the split needs >= 2 samples), so the number has to reach the
+  // one place that derives the flag.
+  repeats = 0,
+  // N6 -- the running build's own ISA dispatch, parsed from llama.cpp's
+  // startup banner once per binary identity. Recorded on CPU-bound rows so
+  // two CPUs running the same build tag are no longer silently comparable.
+  cpuIsa: string | null = null
 ): Promise<SweepItemOutcome> {
   // Read from llama.cpp's own runtime output (see bench.ts's
   // parseOffloadLayers) -- both null when the line was never seen at all
@@ -1377,8 +1441,41 @@ async function finalizeSweepItemResult(
     // already collapse to null/"unavailable" on the cpu backend via
     // vram.ts's own readGpuMemory short-circuit, so no separate check is
     // needed here.
+    // M6's flag/aggregates are derived exactly once per item, here, from the
+    // sampler's own buffer -- the server stores them verbatim and never
+    // re-derives (one writer per column).
+    const thermal = detectThermalThrottle({
+      samples: stats.gpu_clock_samples ?? [],
+      repeats,
+      gpuTempCMax: stats.gpu_temp_c_max,
+    });
+    if (thermal.throttled) {
+      log.warn(
+        `${label}: thermally_throttled -- adapter clock sagged from ~${Math.round(
+          thermal.firstHalfMean ?? 0
+        )}MHz across the first half of this item to ~${Math.round(
+          thermal.secondHalfMean ?? 0
+        )}MHz in the second, peaking at ${stats.gpu_temp_c_max}C. The row is KEPT, not failed -- burst vs sustained is data.`
+      );
+    }
     const results: IngestResultInput[] = bench.results.map((r) => ({
       ...r,
+      // §0.1 -- every ingested row is stamped with the methodology that
+      // produced it. Rows of different vintages are surfaced together but
+      // never averaged together.
+      method_version: r.method_version ?? METHOD_VERSION,
+      n_depth: r.n_depth ?? item.n_depth ?? 0,
+      concurrency: r.concurrency ?? item.concurrency ?? 1,
+      // §0.10 -- the closed caveat registry. Flags the worker derived plus
+      // whatever the engine path already attached (cache_evicted,
+      // context_shift, spec_pair_prompt_mismatch...).
+      caveat_flags: [
+        ...new Set<CaveatFlag>([...(r.caveat_flags ?? []), ...(thermal.throttled ? (["thermally_throttled"] as const) : [])]),
+      ],
+      gpu_temp_c_max: stats.gpu_temp_c_max,
+      gpu_clock_mhz_min: stats.gpu_clock_mhz_min,
+      gpu_clock_samples: stats.gpu_clock_samples,
+      cpu_isa: cpuIsa,
       ram_peak_mib: stats.ram_peak_mib,
       vram_peak_mib: stats.vram_peak_mib,
       ram_avg_mib: stats.ram_avg_mib,
@@ -1825,7 +1922,9 @@ async function runSweepItem(input: RunSweepItemInput): Promise<SweepItemOutcome>
       baseline,
       input.mainGpu,
       input.modelSizeBytes,
-      attempt
+      attempt,
+      input.repeats,
+      detectedCpuIsa
     );
     // Printed last (after the TEST SUMMARY block above, whatever this item's
     // outcome) so anyone reading the log -- including a stopped/cancelled
@@ -1907,6 +2006,7 @@ async function runSweepItemViaServer(input: RunSweepItemViaServerInput): Promise
   });
 
   const sampler = new MemorySampler();
+  let sensorWindowOpen = false;
   try {
     const bench = await runServerBench({
       modelPath: input.modelPath,
@@ -1922,6 +2022,15 @@ async function runSweepItemViaServer(input: RunSweepItemViaServerInput): Promise
         sampler.start(proc.pid, backend, TICK_INTERVAL_MS);
       },
       onProgress: (phase, detail, liveTps) => {
+        // M6's detection window is the TIMED work, not the spawn: a server
+        // item brackets sampling from its first timed request onward, since
+        // model-load idle clocks inside the sampled span would otherwise mask
+        // or fabricate a sag. (llama-bench items approximate with the whole
+        // item -- their repeats are binary-internal.)
+        if (phase !== "loading" && !sensorWindowOpen) {
+          sensorWindowOpen = true;
+          sampler.openSensorWindow();
+        }
         const current = sampler.current;
         const memSuffix = ` ram=${current.ram_mib}MiB${current.vram_mib != null ? ` vram=${current.vram_mib}MiB` : ""}`;
         log.info(`${label}: ${phase} (${detail})${liveTps != null ? ` (${liveTps.toFixed(1)} t/s)` : ""}${memSuffix}`);
@@ -1957,7 +2066,9 @@ async function runSweepItemViaServer(input: RunSweepItemViaServerInput): Promise
       baseline,
       input.mainGpu,
       input.modelSizeBytes,
-      attempt
+      attempt,
+      input.repeats,
+      detectedCpuIsa
     );
     // See runSweepItem's identical line above -- same reasoning, same
     // "always printed last, cancelled included" behavior.
@@ -2006,7 +2117,246 @@ async function pushRunLogIfPresent(runId: string): Promise<void> {
 // never abort the loop. Throws only for a genuine "can't even start"
 // condition (missing model file, requested build not installed) -- caught by
 // workerMain, which reports the job itself failed and reconciles the run.
+// N1/N5 -- a runtime-kind job whose items execute the curve choreography or
+// the concurrency ladder instead of the ordinary sweep. Kept as its own
+// entry point (rather than a branch inside the sweep loop) because the
+// warm-cache repeats N1 needs MUST NOT silently change ordinary runtime runs'
+// reuse semantics.
+async function executeRuntimeBenchmarkJob(
+  payload: BenchmarkJob,
+  mode: "context_curve" | "knee"
+): Promise<void> {
+  const modelPath = await resolveModelPath(payload.model);
+  if (!existsSync(modelPath)) throw new Error(`model file not found at ${modelPath}`);
+  const resolvedBuild = getInstalledBuild(buildsDir, payload.llama_cpp_build);
+  if (!resolvedBuild) throw new Error(`build ${payload.llama_cpp_build} is not installed on this worker`);
+  if (!resolvedBuild.server_path) {
+    throw new Error(
+      `${mode === "knee" ? "a concurrency ladder" : "a context curve"} needs llama-server, and this build has no llama-server binary`
+    );
+  }
+
+  const items = expandSweep(payload.sweep);
+  const template = items[0];
+  setRunLogFile(runLogFilePath(payload.run_id));
+  detectedCpuIsa = await readCpuIsa(resolvedBuild.bench_path).catch(() => null);
+
+  const curvePoint: CurvePointSpec | undefined = payload.curve_point;
+  const kneeSpec: KneeSpec | undefined = payload.knee_spec;
+
+  if (mode === "context_curve") {
+    // N1 -- "Measure missing points" prices every uncovered ladder cell and
+    // enqueues them as ONE run (§0.5's duplicate guard would otherwise 409
+    // every context after the first), one run_item per context in the same
+    // order the server created them. Each point restarts the server: -c is a
+    // start-up flag sized off n_prompt, so one process cannot honestly serve
+    // two different context sizes (same reason the knee ladder below
+    // restarts per slot count).
+    const raw = curvePoint?.effective_ctx;
+    const contexts = raw == null ? [template.n_prompt] : Array.isArray(raw) ? raw : [raw];
+    const repeats = curvePoint?.repeats ?? payload.sweep.repeats;
+    const nGen = curvePoint?.n_gen ?? template.n_gen;
+
+    for (let i = 0; i < contexts.length; i++) {
+      const nPrompt = contexts[i];
+      const item = { ...template, idx: i };
+      const label = `run ${payload.run_id} item ${item.idx} (context_curve)`;
+      const runtimeItem = {
+        ...item,
+        n_prompt: nPrompt,
+        n_gen: nGen,
+        cache_type_k: curvePoint?.kv_pair?.[0] ?? item.cache_type_k,
+        cache_type_v: curvePoint?.kv_pair?.[1] ?? item.cache_type_v,
+        n_gpu_layers: curvePoint?.placement?.ngl ?? item.n_gpu_layers,
+        n_cpu_moe: curvePoint?.placement?.n_cpu_moe ?? item.n_cpu_moe,
+      };
+
+      const baseline = await captureFreeMemoryBaseline(payload.llama_cpp_backend);
+      sendTick(payload.run_id, item.idx, {
+        status: "loading",
+        ram_free_before_mib: baseline.ram_free_before_mib,
+        vram_free_before_mib: baseline.vram_free_before_mib,
+      });
+
+      const sampler = new MemorySampler();
+      let server: Awaited<ReturnType<typeof spawnRuntimeServer>> | null = null;
+      try {
+        server = await spawnRuntimeServer({
+          llamaServerPath: resolvedBuild.server_path,
+          modelPath,
+          port: config.mtp_server_port ?? DEFAULT_MTP_SERVER_PORT,
+          item: runtimeItem,
+          slots: 1,
+          mainGpu: payload.main_gpu,
+          log,
+          onSpawn: (proc) => {
+            activeBenchProc = proc;
+            sampler.start(proc.pid, payload.llama_cpp_backend, TICK_INTERVAL_MS);
+          },
+        });
+        // The timed window opens at the first measured request, not at spawn.
+        sampler.openSensorWindow();
+        sendTick(payload.run_id, item.idx, { status: "processing", detail: `context ${nPrompt}` });
+        const supportsNoContextShift = await supportsFlag(resolvedBuild.server_path, "--no-context-shift").catch(
+          () => false
+        );
+        const execution = await executeCurvePoint({
+          effectiveCtx: nPrompt,
+          nGen,
+          repeats,
+          port: server.port,
+          serverLog: server.stderr(),
+          supportsNoContextShift,
+          log,
+        });
+
+        const stderr = server.stderr();
+        await server.stop();
+        activeBenchProc = null;
+        const stats = sampler.stop();
+        const bench = toBenchResult({
+          results: execution.results,
+          stderr,
+          code: 0,
+          signal: null,
+          warning: execution.warning,
+        });
+        await finalizeSweepItemResult(
+          payload.run_id,
+          { ...item, n_prompt: nPrompt, n_gen: nGen },
+          label,
+          "llama-server",
+          bench,
+          stats,
+          baseline,
+          payload.main_gpu,
+          payload.model.size_bytes,
+          0,
+          repeats,
+          detectedCpuIsa
+        );
+      } catch (err) {
+        activeBenchProc = null;
+        const stats = sampler.stop();
+        await server?.stop();
+        const message = err instanceof Error ? err.message : String(err);
+        log.error(`${label}: TEST SUMMARY -- engine=llama-server status=failed\n  error: ${message}`);
+        await safeItemTerminal(payload.run_id, item.idx, {
+          status: "failed",
+          error: message,
+          ram_peak_mib: stats.ram_peak_mib,
+          vram_peak_mib: stats.vram_peak_mib,
+          ram_avg_mib: stats.ram_avg_mib,
+          vram_avg_mib: stats.vram_avg_mib,
+        });
+        // One point failing (OOM at a large context, say) must not stop the
+        // rest of the ladder from being measured.
+      }
+    }
+    setRunLogFile(null);
+    updateJobReport({ phase: "finalizing", detail: "pushing run log" });
+    await pushRunLogIfPresent(payload.run_id);
+    return;
+  }
+
+  // --- knee: unchanged, single item -----------------------------------------
+  const item = template;
+  const label = `run ${payload.run_id} item ${item.idx} (${mode})`;
+  const slots = kneeSpec?.slots ?? [...DEFAULT_KNEE_SLOTS];
+  const repeats = kneeSpec?.repeats ?? payload.sweep.repeats;
+  const nPrompt = kneeSpec?.n_prompt ?? item.n_prompt;
+  const nGen = kneeSpec?.n_gen ?? item.n_gen;
+
+  const baseline = await captureFreeMemoryBaseline(payload.llama_cpp_backend);
+  sendTick(payload.run_id, item.idx, {
+    status: "loading",
+    ram_free_before_mib: baseline.ram_free_before_mib,
+    vram_free_before_mib: baseline.vram_free_before_mib,
+  });
+
+  const sampler = new MemorySampler();
+  const runtimeItem = { ...item, n_prompt: nPrompt, n_gen: nGen };
+
+  // A ref object, not a bare `let` -- TS's control-flow narrowing cannot see
+  // the reassignment happening inside beforeSlotCount's closure, so a bare
+  // `let server` reads back as narrowed to null after the call even though
+  // it is genuinely non-null at runtime. A property on an object sidesteps
+  // that narrowing gap entirely.
+  const serverRef: { current: Awaited<ReturnType<typeof spawnRuntimeServer>> | null } = { current: null };
+  try {
+    // The ladder restarts the server per slot count: --parallel and -c are
+    // start-up flags, so one process cannot serve two slot counts honestly.
+    const results = await executeKneeLadder({
+      nPrompt,
+      nGen,
+      repeats,
+      slots,
+      port: config.mtp_server_port ?? DEFAULT_MTP_SERVER_PORT,
+      log,
+      beforeSlotCount: async (slotCount) => {
+        await serverRef.current?.stop();
+        serverRef.current = await spawnRuntimeServer({
+          llamaServerPath: resolvedBuild.server_path!,
+          modelPath,
+          port: config.mtp_server_port ?? DEFAULT_MTP_SERVER_PORT,
+          item: runtimeItem,
+          slots: slotCount,
+          mainGpu: payload.main_gpu,
+          log,
+          onSpawn: (proc) => {
+            activeBenchProc = proc;
+            if (slotCount === slots[0]) sampler.start(proc.pid, payload.llama_cpp_backend, TICK_INTERVAL_MS);
+          },
+        });
+        sendTick(payload.run_id, item.idx, { status: "generating", detail: `slots ${slotCount}` });
+        return serverRef.current.port;
+      },
+    });
+
+    const stderr = serverRef.current?.stderr() ?? "";
+    await serverRef.current?.stop();
+    activeBenchProc = null;
+    const stats = sampler.stop();
+    const bench = toBenchResult({ results, stderr, code: 0, signal: null, warning: undefined });
+    await finalizeSweepItemResult(
+      payload.run_id,
+      { ...item, n_prompt: nPrompt, n_gen: nGen },
+      label,
+      "llama-server",
+      bench,
+      stats,
+      baseline,
+      payload.main_gpu,
+      payload.model.size_bytes,
+      0,
+      repeats,
+      detectedCpuIsa
+    );
+  } catch (err) {
+    activeBenchProc = null;
+    const stats = sampler.stop();
+    await serverRef.current?.stop();
+    const message = err instanceof Error ? err.message : String(err);
+    log.error(`${label}: TEST SUMMARY -- engine=llama-server status=failed\n  error: ${message}`);
+    await safeItemTerminal(payload.run_id, item.idx, {
+      status: "failed",
+      error: message,
+      ram_peak_mib: stats.ram_peak_mib,
+      vram_peak_mib: stats.vram_peak_mib,
+      ram_avg_mib: stats.ram_avg_mib,
+      vram_avg_mib: stats.vram_avg_mib,
+    });
+  } finally {
+    setRunLogFile(null);
+    updateJobReport({ phase: "finalizing", detail: "pushing run log" });
+    await pushRunLogIfPresent(payload.run_id);
+  }
+}
+
 async function executeBenchmarkJob(payload: BenchmarkJob): Promise<void> {
+  if (payload.mode === "context_curve" || payload.mode === "knee") {
+    return executeRuntimeBenchmarkJob(payload, payload.mode);
+  }
   const modelPath = await resolveModelPath(payload.model);
   if (!existsSync(modelPath)) {
     throw new Error(`model file not found at ${modelPath} (source=${payload.model.source})`);
@@ -2034,6 +2384,11 @@ async function executeBenchmarkJob(payload: BenchmarkJob): Promise<void> {
     serverPath: resolvedBuild.server_path,
   };
   const effectiveBackend: Backend = payload.llama_cpp_backend;
+  // N6 -- parsed once per binary identity (binary-probe.ts memoizes on
+  // (path, mtimeMs, size), so an in-place llama.cpp update re-probes). This
+  // is the RUNNING build's own compiled-in + runtime-detected dispatch, not
+  // the host CPU's marketing sheet.
+  detectedCpuIsa = await readCpuIsa(effectiveBuild.path).catch(() => null);
 
   pauseRequested = false;
   stopRequested = false;
@@ -2483,6 +2838,288 @@ async function executeDownloadModelJob(
   }
 }
 
+// BENCHMARKING_PLAN_V8.md N2 -- the usable-config probe. Engine pinned to
+// llama-server: the tok/s floor below is meaningless on llama-bench, which
+// has no request lifecycle. At most THREE loads, ever (nextProbeStep enforces
+// the ladder); success means no OOM, no spill, and generation above the
+// floor, because "loads successfully" is not the same as "actually usable".
+async function executeRunProbeJob(payload: RunProbeJobPayload): Promise<void> {
+  const modelPath = await resolveModelPath(payload.model);
+  if (!existsSync(modelPath)) throw new Error(`model file not found at ${modelPath}`);
+  const resolvedBuild = getInstalledBuild(buildsDir, payload.llama_cpp_build);
+  if (!resolvedBuild) throw new Error(`build ${payload.llama_cpp_build} is not installed on this worker`);
+  if (!resolvedBuild.server_path) {
+    throw new Error("a probe needs llama-server, and this build has no llama-server binary");
+  }
+
+  const label = `probe ${payload.run_id}`;
+  setRunLogFile(runLogFilePath(payload.run_id));
+  const attempts: ProbeAttemptOutcome[] = [];
+  let next: { candidateCtx: number } | null = { candidateCtx: payload.candidateCtx };
+  try {
+    while (next && attempts.length < PROBE_MAX_LOADS) {
+      const candidateCtx = next.candidateCtx;
+      log.info(`${label}: loading at candidate context ${candidateCtx}`);
+      const attempt = await runOneProbeLoad({
+        payload,
+        modelPath,
+        serverPath: resolvedBuild.server_path,
+        candidateCtx,
+        label,
+      });
+      attempts.push(attempt);
+      log.info(
+        `${label}: candidate ${candidateCtx} -> ${attempt.ok ? "ok" : "failed"}` +
+          (attempt.error ? ` (${attempt.error})` : "")
+      );
+      next = nextProbeStep(attempts, { trainedCtx: payload.trained_ctx ?? null });
+    }
+
+    const best = attempts.filter((a) => a.ok).sort((a, b) => b.candidateCtx - a.candidateCtx)[0];
+    const report: ProbeResultInput = best
+      ? {
+          status: "verified",
+          verified_ctx_tokens: best.candidateCtx,
+          margin_observed_frac: best.headroomFrac ?? null,
+          method_version: METHOD_VERSION,
+          attempts: attempts.map(toProbeAttemptReport),
+        }
+      : {
+          status: attempts.some((a) => a.oom) ? "failed_oom" : "failed",
+          verified_ctx_tokens: null,
+          method_version: METHOD_VERSION,
+          attempts: attempts.map(toProbeAttemptReport),
+          error:
+            attempts[attempts.length - 1]?.error ??
+            "no candidate context loaded and generated above the usable floor",
+        };
+    await withAuth((token) => postProbeResult(config.vps_url, token, payload.run_id, report));
+    log.info(
+      `${label}: ${report.status}` +
+        (report.verified_ctx_tokens != null ? ` up to ${report.verified_ctx_tokens} tokens` : "") +
+        ` after ${attempts.length} load(s)`
+    );
+  } finally {
+    setRunLogFile(null);
+    await pushRunLogIfPresent(payload.run_id);
+  }
+}
+
+function toProbeAttemptReport(attempt: ProbeAttemptOutcome): ProbeAttemptReport {
+  return {
+    candidate_ctx: attempt.candidateCtx,
+    ok: attempt.ok,
+    oom: attempt.oom,
+    spill: attempt.spill,
+    vram_peak_mib: attempt.vramPeakMib,
+    gen_tps: attempt.genTps,
+    error: attempt.error,
+  };
+}
+
+interface ProbeLoadInput {
+  payload: RunProbeJobPayload;
+  modelPath: string;
+  serverPath: string;
+  candidateCtx: number;
+  label: string;
+}
+
+async function runOneProbeLoad(input: ProbeLoadInput): Promise<ProbeAttemptOutcome> {
+  const { payload, candidateCtx } = input;
+  const sampler = new MemorySampler();
+  const item = {
+    idx: 0,
+    n_prompt: Math.max(1, Math.min(candidateCtx - PROBE_GEN_TOKENS - 8, candidateCtx)),
+    n_gen: PROBE_GEN_TOKENS,
+    n_depth: 0,
+    concurrency: payload.placement.slots,
+    threads: 0,
+    n_gpu_layers: payload.placement.ngl,
+    batch_size: 2048,
+    ubatch_size: 512,
+    cache_type_k: payload.kvPair[0],
+    cache_type_v: payload.kvPair[1],
+    flash_attn: "on",
+    mtp: "off",
+    n_gpu_layers_draft: 0,
+    n_cpu_moe: payload.placement.nCpuMoe ?? 0,
+  } as SweepItem;
+
+  let server: Awaited<ReturnType<typeof spawnRuntimeServer>> | null = null;
+  try {
+    server = await spawnRuntimeServer({
+      llamaServerPath: input.serverPath,
+      modelPath: input.modelPath,
+      port: config.mtp_server_port ?? DEFAULT_MTP_SERVER_PORT,
+      item,
+      slots: payload.placement.slots,
+      mainGpu: payload.main_gpu,
+      contextSizeOverride: candidateCtx,
+      log,
+      onSpawn: (proc) => {
+        activeBenchProc = proc;
+        sampler.start(proc.pid, payload.llama_cpp_backend, TICK_INTERVAL_MS);
+      },
+    });
+    const sample = await streamedCompletion({
+      port: server.port,
+      promptTokens: buildPromptTokens(64),
+      nPredict: PROBE_GEN_TOKENS,
+      cachePrompt: false,
+    });
+    const genTps =
+      sample.e2eMs > sample.ttftMs && sample.tokensPredicted > 0
+        ? (sample.tokensPredicted / (sample.e2eMs - sample.ttftMs)) * 1000
+        : null;
+    const stats = sampler.stop();
+    const verdict = probeSucceeded({
+      oom: false,
+      vramPeakMib: stats.vram_peak_mib,
+      gpuTotalMib: payload.gpu_total_mib ?? null,
+      genTps,
+    });
+    const headroomFrac =
+      stats.vram_peak_mib != null && payload.gpu_total_mib != null && payload.gpu_total_mib > 0
+        ? Math.max(0, 1 - stats.vram_peak_mib / payload.gpu_total_mib)
+        : null;
+    return {
+      candidateCtx,
+      ok: verdict.ok,
+      oom: false,
+      spill: verdict.spill,
+      vramPeakMib: stats.vram_peak_mib,
+      genTps,
+      headroomFrac,
+      error: verdict.reason ?? undefined,
+    };
+  } catch (err) {
+    sampler.stop();
+    const message = err instanceof Error ? err.message : String(err);
+    return {
+      candidateCtx,
+      ok: false,
+      // The same best-effort OOM signature the sweep paths classify on.
+      oom: /out of memory|failed to allocate|cudaMalloc|insufficient memory|bad_alloc|not enough (memory|vram)/i.test(
+        message + (server?.stderr() ?? "")
+      ),
+      spill: false,
+      vramPeakMib: null,
+      genTps: null,
+      error: message,
+    };
+  } finally {
+    activeBenchProc = null;
+    await server?.stop();
+  }
+}
+
+// BENCHMARKING_PLAN_V8.md N4 -- quality as a LABELED SYNTHETIC PROXY, never a
+// score and never inside a ranking argmax. A perplexity number without its
+// corpus hash is meaningless, so the hash rides the payload and the row.
+async function executeMeasureQualityJob(payload: MeasureQualityJobPayload): Promise<void> {
+  const modelPath = await resolveModelPath(payload.model);
+  if (!existsSync(modelPath)) throw new Error(`model file not found at ${modelPath}`);
+  const resolvedBuild = getInstalledBuild(buildsDir, payload.llama_cpp_build);
+  if (!resolvedBuild) throw new Error(`build ${payload.llama_cpp_build} is not installed on this worker`);
+  const perplexityPath = derivePerplexityPath(resolvedBuild.bench_path);
+  if (!perplexityPath || !existsSync(perplexityPath)) {
+    throw new Error("this build ships no llama-perplexity binary, so quality cannot be measured with it");
+  }
+  const datasetPath = resolveQualityDatasetPath(payload.datasetHash);
+  if (!datasetPath) {
+    throw new Error(`no corpus on this machine matches ${payload.datasetHash}`);
+  }
+
+  const label = `quality ${payload.run_id}`;
+  setRunLogFile(runLogFilePath(payload.run_id));
+  try {
+    const args = [
+      "-m",
+      modelPath,
+      "-f",
+      datasetPath,
+      "-c",
+      String(payload.ctxTokens),
+      "-ctk",
+      payload.kvPair[0],
+      "-ctv",
+      payload.kvPair[1],
+    ];
+    if (payload.main_gpu != null) args.push("-sm", "none", "-mg", String(payload.main_gpu));
+    log.info(`${label}: llama-perplexity ${args.join(" ")}`);
+    const output = await runPerplexity(perplexityPath, args);
+    const ppl = parsePerplexity(output);
+    if (ppl == null) {
+      throw new Error("llama-perplexity produced no parseable PPL value");
+    }
+    const report: QualityResultInput = {
+      ppl,
+      dataset_hash: payload.datasetHash,
+      ctx_tokens: payload.ctxTokens,
+      cache_type_k: payload.kvPair[0],
+      cache_type_v: payload.kvPair[1],
+      method_version: METHOD_VERSION,
+    };
+    await withAuth((token) => postQualityResult(config.vps_url, token, payload.run_id, report));
+    log.info(`${label}: ppl=${ppl.toFixed(4)} against ${payload.datasetHash}`);
+  } finally {
+    setRunLogFile(null);
+    await pushRunLogIfPresent(payload.run_id);
+  }
+}
+
+// llama-perplexity lives beside llama-bench in every release layout, same
+// derivation as deriveServerPath above.
+function derivePerplexityPath(benchPath: string): string | null {
+  const name = benchPath.endsWith(".exe") ? "llama-perplexity.exe" : "llama-perplexity";
+  const dir = dirname(benchPath);
+  return join(dir, name);
+}
+
+function resolveQualityDatasetPath(datasetHash: string): string | null {
+  const dir = join(config.model_dir, "corpora");
+  if (!existsSync(dir)) return null;
+  for (const entry of readdirSync(dir)) {
+    const full = join(dir, entry);
+    try {
+      const digest = createHash("sha256").update(readFileSync(full)).digest("hex");
+      if (`sha256:${digest}` === datasetHash) return full;
+    } catch {
+      continue;
+    }
+  }
+  return null;
+}
+
+function runPerplexity(path: string, args: string[]): Promise<string> {
+  return new Promise((resolvePromise, rejectPromise) => {
+    const proc = spawn(path, args, { stdio: ["ignore", "pipe", "pipe"] });
+    activeBenchProc = proc;
+    let output = "";
+    proc.stdout?.on("data", (chunk: Buffer) => {
+      output += chunk.toString();
+    });
+    proc.stderr?.on("data", (chunk: Buffer) => {
+      output += chunk.toString();
+    });
+    proc.on("error", rejectPromise);
+    proc.on("close", (code) => {
+      activeBenchProc = null;
+      if (code === 0) resolvePromise(output);
+      else rejectPromise(new Error(`llama-perplexity exited ${code}`));
+    });
+  });
+}
+
+// llama-perplexity prints "Final estimate: PPL = 6.1234 +/- 0.02".
+export function parsePerplexity(output: string): number | null {
+  const match = /Final estimate:\s*PPL\s*=\s*([0-9.]+)/i.exec(output);
+  if (!match) return null;
+  const value = Number(match[1]);
+  return Number.isFinite(value) && value > 0 ? value : null;
+}
+
 // Resolves immediately (so the normal reportJobResult call right after
 // executeJob in workerMain still gets to fire and tell the server this job
 // succeeded) but schedules the actual exit a beat later rather than doing it
@@ -2536,6 +3173,10 @@ async function executeJob(job: SerialQueueJob): Promise<void> {
       return executeDeleteBuildJob(job.payload);
     case "delete_model_file":
       return executeDeleteModelFileJob(job.payload);
+    case "run_probe":
+      return executeRunProbeJob(job.payload);
+    case "measure_quality":
+      return executeMeasureQualityJob(job.payload);
     case "refresh_models":
       return executeRefreshModelsJob();
     case "shutdown_worker":

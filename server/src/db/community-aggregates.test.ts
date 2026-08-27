@@ -82,7 +82,7 @@ function insertResult(
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-describe("repo.communityRepo (§5.4 consent + self-exclusion, no k-anonymity floor)", () => {
+describe("repo.communityRepo (§5.4 consent + self-exclusion + §0.9 k-anonymity floor)", () => {
   const modelId = "community-model-1";
 
   beforeAll(() => {
@@ -110,22 +110,21 @@ describe("repo.communityRepo (§5.4 consent + self-exclusion, no k-anonymity flo
     insertRun("run8", "u8-optout", "w8", modelId, "cuda", "b9999");
     insertResult("run8", "u8-optout", modelId, "tg", 999, 8000, 20000);
 
-    // Group Y: a single opted-in contributor on a rare GPU -- the k-anonymity
-    // floor that used to suppress groups like this was deliberately dropped
-    // (operator decision: collecting five identical hardware/model/backend
-    // combos was unrealistic), so this group must now be VISIBLE.
+    // Group Y: a single opted-in contributor on a rare GPU -- exactly the
+    // shape BENCHMARKING_PLAN_V8.md §0.9's k-anonymity floor exists to
+    // suppress. This group must stay private-by-default: it never appears in
+    // listAggregates or listFacets no matter who asks, even though the row
+    // itself is perfectly valid data.
     insertUser("u7-lonely", true);
     insertWorker("w7", "linux", "RTX 3060");
     insertRun("run7", "u7-lonely", "w7", modelId, "cuda", "b2000");
     insertResult("run7", "u7-lonely", modelId, "tg", 40, 6000, 10000);
   });
 
-  it("no longer suppresses a single-contributor group -- it's shown with contributorCount 1", () => {
+  it("suppresses a group below the 5-distinct-contributor floor (§0.9)", () => {
     const rows = repo.communityRepo.listAggregates("some-other-caller");
     const rtx3060 = rows.find((r) => r.gpuModel === "RTX 3060");
-    expect(rtx3060).toBeDefined();
-    expect(rtx3060!.contributorCount).toBe(1);
-    expect(rtx3060!.avgTps).toBeCloseTo(40, 1);
+    expect(rtx3060).toBeUndefined();
   });
 
   it("excludes the caller's own contribution from both the group and its average, and drops build from the key", () => {
@@ -160,11 +159,11 @@ describe("repo.communityRepo (§5.4 consent + self-exclusion, no k-anonymity flo
     expect(tgRow!.contributorCount).toBe(6);
   });
 
-  it("every returned row has at least one contributor and carries no UUID- or username-shaped value", () => {
+  it("every returned row clears the 5-contributor floor and carries no UUID- or username-shaped value", () => {
     const rows = repo.communityRepo.listAggregates("some-other-caller");
     expect(rows.length).toBeGreaterThan(0);
     for (const row of rows) {
-      expect(row.contributorCount).toBeGreaterThanOrEqual(1);
+      expect(row.contributorCount).toBeGreaterThanOrEqual(5);
       // CommunityAggregateRow's own type has no userId/username field at
       // all -- this walks every string value actually present to also catch
       // a UUID or a synthetic user id leaking through an unexpected field.
@@ -179,19 +178,19 @@ describe("repo.communityRepo (§5.4 consent + self-exclusion, no k-anonymity flo
     }
   });
 
-  it("listFacets no longer suppresses a low-contributor facet value", () => {
+  it("listFacets applies the same §0.9 floor as listAggregates", () => {
     const facets = repo.communityRepo.listFacets("u1");
     const gpu4090 = facets.gpuModels.find((g) => g.value === "RTX 4090");
     expect(gpu4090).toBeDefined();
     expect(gpu4090!.contributorCount).toBe(5); // u1 excluded, u8-optout excluded by consent
 
     const gpu3060 = facets.gpuModels.find((g) => g.value === "RTX 3060");
-    expect(gpu3060).toBeDefined(); // no minimum contributor count anymore
-    expect(gpu3060!.contributorCount).toBe(1);
+    expect(gpu3060).toBeUndefined(); // single-contributor facet value stays private-by-default
 
     // model facet counts every contributor on that model regardless of GPU
     // -- u2..u6 (RTX 4090) plus u7-lonely (RTX 3060) = 6, u1 excluded as
-    // caller, u8-optout excluded by consent.
+    // caller, u8-optout excluded by consent -- clears the floor even though
+    // the RTX 3060 slice alone would not.
     const model = facets.models.find((m) => m.modelId === modelId);
     expect(model).toBeDefined();
     expect(model!.contributorCount).toBe(6);
