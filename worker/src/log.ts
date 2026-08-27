@@ -18,6 +18,48 @@ function isLogLevel(v: string | undefined): v is LogLevel {
 let logDir: string | null = null;
 let minLevel: LogLevel = isLogLevel(process.env.LOG_LEVEL) ? process.env.LOG_LEVEL : "info";
 
+// ---------------------------------------------------------------------------
+// Color support -- ANSI SGR sequences work as-is in Windows Terminal,
+// conhost (Win10+, libuv enables virtual-terminal processing automatically)
+// and every POSIX terminal, so no library is needed. Colored text must never
+// leak into the log files though (an escape sequence pasted back from a log
+// viewer or grepped by tooling is noise), which is what stripAnsi below
+// guarantees: whatever reaches appendFileSync has been stripped clean.
+// ---------------------------------------------------------------------------
+
+export const ansi = {
+  reset: "\x1b[0m",
+  bold: "\x1b[1m",
+  dim: "\x1b[2m",
+  red: "\x1b[31m",
+  green: "\x1b[32m",
+  yellow: "\x1b[33m",
+  cyan: "\x1b[36m",
+} as const;
+
+// TTY vs pipe honors NO_COLOR / FORCE_COLOR / TERM=dumb so scripted and
+// redirected runs stay plaintext while interactive consoles get highlighting.
+export function colorsEnabled(): boolean {
+  const force = process.env.FORCE_COLOR;
+  if (force !== undefined && force !== "") return force !== "0" && force !== "false";
+  if (process.env.NO_COLOR !== undefined) return false;
+  if (process.env.TERM === "dumb") return false;
+  return Boolean(process.stdout.isTTY);
+}
+
+// Wrap a string in an SGR sequence when colors are on -- identity when off.
+// Caller-supplied codes, so the palette can grow without touching call sites.
+export function paint(colors: boolean, code: string, text: string): string {
+  return colors ? `${code}${text}${ansi.reset}` : text;
+}
+
+const ANSI_SGR_RE = /\x1b\[[0-9;]*m/g;
+
+export function stripAnsi(s: string): string {
+  return s.replace(ANSI_SGR_RE, "");
+}
+
+
 // Optional extra sink, active only while a run is in flight (see
 // worker/src/index.ts's /run handler) -- every line that clears the level
 // filter below is *also* appended here, in addition to the console and the
@@ -63,16 +105,19 @@ function write(level: LogLevel, parts: unknown[]): void {
   const line = format(level, parts);
   const consoleFn = level === "error" ? console.error : level === "warn" ? console.warn : console.log;
   consoleFn(line);
+  // Strip escape sequences so files contain exactly what was logged -- an
+  // interactive banner may carry color codes that only make sense on a TTY.
+  const plain = stripAnsi(line);
   if (logDir) {
     try {
-      appendFileSync(logFilePath(logDir), line + "\n", "utf8");
+      appendFileSync(logFilePath(logDir), plain + "\n", "utf8");
     } catch {
       /* best-effort -- logging must never be why a run fails */
     }
   }
   if (runLogPath) {
     try {
-      appendFileSync(runLogPath, line + "\n", "utf8");
+      appendFileSync(runLogPath, plain + "\n", "utf8");
     } catch {
       /* best-effort, same reasoning as above */
     }
