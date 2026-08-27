@@ -60,7 +60,7 @@ import {
   postProbeResult,
   postQualityResult,
 } from "./vps-client.js";
-import { log, configureLogging, setRunLogFile } from "./log.js";
+import { log, configureLogging, setRunLogFile, ansi, paint, colorsEnabled } from "./log.js";
 import {
   detectPlatform,
   listInstalledBuilds,
@@ -3250,19 +3250,24 @@ async function enrolDevice(): Promise<void> {
   );
   // A one-time credential buried in a stream of INFO lines is easy to miss
   // -- boxed banner so it's unmissable in both the console and the daily log
-  // file, plus the instruction of where the code actually goes.
+  // file, plus the instruction of where the code actually goes. On an
+  // interactive terminal the critical pieces are highlighted (bold-yellow
+  // header, bold-bright-green code); log files and piped output get the same
+  // text with the escape sequences stripped out by worker/src/log.ts.
+  const color = colorsEnabled();
+  const border = "=".repeat(66);
   const codeBanner = [
     "",
-    "==================================================================",
-    "  ACTION REQUIRED -- CONNECT THIS MACHINE TO LLAMATOASTER",
+    paint(color, `${ansi.cyan}${ansi.bold}`, border),
+    paint(color, `${ansi.bold}${ansi.yellow}`, "  ACTION REQUIRED -- CONNECT THIS MACHINE TO LLAMATOASTER"),
     "",
     '  Enter this code on the Workers page ("Add a machine"):',
     "",
-    `            ${start.user_code}`,
+    `            ${paint(color, `${ansi.bold}\x1b[92m`, start.user_code)}`,
     "",
-    `  (opens at: ${config.vps_url}${start.verification_uri})`,
-    `  (expires in ${Math.round(start.expires_in / 60)} minutes)`,
-    "==================================================================",
+    paint(color, ansi.dim, `  (opens at: ${config.vps_url}${start.verification_uri})`),
+    paint(color, ansi.dim, `  (expires in ${Math.round(start.expires_in / 60)} minutes)`),
+    paint(color, `${ansi.cyan}${ansi.bold}`, border),
   ].join("\n");
   log.info(`[worker ${config.worker_name}]${codeBanner}`);
 
