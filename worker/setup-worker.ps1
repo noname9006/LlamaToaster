@@ -35,6 +35,16 @@
 #                        actual GPU on startup. Pass this only to pin/override
 #                        that, e.g. for hardware the auto-detect heuristic
 #                        doesn't specifically know about.
+#   -InstallLhm          fetch LibreHardwareMonitor onto this machine -- the
+#                        sensor_lhm clock/temperature source worker/src/
+#                        sensors.ts reads on Windows AMD/Intel GPUs (an NVIDIA
+#                        box needs only nvidia-smi, which ships with its own
+#                        driver -- nothing to install). Tries winget first,
+#                        falls back to extracting the latest GitHub release
+#                        zip into <Dir>\LibreHardwareMonitor. One step stays
+#                        manual no matter what: LHM must be RUNNING AS
+#                        ADMINISTRATOR while benchmarks execute, or its GPU
+#                        sensor readings are simply not there to be read.
 #   -Reconnect            clear this machine's saved session (keeping
 #                        machine_id and every other setting) so it goes
 #                        through device-flow approval again on the same
@@ -67,7 +77,8 @@ param(
     [string]$VpsUrl,
     [switch]$Reconnect,
     [switch]$Force,
-    [switch]$AllowInsecureUrl
+    [switch]$AllowInsecureUrl,
+    [switch]$InstallLhm
 )
 
 $ErrorActionPreference = "Stop"
@@ -112,6 +123,77 @@ function Select-InstallDir {
     Write-Host ""
     return $resolved
 }
+
+# -InstallLhm worker -- see the header doc above for why this exists. LHM is
+# NOT an npm dependency and cannot become one: it's a .NET desktop app that a
+# human runs elevated. This function only automates getting it ONTO the disk,
+# via whatever channel the machine already has (winget, else GitHub releases).
+# Asset NAMES drift between builds ("...net472.zip", "...NET.10.zip"), but
+# every release ships exactly one .zip, so name-match loosely.
+function Install-LibreHardwareMonitor {
+    $installedViaWinget = $false
+    try {
+        $listed = @(winget list --id LibreHardwareMonitor.LibreHardwareMonitor 2>$null)
+        if (($listed -join "`n") -match "LibreHardwareMonitor") {
+            Write-Host "LibreHardwareMonitor already present via winget -- keeping it."
+            $installedViaWinget = $true
+        }
+    } catch {
+        # No winget, or it failed to enumerate -- the zip fallback covers it.
+    }
+
+    if (-not $installedViaWinget -and (Get-Command winget -ErrorAction SilentlyContinue)) {
+        Write-Host "Installing LibreHardwareMonitor via winget..."
+        winget install -e --id LibreHardwareMonitor.LibreHardwareMonitor `
+            --accept-source-agreements --accept-package-agreements --silent | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            $installedViaWinget = $true
+        } else {
+            Write-Host "winget exited $LASTEXITCODE -- falling back to the GitHub release zip." -ForegroundColor Yellow
+        }
+    }
+
+    if (-not $installedViaWinget) {
+        $extractDir = Join-Path $Dir "LibreHardwareMonitor"
+        if (Test-Path (Join-Path $extractDir "LibreHardwareMonitor.exe")) {
+            Write-Host "Found existing $extractDir\LibreHardwareMonitor.exe -- reusing it."
+        } else {
+            Write-Host "Downloading the latest LibreHardwareMonitor release..."
+            $release = Invoke-RestMethod -Headers @{ "User-Agent" = "llamatoaster-worker-setup" } `
+                "https://api.github.com/repos/LibreHardwareMonitor/LibreHardwareMonitor/releases/latest"
+            $zipAsset = @($release.assets) | Where-Object { $_.name -match "\.zip$" } | Select-Object -First 1
+            if (-not $zipAsset) {
+                Write-Error "No .zip asset found in the latest LibreHardwareMonitor release."
+                exit 1
+            }
+            $zipPath = Join-Path $env:TEMP $zipAsset.name
+            Invoke-WebRequest -Uri $zipAsset.browser_download_url -OutFile $zipPath -UseBasicParsing
+            Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force
+            Remove-Item $zipPath -Force
+            $exe = Get-ChildItem $extractDir -Recurse -Filter "LibreHardwareMonitor.exe" | Select-Object -First 1
+            if (-not $exe) {
+                Write-Error "Downloaded $($zipAsset.name) but no LibreHardwareMonitor.exe inside after extraction."
+                exit 1
+            }
+            Write-Host "Extracted to $($exe.FullName)"
+        }
+    }
+
+    # The part every deployment shares, stated out loud because no automation
+    # can do it -- elevation is consent the OS exists to extract from a human.
+    Write-Host ""
+    Write-Host "One step stays manual (UAC cannot be scripted away):" -ForegroundColor Cyan
+    Write-Host "  1. Run LibreHardwareMonitor AS ADMINISTRATOR and keep it open during benchmarks." -ForegroundColor Cyan
+    Write-Host "     Every sensor read dies with it -- HTTP feed AND WMI both stop populating." -ForegroundColor Cyan
+    Write-Host "  2. Options -> tick 'Remote Web Server' so the worker reads http://127.0.0.1:8085/data.json" -ForegroundColor Cyan
+    Write-Host "     (override the port with the LHM_HTTP_PORT env var; without the web server," -ForegroundColor Cyan
+    Write-Host "     the worker falls back to LHM's WMI namespace at the cost of a slower read)." -ForegroundColor Cyan
+    Write-Host "  3. Auto-start elevated each boot: Task Scheduler -> Create Task -> 'Run with highest privileges'," -ForegroundColor Cyan
+    Write-Host "     logon trigger, action = LibreHardwareMonitor.exe." -ForegroundColor Cyan
+    Write-Host "  4. A worker started while LHM was down picks availability up within ~10 minutes;" -ForegroundColor Cyan
+    Write-Host "     starting the worker AFTER LHM is running lands instantly." -ForegroundColor Cyan
+}
+
 
 if ($Reconnect) {
     if (-not (Test-Path $ConfigPath)) {
@@ -199,6 +281,17 @@ if ($Reconnect) {
     [System.IO.File]::WriteAllText($ConfigPath, $json, (New-Object System.Text.UTF8Encoding($false)))
     Write-Host "Wrote $ConfigPath"
 }
+
+if ($InstallLhm) {
+    # Usable on plain restarts too -- config.json exists then, so setup was
+    # skipped and $Dir never got assigned above. Prompt once rather than
+    # guessing where the fallback zip lands.
+    if (-not $Dir) {
+        $Dir = Select-InstallDir
+    }
+    Install-LibreHardwareMonitor
+}
+
 
 Push-Location $RepoRoot
 if (-not (Test-Path "node_modules\.bin\tsx.cmd") -and -not (Test-Path "node_modules\.bin\tsx")) {

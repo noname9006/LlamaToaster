@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   detectThermalThrottle,
   SensorSampleBuffer,
+  sampleFromLhmReadings,
   THROTTLE_MIN_REPEATS,
   THROTTLE_MIN_SAMPLES,
 } from "./sensors.js";
@@ -122,5 +123,46 @@ describe("M6 sample buffer (the worker owns every M6 column)", () => {
     expect(report.gpu_clock_samples).toEqual([2000, 2000, 1990, 1995]);
     expect(report.gpu_clock_mhz_min).toBe(1990);
     expect(report.throttled).toBe(false);
+  });
+});
+
+// Windows + AMD/Intel fall back to LibreHardwareMonitor (readLhmSensors);
+// sampleFromLhmReadings is its selection rule, so that's what's pinned here.
+describe("M6 sensor_lhm selection rule (Windows LHM fallback)", () => {
+  it("picks GPU-labelled readings and never promotes motherboard/CPU entries", () => {
+    const sample = sampleFromLhmReadings([
+      { label: "Temperature #1", kind: "temp", value: 42 }, // mainboard
+      { label: "CPU Package", kind: "temp", value: 65 },
+      { label: "Core #1", kind: "temp", value: 70 }, // CPU core
+      { label: "Bus Speed", kind: "clock", value: 100 },
+      { label: "GPU Hot Spot Temperature", kind: "temp", value: 84 },
+      { label: "GPU Core", kind: "clock", value: 2480 },
+    ]);
+    // Sample came back (a usable GPU pair exists); these assert exactly what
+    // got picked from the tree above.
+    expect(sample).toMatchObject({ tempC: 84, clockMhz: 2480, source: "sensor_lhm" });
+  });
+
+  it("prefers the shader/core clock over other GPU-labelled clocks", () => {
+    const sample = sampleFromLhmReadings([
+      { label: "GPU Memory Clock", kind: "clock", value: 2000 },
+      { label: "GPU Core", kind: "clock", value: 2480 },
+      { label: "GPU SOC Clock", kind: "clock", value: 1000 },
+    ]);
+    expect(sample?.clockMhz).toBe(2480);
+    expect(sample?.tempC).toBeNull(); // partial: clocks without temps still count
+  });
+
+  it("falls back to any GPU-labelled clock when no core-labelled one exists", () => {
+    const sample = sampleFromLhmReadings([{ label: "GPU Memory Clock", kind: "clock", value: 2000 }]);
+    expect(sample).toMatchObject({ clockMhz: 2000, tempC: null, source: "sensor_lhm" });
+  });
+
+  it("returns null when every reading is non-GPU -- declared unavailable, not guessed", () => {
+    const sample = sampleFromLhmReadings([
+      { label: "CPU Package", kind: "temp", value: 65 },
+      { label: "Bus Speed", kind: "clock", value: 100 },
+    ]);
+    expect(sample).toBeNull();
   });
 });
