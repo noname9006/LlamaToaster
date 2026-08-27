@@ -242,6 +242,24 @@ export interface GgufInfo {
   // files under one repo id) can't report one file's count for another's.
   // null on any parse failure -- fail-soft, same as every other field here.
   param_count: number | null;
+  // GGUF's <architecture>.context_length -- the sequence length the model was
+  // trained on ("trained context"). Anchors M2's target-context clamp,
+  // N1's sizing-ladder ceiling, and the Benchmark page's model card.
+  trained_ctx: number | null;
+  // KV-cache geometry consumed by shared/vramEstimate.ts's
+  // maxAffordableContext (M1) / kvBytesPerToken -- <architecture>.embedding_length
+  // and <architecture>.attention.* hyperparameters. n_embd/n_head are the
+  // both-or-neither fallback pair kvBytesPerToken derives head dims from when
+  // the explicit key/value lengths are absent.
+  n_head_kv: number | null;
+  head_dim_k: number | null;
+  head_dim_v: number | null;
+  n_embd: number | null;
+  n_head: number | null;
+  // <architecture>.attention.sliding_window -- present only for architectures
+  // with sliding-window attention (Mistral/Gemma-style); null means plain
+  // full attention, where KV cache grows linearly across the whole context.
+  sliding_window: number | null;
   // Local-only diagnostic for why n_layer/mtp_layers/expert_count came back
   // null -- never sent over the wire (worker/src/index.ts logs it, nothing
   // else reads it), purely so a failed lookup says WHY instead of leaving
@@ -251,7 +269,21 @@ export interface GgufInfo {
 }
 
 function emptyGgufInfo(debugReason: string): GgufInfo {
-  return { n_layer: null, mtp_layers: null, expert_count: null, quant: null, param_count: null, debugReason };
+  return {
+    n_layer: null,
+    mtp_layers: null,
+    expert_count: null,
+    quant: null,
+    param_count: null,
+    trained_ctx: null,
+    n_head_kv: null,
+    head_dim_k: null,
+    head_dim_v: null,
+    n_embd: null,
+    n_head: null,
+    sliding_window: null,
+    debugReason,
+  };
 }
 
 // Reads a GGUF file's metadata header to find the model's transformer layer
@@ -279,6 +311,17 @@ export async function readGgufInfo(filePath: string): Promise<GgufInfo> {
     const blockCounts = new Map<string, number>();
     const mtpLayerCounts = new Map<string, number>();
     const expertCounts = new Map<string, number>();
+    // KV-cache geometry + trained context -- captured exactly like the maps
+    // above (architecture-prefixed keys resolved after the walk), so a
+    // hyperparameter that happens to appear before the architecture key is
+    // still picked up. Suffix style matches block_count's handling.
+    const contextLengths = new Map<string, number>();
+    const headCountKv = new Map<string, number>();
+    const keyLengths = new Map<string, number>();
+    const valueLengths = new Map<string, number>();
+    const embeddingLengths = new Map<string, number>();
+    const headCounts = new Map<string, number>();
+    const slidingWindows = new Map<string, number>();
 
     // Deliberately walks every KV pair rather than stopping at the first
     // "tokenizer."-prefixed key: a llama.cpp-produced GGUF always puts
@@ -309,6 +352,30 @@ export async function readGgufInfo(filePath: string): Promise<GgufInfo> {
         mtpLayerCounts.set(key, await reader.numeric(valueType));
       } else if (key.endsWith(".expert_count") && valueType !== GGUF_TYPE.ARRAY && valueType !== GGUF_TYPE.STRING) {
         expertCounts.set(key, await reader.numeric(valueType));
+      } else if (key.endsWith(".context_length") && valueType !== GGUF_TYPE.ARRAY && valueType !== GGUF_TYPE.STRING) {
+        contextLengths.set(key, await reader.numeric(valueType));
+      } else if (
+        key.endsWith(".attention.head_count_kv") &&
+        valueType !== GGUF_TYPE.ARRAY &&
+        valueType !== GGUF_TYPE.STRING
+      ) {
+        headCountKv.set(key, await reader.numeric(valueType));
+      } else if (key.endsWith(".attention.key_length") && valueType !== GGUF_TYPE.ARRAY && valueType !== GGUF_TYPE.STRING) {
+        keyLengths.set(key, await reader.numeric(valueType));
+      } else if (
+        key.endsWith(".attention.value_length") &&
+        valueType !== GGUF_TYPE.ARRAY &&
+        valueType !== GGUF_TYPE.STRING
+      ) {
+        valueLengths.set(key, await reader.numeric(valueType));
+      } else if (key.endsWith(".embedding_length") && valueType !== GGUF_TYPE.ARRAY && valueType !== GGUF_TYPE.STRING) {
+        embeddingLengths.set(key, await reader.numeric(valueType));
+      } else if (key.endsWith(".attention.head_count") && valueType !== GGUF_TYPE.ARRAY && valueType !== GGUF_TYPE.STRING) {
+        // NB: this can't collide with .head_count_kv above -- a key ending in
+        // ".head_count_kv" doesn't end in ".attention.head_count".
+        headCounts.set(key, await reader.numeric(valueType));
+      } else if (key.endsWith(".attention.sliding_window") && valueType !== GGUF_TYPE.ARRAY && valueType !== GGUF_TYPE.STRING) {
+        slidingWindows.set(key, await reader.numeric(valueType));
       } else {
         await reader.skip(valueType);
       }
@@ -360,6 +427,13 @@ export async function readGgufInfo(filePath: string): Promise<GgufInfo> {
       expert_count: expertCounts.get(`${architecture}.expert_count`) ?? null,
       quant: fileType != null ? quantLabelFromFileType(fileType) : null,
       param_count,
+      trained_ctx: contextLengths.get(`${architecture}.context_length`) ?? null,
+      n_head_kv: headCountKv.get(`${architecture}.attention.head_count_kv`) ?? null,
+      head_dim_k: keyLengths.get(`${architecture}.attention.key_length`) ?? null,
+      head_dim_v: valueLengths.get(`${architecture}.attention.value_length`) ?? null,
+      n_embd: embeddingLengths.get(`${architecture}.embedding_length`) ?? null,
+      n_head: headCounts.get(`${architecture}.attention.head_count`) ?? null,
+      sliding_window: slidingWindows.get(`${architecture}.attention.sliding_window`) ?? null,
       debugReason:
         n_layer === null ? `architecture "${architecture}" found but no ${architecture}.block_count key` : undefined,
     };

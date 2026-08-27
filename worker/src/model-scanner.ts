@@ -426,6 +426,13 @@ export async function backfillGgufMetadata(modelDir: string, cache: LocalModelCa
       expert_count: info.expert_count ?? entry.expert_count,
       quant: info.quant ?? entry.quant,
       param_count: info.param_count ?? entry.param_count,
+      trained_ctx: info.trained_ctx ?? entry.trained_ctx,
+      n_head_kv: info.n_head_kv ?? entry.n_head_kv,
+      head_dim_k: info.head_dim_k ?? entry.head_dim_k,
+      head_dim_v: info.head_dim_v ?? entry.head_dim_v,
+      n_embd: info.n_embd ?? entry.n_embd,
+      n_head: info.n_head ?? entry.n_head,
+      sliding_window: info.sliding_window ?? entry.sliding_window,
       gguf_checked_at: Date.now(),
       last_verified: entry.last_verified,
     });
@@ -661,13 +668,31 @@ export async function getModelFilesWithState(
     // server can distinguish "checked, was null" from "not checked at all".
     const ggufFields: Pick<
       ModelDirFile,
-      "n_layer" | "mtp_layers" | "expert_count" | "quant" | "param_count"
+      | "n_layer"
+      | "mtp_layers"
+      | "expert_count"
+      | "quant"
+      | "param_count"
+      | "trained_ctx"
+      | "n_head_kv"
+      | "head_dim_k"
+      | "head_dim_v"
+      | "n_embd"
+      | "n_head"
+      | "sliding_window"
     > = {};
     if (entry.n_layer != null) ggufFields.n_layer = entry.n_layer;
     if (entry.mtp_layers != null) ggufFields.mtp_layers = entry.mtp_layers;
     if (entry.expert_count != null) ggufFields.expert_count = entry.expert_count;
     if (entry.quant != null) ggufFields.quant = entry.quant;
     if (entry.param_count != null) ggufFields.param_count = entry.param_count;
+    if (entry.trained_ctx != null) ggufFields.trained_ctx = entry.trained_ctx;
+    if (entry.n_head_kv != null) ggufFields.n_head_kv = entry.n_head_kv;
+    if (entry.head_dim_k != null) ggufFields.head_dim_k = entry.head_dim_k;
+    if (entry.head_dim_v != null) ggufFields.head_dim_v = entry.head_dim_v;
+    if (entry.n_embd != null) ggufFields.n_embd = entry.n_embd;
+    if (entry.n_head != null) ggufFields.n_head = entry.n_head;
+    if (entry.sliding_window != null) ggufFields.sliding_window = entry.sliding_window;
 
     results.push({
       path: entry.path,
