@@ -404,7 +404,7 @@ export async function resolveHfMetadata(
 
 /**
  * One-time per-file GGUF header read, backfilling n_layer/mtp_layers/
- * expert_count/quant/param_count onto each cache entry (see
+ * quant/param_count onto each cache entry (see
  * worker/src/gguf.ts's readGgufInfo). Gated on a staleness window so a
  * header that came back empty (unreadable/corrupt file) isn't re-read on
  * every reconciliation, and so a real model's header gets a fresh look at
@@ -423,7 +423,6 @@ export async function backfillGgufMetadata(modelDir: string, cache: LocalModelCa
       ...entry,
       n_layer: info.n_layer ?? entry.n_layer,
       mtp_layers: info.mtp_layers ?? entry.mtp_layers,
-      expert_count: info.expert_count ?? entry.expert_count,
       quant: info.quant ?? entry.quant,
       param_count: info.param_count ?? entry.param_count,
       trained_ctx: info.trained_ctx ?? entry.trained_ctx,
@@ -670,7 +669,6 @@ export async function getModelFilesWithState(
       ModelDirFile,
       | "n_layer"
       | "mtp_layers"
-      | "expert_count"
       | "quant"
       | "param_count"
       | "trained_ctx"
@@ -683,7 +681,6 @@ export async function getModelFilesWithState(
     > = {};
     if (entry.n_layer != null) ggufFields.n_layer = entry.n_layer;
     if (entry.mtp_layers != null) ggufFields.mtp_layers = entry.mtp_layers;
-    if (entry.expert_count != null) ggufFields.expert_count = entry.expert_count;
     if (entry.quant != null) ggufFields.quant = entry.quant;
     if (entry.param_count != null) ggufFields.param_count = entry.param_count;
     if (entry.trained_ctx != null) ggufFields.trained_ctx = entry.trained_ctx;

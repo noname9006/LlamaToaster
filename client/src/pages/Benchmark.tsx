@@ -298,7 +298,7 @@ function expandedKvPairs(sweep: Sweep): string[] {
 export function Benchmark() {
   const [models, setModels] = useState<Model[]>([]);
   const [locations, setLocations] = useState<Record<string, string[]> | null>(null);
-  const [unreachableLocationWorkers, setUnreachableLocationWorkers] = useState<string[]>([]);
+  const [, setUnreachableLocationWorkers] = useState<string[]>([]);
   const [modelId, setModelId] = useState("");
   const [workerId, setWorkerId] = useState("");
   const [selectedGpuRawIndex, setSelectedGpuRawIndex] = useState<number | undefined>(undefined);
@@ -485,7 +485,6 @@ export function Benchmark() {
   const modelLayerCount = typeof selectedModel?.metadata.n_layer === "number" ? selectedModel.metadata.n_layer : null;
   const baseLayerCount = modelLayerCount != null ? modelLayerCount + OUTPUT_LAYER : null;
   const trainedCtx = typeof selectedModel?.metadata.trained_ctx === "number" ? selectedModel.metadata.trained_ctx : null;
-  const expertCount = typeof selectedModel?.metadata.expert_count === "number" ? selectedModel.metadata.expert_count : null;
 
   const liveVramTotalMib = selectedWorker?.vram?.gpu_memory_total_mib ?? null;
   const liveVramFreeMib = selectedWorker?.vram?.vram_free_before_mib ?? null;
@@ -778,13 +777,6 @@ export function Benchmark() {
         />
       </div>
 
-      {workerId && unreachableLocationWorkers.includes(workerId) && (
-        <p className="-mt-2 text-xs text-warning">
-          Couldn't check what's on {selectedWorker?.displayName ?? "this machine"} — its models aren't offered
-          until that's confirmed, even if they're actually still there.
-        </p>
-      )}
-
       {/* Model + Machine ---------------------------------------------------- */}
       <div className="grid gap-4 md:grid-cols-2">
         <div className="rounded-xl border border-border bg-surface p-5">
@@ -794,15 +786,7 @@ export function Benchmark() {
               <div className="mt-1.5 break-all font-mono text-[12.5px] text-fg">{selectedModel.filename}</div>
               <dl className="mt-3 flex flex-col gap-1.5 text-[12.5px]">
                 <Kv label="Size on disk" value={formatBytes(selectedModel.size_bytes)} />
-                <Kv
-                  label="Layers · experts"
-                  value={
-                    modelLayerCount != null
-                      ? `${modelLayerCount}${expertCount != null && expertCount > 0 ? ` · ${expertCount} (MoE)` : " · dense"}`
-                      : "not read from this file's header"
-                  }
-                  read={modelLayerCount != null}
-                />
+                <Kv label="Layers" value={modelLayerCount != null ? `${modelLayerCount}` : "not read from this file's header"} read={modelLayerCount != null} />
                 {/* Trained context sits right under size/layers because it's
                     the model's own hard ceiling -- every context sizing path
                     (M2's target clamp, N1's ladder) clamps to it, so it can

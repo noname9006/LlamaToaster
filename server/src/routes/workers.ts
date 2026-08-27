@@ -38,7 +38,6 @@ function validateModelDownloadCallback(payload: unknown): string | null {
   for (const key of [
     "n_layer",
     "mtp_layers",
-    "expert_count",
     "param_count",
     "trained_ctx",
     "n_head_kv",
@@ -431,7 +430,7 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
         app.log.warn({ error: validationError }, "model download callback rejected: invalid payload");
         return reply.code(400).send({ error: validationError });
       }
-      const { worker, hf_repo, hf_file, ok, error, sha256, size_bytes, n_layer, mtp_layers, expert_count, quant, param_count, trained_ctx, n_head_kv, head_dim_k, head_dim_v, n_embd, n_head, sliding_window } =
+      const { worker, hf_repo, hf_file, ok, error, sha256, size_bytes, n_layer, mtp_layers, quant, param_count, trained_ctx, n_head_kv, head_dim_k, head_dim_v, n_embd, n_head, sliding_window } =
         request.body;
       if (!ok) {
         app.log.error({ worker, hf_repo, hf_file, error }, "model download failed");
@@ -458,7 +457,6 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
           ...(typeof n_layer === "number" ? { n_layer } : {}),
           ...(typeof resolvedParamCount === "number" ? { param_count: resolvedParamCount } : {}),
           ...(typeof mtp_layers === "number" && mtp_layers > 0 ? { mtp_layers } : {}),
-          ...(typeof expert_count === "number" && expert_count > 0 ? { expert_count } : {}),
           ...(typeof quant === "string" && quant ? { quant } : {}),
           // Trained context + KV geometry from the same GGUF header read --
           // same >0 gate as above so a non-standard header's 0/undefined
@@ -483,7 +481,6 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
             n_layer,
             param_count: resolvedParamCount,
             mtp_layers,
-            expert_count,
             quant,
             trained_ctx,
             n_head_kv,

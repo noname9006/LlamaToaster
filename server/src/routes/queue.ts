@@ -128,7 +128,6 @@ function ggufMetadataPatch(f: ModelDirFile): Partial<ModelMetadata> {
   const patch: Partial<ModelMetadata> = {};
   if (typeof f.n_layer === "number") patch.n_layer = f.n_layer;
   if (typeof f.mtp_layers === "number" && f.mtp_layers > 0) patch.mtp_layers = f.mtp_layers;
-  if (typeof f.expert_count === "number" && f.expert_count > 0) patch.expert_count = f.expert_count;
   if (typeof f.param_count === "number") patch.param_count = f.param_count;
   if (typeof f.quant === "string" && f.quant) patch.quant = f.quant;
   // Trained context + KV geometry -- adopted like the fields above so a

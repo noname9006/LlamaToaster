@@ -26,7 +26,6 @@ export interface LocalCacheEntry {
   // each field means; all absent for a file whose header couldn't be parsed.
   n_layer?: number;
   mtp_layers?: number;
-  expert_count?: number;
   quant?: string;
   param_count?: number;
   // Trained context + KV geometry (see gguf.ts's GgufInfo) -- persisted
@@ -175,9 +174,6 @@ export class LocalModelCache {
     if (!cols.some((c) => c.name === "mtp_layers")) {
       this.db.exec(`ALTER TABLE local_model_cache ADD COLUMN mtp_layers INTEGER`);
     }
-    if (!cols.some((c) => c.name === "expert_count")) {
-      this.db.exec(`ALTER TABLE local_model_cache ADD COLUMN expert_count INTEGER`);
-    }
     if (!cols.some((c) => c.name === "quant")) {
       this.db.exec(`ALTER TABLE local_model_cache ADD COLUMN quant TEXT`);
     }
@@ -227,7 +223,7 @@ export class LocalModelCache {
   // addition can't silently drift between the reader and the writer.
   private static readonly SELECT_COLS =
     "path, size, mtime, sha256, hf_model_id, hf_checked_at, hf_deleted_at, " +
-    "n_layer, mtp_layers, expert_count, quant, param_count, gguf_checked_at, last_verified, state, " +
+    "n_layer, mtp_layers, quant, param_count, gguf_checked_at, last_verified, state, " +
     "trained_ctx, n_head_kv, head_dim_k, head_dim_v, n_embd, n_head, sliding_window";
 
   async get(path: string): Promise<LocalCacheEntry | null> {
@@ -265,8 +261,8 @@ export class LocalModelCache {
 
     this.db
       .prepare(
-        `INSERT INTO local_model_cache (path, size, mtime, sha256, hf_model_id, hf_checked_at, hf_deleted_at, n_layer, mtp_layers, expert_count, quant, param_count, gguf_checked_at, last_verified, state, trained_ctx, n_head_kv, head_dim_k, head_dim_v, n_embd, n_head, sliding_window)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO local_model_cache (path, size, mtime, sha256, hf_model_id, hf_checked_at, hf_deleted_at, n_layer, mtp_layers, quant, param_count, gguf_checked_at, last_verified, state, trained_ctx, n_head_kv, head_dim_k, head_dim_v, n_embd, n_head, sliding_window)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(path) DO UPDATE SET
            size = excluded.size,
            mtime = excluded.mtime,
@@ -276,7 +272,6 @@ export class LocalModelCache {
            hf_deleted_at = excluded.hf_deleted_at,
            n_layer = excluded.n_layer,
            mtp_layers = excluded.mtp_layers,
-           expert_count = excluded.expert_count,
            quant = excluded.quant,
            param_count = excluded.param_count,
            gguf_checked_at = excluded.gguf_checked_at,
@@ -300,7 +295,6 @@ export class LocalModelCache {
         entry.hf_deleted_at ?? null,
         entry.n_layer ?? null,
         entry.mtp_layers ?? null,
-        entry.expert_count ?? null,
         entry.quant ?? null,
         entry.param_count ?? null,
         entry.gguf_checked_at ?? null,
@@ -385,7 +379,6 @@ export class LocalModelCache {
     hf_deleted_at: number | null;
     n_layer: number | null;
     mtp_layers: number | null;
-    expert_count: number | null;
     quant: string | null;
     param_count: number | null;
     gguf_checked_at: number | null;
@@ -409,7 +402,6 @@ export class LocalModelCache {
       hf_deleted_at: row.hf_deleted_at ?? undefined,
       n_layer: row.n_layer ?? undefined,
       mtp_layers: row.mtp_layers ?? undefined,
-      expert_count: row.expert_count ?? undefined,
       quant: row.quant ?? undefined,
       param_count: row.param_count ?? undefined,
       gguf_checked_at: row.gguf_checked_at ?? undefined,
