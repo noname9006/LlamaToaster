@@ -2727,11 +2727,28 @@ async function executeDownloadModelJob(
     }
 
     updateDownloadReport(jobId, { detail: "reading GGUF metadata" });
-    const { n_layer, mtp_layers, expert_count, quant, param_count, debugReason } = await readGgufInfo(target);
+    const {
+      n_layer,
+      mtp_layers,
+      expert_count,
+      quant,
+      param_count,
+      trained_ctx,
+      n_head_kv,
+      head_dim_k,
+      head_dim_v,
+      n_embd,
+      n_head,
+      sliding_window,
+      debugReason,
+    } = await readGgufInfo(target);
     log.info(
       `gguf metadata for ${progressKey}: n_layer=${n_layer ?? "unknown"} mtp_layers=${mtp_layers ?? "unknown"} ` +
         `expert_count=${expert_count ?? "unknown"} quant=${quant ?? "unknown"} ` +
-        `param_count=${param_count ?? "unknown"}${debugReason ? ` (${debugReason})` : ""}`
+        `param_count=${param_count ?? "unknown"} trained_ctx=${trained_ctx ?? "unknown"} ` +
+        `n_head_kv=${n_head_kv ?? "unknown"} head_dim_k=${head_dim_k ?? "unknown"} ` +
+        `head_dim_v=${head_dim_v ?? "unknown"} sliding_window=${sliding_window ?? "none"}` +
+        `${debugReason ? ` (${debugReason})` : ""}`
     );
 
     // Update local cache with the new file info. Identity (hf_model_id) and
@@ -2760,6 +2777,13 @@ async function executeDownloadModelJob(
       expert_count: expert_count ?? undefined,
       quant: quant ?? undefined,
       param_count: param_count ?? undefined,
+      trained_ctx: trained_ctx ?? undefined,
+      n_head_kv: n_head_kv ?? undefined,
+      head_dim_k: head_dim_k ?? undefined,
+      head_dim_v: head_dim_v ?? undefined,
+      n_embd: n_embd ?? undefined,
+      n_head: n_head ?? undefined,
+      sliding_window: sliding_window ?? undefined,
       gguf_checked_at: Date.now(),
       last_verified: Date.now(),
       state: verificationState,
@@ -2801,6 +2825,13 @@ async function executeDownloadModelJob(
       expert_count,
       quant,
       param_count,
+      trained_ctx,
+      n_head_kv,
+      head_dim_k,
+      head_dim_v,
+      n_embd,
+      n_head,
+      sliding_window,
     });
     if (!reported) {
       // The file is on disk and hashed, but the server never learned about

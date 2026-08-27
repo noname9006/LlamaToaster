@@ -31,6 +31,27 @@ function validateModelDownloadCallback(payload: unknown): string | null {
   } else if (p.error !== undefined && typeof p.error !== "string") {
     return "error must be a string";
   }
+  // Per-file GGUF header fields (ModelDownloadCallbackInput) -- all optional
+  // (an old worker sends none), but each must be a number when present. A
+  // null means the header was read and the key wasn't there; tolerated since
+  // it carries no information beyond absence here.
+  for (const key of [
+    "n_layer",
+    "mtp_layers",
+    "expert_count",
+    "param_count",
+    "trained_ctx",
+    "n_head_kv",
+    "head_dim_k",
+    "head_dim_v",
+    "n_embd",
+    "n_head",
+    "sliding_window",
+  ] as const) {
+    const v = p[key];
+    if (v !== undefined && v !== null && typeof v !== "number") return `${key} must be a number`;
+  }
+  if (p.quant !== undefined && p.quant !== null && typeof p.quant !== "string") return "quant must be a string";
   return null;
 }
 
@@ -410,7 +431,7 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
         app.log.warn({ error: validationError }, "model download callback rejected: invalid payload");
         return reply.code(400).send({ error: validationError });
       }
-      const { worker, hf_repo, hf_file, ok, error, sha256, size_bytes, n_layer, mtp_layers, expert_count, quant, param_count } =
+      const { worker, hf_repo, hf_file, ok, error, sha256, size_bytes, n_layer, mtp_layers, expert_count, quant, param_count, trained_ctx, n_head_kv, head_dim_k, head_dim_v, n_embd, n_head, sliding_window } =
         request.body;
       if (!ok) {
         app.log.error({ worker, hf_repo, hf_file, error }, "model download failed");
@@ -439,6 +460,16 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
           ...(typeof mtp_layers === "number" && mtp_layers > 0 ? { mtp_layers } : {}),
           ...(typeof expert_count === "number" && expert_count > 0 ? { expert_count } : {}),
           ...(typeof quant === "string" && quant ? { quant } : {}),
+          // Trained context + KV geometry from the same GGUF header read --
+          // same >0 gate as above so a non-standard header's 0/undefined
+          // can't overwrite anything with a meaningless value.
+          ...(typeof trained_ctx === "number" && trained_ctx > 0 ? { trained_ctx } : {}),
+          ...(typeof n_head_kv === "number" && n_head_kv > 0 ? { n_head_kv } : {}),
+          ...(typeof head_dim_k === "number" && head_dim_k > 0 ? { head_dim_k } : {}),
+          ...(typeof head_dim_v === "number" && head_dim_v > 0 ? { head_dim_v } : {}),
+          ...(typeof n_embd === "number" && n_embd > 0 ? { n_embd } : {}),
+          ...(typeof n_head === "number" && n_head > 0 ? { n_head } : {}),
+          ...(typeof sliding_window === "number" && sliding_window > 0 ? { sliding_window } : {}),
         };
         if (isMtpDraftModel({ metadata, hf_file, filename: hf_file })) {
           metadata.mtp_role = "draft";
@@ -454,6 +485,9 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
             mtp_layers,
             expert_count,
             quant,
+            trained_ctx,
+            n_head_kv,
+            sliding_window,
             mtp_role: metadata.mtp_role,
           },
           "model download complete"

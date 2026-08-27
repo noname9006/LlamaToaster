@@ -1105,6 +1105,17 @@ export interface ModelDirFile {
   expert_count?: number | null;
   quant?: string | null;
   param_count?: number | null;
+  // Trained context + KV-cache geometry, from the same GGUF header walk
+  // (see ModelMetadata's matching fields for what each feeds downstream).
+  // Same optional-null convention as the fields above: null = header key
+  // absent (e.g. no sliding-window attention), absent = old worker code.
+  trained_ctx?: number | null;
+  n_head_kv?: number | null;
+  head_dim_k?: number | null;
+  head_dim_v?: number | null;
+  n_embd?: number | null;
+  n_head?: number | null;
+  sliding_window?: number | null;
 }
 
 export interface HardwareInfo {
@@ -1327,6 +1338,17 @@ export interface ModelDownloadCallbackInput {
   // it straight into ModelMetadata.param_count instead of calling
   // getHfGgufMeta.
   param_count?: number | null;
+  // Trained context + KV geometry from the same GGUF header read -- stored
+  // straight into ModelMetadata (feeds M2's target-context clamp, N1's
+  // sizing ladder, and the Benchmark page's model card). Optional/null so an
+  // older worker binary that doesn't send them keeps validating.
+  trained_ctx?: number | null;
+  n_head_kv?: number | null;
+  head_dim_k?: number | null;
+  head_dim_v?: number | null;
+  n_embd?: number | null;
+  n_head?: number | null;
+  sliding_window?: number | null;
 }
 
 // --- Pull queue (MULTIUSER_PLAN.md Stage 1) ---
