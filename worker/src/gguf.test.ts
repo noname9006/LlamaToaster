@@ -72,21 +72,19 @@ function writeTempGguf(
 }
 
 describe("readGgufInfo", () => {
-  it("resolves n_layer/expert_count for a normal, well-ordered file", async () => {
+  it("resolves n_layer for a normal, well-ordered file", async () => {
     const path = writeTempGguf([
       ["general.architecture", T.STRING, "qwen3moe"],
       ["qwen3moe.block_count", T.UINT32, 48],
-      ["qwen3moe.expert_count", T.UINT32, 128],
       ["tokenizer.ggml.model", T.STRING, "gpt2"],
     ]);
     const info = await readGgufInfo(path);
     expect(info.n_layer).toBe(48);
-    expect(info.expert_count).toBe(128);
     expect(info.debugReason).toBeUndefined();
   });
 
   // Trained context + KV geometry -- resolved via the same suffix-matching
-  // walk as block_count/expert_count, keyed off the file's own architecture,
+  // walk as block_count, keyed off the file's own architecture,
   // so keys that appear before general.architecture are still found.
   it("resolves trained context and KV-cache geometry from architecture-prefixed keys", async () => {
     const path = writeTempGguf([
@@ -181,7 +179,6 @@ describe("readGgufInfo", () => {
     ]);
     const info = await readGgufInfo(path);
     expect(info.n_layer).toBe(32);
-    expect(info.expert_count).toBeNull();
   });
 
   // Regression coverage for a file whose name carries no quant token at all

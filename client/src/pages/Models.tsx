@@ -383,10 +383,9 @@ export function Models() {
   // Live "which worker(s) have this model's file" map -- see
   // server/src/routes/models.ts's /api/models/locations. Drives the
   // Local/Remote (one collapsible section per configured worker) split
-  // below. unreachableLocationWorkers lists workers that couldn't be
-  // checked, so their models aren't wrongly assumed absent everywhere.
+  // below.
   const [locations, setLocations] = useState<Record<string, string[]>>({});
-  const [unreachableLocationWorkers, setUnreachableLocationWorkers] = useState<string[]>([]);
+  const [, setUnreachableLocationWorkers] = useState<string[]>([]);
 
   const [authorFilter, setAuthorFilter] = useState("");
   const [familyFilter, setFamilyFilter] = useState("");
@@ -1355,16 +1354,6 @@ export function Models() {
                 {refreshingModels ? "Refreshing..." : "Refresh Models"}
               </button>
             </div>
-
-            {unreachableLocationWorkers.length > 0 && (
-              <p className="mt-3 text-xs text-warning">
-                Couldn't check what's on:{" "}
-                {unreachableLocationWorkers
-                  .map((id) => workers.find((w) => w.id === id)?.displayName ?? id)
-                  .join(", ")}{" "}
-                -- their models may be missing below even though they actually have them.
-              </p>
-            )}
 
             {workers.length > 1 && (
               <label className="mt-3 flex flex-wrap items-center gap-2 text-sm">

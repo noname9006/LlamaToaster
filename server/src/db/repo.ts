@@ -299,7 +299,6 @@ interface ModelDirFileMeta {
   size_bytes: number;
   n_layer?: number | null;
   mtp_layers?: number | null;
-  expert_count?: number | null;
   // Present in stored model_files_json now that the heartbeat validator
   // persists it -- see validate-worker-state.ts's parseModelFiles.
   state?: string;
@@ -1848,7 +1847,7 @@ export const repo = {
     findModelFileMeta(
       userId: string | undefined,
       filename: string
-    ): { n_layer: number | null; mtp_layers: number | null; expert_count: number | null } | undefined {
+    ): { n_layer: number | null; mtp_layers: number | null } | undefined {
       const rows = getDb()
         .prepare(`SELECT model_files_json FROM workers WHERE (? IS NULL OR user_id = ?)`)
         .all(userId ?? null, userId ?? null) as { model_files_json: string | null }[];
@@ -1861,14 +1860,11 @@ export const repo = {
         const match = files.find((f) => f.path === filename && f.state !== "missing");
         if (
           match &&
-          (typeof match.n_layer === "number" ||
-            typeof match.mtp_layers === "number" ||
-            typeof match.expert_count === "number")
+          (typeof match.n_layer === "number" || typeof match.mtp_layers === "number")
         ) {
           return {
             n_layer: match.n_layer ?? null,
             mtp_layers: match.mtp_layers ?? null,
-            expert_count: match.expert_count ?? null,
           };
         }
       }

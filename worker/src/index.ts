@@ -2748,7 +2748,6 @@ async function executeDownloadModelJob(
     const {
       n_layer,
       mtp_layers,
-      expert_count,
       quant,
       param_count,
       trained_ctx,
@@ -2762,7 +2761,7 @@ async function executeDownloadModelJob(
     } = await readGgufInfo(target);
     log.info(
       `gguf metadata for ${progressKey}: n_layer=${n_layer ?? "unknown"} mtp_layers=${mtp_layers ?? "unknown"} ` +
-        `expert_count=${expert_count ?? "unknown"} quant=${quant ?? "unknown"} ` +
+        `quant=${quant ?? "unknown"} ` +
         `param_count=${param_count ?? "unknown"} trained_ctx=${trained_ctx ?? "unknown"} ` +
         `n_head_kv=${n_head_kv ?? "unknown"} head_dim_k=${head_dim_k ?? "unknown"} ` +
         `head_dim_v=${head_dim_v ?? "unknown"} sliding_window=${sliding_window ?? "none"}` +
@@ -2792,7 +2791,6 @@ async function executeDownloadModelJob(
       hf_checked_at: Date.now(),
       n_layer: n_layer ?? undefined,
       mtp_layers: mtp_layers ?? undefined,
-      expert_count: expert_count ?? undefined,
       quant: quant ?? undefined,
       param_count: param_count ?? undefined,
       trained_ctx: trained_ctx ?? undefined,
@@ -2840,7 +2838,6 @@ async function executeDownloadModelJob(
       size_bytes: byteLength,
       n_layer,
       mtp_layers,
-      expert_count,
       quant,
       param_count,
       trained_ctx,

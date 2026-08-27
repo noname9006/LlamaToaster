@@ -457,14 +457,6 @@ export function NewRun() {
   // MTP-capable) since that detection is best-effort -- see the warning
   // notice next to the toggle.
   const modelMtpCapable = typeof selectedModel?.metadata.mtp_layers === "number" && selectedModel.metadata.mtp_layers > 0;
-  // Gates the --n-cpu-moe control below -- unlike modelMtpCapable above,
-  // this DOES disable its control (SliderChipInput's disabled prop) rather
-  // than just changing hint text, a deliberate stricter posture for this
-  // specific control: MTP detection stays best-effort/advisory because a
-  // false negative there just means an extra manual pick, but a MoE-CPU-
-  // offload control enabled against a model with no experts to offload has
-  // nothing to do at all. See shared/types.ts's ModelMetadata.expert_count.
-  const modelIsMoe = typeof selectedModel?.metadata.expert_count === "number" && selectedModel.metadata.expert_count > 0;
   // Every registered draft is listed (not hidden) so the user can see the
   // full set that exists, but only ones sharing the base model's own
   // hf_repo -- the real HF folder-structure signal a drafter file is
@@ -579,11 +571,9 @@ export function NewRun() {
   const cpuMoeSuggested = 0;
   const cpuMoeSuggestedLabel = noGpu
     ? "Suggested: 0 -- this worker has no GPU backend"
-    : !modelIsMoe
-      ? "Suggested: 0 -- this model isn't detected as Mixture-of-Experts"
-      : modelLayerCount != null
-        ? `Suggested: 0 -- raise to keep some of this model's ${modelLayerCount} MoE layers' experts on CPU RAM instead of GPU VRAM`
-        : `Suggested: 0 -- model's layer count isn't known yet`;
+    : modelLayerCount != null
+      ? `Suggested: 0 -- raise to keep some of this model's ${modelLayerCount} MoE layers' experts on CPU RAM instead of GPU VRAM`
+      : `Suggested: 0 -- model's layer count isn't known yet`;
 
   // Pre-flight VRAM-fit estimate -- null (no banner) whenever any input is
   // unknown (model size, layer count, or a live VRAM reading), same "don't
@@ -662,9 +652,9 @@ export function NewRun() {
     }
     // Always seeded inert (0), never a "try both" [0, max] pair like
     // n_gpu_layers above -- unlike full GPU offload, there's no sensible
-    // universal "on" default for MoE-CPU-offload to suggest trying, and the
-    // control stays disabled anyway until a MoE model is picked (see
-    // modelIsMoe).
+    // universal "on" default for MoE-CPU-offload to suggest trying, so the
+    // control just starts inert as a manual knob the user can raise for a
+    // MoE model that won't fit in VRAM.
     baseSweep.n_cpu_moe = [0];
     // Placeholder until a draft model is actually picked (mtpModelId isn't
     // known yet at this point -- it's reset separately, see the effect
@@ -1162,11 +1152,9 @@ export function NewRun() {
             max={cpuMoeMax}
             suggested={cpuMoeSuggested}
             suggestedLabel={cpuMoeSuggestedLabel}
-            disabled={!modelIsMoe || noGpu}
+            disabled={noGpu}
             disabledNote={
-              noGpu
-                ? "This worker's build has no GPU backend, so there's nothing to keep on CPU vs GPU."
-                : "This model isn't detected as a Mixture-of-Experts model, so --n-cpu-moe has nothing to offload."
+              noGpu ? "This worker's build has no GPU backend, so there's nothing to keep on CPU vs GPU." : undefined
             }
             {...field(sweep, setSweep, "n_cpu_moe")}
           />

@@ -176,7 +176,6 @@ function parseModelFiles(value: unknown): ModelDirFile[] {
       // store" from "nothing to store" without a second presence flag.
       const nLayer = optionalNumber(row.n_layer, `model_files[${i}].n_layer`);
       const mtpLayers = optionalNumber(row.mtp_layers, `model_files[${i}].mtp_layers`);
-      const expertCount = optionalNumber(row.expert_count, `model_files[${i}].expert_count`);
       const paramCount = optionalNumber(row.param_count, `model_files[${i}].param_count`);
       const quant = optionalString(row.quant, `model_files[${i}].quant`, 32);
       // Trained context + KV geometry (see ModelDirFile) -- same optional,
@@ -195,7 +194,6 @@ function parseModelFiles(value: unknown): ModelDirFile[] {
         size_bytes: requireNumber(row.size_bytes, `model_files[${i}].size_bytes`),
         ...(nLayer != null ? { n_layer: nLayer } : {}),
         ...(mtpLayers != null ? { mtp_layers: mtpLayers } : {}),
-        ...(expertCount != null ? { expert_count: expertCount } : {}),
         ...(paramCount != null ? { param_count: paramCount } : {}),
         ...(quant != null ? { quant } : {}),
         ...(trainedCtx != null ? { trained_ctx: trainedCtx } : {}),
