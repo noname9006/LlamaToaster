@@ -225,7 +225,9 @@ function toFiniteNumber(raw: string | undefined): number | null {
 // GPU drivers are no more reachable from us than they are from anyone else.
 // The HTTP port is overridable via LHM_HTTP_PORT (default 8085).
 
-const LHM_HTTP_PORT = Number(process.env.LHM_HTTP_PORT ?? 8085);
+// Exported so the worker's startup log can cite the real port (LHM_HTTP_PORT
+// override) in its Windows AMD/Intel LibreHardwareMonitor guidance.
+export const LHM_HTTP_PORT = Number(process.env.LHM_HTTP_PORT ?? 8085);
 const LHM_HTTP_URL = `http://127.0.0.1:${LHM_HTTP_PORT}/data.json`;
 
 /** One candidate reading harvested from an LHM surface, pre-selection. */

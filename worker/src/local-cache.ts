@@ -210,6 +210,16 @@ export class LocalModelCache {
     if (!cols.some((c) => c.name === "sliding_window")) {
       this.db.exec(`ALTER TABLE local_model_cache ADD COLUMN sliding_window INTEGER`);
     }
+    // First migration that adds the trained-context + KV-geometry columns
+    // (this whole branch runs exactly once, the first time `trained_ctx`
+    // appears). Rows written by an OLDER GGUF reader have those columns NULL
+    // but a fresh `gguf_checked_at`, so the scanner's 24h staleness gate
+    // (worker/src/model-scanner.ts's isGgufCheckStale) would suppress
+    // re-reading them for up to a day. Clear the gate once so the next
+    // reconciliation (backfillGgufMetadata) re-reads every header with the
+    // richer reader -- a one-time cost per file, bounded by model count.
+    // Subsequent startups hit the staleness gate as usual.
+    this.db.exec(`UPDATE local_model_cache SET gguf_checked_at = NULL`);
   }
 
   // Every column, shared by all three SELECT sites (get/getAll/getBySha256)
