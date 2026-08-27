@@ -778,19 +778,6 @@ export async function runsRoutes(app: FastifyInstance): Promise<void> {
         return reply.code(400).send({ error: "worker_id is required" });
       }
 
-      // --n-cpu-moe only has anything to offload on a Mixture-of-Experts
-      // model -- a direct API call needs the same rejection the client's
-      // disabled slider provides, rather than every item silently no-opping
-      // the flag against a model with no experts.
-      if (body.sweep.n_cpu_moe.some((n) => n > 0)) {
-        const modelIsMoe = typeof model.metadata.expert_count === "number" && model.metadata.expert_count > 0;
-        if (!modelIsMoe) {
-          return reply.code(400).send({
-            error: 'sweep includes n_cpu_moe > 0 but this model isn\'t detected as a Mixture-of-Experts model',
-          });
-        }
-      }
-
       const worker = repo.workerRepo.getWorker(body.worker_id);
       if (!worker) {
         request.log.warn({ worker_id: body.worker_id }, "run trigger rejected: unknown machine");

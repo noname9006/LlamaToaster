@@ -125,7 +125,6 @@ describe("LocalModelCache", () => {
       null, // hf_deleted_at
       null, // n_layer
       null, // mtp_layers
-      null, // expert_count
       null, // quant
       null, // param_count
       null, // gguf_checked_at

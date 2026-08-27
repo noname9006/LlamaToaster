@@ -126,17 +126,14 @@ export async function modelsRoutes(app: FastifyInstance): Promise<void> {
       const model = repo.getModel(request.params.id);
       if (!model) return reply.code(404).send({ error: "model not found" });
 
-      // All three must already be known to skip the lookup -- an earlier
-      // version of this check only looked at n_layer, which meant a model
-      // that already had n_layer (true for every model registered before
+      // Both must already be known to skip the lookup -- an earlier version
+      // of this check only looked at n_layer, which meant a model that
+      // already had n_layer (true for every model registered before
       // mtp_layers detection existed) could never get mtp_layers backfilled
-      // at all, since the request never got this far. expert_count joins the
-      // same gate for the same reason (a model registered before MoE
-      // detection existed must still get a chance to pick it up).
+      // at all, since the request never got this far.
       const hasLayerCount = typeof model.metadata.n_layer === "number";
       const hasMtpLayers = typeof model.metadata.mtp_layers === "number";
-      const hasExpertCount = typeof model.metadata.expert_count === "number";
-      if (hasLayerCount && hasMtpLayers && hasExpertCount) {
+      if (hasLayerCount && hasMtpLayers) {
         return reply.code(200).send({ ok: true, n_layer: model.metadata.n_layer });
       }
 
@@ -151,27 +148,25 @@ export async function modelsRoutes(app: FastifyInstance): Promise<void> {
       const meta = repo.workerRepo.findModelFileMeta(authed?.user.id, filename) ?? {
         n_layer: null,
         mtp_layers: null,
-        expert_count: null,
       };
       // Fall back to the already-known value rather than letting a worker
       // that hasn't reported this file (temporarily offline, or no longer has
       // it) regress an n_layer this model already had, just because this
-      // call's real purpose this time was picking up mtp_layers/expert_count.
+      // call's real purpose this time was picking up mtp_layers.
       const resolvedNLayer = meta.n_layer ?? (hasLayerCount ? (model.metadata.n_layer as number) : null);
       if (resolvedNLayer == null) {
         return reply.code(200).send({ ok: true, n_layer: null });
       }
-      // mtp_layers/expert_count come along for free from the same lookup --
-      // only worth persisting when actually present (>0), same "don't
-      // clobber with a meaningless 0" posture the download route already
-      // uses. Also recompute mtp_role from the now-complete metadata (see
-      // shared/types.ts's isMtpDraftModel) -- every read site recomputes
-      // this live regardless, but keeping the persisted flag correct too
-      // avoids a misleading raw DB row.
+      // mtp_layers comes along for free from the same lookup -- only worth
+      // persisting when actually present (>0), same "don't clobber with a
+      // meaningless 0" posture the download route already uses. Also recompute
+      // mtp_role from the now-complete metadata (see shared/types.ts's
+      // isMtpDraftModel) -- every read site recomputes this live regardless,
+      // but keeping the persisted flag correct too avoids a misleading raw DB
+      // row.
       const patch = {
         n_layer: resolvedNLayer,
         ...(typeof meta.mtp_layers === "number" && meta.mtp_layers > 0 ? { mtp_layers: meta.mtp_layers } : {}),
-        ...(typeof meta.expert_count === "number" && meta.expert_count > 0 ? { expert_count: meta.expert_count } : {}),
       };
       const mergedMetadata = { ...model.metadata, ...patch };
       repo.updateModelMetadata(model.id, {
@@ -181,7 +176,7 @@ export async function modelsRoutes(app: FastifyInstance): Promise<void> {
           : {}),
       });
       request.log.info(
-        { model_id: model.id, filename, n_layer: resolvedNLayer, mtp_layers: meta.mtp_layers, expert_count: meta.expert_count },
+        { model_id: model.id, filename, n_layer: resolvedNLayer, mtp_layers: meta.mtp_layers },
         "backfilled model layer count"
       );
       return reply.code(200).send({ ok: true, n_layer: resolvedNLayer });

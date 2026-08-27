@@ -33,8 +33,9 @@ export interface SweepItem {
   // both mtp above and the base model's own -ngl (see worker/src/bench.ts
   // and worker/src/serverBench.ts's buildArgs, which push this on either
   // path regardless of MTP). 0 omits the flag entirely -- today's behavior.
-  // Only meaningful for a model detected as MoE (see shared/types.ts's
-  // ModelMetadata.expert_count); NewRun.tsx disables the control otherwise.
+  // An always-available manual knob: llama.cpp silently ignores it on a
+  // dense model, so the NewRun.tsx control is enabled for every model (there
+  // is no per-model MoE detection anymore).
   n_cpu_moe: number;
 }
 

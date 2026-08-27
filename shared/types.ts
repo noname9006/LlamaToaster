@@ -236,13 +236,6 @@ export interface ModelMetadata {
   // companion file itself (Gemma-4-style), meant to be paired with a base
   // model via --model-draft rather than run standalone.
   mtp_layers?: number;
-  // GGUF's <architecture>.expert_count, read at the same time as n_layer --
-  // see worker/src/gguf.ts. Present and >0 only for a Mixture-of-Experts
-  // architecture; absent for a dense model or a model registered before this
-  // existed, same "absent means unknown/not applicable" convention as
-  // mtp_layers above. Gates NewRun.tsx's --n-cpu-moe control (see
-  // shared/sweep.ts's n_cpu_moe once that axis exists).
-  expert_count?: number;
   // Set to "draft" when this model was registered from a path/filename
   // containing "mtp" (the real-world convention for standalone MTP/drafter
   // downloads, e.g. unsloth's "MTP/mtp-gemma-4-12B-it.gguf") -- see
@@ -1102,7 +1095,6 @@ export interface ModelDirFile {
   // workers running old code that never reads GGUF headers per file.
   n_layer?: number | null;
   mtp_layers?: number | null;
-  expert_count?: number | null;
   quant?: string | null;
   param_count?: number | null;
   // Trained context + KV-cache geometry, from the same GGUF header walk
@@ -1322,7 +1314,6 @@ export interface ModelDownloadCallbackInput {
   size_bytes?: number;
   n_layer?: number | null;
   mtp_layers?: number | null;
-  expert_count?: number | null;
   // Quant code read from the downloaded file's own general.file_type header
   // (see worker/src/gguf.ts's quantLabelFromFileType), independent of
   // hf_file's naming -- some real files (e.g. unsloth's MTP drafters, named

@@ -225,11 +225,6 @@ export interface GgufInfo {
   // server/src/routes/workers.ts), this key describes the drafter itself.
   // See shared/types.ts's ModelMetadata.mtp_layers/mtp_role.
   mtp_layers: number | null;
-  // GGUF's <architecture>.expert_count -- present and >0 only for a
-  // Mixture-of-Experts architecture (absent entirely for a dense model, same
-  // "absent means unknown/not applicable" convention as mtp_layers above).
-  // See shared/types.ts's ModelMetadata.expert_count.
-  expert_count: number | null;
   // Quant code derived from general.file_type (see FTYPE_QUANT_LABEL above),
   // not from the filename -- null when the key is absent (very old/foreign
   // conversion tools) or its value isn't one of the currently-live ftypes.
@@ -260,7 +255,7 @@ export interface GgufInfo {
   // with sliding-window attention (Mistral/Gemma-style); null means plain
   // full attention, where KV cache grows linearly across the whole context.
   sliding_window: number | null;
-  // Local-only diagnostic for why n_layer/mtp_layers/expert_count came back
+  // Local-only diagnostic for why n_layer/mtp_layers came back
   // null -- never sent over the wire (worker/src/index.ts logs it, nothing
   // else reads it), purely so a failed lookup says WHY instead of leaving
   // "unknown" to guess at (bad magic? unreadable file? architecture key
@@ -272,7 +267,6 @@ function emptyGgufInfo(debugReason: string): GgufInfo {
   return {
     n_layer: null,
     mtp_layers: null,
-    expert_count: null,
     quant: null,
     param_count: null,
     trained_ctx: null,
@@ -310,7 +304,6 @@ export async function readGgufInfo(filePath: string): Promise<GgufInfo> {
     let fileType: number | undefined;
     const blockCounts = new Map<string, number>();
     const mtpLayerCounts = new Map<string, number>();
-    const expertCounts = new Map<string, number>();
     // KV-cache geometry + trained context -- captured exactly like the maps
     // above (architecture-prefixed keys resolved after the walk), so a
     // hyperparameter that happens to appear before the architecture key is
@@ -350,8 +343,6 @@ export async function readGgufInfo(filePath: string): Promise<GgufInfo> {
         valueType !== GGUF_TYPE.STRING
       ) {
         mtpLayerCounts.set(key, await reader.numeric(valueType));
-      } else if (key.endsWith(".expert_count") && valueType !== GGUF_TYPE.ARRAY && valueType !== GGUF_TYPE.STRING) {
-        expertCounts.set(key, await reader.numeric(valueType));
       } else if (key.endsWith(".context_length") && valueType !== GGUF_TYPE.ARRAY && valueType !== GGUF_TYPE.STRING) {
         contextLengths.set(key, await reader.numeric(valueType));
       } else if (
@@ -424,7 +415,6 @@ export async function readGgufInfo(filePath: string): Promise<GgufInfo> {
     return {
       n_layer,
       mtp_layers: mtpLayerCounts.get(`${architecture}.nextn_predict_layers`) ?? null,
-      expert_count: expertCounts.get(`${architecture}.expert_count`) ?? null,
       quant: fileType != null ? quantLabelFromFileType(fileType) : null,
       param_count,
       trained_ctx: contextLengths.get(`${architecture}.context_length`) ?? null,
