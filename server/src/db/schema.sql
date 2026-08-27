@@ -13,6 +13,13 @@ CREATE TABLE IF NOT EXISTS models (
 
 CREATE TABLE IF NOT EXISTS runs (
   id TEXT PRIMARY KEY,
+  -- §0.5 -- denormalized at creation, immutable; points at the run itself
+  -- for standalone runs. Chain-scoped reads are indexed equality predicates.
+  root_run_id TEXT REFERENCES runs(id),
+  -- §0.5 -- 'tuning'|'refine'|'sweep'|'runtime'|'probe'|'quality'; NULL = standalone
+  kind TEXT,
+  -- N3 -- groups model-vs-model comparison members; NULL otherwise
+  comparison_id TEXT,
   worker_name TEXT,              -- just a label, e.g. 'Local' — no registration needed
   llama_cpp_build TEXT,          -- pinned build tag, e.g. 'b10068'
   llama_cpp_backend TEXT,        -- 'vulkan' | 'cpu' | 'cuda'
@@ -33,6 +40,49 @@ CREATE TABLE IF NOT EXISTS results (
   test_type TEXT,                -- 'pp' | 'tg' | 'pg'
   n_prompt INTEGER,
   n_gen INTEGER,
+  -- §0.2 -- KV-prefill depth; always 0 on server-engine rows (depth rule)
+  n_depth INTEGER DEFAULT 0,
+  -- §0.1 -- worker-stamped methodology version; NULL = pre-v8-core
+  method_version INTEGER,
+  -- §0.8 twin-join columns (config_hash excludes spec fields, which is what
+  -- makes the join work); speedup_status ∈ ok|unverified|unavailable
+  config_hash TEXT,
+  prompt_offset INTEGER,
+  spec_type TEXT,
+  spec_n_max INTEGER,
+  spec_n_min INTEGER,
+  speedup REAL,
+  speedup_status TEXT,
+  -- §0.10 -- JSON string[] of caveat flags from the closed registry
+  caveat_flags TEXT,
+  -- N5 -- concurrent streaming slots this row measured (1 = solo)
+  concurrency INTEGER,
+  -- M6 -- adapter peak °C, lowest sampled sclk, and the sample series
+  -- (JSON number[], ~6s cadence; prunable 30 days after ingest)
+  gpu_temp_c_max INTEGER,
+  gpu_clock_mhz_min INTEGER,
+  gpu_clock_samples TEXT,
+  -- N6 -- llama.cpp startup-banner ISA provenance (CPU-bound rows)
+  cpu_isa TEXT,
+  -- N1/Test B -- MEASURED time-to-first-token from the streamed response
+  -- (llama-server path only; the llama-bench path has no request lifecycle
+  -- and leaves these NULL, which the UI renders as a derived estimate
+  -- instead). ttft_n is the sample count behind p50/p95: a choreographed
+  -- curve point is single-shot by construction (ttft_n = 1) and is labeled
+  -- as such -- no p50/p95 pretense on cold columns.
+  -- N7 -- imported rows are BADGED and never merge into local profile
+  -- scoring unless opted in per import. NULL bundle id = a local measurement.
+  imported_bundle_id TEXT,
+  import_opt_in INTEGER DEFAULT 0,
+  ttft_ms_p50 REAL,
+  ttft_ms_p95 REAL,
+  ttft_n INTEGER,
+  e2e_ms_mean REAL,
+  -- Denormalized from the parent run so idx_results_curve can cover the
+  -- curve grouping keys exactly (N1's read path stays an index range scan)
+  worker_id TEXT REFERENCES workers(id) ON DELETE SET NULL,
+  llama_cpp_build TEXT,
+  engine TEXT,                   -- 'bench' | 'server' (§0.2)
   n_threads INTEGER,
   n_gpu_layers INTEGER,
   batch_size INTEGER,
@@ -116,6 +166,8 @@ CREATE TABLE IF NOT EXISTS run_items (
   idx INTEGER,
   n_prompt INTEGER,
   n_gen INTEGER,
+  n_depth INTEGER DEFAULT 0, -- KV-prefill depth, llama-bench only (§0.2)
+  concurrency INTEGER DEFAULT 1, -- N5 concurrent streaming slots
   n_threads INTEGER,
   n_gpu_layers INTEGER,
   batch_size INTEGER,
@@ -162,6 +214,12 @@ CREATE TABLE IF NOT EXISTS workers (
   model_files_json TEXT,
   last_heartbeat_at INTEGER,                 -- liveness source of truth; status is DERIVED (see server/src/liveness.ts)
   active_job_id TEXT,                        -- what it is executing right now, or NULL
+  -- §0.7/N2/N4/N1 capability advertisement (probe-v1, quality-v1, curve-v1...)
+  capabilities_json TEXT,
+  -- M6 sensor availability (clock/temp per backend) declared up front
+  sensors_json TEXT,
+  -- N6 llama.cpp startup-banner ISA provenance
+  cpu_isa TEXT,
   pause_requested INTEGER NOT NULL DEFAULT 0, -- see MULTIUSER_PLAN.md §1.14 -- POST /api/runs/:id/pause|resume
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
@@ -326,3 +384,41 @@ CREATE TABLE IF NOT EXISTS local_model_cache (
 CREATE INDEX IF NOT EXISTS idx_local_model_cache_sha256 ON local_model_cache(sha256);
 CREATE INDEX IF NOT EXISTS idx_local_model_cache_hf ON local_model_cache(hf_model_id);
 CREATE INDEX IF NOT EXISTS idx_local_model_cache_state ON local_model_cache(state);
+
+-- N2 -- largest-usable-config verification (estimate → verify). A re-probe
+-- replaces the stale row through the same UNIQUE key. worker_id is derived
+-- from the run named in the ingestion route's URL, never from the payload.
+CREATE TABLE IF NOT EXISTS model_machine_limits (
+  id TEXT PRIMARY KEY,
+  worker_id TEXT NOT NULL REFERENCES workers(id) ON DELETE CASCADE,
+  model_id  TEXT NOT NULL REFERENCES models(id)  ON DELETE CASCADE,
+  llama_cpp_build TEXT NOT NULL,
+  kv_type   TEXT NOT NULL,            -- the K/V pair probed
+  placement_hash TEXT NOT NULL,       -- hash of the placement the estimate assumed (ngl / n-cpu-moe / slots)
+  verified_ctx_tokens INTEGER NOT NULL,
+  margin_observed_frac REAL,          -- headroom left at the verified point
+  method_version INTEGER,
+  created_at INTEGER NOT NULL,
+  UNIQUE(worker_id, model_id, llama_cpp_build, kv_type, placement_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_model_machine_limits_model ON model_machine_limits(model_id);
+
+-- N4 -- perplexity/KLD quality measurements (labeled synthetic proxy; never
+-- feeds ranking until the calibration gate passes). root_run_id is NOT NULL:
+-- quality work is run-scoped like everything else. Worker retries replace
+-- through the six-column UNIQUE key instead of accumulating duplicates.
+CREATE TABLE IF NOT EXISTS quality_results (
+  id TEXT PRIMARY KEY,
+  root_run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+  model_id TEXT NOT NULL REFERENCES models(id) ON DELETE CASCADE,
+  worker_id TEXT NOT NULL REFERENCES workers(id) ON DELETE CASCADE,
+  llama_cpp_build TEXT NOT NULL,
+  ctx_tokens INTEGER NOT NULL,
+  cache_type_k TEXT NOT NULL, cache_type_v TEXT NOT NULL,
+  ppl REAL, kld_vs_baseline REAL,
+  dataset_hash TEXT NOT NULL,
+  method_version INTEGER,
+  created_at INTEGER NOT NULL,
+  UNIQUE(root_run_id, model_id, ctx_tokens, cache_type_k, cache_type_v, dataset_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_quality_results_model ON quality_results(model_id);

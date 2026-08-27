@@ -82,6 +82,13 @@ input[type="range"] {
 .status-dot--cancelled {
   background: var(--color-muted);
 }
+/* Never-measured item (BENCHMARKING_PLAN_V8.md §0.7): a hollow ring rather
+   than a filled dot, so "we did not run this" never reads as an outcome. */
+.status-dot--skipped {
+  background: transparent;
+  box-shadow: inset 0 0 0 2px var(--color-muted);
+  opacity: 0.9;
+}
 /* Split repeat-progress circle (StatusPill.tsx's StatusSplitCircle) -- same
    footprint as .status-dot, but its background is a hard-stop gradient set
    inline per-instance (left half = pp tone, right half = tg tone) instead of

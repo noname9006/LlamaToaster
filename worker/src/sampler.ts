@@ -1,6 +1,12 @@
 import si from "systeminformation";
 import { readGpuMemory } from "./vram.js";
-import type { Backend, GpuMemoryAccuracyLevel, GpuMemoryMeasurementSource } from "../../shared/types.js";
+import { readGpuSensors, SensorSampleBuffer } from "./sensors.js";
+import type {
+  Backend,
+  GpuMemoryAccuracyLevel,
+  GpuMemoryMeasurementSource,
+  SensorMeasurementSource,
+} from "../../shared/types.js";
 
 export interface SampleStats {
   // The benchmark process's own RAM usage (systeminformation's per-pid RSS).
@@ -35,6 +41,14 @@ export interface SampleStats {
   vram_peak_source: GpuMemoryMeasurementSource | null;
   vram_avg_accuracy: GpuMemoryAccuracyLevel;
   vram_avg_source: GpuMemoryMeasurementSource | null;
+  // BENCHMARKING_PLAN_V8.md M6 -- adapter clock/temperature telemetry
+  // piggybacked on the VRAM tick (every third 2s sampler tick, ~6s). The
+  // sample SERIES is part of the spec, not a nice-to-have: aggregates alone
+  // cannot see "sagged between halves". NULL on every sensorless backend.
+  gpu_temp_c_max: number | null;
+  gpu_clock_mhz_min: number | null;
+  gpu_clock_samples: number[] | null;
+  sensor_source: SensorMeasurementSource | null;
 }
 
 export interface SampleCurrent {
@@ -156,6 +170,8 @@ export class MemorySampler {
   private vramProcessMeasured = false;
   private vramProcessWorstAccuracy: GpuMemoryAccuracyLevel = "exact";
   private vramProcessWorstSource: GpuMemoryMeasurementSource | null = null;
+  // M6 -- clock/temp samples, on the same tick as VRAM.
+  private sensors = new SensorSampleBuffer();
 
   start(pid: number | undefined, backend: Backend, intervalMs = 2000): void {
     this.pid = pid;
@@ -187,6 +203,7 @@ export class MemorySampler {
     this.vramProcessMeasured = false;
     this.vramProcessWorstAccuracy = "exact";
     this.vramProcessWorstSource = null;
+    this.sensors.reset();
     this.sample();
     this.timer = setInterval(() => this.sample(), intervalMs);
   }
@@ -199,7 +216,20 @@ export class MemorySampler {
     return this.stats;
   }
 
+  // M6's detection window is the TIMED work, not the spawn: server items
+  // bracket sampling from the first timed request onward, since model-load
+  // idle clocks inside the sampled span would otherwise mask or fabricate
+  // sag. llama-bench items never call this -- their repeats are
+  // binary-internal, so the whole item is the stated approximation.
+  openSensorWindow(): void {
+    this.sensors.openTimedWindow();
+  }
+
   get stats(): SampleStats {
+    // repeats only gates the throttle FLAG (derived at item end by the
+    // caller, which knows the repeat count) -- the aggregates and the series
+    // this getter returns are repeat-independent.
+    const sensorReport = this.sensors.report(0);
     const accuracy = this.vramMeasured ? this.vramWorstAccuracy : "unavailable";
     const source = this.vramMeasured ? this.vramWorstSource : null;
     const totalAccuracy = this.vramTotalMeasured ? this.vramTotalWorstAccuracy : "unavailable";
@@ -237,6 +267,10 @@ export class MemorySampler {
       vram_peak_source: source,
       vram_avg_accuracy: accuracy,
       vram_avg_source: source,
+      gpu_temp_c_max: sensorReport.gpu_temp_c_max,
+      gpu_clock_mhz_min: sensorReport.gpu_clock_mhz_min,
+      gpu_clock_samples: sensorReport.gpu_clock_samples,
+      sensor_source: this.sensors.source,
     };
   }
 
@@ -329,6 +363,14 @@ export class MemorySampler {
         }
       } catch {
         /* VRAM visibility varies by OS/vendor/driver; best-effort */
+      }
+
+      // M6 -- same cadence, same best-effort posture: a sensorless platform
+      // simply contributes nothing and its columns stay NULL.
+      try {
+        this.sensors.add(await readGpuSensors(this.backend));
+      } catch {
+        /* no cross-platform sensor source; declared unavailable, never fatal */
       }
     } catch {
       /* sampler is non-fatal */

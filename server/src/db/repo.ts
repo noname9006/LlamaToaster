@@ -35,11 +35,22 @@ import type {
   CommunityFacets,
   PossibleDuplicateWorker,
   HardwareInfo,
+  Backend,
+  TestType,
   AppSettings,
   VramDiscrepancyPolicy,
+  RunKind,
+  ProbeResultInput,
+  QualityResultInput,
 } from "../../../shared/types.js";
-import { isVramDiscrepancyPolicy } from "../../../shared/types.js";
+import {
+  isVramDiscrepancyPolicy,
+  parseCaveatFlags,
+  CHAIN_WALL_CLOCK_MS,
+} from "../../../shared/types.js";
 import type { SweepItem } from "../../../shared/sweep.js";
+import { configHash, type ConfigHashInput } from "../../../shared/configHash.js";
+import { engineFromItem, specTypeFor, type EngineKind } from "../../../shared/engineSpec.js";
 
 interface ModelRow {
   id: string;
@@ -54,6 +65,9 @@ interface ModelRow {
 
 interface RunRow {
   id: string;
+  root_run_id?: string | null;
+  kind?: string | null;
+  comparison_id?: string | null;
   // Multi-user Stage 4/5: present on every real row (COLUMN_MIGRATIONS,
   // §4.1) but deliberately absent from the public Run type mapRun produces
   // (same "DB-internal only" posture as models.created_by) -- declared here
@@ -84,6 +98,8 @@ interface RunItemRow {
   idx: number;
   n_prompt: number;
   n_gen: number;
+  n_depth: number | null;
+  concurrency: number | null;
   n_threads: number;
   n_gpu_layers: number;
   batch_size: number;
@@ -188,6 +204,31 @@ interface ResultRowRaw {
   repeat_samples: string | null;
   spec_drafted: number | null;
   spec_accepted: number | null;
+  // BENCHMARKING_PLAN_V8.md §0 columns -- NULL on every row predating them.
+  method_version: number | null;
+  n_depth: number | null;
+  config_hash: string | null;
+  prompt_offset: number | null;
+  spec_type: string | null;
+  spec_n_max: number | null;
+  spec_n_min: number | null;
+  speedup: number | null;
+  speedup_status: string | null;
+  caveat_flags: string | null;
+  concurrency: number | null;
+  gpu_temp_c_max: number | null;
+  gpu_clock_mhz_min: number | null;
+  gpu_clock_samples: string | null;
+  cpu_isa: string | null;
+  imported_bundle_id: string | null;
+  import_opt_in: number | null;
+  ttft_ms_p50: number | null;
+  ttft_ms_p95: number | null;
+  ttft_n: number | null;
+  e2e_ms_mean: number | null;
+  worker_id: string | null;
+  llama_cpp_build: string | null;
+  engine: string | null;
   raw_json_path: string | null;
   created_at: number;
 }
@@ -209,6 +250,9 @@ interface WorkerRow {
   vram_json: string | null;
   last_heartbeat_at: number | null;
   active_job_id: string | null;
+  capabilities_json: string | null;
+  sensors_json: string | null;
+  cpu_isa: string | null;
   pause_requested: number;
   created_at: number;
   updated_at: number;
@@ -358,6 +402,9 @@ function mapModel(row: ModelRow): Model {
 function mapRun(row: RunRow): Run {
   return {
     id: row.id,
+    root_run_id: row.root_run_id ?? row.id,
+    kind: (row.kind as RunKind | null) ?? null,
+    comparison_id: row.comparison_id ?? null,
     worker_name: row.worker_name,
     worker_id: row.worker_id ?? undefined,
     llama_cpp_build: row.llama_cpp_build,
@@ -384,6 +431,8 @@ function mapRunItem(row: RunItemRow): RunItem {
     idx: row.idx,
     n_prompt: row.n_prompt,
     n_gen: row.n_gen,
+    n_depth: row.n_depth ?? 0,
+    concurrency: row.concurrency ?? 1,
     n_threads: row.n_threads,
     n_gpu_layers: row.n_gpu_layers,
     batch_size: row.batch_size,
@@ -529,6 +578,9 @@ function mapWorker(row: WorkerRow): Worker {
     hardware: safeParseJson(row.hardware_json, null),
     installedBuilds: safeParseJson(row.installed_builds_json, []),
     modelFiles: safeParseJson(row.model_files_json, []),
+    capabilities: safeParseJson<string[]>(row.capabilities_json, ["benchmark"]),
+    sensors: safeParseJson<Worker["sensors"]>(row.sensors_json, null),
+    cpuIsa: row.cpu_isa,
     vram: safeParseJson(row.vram_json, null),
     status: deriveWorkerStatus(row),
     lastHeartbeatAt: row.last_heartbeat_at,
@@ -664,6 +716,30 @@ function mapResult(row: ResultRowRaw): ResultRow {
     repeat_samples: row.repeat_samples ? safeParseNumberArray(row.repeat_samples) : undefined,
     spec_drafted: row.spec_drafted ?? undefined,
     spec_accepted: row.spec_accepted ?? undefined,
+    method_version: row.method_version ?? null,
+    n_depth: row.n_depth ?? 0,
+    config_hash: row.config_hash,
+    prompt_offset: row.prompt_offset,
+    spec_type: row.spec_type,
+    spec_n_max: row.spec_n_max,
+    spec_n_min: row.spec_n_min,
+    speedup: row.speedup,
+    speedup_status: (row.speedup_status as ResultRow["speedup_status"]) ?? null,
+    caveat_flags: parseCaveatFlags(row.caveat_flags),
+    concurrency: row.concurrency,
+    gpu_temp_c_max: row.gpu_temp_c_max,
+    gpu_clock_mhz_min: row.gpu_clock_mhz_min,
+    gpu_clock_samples: row.gpu_clock_samples ? safeParseNumberArray(row.gpu_clock_samples) ?? null : null,
+    cpu_isa: row.cpu_isa,
+    imported_bundle_id: row.imported_bundle_id,
+    import_opt_in: row.import_opt_in === 1,
+    ttft_ms_p50: row.ttft_ms_p50,
+    ttft_ms_p95: row.ttft_ms_p95,
+    ttft_n: row.ttft_n,
+    e2e_ms_mean: row.e2e_ms_mean,
+    worker_id: row.worker_id,
+    llama_cpp_build: row.llama_cpp_build,
+    engine: (row.engine as EngineKind | null) ?? null,
     raw_json_path: row.raw_json_path ?? undefined,
     created_at: row.created_at,
   };
@@ -848,6 +924,368 @@ export const repo = {
     return { run, results, items };
   },
 
+  // N7 -- write an imported bundle's rows. They land on a synthetic run
+  // badged `imported`, and every row carries its bundle id so it can be shown
+  // as imported everywhere and kept out of local profile scoring unless the
+  // importer opted in for that bundle.
+  importBundleRows(
+    userId: string | undefined,
+    input: {
+      bundleId: string;
+      optIn: boolean;
+      run: {
+        id: string;
+        kind: string | null;
+        model_filename: string;
+        model_quant: string | null;
+        model_sha256?: string | null;
+        llama_cpp_build: string | null;
+        config: Record<string, unknown>;
+      };
+      hardwareClass: { gpu_name: string | null; backend: string | null; vram_class_mib: number | null };
+      rows: ImportedResultRow[];
+    }
+  ): { runId: string } {
+    const database = getDb();
+    const now = Date.now();
+    const runId = uuid();
+    // Never overwrite a local model record from an import: link to it when the
+    // content hash already exists here, register a minimal stand-in otherwise.
+    const modelId = input.run.model_sha256 ?? `imported:${input.bundleId}`;
+    if (!this.getModel(modelId)) {
+      this.registerModel({
+        id: modelId,
+        filename: input.run.model_filename,
+        size_bytes: 0,
+        source: "local",
+        metadata: input.run.model_quant ? { quant: input.run.model_quant } : {},
+      });
+    }
+
+    const insertResult = database.prepare(
+      `INSERT INTO results
+         (id, run_id, user_id, idx, model_id, test_type, n_prompt, n_gen, n_depth, n_threads, n_gpu_layers,
+          batch_size, ubatch_size, cache_type_k, cache_type_v, flash_attn, mtp, n_gpu_layers_draft, n_cpu_moe,
+          avg_tps, stddev_tps, ram_peak_mib, vram_peak_mib, ram_avg_mib, vram_avg_mib,
+          gpu_memory_total_accuracy, gpu_memory_free_start_accuracy,
+          gpu_memory_model_avg_accuracy, gpu_memory_model_peak_accuracy,
+          sample_count, suspect_count, method_version, config_hash, caveat_flags, concurrency,
+          gpu_temp_c_max, gpu_clock_mhz_min, ttft_ms_p50, ttft_ms_p95, ttft_n, e2e_ms_mean,
+          llama_cpp_build, engine, imported_bundle_id, import_opt_in, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    );
+
+    const tx = database.transaction(() => {
+      database
+        .prepare(
+          `INSERT INTO runs (id, root_run_id, kind, user_id, worker_name, worker_id, llama_cpp_build,
+                             llama_cpp_backend, backend_device_name, model_id, config, status, error,
+                             started_at, completed_at)
+           VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, 'done', ?, ?, ?)`
+        )
+        .run(
+          runId,
+          runId,
+          input.run.kind,
+          userId ?? null,
+          // A point-in-time label, not a machine identity: an imported bundle
+          // carries an anonymized hardware CLASS, never a hostname.
+          input.hardwareClass.gpu_name ?? "imported",
+          input.run.llama_cpp_build,
+          input.hardwareClass.backend,
+          input.hardwareClass.gpu_name,
+          modelId,
+          JSON.stringify({ ...input.run.config, imported_bundle_id: input.bundleId }),
+          `imported from bundle ${input.bundleId}`,
+          now,
+          now
+        );
+
+      input.rows.forEach((row, idx) => {
+        insertResult.run(
+          uuid(),
+          runId,
+          userId ?? null,
+          idx,
+          modelId,
+          row.test_type,
+          row.n_prompt,
+          row.n_gen,
+          row.n_depth,
+          row.n_threads,
+          row.n_gpu_layers,
+          row.batch_size,
+          row.ubatch_size,
+          row.cache_type_k,
+          row.cache_type_v,
+          row.flash_attn,
+          row.mtp,
+          row.n_gpu_layers_draft,
+          row.n_cpu_moe,
+          row.avg_tps,
+          row.stddev_tps,
+          row.ram_peak_mib,
+          row.vram_peak_mib,
+          row.ram_peak_mib,
+          row.vram_peak_mib,
+          "unavailable",
+          "unavailable",
+          "unavailable",
+          "unavailable",
+          row.sample_count,
+          row.suspect_count,
+          row.method_version,
+          // Stored verbatim: it was recomputed from the canonical form at
+          // export time and re-verified on the way in.
+          row.config_hash,
+          row.caveat_flags.length > 0 ? JSON.stringify(row.caveat_flags) : null,
+          row.concurrency,
+          row.gpu_temp_c_max,
+          row.gpu_clock_mhz_min,
+          row.ttft_ms_p50,
+          row.ttft_ms_p95,
+          row.ttft_n,
+          row.e2e_ms_mean,
+          input.run.llama_cpp_build,
+          row.engine,
+          input.bundleId,
+          input.optIn ? 1 : 0,
+          row.created_at
+        );
+      });
+    });
+    tx();
+    return { runId };
+  },
+
+  // N1 curve read path -- a curve is a deterministic GROUPING over `results`,
+  // not a table: rows sharing (model_id, worker_id, llama_cpp_build, engine,
+  // method_version), ordered by effective context. idx_results_curve covers
+  // exactly those five keys, so this stays an index range scan.
+  // Serves the CALLER's own rows; other tenants' contributions only ever
+  // surface behind the §0.9 k-anonymity floor, never here.
+  listCurveRows(
+    userId: string | undefined,
+    modelId: string,
+    filters: { workerId?: string; build?: string; engine?: string; methodVersion?: number | null }
+  ): ResultRow[] {
+    const rows = getDb()
+      .prepare(
+        `SELECT results.*, runs.llama_cpp_backend AS backend_type,
+                runs.backend_device_name AS backend_device_name
+         FROM results
+         JOIN runs ON runs.id = results.run_id
+         WHERE results.model_id = ?
+           AND (? IS NULL OR results.user_id = ?)
+           AND (? IS NULL OR results.worker_id = ?)
+           AND (? IS NULL OR results.llama_cpp_build = ?)
+           AND (? IS NULL OR results.engine = ?)
+           AND (? IS NULL OR results.method_version = ?)
+         ORDER BY results.created_at ASC, results.id ASC`
+      )
+      .all(
+        modelId,
+        userId ?? null,
+        userId ?? null,
+        filters.workerId ?? null,
+        filters.workerId ?? null,
+        filters.build ?? null,
+        filters.build ?? null,
+        filters.engine ?? null,
+        filters.engine ?? null,
+        filters.methodVersion ?? null,
+        filters.methodVersion ?? null
+      ) as (ResultRowRaw & { backend_type: Backend; backend_device_name: string | null })[];
+    return rows.map((row) => ({
+      ...mapResult(row),
+      backend_type: row.backend_type,
+      backend_device_name: row.backend_device_name,
+    }));
+  },
+
+  // Every run under one chain root, whatever its kind -- the chain-scoped
+  // read §0.5 makes an indexed equality predicate (idx_runs_root).
+  listRunsUnderRoot(userId: string | undefined, rootRunId: string): Run[] {
+    const rows = getDb()
+      .prepare(
+        `SELECT runs.*, m.filename AS model_filename,
+                0 AS items_total, 0 AS items_done, 0 AS items_failed, 0 AS items_cancelled
+         FROM runs
+         LEFT JOIN models m ON m.id = runs.model_id
+         WHERE COALESCE(runs.root_run_id, runs.id) = ?
+           AND (? IS NULL OR runs.user_id = ?)
+         ORDER BY runs.started_at ASC`
+      )
+      .all(rootRunId, userId ?? null, userId ?? null) as RunRow[];
+    return rows.map(mapRun);
+  },
+
+  // §0.3 scoring universe for one chain: every run under the root whose kind
+  // is 'sweep' (or NULL -- a standalone legacy run is its own sweep, so runs
+  // that predate the kind column keep producing profiles), with N3's
+  // comparison members excluded: trimmed comparison grids must not compete
+  // with Test A's full-grid profiles.
+  listChainScoringRuns(userId: string | undefined, rootRunId: string): Run[] {
+    const rows = getDb()
+      .prepare(
+        `SELECT runs.*, m.filename AS model_filename,
+                0 AS items_total, 0 AS items_done, 0 AS items_failed, 0 AS items_cancelled
+         FROM runs
+         LEFT JOIN models m ON m.id = runs.model_id
+         WHERE COALESCE(runs.root_run_id, runs.id) = ?
+           AND (? IS NULL OR runs.user_id = ?)
+           AND (runs.kind IS NULL OR runs.kind = 'sweep')
+           AND runs.comparison_id IS NULL
+         ORDER BY runs.started_at ASC`
+      )
+      .all(rootRunId, userId ?? null, userId ?? null) as RunRow[];
+    return rows.map(mapRun);
+  },
+
+  // §0.5 duplicate-trigger guard -- a caller's NON-terminal run matching
+  // (user_id, model_id, worker_id) with the same non-NULL kind blocks a new
+  // trigger; roots only (root_run_id IS NULL OR root_run_id = id); NULL-kind
+  // matches only NULL-kind. The 409 body names the active root and kind.
+  findBlockingRun(
+    userId: string | undefined,
+    modelId: string,
+    workerId: string,
+    kind: string | null
+  ): { id: string; kind: string | null } | undefined {
+    return getDb()
+      .prepare(
+        `SELECT id, kind FROM runs
+         WHERE (? IS NULL OR user_id = ?)
+           AND model_id = ? AND worker_id = ?
+           AND status IN ('running','scheduled')
+           AND (root_run_id IS NULL OR root_run_id = id)
+           AND ((kind IS NULL AND ? IS NULL) OR kind = ?)
+         ORDER BY started_at DESC LIMIT 1`
+      )
+      .get(userId ?? null, userId ?? null, modelId, workerId, kind ?? null, kind ?? null) as
+      | { id: string; kind: string | null }
+      | undefined;
+  },
+
+  // §0.5 chain quotas -- ≤ 3 active roots per user; probes are exempt from
+  // the active-roots quota (minutes-long by construction); a comparison
+  // group counts once, not once per member.
+  countActiveRoots(userId: string | undefined): number {
+    const row = getDb()
+      .prepare(
+        `SELECT COUNT(DISTINCT COALESCE(comparison_id, id)) AS n FROM runs
+         WHERE (? IS NULL OR user_id = ?)
+           AND status IN ('running','scheduled')
+           AND (root_run_id IS NULL OR root_run_id = id)
+           AND (kind IS NULL OR kind <> 'probe')`
+      )
+      .get(userId ?? null, userId ?? null) as { n: number };
+    return row.n;
+  },
+
+  // §0.5 -- chain depth of a prospective child whose parent resolves to this
+  // root. Depth counts tuning→refine→sweep links; standalone roots are depth 0.
+  getChainDepth(rootRunId: string): number {
+    const rows = getDb()
+      .prepare(
+        `SELECT id, config FROM runs WHERE root_run_id = ? AND (root_run_id IS NOT NULL)`
+      )
+      .all(rootRunId) as { id: string; config: string }[];
+    let maxDepth = 1;
+    for (const row of rows) {
+      try {
+        const cfg = JSON.parse(row.config) as { chain_depth?: number };
+        if (typeof cfg.chain_depth === "number") maxDepth = Math.max(maxDepth, cfg.chain_depth);
+      } catch {
+        /* legacy config without a depth marker contributes depth 1 */
+      }
+    }
+    return maxDepth;
+  },
+
+  getRunOwnerId(runId: string): string | null | undefined {
+    const row = getDb().prepare(`SELECT user_id FROM runs WHERE id = ?`).get(runId) as
+      | { user_id: string | null }
+      | undefined;
+    return row?.user_id;
+  },
+
+  // N3 -- every member of one comparison group, oldest first (the first is
+  // the fairness reference every later member is checked against).
+  listComparisonMembers(comparisonId: string, userId?: string | undefined): Run[] {
+    const rows = getDb()
+      .prepare(
+        `SELECT runs.*, m.filename AS model_filename,
+                (SELECT COUNT(*) FROM run_items WHERE run_items.run_id = runs.id) AS items_total,
+                (SELECT COUNT(*) FROM run_items WHERE run_items.run_id = runs.id AND status = 'done') AS items_done,
+                (SELECT COUNT(*) FROM run_items WHERE run_items.run_id = runs.id AND status IN ('failed','failed_oom')) AS items_failed,
+                (SELECT COUNT(*) FROM run_items WHERE run_items.run_id = runs.id AND status = 'cancelled') AS items_cancelled
+         FROM runs
+         LEFT JOIN models m ON m.id = runs.model_id
+         WHERE runs.comparison_id = ? AND (? IS NULL OR runs.user_id = ?)
+         ORDER BY runs.started_at ASC`
+      )
+      .all(comparisonId, userId ?? null, userId ?? null) as RunRow[];
+    return rows.map(mapRun);
+  },
+
+  listComparisonMemberRepeats(comparisonId: string): number[] {
+    const rows = getDb()
+      .prepare(`SELECT config FROM runs WHERE comparison_id = ?`)
+      .all(comparisonId) as { config: string }[];
+    const repeats: number[] = [];
+    for (const row of rows) {
+      try {
+        const cfg = JSON.parse(row.config) as RunConfig;
+        if (typeof cfg.sweep?.repeats === "number") repeats.push(cfg.sweep.repeats);
+      } catch {
+        /* unparseable legacy config -- skip */
+      }
+    }
+    return repeats;
+  },
+
+  countComparisonMembers(comparisonId: string): Promise<number> | number {
+    return (
+      getDb().prepare(`SELECT COUNT(*) AS n FROM runs WHERE comparison_id = ?`).get(comparisonId) as { n: number }
+    ).n;
+  },
+
+  hasActiveComparisonMember(comparisonId: string): boolean {
+    const row = getDb()
+      .prepare(
+        `SELECT COUNT(*) AS n FROM runs WHERE comparison_id = ? AND status IN ('running','scheduled')`
+      )
+      .get(comparisonId) as { n: number };
+    return row.n > 0;
+  },
+
+  // §0.5 -- 48h wall clock enforced continuously against RUNNING roots.
+  // Returns the ids that were just force-finalized (the caller cancels their
+  // pending jobs). Called from the trigger path and the maintenance reaper.
+  cancelExpiredRoots(): string[] {
+    const db = getDb();
+    const cutoff = Date.now() - CHAIN_WALL_CLOCK_MS;
+    const expired = db
+      .prepare(
+        `SELECT DISTINCT COALESCE(root_run_id, id) AS root FROM runs
+         WHERE status = 'running' AND started_at < ?`
+      )
+      .all(cutoff) as { root: string }[];
+    const cancelledIds: string[] = [];
+    for (const { root } of expired) {
+      const stillRunning = db
+        .prepare(`SELECT id FROM runs WHERE COALESCE(root_run_id, id) = ? AND status = 'running'`)
+        .all(root);
+      if (stillRunning.length === 0) continue;
+      for (const r of stillRunning) {
+        this.reconcileStaleRun(undefined, (r as { id: string }).id, "chain exceeded its 48 hour wall clock");
+        cancelledIds.push((r as { id: string }).id);
+      }
+    }
+    return cancelledIds;
+  },
+
   // backend_type/backend_device_name are denormalized from the parent run
   // here, not physical columns on `results` itself -- see ResultRow's own
   // doc comment for why (backend can't vary between one run's own items,
@@ -867,14 +1305,46 @@ export const repo = {
     return rows.map(mapResult);
   },
 
+  // §0.12 / N6 -- the >1/3 thermally_throttled ratio, computed the same way
+  // for both the on-demand /sustained read and the once-per-completed-run
+  // observability event: denominator is every non-cancelled item, skipped
+  // included; numerator is items with >=1 result flagged thermally_throttled.
+  thermallyFlaggedRatio(runId: string): { ratio: number; flagged: number; denominator: number } {
+    const items = this.getRunItems(runId);
+    const results = this.getResultsForRun(runId);
+    const flaggedIdx = new Set(
+      results.filter((r) => (r.caveat_flags ?? []).includes("thermally_throttled")).map((r) => r.idx)
+    );
+    const denominator = items.filter((i) => i.status !== "cancelled").length;
+    const ratio = denominator > 0 ? flaggedIdx.size / denominator : 0;
+    return { ratio, flagged: flaggedIdx.size, denominator };
+  },
+
+  // M6 -- "the sample series is this plan's first bulky column (~2 KB per
+  // item). It may be pruned 30 days after ingest -- detection already ran at
+  // ingest time, and gpu_clock_mhz_min, gpu_temp_c_max and the caveat flag
+  // persist indefinitely, which is everything later readers (scoring, N6
+  // policy) consume." Nulls only the sample series; every other thermal
+  // column and caveat_flags are untouched. Called from reaper.ts's
+  // runMaintenanceSweep, same interval as the other retention prunes.
+  pruneOldGpuClockSamples(days: number): number {
+    const cutoff = Date.now() - days * 24 * 3600 * 1000;
+    return getDb()
+      .prepare(`UPDATE results SET gpu_clock_samples = NULL WHERE gpu_clock_samples IS NOT NULL AND created_at < ?`)
+      .run(cutoff).changes;
+  },
+
   createRun(userId: string | undefined, run: Run): void {
     getDb()
       .prepare(
-        `INSERT INTO runs (id, user_id, worker_name, worker_id, llama_cpp_build, llama_cpp_backend, backend_device_name, model_id, config, status, error, started_at, completed_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        `INSERT INTO runs (id, root_run_id, kind, comparison_id, user_id, worker_name, worker_id, llama_cpp_build, llama_cpp_backend, backend_device_name, model_id, config, status, error, started_at, completed_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         run.id,
+        run.root_run_id ?? run.id,
+        run.kind ?? null,
+        run.comparison_id ?? null,
         userId ?? null,
         run.worker_name,
         run.worker_id ?? null,
@@ -900,9 +1370,9 @@ export const repo = {
     const database = getDb();
     const insert = database.prepare(
       `INSERT INTO run_items
-         (id, run_id, user_id, idx, n_prompt, n_gen, n_threads, n_gpu_layers,
+         (id, run_id, user_id, idx, n_prompt, n_gen, n_depth, concurrency, n_threads, n_gpu_layers,
           batch_size, ubatch_size, cache_type_k, cache_type_v, flash_attn, mtp, n_gpu_layers_draft, n_cpu_moe, status)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued')`
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued')`
     );
     const tx = database.transaction((rows: SweepItem[]) => {
       for (const item of rows) {
@@ -913,6 +1383,8 @@ export const repo = {
           item.idx,
           item.n_prompt,
           item.n_gen,
+          item.n_depth ?? 0,
+          item.concurrency ?? 1,
           item.threads,
           item.n_gpu_layers,
           item.batch_size,
@@ -1017,7 +1489,7 @@ export const repo = {
       if (input.status === "done" && input.results) {
         const insertResult = database.prepare(
           `INSERT INTO results
-             (id, run_id, user_id, idx, model_id, test_type, n_prompt, n_gen, n_threads, n_gpu_layers,
+             (id, run_id, user_id, idx, model_id, test_type, n_prompt, n_gen, n_depth, n_threads, n_gpu_layers,
               batch_size, ubatch_size, cache_type_k, cache_type_v, flash_attn, mtp, n_gpu_layers_draft, n_cpu_moe,
               avg_tps, stddev_tps, ram_peak_mib, vram_peak_mib,
               ram_avg_mib, vram_avg_mib, ram_free_before_mib, vram_free_before_mib,
@@ -1036,14 +1508,24 @@ export const repo = {
               gpu_layers_loaded, total_model_layers, gpu_layers_loaded_draft, total_model_layers_draft,
               gpu_layers_resident_est, gpu_layers_resident_est_draft,
               sample_count, suspect_count, suspect_samples, repeat_samples, spec_drafted, spec_accepted,
-              raw_json_path, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+              method_version, prompt_offset, spec_type, spec_n_max, spec_n_min, config_hash,
+              caveat_flags, concurrency, gpu_temp_c_max, gpu_clock_mhz_min, gpu_clock_samples,
+              cpu_isa, ttft_ms_p50, ttft_ms_p95, ttft_n, e2e_ms_mean,
+              worker_id, llama_cpp_build, engine, raw_json_path, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         );
         // Up to two rows for one idx (a pp row and a tg row from the same
         // benchmark process) -- distinguished by test_type, see
         // worker/src/index.ts's runSweepItem/runSweepItemViaServer.
         for (const resultInput of input.results) {
           const row = buildResultRow(runId, run.model_id, idx, resultInput);
+          // §0.2/§0.8 -- one engine derivation feeds both the stored column
+          // and the config hash, so twins can never disagree on engine.
+          const engine = deriveEngineForResult(row, run);
+          // §0.8 -- server and worker agree via the one shared function; the
+          // server (re)computes here so a version-skewed worker that never
+          // heard of config_hash still gets joinable rows.
+          const hash = configHash(configHashInputFromResult(row, resultInput, engine));
           insertResult.run(
             row.id,
             row.run_id,
@@ -1053,6 +1535,7 @@ export const repo = {
             row.test_type,
             row.n_prompt,
             row.n_gen,
+            row.n_depth ?? 0,
             row.n_threads,
             row.n_gpu_layers,
             row.batch_size,
@@ -1107,9 +1590,29 @@ export const repo = {
             row.repeat_samples ? JSON.stringify(row.repeat_samples) : null,
             row.spec_drafted ?? null,
             row.spec_accepted ?? null,
+            row.method_version ?? null,
+            row.prompt_offset ?? null,
+            row.spec_type ?? null,
+            row.spec_n_max ?? null,
+            row.spec_n_min ?? null,
+            hash,
+            row.caveat_flags && row.caveat_flags.length > 0 ? JSON.stringify(row.caveat_flags) : null,
+            row.concurrency ?? null,
+            row.gpu_temp_c_max ?? null,
+            row.gpu_clock_mhz_min ?? null,
+            row.gpu_clock_samples ? JSON.stringify(row.gpu_clock_samples) : null,
+            row.cpu_isa ?? null,
+            row.ttft_ms_p50 ?? null,
+            row.ttft_ms_p95 ?? null,
+            row.ttft_n ?? null,
+            row.e2e_ms_mean ?? null,
+            run.worker_id ?? null,
+            run.llama_cpp_build ?? null,
+            engine,
             null,
             row.created_at
           );
+          markSpeedupStatuses(database, row.id, hash, engine, resultInput.wall_clock_fallback === true);
         }
       }
 
@@ -1136,7 +1639,7 @@ export const repo = {
     const row = getDb()
       .prepare(
         `SELECT COUNT(*) as n FROM run_items
-         WHERE run_id = ? AND status NOT IN ('done','failed','failed_oom','cancelled')`
+         WHERE run_id = ? AND status NOT IN ('done','failed','failed_oom','cancelled','skipped')`
       )
       .get(runId) as { n: number };
     return row.n;
@@ -1163,12 +1666,13 @@ export const repo = {
       .prepare(
         `SELECT
            SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END) as done,
+           SUM(CASE WHEN status = 'skipped' THEN 1 ELSE 0 END) as skipped,
            SUM(CASE WHEN status = 'failed_oom' THEN 1 ELSE 0 END) as oom,
            SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END) as cancelled,
            COUNT(*) as total
          FROM run_items WHERE run_id = ?`
       )
-      .get(runId) as { done: number; oom: number; cancelled: number; total: number };
+      .get(runId) as { done: number; skipped: number; oom: number; cancelled: number; total: number };
 
     let status: RunStatus;
     let error: string | null = null;
@@ -1182,10 +1686,13 @@ export const repo = {
       status = cancelReason && counts.done > 0 ? "partial" : "cancelled";
       const reason = cancelReason ?? "stopped by user";
       error = `${reason} after ${counts.done} of ${counts.total} test${counts.total === 1 ? "" : "s"} completed`;
-    } else if (counts.total === 0 || counts.done === 0) {
+    } else if (counts.total === 0 || (counts.done === 0 && counts.skipped === 0)) {
       status = "failed";
-    } else if (counts.done === counts.total) {
+    } else if (counts.done + counts.skipped === counts.total) {
       status = "done";
+      if (counts.skipped > 0) {
+        error = `${counts.skipped} of ${counts.total} test${counts.total === 1 ? "" : "s"} skipped`;
+      }
     } else {
       status = "partial";
     }
@@ -1195,10 +1702,11 @@ export const repo = {
     // was already set from cancelReason and must not be overwritten with a
     // "tests failed" message; nothing here was a bench failure.
     if (counts.cancelled === 0) {
-      const failedCount = counts.total - counts.done;
+      const failedCount = counts.total - counts.done - counts.skipped;
       if (failedCount > 0) {
         error = `${failedCount} of ${counts.total} test${counts.total === 1 ? "" : "s"} failed`;
         if (counts.oom > 0) error += ` (${counts.oom} OOM)`;
+        if (counts.skipped > 0) error += `, ${counts.skipped} skipped`;
       }
     }
 
@@ -1224,7 +1732,7 @@ export const repo = {
       database
         .prepare(
           `UPDATE run_items SET status = 'failed', error = ?, completed_at = ?
-           WHERE run_id = ? AND status NOT IN ('done','failed','failed_oom','cancelled')`
+           WHERE run_id = ? AND status NOT IN ('done','failed','failed_oom','cancelled','skipped')`
         )
         .run(error, now, runId);
       this.finalizeRun(runId, now);
@@ -1251,7 +1759,7 @@ export const repo = {
       database
         .prepare(
           `UPDATE run_items SET status = 'cancelled', error = ?, completed_at = ?
-           WHERE run_id = ? AND status NOT IN ('done','failed','failed_oom','cancelled')`
+           WHERE run_id = ? AND status NOT IN ('done','failed','failed_oom','cancelled','skipped')`
         )
         .run(note, now, runId);
       this.finalizeRun(runId, now, note);
@@ -1399,6 +1907,7 @@ export const repo = {
              backend = ?, platform = ?, arch = ?, hostname = ?,
              hardware_json = ?, installed_builds_json = ?, model_files_json = ?,
              vram_json = COALESCE(?, vram_json),
+             capabilities_json = ?, sensors_json = COALESCE(?, sensors_json), cpu_isa = COALESCE(?, cpu_isa),
              last_heartbeat_at = ?, active_job_id = ?, updated_at = ?
            WHERE id = ?`
         )
@@ -1411,6 +1920,9 @@ export const repo = {
           JSON.stringify(state.installed_builds),
           JSON.stringify(state.model_files),
           state.vram !== undefined ? JSON.stringify(state.vram) : null,
+          JSON.stringify(state.capabilities ?? []),
+          state.sensors !== undefined ? JSON.stringify(state.sensors) : null,
+          state.cpu_isa ?? null,
           Date.now(),
           activeJobId,
           Date.now(),
@@ -2472,11 +2984,12 @@ export const repo = {
   // cross-tenant read (§5.3). Consent is still enforced HERE, in SQL
   // (u.share_benchmarks = 1 / the consentWhere clause below) -- only opted-in
   // users' rows are ever included, and the caller's own contribution is
-  // always excluded from their own results. The original HAVING
-  // COUNT(DISTINCT user_id) >= 5 k-anonymity floor was deliberately dropped
-  // (operator decision: collecting five people on the exact same model/
-  // backend/GPU combo was unrealistic and made the feature useless in
-  // practice) -- a group may now be shown with as few as one contributor.
+  // always excluded from their own results. BENCHMARKING_PLAN_V8.md §0.9
+  // requires HAVING COUNT(DISTINCT user_id) >= 5 on every community
+  // aggregate; a prior revision dropped it for usability (collecting five
+  // people on the exact same model/backend/GPU combo is rare), but the floor
+  // is normative, not a nice-to-have -- fewer than 5 contributors stays
+  // private-by-default even if that means the group renders empty.
   communityRepo: {
     // Matches the plan's own §5.4 SQL with one addition: ri.test_type is
     // added to the SELECT/GROUP BY on top of the plan's literal query. pp and
@@ -2511,6 +3024,7 @@ export const repo = {
              AND (? IS NULL OR json_extract(w.hardware_json, '$.platform') = ?)
              AND (? IS NULL OR json_extract(w.hardware_json, '$.gpu[0].model') = ?)
            GROUP BY r.model_id, r.llama_cpp_backend, ri.test_type, platform, gpu_model
+           HAVING COUNT(DISTINCT r.user_id) >= 5
            ORDER BY avg_tps DESC`
         )
         .all(
@@ -2552,11 +3066,12 @@ export const repo = {
     },
 
     // Each dimension is counted on its own here (not listAggregates' full
-    // group key), so a value appears the moment anyone opted-in has shared
-    // it -- regardless of which model/backend they happened to run it with.
-    // No minimum contributor count (see communityRepo's own doc comment
-    // above) -- consent (u.share_benchmarks = 1) and self-exclusion are the
-    // only gates.
+    // group key), so a value appears the moment 5 distinct opted-in users
+    // have shared it -- regardless of which model/backend they happened to
+    // run it with. Same §0.9 floor as listAggregates (a facet value shown
+    // with a low contributorCount is exactly the re-identifying leak the
+    // floor exists to prevent), enforced the same way: HAVING, not a
+    // post-filter, so a suppressed value never reaches the caller at all.
     listFacets(callerId: string): CommunityFacets {
       const db = getDb();
       const consentWhere = `r.user_id IS NOT NULL AND r.user_id <> ? AND u.share_benchmarks = 1`;
@@ -2566,7 +3081,8 @@ export const repo = {
           `SELECT r.model_id AS model_id, m.filename AS filename, COUNT(DISTINCT r.user_id) AS contributor_count
            FROM runs r JOIN users u ON u.id = r.user_id LEFT JOIN models m ON m.id = r.model_id
            WHERE ${consentWhere}
-           GROUP BY r.model_id`
+           GROUP BY r.model_id
+           HAVING COUNT(DISTINCT r.user_id) >= 5`
         )
         .all(callerId) as { model_id: string; filename: string | null; contributor_count: number }[];
 
@@ -2575,7 +3091,8 @@ export const repo = {
           `SELECT r.llama_cpp_backend AS value, COUNT(DISTINCT r.user_id) AS contributor_count
            FROM runs r JOIN users u ON u.id = r.user_id
            WHERE ${consentWhere}
-           GROUP BY r.llama_cpp_backend`
+           GROUP BY r.llama_cpp_backend
+           HAVING COUNT(DISTINCT r.user_id) >= 5`
         )
         .all(callerId) as { value: string; contributor_count: number }[];
 
@@ -2584,7 +3101,8 @@ export const repo = {
           `SELECT json_extract(w.hardware_json, '$.platform') AS value, COUNT(DISTINCT r.user_id) AS contributor_count
            FROM runs r JOIN users u ON u.id = r.user_id LEFT JOIN workers w ON w.id = r.worker_id
            WHERE ${consentWhere} AND json_extract(w.hardware_json, '$.platform') IS NOT NULL
-           GROUP BY value`
+           GROUP BY value
+           HAVING COUNT(DISTINCT r.user_id) >= 5`
         )
         .all(callerId) as { value: string; contributor_count: number }[];
 
@@ -2593,7 +3111,8 @@ export const repo = {
           `SELECT json_extract(w.hardware_json, '$.gpu[0].model') AS value, COUNT(DISTINCT r.user_id) AS contributor_count
            FROM runs r JOIN users u ON u.id = r.user_id LEFT JOIN workers w ON w.id = r.worker_id
            WHERE ${consentWhere} AND json_extract(w.hardware_json, '$.gpu[0].model') IS NOT NULL
-           GROUP BY value`
+           GROUP BY value
+           HAVING COUNT(DISTINCT r.user_id) >= 5`
         )
         .all(callerId) as { value: string; contributor_count: number }[];
 
@@ -2666,7 +3185,274 @@ export const repo = {
       return (getDb().prepare(`SELECT COUNT(*) as n FROM users`).get() as { n: number }).n;
     },
   },
+
+  // N2 -- largest-usable-config verification. Verification is per (machine,
+  // build, KV pair, placement): changing any of them invalidates it, which is
+  // exactly the UNIQUE key a re-probe replaces through.
+  limitsRepo: {
+    upsert(input: VerifiedLimitInput): VerifiedLimit {
+      const now = Date.now();
+      const kvType = `${input.cache_type_k}/${input.cache_type_v}`;
+      const database = getDb();
+      // One idempotent transaction: a re-report replaces rather than
+      // accumulating, so a worker retry can never leave two ceilings.
+      const tx = database.transaction(() => {
+        database
+          .prepare(
+            `INSERT INTO model_machine_limits
+               (id, worker_id, model_id, llama_cpp_build, kv_type, placement_hash,
+                verified_ctx_tokens, margin_observed_frac, method_version, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(worker_id, model_id, llama_cpp_build, kv_type, placement_hash)
+             DO UPDATE SET verified_ctx_tokens = excluded.verified_ctx_tokens,
+                           margin_observed_frac = excluded.margin_observed_frac,
+                           method_version = excluded.method_version,
+                           created_at = excluded.created_at`
+          )
+          .run(
+            uuid(),
+            input.worker_id,
+            input.model_id,
+            input.llama_cpp_build,
+            kvType,
+            input.placement_hash,
+            input.verified_ctx_tokens,
+            input.margin_observed_frac ?? null,
+            input.method_version ?? null,
+            now
+          );
+      });
+      tx();
+      return database
+        .prepare(
+          `SELECT * FROM model_machine_limits
+           WHERE worker_id = ? AND model_id = ? AND llama_cpp_build = ? AND kv_type = ? AND placement_hash = ?`
+        )
+        .get(input.worker_id, input.model_id, input.llama_cpp_build, kvType, input.placement_hash) as VerifiedLimit;
+    },
+
+    listForModelAndWorker(modelId: string, workerId: string): VerifiedLimit[] {
+      return getDb()
+        .prepare(
+          `SELECT * FROM model_machine_limits WHERE model_id = ? AND worker_id = ? ORDER BY created_at DESC`
+        )
+        .all(modelId, workerId) as VerifiedLimit[];
+    },
+
+    listForModel(modelId: string): VerifiedLimit[] {
+      return getDb()
+        .prepare(`SELECT * FROM model_machine_limits WHERE model_id = ? ORDER BY created_at DESC`)
+        .all(modelId) as VerifiedLimit[];
+    },
+  },
+
+  // N4 -- perplexity/KLD rows. Worker retries replace through the six-column
+  // UNIQUE key; without it the f16 baseline pairing would face an ambiguous
+  // "which one?".
+  qualityRepo: {
+    upsert(input: QualityRowInput): QualityRow {
+      const database = getDb();
+      const now = Date.now();
+      const tx = database.transaction(() => {
+        // Baseline pairing (N4): KLD is measured against the f16-KV,
+        // same-ctx, same-dataset row of the same model+build -- mirroring
+        // §0.8's twin discipline. "No baseline row => ppl only" is an
+        // ENFORCED invariant here, not merely a description of today's
+        // worker behavior: a reported kld_vs_baseline is only ever stored
+        // when a matching f16/f16 row genuinely exists, and an f16/f16 row
+        // itself (nothing to diff against) always lands ppl-only. Scoped by
+        // (model, build, ctx, dataset) like orphanDependents below, not by
+        // this row's own root_run_id -- a baseline measured once is reused by
+        // every later comparison against that model+build, not re-measured
+        // per chain.
+        //
+        // The value itself is populated ONLY from what the measurement
+        // reported. It is deliberately NOT derived from the two perplexity
+        // numbers: a log-perplexity ratio is not a KL divergence, and filling
+        // a column named kld_vs_baseline with something that isn't one is
+        // exactly the silent substitution this plan forbids everywhere else.
+        // Until llama-perplexity's KL output is wired through (the plan's own
+        // open question), a row with a real baseline still lands ppl-only
+        // unless the worker itself reports a value -- which is the stated
+        // fallback.
+        const isBaselineItself = input.cache_type_k === "f16" && input.cache_type_v === "f16";
+        let kld: number | null = null;
+        if (!isBaselineItself) {
+          const baselineExists = database
+            .prepare(
+              `SELECT 1 FROM quality_results
+               WHERE model_id = ? AND llama_cpp_build = ? AND ctx_tokens = ?
+                 AND cache_type_k = 'f16' AND cache_type_v = 'f16' AND dataset_hash = ?`
+            )
+            .get(input.model_id, input.llama_cpp_build, input.ctx_tokens, input.dataset_hash);
+          if (baselineExists) kld = input.kld_vs_baseline ?? null;
+        }
+
+        database
+          .prepare(
+            `INSERT INTO quality_results
+               (id, root_run_id, model_id, worker_id, llama_cpp_build, ctx_tokens,
+                cache_type_k, cache_type_v, ppl, kld_vs_baseline, dataset_hash, method_version, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(root_run_id, model_id, ctx_tokens, cache_type_k, cache_type_v, dataset_hash)
+             DO UPDATE SET ppl = excluded.ppl,
+                           kld_vs_baseline = excluded.kld_vs_baseline,
+                           worker_id = excluded.worker_id,
+                           llama_cpp_build = excluded.llama_cpp_build,
+                           method_version = excluded.method_version,
+                           created_at = excluded.created_at`
+          )
+          .run(
+            uuid(),
+            input.root_run_id,
+            input.model_id,
+            input.worker_id,
+            input.llama_cpp_build,
+            input.ctx_tokens,
+            input.cache_type_k,
+            input.cache_type_v,
+            input.ppl,
+            kld,
+            input.dataset_hash,
+            input.method_version ?? null,
+            now
+          );
+      });
+      tx();
+      return database
+        .prepare(
+          `SELECT * FROM quality_results
+           WHERE root_run_id = ? AND model_id = ? AND ctx_tokens = ? AND cache_type_k = ? AND cache_type_v = ? AND dataset_hash = ?`
+        )
+        .get(
+          input.root_run_id,
+          input.model_id,
+          input.ctx_tokens,
+          input.cache_type_k,
+          input.cache_type_v,
+          input.dataset_hash
+        ) as QualityRow;
+    },
+
+    listForModel(modelId: string): QualityRow[] {
+      return getDb()
+        .prepare(`SELECT * FROM quality_results WHERE model_id = ? ORDER BY created_at DESC`)
+        .all(modelId) as QualityRow[];
+    },
+
+    listForRoot(rootRunId: string): QualityRow[] {
+      return getDb()
+        .prepare(`SELECT * FROM quality_results WHERE root_run_id = ? ORDER BY created_at DESC`)
+        .all(rootRunId) as QualityRow[];
+    },
+
+    // Deleting a baseline marks dependent KLD rows orphaned rather than
+    // silently re-baselining them (N4's honesty rule).
+    orphanDependents(modelId: string, build: string, ctxTokens: number, datasetHash: string): number {
+      const info = getDb()
+        .prepare(
+          `UPDATE quality_results SET kld_vs_baseline = NULL
+           WHERE model_id = ? AND llama_cpp_build = ? AND ctx_tokens = ? AND dataset_hash = ?
+             AND NOT (cache_type_k = 'f16' AND cache_type_v = 'f16')`
+        )
+        .run(modelId, build, ctxTokens, datasetHash);
+      return info.changes;
+    },
+  },
 };
+
+// N7 -- a validated bundle row, exactly as shared/exchange.ts hands it over.
+export interface ImportedResultRow {
+  config_hash: string;
+  test_type: TestType;
+  n_prompt: number;
+  n_gen: number;
+  n_depth: number;
+  n_threads: number;
+  n_gpu_layers: number;
+  batch_size: number;
+  ubatch_size: number;
+  cache_type_k: string;
+  cache_type_v: string;
+  flash_attn: string;
+  mtp: string;
+  n_gpu_layers_draft: number;
+  n_cpu_moe: number;
+  engine: string | null;
+  concurrency: number | null;
+  method_version: number | null;
+  avg_tps: number;
+  stddev_tps: number;
+  sample_count: number | null;
+  suspect_count: number | null;
+  vram_peak_mib: number | null;
+  ram_peak_mib: number;
+  ttft_ms_p50: number | null;
+  ttft_ms_p95: number | null;
+  ttft_n: number | null;
+  e2e_ms_mean: number | null;
+  gpu_temp_c_max: number | null;
+  gpu_clock_mhz_min: number | null;
+  caveat_flags: string[];
+  created_at: number;
+}
+
+// N2 storage shapes.
+export interface VerifiedLimitInput {
+  worker_id: string;
+  model_id: string;
+  llama_cpp_build: string;
+  cache_type_k: string;
+  cache_type_v: string;
+  placement_hash: string;
+  verified_ctx_tokens: number;
+  margin_observed_frac?: number | null;
+  method_version?: number | null;
+}
+
+export interface VerifiedLimit {
+  id: string;
+  worker_id: string;
+  model_id: string;
+  llama_cpp_build: string;
+  kv_type: string;
+  placement_hash: string;
+  verified_ctx_tokens: number;
+  margin_observed_frac: number | null;
+  method_version: number | null;
+  created_at: number;
+}
+
+// N4 storage shapes.
+export interface QualityRowInput {
+  root_run_id: string;
+  model_id: string;
+  worker_id: string;
+  llama_cpp_build: string;
+  ctx_tokens: number;
+  cache_type_k: string;
+  cache_type_v: string;
+  ppl: number;
+  kld_vs_baseline?: number | null;
+  dataset_hash: string;
+  method_version?: number | null;
+}
+
+export interface QualityRow {
+  id: string;
+  root_run_id: string;
+  model_id: string;
+  worker_id: string;
+  llama_cpp_build: string;
+  ctx_tokens: number;
+  cache_type_k: string;
+  cache_type_v: string;
+  ppl: number | null;
+  kld_vs_baseline: number | null;
+  dataset_hash: string;
+  method_version: number | null;
+  created_at: number;
+}
 
 // Builds the *physical-column* subset of ResultRow -- deliberately excludes
 // backend_type/backend_device_name, which aren't physical columns on
@@ -2756,7 +3542,157 @@ function buildResultRow(
     repeat_samples: r.repeat_samples,
     spec_drafted: r.spec_drafted,
     spec_accepted: r.spec_accepted,
+    method_version: r.method_version ?? null,
+    n_depth: r.n_depth ?? 0,
+    prompt_offset: r.prompt_offset ?? null,
+    spec_type: r.spec_type ?? null,
+    spec_n_max: r.spec_n_max ?? null,
+    spec_n_min: r.spec_n_min ?? null,
+    caveat_flags: r.caveat_flags ?? [],
+    concurrency: r.concurrency ?? null,
+    gpu_temp_c_max: r.gpu_temp_c_max ?? null,
+    gpu_clock_mhz_min: r.gpu_clock_mhz_min ?? null,
+    gpu_clock_samples: r.gpu_clock_samples ?? null,
+    cpu_isa: r.cpu_isa ?? null,
+    ttft_ms_p50: r.ttft_ms_p50 ?? null,
+    ttft_ms_p95: r.ttft_ms_p95 ?? null,
+    ttft_n: r.ttft_n ?? null,
+    e2e_ms_mean: r.e2e_ms_mean ?? null,
+    speedup: null,
+    speedup_status: null,
     raw_json_path: undefined,
     created_at: Date.now(),
   };
+}
+
+function configHashInputFromResult(
+  row: Omit<ResultRow, "backend_type" | "backend_device_name">,
+  r: IngestResultInput,
+  engine: EngineKind
+): ConfigHashInput {
+  return {
+    n_prompt: row.n_prompt,
+    n_gen: row.n_gen,
+    n_depth: row.n_depth ?? 0,
+    threads: row.n_threads,
+    n_gpu_layers: row.n_gpu_layers,
+    batch_size: row.batch_size,
+    ubatch_size: row.ubatch_size,
+    cache_type_k: row.cache_type_k,
+    cache_type_v: row.cache_type_v,
+    flash_attn: row.flash_attn,
+    n_gpu_layers_draft: row.n_gpu_layers_draft,
+    n_cpu_moe: row.n_cpu_moe,
+    engine,
+    concurrency: row.concurrency ?? undefined,
+  };
+}
+
+function deriveEngineForResult(
+  row: Pick<ResultRow, "mtp">,
+  run: Run
+): EngineKind {
+  if (row.mtp === "on") return "server";
+  if (run.kind === "runtime" || run.kind === "probe") return "server";
+  return engineFromItem({ mtp: row.mtp });
+}
+
+interface TwinCandidateRow {
+  id: string;
+  avg_tps: number | null;
+  suspect_count: number | null;
+  sample_count: number | null;
+  spec_drafted: number | null;
+  spec_accepted: number | null;
+  prompt_offset: number | null;
+  method_version: number | null;
+  speedup_status: string | null;
+  mtp: string;
+}
+
+// §0.8 twin join -- a speculative {server, spec} row pairs with its
+// {server, off} baseline on (root_run_id, config_hash, test_type, n_depth),
+// where config_hash excludes the spec fields. Both sides must also match on
+// prompt_offset and method_version; any mismatch or unverifiable input makes
+// the pair `unverified` (an offset mismatch additionally writes
+// spec_pair_prompt_mismatch), no counterpart at all is `unavailable`.
+function markSpeedupStatuses(
+  database: ReturnType<typeof getDb>,
+  insertedRowId: string,
+  hash: string,
+  engine: EngineKind,
+  wallClockFallback: boolean
+): void {
+  const inserted = database
+    .prepare(
+      `SELECT id, run_id, test_type, COALESCE(n_depth, 0) AS n_depth, mtp, avg_tps,
+              suspect_count, sample_count, spec_drafted, spec_accepted, prompt_offset, method_version, speedup_status
+       FROM results WHERE id = ?`
+    )
+    .get(insertedRowId) as (TwinCandidateRow & { run_id: string; test_type: string; n_depth: number }) | undefined;
+  if (!inserted) return;
+  const rootId = (
+    database.prepare(`SELECT COALESCE(root_run_id, id) AS root FROM runs WHERE id = ?`).get(inserted.run_id) as {
+      root: string;
+    }
+  ).root;
+
+  const insertedIsSpec = inserted.mtp === "on";
+  const insertedIsServerBaseline = engine === "server" && inserted.mtp !== "on";
+  if (!insertedIsSpec && !insertedIsServerBaseline) return;
+
+  const update = database.prepare(`UPDATE results SET speedup = ?, speedup_status = ? WHERE id = ?`);
+  const writeFlags = database.prepare(`UPDATE results SET caveat_flags = ? WHERE id = ?`);
+  const readFlags = database.prepare(`SELECT caveat_flags FROM results WHERE id = ?`);
+
+  const findTwin = (mtpFilter: string): TwinCandidateRow | undefined =>
+    database
+      .prepare(
+        `SELECT r.id, r.avg_tps, r.suspect_count, r.sample_count, r.spec_drafted, r.spec_accepted,
+                r.prompt_offset, r.method_version, r.speedup_status, r.mtp
+         FROM results r JOIN runs ON runs.id = r.run_id
+         WHERE COALESCE(runs.root_run_id, runs.id) = ?
+           AND r.config_hash IS ? AND r.test_type = ? AND COALESCE(r.n_depth, 0) = ?
+           AND r.mtp ${mtpFilter}
+         ORDER BY r.created_at DESC LIMIT 1`
+      )
+      .get(rootId, hash, inserted.test_type, inserted.n_depth) as TwinCandidateRow | undefined;
+
+  const spec = insertedIsSpec ? inserted : findTwin("= 'on'");
+  const baseline = insertedIsSpec ? findTwin("!= 'on'") : inserted;
+  if (!spec || !baseline) {
+    if (wallClockFallback) update.run(null, "unverified", inserted.id);
+    else if (inserted.speedup_status == null && insertedIsSpec) update.run(null, "unavailable", inserted.id);
+    return;
+  }
+
+  let status: "ok" | "unverified" = "ok";
+  const flagsToWrite: string[] = [];
+  const suspectOnly = (r: TwinCandidateRow): boolean =>
+    r.sample_count != null && r.sample_count > 0 && (r.suspect_count ?? 0) >= (r.sample_count ?? 0);
+  if (suspectOnly(spec) || suspectOnly(baseline)) status = "unverified";
+  if ((spec.spec_drafted != null && spec.spec_drafted === 0) || (spec.spec_accepted != null && spec.spec_accepted === 0)) {
+    status = "unverified";
+  }
+  if (spec.prompt_offset !== baseline.prompt_offset) {
+    status = "unverified";
+    flagsToWrite.push("spec_pair_prompt_mismatch");
+  }
+  if ((spec.method_version ?? null) !== (baseline.method_version ?? null)) status = "unverified";
+  if (spec.speedup_status === "unverified" || baseline.speedup_status === "unverified" || wallClockFallback) {
+    status = "unverified";
+  }
+
+  const ratio =
+    baseline.avg_tps != null && spec.avg_tps != null && baseline.avg_tps > 0 && spec.avg_tps > 0
+      ? spec.avg_tps / baseline.avg_tps
+      : null;
+  for (const target of [spec.id, baseline.id]) {
+    update.run(ratio, ratio == null ? "unavailable" : status, target);
+  }
+  if (flagsToWrite.length > 0) {
+    const current = (readFlags.get(spec.id) as { caveat_flags: string | null }).caveat_flags;
+    const merged = [...new Set([...parseCaveatFlags(current), ...flagsToWrite])];
+    writeFlags.run(JSON.stringify(merged), spec.id);
+  }
 }

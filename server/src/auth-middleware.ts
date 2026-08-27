@@ -52,6 +52,12 @@ const WORKER_AUTHENTICATED_ROUTES = new Set([
   // "no session" under AUTH_ENABLED (the download itself succeeded, but the
   // model never got registered since the callback never got through).
   "POST /api/models/download-callback",
+  // BENCHMARKING_PLAN_V8.md N2/N4 -- worker-authed result ingestion. Both
+  // handlers enforce a STRICTER rule than authenticateWorker's dual mode:
+  // an enrolled worker session only, never the shared deployment secret,
+  // because these rows feed verified claims other tenants see.
+  "POST /api/runs/:id/probe-result",
+  "POST /api/runs/:id/quality-result",
 ]);
 
 // Cast target for req.user/req.session once authMiddleware (or a route that

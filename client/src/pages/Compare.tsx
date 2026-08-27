@@ -2,6 +2,9 @@ import { useEffect, useState } from "react";
 import type { ChartConfiguration } from "chart.js";
 import { api } from "../api/client";
 import { Chart } from "../components/Chart";
+import { ComparisonView } from "../components/ComparisonView";
+import { NewComparison } from "../components/NewComparison";
+import { ImportBundle } from "../components/ImportBundle";
 import type { Run, ResultRow } from "../types";
 import { shortId, formatFlashAttn } from "../utils";
 
@@ -115,14 +118,25 @@ function comboLabel(r: ResultRow): string {
 export function Compare() {
   const [runs, setRuns] = useState<Run[]>([]);
   const [selected, setSelected] = useState<string[]>([]);
+  // N3 -- comparison GROUPS are their own object: several runs sharing one
+  // comparison_id, where the interesting variable is the model file and
+  // everything else is held fixed by blocking fairness checks.
+  const [comparisonId, setComparisonId] = useState<string>("");
   const [columns, setColumns] = useState<ColumnDef[]>([]);
   const [rows, setRows] = useState<RowDef[]>([]);
 
+  const [comparisonGroups, setComparisonGroups] = useState<string[]>([]);
+
+  async function refreshRuns() {
+    const list = await api.listRuns();
+    setRuns(list.filter((r) => r.status === "done"));
+    setComparisonGroups([
+      ...new Set(list.map((r) => r.comparison_id).filter((id): id is string => typeof id === "string" && id.length > 0)),
+    ]);
+  }
+
   useEffect(() => {
-    (async () => {
-      const list = await api.listRuns();
-      setRuns(list.filter((r) => r.status === "done"));
-    })();
+    refreshRuns();
   }, []);
 
   function toggleSelected(id: string) {
@@ -238,6 +252,49 @@ export function Compare() {
         repeat behind that average was flagged as an implausible reading (most often the known
         llama-server MTP timing bug) — hover it for the raw measured values.
       </p>
+
+      {/* N3 -- a comparison group renders as its own table plus a Pareto
+          scatter, with drifted members marked rather than silently averaged
+          into the conclusion. */}
+      <section className="mt-6">
+        <div className="flex items-center justify-between">
+          <h2 className="text-sm font-semibold uppercase tracking-wide text-muted">Model-vs-model comparisons</h2>
+          <NewComparison
+            onCreated={(id) => {
+              refreshRuns();
+              setComparisonId(id);
+            }}
+          />
+        </div>
+        {comparisonGroups.length > 0 && (
+          <div className="mt-3 flex flex-wrap gap-2">
+            {comparisonGroups.map((group) => (
+              <button
+                key={group}
+                type="button"
+                onClick={() => setComparisonId((current) => (current === group ? "" : group))}
+                className={
+                  comparisonId === group
+                    ? "rounded-lg border border-accent bg-accent/10 px-3 py-1 text-xs font-semibold text-accent"
+                    : "rounded-lg border border-border px-3 py-1 text-xs text-muted hover:text-fg"
+                }
+              >
+                {group.slice(0, 8)}
+              </button>
+            ))}
+          </div>
+        )}
+        {comparisonId && (
+          <div className="mt-3">
+            <ComparisonView comparisonId={comparisonId} />
+          </div>
+        )}
+      </section>
+
+      {/* N7 -- results travel without losing their meaning. */}
+      <section className="mt-6">
+        <ImportBundle />
+      </section>
 
       {runs.length === 0 ? (
         <p className="mt-4 text-sm text-muted">No completed runs yet.</p>

@@ -35,6 +35,7 @@ function migrate(database: Database.Database): void {
   createMultiTenancyIndexes(database);
   createHfGgufIndexSha256Index(database);
   createHfGgufIndexDeletedAtIndex(database);
+  createV8Indexes(database);
 }
 
 interface ColumnSpec {
@@ -198,6 +199,64 @@ const COLUMN_MIGRATIONS: ColumnSpec[] = [
   // module doc comment. Nullable: NULL means live, non-null means confirmed
   // gone from Hugging Face as of that timestamp.
   { table: "hf_gguf_index", column: "deleted_at", ddlType: "INTEGER" },
+  // PRE-EXISTING GAP, caught by the fresh-vs-upgraded parity check in
+  // v8-migrate.test.ts: raw_json_path is in schema.sql's CREATE TABLE for
+  // `results` but never had an ALTER, so a database created before that
+  // column existed would never gain it -- and repo.ts's INSERT names the
+  // column, so every result insert on such an install would fail with "no
+  // such column". Adding it here is a no-op wherever it already exists.
+  { table: "results", column: "raw_json_path", ddlType: "TEXT" },
+  // --- BENCHMARKING_PLAN_V8.md §0/Part A/Part B ---
+  // §0.5 run identity -- root_run_id denormalized at creation, immutable;
+  // NULL-kind standalone legacy runs read as their own root via
+  // COALESCE(root_run_id, id) in queries.
+  { table: "runs", column: "root_run_id", ddlType: "TEXT REFERENCES runs(id)" },
+  { table: "runs", column: "kind", ddlType: "TEXT" },
+  { table: "runs", column: "comparison_id", ddlType: "TEXT" },
+  // §0.1 methodology version -- NULL = pre-v8-core methodology.
+  { table: "results", column: "method_version", ddlType: "INTEGER" },
+  // §0.2 KV-prefill depth (llama-bench only). DEFAULT 0 matches every other
+  // axis's "not applicable" convention; server rows always carry 0 anyway.
+  { table: "run_items", column: "n_depth", ddlType: "INTEGER DEFAULT 0" },
+  { table: "results", column: "n_depth", ddlType: "INTEGER DEFAULT 0" },
+  { table: "run_items", column: "concurrency", ddlType: "INTEGER DEFAULT 1" },
+  // §0.8 twin join + §0.10 caveat flags + N5 concurrency + M6 thermal +
+  // N6 ISA provenance. Every historical column stays NULL, which each
+  // consumer reads as "unavailable/not applicable".
+  { table: "results", column: "config_hash", ddlType: "TEXT" },
+  { table: "results", column: "prompt_offset", ddlType: "INTEGER" },
+  { table: "results", column: "spec_type", ddlType: "TEXT" },
+  { table: "results", column: "spec_n_max", ddlType: "INTEGER" },
+  { table: "results", column: "spec_n_min", ddlType: "INTEGER" },
+  { table: "results", column: "speedup", ddlType: "REAL" },
+  { table: "results", column: "speedup_status", ddlType: "TEXT" },
+  { table: "results", column: "caveat_flags", ddlType: "TEXT" },
+  { table: "results", column: "concurrency", ddlType: "INTEGER" },
+  { table: "results", column: "gpu_temp_c_max", ddlType: "INTEGER" },
+  { table: "results", column: "gpu_clock_mhz_min", ddlType: "INTEGER" },
+  { table: "results", column: "gpu_clock_samples", ddlType: "TEXT" },
+  { table: "results", column: "cpu_isa", ddlType: "TEXT" },
+  // N1/Test B -- measured streamed TTFT and end-to-end latency. NULL on every
+  // llama-bench row and on every row predating the streamed clock, which is
+  // exactly the distinction METHOD_VERSION exists to keep visible.
+  // N7 -- import provenance. Legacy rows read as local (NULL bundle id).
+  { table: "results", column: "imported_bundle_id", ddlType: "TEXT" },
+  { table: "results", column: "import_opt_in", ddlType: "INTEGER DEFAULT 0" },
+  { table: "results", column: "ttft_ms_p50", ddlType: "REAL" },
+  { table: "results", column: "ttft_ms_p95", ddlType: "REAL" },
+  { table: "results", column: "ttft_n", ddlType: "INTEGER" },
+  { table: "results", column: "e2e_ms_mean", ddlType: "REAL" },
+  // Denormalized from the parent run so idx_results_curve covers the curve
+  // grouping keys exactly. Nullable FK: a deleted worker must not take its
+  // historical rows with it.
+  { table: "results", column: "worker_id", ddlType: "TEXT REFERENCES workers(id) ON DELETE SET NULL" },
+  { table: "results", column: "llama_cpp_build", ddlType: "TEXT" },
+  { table: "results", column: "engine", ddlType: "TEXT" },
+  // Worker capability advertisement + M6 sensor availability + N6 ISA
+  // provenance, persisted from the heartbeat's state push.
+  { table: "workers", column: "capabilities_json", ddlType: "TEXT" },
+  { table: "workers", column: "sensors_json", ddlType: "TEXT" },
+  { table: "workers", column: "cpu_isa", ddlType: "TEXT" },
 ];
 
 function applyColumnMigrations(database: Database.Database): void {
@@ -373,4 +432,21 @@ function createMultiTenancyIndexes(database: Database.Database): void {
   database.exec(`CREATE INDEX IF NOT EXISTS idx_results_user ON results(user_id)`);
   database.exec(`CREATE INDEX IF NOT EXISTS idx_run_items_user ON run_items(user_id)`);
   database.exec(`CREATE INDEX IF NOT EXISTS idx_models_created_by ON models(created_by)`);
+}
+
+// BENCHMARKING_PLAN_V8.md §0.11 helper -- every new table (model_machine_limits,
+// quality_results) and its indexes land in schema.sql's static DDL, but the
+// indexes over columns that only exist once COLUMN_MIGRATIONS has applied
+// must run here, after applyColumnMigrations. §0.5 chain-scoped reads are
+// equality predicates on root_run_id/kind/comparison_id; §0.8's twin join
+// ranges over config_hash; N1's curve read path is an index range scan over
+// exactly its five grouping keys.
+function createV8Indexes(database: Database.Database): void {
+  database.exec(`CREATE INDEX IF NOT EXISTS idx_runs_root ON runs(root_run_id)`);
+  database.exec(`CREATE INDEX IF NOT EXISTS idx_runs_kind ON runs(kind)`);
+  database.exec(`CREATE INDEX IF NOT EXISTS idx_runs_comparison ON runs(comparison_id)`);
+  database.exec(`CREATE INDEX IF NOT EXISTS idx_results_config_hash ON results(config_hash)`);
+  database.exec(
+    `CREATE INDEX IF NOT EXISTS idx_results_curve ON results(model_id, worker_id, llama_cpp_build, engine, method_version)`
+  );
 }
