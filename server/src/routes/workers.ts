@@ -272,7 +272,7 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
       const direction = request.query.direction === "1" ? 1 : request.query.direction === "-1" ? -1 : undefined;
       const cursor = request.query.cursor || undefined;
       try {
-        const page = await searchHfGgufModels(q, WORKER_READ_TIMEOUT_MS, { sort, direction, cursor });
+        const page = await searchHfGgufModels(q, WORKER_READ_TIMEOUT_MS, "search-ui", { sort, direction, cursor });
         return { results: page.items as HfRepoSearchResult[], next_cursor: page.nextCursor };
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
@@ -287,7 +287,7 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(400).send({ error: "invalid repo id" });
     }
     try {
-      const files: HfFileEntry[] = await listHfGgufFiles(repoId, WORKER_READ_TIMEOUT_MS);
+      const files: HfFileEntry[] = await listHfGgufFiles(repoId, WORKER_READ_TIMEOUT_MS, "tree-ui");
       return { files };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -451,7 +451,7 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
         // read a count (non-standard/corrupt file, or an old worker that
         // never sends it).
         const { param_count: hfParamCount } =
-          typeof param_count === "number" ? { param_count: null } : await getHfGgufMeta(hf_repo, WORKER_READ_TIMEOUT_MS);
+          typeof param_count === "number" ? { param_count: null } : await getHfGgufMeta(hf_repo, WORKER_READ_TIMEOUT_MS, "register-fallback-metadata");
         const resolvedParamCount = typeof param_count === "number" ? param_count : hfParamCount;
         const metadata: ModelMetadata = {
           ...(typeof n_layer === "number" ? { n_layer } : {}),

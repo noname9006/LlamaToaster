@@ -144,16 +144,23 @@ function mergeAbortSignals(a: AbortSignal | undefined, b: AbortSignal | undefine
  * - Records RateLimit/RateLimit-Policy headers to learn real quotas.
  * - On 429, waits the exact `t=` from the RateLimit header then retries once.
  * Exported so hf-index.ts and routes can share the same wrapper.
+ *
+ * `opts.reason` is a short caller tag (e.g. "backlog-walk", "search-ui",
+ * "on-demand-verify") attributing this specific call -- required, not
+ * optional, so a new call site can't silently go untagged. It costs nothing
+ * at request time and is what lets hf-rate-limit.ts's low-remaining/
+ * window-full log lines say *what* has been consuming the shared budget
+ * instead of just reporting a bare number (see server/src/hf-rate-limit.ts).
  */
 export async function hfFetch(
   url: string,
   init: RequestInit | undefined,
-  opts: { bucket?: "api" | "resolvers"; timeoutMs: number; retries?: number }
+  opts: { bucket?: "api" | "resolvers"; timeoutMs: number; retries?: number; reason: string }
 ): Promise<Response> {
   const bucket = opts.bucket ?? "api";
   const retries = opts.retries ?? 1;
   // Acquire a slot in the 5-minute window before we even hit the network.
-  await acquireRateLimitSlot(bucket);
+  await acquireRateLimitSlot(bucket, opts.reason);
 
   const timeoutSignal = AbortSignal.timeout(opts.timeoutMs);
   const signal = mergeAbortSignals(init?.signal as AbortSignal | undefined, timeoutSignal);
@@ -178,7 +185,7 @@ export async function hfFetch(
     log.warn(`[hf] 429 rate-limited on ${bucket} ${url} -- retrying after ${waitSec}s (t from RateLimit header)`);
     await sleep(waitSec * 1000);
     // Recurse with one fewer retry; acquire will re-check the window.
-    return hfFetch(url, init, { bucket, timeoutMs: opts.timeoutMs, retries: retries - 1 });
+    return hfFetch(url, init, { bucket, timeoutMs: opts.timeoutMs, retries: retries - 1, reason: opts.reason });
   }
 
   return res;
@@ -189,9 +196,12 @@ export { getHfToken, getHfAuthHeaders, isHfTokenConfigured } from "./hf-rate-lim
 
 // query may be empty -- an empty query + sort=downloads is exactly the
 // Models page's default "top 15" listing shown before the user searches.
+// `reason` attributes this call for hf-rate-limit.ts's logging -- see
+// hfFetch's doc comment.
 export async function searchHfGgufModels(
   query: string,
   timeoutMs: number,
+  reason: string,
   options: HfSearchOptions = {}
 ): Promise<HfSearchPage> {
   const q = query.trim();
@@ -201,7 +211,7 @@ export async function searchHfGgufModels(
   if (options.direction) params.set("direction", String(options.direction));
   if (options.cursor) params.set("cursor", options.cursor);
   const url = `https://huggingface.co/api/models?${params.toString()}`;
-  const res = await hfFetch(url, undefined, { bucket: "api", timeoutMs });
+  const res = await hfFetch(url, undefined, { bucket: "api", timeoutMs, reason });
   if (!res.ok) {
     // Enrich 429 with the precise reset (t=) so callers (e.g. hf-index's
     // scanHfRepo) can honor the server's rate-limit window instead of a
@@ -232,6 +242,7 @@ export async function searchHfGgufModels(
 export async function listHfGgufFiles(
   repoId: string,
   timeoutMs: number,
+  reason: string,
   revision = "main"
 ): Promise<HfFileEntry[]> {
   const encRepo = repoId.split("/").map(encodeURIComponent).join("/");
@@ -242,7 +253,7 @@ export async function listHfGgufFiles(
   // index look like files were deleted, so we must walk every page.
   let pages = 0;
   while (url) {
-    const res = await hfFetch(url, undefined, { bucket: "api", timeoutMs });
+    const res = await hfFetch(url, undefined, { bucket: "api", timeoutMs, reason });
     if (!res.ok) {
       if (res.status === 429) {
         const waitSec = parse429WaitSeconds(res.headers as unknown as Headers, 30);
@@ -286,10 +297,11 @@ export async function listHfGgufFiles(
 // decides between those two via the model-info status.
 export async function getHfRepoDefaultRevision(
   repoId: string,
-  timeoutMs: number
+  timeoutMs: number,
+  reason: string
 ): Promise<{ revision: string | null; status: number }> {
   const url = `https://huggingface.co/api/models/${repoId}`;
-  const res = await hfFetch(url, undefined, { bucket: "api", timeoutMs });
+  const res = await hfFetch(url, undefined, { bucket: "api", timeoutMs, reason });
   if (!res.ok) return { revision: null, status: res.status };
   const data = (await res.json()) as { sha?: string };
   const sha = data.sha;
@@ -312,10 +324,10 @@ export interface HfGgufMeta {
   last_modified: string | null;
 }
 
-export async function getHfGgufMeta(repoId: string, timeoutMs: number): Promise<HfGgufMeta> {
+export async function getHfGgufMeta(repoId: string, timeoutMs: number, reason: string): Promise<HfGgufMeta> {
   try {
     const url = `https://huggingface.co/api/models/${repoId}`;
-    const res = await hfFetch(url, undefined, { bucket: "api", timeoutMs });
+    const res = await hfFetch(url, undefined, { bucket: "api", timeoutMs, reason });
     if (!res.ok) return { param_count: null, last_modified: null };
     const data = (await res.json()) as { gguf?: { total?: number }; lastModified?: string };
     const total = data.gguf?.total;
@@ -340,13 +352,14 @@ export async function getHfGgufMeta(repoId: string, timeoutMs: number): Promise<
 export async function headHfResolveFile(
   repoId: string,
   filePath: string,
-  timeoutMs: number
+  timeoutMs: number,
+  reason: string
 ): Promise<{ exists: boolean; size?: number; etag?: string } | null> {
   const encRepo = repoId.split("/").map(encodeURIComponent).join("/");
   const encFile = filePath.split("/").map(encodeURIComponent).join("/");
   const url = `https://huggingface.co/${encRepo}/resolve/main/${encFile}`;
   try {
-    const res = await hfFetch(url, { method: "HEAD" }, { bucket: "resolvers", timeoutMs });
+    const res = await hfFetch(url, { method: "HEAD" }, { bucket: "resolvers", timeoutMs, reason });
     if (res.status === 404) return { exists: false };
     if (!res.ok) return null;
     const len = res.headers.get("content-length");
