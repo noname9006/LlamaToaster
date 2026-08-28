@@ -55,7 +55,7 @@ export function ImportBundle() {
       {error && <p className="mt-2 text-xs text-danger">{error}</p>}
 
       {result && (
-        <div className="mt-3 rounded-lg border border-border bg-raised p-3 text-xs leading-relaxed text-muted">
+        <div className="mt-3 rounded-lg border border-border bg-surface-raised p-3 text-xs leading-relaxed text-muted">
           <p>
             Imported <b className="text-fg">{result.imported_rows}</b> row
             {result.imported_rows === 1 ? "" : "s"}
