@@ -101,8 +101,13 @@ interface BucketState {
   remaining?: number;
   // Absolute reset timestamp (ms) = now + t*1000 from the last 429/200 header.
   resetAtMs?: number;
-  // Timestamps (ms) of requests we admitted in this window, used for sliding-window throttling.
-  timestamps: number[];
+  // Requests we admitted in this window, used for sliding-window throttling.
+  // `reason` is a short caller tag (e.g. "backlog-walk", "search-ui",
+  // "on-demand-verify") -- kept alongside each timestamp, not in a separate
+  // counter, so it prunes for free in the same pass as the timestamp itself
+  // and low-remaining/window-full log lines can say *what* has been calling
+  // this bucket, not just how many times.
+  entries: { ts: number; reason: string }[];
 }
 
 const buckets = new Map<RateLimitBucket, BucketState>();
@@ -113,8 +118,8 @@ function ensureBucket(bucket: RateLimitBucket): BucketState {
   const def = defaultLimitFor(bucket);
   if (!s) {
     // Env override wins outright; otherwise use default guess (which may bump on token presence).
-    if (override != null) s = { limit: override, learned: true, timestamps: [] };
-    else s = { limit: def, learned: false, timestamps: [] };
+    if (override != null) s = { limit: override, learned: true, entries: [] };
+    else s = { limit: def, learned: false, entries: [] };
     buckets.set(bucket, s);
     return s;
   }
@@ -137,7 +142,24 @@ function ensureBucket(bucket: RateLimitBucket): BucketState {
 
 function prune(state: BucketState, now: number): void {
   const cutoff = now - WINDOW_MS;
-  state.timestamps = state.timestamps.filter((t) => t > cutoff);
+  state.entries = state.entries.filter((e) => e.ts > cutoff);
+}
+
+// Tally entries still in-window by reason, formatted for a log line -- e.g.
+// "backlog-walk=310 stale-refresh=180 lastmodified-sweep=95 search-ui=8".
+// Sorted by count descending, capped so a bucket with many distinct callers
+// doesn't blow out the log line.
+function summarizeReasons(state: BucketState, maxReasons = 8): string {
+  const counts = new Map<string, number>();
+  for (const e of state.entries) {
+    counts.set(e.reason, (counts.get(e.reason) ?? 0) + 1);
+  }
+  const sorted = [...counts.entries()].sort((a, b) => b[1] - a[1]);
+  if (sorted.length === 0) return "none";
+  return sorted
+    .slice(0, maxReasons)
+    .map(([reason, count]) => `${reason}=${count}`)
+    .join(" ");
 }
 
 // --- header parsing (IETF draft) ---------------------------------------------
@@ -264,9 +286,15 @@ export function recordRateLimit(bucket: RateLimitBucket, headers: Headers): void
   if (parsed.resetSec != null) {
     state.resetAtMs = Date.now() + parsed.resetSec * 1000;
   }
-  // Early warning when remaining is low ( <10% or < SAFETY_MARGIN )
+  // Early warning when remaining is low ( <10% or < SAFETY_MARGIN ). Includes
+  // a per-reason breakdown of who's actually been calling this bucket in the
+  // current window -- otherwise this line only ever says a number is low,
+  // never what's consuming it.
   if (state.remaining != null && (state.remaining < SAFETY_MARGIN || state.remaining < state.limit * 0.1)) {
-    log.warn(`[hf-rate-limit] ${bucket} low remaining: r=${state.remaining}/${state.limit} t=${parsed.resetSec ?? "?"}s`);
+    prune(state, Date.now());
+    log.warn(
+      `[hf-rate-limit] ${bucket} low remaining: r=${state.remaining}/${state.limit} t=${parsed.resetSec ?? "?"}s (last 5m: ${summarizeReasons(state)})`
+    );
   }
   if (changed) {
     prune(state, Date.now());
@@ -287,7 +315,7 @@ function jitterMs(): number {
   return 80 + Math.floor(Math.random() * 220); // 80-300ms
 }
 
-export async function acquireRateLimitSlot(bucket: RateLimitBucket): Promise<void> {
+export async function acquireRateLimitSlot(bucket: RateLimitBucket, reason: string): Promise<void> {
   const state = ensureBucket(bucket);
   while (true) {
     const now = Date.now();
@@ -305,7 +333,7 @@ export async function acquireRateLimitSlot(bucket: RateLimitBucket): Promise<voi
     }
 
     // Respect a recent 429's resetAt before admitting anything.
-    if (state.resetAtMs && now < state.resetAtMs && (state.remaining === 0 || state.timestamps.length >= state.limit - SAFETY_MARGIN)) {
+    if (state.resetAtMs && now < state.resetAtMs && (state.remaining === 0 || state.entries.length >= state.limit - SAFETY_MARGIN)) {
       const waitMs = state.resetAtMs - now + jitterMs();
       log.warn(`[hf-rate-limit] ${bucket} in 429 backoff -- sleeping ${Math.ceil(waitMs / 1000)}s until window reset`);
       await sleep(waitMs);
@@ -326,24 +354,29 @@ export async function acquireRateLimitSlot(bucket: RateLimitBucket): Promise<voi
       continue;
     }
 
-    const headroom = state.limit - state.timestamps.length;
+    const headroom = state.limit - state.entries.length;
     if (headroom > SAFETY_MARGIN || headroom > state.limit * 0.05) {
       // Room available -- admit.
-      state.timestamps.push(now);
+      state.entries.push({ ts: now, reason });
+      if (process.env.LOG_LEVEL === "debug") {
+        log.debug(`[hf-rate-limit] ${bucket} admitted (reason=${reason}) ${state.entries.length}/${state.limit} in window`);
+      }
       return;
     }
 
     // At limit (sliding window) -- wait for the oldest entry to age out of the 300s window.
-    const oldest = state.timestamps[0];
+    const oldest = state.entries[0]?.ts;
     if (oldest == null) {
-      state.timestamps.push(now);
+      state.entries.push({ ts: now, reason });
       return;
     }
     const waitMs = oldest + WINDOW_MS - now + jitterMs();
     const waitSec = Math.ceil(waitMs / 1000);
     // Don't block longer than the window itself; if t tells us the real fixed-window reset is sooner, use that.
     // Our sliding wait is otherwise the right bound for a bursting caller.
-    log.info(`[hf-rate-limit] ${bucket} window full (${state.timestamps.length}/${state.limit} in 5m) -- throttling ${waitSec}s`);
+    log.info(
+      `[hf-rate-limit] ${bucket} window full (${state.entries.length}/${state.limit} in 5m) -- throttling ${waitSec}s (waiting on behalf of reason=${reason}; last 5m: ${summarizeReasons(state)})`
+    );
     await sleep(Math.max(0, waitMs));
     // loop, prune again
   }
@@ -359,7 +392,7 @@ export function getRateLimitStatus(): Record<RateLimitBucket, { limit: number; r
       limit: s.limit,
       remaining: s.remaining,
       resetInSec: s.resetAtMs ? Math.max(0, Math.ceil((s.resetAtMs - now) / 1000)) : undefined,
-      usedInWindow: s.timestamps.length,
+      usedInWindow: s.entries.length,
     };
   }
   return out as Record<RateLimitBucket, { limit: number; remaining?: number; resetInSec?: number; usedInWindow: number }>;

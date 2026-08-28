@@ -34,7 +34,7 @@ const paramLookupInFlight = new Set<string>();
 function backfillParamCountInBackground(modelId: string, hfRepo: string): void {
   if (paramLookupInFlight.has(modelId)) return;
   paramLookupInFlight.add(modelId);
-  getHfGgufMeta(hfRepo, HF_META_TIMEOUT_MS)
+  getHfGgufMeta(hfRepo, HF_META_TIMEOUT_MS, "register-fallback-metadata")
     .then(({ param_count }) => {
       if (typeof param_count === "number") {
         repo.updateModelMetadata(modelId, { param_count });

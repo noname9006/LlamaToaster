@@ -157,7 +157,7 @@ async function runTool(name: string, rawArguments: string, callerId: string | un
   if (name === "search_huggingface_gguf_models") {
     const query = typeof args.query === "string" ? args.query : "";
     try {
-      return { results: (await searchHfGgufModels(query, HF_TOOL_TIMEOUT_MS)).items };
+      return { results: (await searchHfGgufModels(query, HF_TOOL_TIMEOUT_MS, "ai-tool-search")).items };
     } catch (err) {
       return { error: err instanceof Error ? err.message : String(err) };
     }
@@ -167,7 +167,7 @@ async function runTool(name: string, rawArguments: string, callerId: string | un
     const repoId = typeof args.repo_id === "string" ? args.repo_id : "";
     if (!HF_REPO_PATTERN.test(repoId)) return { error: "invalid repo id" };
     try {
-      return { files: await listHfGgufFiles(repoId, HF_TOOL_TIMEOUT_MS) };
+      return { files: await listHfGgufFiles(repoId, HF_TOOL_TIMEOUT_MS, "ai-tool-tree") };
     } catch (err) {
       return { error: err instanceof Error ? err.message : String(err) };
     }

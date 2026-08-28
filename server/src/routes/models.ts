@@ -202,7 +202,7 @@ export async function modelsRoutes(app: FastifyInstance): Promise<void> {
         return reply.code(400).send({ error: "model has no hf_repo to look up" });
       }
 
-      const { param_count } = await getHfGgufMeta(model.hf_repo, HF_META_TIMEOUT_MS);
+      const { param_count } = await getHfGgufMeta(model.hf_repo, HF_META_TIMEOUT_MS, "metadata-backfill");
       if (param_count == null) {
         return reply.code(200).send({ ok: true, param_count: null });
       }
@@ -275,7 +275,7 @@ export async function modelsRoutes(app: FastifyInstance): Promise<void> {
       }
       byRepo.set(
         m.hf_repo,
-        getHfGgufMeta(m.hf_repo, HF_META_TIMEOUT_MS).then((meta) => {
+        getHfGgufMeta(m.hf_repo, HF_META_TIMEOUT_MS, "hf-updates").then((meta) => {
           hfUpdatesCache.set(m.hf_repo, { value: meta.last_modified, expiresAt: Date.now() + HF_UPDATES_CACHE_TTL_MS });
           return meta.last_modified;
         })

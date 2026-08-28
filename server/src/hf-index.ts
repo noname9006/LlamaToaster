@@ -450,7 +450,7 @@ const verifyingRepos = new Set<string>();
 export function verifyRepoInBackground(repoId: string): void {
   if (verifyingRepos.has(repoId)) return;
   verifyingRepos.add(repoId);
-  scanHfRepo(repoId, HF_INDEX_TIMEOUT_MS)
+  scanHfRepo(repoId, HF_INDEX_TIMEOUT_MS, "on-demand-verify")
     .catch((err) => {
       log.warn(`[hf-index] on-demand verify failed for ${repoId}: ${err instanceof Error ? err.message : String(err)}`);
     })
@@ -484,12 +484,13 @@ export function verifyRepoInBackground(repoId: string): void {
 // thing hash-lookup actually promises callers.
 export async function scanHfRepo(
   repoId: string,
-  timeoutMs: number
+  timeoutMs: number,
+  reason: string
 ): Promise<{ indexed: number; removed: number }> {
   let files: HfFileEntry[];
   let revision = "main";
   try {
-    files = await listHfGgufFiles(repoId, timeoutMs);
+    files = await listHfGgufFiles(repoId, timeoutMs, reason);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     const isNotFound = /\b(404|401)\b/.test(msg);
@@ -500,7 +501,7 @@ export async function scanHfRepo(
       // revision before deleting anything -- a GGUF repo on a non-main
       // default branch is valid and must be indexed, not removed.
       try {
-        const { revision: defaultRev, status } = await getHfRepoDefaultRevision(repoId, timeoutMs);
+        const { revision: defaultRev, status } = await getHfRepoDefaultRevision(repoId, timeoutMs, reason);
         if (status === 404 || status === 401) {
           // Repo genuinely gone (or no longer accessible) -- soft-delete its rows.
           const removed = markRepoDeleted(repoId, Date.now());
@@ -508,7 +509,7 @@ export async function scanHfRepo(
         }
         if (defaultRev && defaultRev !== "main") {
           // Default branch isn't main -- retry the tree fetch on it.
-          files = await listHfGgufFiles(repoId, timeoutMs, defaultRev);
+          files = await listHfGgufFiles(repoId, timeoutMs, reason, defaultRev);
           revision = defaultRev;
         } else {
           // Repo exists and defaults to main, yet tree/main was not-found --
@@ -606,7 +607,7 @@ export async function scanNewRepos(
 
   while (scanned < limit) {
     try {
-      const page = await searchHfGgufModels("", HF_INDEX_TIMEOUT_MS, {
+      const page = await searchHfGgufModels("", HF_INDEX_TIMEOUT_MS, "backlog-walk", {
         sort: "createdAt",
         direction: -1,
         limit: Math.min(50, limit - scanned),
@@ -667,7 +668,7 @@ export async function scanRecentRepos(
   while (scanned < limit) {
     let page;
     try {
-      page = await searchHfGgufModels("", HF_INDEX_TIMEOUT_MS, {
+      page = await searchHfGgufModels("", HF_INDEX_TIMEOUT_MS, "recent-sweep", {
         sort: "createdAt",
         direction: -1,
         limit: Math.min(50, limit - scanned),
@@ -783,7 +784,7 @@ export async function scanLastModifiedRepos(
   while (scanned < limit) {
     let page;
     try {
-      page = await searchHfGgufModels("", HF_INDEX_TIMEOUT_MS, {
+      page = await searchHfGgufModels("", HF_INDEX_TIMEOUT_MS, "lastmodified-sweep", {
         sort: "lastModified",
         direction: -1,
         limit: Math.min(50, limit - scanned),
@@ -1036,7 +1037,15 @@ export async function runIndexTick(): Promise<{ indexed: number; repos: number }
     // self-reschedules from actual completion time instead of a fixed
     // setInterval clock specifically to avoid that).
     for (const repoId of toScan) {
-      const result = await scanHfRepo(repoId, HF_INDEX_TIMEOUT_MS);
+      // Tagged "index-scan" regardless of which of the sweeps above
+      // originally surfaced this repoId -- toScan already merged and deduped
+      // them, so by this point there's no cheap way to attribute a given
+      // repo back to exactly one source (and a repo found by more than one
+      // sweep in the same tick couldn't be attributed to just one anyway).
+      // "index-scan" vs "on-demand-verify" (verifyRepoInBackground) is the
+      // operationally useful distinction: background bulk indexing vs a real
+      // worker's hash-lookup needing a specific repo re-checked right now.
+      const result = await scanHfRepo(repoId, HF_INDEX_TIMEOUT_MS, "index-scan");
       indexedTotal += result.indexed;
     }
 
