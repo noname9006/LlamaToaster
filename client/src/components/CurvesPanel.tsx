@@ -82,7 +82,7 @@ export function CurvesPanel({ modelId, workerId, build, targetCtx, onMeasureMiss
                 className={
                   engine === value
                     ? "bg-accent px-3 py-1 text-[11px] font-semibold text-bg"
-                    : "bg-raised px-3 py-1 text-[11px] text-muted"
+                    : "bg-surface-raised px-3 py-1 text-[11px] text-muted"
                 }
               >
                 {value === "server" ? "llama-server" : "llama-bench"}
@@ -158,7 +158,7 @@ export function CurvesPanel({ modelId, workerId, build, targetCtx, onMeasureMiss
                     <>
                       <span className="mr-1 inline-block h-2 w-2 rounded-full bg-success align-middle" /> measured
                       {targetCtx != null && point.effectiveCtx === targetCtx && (
-                        <span className="ml-2 rounded-full bg-raised px-2 py-0.5 text-[10px]">your target ▸</span>
+                        <span className="ml-2 rounded-full bg-surface-raised px-2 py-0.5 text-[10px]">your target ▸</span>
                       )}
                     </>
                   )}
@@ -252,7 +252,7 @@ export function KneeChart({ runId }: { runId: string }) {
                     className={
                       past
                         ? "flex w-full justify-center rounded-t-md bg-danger/20 pt-1 text-[10px] text-danger outline outline-1 outline-danger/40"
-                        : "flex w-full justify-center rounded-t-md bg-raised pt-1 text-[10px] text-muted outline outline-1 outline-border"
+                        : "flex w-full justify-center rounded-t-md bg-surface-raised pt-1 text-[10px] text-muted outline outline-1 outline-border"
                     }
                   >
                     {sample.ttftP95Ms != null ? `${Math.round(sample.ttftP95Ms / 1000)} s` : "—"}
