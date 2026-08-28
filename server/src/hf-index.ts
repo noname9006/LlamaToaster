@@ -12,24 +12,50 @@ import { isHfTokenConfigured, getRateLimitStatus } from "./hf-rate-limit.js";
 // key (schema.sql) keeps mirrored content across repos distinct; revision is
 // stored per row but isn't part of the key.
 //
-// Each tick does up to three things, all sorted by createdAt (immutable --
-// unlike lastModified/downloads, a repo's position in a createdAt-sorted
-// listing never shifts after upload, so HF's cursor-based pagination can't
-// skip/duplicate items mid-walk):
-//   1) Backlog walk (one-time): newest-created -> oldest, covering the whole
-//      existing catalog. Runs every tick until it wraps once, then never
-//      again (hf_index_backlog_complete flips permanently). Newest-first
-//      because recency matters more than lifetime popularity for this tool --
-//      a hot model released yesterday has ~0 downloads and would sit at the
-//      bottom of a downloads-sorted crawl for weeks otherwise.
-//   2) Recent top-up (perpetual): stop as soon as we reach the bookmark (max
-//      createdAt already covered). Seeded from the backlog walk's very first
-//      page (not just at wrap), so this starts covering new uploads from
-//      tick 1 instead of waiting for the multi-week backlog walk to finish.
-//   3) Staleness refresh: repos whose last_seen is older than
+// Each tick does up to four things:
+//   1) Backlog walk (one-time), sorted by createdAt (immutable -- unlike
+//      lastModified/downloads, a repo's position in a createdAt-sorted
+//      listing never shifts after upload, so HF's cursor-based pagination
+//      can't skip/duplicate items mid-walk): newest-created -> oldest,
+//      covering the whole existing catalog. Runs every tick until it wraps
+//      once, then never again (hf_index_backlog_complete flips permanently).
+//      Newest-first because recency matters more than lifetime popularity
+//      for this tool -- a hot model released yesterday has ~0 downloads and
+//      would sit at the bottom of a downloads-sorted crawl for weeks
+//      otherwise.
+//   2) Recent top-up (perpetual), also createdAt-sorted: stop as soon as we
+//      reach the bookmark (max createdAt already covered). Seeded from the
+//      backlog walk's very first page (not just at wrap), so this starts
+//      covering new uploads from tick 1 instead of waiting for the
+//      multi-week backlog walk to finish. Catches brand-new repos; see (3)
+//      for content changes to repos already in the index.
+//   3) Last-modified sweep (perpetual): sorted by lastModified descending,
+//      stop as soon as we reach a bookmark (max lastModified already
+//      covered this way). Unlike createdAt, lastModified is NOT immutable --
+//      any touch (new file, retag, README edit) bumps a repo back to the top
+//      of this sort. In the normal case (steady stream of changes, nothing
+//      backed up) this reaches the bookmark within the first page, same as
+//      restarting from the top every tick. Only when a burst pushes more
+//      changed repos above the bookmark than one tick's batch can cover
+//      does it fall back to resuming a short-lived cursor across ticks
+//      (hf_index_lastmodified_sweep_resume_cursor) instead of re-covering
+//      the same top slice forever -- safe across a ~1-minute gap in a way a
+//      stored cursor spanning the multi-day backlog walk in (1) would not
+//      be (see scanLastModifiedRepos's doc comment). On a fresh database
+//      with no bookmark yet, it seeds one immediately from whatever it sees
+//      on tick 1 instead of trying to walk the entire catalog to "complete"
+//      -- (1) already owns discovering every existing repo; this sweep only
+//      needs to track changes from here forward. This is what lets content
+//      changes on repos already in the index get picked up cheaply (a
+//      handful of search requests) instead of relying on (4) blindly
+//      re-fetching every repo's full file tree on a timer.
+//   4) Staleness refresh: repos whose last_seen is older than
 //      HF_INDEX_REFRESH_INTERVAL_MS get re-checked (excludes rows already
 //      soft-deleted -- see below, no point background-polling a confirmed-gone
-//      repo).
+//      repo). With (3) now covering content changes, this is mostly a
+//      backstop for the one case neither (3) nor on-demand verification (see
+//      below) can see: a repo that's indexed, gets deleted, and that no
+//      worker currently references and HF never resurfaces as "modified".
 //
 // Deletion is handled lazily, not by a background reconciliation crawl: rows
 // are soft-deleted (deleted_at set, never hard-removed) by scanHfRepo when it
@@ -59,7 +85,8 @@ import { isHfTokenConfigured, getRateLimitStatus } from "./hf-rate-limit.js";
 //     PRO:       API 2500, Resolvers 12000  (+Team/Enterprise higher)
 //   When a token is configured this service automatically scales its per-tick
 //   backlog batch size and uses hfFetch()'s limiter to stay within the current
-//   5-minute window. See getBacklogBatchSize/getRecentBatchSize/getMaxReposPerTick.
+//   5-minute window. See getBacklogBatchSize/getRecentBatchSize/
+//   getLastModifiedBatchSize/getMaxReposPerTick.
 
 export const HF_INDEX_REFRESH_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
 export const HF_INDEX_TIMEOUT_MS = 30_000; // per-repo timeout
@@ -71,6 +98,12 @@ export const HF_INDEX_TIMEOUT_MS = 30_000; // per-repo timeout
 export const HF_INDEX_MAX_REPOS_PER_TICK = 125; // anon fallback; token → 250
 export const HF_INDEX_BACKLOG_BATCH_SIZE = 250; // anon fallback; token → 500
 export const HF_INDEX_RECENT_BATCH_SIZE = 50; // fixed -- real upload volume/5min is tiny
+// Higher default than HF_INDEX_RECENT_BATCH_SIZE: any touch to any
+// gguf-tagged repo (new quant, retag, README edit) bumps lastModified, so
+// this sweep's real per-tick volume is expected to run well above pure
+// new-repo creation. Env-overridable like the others if that assumption is
+// wrong for the real catalog's activity level.
+export const HF_INDEX_LASTMODIFIED_BATCH_SIZE = 100;
 
 export function getMaxReposPerTick(): number {
   const env = process.env.HF_INDEX_MAX_REPOS_PER_TICK?.trim();
@@ -97,6 +130,15 @@ export function getRecentBatchSize(): number {
     if (Number.isFinite(n) && n > 0) return Math.floor(n);
   }
   return HF_INDEX_RECENT_BATCH_SIZE;
+}
+
+export function getLastModifiedBatchSize(): number {
+  const env = process.env.HF_INDEX_LASTMODIFIED_BATCH_SIZE?.trim();
+  if (env) {
+    const n = Number(env);
+    if (Number.isFinite(n) && n > 0) return Math.floor(n);
+  }
+  return HF_INDEX_LASTMODIFIED_BATCH_SIZE;
 }
 
 // How often a tick runs. HF's rate limit is a true sliding window tracked in
@@ -131,6 +173,22 @@ export const HF_INDEX_TICK_INTERVAL_MS = (() => {
 const BACKLOG_CURSOR_KEY = "hf_index_backlog_cursor";
 const RECENT_BOOKMARK_KEY = "hf_index_recent_bookmark";
 const BACKLOG_COMPLETE_KEY = "hf_index_backlog_complete";
+// Deliberately distinct from the orphaned pre-redesign key
+// "hf_index_last_modified_bookmark" mentioned above (same reasoning: that key
+// tracked a downloads-sorted crawl's cursor, a different semantic from this
+// sweep's "max lastModified already covered" bookmark).
+const LASTMODIFIED_BOOKMARK_KEY = "hf_index_lastmodified_sweep_bookmark";
+// Short-lived state for an in-progress (not-yet-complete) lastModified
+// sweep: when a burst pushes more changed repos above the bookmark than one
+// tick's batch can cover, these persist the HF pagination cursor and the
+// running max lastModified seen so far, so the *next* tick continues
+// forward from there instead of restarting at the top and re-covering the
+// same slice. Both are cleared the moment a sweep completes. See
+// scanLastModifiedRepos's doc comment for why resuming a cursor here (a
+// single-tick gap) is safe in a way the multi-day backlog cursor above is
+// not.
+const LASTMODIFIED_RESUME_CURSOR_KEY = "hf_index_lastmodified_sweep_resume_cursor";
+const LASTMODIFIED_RESUME_NEWEST_KEY = "hf_index_lastmodified_sweep_resume_newest";
 
 // Empty string in the meta row (rather than deleting it) means "wrapped back
 // to the start" -- same as never having a cursor at all.
@@ -166,6 +224,62 @@ function setRecentBookmark(ms: number): void {
         ON CONFLICT(key) DO UPDATE SET value = excluded.value`
     )
     .run(RECENT_BOOKMARK_KEY, String(ms));
+}
+
+function getLastModifiedBookmark(): number | undefined {
+  const row = getDb().prepare(`SELECT value FROM meta WHERE key = ?`).get(LASTMODIFIED_BOOKMARK_KEY) as
+    | { value: string }
+    | undefined;
+  if (!row?.value) return undefined;
+  const n = Number(row.value);
+  return Number.isFinite(n) && n > 0 ? n : undefined;
+}
+
+function setLastModifiedBookmark(ms: number): void {
+  getDb()
+    .prepare(
+      `INSERT INTO meta (key, value) VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value`
+    )
+    .run(LASTMODIFIED_BOOKMARK_KEY, String(ms));
+}
+
+// Empty string means "no resume cursor pending" -- same convention as
+// getBacklogCursor. Only meaningful while a lastModified sweep is mid-burst
+// (see LASTMODIFIED_RESUME_CURSOR_KEY above); cleared once that sweep
+// completes.
+function getLastModifiedResumeCursor(): string | undefined {
+  const row = getDb().prepare(`SELECT value FROM meta WHERE key = ?`).get(LASTMODIFIED_RESUME_CURSOR_KEY) as
+    | { value: string }
+    | undefined;
+  return row?.value || undefined;
+}
+
+function setLastModifiedResumeCursor(cursor: string | null): void {
+  getDb()
+    .prepare(
+      `INSERT INTO meta (key, value) VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value`
+    )
+    .run(LASTMODIFIED_RESUME_CURSOR_KEY, cursor ?? "");
+}
+
+function getLastModifiedResumeNewest(): number | undefined {
+  const row = getDb().prepare(`SELECT value FROM meta WHERE key = ?`).get(LASTMODIFIED_RESUME_NEWEST_KEY) as
+    | { value: string }
+    | undefined;
+  if (!row?.value) return undefined;
+  const n = Number(row.value);
+  return Number.isFinite(n) && n > 0 ? n : undefined;
+}
+
+function setLastModifiedResumeNewest(ms: number | null): void {
+  getDb()
+    .prepare(
+      `INSERT INTO meta (key, value) VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value`
+    )
+    .run(LASTMODIFIED_RESUME_NEWEST_KEY, ms == null ? "" : String(ms));
 }
 
 export function isBacklogComplete(): boolean {
@@ -349,12 +463,25 @@ export function verifyRepoInBackground(repoId: string): void {
 // its SHA-256 -- the LFS oid -- from HF's recursive tree response) and
 // upsert into the index. Returns the number of files indexed and rows
 // soft-deleted.
-// Only soft-deletes on a *confirmed* 404 of the repo itself (model-info
-// endpoint says the repo is gone) or an empty tree; a tree/main 404 where
-// the repo still exists but its default branch isn't named "main" (e.g.
-// "master") gets resolved to the real default revision and indexed instead
-// of deleted. Transient errors (timeout, 429, 5xx, unresolved 404) leave
-// existing rows intact and just skip this call so the next refresh can retry.
+// Only soft-deletes on a *confirmed* not-found of the repo itself (model-info
+// endpoint agrees) or an empty tree; a tree/main not-found where the repo
+// still exists but its default branch isn't named "main" (e.g. "master")
+// gets resolved to the real default revision and indexed instead of deleted.
+// Transient errors (timeout, 5xx, unresolved not-found) leave existing rows
+// intact and just skip this call so the next refresh can retry.
+//
+// "Not found" means HTTP 404 OR 401: live-verified against real HF traffic
+// (2026-08-28, unauthenticated) that both the tree and model-info endpoints
+// return 401 "Invalid username or password" -- never 404 -- for a repo id
+// that plain doesn't exist, for both a made-up namespace and a made-up repo
+// under a real namespace. Treating only 404 as "gone" (the original
+// assumption here) meant a deleted repo could never actually be detected
+// without an HF_TOKEN: every check would fall through to the generic
+// "transient failure" branch and leave the row live forever. This can't
+// distinguish "genuinely deleted" from "made private/gated since indexing"
+// (same 401 either way, anonymously) -- accepted, since either way an
+// anonymous worker can no longer fetch the file from that repo, which is the
+// thing hash-lookup actually promises callers.
 export async function scanHfRepo(
   repoId: string,
   timeoutMs: number
@@ -365,17 +492,17 @@ export async function scanHfRepo(
     files = await listHfGgufFiles(repoId, timeoutMs);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    const isNotFound = /404/.test(msg);
+    const isNotFound = /\b(404|401)\b/.test(msg);
     const isRateLimited = /429/.test(msg);
     if (isNotFound) {
-      // tree/main 404: either the repo is gone or its default branch isn't
-      // "main". Resolve the repo's real default revision before deleting
-      // anything -- a GGUF repo on a non-main default branch is valid and
-      // must be indexed, not removed.
+      // tree/main not-found: either the repo is gone (or inaccessible) or its
+      // default branch isn't "main". Resolve the repo's real default
+      // revision before deleting anything -- a GGUF repo on a non-main
+      // default branch is valid and must be indexed, not removed.
       try {
         const { revision: defaultRev, status } = await getHfRepoDefaultRevision(repoId, timeoutMs);
-        if (status === 404) {
-          // Repo genuinely gone -- soft-delete its rows.
+        if (status === 404 || status === 401) {
+          // Repo genuinely gone (or no longer accessible) -- soft-delete its rows.
           const removed = markRepoDeleted(repoId, Date.now());
           return { indexed: 0, removed };
         }
@@ -384,16 +511,16 @@ export async function scanHfRepo(
           files = await listHfGgufFiles(repoId, timeoutMs, defaultRev);
           revision = defaultRev;
         } else {
-          // Repo exists and defaults to main, yet tree/main 404'd -- a
-          // transient oddity; leave rows intact for the next tick.
-          log.warn(`[hf-index] scanHfRepo 404 on tree/main but repo ${repoId} exists - leaving rows`);
+          // Repo exists and defaults to main, yet tree/main was not-found --
+          // a transient oddity; leave rows intact for the next tick.
+          log.warn(`[hf-index] scanHfRepo not-found on tree/main but repo ${repoId} exists - leaving rows`);
           return { indexed: 0, removed: 0 };
         }
       } catch (err2) {
         // The default-revision probe itself failed (transient/network) -- we
         // can't confirm the repo is gone, so leave rows intact.
         const msg2 = err2 instanceof Error ? err2.message : String(err2);
-        log.warn(`[hf-index] scanHfRepo 404 + default-revision probe failed for ${repoId}: ${msg2} - leaving rows`);
+        log.warn(`[hf-index] scanHfRepo not-found + default-revision probe failed for ${repoId}: ${msg2} - leaving rows`);
         return { indexed: 0, removed: 0 };
       }
     } else if (isRateLimited) {
@@ -593,12 +720,129 @@ export async function scanRecentRepos(
   return { repoIds: found, newestSeenMs, complete };
 }
 
+// Incremental "what changed" sweep: sort by lastModified descending, keep a
+// bookmark of the newest lastModified already covered, and stop paging as
+// soon as we hit a repo older than that bookmark. Structurally close to
+// scanRecentRepos above, but on the mutable lastModified field instead of
+// the immutable createdAt one -- this is what catches content changes
+// (new/updated GGUF files, or a file removed) on repos already in the
+// index, cheaply, instead of relying on the 24h-timer staleness refresh to
+// eventually stumble onto them.
+//
+// In the steady-state case (bookmark from last tick is recent), this
+// reaches the bookmark within the first page and `startCursor` is unused --
+// there's no need to resume anything when the whole gap fits in one call.
+// The resume cursor exists for the *burst* case: more repos changed since
+// the bookmark than `limit` allows in one tick. Without it, every tick
+// would restart at position #1 of the lastModified-desc listing and, since
+// that ranking is roughly stable minus new arrivals, keep re-covering
+// roughly the same top slice instead of making progress toward the older
+// (but still-unindexed) end of the burst -- the bookmark would never
+// advance until the burst rate dropped below `limit`/tick. Passing the
+// cursor this call stopped at back in as `startCursor` next time fixes
+// that: each tick reaches further into the burst instead of restarting.
+//
+// Resuming a cursor across this short a gap (one tick, ~60s, only while
+// actively mid-burst) is safe in a way the multi-day backlog cursor in
+// scanNewRepos is not: the only failure mode is a repo that gets touched
+// again in that ~60s window and jumps back ahead of the stored cursor
+// position -- not a real loss, since it'll simply be re-covered whenever a
+// sweep finally completes and the bookmark advances past it. A multi-day
+// resume under the same mutable sort key would see far more reshuffling
+// and could plausibly skip things for good, which is why that walk uses
+// immutable createdAt instead.
+//
+// `complete` is true only when the sweep actually reached the bookmark (or
+// exhausted the listing) -- same contract as scanRecentRepos: the caller
+// must NOT advance the bookmark on an incomplete sweep (error or
+// limit-filled page), since that would skip every repo between the last
+// page examined and the true old bookmark. `resumeCursor` is null exactly
+// when complete is true (nothing left to resume); otherwise it's where this
+// call stopped, for the caller to pass back in as `startCursor` next tick.
+//
+// Note: with `bookmarkMs` undefined (no bookmark set yet -- a fresh
+// database), `complete` will practically never become true on its own,
+// since there's no bookmark to hit and this walk would otherwise have to
+// reach the literal end of the entire catalog first. That's fine -- it's
+// the caller's job (runIndexTick) to special-case "no bookmark yet" as a
+// one-time seed from whatever this first call sees, rather than waiting for
+// `complete`. This function itself has no opinion on that; it just reports
+// what it found.
+export async function scanLastModifiedRepos(
+  limit: number,
+  bookmarkMs?: number,
+  startCursor?: string
+): Promise<{ repoIds: string[]; newestSeenMs: number | null; complete: boolean; resumeCursor: string | null }> {
+  const { searchHfGgufModels } = await import("./hf.js");
+  const found: string[] = [];
+  let cursor: string | null = startCursor ?? null;
+  let newestSeenMs: number | null = null;
+  let scanned = 0;
+  let complete = false;
+
+  while (scanned < limit) {
+    let page;
+    try {
+      page = await searchHfGgufModels("", HF_INDEX_TIMEOUT_MS, {
+        sort: "lastModified",
+        direction: -1,
+        limit: Math.min(50, limit - scanned),
+        cursor: cursor ?? undefined,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      log.warn(`[hf-index] scanLastModifiedRepos sweep error: ${msg}`);
+      break;
+    }
+
+    if (page.items.length === 0) {
+      // Empty page: nothing more to scan. Stop regardless of nextCursor to
+      // avoid an infinite loop if HF ever returns a non-null cursor with an
+      // empty page. complete only if the listing truly ended.
+      complete = page.nextCursor == null;
+      break;
+    }
+
+    let hitBookmark = false;
+    for (const item of page.items) {
+      const ts = item.last_modified ? Date.parse(item.last_modified) : 0;
+      if (Number.isFinite(ts) && ts > 0) {
+        if (newestSeenMs == null || ts > newestSeenMs) newestSeenMs = ts;
+      }
+      // Stop when we reach a repo older than bookmark; keep == as overlap
+      // so a same-ms update isn't missed (idempotent re-scan is fine).
+      if (bookmarkMs != null && ts !== 0 && ts < bookmarkMs) {
+        hitBookmark = true;
+        break;
+      }
+      found.push(item.id);
+      scanned++;
+      if (scanned >= limit) break;
+    }
+
+    if (hitBookmark) {
+      complete = true;
+      break;
+    }
+    cursor = page.nextCursor;
+    if (!cursor) {
+      complete = true;
+      break;
+    }
+    // bookmarkMs set and page had no overlap yet → continue paging
+    // If bookmarkMs undefined (first run) we just fill up to limit.
+  }
+
+  return { repoIds: found, newestSeenMs, complete, resumeCursor: complete ? null : cursor };
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
 // Background service state.
-let refreshTimer: ReturnType<typeof setInterval> | null = null;
+let refreshTimer: ReturnType<typeof setTimeout> | null = null;
+let serviceStarted = false;
 let isRunning = false;
 let lastTickAt: number | null = null;
 let totalIndexed = 0;
@@ -611,10 +855,18 @@ export function getHfIndexStatus(): {
   hfTokenConfigured: boolean;
   backlogBatchSize: number;
   recentBatchSize: number;
+  lastModifiedBatchSize: number;
   maxReposPerTick: number;
   rateLimits: ReturnType<typeof getRateLimitStatus>;
   backlogComplete: boolean;
   recentBookmark: number | null;
+  lastModifiedBookmark: number | null;
+  // True while the lastModified sweep is mid-burst (more repos changed since
+  // the bookmark than one tick's batch could cover) and resuming forward
+  // across ticks instead of having caught up. Healthy operation is this
+  // being false almost always; frequently true means lastModifiedBatchSize
+  // is undersized for real HF activity.
+  lastModifiedSweepCatchingUp: boolean;
 } {
   return {
     isRunning,
@@ -624,15 +876,18 @@ export function getHfIndexStatus(): {
     hfTokenConfigured: isHfTokenConfigured(),
     backlogBatchSize: getBacklogBatchSize(),
     recentBatchSize: getRecentBatchSize(),
+    lastModifiedBatchSize: getLastModifiedBatchSize(),
     maxReposPerTick: getMaxReposPerTick(),
     rateLimits: getRateLimitStatus(),
     backlogComplete: isBacklogComplete(),
     recentBookmark: getRecentBookmark() ?? null,
+    lastModifiedBookmark: getLastModifiedBookmark() ?? null,
+    lastModifiedSweepCatchingUp: getLastModifiedResumeCursor() != null,
   };
 }
 
 // Run one index tick: a one-time backlog walk (until it wraps once) plus a
-// perpetual recent top-up, both createdAt-sorted, plus staleness refresh.
+// perpetual recent top-up and last-modified sweep, plus staleness refresh.
 // See the module doc comment for the full shape and why deletion isn't
 // handled by a background crawl here.
 export async function runIndexTick(): Promise<{ indexed: number; repos: number }> {
@@ -642,12 +897,13 @@ export async function runIndexTick(): Promise<{ indexed: number; repos: number }
   const now = Date.now();
   const backlogBatch = getBacklogBatchSize();
   const recentBatch = getRecentBatchSize();
+  const lastModifiedBatch = getLastModifiedBatchSize();
   const maxStale = getMaxReposPerTick();
 
   if (process.env.LOG_LEVEL === "debug") {
     const rl = getRateLimitStatus();
     log.debug(
-      `[hf-index] tick start: token=${isHfTokenConfigured() ? "yes" : "no"} backlogBatch=${backlogBatch} recentBatch=${recentBatch} staleCap=${maxStale} backlogComplete=${isBacklogComplete()} bookmark=${getRecentBookmark() ?? "none"} window api ${rl.api.usedInWindow}/${rl.api.limit} resolvers ${rl.resolvers.usedInWindow}/${rl.resolvers.limit}`
+      `[hf-index] tick start: token=${isHfTokenConfigured() ? "yes" : "no"} backlogBatch=${backlogBatch} recentBatch=${recentBatch} lastModifiedBatch=${lastModifiedBatch} staleCap=${maxStale} backlogComplete=${isBacklogComplete()} recentBookmark=${getRecentBookmark() ?? "none"} lastModifiedBookmark=${getLastModifiedBookmark() ?? "none"} lastModifiedResume=${getLastModifiedResumeCursor() != null ? "mid-burst" : "none"} window api ${rl.api.usedInWindow}/${rl.api.limit} resolvers ${rl.resolvers.usedInWindow}/${rl.resolvers.limit}`
     );
   }
 
@@ -690,6 +946,83 @@ export async function runIndexTick(): Promise<{ indexed: number; repos: number }
       log.info(`[hf-index] recent sweep: ${recentIds.length} repos (bookmark ${bookmarkMs ? new Date(bookmarkMs).toISOString() : "none"} → ${newestSeenMs ? new Date(newestSeenMs).toISOString() : "none"})`);
     }
 
+    // Runs every tick, independent of backlog progress -- catches content
+    // changes (new/updated/removed GGUF files) on repos already in the
+    // index far more cheaply than the staleness refresh below, since it
+    // only pages through what HF itself reports as recently touched instead
+    // of blind-refetching every repo's file tree on a timer.
+    const lastModifiedBookmarkMs = getLastModifiedBookmark();
+    // Only set while a prior tick's sweep hit its batch cap before reaching
+    // the bookmark (a burst) -- lets this tick continue forward from where
+    // that one stopped instead of restarting at the top and re-covering the
+    // same slice. See scanLastModifiedRepos's doc comment.
+    const resumeCursor = getLastModifiedResumeCursor();
+    const resumeNewestMs = getLastModifiedResumeNewest();
+    const {
+      repoIds: changedIds,
+      newestSeenMs: newestModifiedMsThisCall,
+      complete: lastModifiedComplete,
+      resumeCursor: nextResumeCursor,
+    } = await scanLastModifiedRepos(lastModifiedBatch, lastModifiedBookmarkMs, resumeCursor);
+    for (const repoId of changedIds) toScan.add(repoId);
+    // Combine with whatever a prior incomplete call already saw, so a
+    // completing tick advances the bookmark to the true newest seen across
+    // the whole multi-tick burst, not just this last leg of it.
+    const newestModifiedMs =
+      resumeNewestMs != null
+        ? newestModifiedMsThisCall != null
+          ? Math.max(resumeNewestMs, newestModifiedMsThisCall)
+          : resumeNewestMs
+        : newestModifiedMsThisCall;
+    let lastModifiedOutcome: "seeded" | "complete" | "resuming";
+    if (lastModifiedBookmarkMs == null) {
+      // First run ever, no bookmark yet: don't try to walk backward through
+      // the whole catalog to "complete" a sweep that has nothing real to
+      // catch up on -- the createdAt backlog walk above is already
+      // responsible for visiting every existing repo at least once. Just
+      // take whatever this one call saw as the starting line and watch for
+      // changes from here on -- the same shortcut scanRecentRepos gets for
+      // free via its bookmark being seeded off the backlog walk's first
+      // page. Without this, a fresh database would make this sweep crawl
+      // the entire lastModified-sorted catalog once (its own full pass,
+      // redundant with the backlog walk already doing that in a different
+      // order) before it could ever settle into its normal cheap mode.
+      lastModifiedOutcome = "seeded";
+      setLastModifiedResumeCursor(null);
+      setLastModifiedResumeNewest(null);
+      if (newestModifiedMs != null) {
+        setLastModifiedBookmark(newestModifiedMs);
+      }
+    } else if (lastModifiedComplete) {
+      // Caught up -- clear burst-resume state and advance the bookmark.
+      // Same "only advance on a completed sweep" rule as the recent
+      // bookmark above -- an error- or limit-truncated sweep must not jump
+      // the bookmark past repos it never actually returned.
+      lastModifiedOutcome = "complete";
+      setLastModifiedResumeCursor(null);
+      setLastModifiedResumeNewest(null);
+      if (newestModifiedMs != null && newestModifiedMs > lastModifiedBookmarkMs) {
+        setLastModifiedBookmark(newestModifiedMs);
+      }
+    } else {
+      // Still mid-burst: persist where this call stopped so the next tick
+      // resumes forward instead of restarting at the top.
+      lastModifiedOutcome = "resuming";
+      setLastModifiedResumeCursor(nextResumeCursor);
+      if (newestModifiedMs != null) setLastModifiedResumeNewest(newestModifiedMs);
+    }
+    if (changedIds.length > 0 || lastModifiedOutcome === "seeded") {
+      const suffix =
+        lastModifiedOutcome === "seeded"
+          ? " (first run -- bookmark seeded, not walking full history)"
+          : lastModifiedOutcome === "resuming"
+            ? " (mid-burst, resuming next tick)"
+            : "";
+      log.info(
+        `[hf-index] lastModified sweep: ${changedIds.length} repos changed${suffix} (bookmark ${lastModifiedBookmarkMs ? new Date(lastModifiedBookmarkMs).toISOString() : "none"} → ${newestModifiedMs ? new Date(newestModifiedMs).toISOString() : "none"})`
+      );
+    }
+
     const staleRepos = findStaleRepos(now - HF_INDEX_REFRESH_INTERVAL_MS, maxStale);
     for (const repoId of staleRepos) toScan.add(repoId);
 
@@ -697,10 +1030,11 @@ export async function runIndexTick(): Promise<{ indexed: number; repos: number }
     // every hfFetch() call inside scanHfRepo) already throttles precisely
     // against HF's real published quota via the RateLimit/RateLimit-Policy
     // headers. A flat sleep on top of that just wastes wall-clock time --
-    // with hundreds of repos queued per tick it could push a tick past its
-    // 5-minute interval, causing the next scheduled tick to be skipped
-    // entirely (see runIndexTick's isRunning guard), which silently halves
-    // real throughput.
+    // with hundreds of repos queued per tick it could push a tick well past
+    // HF_INDEX_TICK_INTERVAL_MS. That used to mean the next scheduled tick
+    // was silently skipped entirely (see startHfIndexService, which now
+    // self-reschedules from actual completion time instead of a fixed
+    // setInterval clock specifically to avoid that).
     for (const repoId of toScan) {
       const result = await scanHfRepo(repoId, HF_INDEX_TIMEOUT_MS);
       indexedTotal += result.indexed;
@@ -715,10 +1049,14 @@ export async function runIndexTick(): Promise<{ indexed: number; repos: number }
 }
 
 // Start the background refresh service. Runs a tick immediately
-// (non-blocking), then schedules further ticks every
-// HF_INDEX_TICK_INTERVAL_MS.
+// (non-blocking), then self-reschedules the next tick HF_INDEX_TICK_INTERVAL_MS
+// after each one *completes* (not on a fixed setInterval clock -- see below).
 export function startHfIndexService(): void {
-  if (refreshTimer) return; // already started
+  if (serviceStarted) return; // already started -- guards against a second
+  // concurrent scheduling chain; set synchronously so a second call made
+  // before the first tick even finishes is still caught (unlike checking
+  // refreshTimer, which isn't assigned until a tick completes below).
+  serviceStarted = true;
 
   // Logged at info level (not gated behind LOG_LEVEL=debug) so a restart
   // makes it immediately visible whether HF_TOKEN (or its accepted aliases,
@@ -732,7 +1070,27 @@ export function startHfIndexService(): void {
     log.info(`[hf-index] HF_TOKEN not loaded -- using anonymous quotas (backlog batch ${getBacklogBatchSize()}, stale cap ${getMaxReposPerTick()})`);
   }
 
+  // Previously a plain setInterval(runTick, HF_INDEX_TICK_INTERVAL_MS): once
+  // a tick queued more repos than fit in one interval's worth of real HF
+  // rate-limit budget (routine during the initial backlog-crawl period, now
+  // more so with the lastModified sweep also queuing work every tick) and
+  // ran long, the *next* scheduled setInterval firing hit runIndexTick's
+  // isRunning guard and was silently thrown away -- a wasted invocation that
+  // did nothing, working against this module's own stated goal of keeping
+  // the rate-limit window continuously fed (see HF_INDEX_TICK_INTERVAL_MS's
+  // comment). Self-rescheduling from each tick's actual completion time
+  // instead means a long tick is simply followed immediately by the next
+  // one -- still bounded by the real rate limiter, but no scheduled slot is
+  // ever thrown away. A tick that finishes early still waits out the rest
+  // of the interval, so steady-state cadence is unchanged.
+  const scheduleNext = (delayMs: number) => {
+    if (!serviceStarted) return; // stopHfIndexService() ran while we were mid-tick
+    refreshTimer = setTimeout(runTick, delayMs);
+    refreshTimer.unref();
+  };
+
   const runTick = () => {
+    const startedAt = Date.now();
     runIndexTick()
       .then((result) => {
         if (result.repos > 0) {
@@ -741,18 +1099,20 @@ export function startHfIndexService(): void {
       })
       .catch((err) => {
         log.error("[hf-index] tick failed:", err);
+      })
+      .finally(() => {
+        scheduleNext(Math.max(0, HF_INDEX_TICK_INTERVAL_MS - (Date.now() - startedAt)));
       });
   };
 
-  runTick(); // fire immediately, don't block startup
-  refreshTimer = setInterval(runTick, HF_INDEX_TICK_INTERVAL_MS);
-  refreshTimer.unref();
+  runTick(); // fire immediately, don't block startup; self-reschedules from here
 }
 
 // Stop the background refresh service (called on app shutdown).
 export function stopHfIndexService(): void {
+  serviceStarted = false;
   if (refreshTimer) {
-    clearInterval(refreshTimer);
+    clearTimeout(refreshTimer);
     refreshTimer = null;
   }
 }
