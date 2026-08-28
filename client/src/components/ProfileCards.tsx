@@ -253,7 +253,7 @@ export function ProfileCards({ runId, refreshKey, modelId, workerId }: ProfileCa
             </b>
             {goals.target_ctx != null && ` · target ${goals.target_ctx.toLocaleString()}`}
             {data.target_ctx_clamped && " (clamped)"} · {goals.workload}{" "}
-            <span className="ml-1 rounded-full bg-raised px-2 py-0.5 font-mono text-[11px] text-muted">
+            <span className="ml-1 rounded-full bg-surface-raised px-2 py-0.5 font-mono text-[11px] text-muted">
               wPP {weights.wPP.toFixed(2)} · wTG {weights.wTG.toFixed(2)}
             </span>
           </span>
@@ -284,7 +284,7 @@ export function ProfileCards({ runId, refreshKey, modelId, workerId }: ProfileCa
                 className={
                   goals.goal === goal
                     ? "rounded-full border border-accent bg-accent/10 px-2.5 py-0.5 text-[12px] font-semibold text-accent"
-                    : "rounded-full border border-border bg-raised px-2.5 py-0.5 text-[12px] text-muted"
+                    : "rounded-full border border-border bg-surface-raised px-2.5 py-0.5 text-[12px] text-muted"
                 }
               >
                 {goal === "max_context" ? "Max context" : goal === "max_speed" ? "Max tok/s" : "Balanced"}
@@ -332,7 +332,7 @@ export function ProfileCards({ runId, refreshKey, modelId, workerId }: ProfileCa
 
       {/* Rejection accounting. Zero-profile outcomes render the tallies,
           never silence -- a silent zero is indistinguishable from a bug. */}
-      <p className="rounded-lg border border-border bg-raised px-3.5 py-2.5 text-xs leading-relaxed text-muted">
+      <p className="rounded-lg border border-border bg-surface-raised px-3.5 py-2.5 text-xs leading-relaxed text-muted">
         <b className="text-fg">Scoring rejected nothing silently:</b> {scoring.candidateCount} configuration
         {scoring.candidateCount === 1 ? "" : "s"} considered, {scoring.scoredCount} scored
         {scoring.tallies.stability > 0 && ` · ${scoring.tallies.stability} failed the stability gate`}
@@ -371,8 +371,8 @@ function Card({
     <div
       className={
         card.unverified
-          ? "flex flex-col gap-2 rounded-xl border border-warning/50 bg-raised p-3.5"
-          : "flex flex-col gap-2 rounded-xl border border-border bg-raised p-3.5"
+          ? "flex flex-col gap-2 rounded-xl border border-warning/50 bg-surface-raised p-3.5"
+          : "flex flex-col gap-2 rounded-xl border border-border bg-surface-raised p-3.5"
       }
     >
       <div className="flex items-center justify-between gap-2">
