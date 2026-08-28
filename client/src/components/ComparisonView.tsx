@@ -138,7 +138,7 @@ export function ComparisonView({ comparisonId }: { comparisonId: string }) {
                 }}
                 className={
                   point.dominated
-                    ? "absolute -translate-x-1/2 rounded-full border border-border bg-raised px-2 py-0.5 text-[10px] text-muted opacity-60"
+                    ? "absolute -translate-x-1/2 rounded-full border border-border bg-surface-raised px-2 py-0.5 text-[10px] text-muted opacity-60"
                     : "absolute -translate-x-1/2 rounded-full border border-accent bg-accent/10 px-2 py-0.5 text-[10px] font-semibold text-accent"
                 }
               >
