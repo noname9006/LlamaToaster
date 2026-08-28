@@ -1,6 +1,8 @@
-// BENCHMARKING_PLAN_V8.md's benchmark console -- the page
-// docs/benchmark-page-mockup-v8.html renders as screen 1 ("Test A -- the goal
-// is captured before the grid is built") and screen 4's "Start Test B".
+// BENCHMARKING_PLAN_V8.md's benchmark console -- the page laid out in
+// docs/Benchmark - Proposed Layout (standalone).html: a numbered 1-2-3
+// wizard (pairing -> goal -> chain) beside a sticky "Your run" summary,
+// replacing the stacked-sections layout screen 1 of
+// docs/benchmark-page-mockup-v8.html originally sketched.
 //
 // The difference from NewRun.tsx (which stays, unchanged, at /new-run) is
 // WHO builds the grid. There, the user builds one flat cross-product by
@@ -25,12 +27,14 @@
 //    goal" as a fourth, dashed tile after the third stage rather than beside
 //    it.
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Link } from "react-router-dom";
 import { api } from "../api/client";
 import { useWorkerStatuses } from "../api/useWorkerStatus";
 import { ModelPicker } from "../components/ModelPicker";
 import { GoalQuestionnaire } from "../components/GoalQuestionnaire";
+import { RunStatusPill } from "../components/StatusPill";
+import { IconArrowRight, IconChevronDown, IconInfo } from "../components/icons";
 import { backendVisibleGpus } from "../types";
 import type { Model, Run, ResultRow, RunKind, SweepConfig } from "../types";
 import { formatBytes, formatGpuLabel } from "../utils";
@@ -295,6 +299,15 @@ function expandedKvPairs(sweep: Sweep): string[] {
   return [...pairs];
 }
 
+// Compact facts-strip status word: offline reads as an error, busy as
+// "something is happening right now", idle as the normal ready state --
+// same three-way split WorkerCard.tsx's own status handling already uses.
+function workerStatusTone(status: string): string {
+  if (status === "offline") return "text-danger";
+  if (status === "busy") return "text-accent";
+  return "text-success";
+}
+
 export function Benchmark() {
   const [models, setModels] = useState<Model[]>([]);
   const [locations, setLocations] = useState<Record<string, string[]> | null>(null);
@@ -311,6 +324,12 @@ export function Benchmark() {
     () => readJson<Record<string, BenchPreset>>(PRESETS_STORAGE_KEY) ?? {}
   );
   const [presetsOpen, setPresetsOpen] = useState(false);
+
+  // Step 1's compact facts strip hides everything else behind these two
+  // disclosures by default -- the same "collapsed, one click away" posture
+  // as GoalQuestionnaire's own KV-tolerance section.
+  const [detailsOpen, setDetailsOpen] = useState(false);
+  const [scoringDetailsOpen, setScoringDetailsOpen] = useState(false);
 
   const [chain, setChain] = useState<ChainState>({});
   const [stageData, setStageData] = useState<Record<string, { run: Run; results: ResultRow[] }>>({});
@@ -725,9 +744,8 @@ export function Benchmark() {
       <div>
         <h1 className="text-2xl font-semibold text-fg">Benchmark</h1>
         <p className="mt-2 max-w-3xl text-sm text-muted">
-          State the goal; the console derives the chain. Three stages run in order — two tune prompt
-          processing, the third is the one that produces scored cards — and each is a real run linked to
-          the last, so all three score as one universe. Building a grid by hand instead lives on{" "}
+          State the goal; the console derives the chain — two tuning passes, then the sweep that produces scored
+          cards, each a real run linked to the last. Building a grid by hand instead lives on{" "}
           <Link to="/new-run" className="text-accent hover:underline">
             New Run
           </Link>
@@ -735,477 +753,643 @@ export function Benchmark() {
         </p>
       </div>
 
-      {/* Pairing ------------------------------------------------------------ */}
-      <div className="flex flex-wrap items-end gap-4">
-        <label className="flex flex-col gap-1.5 text-sm">
-          <span className="text-muted">Machine</span>
-          <select value={workerId} onChange={(e) => setWorkerId(e.target.value)} className={`${inputCls} w-56`}>
-            <option value="" disabled>
-              select…
-            </option>
-            {workerOrder.map((id) => (
-              <option key={id} value={id}>
-                {workerStatus[id]?.displayName ?? id}
-              </option>
-            ))}
-          </select>
-        </label>
-        {visibleGpus.length > 1 && (
-          <label className="flex flex-col gap-1.5 text-sm">
-            <span className="text-muted">GPU</span>
-            <select
-              value={selectedGpuRawIndex ?? ""}
-              onChange={(e) => setSelectedGpuRawIndex(e.target.value === "" ? undefined : Number(e.target.value))}
-              className={`${inputCls} w-64`}
-            >
-              <option value="">Auto (split across all GPUs)</option>
-              {visibleGpus.map((g, i) => (
-                <option key={i} value={i}>
-                  {i}: {formatGpuLabel(g)}
-                </option>
-              ))}
-            </select>
-          </label>
-        )}
-        <ModelPicker
-          models={presentModels}
-          value={modelId}
-          mtpValue=""
-          onSelect={(id) => setModelId(id)}
-          hfUpdates={{}}
-          className="w-[26rem]"
-        />
-      </div>
-
-      {/* Model + Machine ---------------------------------------------------- */}
-      <div className="grid gap-4 md:grid-cols-2">
-        <div className="rounded-xl border border-border bg-surface p-5">
-          <span className="text-xs font-semibold uppercase tracking-wide text-muted">Model</span>
-          {selectedModel ? (
-            <>
-              <div className="mt-1.5 break-all font-mono text-[12.5px] text-fg">{selectedModel.filename}</div>
-              <dl className="mt-3 flex flex-col gap-1.5 text-[12.5px]">
-                <Kv label="Size on disk" value={formatBytes(selectedModel.size_bytes)} />
-                <Kv label="Layers" value={modelLayerCount != null ? `${modelLayerCount}` : "not read from this file's header"} read={modelLayerCount != null} />
-                {/* Trained context sits right under size/layers because it's
-                    the model's own hard ceiling -- every context sizing path
-                    (M2's target clamp, N1's ladder) clamps to it, so it can
-                    never be raised by config no matter how much VRAM exists. */}
-                <Kv
-                  label="Context (trained)"
-                  value={trainedCtx != null ? trainedCtx.toLocaleString() : "not read"}
-                  read={trainedCtx != null}
-                />
-                <Kv
-                  label="KV heads · head dim"
-                  value={
-                    selectedModel.metadata.n_head_kv != null
-                      ? `${selectedModel.metadata.n_head_kv} · ${selectedModel.metadata.head_dim_k ?? "—"}`
-                      : "not read"
-                  }
-                  read={selectedModel.metadata.n_head_kv != null}
-                />
-                <Kv
-                  label="Sliding window"
-                  value={
-                    selectedModel.metadata.sliding_window != null && selectedModel.metadata.sliding_window > 0
-                      ? selectedModel.metadata.sliding_window.toLocaleString()
-                      : "none — plain GQA"
-                  }
-                  read={selectedModel.metadata.sliding_window != null}
-                />
-              </dl>
-            </>
-          ) : (
-            <p className="mt-2 text-sm text-muted">Pick a model to see what its header actually reported.</p>
-          )}
-        </div>
-
-        <div className="rounded-xl border border-border bg-surface p-5">
-          <span className="text-xs font-semibold uppercase tracking-wide text-muted">Machine</span>
-          {selectedWorker ? (
-            <>
-              <div className="mt-1.5 font-mono text-[12.5px] text-fg">{selectedWorker.displayName}</div>
-              <dl className="mt-3 flex flex-col gap-1.5 text-[12.5px]">
-                <Kv
-                  label="GPU"
-                  value={gpuList.length > 0 ? gpuList.map((g) => formatGpuLabel(g)).join(" · ") : "none detected"}
-                />
-                <Kv
-                  label="Backend · build"
-                  value={`${selectedWorker.backend ?? "unknown"} · ${activeBuild ?? "no build activated"}`}
-                />
-                <Kv
-                  label="Sensors"
-                  value={
-                    sensors
-                      ? [sensors.clock ? "clock" : null, sensors.temp ? "temp" : null].filter(Boolean).join(" · ") ||
-                        "neither available on this platform"
-                      : "not reported by this worker"
-                  }
-                  // M6/N6 -- declared UP FRONT so a missing thermally_throttled
-                  // flag later reads as "this machine can't produce one",
-                  // never as "nothing throttled".
-                  hint="Whether this machine can report clock and temperature at all — a run that can't sample them never raises a thermal flag."
-                />
-                <Kv label="Status" value={selectedWorker.status} />
-              </dl>
-            </>
-          ) : (
-            <p className="mt-2 text-sm text-muted">Pick a machine to see its backend, sensors and current state.</p>
-          )}
-        </div>
-      </div>
-
-      {/* M2 -- captured BEFORE the grid is built ---------------------------- */}
-      <GoalQuestionnaire
-        goals={goals}
-        onChange={(next) => {
-          setGoals(next);
-          setGoalsUnset(false);
-        }}
-        trainedCtx={trainedCtx}
-        unset={goalsUnset}
-        affordability={{
-          totalMib: liveVramTotalMib,
-          weightsMib: affordability?.weightsMib ?? null,
-          nLayer: modelLayerCount ?? undefined,
-          nHeadKv: selectedModel?.metadata.n_head_kv,
-          headDimK: selectedModel?.metadata.head_dim_k,
-          headDimV: selectedModel?.metadata.head_dim_v,
-          nEmbd: selectedModel?.metadata.n_embd,
-          nHead: selectedModel?.metadata.n_head,
-          slidingWindow: selectedModel?.metadata.sliding_window,
-        }}
-      />
-
-      {/* M1 -- the inverse estimate ----------------------------------------- */}
-      <div className="rounded-xl border border-border bg-raised p-4">
-        <span className="text-xs font-semibold uppercase tracking-wide text-muted">
-          Affordability — the inverse estimate
-        </span>
-        {affordability && affordability.f16.confidence !== "unknown" && affordability.f16.tokens > 0 ? (
-          <>
-            <div className="mt-2 flex flex-wrap items-baseline gap-x-5 gap-y-1.5 text-[12.5px]">
-              <span className="text-fg">
-                Given this card, this placement, this KV type — <b>the largest context that still fits</b>:
-              </span>
-              <span className="font-mono text-fg">
-                f16/f16 ≈ <b>{affordability.f16.tokens.toLocaleString()} tok</b>
-              </span>
-              <span className="font-mono text-fg">
-                q8_0/q8_0 ≈ <b>{affordability.q8.tokens.toLocaleString()} tok</b>
-              </span>
-              <span className="rounded-full border border-accent/40 bg-accent/10 px-2 py-0.5 text-[11px] text-accent">
-                confidence: {affordability.f16.confidence}
-              </span>
+      <div className="flex flex-wrap items-start gap-8">
+        {/* Left column -- the numbered wizard ------------------------------- */}
+        <div className="mx-auto flex min-w-0 flex-1 flex-col" style={{ maxWidth: 820 }}>
+          {/* Step 1 -- pairing --------------------------------------------- */}
+          <Step n={1} title="Pick your pairing" desc="Machine and model — everything below derives from this pair.">
+            {/* Pickers: the same 2-col grid the detail cards below use, so
+                Machine and Model line up pixel-perfectly with the cards
+                each one derives -- Machine left, Model right. */}
+            <div className="grid grid-cols-2 items-start gap-x-4 gap-y-3.5">
+              <div className="flex flex-col gap-3">
+                <label className="flex flex-col gap-1.5 text-sm">
+                  <span className="text-muted">Machine</span>
+                  <select
+                    value={workerId}
+                    onChange={(e) => setWorkerId(e.target.value)}
+                    className={`${inputCls} min-h-[52px] w-full`}
+                  >
+                    <option value="" disabled>
+                      select…
+                    </option>
+                    {workerOrder.map((id) => (
+                      <option key={id} value={id}>
+                        {workerStatus[id]?.displayName ?? id}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                {visibleGpus.length > 1 && (
+                  <label className="flex flex-col gap-1.5 text-sm">
+                    <span className="text-muted">GPU</span>
+                    <select
+                      value={selectedGpuRawIndex ?? ""}
+                      onChange={(e) => setSelectedGpuRawIndex(e.target.value === "" ? undefined : Number(e.target.value))}
+                      className={`${inputCls} w-full`}
+                    >
+                      <option value="">Auto (split across all GPUs)</option>
+                      {visibleGpus.map((g, i) => (
+                        <option key={i} value={i}>
+                          {i}: {formatGpuLabel(g)}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                )}
+              </div>
+              <ModelPicker
+                models={presentModels}
+                value={modelId}
+                mtpValue=""
+                onSelect={(id) => setModelId(id)}
+                hfUpdates={{}}
+                buttonClassName="min-h-[52px]"
+              />
             </div>
-            <p className="mt-2 text-[11.5px] leading-relaxed text-muted">
-              From this placement's resident weights
-              {affordability.weightsMib != null ? ` (~${affordability.weightsMib.toLocaleString()} MiB)` : ""}, a 10 %
-              activation headroom and scratch. Binding constraint:{" "}
-              <span className="font-mono">{affordability.f16.binding ?? "—"}</span>. Advisory only — it ranks and
-              annotates, it never removes a configuration from the sweep.
-            </p>
-          </>
-        ) : affordability && affordability.f16.confidence !== "unknown" ? (
-          <p className="mt-2 text-[12px] leading-relaxed text-muted">
-            <b className="text-fg">This placement leaves no room for a KV cache at all.</b> The weights alone
-            {affordability.weightsMib != null ? ` (~${affordability.weightsMib.toLocaleString()} MiB)` : ""} fill the
-            card once a 10 % activation headroom and scratch are reserved, so the affordable context at every KV type
-            is zero — binding constraint <span className="font-mono">weights-placement</span>, not KV. The lever is
-            offload, not cache quality: the sweep stage already carries a lower{" "}
-            <span className="font-mono">-ngl</span> point, and <span className="font-mono">--n-cpu-moe</span> on New Run moves expert weights off the card
-            entirely. Advisory, as always — nothing is removed from the grid over it.
-          </p>
-        ) : (
-          <p className="mt-2 text-[12px] leading-relaxed text-muted">
-            Unavailable for this pairing — the estimate needs this model's KV geometry from its header and a live
-            VRAM total from the machine. It never fabricates a number in their absence.
-            {affordability?.f16.conservativeFloorTokens != null && (
-              <>
-                {" "}
-                A conservative floor does exist: this model's full trained context of{" "}
-                <b className="text-fg">{affordability.f16.conservativeFloorTokens.toLocaleString()}</b> tokens, offered
-                as a floor, not as an estimate.
-              </>
+
+            {selectedModel && selectedWorker ? (
+              <div className="flex flex-wrap items-center gap-x-2 gap-y-1.5 rounded-lg border border-border bg-surface-raised px-3.5 py-2.5 text-[11.5px] text-muted">
+                <span className="font-mono text-fg">{formatBytes(selectedModel.size_bytes)}</span>
+                <span aria-hidden="true">·</span>
+                <span>{modelLayerCount != null ? `${modelLayerCount} layers` : "layers not read"}</span>
+                <span aria-hidden="true">·</span>
+                <span>{trainedCtx != null ? `${trainedCtx.toLocaleString()} ctx` : "ctx not read"}</span>
+                <span className="mx-1 hidden h-4 w-px self-stretch bg-border sm:block" aria-hidden="true" />
+                <span>{gpuList.length > 0 ? gpuList.map((g) => formatGpuLabel(g)).join(" · ") : "no GPU detected"}</span>
+                <span aria-hidden="true">·</span>
+                <span>{selectedWorker.backend ?? "unknown"}</span>
+                <span aria-hidden="true">·</span>
+                <span className={workerStatusTone(selectedWorker.status)}>{selectedWorker.status}</span>
+                <button
+                  type="button"
+                  onClick={() => setDetailsOpen((open) => !open)}
+                  aria-expanded={detailsOpen}
+                  className="ml-auto flex items-center gap-1 whitespace-nowrap text-[11.5px] font-semibold text-accent"
+                >
+                  {detailsOpen ? "Hide details" : "Show details"}
+                  <IconChevronDown width={13} height={13} className={`transition-transform ${detailsOpen ? "rotate-180" : ""}`} />
+                </button>
+              </div>
+            ) : (
+              <p className="text-sm text-muted">Pick a machine and a model to see what their headers actually reported.</p>
             )}
-          </p>
-        )}
-      </div>
 
-      {/* The chain ----------------------------------------------------------- */}
-      <div className="rounded-xl border border-border bg-surface p-5">
-        <div className="flex flex-wrap items-baseline justify-between gap-3">
-          <span className="text-sm font-medium text-fg">Chain — 3 stages, all llama-bench</span>
-          <span className="font-mono text-[11.5px] text-muted">
-            {totalItems} test{totalItems === 1 ? "" : "s"} · est. {totalPriced}
-          </span>
-        </div>
+            {detailsOpen && selectedModel && selectedWorker && (
+              <div className="flex flex-col gap-3">
+                {/* Same 2-col grid as the pickers above, strict 16px gutter,
+                    both cards stretched to equal height -- Machine left,
+                    Model right, matching the pickers' own left/right. */}
+                <div className="grid grid-cols-2 items-stretch gap-4">
+                  <div className="rounded-lg border border-border bg-surface-raised p-3.5">
+                    <span className="text-[11px] font-semibold uppercase tracking-wide text-muted">Machine</span>
+                    <dl className="mt-2 flex flex-col gap-1.5 text-[12.5px]">
+                      <Kv
+                        label="GPU"
+                        value={gpuList.length > 0 ? gpuList.map((g) => formatGpuLabel(g)).join(" · ") : "none detected"}
+                      />
+                      <Kv
+                        label="Backend · build"
+                        value={`${selectedWorker.backend ?? "unknown"} · ${activeBuild ?? "no build activated"}`}
+                      />
+                      <Kv
+                        label="Sensors"
+                        value={
+                          sensors
+                            ? [sensors.clock ? "clock" : null, sensors.temp ? "temp" : null].filter(Boolean).join(" · ") ||
+                              "neither available on this platform"
+                            : "not reported by this worker"
+                        }
+                        // M6/N6 -- declared UP FRONT so a missing
+                        // thermally_throttled flag later reads as "this
+                        // machine can't produce one", never as "nothing
+                        // throttled".
+                        hint="Whether this machine can report clock and temperature at all — a run that can't sample them never raises a thermal flag."
+                      />
+                    </dl>
+                  </div>
 
-        <div className="mt-3 grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
-          {stagePlans.map((plan) => {
-            const state = stageState(plan.stage);
-            return (
-              <div key={plan.stage} className="flex flex-col rounded-lg border border-border bg-raised p-3">
-                <div className="flex items-baseline justify-between gap-2">
-                  <b className="text-[12.5px] text-fg">{STAGE_TITLE[plan.stage]}</b>
-                  {plan.run && <StatusDot status={plan.run.status} />}
+                  <div className="rounded-lg border border-border bg-surface-raised p-3.5">
+                    <span className="text-[11px] font-semibold uppercase tracking-wide text-muted">Model</span>
+                    <dl className="mt-2 flex flex-col gap-1.5 text-[12.5px]">
+                      <Kv
+                        label="Layers"
+                        value={modelLayerCount != null ? `${modelLayerCount}` : "not read from this file's header"}
+                        read={modelLayerCount != null}
+                      />
+                      {/* Trained context sits right under layers because it's
+                          the model's own hard ceiling -- every context sizing
+                          path (M2's target clamp, N1's ladder) clamps to it,
+                          so it can never be raised by config no matter how
+                          much VRAM exists. */}
+                      <Kv
+                        label="Context (trained)"
+                        value={trainedCtx != null ? trainedCtx.toLocaleString() : "not read"}
+                        read={trainedCtx != null}
+                      />
+                      <Kv
+                        label="KV heads · head dim"
+                        value={
+                          selectedModel.metadata.n_head_kv != null
+                            ? `${selectedModel.metadata.n_head_kv} · ${selectedModel.metadata.head_dim_k ?? "—"}`
+                            : "not read"
+                        }
+                        read={selectedModel.metadata.n_head_kv != null}
+                      />
+                      <Kv
+                        label="Sliding window"
+                        value={
+                          selectedModel.metadata.sliding_window != null && selectedModel.metadata.sliding_window > 0
+                            ? selectedModel.metadata.sliding_window.toLocaleString()
+                            : "none — plain GQA"
+                        }
+                        read={selectedModel.metadata.sliding_window != null}
+                      />
+                    </dl>
+                  </div>
                 </div>
-                <div className="mt-1 font-mono text-[11px] leading-relaxed text-muted">
-                  {plan.itemCount > 0 ? (
+
+                {/* M1 -- the inverse estimate, one click away rather than
+                    always-on: Q2 below already inlines its headline numbers
+                    at the point they matter. --------------------------- */}
+                <div className="rounded-lg border border-border bg-surface-raised p-3.5">
+                  <span className="text-[11px] font-semibold uppercase tracking-wide text-muted">
+                    Affordability — the inverse estimate
+                  </span>
+                  {affordability && affordability.f16.confidence !== "unknown" && affordability.f16.tokens > 0 ? (
                     <>
-                      {plan.itemCount} test{plan.itemCount === 1 ? "" : "s"} ·{" "}
-                      {plan.stage === "sweep" ? "KV × FA × ngl × depth" : "PP only · batch/ubatch"}
+                      <div className="mt-2 flex flex-wrap items-baseline gap-x-5 gap-y-1.5 text-[12.5px]">
+                        <span className="text-fg">
+                          Given this card, this placement, this KV type — <b>the largest context that still fits</b>:
+                        </span>
+                        <span className="font-mono text-fg">
+                          f16/f16 ≈ <b>{affordability.f16.tokens.toLocaleString()} tok</b>
+                        </span>
+                        <span className="font-mono text-fg">
+                          q8_0/q8_0 ≈ <b>{affordability.q8.tokens.toLocaleString()} tok</b>
+                        </span>
+                        <span className="rounded-full border border-accent/40 bg-accent/10 px-2 py-0.5 text-[11px] text-accent">
+                          confidence: {affordability.f16.confidence}
+                        </span>
+                      </div>
+                      <p className="mt-2 text-[11.5px] leading-relaxed text-muted">
+                        From this placement's resident weights
+                        {affordability.weightsMib != null ? ` (~${affordability.weightsMib.toLocaleString()} MiB)` : ""}, a
+                        10 % activation headroom and scratch. Binding constraint:{" "}
+                        <span className="font-mono">{affordability.f16.binding ?? "—"}</span>. Advisory only — it ranks
+                        and annotates, it never removes a configuration from the sweep.
+                      </p>
                     </>
+                  ) : affordability && affordability.f16.confidence !== "unknown" ? (
+                    <p className="mt-2 text-[12px] leading-relaxed text-muted">
+                      <b className="text-fg">This placement leaves no room for a KV cache at all.</b> The weights alone
+                      {affordability.weightsMib != null ? ` (~${affordability.weightsMib.toLocaleString()} MiB)` : ""} fill
+                      the card once a 10 % activation headroom and scratch are reserved, so the affordable context at
+                      every KV type is zero — binding constraint <span className="font-mono">weights-placement</span>,
+                      not KV. The lever is offload, not cache quality: the sweep stage already carries a lower{" "}
+                      <span className="font-mono">-ngl</span> point, and <span className="font-mono">--n-cpu-moe</span>{" "}
+                      on New Run moves expert weights off the card entirely. Advisory, as always — nothing is removed
+                      from the grid over it.
+                    </p>
                   ) : (
-                    <>rules, not values yet</>
+                    <p className="mt-2 text-[12px] leading-relaxed text-muted">
+                      Unavailable for this pairing — the estimate needs this model's KV geometry from its header and a
+                      live VRAM total from the machine. It never fabricates a number in their absence.
+                      {affordability?.f16.conservativeFloorTokens != null && (
+                        <>
+                          {" "}
+                          A conservative floor does exist: this model's full trained context of{" "}
+                          <b className="text-fg">{affordability.f16.conservativeFloorTokens.toLocaleString()}</b> tokens,
+                          offered as a floor, not as an estimate.
+                        </>
+                      )}
+                    </p>
                   )}
                 </div>
-                {plan.itemCount > 0 && <div className="mt-1 text-[11px] text-muted">est. {priceStage(plan.sweep)}</div>}
-                {plan.itemCount === 0 && (
-                  <div className="mt-1 text-[11px] leading-relaxed text-muted">
-                    One octave either side of whatever {STAGE_TITLE.tuning} wins — there is nothing to centre on
-                    until it has.
+              </div>
+            )}
+          </Step>
+
+          {/* Step 2 -- goal --------------------------------------------------- */}
+          <Step n={2} title="State your goal" desc="Three quick calls — skip them and the console just optimizes.">
+            <GoalQuestionnaire
+              goals={goals}
+              onChange={(next) => {
+                setGoals(next);
+                setGoalsUnset(false);
+              }}
+              trainedCtx={trainedCtx}
+              unset={goalsUnset}
+              affordability={{
+                totalMib: liveVramTotalMib,
+                weightsMib: affordability?.weightsMib ?? null,
+                nLayer: modelLayerCount ?? undefined,
+                nHeadKv: selectedModel?.metadata.n_head_kv,
+                headDimK: selectedModel?.metadata.head_dim_k,
+                headDimV: selectedModel?.metadata.head_dim_v,
+                nEmbd: selectedModel?.metadata.n_embd,
+                nHead: selectedModel?.metadata.n_head,
+                slidingWindow: selectedModel?.metadata.sliding_window,
+              }}
+            />
+          </Step>
+
+          {/* Step 3 -- the chain ----------------------------------------------- */}
+          <Step n={3} title="Review the chain & run" desc="Two tuning passes feed the sweep — only the sweep scores cards." last>
+            <div className="flex flex-wrap items-baseline justify-between gap-3">
+              <span className="text-sm font-medium text-fg">Chain — 3 stages, all llama-bench</span>
+              <span className="font-mono text-[11.5px] text-muted">
+                {totalItems} test{totalItems === 1 ? "" : "s"} · est. {totalPriced}
+              </span>
+            </div>
+
+            <div className="flex flex-wrap items-stretch gap-y-2">
+              {stagePlans.map((plan) => {
+                const state = stageState(plan.stage);
+                const highlight = state === "startable" || state === "live";
+                const dim = state === "blocked" && plan.itemCount === 0;
+                return (
+                  <div key={plan.stage} className="contents">
+                    <div
+                      className={`flex w-[180px] shrink-0 flex-col gap-1.5 rounded-lg bg-surface-raised p-3 ${
+                        highlight ? "border-2 border-accent" : "border border-border"
+                      } ${dim ? "opacity-65" : ""}`}
+                    >
+                      <div className="flex items-center gap-1.5">
+                        {!plan.run && (
+                          <span
+                            className={
+                              state === "blocked"
+                                ? "h-[7px] w-[7px] shrink-0 rounded-full shadow-[inset_0_0_0_1.5px_var(--color-muted)]"
+                                : "h-[7px] w-[7px] shrink-0 rounded-full bg-accent"
+                            }
+                          />
+                        )}
+                        <b className="text-[12.5px] text-fg">{STAGE_TITLE[plan.stage]}</b>
+                      </div>
+                      {plan.run && <RunStatusPill status={plan.run.status} />}
+                      <div className="font-mono text-[10.5px] leading-relaxed text-muted">
+                        {plan.itemCount > 0 ? (
+                          <>
+                            {plan.itemCount} test{plan.itemCount === 1 ? "" : "s"} ·{" "}
+                            {plan.stage === "sweep" ? "KV × FA × ngl × depth" : "PP only · batch/ubatch"}
+                          </>
+                        ) : (
+                          <>rules, not values yet</>
+                        )}
+                      </div>
+                      {plan.itemCount > 0 && <div className="text-[10.5px] text-muted">est. {priceStage(plan.sweep)}</div>}
+                      {plan.itemCount === 0 && (
+                        <div className="text-[10.5px] leading-relaxed text-muted">
+                          One octave either side of whatever {STAGE_TITLE.tuning} wins — there is nothing to centre on
+                          until it has.
+                        </div>
+                      )}
+
+                      <div className="mt-auto flex flex-col gap-1 pt-1">
+                        {plan.runId ? (
+                          <Link
+                            to={`/runs/${plan.runId}`}
+                            className="text-center text-[11px] font-semibold text-accent hover:underline"
+                          >
+                            View run →
+                          </Link>
+                        ) : dim ? (
+                          <span className="rounded-md border border-border py-1 text-center text-[10.5px] text-muted">
+                            Waiting
+                          </span>
+                        ) : (
+                          <button
+                            type="button"
+                            disabled={state !== "startable" || busyStage != null || !ready}
+                            onClick={() => void startStage(plan.stage)}
+                            className="rounded-md bg-accent py-1 text-[11px] font-bold text-accent-fg disabled:opacity-40"
+                          >
+                            {STAGE_START_LABEL[plan.stage]}
+                          </button>
+                        )}
+                        {/* Refine is a convenience, not a requirement: a chain
+                            may go straight from the coarse winner to the
+                            scored sweep, which is depth 2 of the 3 §0.5
+                            allows. */}
+                        {plan.stage === "sweep" && !plan.runId && !chain.refine && chain.tuning && (
+                          <button
+                            type="button"
+                            disabled={busyStage != null || stageState("refine") === "blocked"}
+                            onClick={() => void startStage("sweep", "tuning")}
+                            className="rounded-md border border-border py-1 text-[10.5px] font-semibold text-fg hover:border-accent/40 hover:text-accent disabled:opacity-40"
+                          >
+                            Skip refine
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                    <div className="flex w-6 shrink-0 items-center justify-center text-border">
+                      <IconArrowRight width={16} height={16} />
+                    </div>
+                  </div>
+                );
+              })}
+
+              <div className="flex w-[180px] shrink-0 flex-col items-center justify-center gap-1 rounded-lg border border-dashed border-border p-3 text-center">
+                <b className="text-[12.5px] text-accent">Cards per goal</b>
+                <div className="font-mono text-[10.5px] text-muted">
+                  {goals.goal === "max_context"
+                    ? "Max Context + Low Memory"
+                    : goals.goal === "max_speed"
+                      ? "Max Speed + Low Memory"
+                      : "Balanced + Low Memory"}
+                </div>
+                {cardsRunId ? (
+                  <Link to={`/runs/${cardsRunId}`} className="mt-1 text-[11px] font-semibold text-accent hover:underline">
+                    Open scored cards →
+                  </Link>
+                ) : (
+                  <div className="mt-1 text-[10.5px] leading-relaxed text-muted">
+                    Only the sweep stage scores — tuning stages feed it values, never cards.
                   </div>
                 )}
-                <div className="mt-2 flex flex-wrap items-center gap-2">
-                  {plan.runId ? (
-                    <Link to={`/runs/${plan.runId}`} className="text-[11.5px] font-semibold text-accent hover:underline">
-                      View run →
-                    </Link>
-                  ) : (
-                    <button
-                      type="button"
-                      disabled={state !== "startable" || busyStage != null || !ready}
-                      onClick={() => void startStage(plan.stage)}
-                      className="rounded-lg bg-accent px-3 py-1 text-[11.5px] font-semibold text-accent-fg disabled:opacity-40"
-                    >
-                      {STAGE_START_LABEL[plan.stage]}
-                    </button>
-                  )}
-                  {/* Refine is a convenience, not a requirement: a chain may
-                      go straight from the coarse winner to the scored sweep,
-                      which is depth 2 of the 3 §0.5 allows. */}
-                  {plan.stage === "sweep" && !plan.runId && !chain.refine && chain.tuning && (
-                    <button
-                      type="button"
-                      disabled={busyStage != null || stageState("refine") === "blocked"}
-                      onClick={() => void startStage("sweep", "tuning")}
-                      className="rounded-lg border border-border px-2.5 py-1 text-[11.5px] font-semibold text-fg hover:border-accent/40 hover:text-accent disabled:opacity-40"
-                    >
-                      Skip refine
-                    </button>
-                  )}
-                </div>
               </div>
-            );
-          })}
-
-          <div className="flex flex-col justify-center rounded-lg border border-dashed border-border p-3 text-center">
-            <b className="text-[12.5px] text-accent">cards per goal</b>
-            <div className="mt-1 font-mono text-[11px] text-muted">
-              {goals.goal === "max_context"
-                ? "Max Context + Low Memory"
-                : goals.goal === "max_speed"
-                  ? "Max Speed + Low Memory"
-                  : "Balanced + Low Memory"}
             </div>
-            {cardsRunId ? (
-              <Link to={`/runs/${cardsRunId}`} className="mt-2 text-[11.5px] font-semibold text-accent hover:underline">
-                Open scored cards →
-              </Link>
-            ) : (
-              <div className="mt-2 text-[11px] leading-relaxed text-muted">
-                Only the sweep stage scores — tuning stages feed it values, never cards.
-              </div>
+
+            {vramCap && (
+              <p className="rounded-lg border border-warning/30 bg-warning-bg px-3 py-2 text-xs leading-relaxed text-warning">
+                <b>Offload capped at {vramCap.safeNgl} layers.</b> Full offload of this model is estimated at ~
+                {formatBytes(vramCap.neededMib * 1024 * 1024)} against ~{formatBytes(vramCap.freeMib * 1024 * 1024)} free
+                on this machine right now. Every stage above runs at the capped value. The estimate is a flat per-layer
+                average — weakest exactly for Mixture-of-Experts models — so it is shown rather than applied silently.
+              </p>
             )}
-          </div>
-        </div>
 
-        {/* M4 -- the axis, as it will actually expand ---------------------- */}
-        <p className="mt-3 text-xs leading-relaxed text-muted">
-          <b className="text-fg">Sweep axis after your tolerance:</b>{" "}
-          {kvPairs.map((pair) => (
-            <span
-              key={pair}
-              className="mr-1.5 inline-block rounded-full border border-accent/40 bg-accent/10 px-2 py-0.5 font-mono text-[11px] text-accent"
-            >
-              {pair}
-            </span>
-          ))}
-          {prunedPairs.map((pair) => (
-            <span
-              key={pair}
-              className="mr-1.5 inline-block rounded-full border border-border bg-raised px-2 py-0.5 font-mono text-[11px] text-muted line-through opacity-60"
-            >
-              {pair}
-            </span>
-          ))}
-          {prunedPairs.length > 0 ? (
-            <>
-              — removed by your KV tolerance before expansion, so the {sweepPlan.itemCount}-test count above already
-              reflects it. The stage says the axis shrank rather than letting the count imply it.
-            </>
-          ) : (
-            <>— nothing is pruned at this tolerance.</>
-          )}
-        </p>
-
-        {/* M7/M2 -- held fields keep their reasons -------------------------- */}
-        <p className="mt-2 text-xs leading-relaxed text-muted">
-          <b className="text-fg">Held fields keep their reasons.</b> Threads are held at {threads} (one less than this
-          machine's cores): these stages target fully offloaded configurations where <span className="font-mono">-t</span>{" "}
-          barely bites. On CPU-bound rows it is the dominant variable and stays an axis on the New Run page, with the
-          running build's own ISA provenance recorded alongside those rows.{" "}
-          {goals.target_ctx != null ? (
-            <>
-              Depth is anchored to your target:{" "}
-              <span className="font-mono">{Math.round(goals.target_ctx * 0.5).toLocaleString()} = 50 % of your{" "}
-              {goals.target_ctx.toLocaleString()}</span>.
-            </>
-          ) : (
-            <>
-              Depth stays at 0 — without a target context in Q2 there is nothing for a percentage to be a percentage
-              of, and a house number would not be your workload.
-            </>
-          )}
-        </p>
-
-        {vramCap && (
-          <p className="mt-2 rounded-lg border border-warning/30 bg-warning-bg px-3 py-2 text-xs leading-relaxed text-warning">
-            <b>Offload capped at {vramCap.safeNgl} layers.</b> Full offload of this model is estimated at ~
-            {formatBytes(vramCap.neededMib * 1024 * 1024)} against ~{formatBytes(vramCap.freeMib * 1024 * 1024)} free on
-            this machine right now. Every stage above runs at the capped value. The estimate is a flat per-layer
-            average — weakest exactly for Mixture-of-Experts models — so it is shown rather than applied silently.
-          </p>
-        )}
-      </div>
-
-      {/* Repeats + presets ---------------------------------------------------- */}
-      <div className="grid gap-4 md:grid-cols-2">
-        <div className="rounded-xl border border-border bg-surface p-4">
-          <span className="text-xs font-semibold uppercase tracking-wide text-muted">Repeats per test</span>
-          <div className="mt-2 flex flex-wrap gap-1.5" role="radiogroup" aria-label="Repeats per test">
-            {REPEAT_CHOICES.map((n) => {
-              const disabled = n < MIN_SCORING_REPEATS;
-              return (
-                <button
-                  key={n}
-                  type="button"
-                  role="radio"
-                  aria-checked={repeats === n}
-                  aria-disabled={disabled}
-                  disabled={disabled}
-                  onClick={() => setRepeats(n)}
-                  className={
-                    repeats === n
-                      ? "rounded-full border border-accent bg-accent/10 px-3 py-0.5 text-[12px] font-semibold text-accent"
-                      : disabled
-                        ? "rounded-full border border-border bg-raised px-3 py-0.5 text-[12px] text-muted line-through opacity-50"
-                        : "rounded-full border border-border bg-raised px-3 py-0.5 text-[12px] text-muted hover:text-fg"
-                  }
-                >
-                  {n}
-                </button>
-              );
-            })}
-          </div>
-          <p className="mt-2 text-[11.5px] leading-relaxed text-muted">
-            Fewer than {MIN_SCORING_REPEATS} reports a standard deviation of exactly 0 — §0.3's stability gate would
-            pass on a number that was never measured, so those two stay visible and unselectable rather than quietly
-            absent.
-          </p>
-        </div>
-
-        <div className="rounded-xl border border-border bg-surface p-4">
-          <span className="text-xs font-semibold uppercase tracking-wide text-muted">Presets carry intent too</span>
-          <p className="mt-1.5 text-[12px] leading-relaxed text-muted">
-            Saving stores the goals block and the repeat count — goal, target context, workload shape, KV tolerance.
-            They describe your workload, not a machine, so they load verbatim everywhere and the grids above are
-            rebuilt from them.
-          </p>
-          <div className="mt-3 flex flex-wrap items-center gap-2">
-            <button
-              type="button"
-              onClick={resetAll}
-              className="rounded-lg border border-border px-3 py-1.5 text-xs font-semibold text-fg hover:border-accent/40 hover:text-accent"
-            >
-              Reset all
-            </button>
-            <div className="relative">
+            <div>
               <button
                 type="button"
-                onClick={() => setPresetsOpen((open) => !open)}
-                aria-expanded={presetsOpen}
-                disabled={Object.keys(presets).length === 0}
-                className="rounded-lg border border-border px-3 py-1.5 text-xs font-semibold text-fg hover:border-accent/40 hover:text-accent disabled:opacity-40"
+                onClick={() => setScoringDetailsOpen((open) => !open)}
+                aria-expanded={scoringDetailsOpen}
+                className="flex items-center gap-1 text-xs text-muted hover:text-fg"
               >
-                Load preset ▾
+                {scoringDetailsOpen ? "Hide scoring details ▴" : "Show scoring details ▾"}
               </button>
-              {presetsOpen && (
-                <div className="absolute z-10 mt-1 flex min-w-40 flex-col rounded-lg border border-border bg-surface p-1 shadow-lg">
-                  {Object.keys(presets).map((name) => (
-                    <button
-                      key={name}
-                      type="button"
-                      onClick={() => loadPreset(name)}
-                      className="rounded px-2 py-1 text-left text-xs text-fg hover:bg-white/5"
-                    >
-                      {name}
-                    </button>
-                  ))}
+              {scoringDetailsOpen && (
+                <div className="mt-2.5 rounded-lg border border-border bg-surface-raised p-3.5">
+                  {/* M4 -- the axis, as it will actually expand ------------ */}
+                  <p className="text-[11.5px] leading-relaxed text-muted">
+                    <b className="text-fg">Sweep axis after your tolerance:</b>{" "}
+                    {kvPairs.map((pair) => (
+                      <span
+                        key={pair}
+                        className="mr-1.5 inline-block rounded-full border border-accent/40 bg-accent/10 px-2 py-0.5 font-mono text-[11px] text-accent"
+                      >
+                        {pair}
+                      </span>
+                    ))}
+                    {prunedPairs.map((pair) => (
+                      <span
+                        key={pair}
+                        className="mr-1.5 inline-block rounded-full border border-border bg-surface px-2 py-0.5 font-mono text-[11px] text-muted line-through opacity-60"
+                      >
+                        {pair}
+                      </span>
+                    ))}
+                    {prunedPairs.length > 0 ? (
+                      <>
+                        — removed by your KV tolerance before expansion, so the {sweepPlan.itemCount}-test count above
+                        already reflects it. The stage says the axis shrank rather than letting the count imply it.
+                      </>
+                    ) : (
+                      <>— nothing is pruned at this tolerance.</>
+                    )}
+                  </p>
+
+                  {/* M7/M2 -- held fields keep their reasons ---------------- */}
+                  <p className="mt-2.5 text-[11.5px] leading-relaxed text-muted">
+                    <b className="text-fg">Held fields keep their reasons.</b> Threads are held at {threads} (one less
+                    than this machine's cores): these stages target fully offloaded configurations where{" "}
+                    <span className="font-mono">-t</span> barely bites. On CPU-bound rows it is the dominant variable
+                    and stays an axis on the New Run page, with the running build's own ISA provenance recorded
+                    alongside those rows.{" "}
+                    {goals.target_ctx != null ? (
+                      <>
+                        Depth is anchored to your target:{" "}
+                        <span className="font-mono">
+                          {Math.round(goals.target_ctx * 0.5).toLocaleString()} = 50 % of your{" "}
+                          {goals.target_ctx.toLocaleString()}
+                        </span>
+                        .
+                      </>
+                    ) : (
+                      <>
+                        Depth stays at 0 — without a target context in Q2 there is nothing for a percentage to be a
+                        percentage of, and a house number would not be your workload.
+                      </>
+                    )}
+                  </p>
                 </div>
               )}
             </div>
+
+            {/* Repeats --------------------------------------------------------- */}
+            <div className="flex flex-wrap items-center gap-3.5 border-t border-border pt-5">
+              <span className="text-xs font-semibold uppercase tracking-wide text-muted">Repeats per test</span>
+              <div className="flex gap-1.5" role="radiogroup" aria-label="Repeats per test">
+                {REPEAT_CHOICES.map((n) => {
+                  const disabled = n < MIN_SCORING_REPEATS;
+                  return (
+                    <button
+                      key={n}
+                      type="button"
+                      role="radio"
+                      aria-checked={repeats === n}
+                      aria-disabled={disabled}
+                      disabled={disabled}
+                      onClick={() => setRepeats(n)}
+                      className={
+                        repeats === n
+                          ? "rounded-full border border-accent bg-accent/10 px-3 py-0.5 text-[12px] font-semibold text-accent"
+                          : disabled
+                            ? "rounded-full border border-border bg-surface-raised px-3 py-0.5 text-[12px] text-muted line-through opacity-50"
+                            : "rounded-full border border-border bg-surface-raised px-3 py-0.5 text-[12px] text-muted hover:text-fg"
+                      }
+                    >
+                      {n}
+                    </button>
+                  );
+                })}
+              </div>
+              <span
+                className="inline-flex items-center gap-1 text-[11px] text-muted"
+                title="Fewer than 3 reports a standard deviation of exactly 0 — the stability gate would pass on a number that was never measured."
+              >
+                below {MIN_SCORING_REPEATS}, results aren't stable enough to score <IconInfo width={12} height={12} />
+              </span>
+            </div>
+
+            {msg && <p className="text-xs text-muted">{msg}</p>}
+          </Step>
+        </div>
+
+        {/* Right column -- the sticky run summary ---------------------------- */}
+        <aside className="sticky top-6 flex w-[300px] shrink-0 flex-col gap-3.5 rounded-xl border border-border bg-surface p-5">
+          <span className="text-sm font-bold text-fg">Your run</span>
+
+          {ready ? (
+            <div className="flex flex-col gap-0.5">
+              <span className="break-all font-mono text-[11.5px] text-fg">{selectedModel?.filename ?? modelId}</span>
+              <span className="text-[11.5px] text-muted">on {selectedWorker?.displayName ?? workerId}</span>
+            </div>
+          ) : (
+            <p className="text-[11.5px] text-muted">Pick a machine and a model above to build a chain.</p>
+          )}
+
+          <div className="h-px bg-border" />
+
+          <div>
+            <div className="text-[12.5px] font-semibold text-fg">
+              {goalLabel}
+              {goals.target_ctx != null ? ` · ${goals.target_ctx.toLocaleString()}` : ""} · {goals.workload}
+            </div>
+            <div className="mt-0.5 font-mono text-[11px] text-muted">
+              wPP {WORKLOAD_WEIGHTS[goals.workload].wPP.toFixed(2)} · wTG {WORKLOAD_WEIGHTS[goals.workload].wTG.toFixed(2)}
+            </div>
+            <p className="mt-1.5 text-[10.5px] leading-relaxed text-muted">
+              Change the goal later — re-scoring is instant post-processing over stored results, never re-measurement.
+            </p>
+          </div>
+
+          <div className="h-px bg-border" />
+
+          <div className="flex flex-col gap-1.5 text-[11.5px]">
+            {stagePlans.map((plan) => (
+              <div key={plan.stage} className="flex justify-between gap-2">
+                <span className="text-muted">{STAGE_TITLE[plan.stage]}</span>
+                <span className={plan.itemCount > 0 ? "text-fg" : "text-muted"}>
+                  {plan.itemCount > 0 ? `${plan.itemCount} tests` : "—"}
+                </span>
+              </div>
+            ))}
+            <div className="flex justify-between gap-2 border-t border-border pt-1.5 font-bold">
+              <span className="text-fg">Total</span>
+              <span className="text-fg">{totalItems} tests</span>
+            </div>
+            <div className="leading-relaxed text-muted">est. {totalPriced}</div>
+          </div>
+
+          <button
+            type="button"
+            disabled={stageState("tuning") !== "startable" || busyStage != null || !ready}
+            onClick={() => void startStage("tuning")}
+            className="mt-0.5 w-full rounded-lg bg-accent py-2.5 text-sm font-bold text-accent-fg disabled:opacity-40"
+          >
+            {STAGE_START_LABEL.tuning}
+          </button>
+          {!chain.tuning && <div className="-mt-1.5 text-center text-[10.5px] text-muted">Unlocks Tune refine when it finishes</div>}
+
+          {msg && <p className="text-center text-[11px] leading-relaxed text-muted">{msg}</p>}
+
+          <div className="h-px bg-border" />
+
+          <div className="text-[11px] leading-relaxed text-muted">
+            {cardsRunId ? (
+              <Link to={`/runs/${cardsRunId}`} className="font-semibold text-accent hover:underline">
+                Open scored cards →
+              </Link>
+            ) : (
+              <>Scored cards will appear here once the sweep stage runs.</>
+            )}
+          </div>
+
+          <div className="relative flex flex-wrap justify-center gap-x-3.5 gap-y-1 text-[11px]">
             <button
               type="button"
               onClick={savePreset}
-              className="rounded-lg border border-border px-3 py-1.5 text-xs font-semibold text-fg hover:border-accent/40 hover:text-accent"
+              title="Saves the goals block and repeat count — goal, target context, workload shape, KV tolerance. Describes your workload, not a machine, so it loads verbatim on any pairing."
+              className="text-muted hover:text-fg"
             >
-              Save preset…
+              Save preset
             </button>
             <button
               type="button"
-              disabled={stageState("tuning") !== "startable" || busyStage != null || !ready}
-              onClick={() => void startStage("tuning")}
-              className="rounded-lg bg-accent px-4 py-1.5 text-xs font-semibold text-accent-fg disabled:opacity-40"
+              onClick={() => setPresetsOpen((open) => !open)}
+              aria-expanded={presetsOpen}
+              disabled={Object.keys(presets).length === 0}
+              className="text-muted hover:text-fg disabled:opacity-40"
             >
-              {STAGE_START_LABEL.tuning}
+              Load preset
             </button>
+            <button type="button" onClick={resetAll} className="text-muted hover:text-fg">
+              Reset all
+            </button>
+            {presetsOpen && (
+              <div className="absolute bottom-full z-10 mb-1 flex max-h-56 min-w-40 flex-col overflow-y-auto rounded-lg border border-border bg-surface-raised p-1 shadow-lg">
+                {Object.keys(presets).map((name) => (
+                  <button
+                    key={name}
+                    type="button"
+                    onClick={() => loadPreset(name)}
+                    className="rounded px-2 py-1 text-left text-xs text-fg hover:bg-white/5"
+                  >
+                    {name}
+                  </button>
+                ))}
+              </div>
+            )}
           </div>
-          {msg && <p className="mt-2 text-xs text-muted">{msg}</p>}
-        </div>
+        </aside>
       </div>
+    </div>
+  );
+}
 
-      {/* Once this finishes ---------------------------------------------------- */}
-      <div className="rounded-xl border border-accent/35 bg-accent/[0.06] p-4" role="status">
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <div>
-            <div className="text-[12.5px] font-semibold text-fg">Once this finishes</div>
-            <div className="mt-1 text-[12px] leading-relaxed text-muted">
-              Cards ranked for{" "}
-              <b className="text-fg">
-                {goalLabel}
-                {goals.target_ctx != null ? ` · ${goals.target_ctx.toLocaleString()}` : ""} · {goals.workload} (wPP{" "}
-                {WORKLOAD_WEIGHTS[goals.workload].wPP.toFixed(2)} · wTG{" "}
-                {WORKLOAD_WEIGHTS[goals.workload].wTG.toFixed(2)})
-              </b>{" "}
-              — change the goal later and re-scoring is instant post-processing over stored results, never
-              re-measurement.
-            </div>
-          </div>
-          {cardsRunId ? (
-            <Link
-              to={`/runs/${cardsRunId}`}
-              className="rounded-lg bg-accent px-4 py-1.5 text-xs font-semibold text-accent-fg"
-            >
-              Scored cards →
-            </Link>
-          ) : (
-            <span className="text-[11.5px] text-muted">available once the sweep stage has run</span>
-          )}
+// One numbered step of the wizard: a circular badge connected to the next
+// step by a vertical rule (omitted on the last step), a click-to-collapse
+// title+description header, then whatever the step needs in a
+// loosely-gapped column. Kept local -- this shape (badge, connector,
+// heading) is specific to this page's own pairing -> goal -> chain
+// narrative, not a general-purpose disclosure.
+//
+// Collapsing hides the body with `hidden` rather than unmounting it, so a
+// step's own state (Step 1's detailsOpen, GoalQuestionnaire's KV-tolerance
+// disclosure) survives being closed and reopened.
+function Step({
+  n,
+  title,
+  desc,
+  last,
+  children,
+}: {
+  n: number;
+  title: string;
+  desc: string;
+  last?: boolean;
+  children: ReactNode;
+}) {
+  const [open, setOpen] = useState(true);
+  return (
+    <div className="flex gap-4">
+      <div className="flex w-[26px] shrink-0 flex-col items-center">
+        <div className="flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-full bg-accent text-[12.5px] font-bold text-accent-fg">
+          {n}
         </div>
+        {!last && <div className="mt-1.5 w-0.5 flex-1 bg-border" />}
+      </div>
+      <div className={`min-w-0 flex-1 ${last ? "" : "pb-7"}`}>
+        <button
+          type="button"
+          onClick={() => setOpen((o) => !o)}
+          aria-expanded={open}
+          className="flex w-full items-center gap-2 text-left"
+        >
+          <span className="min-w-0 flex-1">
+            <span className="block text-base font-bold text-fg">{title}</span>
+            <span className="mt-0.5 block text-xs text-muted">{desc}</span>
+          </span>
+          <IconChevronDown
+            width={16}
+            height={16}
+            className={`shrink-0 text-muted transition-transform ${open ? "" : "-rotate-90"}`}
+          />
+        </button>
+        <div className={open ? "mt-3.5 flex flex-col gap-3" : "hidden"}>{children}</div>
       </div>
     </div>
   );
@@ -1230,16 +1414,4 @@ function Kv({ label, value, read, hint }: { label: string; value: string; read?:
       </dd>
     </div>
   );
-}
-
-function StatusDot({ status }: { status: string }) {
-  const cls =
-    status === "done"
-      ? "border-accent/40 bg-accent/10 text-accent"
-      : status === "failed" || status === "cancelled"
-        ? "border-danger/40 bg-danger/10 text-danger"
-        : status === "partial"
-          ? "border-warning/40 bg-warning-bg text-warning"
-          : "border-border bg-raised text-muted";
-  return <span className={`rounded-full border px-2 py-0.5 text-[10px] ${cls}`}>{status}</span>;
 }

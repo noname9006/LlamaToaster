@@ -1105,7 +1105,7 @@ export function Models() {
     // state says -- "the exact file HF served this hash from is gone" is the
     // more important thing to surface than "still verified locally".
     const { Icon: StateIcon, className: stateClassName, label: stateLabel } = hfMatch?.deleted
-      ? { Icon: IconAlertTriangle, className: "text-warning", label: "removed from Hugging Face" }
+      ? { Icon: IconAlertTriangle, className: "text-warning", label: "no longer available on Hugging Face" }
       : badgeState(modelState);
     const title = `${m.filename} · ${formatBytes(m.size_bytes)} · ${stateLabel} · added ${formatShortRelativeTime(m.created_at)}`;
 
