@@ -53,6 +53,7 @@ export function ModelPicker({
   onSelect,
   hfUpdates,
   className,
+  buttonClassName,
 }: {
   models: Model[];
   value: string;
@@ -64,6 +65,8 @@ export function ModelPicker({
   onSelect: (modelId: string, draftId?: string) => void;
   hfUpdates: Record<string, string | null>;
   className?: string;
+  /** Extra classes for the trigger button -- e.g. matching a sibling select's min-height. */
+  buttonClassName?: string;
 }) {
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
@@ -98,7 +101,7 @@ export function ModelPicker({
       <button
         type="button"
         onClick={() => setOpen((o) => !o)}
-        className="flex w-full items-center justify-between gap-2 rounded-lg border border-border bg-surface px-3 py-1.5 text-left text-fg outline-none focus:border-accent"
+        className={`flex w-full items-center justify-between gap-2 rounded-lg border border-border bg-surface px-3 py-1.5 text-left text-fg outline-none focus:border-accent ${buttonClassName ?? ""}`}
       >
         {selected ? (
           <span className="flex min-w-0 flex-col">

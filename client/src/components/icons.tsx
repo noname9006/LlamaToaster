@@ -247,3 +247,13 @@ export function IconActivity(props: SVGProps<SVGSVGElement>) {
     </Icon>
   );
 }
+
+// Chain connector between stage cards (Benchmark.tsx) -- a plain
+// left-to-right arrow, reads as "feeds into" rather than a navigational chevron.
+export function IconArrowRight(props: SVGProps<SVGSVGElement>) {
+  return (
+    <Icon {...props}>
+      <path d="M5 12h13M13 6l6 6-6 6" />
+    </Icon>
+  );
+}
