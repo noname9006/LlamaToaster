@@ -59,14 +59,15 @@ import { isHfTokenConfigured, getRateLimitStatus } from "./hf-rate-limit.js";
 //      never resurfaces as "modified". Unlike (1)-(3), which page through
 //      HF's search API (one request covers up to 50 repos), this sweep costs
 //      one full tree-fetch API call PER repo -- by far the most expensive of
-//      the four per repo scanned. HF_INDEX_STALENESS_REFRESH_MODE=on-demand
-//      disables this background sweep entirely and relies solely on
-//      routes/models.ts's hash-lookup already re-verifying a matched-but-
-//      stale row the moment a worker actually reports that file's hash (see
-//      verifyRepoInBackground) -- i.e. only repos someone's local model
-//      directory currently references get re-checked, and only when that
-//      happens. Tradeoff: a repo nobody's hash-lookup ever touches again
-//      keeps its last known last_seen (and deleted_at) forever.
+//      the four per repo scanned. Disabled by default (on-demand mode) and
+//      relies solely on routes/models.ts's hash-lookup already re-verifying
+//      a matched-but-stale row the moment a worker actually reports that
+//      file's hash (see verifyRepoInBackground) -- i.e. only repos someone's
+//      local model directory currently references get re-checked, and only
+//      when that happens. Tradeoff: a repo nobody's hash-lookup ever touches
+//      again keeps its last known last_seen (and deleted_at) forever.
+//      HF_INDEX_STALENESS_REFRESH_MODE=background opts back into the blind
+//      timer-based sweep.
 //
 // Deletion is handled lazily, not by a background reconciliation crawl: rows
 // are soft-deleted (deleted_at set, never hard-removed) by scanHfRepo when it
@@ -152,20 +153,22 @@ export function getLastModifiedBatchSize(): number {
   return HF_INDEX_LASTMODIFIED_BATCH_SIZE;
 }
 
-// "background" (default): runIndexTick's staleness sweep below queries
-// findStaleRepos() every tick and re-scans whatever it returns, same as
-// always -- every indexed repo gets a full tree-fetch API call roughly once
-// per HF_INDEX_REFRESH_INTERVAL_MS regardless of whether anyone still cares
-// about it.
-// "on-demand": that background sweep is skipped entirely. Staleness is left
-// to routes/models.ts's hash-lookup route, which already calls
-// verifyRepoInBackground on a matched-but-stale row the moment a worker
-// reports that file's hash -- i.e. a repo only gets re-checked when its
-// model is actually in use somewhere, not on a blind timer. See the module
-// doc comment's point (4) for the full tradeoff.
+// "on-demand" (default): the background sweep below is skipped entirely.
+// Staleness is left to routes/models.ts's hash-lookup route, which already
+// calls verifyRepoInBackground on a matched-but-stale row the moment a
+// worker reports that file's hash -- i.e. a repo only gets re-checked when
+// its model is actually in use somewhere, not on a blind timer.
+// "background": runIndexTick's staleness sweep queries findStaleRepos()
+// every tick and re-scans whatever it returns -- every indexed repo gets a
+// full tree-fetch API call roughly once per HF_INDEX_REFRESH_INTERVAL_MS
+// regardless of whether anyone still cares about it. This is the most
+// expensive of the index's sweeps (one full API call per stale repo) and
+// the usual cause of "api window full" / "429 backoff" log lines during
+// steady-state use -- opt in only if you need the extra safety net. See the
+// module doc comment's point (4) for the full tradeoff.
 export function getStaleRefreshMode(): "background" | "on-demand" {
   const env = process.env.HF_INDEX_STALENESS_REFRESH_MODE?.trim().toLowerCase();
-  return env === "on-demand" ? "on-demand" : "background";
+  return env === "background" ? "background" : "on-demand";
 }
 
 // How often a tick runs. HF's rate limit is a true sliding window tracked in
