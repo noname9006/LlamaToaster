@@ -173,21 +173,21 @@ describe("getStaleRefreshMode", () => {
     else process.env[ENV_KEY] = original;
   });
 
-  it("defaults to background when unset", () => {
+  it("defaults to on-demand when unset", () => {
     delete process.env[ENV_KEY];
-    expect(hfIndex.getStaleRefreshMode()).toBe("background");
+    expect(hfIndex.getStaleRefreshMode()).toBe("on-demand");
   });
 
-  it("switches to on-demand only on an exact (case-insensitive) match", () => {
-    process.env[ENV_KEY] = "on-demand";
-    expect(hfIndex.getStaleRefreshMode()).toBe("on-demand");
+  it("switches to background only on an exact (case-insensitive) match", () => {
+    process.env[ENV_KEY] = "background";
+    expect(hfIndex.getStaleRefreshMode()).toBe("background");
 
-    process.env[ENV_KEY] = "ON-DEMAND";
-    expect(hfIndex.getStaleRefreshMode()).toBe("on-demand");
+    process.env[ENV_KEY] = "BACKGROUND";
+    expect(hfIndex.getStaleRefreshMode()).toBe("background");
 
     // Anything else (typo, unrelated value) falls back to the safe default
-    // rather than silently disabling the background sweep.
-    process.env[ENV_KEY] = "ondemand";
-    expect(hfIndex.getStaleRefreshMode()).toBe("background");
+    // rather than silently enabling the expensive background sweep.
+    process.env[ENV_KEY] = "backgroundish";
+    expect(hfIndex.getStaleRefreshMode()).toBe("on-demand");
   });
 });
