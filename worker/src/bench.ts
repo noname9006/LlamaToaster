@@ -107,6 +107,7 @@ export async function buildArgs(input: BenchRunInput): Promise<string[]> {
     String(item.n_prompt),
     "-n",
     String(item.n_gen),
+    ...(item.n_depth > 0 ? ["-d", String(item.n_depth)] : []),
     "-t",
     String(item.threads),
     "-ngl",
