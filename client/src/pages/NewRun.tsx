@@ -12,7 +12,7 @@ import type { Model, SweepConfig, Backend, WorkerVramInfo } from "../types";
 import { formatGpuLabel, formatBytes } from "../utils";
 import { estimateVramNeededMib, estimateSafeNgl } from "../vramEstimate";
 import { GoalQuestionnaire } from "../components/GoalQuestionnaire";
-import { defaultGoals, goalsEqualDefaults, normalizeGoals, type GoalsConfig } from "../goals";
+import { defaultGoals, goalsEqualDefaults, normalizeGoals, type GoalsConfig, type WorkloadShape } from "../goals";
 import { expandSweep } from "../../../shared/sweep";
 import { priceMatrix, ETA_UNAVAILABLE } from "../../../shared/pricing";
 import type { ModelRatesResponse } from "../types";
@@ -192,6 +192,24 @@ function sanitizeSweep(sweep: Sweep): Sweep {
 // since it must stay ≤ batch size (its own default is already 4x smaller).
 const BATCH_SIZE_PRESETS = [32, 64, 128, 256, 512, 1024, 2048, 4096];
 const UBATCH_SIZE_PRESETS = [32, 64, 128, 256, 512, 1024, 2048];
+
+// The workload picker (shared/goals.ts's WORKLOAD_WEIGHTS) only reweights
+// already-measured PP/TG into a score -- it never touched what actually got
+// swept, so a "docs" score could silently be a "chat"-sized prompt reweighted
+// rather than a real long-prompt measurement. This maps each workload shape
+// to sizes drawn from the SAME chips already offered above, so applying one
+// is never a value the user couldn't have picked by hand -- just a shortcut
+// to the pair that matches the shape's own premise. -n is held at 256 across
+// all three (longer than the old 128 default -- a more stable TG sample, and
+// directly comparable across workloads since only -p varies); -p climbs
+// 512 -> 1024 -> 4096 as prompts get more document-like. 512 rather than a
+// shorter chat prompt: fixed per-call overhead dominates -p below ~512,
+// making shorter PP readings noisier, not more "chat-like".
+const WORKLOAD_SIZE_PRESETS: Record<WorkloadShape, { n_prompt: number[]; n_gen: number[] }> = {
+  chat: { n_prompt: [512], n_gen: [256] },
+  docs: { n_prompt: [4096], n_gen: [256] },
+  even: { n_prompt: [1024], n_gen: [256] },
+};
 
 // Ceilings used until the real number is known -- unreachable/predates-hardware-
 // reporting worker, or a model registered before GGUF layer-count parsing
@@ -796,6 +814,20 @@ export function NewRun() {
     setWorkflowMsg(`Prompt sizes pre-selected around your ${target.toLocaleString()} target: ${around.join(", ")}.`);
   }
 
+  // Sets -p/-n to the pair that matches the stated workload shape's own
+  // premise (see WORKLOAD_SIZE_PRESETS above) -- an explicit action, not a
+  // reactive rewrite on workload change, matching this form's existing
+  // "nothing changes until you press a workflow button" posture.
+  function applyWorkloadSizes(): void {
+    const preset = WORKLOAD_SIZE_PRESETS[goals.workload];
+    setSweep((current) => ({ ...current, n_prompt: preset.n_prompt, n_gen: preset.n_gen }));
+    setWorkflowMsg(
+      `Prompt/gen sizes set for the "${goals.workload}" workload: -p ${preset.n_prompt.join(
+        ", "
+      )} · -n ${preset.n_gen.join(", ")}. This changes what gets measured -- it does not touch the wPP/wTG scoring weights, which are applied separately.`
+    );
+  }
+
   // N5 -- the concurrency ladder. Rows land as ordinary results with
   // `concurrency` set; the knee is derived on read, never stored as a verdict.
   async function startKneeLadder(): Promise<void> {
@@ -1045,7 +1077,7 @@ export function NewRun() {
           <ChipInput
             label="Prompt length (-p)"
             hint="Prompt tokens processed before generating (the pp test). 0 disables the pp phase."
-            presets={[128, 512, 2048, 4096]}
+            presets={[128, 512, 1024, 2048, 4096]}
             {...field(sweep, setSweep, "n_prompt")}
           />
           <ChipInput
@@ -1325,6 +1357,14 @@ export function NewRun() {
               className="rounded-lg border border-border px-3 py-1.5 text-xs font-semibold text-fg hover:border-accent/40 hover:text-accent"
             >
               Sizes around my target
+            </button>
+            <button
+              type="button"
+              onClick={applyWorkloadSizes}
+              title={`Sets -p/-n to match the "${goals.workload}" workload shape's own premise, instead of leaving the sweep at whatever it was before you picked a workload`}
+              className="rounded-lg border border-border px-3 py-1.5 text-xs font-semibold text-fg hover:border-accent/40 hover:text-accent"
+            >
+              Sizes for my workload
             </button>
             <button
               type="button"
