@@ -106,7 +106,7 @@ beforeAll(async () => {
     config: {
       model_id: "a".repeat(64),
       sweep,
-      goals: { goal: "max_context", target_ctx: 32_768, workload: "chat", speed_floor_frac: 0.5, kv_tolerance: "q8_0_ok" },
+      goals: { goal: "max_context", target_ctx: 32_768, workload: "chat", speed_floor_frac: 0.5, kv_preset: "extended" },
     } as never,
     status: "running",
     started_at: Date.now(),

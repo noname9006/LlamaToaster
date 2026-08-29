@@ -5,25 +5,33 @@
 // `goals` only when the user actually touched something).
 //
 // Accessibility (the plan's own conformance block): the whole thing is a
-// labelled fieldset; goal/floor/workload chips carry role="radio" +
-// aria-checked; the floor reveal and the KV-tolerance section are disclosures
-// with aria-expanded; the target clamp announces via aria-live="polite"; and
-// tolerance-pruned KV chips stay in the accessibility tree, struck through
-// with aria-disabled and the reason in an accessible description.
+// labelled fieldset; goal/floor/workload/KV-preset chips carry role="radio" +
+// aria-checked; the floor reveal and the KV-preset section are disclosures
+// with aria-expanded; the target clamp announces via aria-live="polite".
 
 import { useId, useMemo, useState } from "react";
 import {
-  DEFAULT_RECOMMENDED_KV_PAIRS,
-  KV_TOLERANCES,
+  KV_PRESET_PAIRS,
+  KV_PRESETS,
   SPEED_FLOOR_CHOICES,
   WORKLOAD_WEIGHTS,
-  pairAllowedUnderTolerance,
   type GoalKind,
   type GoalsConfig,
-  type KvTolerance,
+  type KvPreset,
   type WorkloadShape,
 } from "../goals";
-import { maxAffordableContext, type MaxCtxEstimate } from "../vramEstimate";
+import {
+  maxAffordableContext,
+  computeDualPoolFit,
+  suggestPlacementConfigs,
+  type MaxCtxEstimate,
+  type PoolReading,
+  type PoolFit,
+  type DualPoolFit,
+  type SuggestedConfig,
+  type SuggestedConfigLabel,
+  type SuggestionResult,
+} from "../vramEstimate";
 
 export interface GoalQuestionnaireProps {
   goals: GoalsConfig;
@@ -44,6 +52,40 @@ export interface GoalQuestionnaireProps {
   };
   /** True when these values came from a preset that predates M5's goals block. */
   unset?: boolean;
+  /**
+   * The offload (GPU/CPU layer split) matrix paired with the context slider
+   * above -- absent until a real model+worker pairing exists (matching
+   * `affordability`'s own null-until-computable posture). Placement is
+   * machine-specific, never part of `goals`/presets -- see Benchmark.tsx's
+   * own placementStorageKey and M5's principle for why.
+   */
+  placement?: {
+    ngl: number;
+    onNglChange: (ngl: number) => void;
+    /** Total layers including the output layer -- the slider's own max. */
+    nglMax: number;
+    /** Raw n_layer (no +1) -- only transformer layers carry a KV cache. */
+    kvLayerCount: number;
+    modelSizeBytes: number | null;
+    /** Non-null when the slider is locked and pinned -- see the lock rules. */
+    locked: "cpu" | "unified" | null;
+    vram: PoolReading;
+    ram: PoolReading;
+    unifiedPool: boolean;
+    noGpu: boolean;
+    /** A recent failed/failed_oom verify's safety margin -- see Benchmark.tsx. */
+    poolHaircutFrac: number;
+    onVerify: (ngl: number, ctx: number) => void;
+    verifying: boolean;
+    verifyResult: {
+      ngl: number;
+      ctx: number;
+      runId: string;
+      status: "pending" | "verified" | "failed" | "failed_oom" | "error";
+      detail?: string;
+      verifiedCtxTokens?: number | null;
+    } | null;
+  };
 }
 
 const GOAL_CHOICES: { value: GoalKind; label: string }[] = [
@@ -58,16 +100,44 @@ const WORKLOAD_CHOICES: { value: WorkloadShape; label: string }[] = [
   { value: "even", label: "Even" },
 ];
 
-const TOLERANCE_LABEL: Record<KvTolerance, string> = {
-  q4_0_ok: "q4_0 ok",
-  q8_0_ok: "q8_0 ok",
-  f16_only: "f16 only",
+export const KV_PRESET_LABEL: Record<KvPreset, string> = {
+  compact: "Compact",
+  basic: "Basic",
+  extended: "Extended",
+  comprehensive: "Comprehensive",
+};
+
+const KV_PRESET_BLURB: Record<KvPreset, string> = {
+  compact: "Fast sanity check — baseline, mild, and the popular long-context setup.",
+  basic: "Compact + BF16, to check it behaves like F16.",
+  extended: "Basic + isolates K vs V impact and an aggressive-quantization data point. Default.",
+  comprehensive: "Extended + every remaining corner: asymmetric quantization, a mid bit-width rung, and an alternative 4-bit codec.",
 };
 
 function formatTokens(tokens: number): string {
   if (tokens >= 1000) return `${Math.round(tokens / 1000)} k`;
   return String(tokens);
 }
+
+function formatMib(mib: number): string {
+  if (mib >= 1024) return `${(mib / 1024).toFixed(1)} GiB`;
+  return `${Math.round(mib)} MiB`;
+}
+
+// A recent verify failure haircuts the free-mib figure fed into the fit
+// check (not the displayed live reading) -- see suggestPlacementConfigs'
+// own doc comment for why: the estimate was proven wrong at that point, so
+// the next round shouldn't trust the same number at full confidence.
+function haircut(freeMib: number | null, frac: number): number | null {
+  return freeMib == null ? null : freeMib * (1 - frac);
+}
+
+const SUGGESTION_LABEL: Record<SuggestedConfigLabel, string> = {
+  target_ctx_reduce_offload: "Keep your context, reduce offload",
+  max_offload_reduce_ctx: "Max GPU speed, reduce context",
+  balanced: "Balanced",
+  minimum_viable: "Minimum viable",
+};
 
 // The context-target slider's stops: roughly 100/75/50/25/12.5/7.5/5/2.5/1%
 // of the model's trained context, each rounded to the nearest power of two
@@ -95,10 +165,11 @@ export function GoalQuestionnaire({
   trainedCtx,
   affordability,
   unset,
+  placement,
 }: GoalQuestionnaireProps) {
-  const [toleranceOpen, setToleranceOpen] = useState(false);
+  const [kvPresetOpen, setKvPresetOpen] = useState(false);
   const [targetText, setTargetText] = useState(goals.target_ctx != null ? String(goals.target_ctx) : "");
-  const toleranceId = useId();
+  const kvPresetId = useId();
   const clampId = useId();
 
   const clamped =
@@ -173,6 +244,57 @@ export function GoalQuestionnaire({
   const f16 = affordabilityFor("f16");
   const q8 = affordabilityFor("q8_0");
   const feasible = f16 && f16.confidence !== "unknown" ? f16 : null;
+
+  // The dual-pool (VRAM + RAM) fit matrix -- same posture as affordabilityFor
+  // above (plain consts, not memoized: the arithmetic is cheap and every
+  // other estimate on this page is computed the same way), anchored on the
+  // same f16/f16 pair and the same ctxActiveValue the slider itself shows.
+  const dualFit = placement
+    ? computeDualPoolFit({
+        modelSizeBytes: placement.modelSizeBytes ?? 0,
+        totalModelLayers: placement.nglMax,
+        kvLayerCount: placement.kvLayerCount,
+        ngl: placement.ngl,
+        ctxTokens: ctxActiveValue,
+        nHeadKv: affordability?.nHeadKv ?? 0,
+        headDimK: affordability?.headDimK,
+        headDimV: affordability?.headDimV,
+        nEmbd: affordability?.nEmbd,
+        nHead: affordability?.nHead,
+        cacheTypeK: "f16",
+        cacheTypeV: "f16",
+        slidingWindow: affordability?.slidingWindow,
+        vram: { freeMib: haircut(placement.vram.freeMib, placement.poolHaircutFrac), totalMib: placement.vram.totalMib },
+        ram: { freeMib: haircut(placement.ram.freeMib, placement.poolHaircutFrac), totalMib: placement.ram.totalMib },
+        unifiedPool: placement.unifiedPool,
+      })
+    : null;
+
+  // Only computed once the live check says the current combo doesn't fit --
+  // an "ok" verdict has nothing to suggest against.
+  const suggestions =
+    placement && dualFit?.fits === false
+      ? suggestPlacementConfigs({
+          modelSizeBytes: placement.modelSizeBytes ?? 0,
+          totalModelLayers: placement.nglMax,
+          kvLayerCount: placement.kvLayerCount,
+          currentNgl: placement.ngl,
+          currentCtx: ctxActiveValue,
+          trainedCtx: trainedCtx ?? null,
+          nHeadKv: affordability?.nHeadKv ?? 0,
+          headDimK: affordability?.headDimK,
+          headDimV: affordability?.headDimV,
+          nEmbd: affordability?.nEmbd,
+          nHead: affordability?.nHead,
+          cacheTypeK: "f16",
+          cacheTypeV: "f16",
+          slidingWindow: affordability?.slidingWindow,
+          vram: { freeMib: haircut(placement.vram.freeMib, placement.poolHaircutFrac), totalMib: placement.vram.totalMib },
+          ram: { freeMib: haircut(placement.ram.freeMib, placement.poolHaircutFrac), totalMib: placement.ram.totalMib },
+          unifiedPool: placement.unifiedPool,
+          noGpu: placement.noGpu,
+        })
+      : null;
 
   return (
     <fieldset className="rounded-xl border border-border bg-surface p-4">
@@ -381,6 +503,19 @@ export function GoalQuestionnaire({
               <> Affordability is unavailable for this model+machine — the estimate never fabricates a number.</>
             )}
           </p>
+
+          {placement && (
+            <PlacementMatrix
+              placement={placement}
+              dualFit={dualFit}
+              suggestions={suggestions}
+              ctx={ctxActiveValue}
+              onApplyConfig={(cfg) => {
+                placement.onNglChange(cfg.ngl);
+                setTarget(String(cfg.ctx));
+              }}
+            />
+          )}
         </div>
 
         {/* Workload shape ------------------------------------------------------- */}
@@ -418,38 +553,42 @@ export function GoalQuestionnaire({
           </p>
         </div>
 
-        {/* KV tolerance -- collapsed by default, understated rather than boxed:
-            an advanced knob most runs never touch. -------------------------- */}
+        {/* KV cache preset -- collapsed by default, understated rather than
+            boxed: an advanced knob most runs never touch. Four curated,
+            strictly nested grids (Compact ⊂ Basic ⊂ Extended ⊂
+            Comprehensive) replace the old prune-a-tolerance knob -- each tier
+            IS the exact set of (K,V) pairs the sweep stage runs, not a
+            cross-product superset of it. ------------------------------- */}
         <div>
           <button
             type="button"
-            onClick={() => setToleranceOpen((open) => !open)}
-            aria-expanded={toleranceOpen}
-            aria-controls={toleranceId}
+            onClick={() => setKvPresetOpen((open) => !open)}
+            aria-expanded={kvPresetOpen}
+            aria-controls={kvPresetId}
             className="text-left text-xs text-muted underline decoration-dotted hover:text-fg"
           >
-            KV quality tolerance (advanced) — collapsed, prunes the grid before it runs
+            KV cache preset (advanced) — collapsed, picks the KV grid the sweep stage runs
           </button>
-          <div id={toleranceId} hidden={!toleranceOpen} className="mt-2">
-            <div className="flex flex-wrap gap-1.5" role="radiogroup" aria-label="KV quality tolerance">
-              {KV_TOLERANCES.map((tolerance) => (
+          <div id={kvPresetId} hidden={!kvPresetOpen} className="mt-2">
+            <div className="flex flex-wrap gap-1.5" role="radiogroup" aria-label="KV cache preset">
+              {KV_PRESETS.map((preset) => (
                 <button
-                  key={tolerance}
+                  key={preset}
                   type="button"
                   role="radio"
-                  aria-checked={(goals.kv_tolerance ?? "q4_0_ok") === tolerance}
-                  onClick={() => onChange({ ...goals, kv_tolerance: tolerance })}
+                  aria-checked={(goals.kv_preset ?? "extended") === preset}
+                  onClick={() => onChange({ ...goals, kv_preset: preset })}
                   className={
-                    (goals.kv_tolerance ?? "q4_0_ok") === tolerance
+                    (goals.kv_preset ?? "extended") === preset
                       ? "rounded-full border border-accent bg-accent/10 px-2.5 py-0.5 text-[12px] font-semibold text-accent"
                       : "rounded-full border border-border bg-surface-raised px-2.5 py-0.5 text-[12px] text-muted"
                   }
                 >
-                  {TOLERANCE_LABEL[tolerance]}
+                  {KV_PRESET_LABEL[preset]} ({KV_PRESET_PAIRS[preset].length})
                 </button>
               ))}
             </div>
-            <KvAxisPreview tolerance={goals.kv_tolerance ?? "q4_0_ok"} />
+            <KvPresetPreview preset={goals.kv_preset ?? "extended"} />
           </div>
         </div>
       </div>
@@ -457,45 +596,211 @@ export function GoalQuestionnaire({
   );
 }
 
-// M4 -- the pruned pairs stay in the accessibility tree: struck through
-// visually, aria-disabled with the reason in an accessible description,
-// exactly like the profile-source rule. The count above already reflects the
-// pruning, because pruning happens at grid-BUILD time, before expansion.
-function KvAxisPreview({ tolerance }: { tolerance: KvTolerance }) {
-  const reasonId = useId();
-  const removed = DEFAULT_RECOMMENDED_KV_PAIRS.filter(([k, v]) => !pairAllowedUnderTolerance(k, v, tolerance));
+// The Step-2 fit matrix: an offload slider paired with the context slider
+// above it, live dual-pool (VRAM+RAM) indicators, an inaccuracy warning, up
+// to three auto-suggested configs when the current combo doesn't fit, and a
+// Verify button that fires a real N2 probe at the exact placement shown.
+function PlacementMatrix({
+  placement,
+  dualFit,
+  suggestions,
+  ctx,
+  onApplyConfig,
+}: {
+  placement: NonNullable<GoalQuestionnaireProps["placement"]>;
+  dualFit: DualPoolFit | null;
+  suggestions: SuggestionResult | null;
+  ctx: number;
+  onApplyConfig: (config: SuggestedConfig) => void;
+}) {
+  const lockedReason =
+    placement.locked === "cpu"
+      ? "This machine has no GPU — every layer runs on CPU. Nothing to trade here."
+      : placement.locked === "unified"
+        ? "Metal / shared-memory GPU — VRAM and RAM are the same physical pool, so offload placement costs nothing and buys nothing. Every layer runs on GPU for speed."
+        : null;
+
+  return (
+    <div className="mt-3 border-t border-border pt-3">
+      <div className="flex flex-wrap items-baseline justify-between gap-2">
+        <span className="text-[13.5px] text-fg">
+          Placement · GPU ↔ CPU layers
+          <small className="mt-0.5 block text-[11px] font-normal text-muted">
+            paired with the context above — together they decide what fits
+          </small>
+        </span>
+        <span className="font-mono text-[13.5px] font-bold text-fg">
+          {placement.ngl} / {placement.nglMax} layers on GPU
+        </span>
+      </div>
+
+      <div className="mt-3 px-0.5">
+        <input
+          type="range"
+          min={0}
+          max={placement.nglMax}
+          step={1}
+          value={placement.ngl}
+          disabled={placement.locked != null}
+          onChange={(e) => placement.onNglChange(Number(e.target.value))}
+          aria-label="GPU layers offloaded, CPU/RAM the rest"
+          aria-disabled={placement.locked != null}
+          className={`w-full ${placement.locked != null ? "cursor-not-allowed opacity-40" : "cursor-pointer"}`}
+        />
+      </div>
+      {lockedReason && <p className="mt-1.5 text-[11px] leading-relaxed text-muted">{lockedReason}</p>}
+
+      {dualFit && (
+        <div className="mt-3 flex flex-col gap-2">
+          {dualFit.unifiedPool ? (
+            <PoolBar label="Unified memory (GPU + CPU)" fit={dualFit.gpu} />
+          ) : (
+            <>
+              <PoolBar label="VRAM" fit={dualFit.gpu} />
+              <PoolBar label="RAM" fit={dualFit.cpu} />
+            </>
+          )}
+        </div>
+      )}
+
+      <p className="mt-2 text-[11px] leading-relaxed text-muted">
+        <b className="text-fg">Estimate only, not a guarantee.</b> Flat per-layer average — weakest for
+        Mixture-of-Experts models — and doesn't account for the real compute/scratch buffer, which varies with batch
+        size and architecture. Verify below before trusting it for a real run.
+        {placement.poolHaircutFrac > 0 && (
+          <>
+            {" "}
+            A recent verify came back short, so free memory above is shown with a{" "}
+            {Math.round(placement.poolHaircutFrac * 100)}% safety margin until the next successful verify.
+          </>
+        )}
+      </p>
+
+      {dualFit?.fits === false && suggestions && (
+        <div className="mt-3 rounded-lg border border-dashed border-border p-3">
+          {suggestions.outcome === "cannot_run" && (
+            <p className="text-[12px] leading-relaxed text-danger">
+              <b>This model cannot run on this machine</b> — no combination of offload placement and context length
+              fits VRAM and RAM together.
+            </p>
+          )}
+          {suggestions.outcome === "unknown" && (
+            <p className="text-[12px] leading-relaxed text-muted">
+              Not enough data to suggest a fix yet — waiting on a live memory reading from this machine, or this
+              model's KV geometry.
+            </p>
+          )}
+          {suggestions.outcome === "ok" && (
+            <>
+              <span className="text-[12px] font-semibold text-fg">Suggested configurations</span>
+              <div className="mt-2 flex flex-wrap gap-2">
+                {suggestions.configs.map((cfg) => (
+                  <SuggestionCard
+                    key={`${cfg.label}:${cfg.ngl}:${cfg.ctx}`}
+                    config={cfg}
+                    onApply={() => onApplyConfig(cfg)}
+                  />
+                ))}
+              </div>
+            </>
+          )}
+        </div>
+      )}
+
+      <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-border pt-3">
+        <button
+          type="button"
+          disabled={placement.verifying}
+          onClick={() => placement.onVerify(placement.ngl, ctx)}
+          className="rounded-md border border-accent px-3 py-1 text-[11.5px] font-semibold text-accent disabled:opacity-40"
+        >
+          {placement.verifying ? "Verifying…" : "Verify with a probe"}
+        </button>
+        <span className="text-[11px] leading-relaxed text-muted">
+          Actually loads the model on this machine at the exact placement above and confirms it fits — up to 3 real
+          loads.
+        </span>
+      </div>
+      {placement.verifyResult && (
+        <p className="mt-1.5 text-[11px] leading-relaxed text-muted">{verifyResultText(placement.verifyResult)}</p>
+      )}
+    </div>
+  );
+}
+
+function verifyResultText(result: NonNullable<NonNullable<GoalQuestionnaireProps["placement"]>["verifyResult"]>): string {
+  const at = `${result.ngl} layers / ${result.ctx.toLocaleString()} tokens`;
+  switch (result.status) {
+    case "pending":
+      return `Verifying at ${at}…`;
+    case "verified":
+      return `✓ Verified — fits at ${at}${
+        result.verifiedCtxTokens != null ? ` (confirmed ceiling ~${result.verifiedCtxTokens.toLocaleString()} tokens)` : ""
+      }.`;
+    case "failed":
+      return `✗ Doesn't fit at ${at} — the machine couldn't load this configuration.${result.detail ? ` ${result.detail}` : ""}`;
+    case "failed_oom":
+      return `✗ Doesn't fit at ${at} — ran out of memory.${result.detail ? ` ${result.detail}` : ""}`;
+    case "error":
+      return `Error verifying ${at}: ${result.detail ?? "unknown error"}`;
+  }
+}
+
+function PoolBar({ label, fit }: { label: string; fit: PoolFit }) {
+  const pct = fit.freeMib != null && fit.freeMib > 0 ? Math.min(100, (fit.neededMib / fit.freeMib) * 100) : null;
+  const tone = fit.fits == null ? "text-muted" : fit.fits ? "text-success" : "text-danger";
+  return (
+    <div>
+      <div className="flex items-baseline justify-between text-[11.5px]">
+        <span className="text-muted">{label}</span>
+        <span className={`font-mono font-semibold ${tone}`}>
+          {formatMib(fit.neededMib)} needed
+          {fit.freeMib != null ? ` / ${formatMib(fit.freeMib)} free` : " · no live reading yet"}
+        </span>
+      </div>
+      <div className="mt-1 h-1.5 overflow-hidden rounded-full bg-surface">
+        <div
+          className={`h-full ${fit.fits === false ? "bg-danger" : "bg-accent"}`}
+          style={{ width: `${pct ?? 0}%` }}
+        />
+      </div>
+    </div>
+  );
+}
+
+function SuggestionCard({ config, onApply }: { config: SuggestedConfig; onApply: () => void }) {
+  return (
+    <div className="flex flex-col gap-1 rounded-lg border border-border bg-surface p-2.5">
+      <span className="text-[11.5px] font-semibold text-fg">{SUGGESTION_LABEL[config.label]}</span>
+      <span className="font-mono text-[11px] text-muted">
+        {config.ngl} layers · {config.ctx.toLocaleString()} tokens
+      </span>
+      <button
+        type="button"
+        onClick={onApply}
+        className="mt-1 rounded-md bg-accent px-2 py-1 text-[11px] font-bold text-accent-fg"
+      >
+        Apply
+      </button>
+    </div>
+  );
+}
+
+function KvPresetPreview({ preset }: { preset: KvPreset }) {
+  const pairs = KV_PRESET_PAIRS[preset];
   return (
     <div className="mt-2">
       <div className="flex flex-wrap items-center gap-1.5">
-        {DEFAULT_RECOMMENDED_KV_PAIRS.map(([k, v]) => {
-          const kept = pairAllowedUnderTolerance(k, v, tolerance);
-          return (
-            <span
-              key={`${k}/${v}`}
-              aria-disabled={!kept}
-              aria-describedby={kept ? undefined : reasonId}
-              className={
-                kept
-                  ? "rounded-full border border-accent bg-accent/10 px-2.5 py-0.5 font-mono text-[11px] text-accent"
-                  : "rounded-full border border-border bg-surface-raised px-2.5 py-0.5 font-mono text-[11px] text-muted line-through opacity-50"
-              }
-            >
-              {k} / {v}
-            </span>
-          );
-        })}
+        {pairs.map(([k, v]) => (
+          <span
+            key={`${k}/${v}`}
+            className="rounded-full border border-accent bg-accent/10 px-2.5 py-0.5 font-mono text-[11px] text-accent"
+          >
+            {k} / {v}
+          </span>
+        ))}
       </div>
-      <p id={reasonId} className="mt-1.5 text-[11px] leading-relaxed text-muted">
-        {removed.length > 0 ? (
-          <>
-            Removed by “{TOLERANCE_LABEL[tolerance]}”, before expansion — the live count and cost estimate below
-            already reflect it.{" "}
-          </>
-        ) : (
-          <>Nothing is pruned at this tolerance. </>
-        )}
-        One unquantized pair always survives so flash-attention-off keeps something to vary against.
-      </p>
+      <p className="mt-1.5 text-[11px] leading-relaxed text-muted">{KV_PRESET_BLURB[preset]}</p>
     </div>
   );
 }

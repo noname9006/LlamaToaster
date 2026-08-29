@@ -10,6 +10,7 @@ process.env.DB_PATH = join(tmpDir, "test.db");
 let app: FastifyInstance;
 let baseUrl: string;
 let repo: (typeof import("../db/repo.js"))["repo"];
+let getDb: (typeof import("../db/migrate.js"))["getDb"];
 
 const sweep = {
   n_prompt: [512],
@@ -93,6 +94,7 @@ function result(testType: "pp" | "tg", tps: number, over: Record<string, unknown
 
 beforeAll(async () => {
   ({ repo } = await import("../db/repo.js"));
+  ({ getDb } = await import("../db/migrate.js"));
   const { profilesRoutes } = await import("./profiles.js");
   app = Fastify({ logger: false });
   app.setErrorHandler((error: { statusCode?: number; message: string }, _req, reply) => {
@@ -223,7 +225,7 @@ describe("GET /api/runs/:id/profiles (M3)", () => {
         { ngl: 99, pp: 1400, tg: 41, vramPeak: 7000 },
         { ngl: 50, pp: 1200, tg: 39, vramPeak: 4200 },
       ],
-      { goals: { goal: "max_context", target_ctx: 16_384, workload: "chat", speed_floor_frac: 0.5, kv_tolerance: "q8_0_ok" } }
+      { goals: { goal: "max_context", target_ctx: 16_384, workload: "chat", speed_floor_frac: 0.5, kv_preset: "extended" } }
     );
     const body = (await (await fetch(`${baseUrl}/api/runs/run-goals/profiles`)).json()) as {
       goals: { goal: string; target_ctx: number };
@@ -398,5 +400,84 @@ describe("GET /api/runs/:id/profiles (M3)", () => {
   it("404s for an unknown run", async () => {
     const res = await fetch(`${baseUrl}/api/runs/nope/profiles`);
     expect(res.status).toBe(404);
+  });
+});
+
+// New Step-2 fit-check route: verified limits readable WITHOUT an existing
+// sweep run. Security-critical -- must authorize exactly like every other
+// worker-scoped GET route (assertOwnsWorker), same 403 as
+// GET /api/workers/:id/vram, not a reuse of a run's own ownership.
+describe("GET /api/models/:id/verified-limits", () => {
+  function authed(token: string): Record<string, string> {
+    return { authorization: `Bearer ${token}` };
+  }
+
+  async function sessionFor(login: string): Promise<{ userId: string; token: string }> {
+    const user = repo.userRepo.upsertByIdentity("github", { providerUserId: login, login, avatarUrl: null });
+    const { token } = repo.sessionRepo.create(user.id, { label: login });
+    return { userId: user.id, token };
+  }
+
+  function claimWorker(workerId: string, userId: string): void {
+    getDb().prepare(`UPDATE workers SET user_id = ? WHERE id = ?`).run(userId, workerId);
+  }
+
+  it("400s when the worker query parameter is missing", async () => {
+    const res = await fetch(`${baseUrl}/api/models/m1/verified-limits`);
+    expect(res.status).toBe(400);
+  });
+
+  it("404s for an unknown model", async () => {
+    const worker = repo.workerRepo.getOrCreateByMachineId("limits-model-404", "limits-model-404");
+    const res = await fetch(`${baseUrl}/api/models/nope/verified-limits?worker=${worker.id}`);
+    expect(res.status).toBe(404);
+  });
+
+  it("404s for an unknown worker", async () => {
+    const res = await fetch(`${baseUrl}/api/models/m1/verified-limits?worker=nope`);
+    expect(res.status).toBe(404);
+  });
+
+  it("a different authenticated user cannot read another user's claimed worker's verified limits", async () => {
+    const worker = repo.workerRepo.getOrCreateByMachineId("limits-intruder", "limits-intruder");
+    const { userId } = await sessionFor("limits-real-owner");
+    claimWorker(worker.id, userId);
+    const { token: intruderToken } = await sessionFor("limits-intruder-user");
+
+    const res = await fetch(`${baseUrl}/api/models/m1/verified-limits?worker=${worker.id}`, {
+      headers: authed(intruderToken),
+    });
+    expect(res.status).toBe(403);
+  });
+
+  it("the owner can read their own machine's verified limits", async () => {
+    const worker = repo.workerRepo.getOrCreateByMachineId("limits-owner-ok", "limits-owner-ok");
+    const { userId, token } = await sessionFor("limits-owner");
+    claimWorker(worker.id, userId);
+    repo.limitsRepo.upsert({
+      worker_id: worker.id,
+      model_id: "m1",
+      llama_cpp_build: "b1",
+      cache_type_k: "f16",
+      cache_type_v: "f16",
+      placement_hash: "hash-1",
+      verified_ctx_tokens: 8192,
+    });
+
+    const res = await fetch(`${baseUrl}/api/models/m1/verified-limits?worker=${worker.id}`, { headers: authed(token) });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { model_id: string; worker_id: string; limits: { verified_ctx_tokens: number }[] };
+    expect(body.model_id).toBe("m1");
+    expect(body.worker_id).toBe(worker.id);
+    expect(body.limits.some((l) => l.verified_ctx_tokens === 8192)).toBe(true);
+  });
+
+  it("an unauthenticated caller (single-tenant mode) can read any machine's limits regardless of ownership", async () => {
+    const worker = repo.workerRepo.getOrCreateByMachineId("limits-single-tenant", "limits-single-tenant");
+    const { userId } = await sessionFor("limits-single-tenant-owner");
+    claimWorker(worker.id, userId);
+
+    const res = await fetch(`${baseUrl}/api/models/m1/verified-limits?worker=${worker.id}`);
+    expect(res.status).toBe(200);
   });
 });

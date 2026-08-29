@@ -32,7 +32,7 @@ import { Link } from "react-router-dom";
 import { api } from "../api/client";
 import { useWorkerStatuses } from "../api/useWorkerStatus";
 import { ModelPicker } from "../components/ModelPicker";
-import { GoalQuestionnaire } from "../components/GoalQuestionnaire";
+import { GoalQuestionnaire, KV_PRESET_LABEL } from "../components/GoalQuestionnaire";
 import { RunStatusPill } from "../components/StatusPill";
 import { IconArrowRight, IconChevronDown, IconInfo } from "../components/icons";
 import { backendVisibleGpus } from "../types";
@@ -43,10 +43,7 @@ import {
   defaultGoals,
   goalsEqualDefaults,
   normalizeGoals,
-  pruneCacheTypes,
-  ensureUnquantizedPairSurvives,
-  recommendedKvGrid,
-  DEFAULT_RECOMMENDED_KV_PAIRS,
+  kvPresetPairs,
   WORKLOAD_WEIGHTS,
   type GoalsConfig,
 } from "../goals";
@@ -77,8 +74,7 @@ const STAGE_START_LABEL: Record<StageKind, string> = {
 // P0.5 -- below 3 repeats llama-bench reports a standard deviation of
 // exactly 0, so §0.3's stability gate would pass on a number that was never
 // measured. 1 and 2 stay VISIBLE and disabled (with the reason) rather than
-// being dropped from the row: the mockup's own posture, and the same one
-// GoalQuestionnaire's pruned KV chips take.
+// being dropped from the row: the mockup's own posture.
 const REPEAT_CHOICES = [1, 2, 3, 5, 10] as const;
 const MIN_SCORING_REPEATS = 3;
 
@@ -116,10 +112,31 @@ function chainStorageKey(modelId: string, workerId: string): string {
   return `llamatoaster:benchmark:chain:${modelId}:${workerId}`;
 }
 
+// Placement (the offload slider) is machine-specific, not workload intent --
+// M5's own principle for why goals travel with presets and placement never
+// does. Page-local, keyed to the pairing, same as chainStorageKey above.
+function placementStorageKey(modelId: string, workerId: string): string {
+  return `llamatoaster:benchmark:placement:${modelId}:${workerId}`;
+}
+
 const PRESETS_STORAGE_KEY = "llamatoaster:benchmark:presets";
 const REPEATS_STORAGE_KEY = "llamatoaster:benchmark:repeats";
+const AUTO_ADVANCE_STORAGE_KEY = "llamatoaster:benchmark:auto-advance";
 
 type ChainState = Partial<Record<StageKind, string>>;
+
+// The Step-2 placement fit check's own verify lifecycle -- ngl/ctx are
+// SNAPSHOTTED at the moment Verify was clicked (not a live reference to the
+// sliders), so the eventual result banner always names the placement it
+// actually checked even if the user keeps dragging while it's in flight.
+interface PlacementVerifyState {
+  ngl: number;
+  ctx: number;
+  runId: string;
+  status: "pending" | "verified" | "failed" | "failed_oom" | "error";
+  detail?: string;
+  verifiedCtxTokens?: number | null;
+}
 
 // M5 -- a preset here carries INTENT (goals + repeats) and nothing machine-
 // specific: no worker id, no ngl, no layer counts. That is the whole reason
@@ -204,21 +221,46 @@ function tuningSweep(input: StageInputs): Sweep {
   };
 }
 
+// Each side of a winner's neighbourhood decides independently whether Test
+// A's own grid already has a value past it. A winner sitting at that grid's
+// floor or ceiling extends past it (the +/-1-octave step the old scheme used
+// everywhere) since nothing out there has been measured; a winner elsewhere
+// refines within it (+/-25%) since Test A's own neighbour in that direction
+// is already a known, already-measured value.
+function refineNeighbors(winner: number, floor: number, ceiling: number): [number, number, number] {
+  const lower = winner === floor ? winner / 2 : winner * 0.75;
+  const upper = winner === ceiling ? winner * 2 : winner * 1.25;
+  return [lower, winner, upper];
+}
+
 // Test B. The mockup's "rules, not values yet": the neighbourhood is defined
-// here as one octave either side of whatever Test A actually won, so this
-// stage has no values at all until that result exists.
+// here as refineNeighbors() of whatever Test A actually won, so an interior
+// winner gets genuinely new candidates instead of Test A's own values
+// measured a second time, while an edge winner still probes past Test A's
+// own floor/ceiling. It also widens n_prompt to half and double the anchored
+// size, since a winner measured at one prompt length was never checked
+// against shorter or longer workloads. This stage has no values at all until
+// Test A's result exists.
 function refineSweep(input: StageInputs): Sweep {
   const coarse = tuningSweep(input);
   if (!input.tuned) return { ...coarse, batch_size: [], ubatch_size: [] };
-  const batches = [...new Set([input.tuned.batch / 2, input.tuned.batch, input.tuned.batch * 2])]
+  const batches = [
+    ...new Set(refineNeighbors(input.tuned.batch, Math.min(...COARSE_BATCHES), Math.max(...COARSE_BATCHES))),
+  ]
     .filter((b) => Number.isInteger(b) && b >= 32 && b <= 8192)
     .sort((a, b) => a - b);
   const smallestBatch = batches.length > 0 ? batches[0] : input.tuned.batch;
-  const ubatches = [...new Set([input.tuned.ubatch / 2, input.tuned.ubatch, input.tuned.ubatch * 2])]
+  const ubatches = [
+    ...new Set(refineNeighbors(input.tuned.ubatch, Math.min(...COARSE_UBATCHES), Math.max(...COARSE_UBATCHES))),
+  ]
     .filter((u) => Number.isInteger(u) && u >= 32 && u <= smallestBatch)
+    .sort((a, b) => a - b);
+  const nPrompts = [...new Set([Math.round(input.ppTokens * 0.5), input.ppTokens, input.ppTokens * 2])]
+    .filter((p) => Number.isInteger(p) && p >= 32)
     .sort((a, b) => a - b);
   return {
     ...coarse,
+    n_prompt: nPrompts.length > 0 ? nPrompts : [input.ppTokens],
     batch_size: batches.length > 0 ? batches : [input.tuned.batch],
     // Every candidate can exceed the smallest batch (a winner whose ubatch
     // already equals its batch) -- pin to that batch rather than emitting a
@@ -233,20 +275,15 @@ function refineSweep(input: StageInputs): Sweep {
 // two under `missing_pp_or_tg`.
 function sweepStageSweep(input: StageInputs): Sweep {
   const base = baseSweep(input);
-  const tolerance = input.goals.kv_tolerance ?? "q4_0_ok";
-  const recommended = recommendedKvGrid(tolerance);
-  // Same primitives NewRun.tsx prunes with, in the same order: prune to the
-  // tolerance, then re-add an unquantized pair if the tolerance took the
-  // last one (M4's inviolable rule -- flash-attention-off needs something to
-  // vary against).
-  const prunedK = pruneCacheTypes([...new Set(recommended.map(([k]) => k))], tolerance);
-  const prunedV = pruneCacheTypes([...new Set(recommended.map(([, v]) => v))], tolerance);
-  const { cache_type_k, cache_type_v } = ensureUnquantizedPairSurvives(
-    prunedK,
-    prunedV,
-    DEFAULT_RECOMMENDED_KV_PAIRS,
-    true
-  );
+  // The preset IS the exact set of (K,V) pairs this stage runs -- no
+  // tolerance-pruning step needed, since these curated lists never contain a
+  // pair the grid has to filter back out. cache_type_pairs carries the
+  // coupling through expandSweep (shared/sweep.ts); cache_type_k/v stay
+  // populated with the pairs' own unique values for any caller that only
+  // reads the plain axis arrays (e.g. display labels).
+  const pairs = kvPresetPairs(input.goals.kv_preset);
+  const cache_type_k = [...new Set(pairs.map(([k]) => k))];
+  const cache_type_v = [...new Set(pairs.map(([, v]) => v))];
 
   // Two offload points, not one: -ngl is an axis in this stage per the
   // mockup, and the second point is what a Low Memory card is scored from.
@@ -267,6 +304,7 @@ function sweepStageSweep(input: StageInputs): Sweep {
     ubatch_size: [input.tuned?.ubatch ?? 512],
     cache_type_k,
     cache_type_v,
+    cache_type_pairs: [...pairs],
     flash_attn: ["on", "off"],
     n_gpu_layers: nglAxis.length > 0 ? nglAxis : [0],
     n_depth: depthAxis,
@@ -281,18 +319,21 @@ function sweepForStage(stage: StageKind, input: StageInputs): Sweep {
 
 // The pp winner of a finished stage -- the only thing a tuning stage hands
 // downstream. Rows with a zero rate never won anything; they are failures
-// that still ingested a row.
-function bestPpPlacement(results: ResultRow[]): { batch: number; ubatch: number } | null {
-  const pp = results.filter((r) => r.test_type === "pp" && r.avg_tps > 0);
+// that still ingested a row. anchorPrompt pins the comparison to the one
+// n_prompt every stage is anchored on: refine's own n_prompt axis now spans
+// 0.5x/1x/2x that value (see refineSweep), and comparing across all three
+// would just hand the next stage whichever prompt length happens to score
+// the highest tok/s, not the batch/ubatch that actually won at the anchor.
+function bestPpPlacement(results: ResultRow[], anchorPrompt: number): { batch: number; ubatch: number } | null {
+  const pp = results.filter((r) => r.test_type === "pp" && r.avg_tps > 0 && r.n_prompt === anchorPrompt);
   if (pp.length === 0) return null;
   const best = pp.reduce((a, b) => (b.avg_tps > a.avg_tps ? b : a));
   return { batch: best.batch_size, ubatch: best.ubatch_size };
 }
 
-// The KV pairs the sweep stage will ACTUALLY expand to. Rendered instead of
-// the axis values because the cross-product of two pruned axes is a superset
-// of the recommended pair list, and M4's whole point is that the page shows
-// what runs rather than something the count has to be reconciled against.
+// The KV pairs the sweep stage will ACTUALLY expand to -- exactly the chosen
+// preset's curated list now that cache_type_pairs carries the coupling
+// through expandSweep, rather than a cross-product superset of it.
 function expandedKvPairs(sweep: Sweep): string[] {
   const pairs = new Set<string>();
   for (const item of expandSweep(sweep)) pairs.add(`${item.cache_type_k} / ${item.cache_type_v}`);
@@ -327,7 +368,7 @@ export function Benchmark() {
 
   // Step 1's compact facts strip hides everything else behind these two
   // disclosures by default -- the same "collapsed, one click away" posture
-  // as GoalQuestionnaire's own KV-tolerance section.
+  // as GoalQuestionnaire's own KV-preset section.
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [scoringDetailsOpen, setScoringDetailsOpen] = useState(false);
 
@@ -335,8 +376,24 @@ export function Benchmark() {
   const [stageData, setStageData] = useState<Record<string, { run: Run; results: ResultRow[] }>>({});
   const [busyStage, setBusyStage] = useState<StageKind | null>(null);
   const [msg, setMsg] = useState("");
+  const [autoAdvance, setAutoAdvance] = useState<boolean>(() => readJson<boolean>(AUTO_ADVANCE_STORAGE_KEY) ?? false);
+  // Guards each parent->child hand-off to at most one attempt per parent run:
+  // keyed on the parent's own run id, so a re-run of the parent (new id) is
+  // free to retry, but a failed trigger is not retried every 5s poll tick.
+  const autoAdvanceAttempted = useRef<Set<string>>(new Set());
 
   const [rates, setRates] = useState<ModelRatesResponse | null>(null);
+
+  // Step 2's placement (offload) slider -- null means "use the auto-derived
+  // default" (today's silent auto-cap), a number once the user has actually
+  // dragged it. Never part of `goals`/presets -- see placementStorageKey.
+  const [nglOverride, setNglOverride] = useState<number | null>(null);
+  const [verifyState, setVerifyState] = useState<PlacementVerifyState | null>(null);
+  // A real failed/failed_oom verify result means the estimate was wrong at
+  // that point -- bumped so the NEXT round of suggestions doesn't just
+  // recompute the same number that already failed, rather than trusting the
+  // live reading at full confidence forever.
+  const [poolHaircutFrac, setPoolHaircutFrac] = useState(0);
 
   useEffect(() => {
     (async () => {
@@ -412,6 +469,9 @@ export function Benchmark() {
       setGoals(defaultGoals());
       setGoalsUnset(true);
       setChain({});
+      setNglOverride(null);
+      setVerifyState(null);
+      setPoolHaircutFrac(0);
       return;
     }
     const stored = readJson<unknown>(goalsStorageKey(modelId, workerId));
@@ -419,11 +479,23 @@ export function Benchmark() {
     setGoals(restored ?? defaultGoals());
     setGoalsUnset(restored == null);
     setChain(readJson<ChainState>(chainStorageKey(modelId, workerId)) ?? {});
+    setNglOverride(readJson<number>(placementStorageKey(modelId, workerId)));
+    setVerifyState(null);
+    setPoolHaircutFrac(0);
   }, [modelId, workerId]);
+
+  useEffect(() => {
+    if (!modelId || !workerId || nglOverride == null) return;
+    writeJson(placementStorageKey(modelId, workerId), nglOverride);
+  }, [modelId, workerId, nglOverride]);
 
   useEffect(() => {
     writeJson(REPEATS_STORAGE_KEY, repeats);
   }, [repeats]);
+
+  useEffect(() => {
+    writeJson(AUTO_ADVANCE_STORAGE_KEY, autoAdvance);
+  }, [autoAdvance]);
 
   const persistChain = useCallback(
     (next: ChainState) => {
@@ -507,6 +579,13 @@ export function Benchmark() {
 
   const liveVramTotalMib = selectedWorker?.vram?.gpu_memory_total_mib ?? null;
   const liveVramFreeMib = selectedWorker?.vram?.vram_free_before_mib ?? null;
+  const liveRamTotalMib = selectedWorker?.vram?.system_memory_total_mib ?? null;
+  const liveRamFreeMib = selectedWorker?.vram?.ram_free_before_mib ?? null;
+
+  // Metal, or any visible GPU with vram_dynamic:true (a shared-memory iGPU)
+  // -- VRAM and RAM describe the same physical bytes, so the offload slider
+  // has nothing real to trade and stays locked full-GPU (see effectiveNgl).
+  const unifiedPool = selectedWorker?.vram?.backend === "metal" || visibleGpus.some((g) => g.vram_dynamic === true);
 
   const threads = Math.max(1, (workerHardware?.cpu.cores ?? 8) - 1);
 
@@ -533,6 +612,13 @@ export function Benchmark() {
   }, [selectedModel, baseLayerCount, liveVramFreeMib, fullNgl]);
   const stageNgl = vramCap ? vramCap.safeNgl : fullNgl;
 
+  // The placement that ACTUALLY runs every stage: stageNgl's auto-cap is
+  // only ever the slider's initial default now -- once the user drags it
+  // (nglOverride set), their choice wins. Locked machines (CPU-only, unified
+  // memory) ignore both and use their own fixed point, matching the
+  // slider-lock rules the fit matrix enforces in GoalQuestionnaire.
+  const effectiveNgl = noGpu ? 0 : unifiedPool ? baseLayerCount ?? NGL_FALLBACK_MAX : nglOverride ?? stageNgl;
+
   // M1's inverse estimate, for the two KV pairs the questionnaire itself
   // talks about. Never gates anything: it ranks and annotates.
   const affordability = useMemo(() => {
@@ -540,7 +626,7 @@ export function Benchmark() {
     const weightsMib = estimateVramNeededMib({
       modelSizeBytes: selectedModel.size_bytes,
       totalModelLayers: baseLayerCount,
-      requestedNgl: stageNgl,
+      requestedNgl: effectiveNgl,
     });
     const shared = {
       totalMib: liveVramTotalMib,
@@ -559,7 +645,7 @@ export function Benchmark() {
       f16: maxAffordableContext({ ...shared, cacheTypeK: "f16", cacheTypeV: "f16" }),
       q8: maxAffordableContext({ ...shared, cacheTypeK: "q8_0", cacheTypeV: "q8_0" }),
     };
-  }, [liveVramTotalMib, selectedModel, baseLayerCount, modelLayerCount, stageNgl, trainedCtx]);
+  }, [liveVramTotalMib, selectedModel, baseLayerCount, modelLayerCount, effectiveNgl, trainedCtx]);
 
   // --- the chain ------------------------------------------------------------
 
@@ -575,9 +661,9 @@ export function Benchmark() {
       if (!id) return null;
       const data = stageData[id];
       if (!data || !TERMINAL.has(data.run.status)) return null;
-      return bestPpPlacement(data.results);
+      return bestPpPlacement(data.results, ppTokens);
     },
-    [chain, stageData]
+    [chain, stageData, ppTokens]
   );
 
   const stageInputs = useCallback(
@@ -588,14 +674,14 @@ export function Benchmark() {
       // paying for a tg phase in each of them buys nothing.
       nGen: stage === "sweep" ? 128 : 0,
       threads,
-      ngl: stageNgl,
+      ngl: effectiveNgl,
       cpuMoe: 0,
       repeats,
       goals,
       tuned: stage === "sweep" ? tunedFrom("refine") ?? tunedFrom("tuning") : stage === "refine" ? tunedFrom("tuning") : null,
       noGpu,
     }),
-    [ppTokens, threads, stageNgl, repeats, goals, tunedFrom, noGpu]
+    [ppTokens, threads, effectiveNgl, repeats, goals, tunedFrom, noGpu]
   );
 
   const stagePlans = useMemo(
@@ -692,6 +778,123 @@ export function Benchmark() {
     }
   }
 
+  // Step 2's fit-check "Verify" -- rides the ordinary N2 probe trigger,
+  // exactly the way ProfileCards.tsx's own verifyWithProbe already does for
+  // a scored card, just sourced from the placement sliders instead of a
+  // ScoredConfig, and callable before any chain run exists (a probe root is
+  // standalone, never part of the chain). f16/f16 anchors the check, same
+  // convention GoalQuestionnaire's own feasibility readout already uses.
+  // Disables synchronously (setVerifyState before the await) so a
+  // double-click can never fire two triggers.
+  async function verifyPlacement(ngl: number, ctx: number): Promise<void> {
+    if (!modelId || !workerId || verifyState?.status === "pending") return;
+    setVerifyState({ ngl, ctx, runId: "", status: "pending" });
+    try {
+      const selectedGpu = selectedGpuRawIndex != null ? visibleGpus[selectedGpuRawIndex] : undefined;
+      const run = await api.triggerRun({
+        model_id: modelId,
+        worker_id: workerId,
+        kind: "probe",
+        main_gpu: selectedGpu ? selectedGpuRawIndex : undefined,
+        probe: {
+          candidate_ctx: ctx,
+          placement: { ngl, slots: 1 },
+          kv_pair: ["f16", "f16"],
+        },
+        // Vestigial -- the worker derives its own n_prompt/n_gen from
+        // candidate_ctx for a probe load (see worker/src/index.ts's
+        // runOneProbeLoad); this block only needs to satisfy the trigger
+        // route's own validation and create the tracked run_item.
+        sweep: {
+          n_prompt: [512],
+          n_gen: [128],
+          threads: [threads],
+          n_gpu_layers: [ngl],
+          batch_size: [2048],
+          ubatch_size: [512],
+          cache_type_k: ["f16"],
+          cache_type_v: ["f16"],
+          flash_attn: ["on"],
+          mtp: ["off"],
+          n_gpu_layers_draft: [0],
+          n_cpu_moe: [0],
+          repeats: 1,
+        },
+      });
+      setVerifyState({ ngl, ctx, runId: run.id, status: "pending" });
+    } catch (err) {
+      setVerifyState({ ngl, ctx, runId: "", status: "error", detail: err instanceof Error ? err.message : String(err) });
+    }
+  }
+
+  // Polls the probe root independently of chainIds -- it is never part of
+  // the tuning->refine->sweep chain. Coarse pass/fail/OOM comes straight off
+  // items[0] (TerminalRunItemStatus distinguishes failed_oom from failed
+  // even though the aggregate Run.status collapses both to "failed"); a
+  // verified pass then looks up the precise ceiling via the dedicated route.
+  useEffect(() => {
+    if (!verifyState || verifyState.status !== "pending" || !verifyState.runId) return;
+    let cancelled = false;
+    let timer: number | undefined;
+    const runId = verifyState.runId;
+    async function poll() {
+      try {
+        const res = await api.getRun(runId);
+        if (cancelled) return;
+        if (TERMINAL.has(res.run.status)) {
+          const item = res.items[0];
+          const status: PlacementVerifyState["status"] =
+            item?.status === "failed_oom" ? "failed_oom" : item?.status === "done" ? "verified" : "failed";
+          setVerifyState((prev) => (prev && prev.runId === runId ? { ...prev, status, detail: item?.detail } : prev));
+          if (status === "failed" || status === "failed_oom") {
+            setPoolHaircutFrac((f) => Math.min(0.3, f === 0 ? 0.15 : 0.3));
+          }
+          if (status === "verified" && modelId && workerId) {
+            try {
+              const limits = await api.getVerifiedLimits(modelId, workerId);
+              const match = limits.limits
+                .filter((l) => l.kv_type === "f16/f16")
+                .sort((a, b) => b.created_at - a.created_at)[0];
+              if (!cancelled && match) {
+                setVerifyState((prev) =>
+                  prev && prev.runId === runId ? { ...prev, verifiedCtxTokens: match.verified_ctx_tokens } : prev
+                );
+              }
+            } catch {
+              /* advisory upgrade only -- the coarse verdict above already landed */
+            }
+          }
+          return;
+        }
+      } catch {
+        /* transient -- keep polling */
+      }
+      timer = window.setTimeout(poll, 5000);
+    }
+    void poll();
+    return () => {
+      cancelled = true;
+      if (timer) window.clearTimeout(timer);
+    };
+  }, [verifyState?.runId, verifyState?.status, modelId, workerId]);
+
+  // Fires the same transition the "Start Test B"/"Start Sweep" buttons do,
+  // the moment stageState says a stage is startable -- so autoAdvance is
+  // never a second code path, just this page clicking its own button.
+  useEffect(() => {
+    if (!autoAdvance) return;
+    for (const stage of STAGES) {
+      const parent = stage === "refine" ? "tuning" : stage === "sweep" ? "refine" : null;
+      if (!parent || chain[stage]) continue;
+      if (stageState(stage) !== "startable") continue;
+      const key = `${stage}:${chain[parent]}`;
+      if (autoAdvanceAttempted.current.has(key)) continue;
+      autoAdvanceAttempted.current.add(key);
+      void startStage(stage);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- stageState/startStage close over chain+stageData, already deps below
+  }, [autoAdvance, chain, stageData]);
+
   function resetAll(): void {
     setGoals(defaultGoals());
     setGoalsUnset(true);
@@ -702,7 +905,7 @@ export function Benchmark() {
   }
 
   function savePreset(): void {
-    const name = window.prompt("Save this intent (goal, target context, workload shape, KV tolerance, repeats) as:");
+    const name = window.prompt("Save this intent (goal, target context, workload shape, KV cache preset, repeats) as:");
     if (!name) return;
     const next = { ...presets, [name]: { goals, repeats } };
     setPresets(next);
@@ -722,10 +925,6 @@ export function Benchmark() {
 
   const sweepPlan = stagePlans.find((p) => p.stage === "sweep")!;
   const kvPairs = useMemo(() => expandedKvPairs(sweepPlan.sweep), [sweepPlan.sweep]);
-  const prunedPairs = useMemo(() => {
-    const kept = new Set(recommendedKvGrid(goals.kv_tolerance ?? "q4_0_ok").map(([k, v]) => `${k} / ${v}`));
-    return DEFAULT_RECOMMENDED_KV_PAIRS.map(([k, v]) => `${k} / ${v}`).filter((p) => !kept.has(p));
-  }, [goals.kv_tolerance]);
 
   const cardsRunId = chain.sweep ?? null;
   const ready = Boolean(modelId && workerId);
@@ -991,6 +1190,26 @@ export function Benchmark() {
                 nHead: selectedModel?.metadata.n_head,
                 slidingWindow: selectedModel?.metadata.sliding_window,
               }}
+              placement={
+                selectedModel && baseLayerCount != null
+                  ? {
+                      ngl: effectiveNgl,
+                      onNglChange: setNglOverride,
+                      nglMax: baseLayerCount,
+                      kvLayerCount: modelLayerCount ?? 0,
+                      modelSizeBytes: selectedModel.size_bytes,
+                      locked: noGpu ? "cpu" : unifiedPool ? "unified" : null,
+                      vram: { freeMib: liveVramFreeMib, totalMib: liveVramTotalMib },
+                      ram: { freeMib: liveRamFreeMib, totalMib: liveRamTotalMib },
+                      unifiedPool,
+                      noGpu,
+                      poolHaircutFrac,
+                      onVerify: verifyPlacement,
+                      verifying: verifyState?.status === "pending",
+                      verifyResult: verifyState,
+                    }
+                  : undefined
+              }
             />
           </Step>
 
@@ -1003,7 +1222,17 @@ export function Benchmark() {
               </span>
             </div>
 
-            <div className="flex flex-wrap items-stretch gap-y-2">
+            <label className="mt-2 flex items-center gap-2 text-[11.5px] text-muted">
+              <input
+                type="checkbox"
+                checked={autoAdvance}
+                onChange={(e) => setAutoAdvance(e.target.checked)}
+                className="h-3.5 w-3.5 accent-accent"
+              />
+              Auto-start the next stage as soon as the previous one finishes
+            </label>
+
+            <div className="mt-2 flex flex-wrap items-stretch gap-y-2">
               {stagePlans.map((plan) => {
                 const state = stageState(plan.stage);
                 const highlight = state === "startable" || state === "live";
@@ -1134,7 +1363,10 @@ export function Benchmark() {
                 <div className="mt-2.5 rounded-lg border border-border bg-surface-raised p-3.5">
                   {/* M4 -- the axis, as it will actually expand ------------ */}
                   <p className="text-[11.5px] leading-relaxed text-muted">
-                    <b className="text-fg">Sweep axis after your tolerance:</b>{" "}
+                    <b className="text-fg">
+                      Sweep axis ({KV_PRESET_LABEL[goals.kv_preset ?? "extended"]} preset, {kvPairs.length} pair
+                      {kvPairs.length === 1 ? "" : "s"}):
+                    </b>{" "}
                     {kvPairs.map((pair) => (
                       <span
                         key={pair}
@@ -1143,22 +1375,7 @@ export function Benchmark() {
                         {pair}
                       </span>
                     ))}
-                    {prunedPairs.map((pair) => (
-                      <span
-                        key={pair}
-                        className="mr-1.5 inline-block rounded-full border border-border bg-surface px-2 py-0.5 font-mono text-[11px] text-muted line-through opacity-60"
-                      >
-                        {pair}
-                      </span>
-                    ))}
-                    {prunedPairs.length > 0 ? (
-                      <>
-                        — removed by your KV tolerance before expansion, so the {sweepPlan.itemCount}-test count above
-                        already reflects it. The stage says the axis shrank rather than letting the count imply it.
-                      </>
-                    ) : (
-                      <>— nothing is pruned at this tolerance.</>
-                    )}
+                    — the {sweepPlan.itemCount}-test count above already reflects it.
                   </p>
 
                   {/* M7/M2 -- held fields keep their reasons ---------------- */}
@@ -1302,7 +1519,7 @@ export function Benchmark() {
             <button
               type="button"
               onClick={savePreset}
-              title="Saves the goals block and repeat count — goal, target context, workload shape, KV tolerance. Describes your workload, not a machine, so it loads verbatim on any pairing."
+              title="Saves the goals block and repeat count — goal, target context, workload shape, KV cache preset. Describes your workload, not a machine, so it loads verbatim on any pairing."
               className="text-muted hover:text-fg"
             >
               Save preset
@@ -1348,7 +1565,7 @@ export function Benchmark() {
 // narrative, not a general-purpose disclosure.
 //
 // Collapsing hides the body with `hidden` rather than unmounting it, so a
-// step's own state (Step 1's detailsOpen, GoalQuestionnaire's KV-tolerance
+// step's own state (Step 1's detailsOpen, GoalQuestionnaire's KV-preset
 // disclosure) survives being closed and reopened.
 function Step({
   n,

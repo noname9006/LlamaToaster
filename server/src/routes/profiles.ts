@@ -5,7 +5,7 @@
 
 import type { FastifyInstance } from "fastify";
 import { repo } from "../db/repo.js";
-import { resolveAuthUser } from "../auth-middleware.js";
+import { resolveAuthUser, assertOwnsWorker } from "../auth-middleware.js";
 import type { Model, ResultRow, RunConfig } from "../../../shared/types.js";
 import { scoreProfiles, tupleKey, type ScoringRow, type ScoringResult } from "../../../shared/scoring.js";
 import type { ConfigHashInput } from "../../../shared/configHash.js";
@@ -13,6 +13,7 @@ import { maxAffordableContext, residentWeightsMibFromPeak } from "../../../share
 import type { MaxCtxEstimate } from "../../../shared/vramEstimate.js";
 import { normalizeGoals, defaultGoals, type GoalsConfig } from "../../../shared/goals.js";
 import type { VerifiedLimit, QualityRow } from "../db/repo.js";
+import type { VerifiedLimitDto } from "../../../shared/api-v8.js";
 
 export interface ProfilesResponse {
   run_id: string;
@@ -45,7 +46,7 @@ function goalsFromQuery(
   stored: GoalsConfig | undefined,
   query: Record<string, string | undefined>
 ): { goals: GoalsConfig; overridden: boolean } {
-  const hasOverride = ["goal", "target_ctx", "workload", "speed_floor_frac", "kv_tolerance"].some(
+  const hasOverride = ["goal", "target_ctx", "workload", "speed_floor_frac", "kv_preset"].some(
     (k) => query[k] !== undefined
   );
   if (!hasOverride) return { goals: stored ?? defaultGoals(), overridden: false };
@@ -53,7 +54,7 @@ function goalsFromQuery(
   const merged = normalizeGoals({
     goal: query.goal ?? base.goal,
     workload: query.workload ?? base.workload,
-    kv_tolerance: query.kv_tolerance ?? base.kv_tolerance,
+    kv_preset: query.kv_preset ?? base.kv_preset,
     speed_floor_frac:
       query.speed_floor_frac !== undefined ? Number(query.speed_floor_frac) : base.speed_floor_frac,
     target_ctx:
@@ -318,6 +319,31 @@ export async function profilesRoutes(app: FastifyInstance): Promise<void> {
         target_ctx_clamped: clamped.clamped,
       };
       return body;
+    }
+  );
+
+  // N2's verified ceilings, readable WITHOUT an existing sweep run -- the
+  // Benchmark page's live fit matrix needs this before any chain run exists,
+  // whereas /api/runs/:id/profiles above only ever surfaces it as a
+  // side-effect of already owning a run tied to the same model+worker. This
+  // is new surface area, so it authorizes the same way every other
+  // worker-scoped GET route does (assertOwnsWorker, see /api/workers/:id/vram)
+  // rather than reusing a run's own ownership as a proxy.
+  app.get<{ Params: { id: string }; Querystring: { worker?: string } }>(
+    "/api/models/:id/verified-limits",
+    async (request, reply) => {
+      const model = repo.getModel(request.params.id);
+      if (!model) return reply.code(404).send({ error: "model not found" });
+
+      const workerId = request.query.worker;
+      if (!workerId) return reply.code(400).send({ error: "worker query parameter is required" });
+
+      const worker = repo.workerRepo.getWorker(workerId);
+      if (!worker) return reply.code(404).send({ error: "unknown machine" });
+      assertOwnsWorker(resolveAuthUser(request)?.user.id, worker.id);
+
+      const limits: VerifiedLimitDto[] = repo.limitsRepo.listForModelAndWorker(model.id, worker.id);
+      return { model_id: model.id, worker_id: worker.id, limits };
     }
   );
 }
