@@ -31,6 +31,7 @@ import {
   type SuggestedConfig,
   type SuggestedConfigLabel,
   type SuggestionResult,
+  type TensorLayerBreakdown,
 } from "../vramEstimate";
 
 export interface GoalQuestionnaireProps {
@@ -67,6 +68,13 @@ export interface GoalQuestionnaireProps {
     /** Raw n_layer (no +1) -- only transformer layers carry a KV cache. */
     kvLayerCount: number;
     modelSizeBytes: number | null;
+    /**
+     * Real per-tensor weight-byte breakdown (see shared/vramEstimate.ts's
+     * TensorLayerBreakdown/placeWeightBytes) -- drives an accurate fit check
+     * instead of the flat per-layer average when available. Absent/null for
+     * a model registered before this existed.
+     */
+    tensorBreakdown?: TensorLayerBreakdown | null;
     /** Non-null when the slider is locked and pinned -- see the lock rules. */
     locked: "cpu" | "unified" | null;
     vram: PoolReading;
@@ -267,6 +275,7 @@ export function GoalQuestionnaire({
         vram: { freeMib: haircut(placement.vram.freeMib, placement.poolHaircutFrac), totalMib: placement.vram.totalMib },
         ram: { freeMib: haircut(placement.ram.freeMib, placement.poolHaircutFrac), totalMib: placement.ram.totalMib },
         unifiedPool: placement.unifiedPool,
+        tensorBreakdown: placement.tensorBreakdown,
       })
     : null;
 
@@ -293,6 +302,7 @@ export function GoalQuestionnaire({
           ram: { freeMib: haircut(placement.ram.freeMib, placement.poolHaircutFrac), totalMib: placement.ram.totalMib },
           unifiedPool: placement.unifiedPool,
           noGpu: placement.noGpu,
+          tensorBreakdown: placement.tensorBreakdown,
         })
       : null;
 

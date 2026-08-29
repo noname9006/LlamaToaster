@@ -1,4 +1,5 @@
 import { open, type FileHandle } from "node:fs/promises";
+import type { TensorLayerBreakdown } from "../../shared/vramEstimate.js";
 
 // Minimal sequential reader over a GGUF file's metadata section -- just
 // enough to resolve <architecture>.block_count (the model's transformer
@@ -56,6 +57,12 @@ class GgufReader {
   private buf = Buffer.alloc(0);
   private bufPos = 0;
   private totalRead = 0;
+  // Logical stream position (bytes actually consumed via bytes(), independent
+  // of how far ensure()'s read-ahead has buffered past that point) -- used to
+  // locate the tensor data section's start once the tensor_info walk
+  // finishes, since GGUF stores each tensor's offset relative to that point
+  // rather than to the start of the file.
+  pos = 0;
 
   constructor(private fh: FileHandle) {}
 
@@ -77,6 +84,7 @@ class GgufReader {
     await this.ensure(n);
     const out = this.buf.subarray(this.bufPos, this.bufPos + n);
     this.bufPos += n;
+    this.pos += n;
     return out;
   }
 
@@ -255,6 +263,11 @@ export interface GgufInfo {
   // with sliding-window attention (Mistral/Gemma-style); null means plain
   // full attention, where KV cache grows linearly across the whole context.
   sliding_window: number | null;
+  // Real per-tensor weight-byte breakdown -- see TensorLayerBreakdown. Null
+  // whenever it can't be built: n_layer unresolved (nothing to size the
+  // per-block arrays against), the tensor_info walk failed, or the file has
+  // no tensors at all.
+  tensor_layer_bytes: TensorLayerBreakdown | null;
   // Local-only diagnostic for why n_layer/mtp_layers came back
   // null -- never sent over the wire (worker/src/index.ts logs it, nothing
   // else reads it), purely so a failed lookup says WHY instead of leaving
@@ -276,6 +289,7 @@ function emptyGgufInfo(debugReason: string): GgufInfo {
     n_embd: null,
     n_head: null,
     sliding_window: null,
+    tensor_layer_bytes: null,
     debugReason,
   };
 }
@@ -302,6 +316,10 @@ export async function readGgufInfo(filePath: string): Promise<GgufInfo> {
 
     let architecture: string | undefined;
     let fileType: number | undefined;
+    // GGUF's general.alignment -- each tensor's stored offset is a multiple
+    // of this, and the tensor data section itself starts at the first such
+    // multiple after tensor_info. Spec default is 32 when the key is absent.
+    let alignment = 32;
     const blockCounts = new Map<string, number>();
     const mtpLayerCounts = new Map<string, number>();
     // KV-cache geometry + trained context -- captured exactly like the maps
@@ -335,6 +353,9 @@ export async function readGgufInfo(filePath: string): Promise<GgufInfo> {
         architecture = await reader.string();
       } else if (key === "general.file_type" && valueType !== GGUF_TYPE.ARRAY && valueType !== GGUF_TYPE.STRING) {
         fileType = await reader.numeric(valueType);
+      } else if (key === "general.alignment" && valueType !== GGUF_TYPE.ARRAY && valueType !== GGUF_TYPE.STRING) {
+        const a = await reader.numeric(valueType);
+        if (a > 0) alignment = a;
       } else if (key.endsWith(".block_count") && valueType !== GGUF_TYPE.ARRAY && valueType !== GGUF_TYPE.STRING) {
         blockCounts.set(key, await reader.numeric(valueType));
       } else if (
@@ -381,6 +402,11 @@ export async function readGgufInfo(filePath: string): Promise<GgufInfo> {
     // already resolved -- it just leaves param_count null, same fail-soft
     // posture as every other field here.
     let param_count: number | null = null;
+    // Name + declared offset for every tensor -- gathered in the same walk as
+    // param_count (tensor_info can only be streamed through once) and turned
+    // into tensor_layer_bytes below via offset deltas, once the data
+    // section's start is known.
+    const tensorOffsets: { name: string; offset: number }[] = [];
     try {
       // No tensor_info_count field exists: the tensor_infos array follows the
       // KV metadata directly and is counted by the header's tensor_count
@@ -393,15 +419,16 @@ export async function readGgufInfo(filePath: string): Promise<GgufInfo> {
       }
       let total = 0n;
       for (let i = 0; i < tensorCount; i++) {
-        await reader.string(); // tensor name -- advanced past, not retained
+        const name = await reader.string();
         const nDims = await reader.u32();
         if (nDims > MAX_TENSOR_DIMS) throw new Error(`implausible tensor dim count ${nDims}`);
         let elements = 1n;
         for (let d = 0; d < nDims; d++) {
           elements *= BigInt(await reader.u64());
         }
-        await reader.u32(); // tensor type -- not needed for the element count
-        await reader.u64(); // tensor offset -- not needed for the element count
+        await reader.u32(); // tensor type -- not needed for the element count or the byte-size-by-offset-delta below
+        const offset = await reader.u64();
+        tensorOffsets.push({ name, offset });
         total += elements;
       }
       param_count = total <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(total) : null;
@@ -410,6 +437,33 @@ export async function readGgufInfo(filePath: string): Promise<GgufInfo> {
       // n_layer==null is not the trigger for logging this -- the KV walk's own
       // debugReason already covers that -- so just swallow the detail here.
       void tensorErr;
+    }
+
+    // Real per-tensor byte sizes, independent of quantization format: each
+    // tensor's stored length is the gap to the next tensor's offset (sorted
+    // by offset, since nothing guarantees tensor_info's declaration order
+    // matches on-disk order, even though real writers keep them the same),
+    // with the last tensor's length filled in from the file's own total size.
+    // This needs no per-ggml-type block-size table at all -- a brand new
+    // quantization format is sized correctly the moment llama.cpp can write
+    // it, with zero changes here. Isolated in its own try/catch for the same
+    // reason as param_count above: a corrupt/truncated data section must not
+    // disturb any already-resolved field.
+    let tensor_layer_bytes: TensorLayerBreakdown | null = null;
+    try {
+      if (n_layer != null && n_layer > 0 && tensorOffsets.length > 0) {
+        const dataSectionStart = Math.ceil(reader.pos / alignment) * alignment;
+        const fileSize = (await fh.stat()).size;
+        const sorted = [...tensorOffsets].sort((a, b) => a.offset - b.offset);
+        const sizes = new Map<string, number>();
+        for (let i = 0; i < sorted.length; i++) {
+          const next = i + 1 < sorted.length ? sorted[i + 1].offset : fileSize - dataSectionStart;
+          sizes.set(sorted[i].name, Math.max(0, next - sorted[i].offset));
+        }
+        tensor_layer_bytes = buildTensorLayerBreakdown(tensorOffsets.map((t) => ({ name: t.name, size: sizes.get(t.name) ?? 0 })), n_layer);
+      }
+    } catch (sizeErr) {
+      void sizeErr;
     }
 
     return {
@@ -433,6 +487,7 @@ export async function readGgufInfo(filePath: string): Promise<GgufInfo> {
       n_embd: embeddingLengths.get(`${architecture}.embedding_length`) ?? null,
       n_head: headCounts.get(`${architecture}.attention.head_count`) ?? null,
       sliding_window: slidingWindows.get(`${architecture}.attention.sliding_window`) ?? null,
+      tensor_layer_bytes,
       debugReason:
         n_layer === null ? `architecture "${architecture}" found but no ${architecture}.block_count key` : undefined,
     };
@@ -441,4 +496,59 @@ export async function readGgufInfo(filePath: string): Promise<GgufInfo> {
   } finally {
     await fh?.close().catch(() => {});
   }
+}
+
+// A block's transformer-block tensors, e.g. "blk.12.attn_q.weight" -- capture
+// group 1 is the block index, group 2 is everything after it.
+const BLOCK_TENSOR = /^blk\.(\d+)\.(.+)$/;
+// MoE expert-weight tensors, both real-world naming conventions: the modern
+// stacked 3D tensor llama.cpp itself writes ("ffn_gate_exps.weight") and the
+// older per-expert convention some conversion pipelines still produce
+// ("ffn_gate.3.weight", one tensor per expert index). Deliberately excludes
+// plain dense FFN tensors ("ffn_gate.weight", no _exps suffix or numeric
+// index) -- those are ordinary per-layer weights, not subject to
+// --n-cpu-moe.
+const MOE_EXPERT_TENSOR = /^ffn_(?:gate|up|down)(_exps)?(?:\.\d+)?\.(?:weight|bias)$/;
+
+function isMoeExpertTensorName(rest: string): boolean {
+  const m = MOE_EXPERT_TENSOR.exec(rest);
+  if (!m) return false;
+  return m[1] === "_exps" || /^ffn_(?:gate|up|down)\.\d+\./.test(rest);
+}
+
+// Buckets every tensor's real on-disk byte size (see readGgufInfo's caller
+// above) into the shape shared/vramEstimate.ts's placeWeightBytes consumes.
+// A block index found in a tensor name but outside [0, nLayer) (a malformed
+// or non-standard file) falls back to the "other" bucket rather than
+// crashing or silently growing the per-block arrays past the real layer
+// count.
+function buildTensorLayerBreakdown(tensors: { name: string; size: number }[], nLayer: number): TensorLayerBreakdown {
+  const dense = new Array(nLayer).fill(0);
+  const moe = new Array(nLayer).fill(0);
+  let embed = 0;
+  let output = 0;
+  let other = 0;
+
+  for (const t of tensors) {
+    const blockMatch = BLOCK_TENSOR.exec(t.name);
+    if (blockMatch) {
+      const idx = Number(blockMatch[1]);
+      if (Number.isInteger(idx) && idx >= 0 && idx < nLayer) {
+        if (isMoeExpertTensorName(blockMatch[2])) moe[idx] += t.size;
+        else dense[idx] += t.size;
+        continue;
+      }
+      other += t.size;
+      continue;
+    }
+    if (t.name.startsWith("token_embd.")) {
+      embed += t.size;
+    } else if (t.name.startsWith("output_norm.") || t.name.startsWith("output.")) {
+      output += t.size;
+    } else {
+      other += t.size;
+    }
+  }
+
+  return { dense, moe, embed, output, other };
 }

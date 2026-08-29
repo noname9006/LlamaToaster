@@ -3,6 +3,7 @@ import { resolve } from "node:path";
 import { existsSync, mkdirSync } from "node:fs";
 import { log } from "./log.js";
 import type { ModelDirFile, LocalModelState } from "../../shared/types.js";
+import type { TensorLayerBreakdown } from "../../shared/vramEstimate.js";
 
 export interface LocalCacheEntry {
   path: string;
@@ -37,6 +38,12 @@ export interface LocalCacheEntry {
   n_embd?: number;
   n_head?: number;
   sliding_window?: number;
+  // Real per-tensor weight-byte breakdown -- see ModelMetadata.tensor_layer_bytes
+  // (shared/types.ts) and TensorLayerBreakdown (shared/vramEstimate.ts).
+  // Stored as JSON text in the actual SQLite column (see SELECT_COLS/upsert/
+  // mapRow below) since better-sqlite3 binds only primitives -- this field
+  // itself stays the parsed object everywhere else.
+  tensor_layer_bytes?: TensorLayerBreakdown;
   // When this entry's GGUF header was last (successfully or unsuccessfully)
   // read -- gates backfillGgufMetadata's re-read window the same way
   // hf_checked_at gates HF re-verification, so a header that came back null
@@ -206,6 +213,13 @@ export class LocalModelCache {
     if (!cols.some((c) => c.name === "sliding_window")) {
       this.db.exec(`ALTER TABLE local_model_cache ADD COLUMN sliding_window INTEGER`);
     }
+    // Real per-tensor weight-byte breakdown, JSON-encoded (see
+    // LocalCacheEntry.tensor_layer_bytes's doc comment) -- SQLite has no
+    // array/object column type, so this is stored as TEXT like every other
+    // JSON-shaped column in this codebase (e.g. workers.model_files_json).
+    if (!cols.some((c) => c.name === "tensor_layer_bytes")) {
+      this.db.exec(`ALTER TABLE local_model_cache ADD COLUMN tensor_layer_bytes TEXT`);
+    }
     // First migration that adds the trained-context + KV-geometry columns
     // (this whole branch runs exactly once, the first time `trained_ctx`
     // appears). Rows written by an OLDER GGUF reader have those columns NULL
@@ -238,7 +252,7 @@ export class LocalModelCache {
   private static readonly SELECT_COLS =
     "path, size, mtime, sha256, hf_model_id, hf_checked_at, hf_deleted_at, " +
     "n_layer, mtp_layers, quant, param_count, gguf_checked_at, last_verified, state, " +
-    "trained_ctx, n_head_kv, head_dim_k, head_dim_v, n_embd, n_head, sliding_window";
+    "trained_ctx, n_head_kv, head_dim_k, head_dim_v, n_embd, n_head, sliding_window, tensor_layer_bytes";
 
   async get(path: string): Promise<LocalCacheEntry | null> {
     if (!this.db) throw new Error("Database not initialized");
@@ -275,8 +289,8 @@ export class LocalModelCache {
 
     this.db
       .prepare(
-        `INSERT INTO local_model_cache (path, size, mtime, sha256, hf_model_id, hf_checked_at, hf_deleted_at, n_layer, mtp_layers, quant, param_count, gguf_checked_at, last_verified, state, trained_ctx, n_head_kv, head_dim_k, head_dim_v, n_embd, n_head, sliding_window)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO local_model_cache (path, size, mtime, sha256, hf_model_id, hf_checked_at, hf_deleted_at, n_layer, mtp_layers, quant, param_count, gguf_checked_at, last_verified, state, trained_ctx, n_head_kv, head_dim_k, head_dim_v, n_embd, n_head, sliding_window, tensor_layer_bytes)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(path) DO UPDATE SET
            size = excluded.size,
            mtime = excluded.mtime,
@@ -297,7 +311,8 @@ export class LocalModelCache {
            head_dim_v = excluded.head_dim_v,
            n_embd = excluded.n_embd,
            n_head = excluded.n_head,
-           sliding_window = excluded.sliding_window`
+           sliding_window = excluded.sliding_window,
+           tensor_layer_bytes = excluded.tensor_layer_bytes`
       )
       .run(
         entry.path,
@@ -320,7 +335,8 @@ export class LocalModelCache {
         entry.head_dim_v ?? null,
         entry.n_embd ?? null,
         entry.n_head ?? null,
-        entry.sliding_window ?? null
+        entry.sliding_window ?? null,
+        entry.tensor_layer_bytes ? JSON.stringify(entry.tensor_layer_bytes) : null
       );
   }
 
@@ -405,6 +421,7 @@ export class LocalModelCache {
     n_embd: number | null;
     n_head: number | null;
     sliding_window: number | null;
+    tensor_layer_bytes: string | null;
   }): LocalCacheEntry {
     return {
       path: row.path,
@@ -428,7 +445,20 @@ export class LocalModelCache {
       n_embd: row.n_embd ?? undefined,
       n_head: row.n_head ?? undefined,
       sliding_window: row.sliding_window ?? undefined,
+      tensor_layer_bytes: parseTensorLayerBytes(row.tensor_layer_bytes),
     };
+  }
+}
+
+// Tolerant of a corrupt/foreign-written value in this column -- a bad parse
+// must not break every other field this row carries, same fail-soft posture
+// as readGgufInfo itself.
+function parseTensorLayerBytes(raw: string | null): TensorLayerBreakdown | undefined {
+  if (!raw) return undefined;
+  try {
+    return JSON.parse(raw) as TensorLayerBreakdown;
+  } catch {
+    return undefined;
   }
 }
 
