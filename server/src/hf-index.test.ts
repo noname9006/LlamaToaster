@@ -163,3 +163,31 @@ describe("findStaleRepos", () => {
     expect(stale).not.toContain("test/stale-deleted-repo");
   });
 });
+
+describe("getStaleRefreshMode", () => {
+  const ENV_KEY = "HF_INDEX_STALENESS_REFRESH_MODE";
+  const original = process.env[ENV_KEY];
+
+  afterAll(() => {
+    if (original === undefined) delete process.env[ENV_KEY];
+    else process.env[ENV_KEY] = original;
+  });
+
+  it("defaults to background when unset", () => {
+    delete process.env[ENV_KEY];
+    expect(hfIndex.getStaleRefreshMode()).toBe("background");
+  });
+
+  it("switches to on-demand only on an exact (case-insensitive) match", () => {
+    process.env[ENV_KEY] = "on-demand";
+    expect(hfIndex.getStaleRefreshMode()).toBe("on-demand");
+
+    process.env[ENV_KEY] = "ON-DEMAND";
+    expect(hfIndex.getStaleRefreshMode()).toBe("on-demand");
+
+    // Anything else (typo, unrelated value) falls back to the safe default
+    // rather than silently disabling the background sweep.
+    process.env[ENV_KEY] = "ondemand";
+    expect(hfIndex.getStaleRefreshMode()).toBe("background");
+  });
+});
