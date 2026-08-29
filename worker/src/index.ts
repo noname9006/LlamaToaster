@@ -44,6 +44,8 @@ import {
   estimateResidentGpuLayersFromBufferSizes,
   estimateVramNeededMib,
   isVramDiscrepancy,
+  computeDualPoolFit,
+  type TensorLayerBreakdown,
 } from "../../shared/vramEstimate.js";
 import {
   writeRawJson,
@@ -967,6 +969,9 @@ interface RunSweepItemInput {
   // finalizeSweepItemResult's VRAM-discrepancy check (see
   // shared/vramEstimate.ts), not used for anything else here.
   modelSizeBytes: number;
+  // Real per-tensor weight-byte breakdown -- same forwarding purpose as
+  // modelSizeBytes above, see ModelMetadata.tensor_layer_bytes.
+  tensorBreakdown: TensorLayerBreakdown | null;
   llamaBenchPath: string;
   backend: Backend;
   // See shared/types.ts's RunConfig.main_gpu -- forwarded to bench.ts's
@@ -1334,6 +1339,7 @@ async function finalizeSweepItemResult(
   baseline: FreeMemoryBaseline,
   mainGpu: number | undefined,
   modelSizeBytes: number,
+  tensorBreakdown: TensorLayerBreakdown | null,
   attempt = 0,
   // BENCHMARKING_PLAN_V8.md M6 -- the repeat count this item ran. The
   // thermally_throttled flag needs >= 4 repeats to be eligible at all (each
@@ -1371,12 +1377,16 @@ async function finalizeSweepItemResult(
   //      before tensor loading finished.
   // Neither path runs at all unless there's something real to compare: a
   // positive offload claim (both null/0 on a cpu-backend or -ngl 0 run --
-  // nothing to flag). Also skipped whenever item.n_cpu_moe > 0: a deliberate
-  // partial MoE-to-CPU placement *correctly* produces a smaller GPU share
-  // than either check expects (that's the whole point of --n-cpu-moe, see
+  // nothing to flag). Also skipped whenever item.n_cpu_moe > 0 AND there's no
+  // real tensorBreakdown to account for it: a deliberate partial MoE-to-CPU
+  // placement *correctly* produces a smaller GPU share than the flat-average
+  // estimate expects (that's the whole point of --n-cpu-moe, see
   // shared/sweep.ts's SweepItem.n_cpu_moe) -- without this guard, every
   // legitimate cpu-moe run would false-positive against the exact warning
-  // built to catch the opposite problem.
+  // built to catch the opposite problem. A real tensorBreakdown removes the
+  // need for the guard entirely, since estimateVramNeededMib's accurate path
+  // (see shared/vramEstimate.ts's placeWeightBytes) already subtracts the
+  // pinned-CPU expert bytes itself.
   let vramDiscrepancyWarning: string | undefined;
   // Structured sibling of the string below, carrying the same numbers onward
   // to formatOffloadLine (the log's offload line) and each result row's
@@ -1407,11 +1417,13 @@ async function finalizeSweepItemResult(
   // base vs draft, so llama.cpp's own output is the only honest source.
   const draftResident = computeResidentLayers(offload.draft, bench.modelBufferSizes?.draft ?? null);
 
-  if (item.n_cpu_moe === 0 && offload.main && offload.main.gpu_layers_loaded > 0) {
+  if ((item.n_cpu_moe === 0 || tensorBreakdown != null) && offload.main && offload.main.gpu_layers_loaded > 0) {
     const estimatedMib = estimateVramNeededMib({
       modelSizeBytes,
       totalModelLayers: offload.main.total_model_layers,
       requestedNgl: offload.main.gpu_layers_loaded,
+      nCpuMoe: item.n_cpu_moe,
+      tensorBreakdown,
     });
     if (estimatedMib != null && bench.modelBufferSizes?.main) {
       const { gpuMib, cpuMib } = bench.modelBufferSizes.main;
@@ -1959,6 +1971,7 @@ async function runSweepItem(input: RunSweepItemInput): Promise<SweepItemOutcome>
       baseline,
       input.mainGpu,
       input.modelSizeBytes,
+      input.tensorBreakdown,
       attempt,
       input.repeats,
       detectedCpuIsa
@@ -1996,6 +2009,8 @@ interface RunSweepItemViaServerInput {
   modelPath: string;
   // See RunSweepItemInput.modelSizeBytes above -- same purpose.
   modelSizeBytes: number;
+  // See RunSweepItemInput.tensorBreakdown above -- same purpose.
+  tensorBreakdown: TensorLayerBreakdown | null;
   mtpModelPath: string | undefined;
   llamaServerPath: string;
   port: number;
@@ -2103,6 +2118,7 @@ async function runSweepItemViaServer(input: RunSweepItemViaServerInput): Promise
       baseline,
       input.mainGpu,
       input.modelSizeBytes,
+      input.tensorBreakdown,
       attempt,
       input.repeats,
       detectedCpuIsa
@@ -2268,6 +2284,7 @@ async function executeRuntimeBenchmarkJob(
           baseline,
           payload.main_gpu,
           payload.model.size_bytes,
+          payload.model.metadata.tensor_layer_bytes ?? null,
           0,
           repeats,
           detectedCpuIsa
@@ -2365,6 +2382,7 @@ async function executeRuntimeBenchmarkJob(
       baseline,
       payload.main_gpu,
       payload.model.size_bytes,
+      payload.model.metadata.tensor_layer_bytes ?? null,
       0,
       repeats,
       detectedCpuIsa
@@ -2508,6 +2526,7 @@ async function executeBenchmarkJob(payload: BenchmarkJob): Promise<void> {
           timeoutMs: config.bench_timeout_ms,
           rawJsonDir: rawDir,
           modelSizeBytes: payload.model.size_bytes,
+          tensorBreakdown: payload.model.metadata.tensor_layer_bytes ?? null,
         };
         let outcome = await runSweepItemViaServer({ ...serverArgs, attempt: 0 });
         // retry_once_then_fail's single re-run (see SweepItemOutcome) --
@@ -2530,6 +2549,7 @@ async function executeBenchmarkJob(payload: BenchmarkJob): Promise<void> {
           vpsUrl: config.vps_url,
           rawJsonDir: rawDir,
           modelSizeBytes: payload.model.size_bytes,
+          tensorBreakdown: payload.model.metadata.tensor_layer_bytes ?? null,
         };
         let outcome = await runSweepItem({ ...benchArgs, attempt: 0 });
         if (outcome.retryForVramFallback) {
@@ -2903,6 +2923,50 @@ async function executeDownloadModelJob(
   }
 }
 
+// Logged right before each probe load so the run log shows a predicted
+// figure next to the real outcome the next line reports -- surfaces exactly
+// what shared/vramEstimate.ts's accurate tensor-based path (or its flat
+// fallback, for a model not yet carrying a tensor_layer_bytes breakdown)
+// predicts for THIS model/ngl/context/KV-type combination, before llama.cpp
+// ever loads it. Reuses computeDualPoolFit verbatim rather than a new
+// formula: only its weightsMib/kvMib figures are used here (freeMib is
+// irrelevant to a "how much is needed" log line, so vram/ram readings are
+// passed as unknown and unifiedPool is a light guess from the backend alone --
+// neither affects the needed-bytes math, only the `fits` verdict this caller
+// ignores). Returns null when the model's own header metadata can't support
+// even the flat fallback (n_layer or KV head geometry unresolved) -- the
+// caller then logs the candidate context with no estimate rather than a
+// fabricated one.
+function describeEstimatedMemoryNeed(payload: RunProbeJobPayload, candidateCtx: number): string | null {
+  const meta = payload.model.metadata;
+  const nLayer = meta.n_layer;
+  if (nLayer == null || nLayer <= 0 || meta.n_head_kv == null) return null;
+  const fit = computeDualPoolFit({
+    modelSizeBytes: payload.model.size_bytes,
+    totalModelLayers: nLayer + 1,
+    kvLayerCount: nLayer,
+    ngl: payload.placement.ngl,
+    ctxTokens: candidateCtx,
+    nHeadKv: meta.n_head_kv,
+    headDimK: meta.head_dim_k,
+    headDimV: meta.head_dim_v,
+    nEmbd: meta.n_embd,
+    nHead: meta.n_head,
+    cacheTypeK: payload.kvPair[0],
+    cacheTypeV: payload.kvPair[1],
+    slidingWindow: meta.sliding_window,
+    parallelSlots: payload.placement.slots,
+    vram: { freeMib: null, totalMib: payload.gpu_total_mib ?? null },
+    ram: { freeMib: null, totalMib: null },
+    unifiedPool: payload.llama_cpp_backend === "metal",
+    nCpuMoe: payload.placement.nCpuMoe,
+    tensorBreakdown: meta.tensor_layer_bytes ?? null,
+  });
+  const vramMib = Math.round(fit.gpu.weightsMib + fit.gpu.kvMib);
+  const ramMib = Math.round(fit.cpu.weightsMib + fit.cpu.kvMib);
+  return `estimated need: ${vramMib}MiB VRAM, ${ramMib}MiB RAM`;
+}
+
 // BENCHMARKING_PLAN_V8.md N2 -- the usable-config probe. Engine pinned to
 // llama-server: the tok/s floor below is meaningless on llama-bench, which
 // has no request lifecycle. At most THREE loads, ever (nextProbeStep enforces
@@ -2924,7 +2988,8 @@ async function executeRunProbeJob(payload: RunProbeJobPayload): Promise<void> {
   try {
     while (next && attempts.length < PROBE_MAX_LOADS) {
       const candidateCtx = next.candidateCtx;
-      log.info(`${label}: loading at candidate context ${candidateCtx}`);
+      const estimateNote = describeEstimatedMemoryNeed(payload, candidateCtx);
+      log.info(`${label}: loading at candidate context ${candidateCtx}${estimateNote ? ` -- ${estimateNote}` : ""}`);
       const attempt = await runOneProbeLoad({
         payload,
         modelPath,
@@ -2933,8 +2998,12 @@ async function executeRunProbeJob(payload: RunProbeJobPayload): Promise<void> {
         label,
       });
       attempts.push(attempt);
+      // Actual observed peak alongside the "estimated need" line logged
+      // before this load started -- lets a log reader compare predicted vs
+      // real without cross-referencing anything else.
+      const actualNote = attempt.vramPeakMib != null ? ` (actual VRAM peak: ${Math.round(attempt.vramPeakMib)}MiB)` : "";
       log.info(
-        `${label}: candidate ${candidateCtx} -> ${attempt.ok ? "ok" : "failed"}` +
+        `${label}: candidate ${candidateCtx} -> ${attempt.ok ? "ok" : "failed"}${actualNote}` +
           (attempt.error ? ` (${attempt.error})` : "")
       );
       next = nextProbeStep(attempts, { trainedCtx: payload.trained_ctx ?? null });

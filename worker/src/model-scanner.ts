@@ -432,6 +432,7 @@ export async function backfillGgufMetadata(modelDir: string, cache: LocalModelCa
       n_embd: info.n_embd ?? entry.n_embd,
       n_head: info.n_head ?? entry.n_head,
       sliding_window: info.sliding_window ?? entry.sliding_window,
+      tensor_layer_bytes: info.tensor_layer_bytes ?? entry.tensor_layer_bytes,
       gguf_checked_at: Date.now(),
       last_verified: entry.last_verified,
     });
@@ -678,6 +679,7 @@ export async function getModelFilesWithState(
       | "n_embd"
       | "n_head"
       | "sliding_window"
+      | "tensor_layer_bytes"
     > = {};
     if (entry.n_layer != null) ggufFields.n_layer = entry.n_layer;
     if (entry.mtp_layers != null) ggufFields.mtp_layers = entry.mtp_layers;
@@ -690,6 +692,7 @@ export async function getModelFilesWithState(
     if (entry.n_embd != null) ggufFields.n_embd = entry.n_embd;
     if (entry.n_head != null) ggufFields.n_head = entry.n_head;
     if (entry.sliding_window != null) ggufFields.sliding_window = entry.sliding_window;
+    if (entry.tensor_layer_bytes != null) ggufFields.tensor_layer_bytes = entry.tensor_layer_bytes;
 
     results.push({
       path: entry.path,

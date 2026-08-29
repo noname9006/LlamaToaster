@@ -592,22 +592,26 @@ export function Benchmark() {
   // The offload point every stage runs at: everything, unless the live free-
   // VRAM reading says everything will not fit, in which case the same
   // estimator NewRun.tsx's banner uses caps it. Advisory in both directions
-  // -- shared/vramEstimate.ts's flat per-layer average is weakest exactly
-  // where it matters most (MoE), which is why the cap is surfaced in the
-  // chain note rather than applied silently.
+  // -- shared/vramEstimate.ts's real per-tensor placement (see
+  // placeWeightBytes) is used whenever this model carries a tensor_layer_bytes
+  // breakdown; a model registered before that existed falls back to a flat
+  // per-layer average, weakest exactly where it matters most (MoE). Either
+  // way the cap is surfaced in the chain note rather than applied silently.
   const fullNgl = noGpu ? 0 : baseLayerCount ?? NGL_FALLBACK_MAX;
   const vramCap = useMemo(() => {
     if (!selectedModel || baseLayerCount == null || liveVramFreeMib == null || fullNgl <= 0) return null;
+    const tensorBreakdown = selectedModel.metadata.tensor_layer_bytes ?? null;
     const needed = estimateVramNeededMib({
       modelSizeBytes: selectedModel.size_bytes,
       totalModelLayers: baseLayerCount,
       requestedNgl: fullNgl,
+      tensorBreakdown,
     });
     if (needed == null || needed <= liveVramFreeMib) return null;
     return {
       neededMib: needed,
       freeMib: liveVramFreeMib,
-      safeNgl: estimateSafeNgl(selectedModel.size_bytes, baseLayerCount, liveVramFreeMib),
+      safeNgl: estimateSafeNgl(selectedModel.size_bytes, baseLayerCount, liveVramFreeMib, tensorBreakdown),
     };
   }, [selectedModel, baseLayerCount, liveVramFreeMib, fullNgl]);
   const stageNgl = vramCap ? vramCap.safeNgl : fullNgl;
@@ -627,6 +631,7 @@ export function Benchmark() {
       modelSizeBytes: selectedModel.size_bytes,
       totalModelLayers: baseLayerCount,
       requestedNgl: effectiveNgl,
+      tensorBreakdown: selectedModel.metadata.tensor_layer_bytes ?? null,
     });
     const shared = {
       totalMib: liveVramTotalMib,
@@ -1198,6 +1203,7 @@ export function Benchmark() {
                       nglMax: baseLayerCount,
                       kvLayerCount: modelLayerCount ?? 0,
                       modelSizeBytes: selectedModel.size_bytes,
+                      tensorBreakdown: selectedModel.metadata.tensor_layer_bytes ?? null,
                       locked: noGpu ? "cpu" : unifiedPool ? "unified" : null,
                       vram: { freeMib: liveVramFreeMib, totalMib: liveVramTotalMib },
                       ram: { freeMib: liveRamFreeMib, totalMib: liveRamTotalMib },

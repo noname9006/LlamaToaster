@@ -6,6 +6,7 @@ import {
   MIN_FEASIBLE_CTX,
   type DualPoolInput,
   type SuggestInput,
+  type TensorLayerBreakdown,
 } from "./vramEstimate.js";
 
 const BYTES_PER_MIB = 1024 * 1024;
@@ -45,6 +46,43 @@ describe("computeDualPoolFit", () => {
     expect(fit.gpu.weightsMib + fit.cpu.weightsMib).toBeCloseTo(MODEL.modelSizeBytes / BYTES_PER_MIB, 6);
     const wholeKv = estimateKvCacheMib({ ...MODEL, nLayer: MODEL.kvLayerCount, tokens: ctx }) ?? 0;
     expect(fit.gpu.kvMib + fit.cpu.kvMib).toBeCloseTo(wholeKv, 6);
+  });
+
+  // The reported real-world bug: a flat file-size/layer-count average spreads
+  // a share of the (often huge) token-embedding tensor across every
+  // requested layer, overstating VRAM need at partial offload. A real
+  // tensorBreakdown must report materially less GPU weight for the same
+  // (small) ngl once that embedding is correctly excluded.
+  it("with a real tensorBreakdown, reports less GPU weight than the flat average when a huge embedding is involved", () => {
+    const breakdown: TensorLayerBreakdown = {
+      dense: new Array(9).fill(1000 * BYTES_PER_MIB), // 9 layers, matches MODEL.kvLayerCount
+      moe: new Array(9).fill(0),
+      embed: 900_000 * BYTES_PER_MIB, // dwarfs the transformer blocks, e.g. a huge-vocab model
+      output: 100_000 * BYTES_PER_MIB,
+      other: 0,
+    };
+    // Same total file size either way (9000 + 900_000 + 100_000 = 1_009_000
+    // MiB across totalModelLayers:10) -- only the PLACEMENT assumption
+    // differs, isolating exactly what this fix changes.
+    const modelSizeBytes = 1_009_000 * BYTES_PER_MIB;
+    const flat = computeDualPoolFit(dualInput({ ngl: 2, modelSizeBytes }));
+    const accurate = computeDualPoolFit(dualInput({ ngl: 2, modelSizeBytes, tensorBreakdown: breakdown }));
+    expect(accurate.gpu.weightsMib).toBe(2000); // exactly 2 blocks' worth, no embedding share
+    expect(accurate.gpu.weightsMib).toBeLessThan(flat.gpu.weightsMib);
+  });
+
+  it("with a tensorBreakdown, --n-cpu-moe moves the pinned blocks' expert bytes from GPU to CPU", () => {
+    const breakdown: TensorLayerBreakdown = {
+      dense: new Array(9).fill(100 * BYTES_PER_MIB),
+      moe: new Array(9).fill(500 * BYTES_PER_MIB),
+      embed: 0,
+      output: 0,
+      other: 0,
+    };
+    const noCpuMoe = computeDualPoolFit(dualInput({ ngl: 9, tensorBreakdown: breakdown, nCpuMoe: 0 }));
+    const withCpuMoe = computeDualPoolFit(dualInput({ ngl: 9, tensorBreakdown: breakdown, nCpuMoe: 3 }));
+    expect(withCpuMoe.gpu.weightsMib).toBeCloseTo(noCpuMoe.gpu.weightsMib - 3 * 500, 6);
+    expect(withCpuMoe.cpu.weightsMib).toBeCloseTo(noCpuMoe.cpu.weightsMib + 3 * 500, 6);
   });
 
   it("keeps unified-pool need identical for every ngl -- VRAM and RAM are the same bytes", () => {

@@ -265,6 +265,55 @@ describe("readGgufInfo", () => {
     expect(info.n_layer).toBe(32);
   });
 
+  // tensor_layer_bytes must come from each tensor's REAL on-disk byte span
+  // (offset deltas + final file size), not from dims/param-count -- the whole
+  // point is it stays correct across quantization formats without a
+  // per-type size table. general.alignment is pinned to 1 here purely to
+  // keep the expected offsets/sizes in this test arithmetic-free; real files
+  // default to 32 (exercised implicitly by every other test in this file,
+  // which never sets it).
+  it("computes tensor_layer_bytes from real per-tensor byte offsets, independent of dims/quant", async () => {
+    const tensors = [
+      { name: "token_embd.weight", dims: [1], offset: 0, size: 100 }, // embed
+      { name: "blk.0.attn_q.weight", dims: [1], offset: 100, size: 50 }, // dense, layer 0
+      { name: "blk.0.ffn_gate_exps.weight", dims: [1], offset: 150, size: 300 }, // moe, layer 0 (modern stacked convention)
+      { name: "blk.1.attn_q.weight", dims: [1], offset: 450, size: 50 }, // dense, layer 1
+      { name: "blk.1.ffn_gate.2.weight", dims: [1], offset: 500, size: 70 }, // moe, layer 1 (legacy per-expert convention)
+      { name: "output_norm.weight", dims: [1], offset: 570, size: 10 }, // output
+      { name: "output.weight", dims: [1], offset: 580, size: 90 }, // output
+      { name: "rope_freqs.weight", dims: [1], offset: 670, size: 20 }, // other
+    ];
+    const totalDataBytes = tensors.reduce((sum, t) => sum + t.size, 0);
+    const header = buildGguf(
+      [
+        ["general.architecture", T.STRING, "qwen3moe"],
+        ["general.alignment", T.UINT32, 1],
+        ["qwen3moe.block_count", T.UINT32, 2],
+      ],
+      tensors.map(({ name, dims, offset }) => ({ name, dims, offset }))
+    );
+    const path = join(tmpDir, `test-tensor-layer-bytes-${counter++}.gguf`);
+    writeFileSync(path, Buffer.concat([header, Buffer.alloc(totalDataBytes)]));
+
+    const info = await readGgufInfo(path);
+    expect(info.tensor_layer_bytes).toEqual({
+      dense: [50, 50],
+      moe: [300, 70],
+      embed: 100,
+      output: 100,
+      other: 20,
+    });
+  });
+
+  it("leaves tensor_layer_bytes null when n_layer is unresolved", async () => {
+    const path = writeTempGguf(
+      [["general.architecture", T.STRING, "mystery-arch"]],
+      [{ name: "token_embd.weight", dims: [16, 1000] }]
+    );
+    const info = await readGgufInfo(path);
+    expect(info.tensor_layer_bytes).toBeNull();
+  });
+
   it("returns null param_count when the tensor_info walk runs off the end of the file", async () => {
     // tensor_count advertises 2 tensors but only 1 is written -- the walk
     // throws on the second, and must leave the already-resolved fields intact

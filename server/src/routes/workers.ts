@@ -14,6 +14,7 @@ import type {
   LlamaCppRelease,
   WorkerVramInfo,
 } from "../../../shared/types.js";
+import type { TensorLayerBreakdown } from "../../../shared/vramEstimate.js";
 import { HF_REPO_PATTERN, searchHfGgufModels, listHfGgufFiles, getHfGgufMeta, type HfSortField } from "../hf.js";
 
 const WORKER_READ_TIMEOUT_MS = 5_000;
@@ -51,6 +52,28 @@ function validateModelDownloadCallback(payload: unknown): string | null {
     if (v !== undefined && v !== null && typeof v !== "number") return `${key} must be a number`;
   }
   if (p.quant !== undefined && p.quant !== null && typeof p.quant !== "string") return "quant must be a string";
+  if (p.tensor_layer_bytes !== undefined && p.tensor_layer_bytes !== null) {
+    const err = validateTensorLayerBreakdownShape(p.tensor_layer_bytes);
+    if (err) return err;
+  }
+  return null;
+}
+
+// Same shape server/src/validate-worker-state.ts's optionalTensorLayerBreakdown
+// enforces for the heartbeat's model_files -- duplicated rather than shared
+// since this route validates a flat top-level field, not an array entry, and
+// the two payloads are otherwise unrelated (this one is worker download
+// callback -> catalog write, that one is a scan-derived heartbeat).
+function validateTensorLayerBreakdownShape(value: unknown): string | null {
+  if (typeof value !== "object" || value === null) return "tensor_layer_bytes must be an object";
+  const v = value as Record<string, unknown>;
+  const isNumArray = (arr: unknown): arr is number[] => Array.isArray(arr) && arr.every((n) => typeof n === "number");
+  if (!isNumArray(v.dense)) return "tensor_layer_bytes.dense must be an array of numbers";
+  if (!isNumArray(v.moe)) return "tensor_layer_bytes.moe must be an array of numbers";
+  if (v.dense.length !== v.moe.length) return "tensor_layer_bytes.dense and .moe must be the same length";
+  if (typeof v.embed !== "number") return "tensor_layer_bytes.embed must be a number";
+  if (typeof v.output !== "number") return "tensor_layer_bytes.output must be a number";
+  if (typeof v.other !== "number") return "tensor_layer_bytes.other must be a number";
   return null;
 }
 
@@ -430,8 +453,27 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
         app.log.warn({ error: validationError }, "model download callback rejected: invalid payload");
         return reply.code(400).send({ error: validationError });
       }
-      const { worker, hf_repo, hf_file, ok, error, sha256, size_bytes, n_layer, mtp_layers, quant, param_count, trained_ctx, n_head_kv, head_dim_k, head_dim_v, n_embd, n_head, sliding_window } =
-        request.body;
+      const {
+        worker,
+        hf_repo,
+        hf_file,
+        ok,
+        error,
+        sha256,
+        size_bytes,
+        n_layer,
+        mtp_layers,
+        quant,
+        param_count,
+        trained_ctx,
+        n_head_kv,
+        head_dim_k,
+        head_dim_v,
+        n_embd,
+        n_head,
+        sliding_window,
+        tensor_layer_bytes,
+      } = request.body;
       if (!ok) {
         app.log.error({ worker, hf_repo, hf_file, error }, "model download failed");
         return reply.code(200).send({ ok: true });
@@ -468,6 +510,9 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
           ...(typeof n_embd === "number" && n_embd > 0 ? { n_embd } : {}),
           ...(typeof n_head === "number" && n_head > 0 ? { n_head } : {}),
           ...(typeof sliding_window === "number" && sliding_window > 0 ? { sliding_window } : {}),
+          // Real per-tensor weight-byte breakdown from the same GGUF header
+          // read -- see ModelMetadata.tensor_layer_bytes.
+          ...(tensor_layer_bytes ? { tensor_layer_bytes } : {}),
         };
         if (isMtpDraftModel({ metadata, hf_file, filename: hf_file })) {
           metadata.mtp_role = "draft";

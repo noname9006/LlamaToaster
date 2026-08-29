@@ -6,6 +6,7 @@
 export const WORKER_INACCESSIBLE_MESSAGE = "worker is inaccessible";
 
 import type { EngineKind } from "./engineSpec.js";
+import type { TensorLayerBreakdown } from "./vramEstimate.js";
 
 // Well-known values used for auto-detection's own guess (see
 // worker/src/hardware.ts's detectBackend) and as UI suggestions -- NOT an
@@ -243,6 +244,14 @@ export interface ModelMetadata {
   // directly benchmarkable on its own; the client excludes it from the main
   // model picker and offers it only as an MTP-model companion choice.
   mtp_role?: "draft";
+  // Real per-tensor weight-byte breakdown, read from the GGUF file's own
+  // tensor_info section (worker/src/gguf.ts's readGgufInfo) -- see
+  // shared/vramEstimate.ts's TensorLayerBreakdown for the shape and
+  // placeWeightBytes for how it's consumed. Drives the accurate replacement
+  // for the old flat file-size/layer-count VRAM estimate: undefined for a
+  // model registered before this existed (falls back to that flat average),
+  // or a "local" entry never hash-matched/downloaded through the app.
+  tensor_layer_bytes?: TensorLayerBreakdown;
   [key: string]: unknown;
 }
 
@@ -1118,6 +1127,10 @@ export interface ModelDirFile {
   n_embd?: number | null;
   n_head?: number | null;
   sliding_window?: number | null;
+  // Real per-tensor weight-byte breakdown -- see ModelMetadata's matching
+  // field. Same optional-null convention: null = tensor_info walk ran but
+  // couldn't build one (e.g. n_layer unresolved), absent = old worker code.
+  tensor_layer_bytes?: TensorLayerBreakdown | null;
 }
 
 export interface HardwareInfo {
@@ -1350,6 +1363,9 @@ export interface ModelDownloadCallbackInput {
   n_embd?: number | null;
   n_head?: number | null;
   sliding_window?: number | null;
+  // Real per-tensor weight-byte breakdown from the same GGUF header read --
+  // see ModelMetadata.tensor_layer_bytes.
+  tensor_layer_bytes?: TensorLayerBreakdown | null;
 }
 
 // --- Pull queue (MULTIUSER_PLAN.md Stage 1) ---

@@ -49,6 +49,7 @@ import {
   CHAIN_WALL_CLOCK_MS,
 } from "../../../shared/types.js";
 import type { SweepItem } from "../../../shared/sweep.js";
+import type { TensorLayerBreakdown } from "../../../shared/vramEstimate.js";
 import { configHash, type ConfigHashInput } from "../../../shared/configHash.js";
 import { engineFromItem, specTypeFor, type EngineKind } from "../../../shared/engineSpec.js";
 
@@ -302,6 +303,11 @@ interface ModelDirFileMeta {
   // Present in stored model_files_json now that the heartbeat validator
   // persists it -- see validate-worker-state.ts's parseModelFiles.
   state?: string;
+  // Real per-tensor weight-byte breakdown -- see ModelMetadata.tensor_layer_bytes
+  // (shared/types.ts). Read by findModelFileMeta below for the same
+  // "backfill a hand-dropped file's missing catalog metadata" story as
+  // n_layer/mtp_layers.
+  tensor_layer_bytes?: TensorLayerBreakdown | null;
 }
 
 interface WorkerJobRow {
@@ -1847,7 +1853,9 @@ export const repo = {
     findModelFileMeta(
       userId: string | undefined,
       filename: string
-    ): { n_layer: number | null; mtp_layers: number | null } | undefined {
+    ):
+      | { n_layer: number | null; mtp_layers: number | null; tensor_layer_bytes: TensorLayerBreakdown | null }
+      | undefined {
       const rows = getDb()
         .prepare(`SELECT model_files_json FROM workers WHERE (? IS NULL OR user_id = ?)`)
         .all(userId ?? null, userId ?? null) as { model_files_json: string | null }[];
@@ -1860,11 +1868,12 @@ export const repo = {
         const match = files.find((f) => f.path === filename && f.state !== "missing");
         if (
           match &&
-          (typeof match.n_layer === "number" || typeof match.mtp_layers === "number")
+          (typeof match.n_layer === "number" || typeof match.mtp_layers === "number" || match.tensor_layer_bytes)
         ) {
           return {
             n_layer: match.n_layer ?? null,
             mtp_layers: match.mtp_layers ?? null,
+            tensor_layer_bytes: match.tensor_layer_bytes ?? null,
           };
         }
       }

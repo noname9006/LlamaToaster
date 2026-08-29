@@ -7,6 +7,7 @@ import type {
   ActiveJobReport,
   WorkerVramInfo,
 } from "../../shared/types.js";
+import type { TensorLayerBreakdown } from "../../shared/vramEstimate.js";
 import {
   LOCAL_MODEL_STATES,
   SENSOR_MEASUREMENT_SOURCES,
@@ -27,6 +28,10 @@ const LIMITS = {
   maxGpus: 16,
   maxCapabilities: 50,
   maxString: 256,
+  // Generous upper bound on a model's transformer block count -- real models
+  // top out in the low hundreds; this only guards against a corrupt/hostile
+  // payload driving unbounded array allocation.
+  maxTensorLayers: 2_048,
 } as const;
 
 // Strips C0/DEL control characters (newlines, tabs, escape sequences, ...)
@@ -51,6 +56,32 @@ function requireNumber(value: unknown, field: string): number {
 function optionalNumber(value: unknown, field: string): number | undefined {
   if (value === undefined || value === null) return undefined;
   return requireNumber(value, field);
+}
+
+// See ModelDirFile.tensor_layer_bytes / TensorLayerBreakdown (shared/
+// vramEstimate.ts). Same null-treated-as-absent convention as optionalNumber/
+// optionalString above -- a worker-reported "checked, came back empty" null
+// degrades to "field omitted" here exactly like every other optional GGUF
+// field in this file.
+function optionalTensorLayerBreakdown(value: unknown, field: string): TensorLayerBreakdown | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "object") throw new BadRequestError(`${field} must be an object`);
+  const v = value as Record<string, unknown>;
+  const numArray = (arr: unknown, arrField: string): number[] => {
+    if (!Array.isArray(arr)) throw new BadRequestError(`${arrField} must be an array`);
+    if (arr.length > LIMITS.maxTensorLayers) throw new BadRequestError(`${arrField} is too long`);
+    return arr.map((n, i) => requireNumber(n, `${arrField}[${i}]`));
+  };
+  const dense = numArray(v.dense, `${field}.dense`);
+  const moe = numArray(v.moe, `${field}.moe`);
+  if (dense.length !== moe.length) throw new BadRequestError(`${field}.dense and ${field}.moe must be the same length`);
+  return {
+    dense,
+    moe,
+    embed: requireNumber(v.embed, `${field}.embed`),
+    output: requireNumber(v.output, `${field}.output`),
+    other: requireNumber(v.other, `${field}.other`),
+  };
 }
 
 function optionalBoolean(value: unknown, field: string): boolean | undefined {
@@ -211,6 +242,7 @@ function parseModelFiles(value: unknown): ModelDirFile[] {
       const nEmbd = optionalNumber(row.n_embd, `model_files[${i}].n_embd`);
       const nHead = optionalNumber(row.n_head, `model_files[${i}].n_head`);
       const slidingWindow = optionalNumber(row.sliding_window, `model_files[${i}].sliding_window`);
+      const tensorLayerBytes = optionalTensorLayerBreakdown(row.tensor_layer_bytes, `model_files[${i}].tensor_layer_bytes`);
 
       return {
         path: sanitizeString(row.path, `model_files[${i}].path`),
@@ -226,6 +258,7 @@ function parseModelFiles(value: unknown): ModelDirFile[] {
         ...(nEmbd != null ? { n_embd: nEmbd } : {}),
         ...(nHead != null ? { n_head: nHead } : {}),
         ...(slidingWindow != null ? { sliding_window: slidingWindow } : {}),
+        ...(tensorLayerBytes !== undefined ? { tensor_layer_bytes: tensorLayerBytes } : {}),
         ...(rawSha != null ? { sha256: rawSha.toLowerCase() } : {}),
         ...(state != null ? { state: state as ModelDirFile["state"] } : {}),
         hf_match,

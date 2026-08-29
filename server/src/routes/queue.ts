@@ -139,6 +139,7 @@ function ggufMetadataPatch(f: ModelDirFile): Partial<ModelMetadata> {
   if (typeof f.n_embd === "number" && f.n_embd > 0) patch.n_embd = f.n_embd;
   if (typeof f.n_head === "number" && f.n_head > 0) patch.n_head = f.n_head;
   if (typeof f.sliding_window === "number" && f.sliding_window > 0) patch.sliding_window = f.sliding_window;
+  if (f.tensor_layer_bytes) patch.tensor_layer_bytes = f.tensor_layer_bytes;
   return patch;
 }
 

@@ -11,6 +11,93 @@
 // fallback from the CUDA runtime itself, so there's no more-detailed log
 // line to go parse instead).
 
+// Real on-disk byte sizes per tensor, bucketed by what placeWeightBytes below
+// needs to place them: which transformer block (if any) each belongs to, and
+// whether it's a MoE expert tensor (subject to --n-cpu-moe) or not. Built by
+// worker/src/gguf.ts's readGgufInfo from each tensor_info entry's OWN
+// declared byte offset -- consecutive tensors' offsets subtracted give the
+// exact stored size regardless of quantization format, so this needs no
+// per-type block-size table and never goes stale against a new GGUF quant
+// format. Defined here (not gguf.ts) since it's consumed by placeWeightBytes
+// below and by every client call site, none of which may import from
+// worker/.
+export interface TensorLayerBreakdown {
+  // Bytes per transformer block (blk.N.*), index-aligned to block index N,
+  // EXCLUDING any MoE expert tensors that block holds -- length n_layer.
+  dense: number[];
+  // MoE expert tensor (blk.N.ffn_*_exps.*) bytes per block, same indexing as
+  // dense -- 0 for a block with no experts (dense model, or a hybrid
+  // architecture's dense-only layers).
+  moe: number[];
+  // token_embd.* -- llama.cpp keeps this CPU-resident unless every
+  // transformer block is itself GPU-resident (ngl >= n_layer), regardless of
+  // how many layers are offloaded short of that.
+  embed: number;
+  // output_norm.* + output.* (or output.* alone when the model ties output
+  // to token_embd, per architecture) -- llama.cpp's own "+1" pseudo-layer,
+  // offloaded only once requested ngl exceeds n_layer.
+  output: number;
+  // Anything matched by neither bucket above (rope frequency tables, misc
+  // top-level tensors) -- always treated as CPU-resident; typically tiny.
+  other: number;
+}
+
+export interface WeightPlacementBytes {
+  gpuBytes: number;
+  cpuBytes: number;
+}
+
+// The accurate replacement for the flat file-size/layer-count average below:
+// places every real tensor bucket according to llama.cpp's OWN documented
+// offload rules (confirmed against its source, see the PR/issue discussion
+// on input-embedding placement), not an assumption that every layer is the
+// same size.
+//
+//   - dense block tensors: GPU iff the block is among the LAST `ngl` blocks
+//     (llama.cpp's i_gpu_start = n_layer - ngl; layers closer to the output
+//     offload first as ngl grows).
+//   - MoE expert tensors: forced CPU for the FIRST `nCpuMoe` blocks
+//     regardless of the dense rule (--n-cpu-moe), otherwise follow the same
+//     dense rule as their block's other tensors.
+//   - token_embd: GPU only once EVERY transformer block is GPU-resident
+//     (ngl >= nLayer) -- llama.cpp keeps it CPU otherwise, since there's
+//     little benefit to offloading a lookup-only tensor short of that.
+//   - output/output_norm: GPU only once ngl exceeds nLayer (this codebase's
+//     own "+1" convention for the output pseudo-layer, e.g.
+//     ResultRow.total_model_layers).
+//   - other: always CPU (typically tiny -- rope frequency tables etc.).
+export function placeWeightBytes(
+  breakdown: TensorLayerBreakdown,
+  nLayer: number,
+  ngl: number,
+  nCpuMoe = 0
+): WeightPlacementBytes {
+  const clampedNgl = Math.max(0, Math.min(Math.round(ngl), nLayer + 1));
+  const gpuBlocks = Math.min(clampedNgl, nLayer);
+  const gpuFrom = nLayer - gpuBlocks; // blocks [gpuFrom, nLayer) are GPU-resident
+  let gpuBytes = 0;
+  let cpuBytes = 0;
+  for (let i = 0; i < nLayer; i++) {
+    const dense = breakdown.dense[i] ?? 0;
+    const moe = breakdown.moe[i] ?? 0;
+    const onGpu = i >= gpuFrom;
+    if (onGpu) gpuBytes += dense;
+    else cpuBytes += dense;
+    // --n-cpu-moe pins this block's experts to CPU regardless of the dense
+    // rule above, but only when that block would otherwise be GPU-resident --
+    // a block the dense rule already sends to CPU needs no separate pin.
+    if (onGpu && i < nCpuMoe) cpuBytes += moe;
+    else if (onGpu) gpuBytes += moe;
+    else cpuBytes += moe;
+  }
+  if (gpuBlocks >= nLayer) gpuBytes += breakdown.embed;
+  else cpuBytes += breakdown.embed;
+  if (clampedNgl > nLayer) gpuBytes += breakdown.output;
+  else cpuBytes += breakdown.output;
+  cpuBytes += breakdown.other;
+  return { gpuBytes, cpuBytes };
+}
+
 export const VRAM_ESTIMATE_FIXED_OVERHEAD_MIB = 512;
 // Deliberately generous: the real diagnosed case above was off by roughly
 // 25x, so flagging anything under half the estimate still catches that
@@ -27,31 +114,93 @@ export interface VramNeedEstimateInput {
   // X/Y" runtime convention, see shared/types.ts's ResultRow.total_model_layers.
   totalModelLayers: number;
   requestedNgl: number;
+  // --n-cpu-moe -- see shared/sweep.ts's SweepItem.n_cpu_moe. Only consumed
+  // alongside tensorBreakdown below; the flat fallback path has no way to
+  // see which bytes are MoE-expert weights at all.
+  nCpuMoe?: number;
+  // Real per-tensor byte breakdown (worker/src/gguf.ts's readGgufInfo, see
+  // ModelMetadata.tensor_layer_bytes) -- when present, drives the accurate
+  // placeWeightBytes path below instead of the flat per-layer average.
+  // Absent/null for a model registered before this field existed (or a
+  // "local" entry the app never had file bytes to parse), in which case this
+  // falls back to the flat average exactly as before.
+  tensorBreakdown?: TensorLayerBreakdown | null;
 }
 
-// Flat per-layer average of the whole on-disk file -- deliberately simple,
-// not a real per-tensor breakdown. Weakest for MoE models specifically: a
-// MoE layer's true footprint depends on how many of ITS experts actually end
-// up GPU-resident (see --n-cpu-moe), which this formula has no way to see --
-// it just assumes every layer is the same size as the file-wide average.
-// Good enough for an order-of-magnitude warning, not a precise budget. Null
-// whenever an input can't produce a meaningful estimate (nothing requested,
-// or a size/layer-count of 0) -- callers treat null as "don't show a banner"
-// rather than a false "fits" or "doesn't fit".
-export function estimateVramNeededMib(input: VramNeedEstimateInput): number | null {
+// Flat per-layer average of the whole on-disk file -- the fallback for a
+// model with no real tensorBreakdown yet (see VramNeedEstimateInput). Weakest
+// for MoE models specifically: a MoE layer's true footprint depends on how
+// many of ITS experts actually end up GPU-resident (see --n-cpu-moe), which
+// this formula has no way to see -- it just assumes every layer is the same
+// size as the file-wide average. It also silently misattributes a share of
+// the (often huge) token-embedding/output tensors to every requested layer,
+// even though llama.cpp keeps those CPU-resident short of a full-model
+// offload -- systematically overestimating VRAM need, which is the "less
+// memory needed than the estimate" bug the tensor-based path above exists to
+// fix. Good enough for an order-of-magnitude warning when no better data
+// exists, not a precise budget. Null whenever an input can't produce a
+// meaningful estimate (nothing requested, or a size/layer-count of 0) --
+// callers treat null as "don't show a banner" rather than a false "fits" or
+// "doesn't fit".
+function estimateVramNeededMibFlat(input: VramNeedEstimateInput): number | null {
   if (input.modelSizeBytes <= 0 || input.totalModelLayers <= 0 || input.requestedNgl <= 0) return null;
   const bytesPerLayer = input.modelSizeBytes / input.totalModelLayers;
   const neededBytes = bytesPerLayer * input.requestedNgl + VRAM_ESTIMATE_FIXED_OVERHEAD_MIB * BYTES_PER_MIB;
   return Math.round(neededBytes / BYTES_PER_MIB);
 }
 
+// GPU-resident weight bytes for the requested placement, in MiB. Prefers the
+// accurate tensor-based placeWeightBytes whenever a real tensorBreakdown is
+// available (see TensorLayerBreakdown's doc comment for why this needs no
+// per-quant-format table and stays correct for MoE/uneven-layer models),
+// falling back to the flat per-layer average otherwise. See
+// estimateVramNeededMibFlat above for that fallback's known weaknesses.
+export function estimateVramNeededMib(input: VramNeedEstimateInput): number | null {
+  if (input.requestedNgl <= 0) return null;
+  if (input.tensorBreakdown && input.totalModelLayers > 0) {
+    const nLayer = input.totalModelLayers - 1;
+    if (nLayer > 0) {
+      const { gpuBytes } = placeWeightBytes(input.tensorBreakdown, nLayer, input.requestedNgl, input.nCpuMoe ?? 0);
+      return Math.round(gpuBytes / BYTES_PER_MIB + VRAM_ESTIMATE_FIXED_OVERHEAD_MIB);
+    }
+  }
+  return estimateVramNeededMibFlat(input);
+}
+
 // Inverse of the above: the largest ngl whose estimate still fits under
 // freeVramMib. Used both by the pre-flight banner (a starting suggestion)
 // and the auto-cap action (NewRun.tsx). Clamped to [0, totalModelLayers].
-export function estimateSafeNgl(modelSizeBytes: number, totalModelLayers: number, freeVramMib: number): number {
+// Ignores nCpuMoe deliberately when a tensorBreakdown is given: this answers
+// "how many layers can I add", and a caller not yet offloading any MoE
+// experts to CPU should see the same ceiling regardless of what --n-cpu-moe
+// might later be set to -- treating every candidate ngl as nCpuMoe:0 (the
+// worst case for GPU bytes needed) keeps the suggestion conservative rather
+// than optimistic.
+export function estimateSafeNgl(
+  modelSizeBytes: number,
+  totalModelLayers: number,
+  freeVramMib: number,
+  tensorBreakdown?: TensorLayerBreakdown | null
+): number {
   if (modelSizeBytes <= 0 || totalModelLayers <= 0) return 0;
-  const bytesPerLayer = modelSizeBytes / totalModelLayers;
   const usableBytes = Math.max(0, freeVramMib - VRAM_ESTIMATE_FIXED_OVERHEAD_MIB) * BYTES_PER_MIB;
+  if (tensorBreakdown) {
+    const nLayer = totalModelLayers - 1;
+    if (nLayer > 0) {
+      // Bytes are non-decreasing in ngl (each step only ever adds a block's
+      // worth of tensors), so a linear scan for the largest fitting ngl is
+      // safe and simple -- nLayer is at most a few hundred even for the
+      // deepest real models.
+      let best = 0;
+      for (let ngl = 0; ngl <= totalModelLayers; ngl++) {
+        const { gpuBytes } = placeWeightBytes(tensorBreakdown, nLayer, ngl, 0);
+        if (gpuBytes > usableBytes) break;
+        best = ngl;
+      }
+      return best;
+    }
+  }
+  const bytesPerLayer = modelSizeBytes / totalModelLayers;
   const safeLayers = Math.floor(usableBytes / bytesPerLayer);
   return Math.max(0, Math.min(totalModelLayers, safeLayers));
 }
@@ -369,6 +518,14 @@ export interface DualPoolInput {
   ram: PoolReading;
   // Metal, or any visible GPU with vram_dynamic:true.
   unifiedPool: boolean;
+  // --n-cpu-moe -- see shared/sweep.ts's SweepItem.n_cpu_moe. Only consumed
+  // alongside tensorBreakdown below.
+  nCpuMoe?: number;
+  // Real per-tensor byte breakdown -- see estimateVramNeededMib's own doc
+  // comment (VramNeedEstimateInput.tensorBreakdown) for what this changes and
+  // why. Absent/null falls back to the flat per-layer average exactly as
+  // before.
+  tensorBreakdown?: TensorLayerBreakdown | null;
 }
 
 export interface PoolFit {
@@ -406,9 +563,17 @@ function dualPoolConfidence(input: DualPoolInput): "good" | "rough" | "unknown" 
 
 export function computeDualPoolFit(input: DualPoolInput): DualPoolFit {
   const ngl = Math.max(0, Math.min(Math.round(input.ngl), input.totalModelLayers));
-  const bytesPerLayer = input.modelSizeBytes / input.totalModelLayers;
-  const gpuWeightsMib = (bytesPerLayer * ngl) / BYTES_PER_MIB;
-  const cpuWeightsMib = (bytesPerLayer * (input.totalModelLayers - ngl)) / BYTES_PER_MIB;
+  let gpuWeightsMib: number;
+  let cpuWeightsMib: number;
+  if (input.tensorBreakdown && input.kvLayerCount > 0) {
+    const { gpuBytes, cpuBytes } = placeWeightBytes(input.tensorBreakdown, input.kvLayerCount, ngl, input.nCpuMoe ?? 0);
+    gpuWeightsMib = gpuBytes / BYTES_PER_MIB;
+    cpuWeightsMib = cpuBytes / BYTES_PER_MIB;
+  } else {
+    const bytesPerLayer = input.modelSizeBytes / input.totalModelLayers;
+    gpuWeightsMib = (bytesPerLayer * ngl) / BYTES_PER_MIB;
+    cpuWeightsMib = (bytesPerLayer * (input.totalModelLayers - ngl)) / BYTES_PER_MIB;
+  }
 
   // ngl's range includes the output layer, which carries no KV -- clamping
   // against kvLayerCount (not totalModelLayers) matches llama.cpp's own
@@ -526,6 +691,10 @@ export interface SuggestInput {
   ram: PoolReading;
   unifiedPool: boolean;
   noGpu: boolean;
+  // See DualPoolInput's matching fields -- threaded through to every internal
+  // fitAt/estimateSafeNgl/maxAffordableContext call below.
+  nCpuMoe?: number;
+  tensorBreakdown?: TensorLayerBreakdown | null;
 }
 
 // Three deterministic auto-suggested placements for when the caller's
@@ -552,6 +721,8 @@ export function suggestPlacementConfigs(input: SuggestInput): SuggestionResult {
       vram: input.vram,
       ram: input.ram,
       unifiedPool: input.unifiedPool,
+      nCpuMoe: input.nCpuMoe,
+      tensorBreakdown: input.tensorBreakdown,
     });
 
   // A missing reading is "we don't know", never "0 MiB free" -- guard BEFORE
@@ -576,7 +747,7 @@ export function suggestPlacementConfigs(input: SuggestInput): SuggestionResult {
     ? 0
     : input.unifiedPool
       ? input.totalModelLayers
-      : estimateSafeNgl(input.modelSizeBytes, input.totalModelLayers, input.vram.freeMib ?? 0);
+      : estimateSafeNgl(input.modelSizeBytes, input.totalModelLayers, input.vram.freeMib ?? 0, input.tensorBreakdown);
 
   const floorFit = fitAt(0, MIN_FEASIBLE_CTX).fits;
   if (floorFit === false) return { outcome: "cannot_run", configs: [] };
@@ -610,7 +781,10 @@ export function suggestPlacementConfigs(input: SuggestInput): SuggestionResult {
       const bound = Math.min(trainedCtxOrInf, currentCtxOrInf);
       ctx = Number.isFinite(bound) ? Math.max(MIN_FEASIBLE_CTX, bound) : MIN_FEASIBLE_CTX;
     } else {
-      const gpuWeightsMib = (bytesPerLayer * ngl) / BYTES_PER_MIB;
+      const gpuWeightsMib =
+        input.tensorBreakdown && input.kvLayerCount > 0
+          ? placeWeightBytes(input.tensorBreakdown, input.kvLayerCount, ngl, input.nCpuMoe ?? 0).gpuBytes / BYTES_PER_MIB
+          : (bytesPerLayer * ngl) / BYTES_PER_MIB;
       // activationsHeadroomFrac:0 -- vram.freeMib is ALREADY the reserved
       // budget; maxAffordableContext's own 10% headroom is calibrated
       // against every existing caller's use of TOTAL vram, and stacking it

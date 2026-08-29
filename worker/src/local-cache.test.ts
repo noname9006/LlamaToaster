@@ -160,7 +160,8 @@ describe("LocalModelCache", () => {
       null, // head_dim_v
       null, // n_embd
       null, // n_head
-      null // sliding_window
+      null, // sliding_window
+      null // tensor_layer_bytes
     );
 
     await cache.close();
