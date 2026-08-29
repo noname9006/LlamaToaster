@@ -425,6 +425,23 @@ export function residentWeightsMibFromPeak(
   return Math.max(0, Math.round(input.vramPeakMib - kvMib - scratch));
 }
 
+// Global (full-attention) layer count within a GPU-resident SUFFIX of
+// `subsetLen` blocks, for the Gemma-style hybrid attention pattern where the
+// model's LAST block is always global and full-attention blocks repeat every
+// 6th block counting backward from there (see the module's SWA doc comments
+// below for the fuller rationale). Because that phase is anchored at the
+// model's own final block -- never at wherever a subset happens to start --
+// this count depends only on subsetLen, not on the size of the model the
+// subset was taken from: it's exact (given the pattern assumption) whether
+// the subset is the whole model (maxAffordableContext below) or the
+// GPU-resident tail of a partial --ngl offload (computeDualPoolFit's
+// gpuKvLayers further down), since llama.cpp always offloads the LAST `ngl`
+// blocks first -- i.e. the GPU side is always a suffix ending at the same
+// final block the pattern is anchored to.
+function swaGlobalLayersInSuffix(subsetLen: number): number {
+  return subsetLen <= 0 ? 0 : Math.ceil(subsetLen / 6);
+}
+
 export function maxAffordableContext(input: MaxCtxInput): MaxCtxEstimate {
   const scratchMib = input.scratchMib ?? DEFAULT_MAX_CTX_SCRATCH_MIB;
   const headroomFrac = input.activationsHeadroomFrac ?? DEFAULT_ACTIVATIONS_HEADROOM_FRAC;
@@ -454,7 +471,7 @@ export function maxAffordableContext(input: MaxCtxInput): MaxCtxEstimate {
     // the unsafe direction. Assume the Gemma-style ~1 global : 5 local
     // interleave: local layers contribute their window-bound bytes and the
     // global budget is solved for.
-    const g = Math.ceil(input.nLayer / 6);
+    const g = swaGlobalLayersInSuffix(input.nLayer);
     const rawTokens = (usableMib * 2 ** 20) / kvBytesPerTok;
     const tokens = Math.max(0, rawTokens - (input.nLayer - g) * input.slidingWindow) / g;
     return { tokens: Math.floor(tokens), confidence: "rough", binding: "kv" };
@@ -475,20 +492,26 @@ export function maxAffordableContext(input: MaxCtxInput): MaxCtxEstimate {
 // where VRAM and RAM are literally the same bytes and a split two-pool check
 // would double-count them.
 //
-// Reuses kvBytesPerToken/estimateKvCacheMib UNCHANGED: because that formula
-// is linear in nLayer, the GPU share of KV cache is the same call with
-// nLayer:ngl and the CPU share is nLayer:(kvLayerCount-ngl) -- no new KV math
-// needed, just re-parameterizing the existing one twice.
+// Reuses kvBytesPerToken/estimateKvCacheMib UNCHANGED for the non-SWA case:
+// because that formula is linear in nLayer, the GPU share of KV cache is the
+// same call with nLayer:ngl and the CPU share is nLayer:(kvLayerCount-ngl) --
+// no new KV math needed, just re-parameterizing the existing one twice.
 //
-// Deliberately uses the PLAIN (non-SWA) kvBytesPerToken path even when
-// slidingWindow is set: maxAffordableContext's SWA branch above assumes
-// nLayer is the WHOLE model's own fixed global/local layer pattern, which an
-// arbitrary GPU-resident subset does not preserve. The plain formula
-// overestimates KV need for an SWA model instead -- the SAFE direction for a
-// forward fit check (unlike maxAffordableContext's own inverse direction,
-// where overestimating affordable tokens is the unsafe one). Confidence
-// drops one level whenever slidingWindow is set, so the UI still hedges even
-// though the arithmetic is deliberately simple.
+// When slidingWindow IS set, splits each side's KV further into its global
+// (full-attention) and local (window-bound) layer counts via
+// swaGlobalLayersInSuffix, rather than falling back to the plain formula's
+// blanket overestimate: llama.cpp always offloads the LAST `ngl` blocks
+// first (placeWeightBytes' own i_gpu_start convention), and the Gemma-style
+// pattern's global layer is always the model's LAST block -- so the
+// GPU-resident side is always a suffix ending at that same anchor, making
+// swaGlobalLayersInSuffix(gpuKvLayers) exact (given the pattern assumption),
+// not just a whole-model approximation. The CPU side's global count is
+// simply whatever's left: swaGlobalLayersInSuffix(kvLayerCount) -
+// swaGlobalLayersInSuffix(gpuKvLayers) -- exact for the same reason, since
+// both counts are taken from the same anchored pattern. Confidence still
+// drops one level whenever slidingWindow is set (dualPoolConfidence below),
+// since the pattern itself (a fixed 1-global-per-6-layer interleave) is
+// still an assumption, not read from the model's own header.
 
 export const RAM_ESTIMATE_FIXED_OVERHEAD_MIB = 512;
 
@@ -593,12 +616,37 @@ export function computeDualPoolFit(input: DualPoolInput): DualPoolFit {
   // estimateKvCacheMib returns null when nLayer<=0 -- the ?? 0 fallback is
   // correct here: zero GPU-resident KV layers genuinely need zero GPU KV
   // bytes, not "unknown".
-  const gpuKvMib =
-    estimateKvCacheMib({ ...kvGeometry, nLayer: gpuKvLayers, tokens: input.ctxTokens, parallelSlots: input.parallelSlots }) ??
-    0;
-  const cpuKvMib =
-    estimateKvCacheMib({ ...kvGeometry, nLayer: cpuKvLayers, tokens: input.ctxTokens, parallelSlots: input.parallelSlots }) ??
-    0;
+  let gpuKvMib: number;
+  let cpuKvMib: number;
+  if (input.slidingWindow != null && input.slidingWindow > 0) {
+    // See this function's doc comment above: the GPU side is always a
+    // suffix ending at the model's last block, so swaGlobalLayersInSuffix
+    // applies directly to it; the CPU side's global count is just the
+    // model-wide total minus the GPU side's share.
+    const totalGlobal = swaGlobalLayersInSuffix(input.kvLayerCount);
+    const gpuGlobal = swaGlobalLayersInSuffix(gpuKvLayers);
+    const cpuGlobal = Math.max(0, totalGlobal - gpuGlobal);
+    const perLayerBytes = kvBytesPerToken({ ...kvGeometry, nLayer: 1 }).bytes ?? 0;
+    const localTokens = Math.min(input.ctxTokens, input.slidingWindow);
+    const slots = Math.max(1, input.parallelSlots ?? 1);
+    gpuKvMib =
+      (perLayerBytes *
+        (gpuGlobal * input.ctxTokens + (gpuKvLayers - gpuGlobal) * localTokens) *
+        slots) /
+      BYTES_PER_MIB;
+    cpuKvMib =
+      (perLayerBytes *
+        (cpuGlobal * input.ctxTokens + (cpuKvLayers - cpuGlobal) * localTokens) *
+        slots) /
+      BYTES_PER_MIB;
+  } else {
+    gpuKvMib =
+      estimateKvCacheMib({ ...kvGeometry, nLayer: gpuKvLayers, tokens: input.ctxTokens, parallelSlots: input.parallelSlots }) ??
+      0;
+    cpuKvMib =
+      estimateKvCacheMib({ ...kvGeometry, nLayer: cpuKvLayers, tokens: input.ctxTokens, parallelSlots: input.parallelSlots }) ??
+      0;
+  }
 
   const confidence = dualPoolConfidence(input);
 
