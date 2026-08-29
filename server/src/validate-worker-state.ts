@@ -5,8 +5,14 @@ import type {
   InstalledBuild,
   ModelDirFile,
   ActiveJobReport,
+  WorkerVramInfo,
 } from "../../shared/types.js";
-import { LOCAL_MODEL_STATES, SENSOR_MEASUREMENT_SOURCES } from "../../shared/types.js";
+import {
+  LOCAL_MODEL_STATES,
+  SENSOR_MEASUREMENT_SOURCES,
+  GPU_MEMORY_ACCURACY_LEVELS,
+  GPU_MEMORY_MEASUREMENT_SOURCES,
+} from "../../shared/types.js";
 import type { SensorMeasurementSource } from "../../shared/types.js";
 
 // A worker is a semi-trusted client, not part of the server -- MULTIUSER_PLAN.md
@@ -51,6 +57,23 @@ function optionalBoolean(value: unknown, field: string): boolean | undefined {
   if (value === undefined || value === null) return undefined;
   if (typeof value !== "boolean") throw new BadRequestError(`${field} must be a boolean`);
   return value;
+}
+
+function requireNullableNumber(value: unknown, field: string): number | null {
+  if (value === null) return null;
+  return requireNumber(value, field);
+}
+
+function requireEnum<T extends string>(value: unknown, allowed: readonly T[], field: string): T {
+  if (typeof value !== "string" || !(allowed as readonly string[]).includes(value)) {
+    throw new BadRequestError(`${field} must be one of ${allowed.join(", ")}`);
+  }
+  return value as T;
+}
+
+function requireNullableEnum<T extends string>(value: unknown, allowed: readonly T[], field: string): T | null {
+  if (value === null) return null;
+  return requireEnum(value, allowed, field);
 }
 
 function requireArray(value: unknown, field: string): unknown[] {
@@ -210,6 +233,47 @@ function parseModelFiles(value: unknown): ModelDirFile[] {
     });
 }
 
+// Live VRAM+RAM reading (shared/types.ts's WorkerVramInfo doc comment) --
+// omitted (not just null) while the worker is busy, so `undefined` here is
+// distinct from an explicit `null` (repo.ts's upsert treats undefined as "no
+// update, keep whatever was cached" via COALESCE, vs. null overwriting the
+// cached value with "nothing to report").
+function parseVram(raw: unknown, field: string): WorkerVramInfo | null | undefined {
+  if (raw === undefined) return undefined;
+  if (raw === null) return null;
+  if (typeof raw !== "object") throw new BadRequestError(`${field} must be an object`);
+  const v = raw as Record<string, unknown>;
+  if (v.ok !== true) throw new BadRequestError(`${field}.ok must be true`);
+  return {
+    ok: true,
+    backend: sanitizeString(v.backend, `${field}.backend`),
+    ram_free_before_mib: requireNumber(v.ram_free_before_mib, `${field}.ram_free_before_mib`),
+    vram_free_before_mib: requireNullableNumber(v.vram_free_before_mib, `${field}.vram_free_before_mib`),
+    vram_free_before_accuracy: requireEnum(
+      v.vram_free_before_accuracy,
+      GPU_MEMORY_ACCURACY_LEVELS,
+      `${field}.vram_free_before_accuracy`
+    ),
+    vram_free_before_source: requireNullableEnum(
+      v.vram_free_before_source,
+      GPU_MEMORY_MEASUREMENT_SOURCES,
+      `${field}.vram_free_before_source`
+    ),
+    system_memory_total_mib: requireNullableNumber(v.system_memory_total_mib, `${field}.system_memory_total_mib`),
+    gpu_memory_total_mib: requireNullableNumber(v.gpu_memory_total_mib, `${field}.gpu_memory_total_mib`),
+    gpu_memory_total_accuracy: requireEnum(
+      v.gpu_memory_total_accuracy,
+      GPU_MEMORY_ACCURACY_LEVELS,
+      `${field}.gpu_memory_total_accuracy`
+    ),
+    gpu_memory_total_source: requireNullableEnum(
+      v.gpu_memory_total_source,
+      GPU_MEMORY_MEASUREMENT_SOURCES,
+      `${field}.gpu_memory_total_source`
+    ),
+  };
+}
+
 // Reject, don't coerce -- a malformed field throws BadRequestError (400)
 // rather than silently substituting a default, so a broken/malicious worker
 // gets a clear error instead of a partially-trusted state getting persisted.
@@ -231,6 +295,7 @@ export function parseWorkerState(body: unknown): WorkerStatePush {
     installed_builds: parseInstalledBuilds(b.installed_builds ?? []),
     model_files: parseModelFiles(b.model_files ?? []),
     status,
+    vram: parseVram(b.vram, "vram"),
     ...parseSensorsAndIsa(b),
   };
 }

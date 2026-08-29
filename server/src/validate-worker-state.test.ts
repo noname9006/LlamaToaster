@@ -149,6 +149,59 @@ describe("parseWorkerState", () => {
     ).toThrow(BadRequestError);
   });
 
+  it("leaves vram undefined when omitted (busy worker) rather than defaulting to null", () => {
+    const state = parseWorkerState(validBody());
+    expect(state.vram).toBeUndefined();
+  });
+
+  it("passes an explicit null vram through (worker read it but got nothing)", () => {
+    const state = parseWorkerState(validBody({ vram: null }));
+    expect(state.vram).toBeNull();
+  });
+
+  it("passes a well-formed vram reading through", () => {
+    const vram = {
+      ok: true,
+      backend: "cuda",
+      ram_free_before_mib: 20000,
+      vram_free_before_mib: 8000,
+      vram_free_before_accuracy: "exact",
+      vram_free_before_source: "process_gpu_usage",
+      system_memory_total_mib: 32768,
+      gpu_memory_total_mib: 12288,
+      gpu_memory_total_accuracy: "exact",
+      gpu_memory_total_source: "driver_reported_memory",
+    };
+    const state = parseWorkerState(validBody({ vram }));
+    expect(state.vram).toEqual(vram);
+  });
+
+  it("accepts nullable vram fields (Metal/unified-memory shape)", () => {
+    const vram = {
+      ok: true,
+      backend: "cpu",
+      ram_free_before_mib: 60000,
+      vram_free_before_mib: null,
+      vram_free_before_accuracy: "unavailable",
+      vram_free_before_source: null,
+      system_memory_total_mib: 65536,
+      gpu_memory_total_mib: null,
+      gpu_memory_total_accuracy: "unavailable",
+      gpu_memory_total_source: null,
+    };
+    const state = parseWorkerState(validBody({ vram }));
+    expect(state.vram).toEqual(vram);
+  });
+
+  it("rejects an unrecognized vram accuracy level rather than coercing it", () => {
+    const vram = { ok: true, backend: "cuda", ram_free_before_mib: 1000, vram_free_before_mib: 1000, vram_free_before_accuracy: "guess", vram_free_before_source: null, system_memory_total_mib: null, gpu_memory_total_mib: null, gpu_memory_total_accuracy: "unavailable", gpu_memory_total_source: null };
+    expect(() => parseWorkerState(validBody({ vram }))).toThrow(BadRequestError);
+  });
+
+  it("rejects a vram object missing ok:true", () => {
+    expect(() => parseWorkerState(validBody({ vram: { backend: "cuda" } }))).toThrow(BadRequestError);
+  });
+
   it("passes cudart_name through on installed_builds", () => {
     const state = parseWorkerState(
       validBody({
