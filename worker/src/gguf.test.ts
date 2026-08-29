@@ -110,6 +110,33 @@ describe("readGgufInfo", () => {
     expect(info.n_layer).toBe(36);
   });
 
+  // attention.head_count_kv is optional in the GGUF spec -- a non-GQA model
+  // (KV heads == attention heads) commonly omits it entirely, and llama.cpp's
+  // own loader defaults it to head_count in that case. readGgufInfo must do
+  // the same, or every such model reads as "unknown KV geometry" despite the
+  // value being fully derivable.
+  it("defaults n_head_kv to head_count when head_count_kv is absent (non-GQA model)", async () => {
+    const path = writeTempGguf([
+      ["general.architecture", T.STRING, "gpt2"],
+      ["gpt2.block_count", T.UINT32, 24],
+      ["gpt2.attention.head_count", T.UINT32, 16],
+    ]);
+    const info = await readGgufInfo(path);
+    expect(info.n_head).toBe(16);
+    expect(info.n_head_kv).toBe(16);
+  });
+
+  it("prefers an explicit head_count_kv over the head_count default when both are present", async () => {
+    const path = writeTempGguf([
+      ["general.architecture", T.STRING, "qwen3"],
+      ["qwen3.block_count", T.UINT32, 36],
+      ["qwen3.attention.head_count", T.UINT32, 32],
+      ["qwen3.attention.head_count_kv", T.UINT32, 8],
+    ]);
+    const info = await readGgufInfo(path);
+    expect(info.n_head_kv).toBe(8);
+  });
+
   it("reads sliding_window only for architectures that declare one", async () => {
     const swPath = writeTempGguf([
       ["general.architecture", T.STRING, "mistral"],
