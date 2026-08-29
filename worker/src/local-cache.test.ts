@@ -99,6 +99,30 @@ describe("LocalModelCache", () => {
     await cache.close();
   });
 
+  it("re-checks GGUF headers once when the head_count_kv default-to-head_count fix ships", async () => {
+    // A fresh/pre-migration cache reports schema version 0 -- the fix must
+    // clear gguf_checked_at once more (same staleness-gate problem as the
+    // trained_ctx migration above, but this time gguf.ts's own extraction
+    // logic changed, not the schema) and record that it did so.
+    mockDb.pragma.mockImplementation((stmt: string) => (stmt === "user_version" ? 0 : undefined));
+
+    const cache = new LocalModelCache("/test/model/dir");
+    await cache.init();
+
+    expect(mockDb.pragma).toHaveBeenCalledWith("user_version = 1");
+    await cache.close();
+  });
+
+  it("does not re-clear gguf_checked_at once the head_count_kv fix has already migrated", async () => {
+    mockDb.pragma.mockImplementation((stmt: string) => (stmt === "user_version" ? 1 : undefined));
+
+    const cache = new LocalModelCache("/test/model/dir");
+    await cache.init();
+
+    expect(mockDb.pragma).not.toHaveBeenCalledWith("user_version = 1");
+    await cache.close();
+  });
+
   it("should upsert a cache entry", async () => {
     const cache = new LocalModelCache("/test/model/dir");
     await cache.init();

@@ -216,6 +216,20 @@ export class LocalModelCache {
     // richer reader -- a one-time cost per file, bounded by model count.
     // Subsequent startups hit the staleness gate as usual.
     this.db.exec(`UPDATE local_model_cache SET gguf_checked_at = NULL`);
+
+    // gguf.ts's readGgufInfo now defaults n_head_kv to head_count when the
+    // header omits attention.head_count_kv (a spec-legal omission for any
+    // non-GQA model, previously read back as "unknown"). Existing rows read
+    // by the older reader are stuck at n_head_kv NULL for up to
+    // GGUF_RECHECK_INTERVAL_MS even though the value is now derivable --
+    // same one-time-reset need as above, but gated on user_version (a plain
+    // SQLite pragma, not a table column) since no new column exists this
+    // time to key the check off of.
+    const cacheSchemaVersion = this.db.pragma("user_version", { simple: true }) as number;
+    if (cacheSchemaVersion < 1) {
+      this.db.exec(`UPDATE local_model_cache SET gguf_checked_at = NULL`);
+      this.db.pragma("user_version = 1");
+    }
   }
 
   // Every column, shared by all three SELECT sites (get/getAll/getBySha256)

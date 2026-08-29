@@ -418,7 +418,16 @@ export async function readGgufInfo(filePath: string): Promise<GgufInfo> {
       quant: fileType != null ? quantLabelFromFileType(fileType) : null,
       param_count,
       trained_ctx: contextLengths.get(`${architecture}.context_length`) ?? null,
-      n_head_kv: headCountKv.get(`${architecture}.attention.head_count_kv`) ?? null,
+      // attention.head_count_kv is OPTIONAL in the GGUF spec: a model that
+      // doesn't use grouped-query attention (plain multi-head) often has no
+      // such key at all, and llama.cpp's own hparam loader defaults it to
+      // head_count in that case. Mirror that default here -- otherwise every
+      // non-GQA model reads as "unknown KV geometry" even though the true
+      // value is fully derivable from head_count alone.
+      n_head_kv:
+        headCountKv.get(`${architecture}.attention.head_count_kv`) ??
+        headCounts.get(`${architecture}.attention.head_count`) ??
+        null,
       head_dim_k: keyLengths.get(`${architecture}.attention.key_length`) ?? null,
       head_dim_v: valueLengths.get(`${architecture}.attention.value_length`) ?? null,
       n_embd: embeddingLengths.get(`${architecture}.embedding_length`) ?? null,
