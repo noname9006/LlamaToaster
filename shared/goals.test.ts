@@ -4,10 +4,9 @@ import {
   defaultGoals,
   goalsEqualDefaults,
   WORKLOAD_WEIGHTS,
-  recommendedKvGrid,
-  pruneCacheTypes,
-  ensureUnquantizedPairSurvives,
-  pairAllowedUnderTolerance,
+  KV_PRESETS,
+  KV_PRESET_PAIRS,
+  kvPresetPairs,
 } from "./goals.js";
 
 describe("goals normalization (M2)", () => {
@@ -25,9 +24,9 @@ describe("goals normalization (M2)", () => {
       target_ctx: 65536,
       speed_floor_frac: 0.5,
       workload: "chat",
-      kv_tolerance: "q8_0_ok",
+      kv_preset: "comprehensive",
     });
-    expect(g).toEqual({ goal: "max_context", target_ctx: 65536, speed_floor_frac: 0.5, workload: "chat", kv_tolerance: "q8_0_ok" });
+    expect(g).toEqual({ goal: "max_context", target_ctx: 65536, speed_floor_frac: 0.5, workload: "chat", kv_preset: "comprehensive" });
   });
 
   it("coerces garbage to defaults rather than fabricating answers", () => {
@@ -35,6 +34,7 @@ describe("goals normalization (M2)", () => {
     expect(g?.goal).toBe("balanced");
     expect(g?.workload).toBe("even");
     expect(g?.target_ctx).toBeNull();
+    expect(g?.kv_preset).toBe("extended");
   });
 
   it("treats 'don't know' targets as target_unverified (null)", () => {
@@ -49,55 +49,45 @@ describe("goals normalization (M2)", () => {
   });
 });
 
-describe("KV tolerance pruning (M4)", () => {
-  it("prunes exactly the forbidden pairs from the recommended grid", () => {
-    // q8_0 ok drops q8_0/q4_0.
-    expect(recommendedKvGrid("q8_0_ok")).toEqual([
-      ["f16", "f16"],
-      ["f16", "q8_0"],
-      ["q8_0", "q8_0"],
-    ]);
-    // f16 only leaves f16/f16 alone.
-    expect(recommendedKvGrid("f16_only")).toEqual([["f16", "f16"]]);
-    // q4_0 ok keeps everything.
-    expect(recommendedKvGrid("q4_0_ok").length).toBe(4);
+describe("KV cache presets", () => {
+  it("defaults to extended", () => {
+    expect(defaultGoals().kv_preset).toBe("extended");
+    expect(kvPresetPairs(undefined)).toEqual(KV_PRESET_PAIRS.extended);
   });
 
-  it("prunes quantized sides but retains other unquantized pairs in expert mode (tolerance speaks to quantization, not width)", () => {
-    const pruned = pruneCacheTypes(["f32", "bf16", "f16", "q8_0", "q4_0"], "q8_0_ok");
-    expect(pruned).toEqual(["f32", "bf16", "f16", "q8_0"]);
+  it("grows strictly with tier: compact (3) < basic (4) < extended (7) < comprehensive (12)", () => {
+    expect(KV_PRESET_PAIRS.compact.length).toBe(3);
+    expect(KV_PRESET_PAIRS.basic.length).toBe(4);
+    expect(KV_PRESET_PAIRS.extended.length).toBe(7);
+    expect(KV_PRESET_PAIRS.comprehensive.length).toBe(12);
   });
 
-  it("always leaves at least one unquantized pair surviving", () => {
-    for (const tolerance of ["q4_0_ok", "q8_0_ok", "f16_only"] as const) {
-      const grid = recommendedKvGrid(tolerance);
-      expect(grid.length).toBeGreaterThan(0);
-      expect(grid.some(([k, v]) => k === v && ["f32", "bf16", "f16"].includes(k))).toBe(true);
+  it("is strictly nested: each tier is a superset of the one before it", () => {
+    const tiers: (readonly [string, string][])[] = [
+      KV_PRESET_PAIRS.compact as readonly [string, string][],
+      KV_PRESET_PAIRS.basic as readonly [string, string][],
+      KV_PRESET_PAIRS.extended as readonly [string, string][],
+      KV_PRESET_PAIRS.comprehensive as readonly [string, string][],
+    ];
+    for (let i = 1; i < tiers.length; i++) {
+      const smaller = new Set(tiers[i - 1].map(([k, v]) => `${k}/${v}`));
+      const bigger = new Set(tiers[i].map(([k, v]) => `${k}/${v}`));
+      for (const pair of smaller) expect(bigger.has(pair)).toBe(true);
+      // Strict, not equal -- every tier actually adds something new.
+      expect(bigger.size).toBeGreaterThan(smaller.size);
     }
   });
 
-  it("keeps one unquantized pair even when a caller pruned them all away", () => {
-    const result = ensureUnquantizedPairSurvives(["q8_0"], ["q8_0"], [["f16", "f16"]], false);
-    expect(result.cache_type_k).toContain("f16");
-    expect(result.cache_type_v).toContain("f16");
+  it("every tier includes the f16/f16 baseline pair", () => {
+    for (const preset of KV_PRESETS) {
+      expect(KV_PRESET_PAIRS[preset].some(([k, v]) => k === "f16" && v === "f16")).toBe(true);
+    }
   });
 
-  it("prunes to empty, never back to the forbidden originals, when an axis is entirely quantized types the tolerance rejects", () => {
-    // Every value here is quantized and below f16_only's infinite-bit floor
-    // -- pruning must never silently let a forbidden quantized type back in
-    // just because nothing survived.
-    expect(pruneCacheTypes(["q4_0", "q4_1"], "f16_only")).toEqual([]);
-    // Composed with ensureUnquantizedPairSurvives, the empty axis still ends
-    // up with a real fallback pair, never the forbidden values.
-    const result = ensureUnquantizedPairSurvives([], [], [["f16", "f16"]], true);
-    expect(result.cache_type_k).toEqual(["f16"]);
-    expect(result.cache_type_v).toEqual(["f16"]);
-  });
-
-  it("checks both sides of a pair against the tolerance", () => {
-    expect(pairAllowedUnderTolerance("q8_0", "q4_0", "q8_0_ok")).toBe(false);
-    expect(pairAllowedUnderTolerance("q8_0", "q8_0", "q8_0_ok")).toBe(true);
-    expect(pairAllowedUnderTolerance("f16", "q4_0", "f16_only")).toBe(false);
-    expect(pairAllowedUnderTolerance("f32", "bf16", "f16_only")).toBe(true);
+  it("has no duplicate pairs within a tier", () => {
+    for (const preset of KV_PRESETS) {
+      const seen = new Set(KV_PRESET_PAIRS[preset].map(([k, v]) => `${k}/${v}`));
+      expect(seen.size).toBe(KV_PRESET_PAIRS[preset].length);
+    }
   });
 });

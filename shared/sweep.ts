@@ -85,6 +85,20 @@ function isValidCombo(cache_type_k: string, cache_type_v: string, flash_attn: st
   return flash_attn !== "off" || (UNQUANTIZED_CACHE_TYPES.has(cache_type_k) && UNQUANTIZED_CACHE_TYPES.has(cache_type_v));
 }
 
+// Coupled (K,V) pairs when the caller supplied them (a curated, deliberately
+// non-rectangular list -- see SweepConfig.cache_type_pairs); otherwise the
+// full cross product of the two independent axes, exactly as before.
+function kvPairsFor(sweep: Omit<SweepConfig, "model_id">): ReadonlyArray<readonly [string, string]> {
+  if (sweep.cache_type_pairs && sweep.cache_type_pairs.length > 0) return sweep.cache_type_pairs;
+  const pairs: Array<readonly [string, string]> = [];
+  for (const cache_type_k of sweep.cache_type_k) {
+    for (const cache_type_v of sweep.cache_type_v) {
+      pairs.push([cache_type_k, cache_type_v]);
+    }
+  }
+  return pairs;
+}
+
 export function expandSweep(sweep: Omit<SweepConfig, "model_id">): SweepItem[] {
   const items: SweepItem[] = [];
   // Defaulted (not required) so legacy sweep payloads without the axis keep
@@ -93,39 +107,38 @@ export function expandSweep(sweep: Omit<SweepConfig, "model_id">): SweepItem[] {
   const n_depthValues = Array.isArray(sweep.n_depth) && sweep.n_depth.length > 0 ? sweep.n_depth : [0];
   const concurrencyValues =
     Array.isArray(sweep.concurrency) && sweep.concurrency.length > 0 ? sweep.concurrency : [1];
+  const kvPairs = kvPairsFor(sweep);
   for (const n_prompt of sweep.n_prompt) {
     for (const n_gen of sweep.n_gen) {
       for (const threads of sweep.threads) {
         for (const n_gpu_layers of sweep.n_gpu_layers) {
           for (const batch_size of sweep.batch_size) {
             for (const ubatch_size of sweep.ubatch_size) {
-              for (const cache_type_k of sweep.cache_type_k) {
-                for (const cache_type_v of sweep.cache_type_v) {
-                  for (const flash_attn of sweep.flash_attn) {
-                    if (!isValidCombo(cache_type_k, cache_type_v, flash_attn)) continue;
-                    for (const mtp of sweep.mtp) {
-                      for (const n_gpu_layers_draft of sweep.n_gpu_layers_draft) {
-                        for (const n_cpu_moe of sweep.n_cpu_moe) {
-                          for (const n_depth of n_depthValues) {
-                            for (const concurrency of concurrencyValues) {
-                              items.push({
-                                idx: items.length,
-                                n_prompt,
-                                n_gen,
-                                n_depth,
-                                concurrency,
-                                threads,
-                                n_gpu_layers,
-                                batch_size,
-                                ubatch_size,
-                                cache_type_k,
-                                cache_type_v,
-                                flash_attn,
-                                mtp,
-                                n_gpu_layers_draft,
-                                n_cpu_moe,
-                              });
-                            }
+              for (const [cache_type_k, cache_type_v] of kvPairs) {
+                for (const flash_attn of sweep.flash_attn) {
+                  if (!isValidCombo(cache_type_k, cache_type_v, flash_attn)) continue;
+                  for (const mtp of sweep.mtp) {
+                    for (const n_gpu_layers_draft of sweep.n_gpu_layers_draft) {
+                      for (const n_cpu_moe of sweep.n_cpu_moe) {
+                        for (const n_depth of n_depthValues) {
+                          for (const concurrency of concurrencyValues) {
+                            items.push({
+                              idx: items.length,
+                              n_prompt,
+                              n_gen,
+                              n_depth,
+                              concurrency,
+                              threads,
+                              n_gpu_layers,
+                              batch_size,
+                              ubatch_size,
+                              cache_type_k,
+                              cache_type_v,
+                              flash_attn,
+                              mtp,
+                              n_gpu_layers_draft,
+                              n_cpu_moe,
+                            });
                           }
                         }
                       }
