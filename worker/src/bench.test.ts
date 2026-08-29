@@ -1,5 +1,50 @@
 import { describe, expect, it } from "vitest";
-import { parseModelBufferSizes, extractCudaDiagnosticLines, MAX_CUDA_DIAGNOSTIC_LINES } from "./bench.js";
+import { parseModelBufferSizes, extractCudaDiagnosticLines, MAX_CUDA_DIAGNOSTIC_LINES, buildArgs, type BenchRunInput } from "./bench.js";
+import type { SweepItem } from "../../shared/sweep.js";
+
+const BASE_ITEM: SweepItem = {
+  idx: 0,
+  n_prompt: 512,
+  n_gen: 128,
+  n_depth: 0,
+  concurrency: 1,
+  threads: 4,
+  n_gpu_layers: 0,
+  batch_size: 512,
+  ubatch_size: 512,
+  cache_type_k: "f16",
+  cache_type_v: "f16",
+  flash_attn: "on",
+  mtp: "off",
+  n_gpu_layers_draft: 0,
+  n_cpu_moe: 0,
+};
+
+// A nonexistent binary path so the flag-support probes' spawn() hits ENOENT
+// and resolves false quickly, instead of actually needing a real build.
+function benchInput(item: SweepItem): BenchRunInput {
+  return {
+    modelPath: "/models/fake.gguf",
+    item,
+    repeats: 3,
+    llamaBenchPath: "/nonexistent/llama-bench-buildargs-test",
+    backend: "cuda",
+  };
+}
+
+describe("buildArgs", () => {
+  it("omits -d when n_depth is 0 (today's behavior, unchanged)", async () => {
+    const args = await buildArgs(benchInput(BASE_ITEM));
+    expect(args).not.toContain("-d");
+  });
+
+  it("passes -d <n_depth> when n_depth is set, right after -p/-n", async () => {
+    const args = await buildArgs(benchInput({ ...BASE_ITEM, n_depth: 2048 }));
+    const nIdx = args.indexOf("-n");
+    expect(args[nIdx + 2]).toBe("-d");
+    expect(args[nIdx + 3]).toBe("2048");
+  });
+});
 
 describe("parseModelBufferSizes", () => {
   it("returns null when the line was never seen at all (older build, or failed pre-load)", () => {
