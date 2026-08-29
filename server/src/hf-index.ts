@@ -49,13 +49,24 @@ import { isHfTokenConfigured, getRateLimitStatus } from "./hf-rate-limit.js";
 //      changes on repos already in the index get picked up cheaply (a
 //      handful of search requests) instead of relying on (4) blindly
 //      re-fetching every repo's full file tree on a timer.
-//   4) Staleness refresh: repos whose last_seen is older than
-//      HF_INDEX_REFRESH_INTERVAL_MS get re-checked (excludes rows already
-//      soft-deleted -- see below, no point background-polling a confirmed-gone
-//      repo). With (3) now covering content changes, this is mostly a
-//      backstop for the one case neither (3) nor on-demand verification (see
-//      below) can see: a repo that's indexed, gets deleted, and that no
-//      worker currently references and HF never resurfaces as "modified".
+//   4) Staleness refresh (mode-gated -- see getStaleRefreshMode): repos whose
+//      last_seen is older than HF_INDEX_REFRESH_INTERVAL_MS get re-checked
+//      (excludes rows already soft-deleted -- see below, no point
+//      background-polling a confirmed-gone repo). With (3) now covering
+//      content changes, this is mostly a backstop for the one case neither
+//      (3) nor on-demand verification (see below) can see: a repo that's
+//      indexed, gets deleted, and that no worker currently references and HF
+//      never resurfaces as "modified". Unlike (1)-(3), which page through
+//      HF's search API (one request covers up to 50 repos), this sweep costs
+//      one full tree-fetch API call PER repo -- by far the most expensive of
+//      the four per repo scanned. HF_INDEX_STALENESS_REFRESH_MODE=on-demand
+//      disables this background sweep entirely and relies solely on
+//      routes/models.ts's hash-lookup already re-verifying a matched-but-
+//      stale row the moment a worker actually reports that file's hash (see
+//      verifyRepoInBackground) -- i.e. only repos someone's local model
+//      directory currently references get re-checked, and only when that
+//      happens. Tradeoff: a repo nobody's hash-lookup ever touches again
+//      keeps its last known last_seen (and deleted_at) forever.
 //
 // Deletion is handled lazily, not by a background reconciliation crawl: rows
 // are soft-deleted (deleted_at set, never hard-removed) by scanHfRepo when it
@@ -139,6 +150,22 @@ export function getLastModifiedBatchSize(): number {
     if (Number.isFinite(n) && n > 0) return Math.floor(n);
   }
   return HF_INDEX_LASTMODIFIED_BATCH_SIZE;
+}
+
+// "background" (default): runIndexTick's staleness sweep below queries
+// findStaleRepos() every tick and re-scans whatever it returns, same as
+// always -- every indexed repo gets a full tree-fetch API call roughly once
+// per HF_INDEX_REFRESH_INTERVAL_MS regardless of whether anyone still cares
+// about it.
+// "on-demand": that background sweep is skipped entirely. Staleness is left
+// to routes/models.ts's hash-lookup route, which already calls
+// verifyRepoInBackground on a matched-but-stale row the moment a worker
+// reports that file's hash -- i.e. a repo only gets re-checked when its
+// model is actually in use somewhere, not on a blind timer. See the module
+// doc comment's point (4) for the full tradeoff.
+export function getStaleRefreshMode(): "background" | "on-demand" {
+  const env = process.env.HF_INDEX_STALENESS_REFRESH_MODE?.trim().toLowerCase();
+  return env === "on-demand" ? "on-demand" : "background";
 }
 
 // How often a tick runs. HF's rate limit is a true sliding window tracked in
@@ -868,6 +895,7 @@ export function getHfIndexStatus(): {
   // being false almost always; frequently true means lastModifiedBatchSize
   // is undersized for real HF activity.
   lastModifiedSweepCatchingUp: boolean;
+  staleRefreshMode: "background" | "on-demand";
 } {
   return {
     isRunning,
@@ -884,11 +912,13 @@ export function getHfIndexStatus(): {
     recentBookmark: getRecentBookmark() ?? null,
     lastModifiedBookmark: getLastModifiedBookmark() ?? null,
     lastModifiedSweepCatchingUp: getLastModifiedResumeCursor() != null,
+    staleRefreshMode: getStaleRefreshMode(),
   };
 }
 
 // Run one index tick: a one-time backlog walk (until it wraps once) plus a
-// perpetual recent top-up and last-modified sweep, plus staleness refresh.
+// perpetual recent top-up and last-modified sweep, plus staleness refresh
+// (unless HF_INDEX_STALENESS_REFRESH_MODE=on-demand, see getStaleRefreshMode).
 // See the module doc comment for the full shape and why deletion isn't
 // handled by a background crawl here.
 export async function runIndexTick(): Promise<{ indexed: number; repos: number }> {
@@ -904,7 +934,7 @@ export async function runIndexTick(): Promise<{ indexed: number; repos: number }
   if (process.env.LOG_LEVEL === "debug") {
     const rl = getRateLimitStatus();
     log.debug(
-      `[hf-index] tick start: token=${isHfTokenConfigured() ? "yes" : "no"} backlogBatch=${backlogBatch} recentBatch=${recentBatch} lastModifiedBatch=${lastModifiedBatch} staleCap=${maxStale} backlogComplete=${isBacklogComplete()} recentBookmark=${getRecentBookmark() ?? "none"} lastModifiedBookmark=${getLastModifiedBookmark() ?? "none"} lastModifiedResume=${getLastModifiedResumeCursor() != null ? "mid-burst" : "none"} window api ${rl.api.usedInWindow}/${rl.api.limit} resolvers ${rl.resolvers.usedInWindow}/${rl.resolvers.limit}`
+      `[hf-index] tick start: token=${isHfTokenConfigured() ? "yes" : "no"} backlogBatch=${backlogBatch} recentBatch=${recentBatch} lastModifiedBatch=${lastModifiedBatch} staleCap=${maxStale} staleRefreshMode=${getStaleRefreshMode()} backlogComplete=${isBacklogComplete()} recentBookmark=${getRecentBookmark() ?? "none"} lastModifiedBookmark=${getLastModifiedBookmark() ?? "none"} lastModifiedResume=${getLastModifiedResumeCursor() != null ? "mid-burst" : "none"} window api ${rl.api.usedInWindow}/${rl.api.limit} resolvers ${rl.resolvers.usedInWindow}/${rl.resolvers.limit}`
     );
   }
 
@@ -1024,7 +1054,8 @@ export async function runIndexTick(): Promise<{ indexed: number; repos: number }
       );
     }
 
-    const staleRepos = findStaleRepos(now - HF_INDEX_REFRESH_INTERVAL_MS, maxStale);
+    const staleRepos =
+      getStaleRefreshMode() === "background" ? findStaleRepos(now - HF_INDEX_REFRESH_INTERVAL_MS, maxStale) : [];
     for (const repoId of staleRepos) toScan.add(repoId);
 
     // No fixed inter-repo delay here: acquireRateLimitSlot() (invoked by
@@ -1073,10 +1104,15 @@ export function startHfIndexService(): void {
   // process's env -- the common failure mode is editing orchestrator.env /
   // .env without restarting the service, or editing the wrong file for how
   // this process was launched (see .env.example / orchestrator.env.example).
+  const staleRefreshMode = getStaleRefreshMode();
+  const staleDesc =
+    staleRefreshMode === "background"
+      ? `stale cap ${getMaxReposPerTick()}`
+      : `stale refresh on-demand (HF_INDEX_STALENESS_REFRESH_MODE=on-demand -- background sweep disabled)`;
   if (isHfTokenConfigured()) {
-    log.info(`[hf-index] HF_TOKEN loaded -- using authenticated quotas (backlog batch ${getBacklogBatchSize()}, stale cap ${getMaxReposPerTick()})`);
+    log.info(`[hf-index] HF_TOKEN loaded -- using authenticated quotas (backlog batch ${getBacklogBatchSize()}, ${staleDesc})`);
   } else {
-    log.info(`[hf-index] HF_TOKEN not loaded -- using anonymous quotas (backlog batch ${getBacklogBatchSize()}, stale cap ${getMaxReposPerTick()})`);
+    log.info(`[hf-index] HF_TOKEN not loaded -- using anonymous quotas (backlog batch ${getBacklogBatchSize()}, ${staleDesc})`);
   }
 
   // Previously a plain setInterval(runTick, HF_INDEX_TICK_INTERVAL_MS): once
