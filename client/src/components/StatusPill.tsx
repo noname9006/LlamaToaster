@@ -22,7 +22,7 @@ export function StatusPill({ label, tone }: { label: string; tone: PillTone }) {
   );
 }
 
-const RUN_STATUS_TONE: Record<RunStatus, PillTone> = {
+export const RUN_STATUS_TONE: Record<RunStatus, PillTone> = {
   running: "accent",
   scheduled: "muted",
   done: "success",

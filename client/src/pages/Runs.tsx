@@ -1,15 +1,65 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { api } from "../api/client";
-import { RunStatusPill, StatusDot, StatusCircleStrip, buildProgressUnits, describeItemPhase } from "../components/StatusPill";
+import {
+  RunStatusPill,
+  StatusDot,
+  StatusPill,
+  StatusCircleStrip,
+  buildProgressUnits,
+  describeItemPhase,
+  RUN_STATUS_TONE,
+} from "../components/StatusPill";
 import { Th, toggleSort, type SortState } from "../components/Th";
 import type { Run, RunConfig, RunItem } from "../types";
 import { shortId, formatElapsed, formatFlashAttn } from "../utils";
 
 const TERMINAL_ITEM_STATUSES = new Set(["done", "failed", "failed_oom", "cancelled"]);
 
+// §0.5's chain stages, abbreviated for the compact per-row chip strip below.
+// Any other kind (runtime/probe/quality/null) falls back to its own kind
+// name (or "run" for a legacy/standalone row) rather than a letter, since
+// those aren't part of the A/B/C tuning->refine->sweep sequence.
+const STAGE_CHIP_LABEL: Partial<Record<string, string>> = { tuning: "A", refine: "B", sweep: "C" };
+function chipLabel(kind: string | null | undefined): string {
+  return (kind && STAGE_CHIP_LABEL[kind]) || kind || "run";
+}
+
+// One row's worth of chain: every run sharing a root_run_id (Test A's own
+// id -- see Benchmark.tsx's startStage/repo.ts's chain insert, which points
+// every child at its root and never at itself). A standalone run (no
+// tuning/refine/sweep chain, e.g. most runtime/comparison rows) is simply a
+// group of one, and renders exactly as a bare run did before this grouping
+// existed.
+interface RunGroup {
+  rootId: string;
+  members: Run[]; // ascending by started_at, so members[0] is the chain's own start and members.at(-1) is its most advanced stage
+}
+
+// The stage the row should represent right now: whichever member is
+// actually in flight, else the furthest one the chain has reached. This is
+// NOT what the ID cell links to -- the ID always points at the chain's own
+// root page -- but it drives every other cell (backend/build/status/params)
+// so the row shows what the chain is doing *now*, not stale facts from
+// Test A.
+function currentMember(members: Run[]): Run {
+  return members.find((r) => r.status === "running") ?? members.find((r) => r.status === "scheduled") ?? members[members.length - 1];
+}
+
+function aggregateItems(members: Run[]): { total: number; done: number; failed: number; cancelled: number } {
+  return members.reduce(
+    (acc, r) => ({
+      total: acc.total + (r.items_total ?? 0),
+      done: acc.done + (r.items_done ?? 0),
+      failed: acc.failed + (r.items_failed ?? 0),
+      cancelled: acc.cancelled + (r.items_cancelled ?? 0),
+    }),
+    { total: 0, done: 0, failed: 0, cancelled: 0 }
+  );
+}
+
 const COLUMN_DESCRIPTIONS: Record<string, string> = {
-  id: "Unique run identifier — click it to open this run's detail page.",
+  id: "Unique test identifier — click it to open this run's detail page. A multi-stage chain (Test A/B/C) shares one id here; the small A/B/C chips below Params jump to an individual stage.",
   worker: "Which configured machine executed this run (e.g. a GPU box vs a CPU worker).",
   model: "The GGUF model file benchmarked in this run.",
   backend: "llama.cpp compute backend the worker was configured with for this run (e.g. cpu, vulkan, cuda, rocm, sycl — whatever that worker actually uses).",
@@ -22,23 +72,29 @@ const COLUMN_DESCRIPTIONS: Record<string, string> = {
   started: "When this run was triggered.",
 };
 
-function runSortValue(r: Run, key: string): string | number {
+// Same columns as a bare run, but resolved against a whole chain: id/worker/
+// model/started are the chain's own facts (root id, root's pairing, root's
+// start time), while backend/build/status track whichever member
+// currentMember() says is "now" -- see that function's comment.
+function groupSortValue(g: RunGroup, key: string): string | number {
+  const root = g.members[0];
+  const cur = currentMember(g.members);
   switch (key) {
     case "id":
-      return r.id;
+      return g.rootId;
     case "worker":
-      return r.worker_name;
+      return root.worker_name;
     case "model":
-      return r.model_filename || r.model_id;
+      return root.model_filename || root.model_id;
     case "backend":
-      return r.llama_cpp_backend;
+      return cur.llama_cpp_backend;
     case "build":
-      return r.llama_cpp_build;
+      return cur.llama_cpp_build;
     case "status":
-      return r.status;
+      return cur.status;
     case "started":
     default:
-      return r.started_at;
+      return root.started_at;
   }
 }
 
@@ -78,19 +134,37 @@ export function Runs() {
   const backendOptions = useMemo(() => Array.from(new Set(runs.map((r) => r.llama_cpp_backend))).sort(), [runs]);
   const statusOptions = useMemo(() => Array.from(new Set(runs.map((r) => r.status))).sort(), [runs]);
 
-  const visibleRuns = useMemo(() => {
-    let list = runs;
-    if (workerFilter) list = list.filter((r) => r.worker_name === workerFilter);
-    if (backendFilter) list = list.filter((r) => r.llama_cpp_backend === backendFilter);
-    if (statusFilter) list = list.filter((r) => r.status === statusFilter);
+  // §0.5's chain: every run sharing a root_run_id (Test A's own id, per
+  // repo.ts's chain insert) collapses to one row. A standalone run (no
+  // parent, no children -- most runtime/comparison rows) is a group of one
+  // and renders exactly as before this grouping existed.
+  const groups = useMemo<RunGroup[]>(() => {
+    const byRoot = new Map<string, Run[]>();
+    for (const r of runs) {
+      const key = r.root_run_id ?? r.id;
+      const bucket = byRoot.get(key);
+      if (bucket) bucket.push(r);
+      else byRoot.set(key, [r]);
+    }
+    return Array.from(byRoot.entries()).map(([rootId, members]) => ({
+      rootId,
+      members: [...members].sort((a, b) => a.started_at - b.started_at),
+    }));
+  }, [runs]);
+
+  const visibleGroups = useMemo(() => {
+    let list = groups;
+    if (workerFilter) list = list.filter((g) => g.members[0].worker_name === workerFilter);
+    if (backendFilter) list = list.filter((g) => currentMember(g.members).llama_cpp_backend === backendFilter);
+    if (statusFilter) list = list.filter((g) => currentMember(g.members).status === statusFilter);
     const dir = sort.dir === "asc" ? 1 : -1;
     return [...list].sort((a, b) => {
-      const av = runSortValue(a, sort.key);
-      const bv = runSortValue(b, sort.key);
+      const av = groupSortValue(a, sort.key);
+      const bv = groupSortValue(b, sort.key);
       if (typeof av === "number" && typeof bv === "number") return dir * (av - bv);
       return dir * String(av).localeCompare(String(bv));
     });
-  }, [runs, workerFilter, backendFilter, statusFilter, sort]);
+  }, [groups, workerFilter, backendFilter, statusFilter, sort]);
 
   useEffect(() => {
     let cancelled = false;
@@ -214,7 +288,7 @@ export function Runs() {
             )}
           </div>
 
-          {visibleRuns.length === 0 ? (
+          {visibleGroups.length === 0 ? (
             <p className="mt-4 text-sm text-muted">No runs match the current filters.</p>
           ) : (
             <div className="mt-4 overflow-x-auto rounded-xl border border-border bg-surface">
@@ -232,47 +306,59 @@ export function Runs() {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-border">
-                  {visibleRuns.map((r) => {
-                    const items = r.status === "running" ? runItems[r.id] : undefined;
+                  {visibleGroups.map((g) => {
+                    const root = g.members[0];
+                    const cur = currentMember(g.members);
+                    const agg = aggregateItems(g.members);
+                    const items = cur.status === "running" ? runItems[cur.id] : undefined;
                     const current =
                       items?.find((it) => !TERMINAL_ITEM_STATUSES.has(it.status) && it.status !== "queued") ??
                       items?.find((it) => it.status === "queued");
                     return (
-                      <tr key={r.id} className="hover:bg-white/5">
+                      <tr key={g.rootId} className="hover:bg-white/5">
                         <td className="px-4 py-2.5">
-                          <Link to={`/runs/${r.id}`} className="text-accent hover:underline">
-                            <code>{shortId(r.id)}</code>
+                          <Link to={`/runs/${g.rootId}`} className="text-accent hover:underline">
+                            <code>{shortId(g.rootId)}</code>
                           </Link>
                         </td>
-                        <td className="px-4 py-2.5 text-fg">{r.worker_name}</td>
-                        <td className="px-4 py-2.5 text-muted">{r.model_filename || `${shortId(r.model_id)}…`}</td>
-                        <td className="px-4 py-2.5 text-muted">{r.llama_cpp_backend}</td>
-                        <td className="px-4 py-2.5 text-muted">{r.llama_cpp_build}</td>
+                        <td className="px-4 py-2.5 text-fg">{root.worker_name}</td>
+                        <td className="px-4 py-2.5 text-muted">{root.model_filename || `${shortId(root.model_id)}…`}</td>
+                        <td className="px-4 py-2.5 text-muted">{cur.llama_cpp_backend}</td>
+                        <td className="px-4 py-2.5 text-muted">{cur.llama_cpp_build}</td>
                         <td className="px-4 py-2.5 text-muted whitespace-nowrap font-mono text-xs">
-                          {formatSweepParams(r.config.sweep)}
-                          {r.status === "running" && items && items.length > 0 && (
-                            <StatusCircleStrip units={buildProgressUnits(items, r.config.sweep.repeats)} />
+                          {formatSweepParams(cur.config.sweep)}
+                          {cur.status === "running" && items && items.length > 0 && (
+                            <StatusCircleStrip units={buildProgressUnits(items, cur.config.sweep.repeats)} />
+                          )}
+                          {g.members.length > 1 && (
+                            <div className="mt-1.5 flex flex-wrap items-center gap-1">
+                              {g.members.map((m) => (
+                                <Link key={m.id} to={`/runs/${m.id}`} title={`${chipLabel(m.kind)}: ${m.status}`}>
+                                  <StatusPill label={chipLabel(m.kind)} tone={RUN_STATUS_TONE[m.status]} />
+                                </Link>
+                              ))}
+                            </div>
                           )}
                         </td>
                         <td className="px-4 py-2.5">
                           <div className="flex flex-wrap items-center gap-2">
-                            <RunStatusPill status={r.status} />
-                            {r.items_total ? (
+                            <RunStatusPill status={cur.status} />
+                            {agg.total ? (
                               <span className="text-xs text-muted">
-                                {r.items_done}/{r.items_total}
-                                {r.items_failed ? ` (${r.items_failed} failed)` : ""}
-                                {r.items_cancelled ? ` (${r.items_cancelled} cancelled)` : ""}
+                                {agg.done}/{agg.total}
+                                {agg.failed ? ` (${agg.failed} failed)` : ""}
+                                {agg.cancelled ? ` (${agg.cancelled} cancelled)` : ""}
                               </span>
                             ) : null}
-                            {r.status === "running" && (
-                              <span className="text-xs text-muted">{formatElapsed(now - r.started_at)}</span>
+                            {cur.status === "running" && (
+                              <span className="text-xs text-muted">{formatElapsed(now - root.started_at)}</span>
                             )}
                           </div>
-                          {r.status === "running" && current && (
+                          {cur.status === "running" && current && (
                             <div className="mt-1 flex items-center gap-1.5">
                               <StatusDot status={current.status} />
                               <span className="text-xs text-muted">
-                                step {current.idx + 1}/{r.items_total}
+                                step {current.idx + 1}/{cur.items_total}
                               </span>
                               <span className="max-w-xs truncate text-xs text-muted" title={describeItemPhase(current)}>
                                 {describeItemPhase(current)}
@@ -280,7 +366,7 @@ export function Runs() {
                             </div>
                           )}
                         </td>
-                        <td className="px-4 py-2.5 text-muted">{new Date(r.started_at).toLocaleString()}</td>
+                        <td className="px-4 py-2.5 text-muted">{new Date(root.started_at).toLocaleString()}</td>
                       </tr>
                     );
                   })}
