@@ -96,13 +96,45 @@ describe("computeDualPoolFit", () => {
     expect(at0.fits).toBe(at10.fits);
   });
 
-  it("uses the plain KV formula regardless of a sliding window -- need is unchanged, confidence downgrades", () => {
-    const plain = computeDualPoolFit(dualInput({ ngl: 5, ctxTokens: 4000 }));
-    const swa = computeDualPoolFit(dualInput({ ngl: 5, ctxTokens: 4000, slidingWindow: 512 }));
-    expect(swa.gpu.kvMib).toBeCloseTo(plain.gpu.kvMib, 6);
-    expect(swa.cpu.kvMib).toBeCloseTo(plain.cpu.kvMib, 6);
+  // With a sliding window set, the GPU side is always the SUFFIX of
+  // GPU-resident blocks (llama.cpp offloads the last `ngl` blocks first) and
+  // the Gemma-style pattern's global block is always the model's LAST
+  // block -- so global-layer counts are exact, not approximated, on both
+  // sides: gpuGlobal = ceil(gpuKvLayers/6), cpuGlobal = ceil(kvLayerCount/6)
+  // - gpuGlobal. Here kvLayerCount:9, ngl:5 -> gpuKvLayers:5, cpuKvLayers:4,
+  // totalGlobal:ceil(9/6)=2, gpuGlobal:ceil(5/6)=1, cpuGlobal:2-1=1. Per-layer
+  // cost is MODEL's own 2048 bytes/token/layer (see its doc comment).
+  it("splits KV by global (full-ctx) vs local (window-bound) layers when a sliding window is set", () => {
+    const ctxTokens = 4000;
+    const slidingWindow = 512;
+    const plain = computeDualPoolFit(dualInput({ ngl: 5, ctxTokens }));
+    const swa = computeDualPoolFit(dualInput({ ngl: 5, ctxTokens, slidingWindow }));
+
+    // gpu: 1 global layer @ full ctx + 4 local layers capped at the window.
+    const expectedGpuBytes = 2048 * (1 * ctxTokens + 4 * slidingWindow);
+    // cpu: 1 global layer @ full ctx + 3 local layers capped at the window.
+    const expectedCpuBytes = 2048 * (1 * ctxTokens + 3 * slidingWindow);
+    expect(swa.gpu.kvMib).toBeCloseTo(expectedGpuBytes / BYTES_PER_MIB, 6);
+    expect(swa.cpu.kvMib).toBeCloseTo(expectedCpuBytes / BYTES_PER_MIB, 6);
+
+    // Window-capping must strictly reduce need vs the naive all-full-ctx
+    // formula -- this is the whole point of the SWA-aware split.
+    expect(swa.gpu.kvMib).toBeLessThan(plain.gpu.kvMib);
+    expect(swa.cpu.kvMib).toBeLessThan(plain.cpu.kvMib);
+
     expect(plain.confidence).toBe("good");
     expect(swa.confidence).toBe("rough");
+  });
+
+  // ctxTokens below the window means no layer is actually capped yet -- SWA
+  // and plain math must agree exactly here, same as the real llama.cpp
+  // behavior (a sliding-window cache is identical to a full one up to the
+  // window size).
+  it("agrees with the plain formula whenever ctx is within the sliding window", () => {
+    const swa = computeDualPoolFit(dualInput({ ngl: 5, ctxTokens: 400, slidingWindow: 512 }));
+    const plain = computeDualPoolFit(dualInput({ ngl: 5, ctxTokens: 400 }));
+    expect(swa.gpu.kvMib).toBeCloseTo(plain.gpu.kvMib, 6);
+    expect(swa.cpu.kvMib).toBeCloseTo(plain.cpu.kvMib, 6);
   });
 
   it("reports fits:null (not false) when a pool's live reading is missing", () => {
@@ -119,6 +151,51 @@ describe("computeDualPoolFit", () => {
     const fit = computeDualPoolFit(dualInput({ ngl: 0, ctxTokens: 1000 }));
     expect(fit.gpu.kvMib).toBe(0);
     expect(fit.gpu.weightsMib).toBe(0);
+  });
+
+  // Regression case: a real Gemma-4-12B-style model (48 layers, GQA
+  // nHeadKv:8/headDim:256, 1024-token sliding window, ngl:0 i.e. CPU-only)
+  // at ctx:32768. Before this fix, every one of the 40 window-bound layers
+  // was wrongly charged the full 32768-token cost instead of its real
+  // 1024-token cap: plain math gives ~24.3 GiB (weights ~11.83 + naive KV 12
+  // + 0.5 overhead). The live app was observed showing ~54.8 GiB for this
+  // exact model/ctx/ngl -- notably MORE than even this naive-but-correct-
+  // head-count figure, which this fix alone doesn't explain (points at a
+  // separate metadata discrepancy for that specific GGUF, e.g. a wrong
+  // stored n_head_kv). What this test locks in is that the SWA-aware math
+  // itself is correct given accurate inputs: only the 8 global layers
+  // (ceil(48/6)) scale with ctx, the other 40 stay capped at the window,
+  // landing far below the naive figure either way.
+  it("keeps a Gemma-3/4-style 48-layer hybrid-attention model's RAM estimate realistic at CPU-only offload", () => {
+    const modelSizeBytes = 12.7e9; // Q8_0 file size, decimal GB per HF's own listing
+    const input: DualPoolInput = {
+      modelSizeBytes,
+      totalModelLayers: 49,
+      kvLayerCount: 48,
+      ngl: 0,
+      ctxTokens: 32_768,
+      nHeadKv: 8,
+      headDimK: 256,
+      headDimV: 256,
+      cacheTypeK: "f16",
+      cacheTypeV: "f16",
+      slidingWindow: 1024,
+      vram: { freeMib: 5.2 * 1024, totalMib: 5.2 * 1024 },
+      ram: { freeMib: 12.2 * 1024, totalMib: 12.2 * 1024 },
+      unifiedPool: false,
+    };
+    const swa = computeDualPoolFit(input);
+    const plain = computeDualPoolFit({ ...input, slidingWindow: undefined });
+
+    // Naive (old) behavior: every layer charged the full 32768-token cost.
+    const plainGiB = plain.cpu.neededMib / 1024;
+    expect(plainGiB).toBeGreaterThan(23);
+    expect(plainGiB).toBeLessThan(26);
+    // SWA-aware (new) behavior lands well below it.
+    const swaGiB = swa.cpu.neededMib / 1024;
+    expect(swaGiB).toBeGreaterThan(13);
+    expect(swaGiB).toBeLessThan(16);
+    expect(swa.cpu.neededMib).toBeLessThan(plain.cpu.neededMib);
   });
 });
 
