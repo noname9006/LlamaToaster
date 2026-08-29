@@ -588,18 +588,24 @@ export function NewRun() {
   // Pre-flight VRAM-fit estimate -- null (no banner) whenever any input is
   // unknown (model size, layer count, or a live VRAM reading), same "don't
   // guess" posture as nglSuggestedLabel's own NGL_FALLBACK_MAX fallback
-  // above. Uses the highest -ngl value currently in the sweep, since that's
-  // the one that would actually risk overcommitting VRAM. See
-  // shared/vramEstimate.ts for the formula and its known limitations
-  // (a flat per-layer average, weakest for MoE models).
+  // above. Uses the highest -ngl value currently in the sweep (worst case for
+  // VRAM) and the LOWEST --n-cpu-moe value (0 if unset -- the worst case,
+  // since a higher n_cpu_moe only ever moves MORE bytes off GPU). Prefers the
+  // model's real per-tensor breakdown when available -- see
+  // shared/vramEstimate.ts's placeWeightBytes -- falling back to the flat
+  // per-layer average (weakest for MoE/large-vocab models) otherwise.
   const vramFitEstimate = useMemo(() => {
     if (!selectedModel || baseLayerCount == null || liveVram?.vram_free_before_mib == null) return null;
     const requestedNgl = sweep.n_gpu_layers.length > 0 ? Math.max(...sweep.n_gpu_layers) : 0;
     if (requestedNgl <= 0) return null;
+    const nCpuMoe = sweep.n_cpu_moe.length > 0 ? Math.min(...sweep.n_cpu_moe) : 0;
+    const tensorBreakdown = selectedModel.metadata.tensor_layer_bytes ?? null;
     const neededMib = estimateVramNeededMib({
       modelSizeBytes: selectedModel.size_bytes,
       totalModelLayers: baseLayerCount,
       requestedNgl,
+      nCpuMoe,
+      tensorBreakdown,
     });
     if (neededMib == null) return null;
     const freeMib = liveVram.vram_free_before_mib;
@@ -607,10 +613,10 @@ export function NewRun() {
       modelSizeBytes: selectedModel.size_bytes,
       neededMib,
       freeMib,
-      safeNgl: estimateSafeNgl(selectedModel.size_bytes, baseLayerCount, freeMib),
+      safeNgl: estimateSafeNgl(selectedModel.size_bytes, baseLayerCount, freeMib, tensorBreakdown),
       fits: neededMib <= freeMib,
     };
-  }, [selectedModel, baseLayerCount, sweep.n_gpu_layers, liveVram]);
+  }, [selectedModel, baseLayerCount, sweep.n_gpu_layers, sweep.n_cpu_moe, liveVram]);
 
   const threadsMax = workerHardware?.cpu.cores || THREADS_FALLBACK_MAX;
   const threadsSuggested = Math.max(1, threadsMax - 1);
@@ -936,6 +942,8 @@ export function NewRun() {
                     modelSizeBytes: selectedModel.size_bytes,
                     totalModelLayers: baseLayerCount,
                     requestedNgl: Math.max(...(sweep.n_gpu_layers.length > 0 ? sweep.n_gpu_layers : [0])),
+                    nCpuMoe: sweep.n_cpu_moe.length > 0 ? Math.min(...sweep.n_cpu_moe) : 0,
+                    tensorBreakdown: selectedModel.metadata.tensor_layer_bytes ?? null,
                   })
                 : null,
             nLayer: selectedModel?.metadata.n_layer,
