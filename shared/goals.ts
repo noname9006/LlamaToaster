@@ -1,18 +1,18 @@
 export type GoalKind = "balanced" | "max_speed" | "max_context";
 export type WorkloadShape = "chat" | "docs" | "even";
-export type KvTolerance = "q4_0_ok" | "q8_0_ok" | "f16_only";
+export type KvPreset = "compact" | "basic" | "extended" | "comprehensive";
 
 export interface GoalsConfig {
   goal: GoalKind;
   target_ctx?: number | null;
   speed_floor_frac?: number;
   workload: WorkloadShape;
-  kv_tolerance?: KvTolerance;
+  kv_preset?: KvPreset;
 }
 
 export const GOAL_KINDS: readonly GoalKind[] = ["balanced", "max_speed", "max_context"];
 export const WORKLOAD_SHAPES: readonly WorkloadShape[] = ["chat", "docs", "even"];
-export const KV_TOLERANCES: readonly KvTolerance[] = ["q4_0_ok", "q8_0_ok", "f16_only"];
+export const KV_PRESETS: readonly KvPreset[] = ["compact", "basic", "extended", "comprehensive"];
 export const SPEED_FLOOR_CHOICES = [0.4, 0.5, 0.6] as const;
 
 export const WORKLOAD_WEIGHTS: Record<WorkloadShape, { wPP: number; wTG: number }> = {
@@ -22,7 +22,7 @@ export const WORKLOAD_WEIGHTS: Record<WorkloadShape, { wPP: number; wTG: number 
 };
 
 export function defaultGoals(): GoalsConfig {
-  return { goal: "balanced", target_ctx: null, speed_floor_frac: 0.5, workload: "even", kv_tolerance: "q4_0_ok" };
+  return { goal: "balanced", target_ctx: null, speed_floor_frac: 0.5, workload: "even", kv_preset: "extended" };
 }
 
 function oneOf<T extends string>(raw: unknown, allowed: readonly T[]): T | undefined {
@@ -34,7 +34,7 @@ export function normalizeGoals(raw: unknown): GoalsConfig | undefined {
   const r = raw as Record<string, unknown>;
   const goal = oneOf(r.goal, GOAL_KINDS) ?? defaultGoals().goal;
   const workload = oneOf(r.workload, WORKLOAD_SHAPES) ?? defaultGoals().workload;
-  const kv_tolerance = oneOf(r.kv_tolerance, KV_TOLERANCES) ?? defaultGoals().kv_tolerance;
+  const kv_preset = oneOf(r.kv_preset, KV_PRESETS) ?? defaultGoals().kv_preset;
   let target_ctx: number | null | undefined;
   if (r.target_ctx === null || r.target_ctx === "unverified") target_ctx = null;
   else if (typeof r.target_ctx === "number" && Number.isFinite(r.target_ctx) && r.target_ctx > 0) {
@@ -45,7 +45,7 @@ export function normalizeGoals(raw: unknown): GoalsConfig | undefined {
     floorRaw != null && (SPEED_FLOOR_CHOICES as readonly number[]).includes(floorRaw)
       ? floorRaw
       : defaultGoals().speed_floor_frac;
-  return { goal, target_ctx, speed_floor_frac, workload, kv_tolerance };
+  return { goal, target_ctx, speed_floor_frac, workload, kv_preset };
 }
 
 export function goalsEqualDefaults(goals: GoalsConfig | undefined): boolean {
@@ -56,98 +56,63 @@ export function goalsEqualDefaults(goals: GoalsConfig | undefined): boolean {
     (goals.target_ctx == null || goals.target_ctx === d.target_ctx) &&
     (goals.speed_floor_frac ?? d.speed_floor_frac) === d.speed_floor_frac &&
     goals.workload === d.workload &&
-    (goals.kv_tolerance ?? d.kv_tolerance) === d.kv_tolerance
+    (goals.kv_preset ?? d.kv_preset) === d.kv_preset
   );
 }
 
-const QUANTIZED_KV_TYPES = new Set(["q8_0", "q5_1", "q5_0", "q4_1", "q4_0", "iq4_nl"]);
-const UNQUANTIZED_KV_TYPES = new Set(["f32", "bf16", "f16"]);
+// Four curated (K,V) grids, each a strict superset of the one before it --
+// Compact ⊂ Basic ⊂ Extended ⊂ Comprehensive -- so picking a bigger tier is
+// always strictly "more", never a lateral trade against what a smaller tier
+// already covered. Every tier keeps f16/f16 as its baseline, which is why no
+// separate "ensure an unquantized pair survives" fallback is needed here the
+// way the old tolerance-pruning machinery required: there is nothing left to
+// prune at run time, these are exactly the pairs that run.
+export const KV_PRESET_PAIRS: Record<KvPreset, ReadonlyArray<readonly [string, string]>> = {
+  // Fast sanity check: baseline, mild (both q8_0), and the popular
+  // long-context setup (q8_0 K / q4_0 V).
+  compact: [
+    ["f16", "f16"],
+    ["q8_0", "q8_0"],
+    ["q8_0", "q4_0"],
+  ],
+  // Compact + bf16/bf16, so it also answers "does bf16 behave like f16".
+  basic: [
+    ["f16", "f16"],
+    ["bf16", "bf16"],
+    ["q8_0", "q8_0"],
+    ["q8_0", "q4_0"],
+  ],
+  // Basic + K-only and V-only isolation at the mild (q8_0) level, plus both
+  // sides pushed to the aggressive (q4_0) level together.
+  extended: [
+    ["f16", "f16"],
+    ["bf16", "bf16"],
+    ["q8_0", "f16"],
+    ["f16", "q8_0"],
+    ["q8_0", "q8_0"],
+    ["q8_0", "q4_0"],
+    ["q4_0", "q4_0"],
+  ],
+  // Extended + the asymmetric-quantized corner (K aggressive / V mild), the
+  // two full-range corners (one side untouched, the other pushed straight to
+  // q4_0), a middle bit-width rung (q5_0, between q8_0 and q4_0), and an
+  // alternative 4-bit codec (iq4_nl) compared against q4_0 at the same size.
+  comprehensive: [
+    ["f16", "f16"],
+    ["bf16", "bf16"],
+    ["q8_0", "f16"],
+    ["f16", "q8_0"],
+    ["q8_0", "q8_0"],
+    ["q5_0", "q5_0"],
+    ["q8_0", "q4_0"],
+    ["q4_0", "q8_0"],
+    ["q4_0", "q4_0"],
+    ["f16", "q4_0"],
+    ["q4_0", "f16"],
+    ["iq4_nl", "iq4_nl"],
+  ],
+};
 
-function isQuantized(t: string): boolean {
-  return QUANTIZED_KV_TYPES.has(t);
-}
-
-function minQuantBitsRequired(tolerance: KvTolerance): number {
-  switch (tolerance) {
-    case "q4_0_ok":
-      return 0;
-    case "q8_0_ok":
-      return 5;
-    case "f16_only":
-      return Number.POSITIVE_INFINITY;
-  }
-}
-
-function quantBits(t: string): number {
-  switch (t) {
-    case "q8_0":
-      return 8;
-    case "q5_1":
-    case "q5_0":
-      return 5;
-    case "q4_1":
-    case "q4_0":
-    case "iq4_nl":
-      return 4;
-    default:
-      return 16;
-  }
-}
-
-export function pairAllowedUnderTolerance(ck: string, cv: string, tolerance: KvTolerance): boolean {
-  const min = minQuantBitsRequired(tolerance);
-  for (const t of [ck, cv]) {
-    if (!isQuantized(t)) continue;
-    if (quantBits(t) < min) return false;
-  }
-  return true;
-}
-
-export function pruneCacheTypes(types: string[], tolerance: KvTolerance): string[] {
-  // If every value in this axis is a quantized type the tolerance forbids,
-  // the axis prunes to empty -- NEVER back to the original, unquantized
-  // types are never pruned by tolerance in the first place, so an empty
-  // result here means the caller reintroducing the originals would be
-  // reintroducing exactly the forbidden quantized values (a silent
-  // tolerance violation). ensureUnquantizedPairSurvives is what adds a
-  // real fallback pair back in.
-  return types.filter((t) => !isQuantized(t) || quantBits(t) >= minQuantBitsRequired(tolerance));
-}
-
-// One unquantized pair always survives so the flash-attention-off axis keeps
-// something to vary against (M4's inviolable rule). Expert mode prunes
-// quantized sides but retains other unquantized pairs; only the recommended
-// set collapses to the single f16/f16 value.
-export function ensureUnquantizedPairSurvives(
-  cache_type_k: string[],
-  cache_type_v: string[],
-  recommendedPairs: ReadonlyArray<readonly [string, string]>,
-  expertMode: boolean
-): { cache_type_k: string[]; cache_type_v: string[] } {
-  const hasUnquantizedPair = cache_type_k.some((k) => UNQUANTIZED_KV_TYPES.has(k)) &&
-    cache_type_v.some((v) => UNQUANTIZED_KV_TYPES.has(v));
-  if (hasUnquantizedPair) return { cache_type_k, cache_type_v };
-  const fallbackPair = expertMode
-    ? (recommendedPairs.find(([k, v]) => UNQUANTIZED_KV_TYPES.has(k) && UNQUANTIZED_KV_TYPES.has(v)) ??
-      (["f32", "bf16", "f16"] as const)
-        .map((t) => [t, t] as const)
-        .find(([k, v]) => UNQUANTIZED_KV_TYPES.has(k) && UNQUANTIZED_KV_TYPES.has(v)))!
-    : (["f16", "f16"] as const);
-  return {
-    cache_type_k: [...new Set([...cache_type_k, fallbackPair[0]])],
-    cache_type_v: [...new Set([...cache_type_v, fallbackPair[1]])],
-  };
-}
-
-export const DEFAULT_RECOMMENDED_KV_PAIRS: ReadonlyArray<readonly [string, string]> = [
-  ["f16", "f16"],
-  ["f16", "q8_0"],
-  ["q8_0", "q8_0"],
-  ["q8_0", "q4_0"],
-];
-
-export function recommendedKvGrid(tolerance: KvTolerance): Array<readonly [string, string]> {
-  const pruned = DEFAULT_RECOMMENDED_KV_PAIRS.filter(([k, v]) => pairAllowedUnderTolerance(k, v, tolerance));
-  if (pruned.length > 0) return pruned;
-  return [["f16", "f16"]];
+export function kvPresetPairs(preset: KvPreset | undefined): ReadonlyArray<readonly [string, string]> {
+  return KV_PRESET_PAIRS[preset ?? "extended"];
 }

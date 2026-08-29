@@ -12,15 +12,7 @@ import type { Model, SweepConfig, Backend, WorkerVramInfo } from "../types";
 import { formatGpuLabel, formatBytes } from "../utils";
 import { estimateVramNeededMib, estimateSafeNgl } from "../vramEstimate";
 import { GoalQuestionnaire } from "../components/GoalQuestionnaire";
-import {
-  defaultGoals,
-  goalsEqualDefaults,
-  normalizeGoals,
-  pruneCacheTypes,
-  ensureUnquantizedPairSurvives,
-  DEFAULT_RECOMMENDED_KV_PAIRS,
-  type GoalsConfig,
-} from "../goals";
+import { defaultGoals, goalsEqualDefaults, normalizeGoals, type GoalsConfig } from "../goals";
 import { expandSweep } from "../../../shared/sweep";
 import { priceMatrix, ETA_UNAVAILABLE } from "../../../shared/pricing";
 import type { ModelRatesResponse } from "../types";
@@ -745,9 +737,7 @@ export function NewRun() {
         mtp_model_id: mtpModelId || undefined,
         main_gpu: mainGpuForSubmit,
         main_gpu_backend: gpuOverrideBackend,
-        // M4 -- the tolerance prunes forbidden pairs BEFORE expansion, so the
-        // live count, the cost estimate and what actually runs all agree.
-        sweep: prunedSweep,
+        sweep,
         // M2's "skippable by construction": an untouched questionnaire sends
         // NO goals key at all, making the payload byte-identical to what this
         // page sent before the amendment existed.
@@ -822,7 +812,7 @@ export function NewRun() {
         worker_id: workerId,
         kind: "runtime",
         knee: { n_prompt: nPrompt, n_gen: nGen, slots: [1, 2, 4, 8], repeats: 1 },
-        sweep: prunedSweep,
+        sweep,
       });
       setLastRunId(run.id);
       setWorkflowMsg(
@@ -833,43 +823,20 @@ export function NewRun() {
     }
   }
 
-  // M4 -- the KV-quality tolerance removes forbidden pairs at GRID-BUILD time,
-  // before expansion, so the live count, the cost estimate and the invalid-
-  // combination breakdown all reflect what will actually run. Uses the same
-  // shared, tested pruning primitives shared/goals.ts's recommendedKvGrid
-  // does, rather than a second hand-rolled copy of this logic: one rule is
-  // inviolable whatever the tolerance -- at least one UNQUANTIZED pair
-  // survives, so the flash-attention-off axis keeps something to vary
-  // against -- and expertMode:true here since this grid is always the flat
-  // cross-product NewRun builds, never the collapsed single-pair Recommended
-  // grid (this app has no Recommended/Expert mode toggle).
-  const prunedSweep = useMemo<Sweep>(() => {
-    const tolerance = goals.kv_tolerance ?? "q4_0_ok";
-    const prunedK = pruneCacheTypes(sweep.cache_type_k, tolerance);
-    const prunedV = pruneCacheTypes(sweep.cache_type_v, tolerance);
-    const { cache_type_k, cache_type_v } = ensureUnquantizedPairSurvives(
-      prunedK,
-      prunedV,
-      DEFAULT_RECOMMENDED_KV_PAIRS,
-      true
-    );
-    return { ...sweep, cache_type_k, cache_type_v };
-  }, [sweep, goals.kv_tolerance]);
-
-  const prunedPairs = useMemo(() => {
-    const removedK = sweep.cache_type_k.filter((t) => !prunedSweep.cache_type_k.includes(t));
-    const removedV = sweep.cache_type_v.filter((t) => !prunedSweep.cache_type_v.includes(t));
-    return [...new Set([...removedK, ...removedV])];
-  }, [sweep, prunedSweep]);
-
-  // The LIVE count is the post-prune expansion, not an estimate of it.
+  // The LIVE count is the actual expansion -- this page builds one flat
+  // cross-product by hand (K x V included: there's no curated-preset concept
+  // here, that's the Benchmark page's job), so nothing needs pruning before
+  // expandSweep sees it. A quantized pair crossed with flash_attn:"off" is
+  // still silently skipped per-item by expandSweep itself (shared/sweep.ts's
+  // isValidCombo), which is why the count below can be lower than the raw
+  // axis product without anything here having to reconcile it.
   const expandedItems = useMemo(() => {
     try {
-      return expandSweep(prunedSweep).length;
+      return expandSweep(sweep).length;
     } catch {
       return 0;
     }
-  }, [prunedSweep]);
+  }, [sweep]);
 
   // §0.6 -- the ETA prices from a {server, spec:"off"} rate first, then a
   // labeled llama-bench rate, then not at all. No number renders without its
@@ -894,17 +861,17 @@ export function NewRun() {
 
   const priced = useMemo(() => {
     if (!rates) return { seconds: null, display: `${ETA_UNAVAILABLE} — no measured rates for this pairing yet` };
-    const items = expandSweep(prunedSweep);
+    const items = expandSweep(sweep);
     return priceMatrix(
       items.map((item) => ({
         nPrompt: item.n_prompt,
         nGen: item.n_gen,
-        repeats: prunedSweep.repeats,
+        repeats: sweep.repeats,
         ppRate: rates.pp,
         tgRate: rates.tg,
       }))
     );
-  }, [rates, prunedSweep]);
+  }, [rates, sweep]);
 
   const inputCls =
     "rounded-lg border border-border bg-surface px-3 py-1.5 text-fg outline-none focus:border-accent";
@@ -1371,9 +1338,9 @@ export function NewRun() {
           {workflowMsg && <p className="mt-2 text-xs leading-relaxed text-muted">{workflowMsg}</p>}
         </div>
 
-        {/* The grid as it will actually run. M4's exit criterion is exactly
-            this: the LIVE COUNT equals the post-prune expansion, so the
-            number here and the number of tests that execute never disagree. */}
+        {/* The grid as it will actually run. The LIVE COUNT is the real
+            expansion, so the number here and the number of tests that
+            execute never disagree. */}
         <div className="rounded-xl border border-border bg-surface p-5">
           <div className="flex flex-wrap items-baseline justify-between gap-3">
             <span className="text-sm font-medium text-fg">Grid as it will run</span>
@@ -1381,13 +1348,6 @@ export function NewRun() {
               {expandedItems} test{expandedItems === 1 ? "" : "s"} · {priced.display}
             </span>
           </div>
-          {prunedPairs.length > 0 && (
-            <p className="mt-2 text-xs leading-relaxed text-muted">
-              <b className="text-fg">Sweep axis after your tolerance:</b> {prunedPairs.join(", ")}{" "}
-              {prunedPairs.length === 1 ? "was" : "were"} removed before expansion — the count above already
-              reflects it. The axis shrank; the count does not have to imply it.
-            </p>
-          )}
           <p className="mt-2 text-xs leading-relaxed text-muted">
             <b className="text-fg">Held fields keep their reasons.</b> Threads are held at the machine default:
             Test A targets fully offloaded configurations where <span className="font-mono">-t</span> barely

@@ -18,16 +18,48 @@ export function getDb(): Database.Database {
   // VPS after a redeploy that didn't preserve data/. Same mkdirSync-before-
   // write pattern the worker already uses for its own model_dir.
   mkdirSync(dirname(path), { recursive: true });
-  db = new Database(path);
-  db.pragma("journal_mode = WAL");
-  db.pragma("foreign_keys = ON");
-  migrate(db);
+  const opened = new Database(path);
+  opened.pragma("journal_mode = WAL");
+  opened.pragma("foreign_keys = ON");
+  try {
+    migrate(opened);
+  } catch (err) {
+    // Do NOT assign the module-level singleton on a failed migration: every
+    // other caller sees `if (db) return db` above and would otherwise reuse
+    // this half-migrated connection for the rest of the process with no way
+    // to ever retry. Closing it and leaving `db` null means the next getDb()
+    // call opens fresh and gets a real second attempt at migrate() instead.
+    opened.close();
+    throw err;
+  }
+  db = opened;
   return db;
 }
 
 function migrate(database: Database.Database): void {
   const sql = readFileSync(join(__dirname, "schema.sql"), "utf8");
-  database.exec(sql);
+  // schema.sql mixes CREATE TABLE IF NOT EXISTS (a safe no-op on an existing
+  // table) with CREATE INDEX IF NOT EXISTS statements that reference columns
+  // added to that table only much later (e.g. idx_local_model_cache_state on
+  // local_model_cache.state). On a DB whose table predates the column, the
+  // index statement throws "no such column" -- and since database.exec runs
+  // the whole file as one sequential batch, that abort happens BEFORE
+  // applyColumnMigrations below ever gets a chance to backfill the column,
+  // which silently skips every other column migration too (getDb's singleton
+  // is assigned before this function runs, so a caller never gets to retry).
+  // Recover by backfilling columns first, then retrying schema.sql from the
+  // top: every statement in it is idempotent (IF NOT EXISTS), so re-running
+  // it once the missing column exists is safe -- confirmed against a real
+  // pre-existing local_model_cache table missing `state` (2026-08-29).
+  try {
+    database.exec(sql);
+  } catch (err) {
+    log.warn(
+      `[migrate] schema.sql failed on first pass (${(err as Error).message}) -- retrying after column backfill`
+    );
+    applyColumnMigrations(database);
+    database.exec(sql);
+  }
   applyColumnMigrations(database);
   migrateHfGgufIndexPk(database);
   createResultsItemUniqueIndex(database);
@@ -384,24 +416,40 @@ function createWorkerEnrolmentIndexes(database: Database.Database): void {
 // If legacy detected, recreate table preserving data (deduplicate via
 // REPLACE semantics -- last_seen wins, same as upsert).
 function migrateHfGgufIndexPk(database: Database.Database): void {
-  const tableInfo = database.prepare(`PRAGMA table_info(hf_gguf_index)`).all() as { name: string; pk: number }[];
+  const tableInfo = database.prepare(`PRAGMA table_info(hf_gguf_index)`).all() as {
+    name: string;
+    type: string;
+    notnull: number;
+    dflt_value: string | null;
+    pk: number;
+  }[];
   if (tableInfo.length === 0) return;
   const pkCols = tableInfo.filter((c) => c.pk > 0).map((c) => c.name).sort();
   const needsMigration = pkCols.length === 1 && pkCols[0] === "sha256";
   if (!needsMigration) return;
-  // Legacy table -- recreate with composite PK
+  // Legacy table -- recreate with composite PK. The rebuilt column list is
+  // read from the table itself (PRAGMA table_info, above) rather than
+  // hardcoded: applyColumnMigrations runs before this function, so the
+  // source table already carries every column COLUMN_MIGRATIONS has ever
+  // added, and a hardcoded list here goes stale the next time one of those
+  // is added -- confirmed 2026-08-29, where a hardcoded list predating
+  // `deleted_at` silently dropped it on rebuild, then
+  // createHfGgufIndexDeletedAtIndex crashed on the now-missing column.
+  const cols = tableInfo.map((c) => c.name);
+  const colDefs = tableInfo
+    .map(
+      (c) =>
+        `${c.name} ${c.type}${c.notnull ? " NOT NULL" : ""}${c.dflt_value != null ? ` DEFAULT ${c.dflt_value}` : ""}`
+    )
+    .join(",\n      ");
+  const colList = cols.join(", ");
   database.exec(`
     CREATE TABLE hf_gguf_index_new (
-      sha256 TEXT NOT NULL,
-      repo_id TEXT NOT NULL,
-      filename TEXT NOT NULL,
-      revision TEXT,
-      file_size INTEGER,
-      last_seen INTEGER NOT NULL,
+      ${colDefs},
       PRIMARY KEY (sha256, repo_id, filename)
     );
-    INSERT OR REPLACE INTO hf_gguf_index_new (sha256, repo_id, filename, revision, file_size, last_seen)
-      SELECT sha256, repo_id, filename, revision, file_size, last_seen FROM hf_gguf_index;
+    INSERT OR REPLACE INTO hf_gguf_index_new (${colList})
+      SELECT ${colList} FROM hf_gguf_index;
     DROP TABLE hf_gguf_index;
     ALTER TABLE hf_gguf_index_new RENAME TO hf_gguf_index;
   `);

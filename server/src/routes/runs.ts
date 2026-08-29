@@ -107,6 +107,20 @@ function validateSweep(sweep: unknown): string | null {
       }
     }
   }
+  // Optional coupled (K,V) pairs -- see shared/types.ts's SweepConfig.
+  // cache_type_pairs doc comment. Absent/empty leaves the cross-product of
+  // cache_type_k x cache_type_v as the only source of KV combos, unchanged.
+  if (s.cache_type_pairs !== undefined) {
+    if (!Array.isArray(s.cache_type_pairs)) return "sweep.cache_type_pairs must be an array";
+    if (s.cache_type_pairs.length > MAX_AXIS_VALUES) {
+      return `sweep.cache_type_pairs has more than ${MAX_AXIS_VALUES} values`;
+    }
+    for (const pair of s.cache_type_pairs) {
+      if (!Array.isArray(pair) || pair.length !== 2 || !isKnownCacheType(pair[0]) || !isKnownCacheType(pair[1])) {
+        return `sweep.cache_type_pairs must contain [cache_type_k, cache_type_v] pairs -- allowed: ${CACHE_TYPE_VALUES.join(", ")}`;
+      }
+    }
+  }
   for (const field of NUMERIC_SWEEP_FIELDS) {
     const v = s[field] as number[];
     if (Array.isArray(v) && v.length > MAX_AXIS_VALUES) {

@@ -237,4 +237,97 @@ describe("v8 schema evolution (§0.11)", () => {
     // upgraded install behave differently from a fresh one.
     expect(freshResults).toEqual(upgradedResults);
   });
+
+  // 2026-08-29 incident: local_model_cache existed (created by an earlier
+  // schema.sql, before the `state` column was added to it) but predated
+  // `state`. schema.sql's own idx_local_model_cache_state index -- created
+  // unconditionally right after the table's CREATE TABLE IF NOT EXISTS no-op
+  // -- threw "no such column: state" partway through database.exec(sql),
+  // which aborted BEFORE applyColumnMigrations (the thing that would add
+  // `state`) ever ran, so every other column migration silently got skipped
+  // too. This must self-heal in one boot, not require a hand-run ALTER.
+  it("self-heals a table that predates a column its own schema.sql index references (2026-08-29)", async () => {
+    const dbPath = makeTmpDbPath();
+    seedLegacyDatabase(dbPath);
+    const seed = new Database(dbPath);
+    // Every real local_model_cache column (schema.sql) except `state` --
+    // matching the actual incident, where sha256/hf_model_id already existed
+    // and only `state` (added later) was missing.
+    seed.exec(`
+      CREATE TABLE local_model_cache (
+        path TEXT PRIMARY KEY,
+        size INTEGER NOT NULL,
+        mtime INTEGER NOT NULL,
+        sha256 TEXT,
+        hf_model_id TEXT,
+        last_verified INTEGER NOT NULL
+      );
+      INSERT INTO local_model_cache (path, size, mtime, sha256, hf_model_id, last_verified)
+        VALUES ('/models/old.gguf', 1, 1, 'abc123', NULL, 1);
+    `);
+    seed.close();
+
+    const { getDb } = await freshMigrateModule(dbPath);
+    // Must not throw -- the whole point of the fix.
+    const db = getDb();
+
+    expect(columnsOf(db, "local_model_cache")).toContain("state");
+    expect(indexesOf(db, "local_model_cache")).toContain("idx_local_model_cache_state");
+    // The historical row survives with the new column's stated default, and
+    // every OTHER column migration (blocked by the same aborted first pass
+    // in the old code) also actually applied -- not just this one column.
+    const row = db.prepare(`SELECT * FROM local_model_cache WHERE path = '/models/old.gguf'`).get() as Record<
+      string,
+      unknown
+    >;
+    expect(row.state).toBe("detected");
+    expect(columnsOf(db, "results")).toContain("gpu_clock_samples");
+  });
+
+  // Same 2026-08-29 incident, second half: migrateHfGgufIndexPk rebuilds
+  // hf_gguf_index from a hardcoded column list to fix its legacy single-
+  // column PK. That list predated `deleted_at` (added later via
+  // COLUMN_MIGRATIONS, which runs BEFORE this function), so the rebuild
+  // silently dropped a column that had just been backfilled onto the source
+  // table moments earlier in the same boot -- then createHfGgufIndexDeletedAtIndex
+  // crashed on the now-missing column right after.
+  it("preserves a column added after migrateHfGgufIndexPk's rebuild SQL was written, when recreating a legacy-PK table", async () => {
+    const dbPath = makeTmpDbPath();
+    seedLegacyDatabase(dbPath);
+    const seed = new Database(dbPath);
+    // The legacy single-sha256-PK shape migrateHfGgufIndexPk detects --
+    // predates `deleted_at` entirely, matching the real incident.
+    seed.exec(`
+      CREATE TABLE hf_gguf_index (
+        sha256 TEXT NOT NULL PRIMARY KEY,
+        repo_id TEXT NOT NULL,
+        filename TEXT NOT NULL,
+        revision TEXT,
+        file_size INTEGER,
+        last_seen INTEGER NOT NULL
+      );
+      INSERT INTO hf_gguf_index (sha256, repo_id, filename, revision, file_size, last_seen)
+        VALUES ('sha-legacy', 'org/repo', 'model.gguf', 'main', 1000, 1);
+    `);
+    seed.close();
+
+    const { getDb } = await freshMigrateModule(dbPath);
+    const db = getDb();
+
+    // PK migrated to composite, AND deleted_at survived the rebuild.
+    const pkCols = (db.prepare(`PRAGMA table_info(hf_gguf_index)`).all() as { name: string; pk: number }[])
+      .filter((c) => c.pk > 0)
+      .map((c) => c.name)
+      .sort();
+    expect(pkCols).toEqual(["filename", "repo_id", "sha256"]);
+    expect(columnsOf(db, "hf_gguf_index")).toContain("deleted_at");
+    expect(indexesOf(db, "hf_gguf_index")).toContain("idx_hf_gguf_index_deleted_at");
+
+    const row = db.prepare(`SELECT * FROM hf_gguf_index WHERE sha256 = 'sha-legacy'`).get() as Record<
+      string,
+      unknown
+    >;
+    expect(row.repo_id).toBe("org/repo");
+    expect(row.deleted_at).toBeNull();
+  });
 });

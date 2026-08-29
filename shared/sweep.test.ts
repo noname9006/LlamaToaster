@@ -70,6 +70,57 @@ describe("expandSweep", () => {
   });
 });
 
+describe("cache_type_pairs (curated, non-rectangular KV grids)", () => {
+  it("iterates exactly the coupled pairs instead of the cross product of cache_type_k x cache_type_v", () => {
+    const sweep: Omit<SweepConfig, "model_id"> = {
+      ...baseSweep,
+      // The cross product of these two axes would be 4 pairs (f16/f16,
+      // f16/q8_0, q8_0/f16, q8_0/q8_0) -- cache_type_pairs restricts it to
+      // just the 2 curated ones, proving the axis arrays no longer drive
+      // expansion once pairs are supplied.
+      cache_type_k: ["f16", "q8_0"],
+      cache_type_v: ["f16", "q8_0"],
+      cache_type_pairs: [
+        ["f16", "f16"],
+        ["q8_0", "q8_0"],
+      ],
+      flash_attn: ["on"],
+      n_gpu_layers: [0],
+    };
+    const items = expandSweep(sweep);
+    expect(items.map((i) => [i.cache_type_k, i.cache_type_v])).toEqual([
+      ["f16", "f16"],
+      ["q8_0", "q8_0"],
+    ]);
+  });
+
+  it("still applies isValidCombo per coupled pair (quantized KV needs flash_attn on)", () => {
+    const sweep: Omit<SweepConfig, "model_id"> = {
+      ...baseSweep,
+      cache_type_k: ["f16", "q8_0"],
+      cache_type_v: ["f16", "q8_0"],
+      cache_type_pairs: [
+        ["f16", "f16"],
+        ["q8_0", "q8_0"],
+      ],
+      flash_attn: ["on", "off"],
+      n_gpu_layers: [0],
+    };
+    const items = expandSweep(sweep);
+    // f16/f16 survives both flash_attn values; q8_0/q8_0 only survives "on".
+    expect(items).toHaveLength(3);
+    for (const item of items) {
+      if (item.flash_attn === "off") expect(item.cache_type_k).toBe("f16");
+    }
+  });
+
+  it("falls back to the cross product when cache_type_pairs is absent or empty (legacy behavior unchanged)", () => {
+    const withoutPairs = expandSweep(baseSweep);
+    const withEmptyPairs = expandSweep({ ...baseSweep, cache_type_pairs: [] });
+    expect(withEmptyPairs).toEqual(withoutPairs);
+  });
+});
+
 describe("deriveTestType", () => {
   it("maps n_gen=0 to pp, n_prompt=0 to tg, and both nonzero to pg", () => {
     expect(deriveTestType(512, 0)).toBe("pp");

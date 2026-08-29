@@ -24,6 +24,7 @@ import {
   type SustainedResponse,
   type ComparisonResponse,
   type ImportResponse,
+  type VerifiedLimitDto,
 } from "../types";
 
 export class ApiError extends Error {
@@ -263,12 +264,12 @@ export const api = {
   // SAME stored rows; nothing is re-measured.
   getProfiles: (
     runId: string,
-    goals?: { goal?: string; target_ctx?: number | null; workload?: string; speed_floor_frac?: number; kv_tolerance?: string }
+    goals?: { goal?: string; target_ctx?: number | null; workload?: string; speed_floor_frac?: number; kv_preset?: string }
   ): Promise<ProfilesResponse> => {
     const params = new URLSearchParams();
     if (goals?.goal) params.set("goal", goals.goal);
     if (goals?.workload) params.set("workload", goals.workload);
-    if (goals?.kv_tolerance) params.set("kv_tolerance", goals.kv_tolerance);
+    if (goals?.kv_preset) params.set("kv_preset", goals.kv_preset);
     if (goals?.speed_floor_frac != null) params.set("speed_floor_frac", String(goals.speed_floor_frac));
     if (goals && "target_ctx" in goals) params.set("target_ctx", goals.target_ctx == null ? "" : String(goals.target_ctx));
     const query = params.toString();
@@ -283,6 +284,17 @@ export const api = {
     if (build) params.set("build", build);
     const query = params.toString();
     return request(`/api/models/${encodeURIComponent(modelId)}/rates${query ? `?${query}` : ""}`);
+  },
+
+  // N2 -- verified ceilings for a model+machine, readable without an
+  // existing sweep run (see GET /api/runs/:id/profiles's own verified_limits
+  // for the other read path, reachable only once a run exists).
+  getVerifiedLimits: (
+    modelId: string,
+    workerId: string
+  ): Promise<{ model_id: string; worker_id: string; limits: VerifiedLimitDto[] }> => {
+    const params = new URLSearchParams({ worker: workerId });
+    return request(`/api/models/${encodeURIComponent(modelId)}/verified-limits?${params.toString()}`);
   },
 
   // N1 -- a curve is a deterministic grouping over results, computed on read.

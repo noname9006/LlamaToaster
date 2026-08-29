@@ -316,6 +316,16 @@ export interface SweepConfig {
   ubatch_size: number[];
   cache_type_k: string[];
   cache_type_v: string[];
+  // Optional COUPLED (K,V) pairs, e.g. shared/goals.ts's KV_PRESET_PAIRS.
+  // When present and non-empty, expandSweep iterates these pairs directly
+  // instead of the full cross product of cache_type_k x cache_type_v --
+  // needed because a curated preset list is deliberately NOT rectangular
+  // (e.g. it can include q8_0/f16 without also including every other
+  // K x V combination those two axes would otherwise imply). cache_type_k/
+  // cache_type_v should still be set to the pairs' own K/V values for
+  // callers that only read the plain axis arrays (e.g. display labels);
+  // they no longer independently drive expansion once pairs are given.
+  cache_type_pairs?: Array<readonly [string, string]>;
   flash_attn: string[];
   // "on"/"off" -- whether to run this combo's benchmark via llama-server
   // with --spec-type draft-mtp instead of the normal llama-bench path. See

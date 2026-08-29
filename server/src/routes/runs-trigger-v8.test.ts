@@ -234,7 +234,7 @@ describe("M2 goals block", () => {
   it("echoes the goals block on the created run verbatim", async () => {
     await heartbeat("v8-goals-a");
     const worker = repo.workerRepo.getByMachineId("v8-goals-a")!;
-    const goals = { goal: "max_context", target_ctx: 32768, speed_floor_frac: 0.5, workload: "chat", kv_tolerance: "q8_0_ok" };
+    const goals = { goal: "max_context", target_ctx: 32768, speed_floor_frac: 0.5, workload: "chat", kv_preset: "extended" };
     const res = await postJson("/api/runs/trigger", {
       model_id: "v8-model",
       worker_id: worker.id,

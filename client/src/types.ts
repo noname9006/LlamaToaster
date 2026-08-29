@@ -9,4 +9,4 @@ export type { CurvePoint, LadderCell, KneeResult, KneeSample } from "../../share
 export type { PricedRate, RateSource } from "../../shared/pricing.js";
 export type { ComparisonMemberRow, ParetoPoint, FairnessViolation } from "../../shared/comparison.js";
 export type { Bundle, BundleRow, ImportRowVerdict, MethodsSection } from "../../shared/exchange.js";
-export type { GoalsConfig, GoalKind, WorkloadShape, KvTolerance } from "../../shared/goals.js";
+export type { GoalsConfig, GoalKind, WorkloadShape, KvPreset } from "../../shared/goals.js";

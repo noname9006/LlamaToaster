@@ -153,7 +153,7 @@ describe("M3 profile scoring", () => {
       target_ctx: 32_768,
       speed_floor_frac: 0.5,
       workload: "chat",
-      kv_tolerance: "q8_0_ok",
+      kv_preset: "extended",
     };
     const result = scoreProfiles({
       rows,
