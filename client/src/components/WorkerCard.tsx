@@ -63,10 +63,10 @@ export interface SetupScenario {
   cmd: Record<SetupOS, string>;
 }
 
-// vpsUrl is this server's own public origin (pass window.location.origin --
+// url is this server's own public origin (pass window.location.origin --
 // the page showing this command IS served from PUBLIC_URL, see
 // deploy/orchestrator.env.example) -- baked into the fresh-install command
-// so it's copy-paste-runnable as-is instead of erroring with "-VpsUrl is
+// so it's copy-paste-runnable as-is instead of erroring with "-Url is
 // required" (bootstrap.ps1/bootstrap.sh both require it on first setup).
 // Already-cloned/restart need no URL: by then config.json has it saved.
 //
@@ -76,15 +76,15 @@ export interface SetupScenario {
 // screen there never drift apart. Kept in sync with worker/bootstrap.ps1,
 // worker/bootstrap.sh, worker/setup-worker.ps1, worker/setup-worker.sh, and
 // README.md's "Running the worker (GPU box)" section.
-export function buildSetupScenarios(vpsUrl: string): SetupScenario[] {
+export function buildSetupScenarios(url: string): SetupScenario[] {
   return [
     {
       title: "Fresh install",
       desc: "Brand-new machine, nothing downloaded yet (no repo, no config, no llama.cpp) -- one command fetches the repo, installs dependencies, and starts the worker. It'll ask which drive/volume to use (showing free space -- models are often tens of GB each) and a folder name, then create it. Re-running the same command later updates an existing install in place -- config.json, models and all other local data are preserved.",
       cmd: {
-        windows: `iex "& { $(irm https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.ps1) } -VpsUrl ${vpsUrl}"`,
-        macos: `curl -fsSL https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.sh | bash -s -- --vps-url ${vpsUrl}`,
-        linux: `curl -fsSL https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.sh | bash -s -- --vps-url ${vpsUrl}`,
+        windows: `iex "& { $(irm https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.ps1) } -Url ${url}"`,
+        macos: `curl -fsSL https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.sh | bash -s -- --url ${url}`,
+        linux: `curl -fsSL https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.sh | bash -s -- --url ${url}`,
       },
     },
     {

@@ -151,9 +151,9 @@ export function AddMachinePanel() {
         ))}
         {os === "windows" && <PowerShellNotice />}
       </div>
-      {/* First-run command has this page's own origin baked in as -VpsUrl/
-          --vps-url (see WorkerCard.tsx's buildSetupScenarios) -- copy-paste
-          runs as-is instead of erroring "-VpsUrl is required". Already-
+      {/* First-run command has this page's own origin baked in as -Url/
+          --url (see WorkerCard.tsx's buildSetupScenarios) -- copy-paste
+          runs as-is instead of erroring "-Url is required". Already-
           installed/restart need no URL: config.json has it saved by then. */}
       <div className="mt-2 flex flex-col gap-3">
         {setupScenarios.map((scenario, i) => (
