@@ -277,9 +277,15 @@ export async function queueRoutes(app: FastifyInstance): Promise<void> {
         repo.queueRepo.markJobFailed(job.id, error);
         if (job.runId) {
           // undefined userId -- this is the worker's own job-completion
-          // report, not a browser request; see repo.ts's reconcileStaleRun
-          // doc comment (MULTIUSER_PLAN.md §4.3).
-          repo.reconcileStaleRun(undefined, job.runId, error);
+          // report, not a browser request; see repo.ts's reportJobFailure
+          // doc comment (MULTIUSER_PLAN.md §4.3). reportJobFailure, not
+          // reconcileStaleRun -- the worker just told us exactly why this
+          // job didn't finish, which is the opposite of "lost track of it,"
+          // so the run should read "failed"/"partial" with that real reason,
+          // never "cancelled" (a label this app reserves for a genuine user
+          // stop or an unconfirmed/lost run elsewhere -- see Runs.tsx's own
+          // column description).
+          repo.reportJobFailure(undefined, job.runId, error);
           // See the matching comment in index.ts's reapExpiredLeases -- an
           // install_build failure can leave a sibling benchmark job pending.
           repo.queueRepo.cancelPendingJobsForRun(job.runId);
