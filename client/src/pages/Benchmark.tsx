@@ -147,6 +147,10 @@ interface PlacementVerifyState {
   measuredNgl?: number | null;
   measuredVramPeakMib?: number | null;
   measuredRamPeakMib?: number | null;
+  /** When this card's Test was clicked -- captured once at trigger time (not
+   * re-stamped by the poll's terminal/verified updates), so it reads as
+   * "when the test ran" even for a still-pending or since-reset card. */
+  testedAt?: number;
 }
 
 // M5 -- a preset here carries INTENT (goals + repeats) and nothing machine-
@@ -829,7 +833,8 @@ export function Benchmark() {
     granularity: ProbeGranularity
   ): Promise<void> {
     if (!modelId || !workerId || verifyStates[mode]?.status === "pending") return;
-    setVerifyStates((prev) => ({ ...prev, [mode]: { ngl, ctx, runId: "", status: "pending", mode } }));
+    const testedAt = Date.now();
+    setVerifyStates((prev) => ({ ...prev, [mode]: { ngl, ctx, runId: "", status: "pending", mode, testedAt } }));
     try {
       const selectedGpu = selectedGpuRawIndex != null ? visibleGpus[selectedGpuRawIndex] : undefined;
       const run = await api.triggerRun({
@@ -864,12 +869,20 @@ export function Benchmark() {
           repeats: 1,
         },
       });
-      setVerifyStates((prev) => ({ ...prev, [mode]: { ngl, ctx, runId: run.id, status: "pending", mode } }));
+      setVerifyStates((prev) => ({ ...prev, [mode]: { ngl, ctx, runId: run.id, status: "pending", mode, testedAt } }));
       startPolling(mode, run.id);
     } catch (err) {
       setVerifyStates((prev) => ({
         ...prev,
-        [mode]: { ngl, ctx, runId: "", status: "error", mode, detail: err instanceof Error ? err.message : String(err) },
+        [mode]: {
+          ngl,
+          ctx,
+          runId: "",
+          status: "error",
+          mode,
+          testedAt,
+          detail: err instanceof Error ? err.message : String(err),
+        },
       }));
     }
   }
