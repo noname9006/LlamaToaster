@@ -88,6 +88,13 @@ export function Dashboard() {
   // machine that's merely powered off right now still does.
   const machinesEverConnected = workers.filter((w) => w.lastHeartbeatAt !== null).length;
   const testsTotal = runs.reduce((sum, r) => sum + (r.items_total ?? 0), 0);
+  // "Runs" in this app's own vocabulary means repeats (-r), not sweep
+  // combinations or job rows -- see RunDetail.tsx's own totalRuns (items x
+  // repeats) for the per-run version of this same math. A raw runs.length
+  // (job-row count) would undercount relative to testsTotal above, since
+  // one job's several sweep combinations each get counted as one test but
+  // physically execute `repeats` times.
+  const totalRuns = runs.reduce((sum, r) => sum + (r.items_total ?? 0) * (r.config?.sweep?.repeats ?? 1), 0);
   const distinctModelsTested = new Set(runs.map((r) => r.model_id)).size;
   const recent = runs.slice(0, 8);
 
@@ -100,7 +107,7 @@ export function Dashboard() {
         <StatCard label="Machines" value={machinesEverConnected} />
         <StatCard label="Models tested" value={distinctModelsTested} />
         <StatCard label="Tests performed" value={testsTotal} />
-        <StatCard label="Total runs" value={runs.length} />
+        <StatCard label="Total runs" value={totalRuns} />
       </section>
 
       {loaded && workers.length === 0 ? (
