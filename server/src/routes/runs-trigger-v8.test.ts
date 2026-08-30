@@ -318,6 +318,55 @@ describe("§0.7/N2 capability gates", () => {
     expect(res3.status).toBe(400);
   });
 
+  it("stores a probe's mode and granularity on the run, and passes them to the worker job", async () => {
+    await heartbeat("v8-cap-mode", { capabilities: ["benchmark", "probe-v1"] });
+    const worker = repo.workerRepo.getByMachineId("v8-cap-mode")!;
+    const res = await postJson("/api/runs/trigger", {
+      model_id: "v8-model",
+      worker_id: worker.id,
+      kind: "probe",
+      probe: {
+        candidate_ctx: 32768,
+        placement: { ngl: 16, slots: 1 },
+        kv_pair: ["f16", "f16"],
+        mode: "max_gpu",
+        granularity: "fine",
+      },
+      sweep: baseSweep,
+    });
+    expect(res.status).toBe(201);
+    const run = ((await res.json()) as { run: { id: string; config: { probe: Record<string, unknown> } } }).run;
+    expect(run.config.probe.mode).toBe("max_gpu");
+    expect(run.config.probe.granularity).toBe("fine");
+
+    const job = repo.queueRepo.claimNextJob(worker.id);
+    expect(job?.type).toBe("run_probe");
+    expect((job?.payload as { mode?: string; granularity?: string }).mode).toBe("max_gpu");
+    expect((job?.payload as { mode?: string; granularity?: string }).granularity).toBe("fine");
+  });
+
+  it("rejects an unknown probe mode or granularity rather than silently searching differently", async () => {
+    await heartbeat("v8-cap-mode-bad", { capabilities: ["benchmark", "probe-v1"] });
+    const worker = repo.workerRepo.getByMachineId("v8-cap-mode-bad")!;
+    const badMode = await postJson("/api/runs/trigger", {
+      model_id: "v8-model",
+      worker_id: worker.id,
+      kind: "probe",
+      probe: { candidate_ctx: 4096, placement: { ngl: 0, slots: 1 }, kv_pair: ["f16", "f16"], mode: "go-fast" },
+      sweep: baseSweep,
+    });
+    expect(badMode.status).toBe(400);
+
+    const badGranularity = await postJson("/api/runs/trigger", {
+      model_id: "v8-model",
+      worker_id: worker.id,
+      kind: "probe",
+      probe: { candidate_ctx: 4096, placement: { ngl: 0, slots: 1 }, kv_pair: ["f16", "f16"], granularity: "coarse" },
+      sweep: baseSweep,
+    });
+    expect(badGranularity.status).toBe(400);
+  });
+
   it("refuses N4 quality runs on workers without quality-v1, with the update copy", async () => {
     drainActiveRuns();
     await heartbeat("v8-cap-quality-old");

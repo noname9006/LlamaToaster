@@ -114,6 +114,20 @@ function formatSweepParams(sweep: RunConfig["sweep"]): string {
   );
 }
 
+// A probe's `sweep` block is vestigial -- it exists only to satisfy the
+// trigger route's validation and create the tracked run_item (see
+// Benchmark.tsx's verifyPlacement), so printing it here would show made-up
+// numbers. The probe spec is what the run actually did, and it rides along
+// on the run's own config, needing no extra fetch. Returns null for any
+// other kind, which keeps using formatSweepParams.
+function formatProbeParams(config: RunConfig): string | null {
+  const probe = config.probe;
+  if (!probe) return null;
+  const [k, v] = probe.kv_pair;
+  const moe = probe.placement.n_cpu_moe ? ` moe${probe.placement.n_cpu_moe}` : "";
+  return `ctx${probe.candidate_ctx.toLocaleString()} ngl${probe.placement.ngl}${moe} ${k}/${v}`;
+}
+
 export function Runs() {
   const [runs, setRuns] = useState<Run[]>([]);
   const [loaded, setLoaded] = useState(false);
@@ -326,7 +340,12 @@ export function Runs() {
                         <td className="px-4 py-2.5 text-muted">{cur.llama_cpp_backend}</td>
                         <td className="px-4 py-2.5 text-muted">{cur.llama_cpp_build}</td>
                         <td className="px-4 py-2.5 text-muted whitespace-nowrap font-mono text-xs">
-                          {formatSweepParams(cur.config.sweep)}
+                          {cur.kind === "probe" && (
+                            <span className="mr-1.5 rounded-full bg-accent/10 px-2 py-0.5 text-[10px] font-semibold not-italic text-accent">
+                              probe
+                            </span>
+                          )}
+                          {formatProbeParams(cur.config) ?? formatSweepParams(cur.config.sweep)}
                           {cur.status === "running" && items && items.length > 0 && (
                             <StatusCircleStrip units={buildProgressUnits(items, cur.config.sweep.repeats)} />
                           )}

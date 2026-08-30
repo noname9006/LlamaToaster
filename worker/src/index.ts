@@ -28,13 +28,19 @@ import {
   streamedCompletion,
   executeCurvePoint,
   executeKneeLadder,
-  nextProbeStep,
   probeSucceeded,
   toBenchResult,
   PROBE_GEN_TOKENS,
-  PROBE_MAX_LOADS,
   type ProbeAttemptOutcome,
 } from "./runtimeBench.js";
+import {
+  bestLadderResult,
+  nextLadderRung,
+  snapToSafeCtx,
+  PROBE_LADDER_MIN_CTX,
+  PROBE_MAX_LOADS,
+  type LadderAttempt,
+} from "../../shared/probeLadder.js";
 import { buildPromptTokens, DEFAULT_KNEE_SLOTS } from "./loadDriver.js";
 import { supportsFlag } from "./binary-probe.js";
 import { MemorySampler, captureFreeMemoryBaseline, type SampleStats, type FreeMemoryBaseline } from "./sampler.js";
@@ -43,6 +49,8 @@ import {
   estimateResidentGpuLayers,
   estimateResidentGpuLayersFromBufferSizes,
   estimateVramNeededMib,
+  estimateSafeNgl,
+  maxAffordableContext,
   isVramDiscrepancy,
   computeDualPoolFit,
   type TensorLayerBreakdown,
@@ -1247,7 +1255,7 @@ function formatResultsLine(results: IngestResultInput[]): string {
     .map((r) => {
       const suspect = r.suspect_count ? `, ${r.suspect_count} suspect` : "";
       const n = r.sample_count != null ? ` (n=${r.sample_count}${suspect})` : "";
-      return `${r.test_type}=${r.avg_tps.toFixed(2)}tok/s ±${r.stddev_tps.toFixed(2)}${n}`;
+      return `${r.test_type}=${r.avg_tps.toFixed(2)}tok/s +/-${r.stddev_tps.toFixed(2)}${n}`;
     })
     .join("  ");
 }
@@ -1258,7 +1266,7 @@ function formatTtftLine(results: IngestResultInput[]): string | null {
   const pp = results.find((r) => r.test_type === "pp" || r.test_type === "pg");
   if (!pp || pp.n_prompt <= 0 || pp.avg_tps <= 0) return null;
   const ttftMs = (pp.n_prompt / pp.avg_tps) * 1000;
-  return `ttft: ~${ttftMs.toFixed(0)}ms (est. n_prompt÷pp avg)`;
+  return `ttft: ~${ttftMs.toFixed(0)}ms (est. n_prompt/pp avg)`;
 }
 
 // Draft-model acceptance rate for an MTP item's tg row, same figure
@@ -1306,7 +1314,7 @@ function filterDiagnosticOutput(stderr: string): string {
     .split("\n")
     .map((line) =>
       line.length > MAX_LOGGED_LINE_CHARS
-        ? `${line.slice(0, MAX_LOGGED_LINE_CHARS)} …[${
+        ? `${line.slice(0, MAX_LOGGED_LINE_CHARS)} ...[${
             line.length - MAX_LOGGED_LINE_CHARS
           } more chars elided -- see the raw JSON dump for the full line]`
         : line
@@ -2937,7 +2945,11 @@ async function executeDownloadModelJob(
 // even the flat fallback (n_layer or KV head geometry unresolved) -- the
 // caller then logs the candidate context with no estimate rather than a
 // fabricated one.
-function describeEstimatedMemoryNeed(payload: RunProbeJobPayload, candidateCtx: number): string | null {
+function estimateProbeMemoryNeed(
+  payload: RunProbeJobPayload,
+  candidateCtx: number,
+  ngl: number
+): { vramMib: number; ramMib: number } | null {
   const meta = payload.model.metadata;
   const nLayer = meta.n_layer;
   if (nLayer == null || nLayer <= 0 || meta.n_head_kv == null) return null;
@@ -2945,7 +2957,7 @@ function describeEstimatedMemoryNeed(payload: RunProbeJobPayload, candidateCtx: 
     modelSizeBytes: payload.model.size_bytes,
     totalModelLayers: nLayer + 1,
     kvLayerCount: nLayer,
-    ngl: payload.placement.ngl,
+    ngl,
     ctxTokens: candidateCtx,
     nHeadKv: meta.n_head_kv,
     headDimK: meta.head_dim_k,
@@ -2962,16 +2974,30 @@ function describeEstimatedMemoryNeed(payload: RunProbeJobPayload, candidateCtx: 
     nCpuMoe: payload.placement.nCpuMoe,
     tensorBreakdown: meta.tensor_layer_bytes ?? null,
   });
-  const vramMib = Math.round(fit.gpu.weightsMib + fit.gpu.kvMib);
-  const ramMib = Math.round(fit.cpu.weightsMib + fit.cpu.kvMib);
-  return `estimated need: ${vramMib}MiB VRAM, ${ramMib}MiB RAM`;
+  return {
+    vramMib: Math.round(fit.gpu.weightsMib + fit.gpu.kvMib),
+    ramMib: Math.round(fit.cpu.weightsMib + fit.cpu.kvMib),
+  };
+}
+
+// The log line's own wording, unchanged -- kept as a thin formatter over the
+// numbers above so the persisted probe_attempts row and the log a reader
+// compares it against can never be computed two different ways.
+function describeEstimatedMemoryNeed(estimate: { vramMib: number; ramMib: number } | null): string | null {
+  if (!estimate) return null;
+  return `estimated need: ${estimate.vramMib}MiB VRAM, ${estimate.ramMib}MiB RAM`;
 }
 
 // BENCHMARKING_PLAN_V8.md N2 -- the usable-config probe. Engine pinned to
 // llama-server: the tok/s floor below is meaningless on llama-bench, which
-// has no request lifecycle. At most THREE loads, ever (nextProbeStep enforces
-// the ladder); success means no OOM, no spill, and generation above the
-// floor, because "loads successfully" is not the same as "actually usable".
+// has no request lifecycle. Success per rung means no OOM, no spill, and
+// generation above the floor, because "loads successfully" is not the same as
+// "actually usable".
+//
+// The search itself lives in shared/probeLadder.ts -- which axis a mode
+// moves, how far, and when to stop. This function is only the loop that turns
+// its decisions into real model loads, so the strategy stays testable without
+// a GPU.
 async function executeRunProbeJob(payload: RunProbeJobPayload): Promise<void> {
   const modelPath = await resolveModelPath(payload.model);
   if (!existsSync(modelPath)) throw new Error(`model file not found at ${modelPath}`);
@@ -2984,17 +3010,98 @@ async function executeRunProbeJob(payload: RunProbeJobPayload): Promise<void> {
   const label = `probe ${payload.run_id}`;
   setRunLogFile(runLogFilePath(payload.run_id));
   const attempts: ProbeAttemptOutcome[] = [];
-  let next: { candidateCtx: number } | null = { candidateCtx: payload.candidateCtx };
+  const mode = payload.mode ?? "max_context";
+  const granularity = payload.granularity ?? "basic";
+  // The ladder never probes above what the model was trained for. With no
+  // trained_ctx in the header there is no honest ceiling to search toward, so
+  // the caller's own candidate stands as one rather than inventing a bound.
+  const maxCtx = payload.trained_ctx ?? payload.candidateCtx;
+  // ngl's ceiling is llama.cpp's own "+1" convention (n_layer plus the output
+  // pseudo-layer), the same total_model_layers the rest of the app uses.
+  const nglMax =
+    payload.model.metadata.n_layer != null && payload.model.metadata.n_layer > 0
+      ? payload.model.metadata.n_layer + 1
+      : payload.placement.ngl;
+
+  // Captured ONCE, before any load -- the ladder's "calculated" anchors are a
+  // pre-flight heuristic, not a live-updated one; what's free right before
+  // this whole probe starts is a stable enough basis for it.
+  const preflight = await captureFreeMemoryBaseline(payload.llama_cpp_backend).catch(() => null);
+  const freeVramMib = preflight?.vram_free_before_mib ?? payload.gpu_total_mib ?? 0;
+
+  // estimateSafeNgl's own math sizes weights only (no KV cache), so it does
+  // not vary with the pinned context -- pinnedCtx exists only so this has the
+  // same shape as calculateCtx below, which genuinely does depend on ngl.
+  function calculateNgl(): number {
+    return estimateSafeNgl(payload.model.size_bytes, nglMax, freeVramMib, payload.model.metadata.tensor_layer_bytes ?? null);
+  }
+
+  function calculateCtx(pinnedNgl: number): number {
+    const meta = payload.model.metadata;
+    const nLayer = meta.n_layer;
+    if (nLayer == null || nLayer <= 0 || meta.n_head_kv == null) return maxCtx;
+    const weightsMib =
+      estimateVramNeededMib({
+        modelSizeBytes: payload.model.size_bytes,
+        totalModelLayers: nLayer + 1,
+        requestedNgl: pinnedNgl,
+        nCpuMoe: payload.placement.nCpuMoe,
+        tensorBreakdown: meta.tensor_layer_bytes ?? null,
+      }) ?? 0;
+    const affordable = maxAffordableContext({
+      totalMib: freeVramMib,
+      weightsMib,
+      nLayer,
+      nHeadKv: meta.n_head_kv,
+      headDimK: meta.head_dim_k,
+      headDimV: meta.head_dim_v,
+      nEmbd: meta.n_embd,
+      nHead: meta.n_head,
+      cacheTypeK: payload.kvPair[0],
+      cacheTypeV: payload.kvPair[1],
+      slidingWindow: meta.sliding_window,
+      parallelSlots: payload.placement.slots,
+      // freeVramMib is ALREADY the free budget -- maxAffordableContext's own
+      // 10% headroom is calibrated against callers passing TOTAL vram, and
+      // stacking it here would double-apply headroom silently.
+      activationsHeadroomFrac: 0,
+      trainedCtx: payload.trained_ctx ?? undefined,
+    });
+    return affordable.tokens > 0 ? affordable.tokens : maxCtx;
+  }
+
+  const ladderInput = {
+    mode,
+    granularity,
+    candidateCtx: payload.candidateCtx,
+    candidateNgl: payload.placement.ngl,
+    nglMax,
+    maxCtx,
+    calculateNgl,
+    calculateCtx,
+  };
+  log.info(
+    `${label}: ${mode} / ${granularity} ladder -- context within [${PROBE_LADDER_MIN_CTX}, ${maxCtx}], ` +
+      `layers within [0, ${nglMax}], at most ${PROBE_MAX_LOADS} loads`
+  );
+
   try {
-    while (next && attempts.length < PROBE_MAX_LOADS) {
-      const candidateCtx = next.candidateCtx;
-      const estimateNote = describeEstimatedMemoryNeed(payload, candidateCtx);
-      log.info(`${label}: loading at candidate context ${candidateCtx}${estimateNote ? ` -- ${estimateNote}` : ""}`);
+    for (;;) {
+      const rung = nextLadderRung({ ...ladderInput, history: attempts.map(toLadderAttempt) });
+      if (!rung) break;
+      const estimate = estimateProbeMemoryNeed(payload, rung.ctx, rung.ngl);
+      const estimateNote = describeEstimatedMemoryNeed(estimate);
+      log.info(
+        `${label}: loading at candidate context ${rung.ctx}, ${rung.ngl} layers on GPU` +
+          `${estimateNote ? ` -- ${estimateNote}` : ""}`
+      );
       const attempt = await runOneProbeLoad({
         payload,
         modelPath,
         serverPath: resolvedBuild.server_path,
-        candidateCtx,
+        candidateCtx: rung.ctx,
+        ngl: rung.ngl,
+        estimate,
         label,
       });
       attempts.push(attempt);
@@ -3003,18 +3110,27 @@ async function executeRunProbeJob(payload: RunProbeJobPayload): Promise<void> {
       // real without cross-referencing anything else.
       const actualNote = attempt.vramPeakMib != null ? ` (actual VRAM peak: ${Math.round(attempt.vramPeakMib)}MiB)` : "";
       log.info(
-        `${label}: candidate ${candidateCtx} -> ${attempt.ok ? "ok" : "failed"}${actualNote}` +
+        `${label}: candidate ${rung.ctx}/${rung.ngl} -> ${attempt.ok ? "ok" : "failed"}${actualNote}` +
           (attempt.error ? ` (${attempt.error})` : "")
       );
-      next = nextProbeStep(attempts, { trainedCtx: payload.trained_ctx ?? null });
     }
 
-    const best = attempts.filter((a) => a.ok).sort((a, b) => b.candidateCtx - a.candidateCtx)[0];
-    const report: ProbeResultInput = best
+    const best = bestLadderResult(attempts.map(toLadderAttempt));
+    // What later benchmark runs consume is snapped DOWN to a slider stop: a
+    // `fine` ladder can verify a context between two stops, and that exact
+    // number stays visible in probe_attempts, but a ceiling the rest of the
+    // app cannot express is not a usable ceiling. Down, never up -- rounding
+    // one upward would claim a context that was never loaded.
+    const safeCtx = best ? snapToSafeCtx(best.ctx, maxCtx) : null;
+    const bestAttempt = best ? attempts.find((a) => a.candidateCtx === best.ctx && a.ngl === best.ngl) : undefined;
+    if (best && safeCtx !== best.ctx) {
+      log.info(`${label}: verified ${best.ctx} tokens, stored as ${safeCtx} -- the nearest value at or below it`);
+    }
+    const report: ProbeResultInput = safeCtx != null
       ? {
           status: "verified",
-          verified_ctx_tokens: best.candidateCtx,
-          margin_observed_frac: best.headroomFrac ?? null,
+          verified_ctx_tokens: safeCtx,
+          margin_observed_frac: bestAttempt?.headroomFrac ?? null,
           method_version: METHOD_VERSION,
           attempts: attempts.map(toProbeAttemptReport),
         }
@@ -3039,14 +3155,26 @@ async function executeRunProbeJob(payload: RunProbeJobPayload): Promise<void> {
   }
 }
 
+// The ladder reasons over (ctx, ngl, ok) alone -- everything else on an
+// outcome is telemetry it has no opinion about.
+function toLadderAttempt(attempt: ProbeAttemptOutcome): LadderAttempt {
+  return { ctx: attempt.candidateCtx, ngl: attempt.ngl ?? 0, ok: attempt.ok };
+}
+
 function toProbeAttemptReport(attempt: ProbeAttemptOutcome): ProbeAttemptReport {
   return {
     candidate_ctx: attempt.candidateCtx,
     ok: attempt.ok,
     oom: attempt.oom,
     spill: attempt.spill,
+    ngl: attempt.ngl,
     vram_peak_mib: attempt.vramPeakMib,
     gen_tps: attempt.genTps,
+    vram_needed_mib: attempt.vramNeededMib,
+    vram_free_mib: attempt.vramFreeMib,
+    ram_needed_mib: attempt.ramNeededMib,
+    ram_free_mib: attempt.ramFreeMib,
+    ram_peak_mib: attempt.ramPeakMib,
     error: attempt.error,
   };
 }
@@ -3056,12 +3184,26 @@ interface ProbeLoadInput {
   modelPath: string;
   serverPath: string;
   candidateCtx: number;
+  /** This rung's own placement -- the ladder moves ngl, not just context. */
+  ngl: number;
+  /** What this rung was predicted to need -- carried onto the outcome row. */
+  estimate: { vramMib: number; ramMib: number } | null;
   label: string;
 }
 
 async function runOneProbeLoad(input: ProbeLoadInput): Promise<ProbeAttemptOutcome> {
-  const { payload, candidateCtx } = input;
+  const { payload, candidateCtx, ngl, estimate } = input;
   const sampler = new MemorySampler();
+  // Taken BEFORE the spawn, same as every sweep path: "free" has to mean
+  // free-before-this-load, not free-while-the-model-is-resident.
+  const baseline = await captureFreeMemoryBaseline(payload.llama_cpp_backend).catch(() => null);
+  const memoryFields = {
+    ngl,
+    vramNeededMib: estimate?.vramMib ?? null,
+    ramNeededMib: estimate?.ramMib ?? null,
+    vramFreeMib: baseline?.vram_free_before_mib ?? null,
+    ramFreeMib: baseline?.ram_free_before_mib ?? null,
+  };
   const item = {
     idx: 0,
     n_prompt: Math.max(1, Math.min(candidateCtx - PROBE_GEN_TOKENS - 8, candidateCtx)),
@@ -3069,7 +3211,8 @@ async function runOneProbeLoad(input: ProbeLoadInput): Promise<ProbeAttemptOutco
     n_depth: 0,
     concurrency: payload.placement.slots,
     threads: 0,
-    n_gpu_layers: payload.placement.ngl,
+    // This rung's ngl, not the payload's -- the ladder moves placement too.
+    n_gpu_layers: ngl,
     batch_size: 2048,
     ubatch_size: 512,
     cache_type_k: payload.kvPair[0],
@@ -3123,12 +3266,14 @@ async function runOneProbeLoad(input: ProbeLoadInput): Promise<ProbeAttemptOutco
       oom: false,
       spill: verdict.spill,
       vramPeakMib: stats.vram_peak_mib,
+      ramPeakMib: stats.ram_peak_mib,
       genTps,
       headroomFrac,
+      ...memoryFields,
       error: verdict.reason ?? undefined,
     };
   } catch (err) {
-    sampler.stop();
+    const stats = sampler.stop();
     const message = err instanceof Error ? err.message : String(err);
     return {
       candidateCtx,
@@ -3139,7 +3284,9 @@ async function runOneProbeLoad(input: ProbeLoadInput): Promise<ProbeAttemptOutco
       ),
       spill: false,
       vramPeakMib: null,
+      ramPeakMib: stats.ram_peak_mib,
       genTps: null,
+      ...memoryFields,
       error: message,
     };
   } finally {

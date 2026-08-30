@@ -2,10 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   executeCurvePoint,
   executeKneeLadder,
-  nextProbeStep,
   probeSucceeded,
   PROBE_MIN_GEN_TPS,
-  type ProbeAttemptOutcome,
   type StreamedRequestInput,
 } from "./runtimeBench.js";
 import type { StreamSample } from "./loadDriver.js";
@@ -207,57 +205,10 @@ describe("N5 knee ladder execution", () => {
   });
 });
 
-describe("N2 probe ladder and success rule", () => {
-  const attempt = (over: Partial<ProbeAttemptOutcome> & { candidateCtx: number }): ProbeAttemptOutcome => ({
-    ok: true,
-    oom: false,
-    spill: false,
-    vramPeakMib: 7000,
-    genTps: 30,
-    ...over,
-  });
-
-  it("retries once at x0.75 after a failure, then stops", () => {
-    const first = nextProbeStep([attempt({ candidateCtx: 44_000, ok: false, oom: true })], { trainedCtx: 32_768 });
-    expect(first).toEqual({ candidateCtx: 33_000, reason: "retry_smaller" });
-    const second = nextProbeStep(
-      [attempt({ candidateCtx: 44_000, ok: false, oom: true }), attempt({ candidateCtx: 33_000, ok: false, oom: true })],
-      { trainedCtx: 32_768 }
-    );
-    expect(second).toBeNull();
-  });
-
-  it("probes once higher only when the success left more than 25 % headroom", () => {
-    const roomy = nextProbeStep(
-      [attempt({ candidateCtx: 20_000, headroomFrac: 0.4 })],
-      { trainedCtx: 131_072 }
-    );
-    expect(roomy).toEqual({ candidateCtx: 26_600, reason: "retry_larger" });
-
-    const tight = nextProbeStep(
-      [attempt({ candidateCtx: 20_000, headroomFrac: 0.06 })],
-      { trainedCtx: 131_072 }
-    );
-    expect(tight).toBeNull();
-  });
-
-  it("caps the upward probe at trained context", () => {
-    const step = nextProbeStep(
-      [attempt({ candidateCtx: 30_000, headroomFrac: 0.5 })],
-      { trainedCtx: 32_768 }
-    );
-    expect(step).toEqual({ candidateCtx: 32_768, reason: "retry_larger" });
-  });
-
-  it("never exceeds three loads, ever", () => {
-    const history = [
-      attempt({ candidateCtx: 20_000, headroomFrac: 0.9 }),
-      attempt({ candidateCtx: 26_000, headroomFrac: 0.9 }),
-      attempt({ candidateCtx: 32_000, headroomFrac: 0.9 }),
-    ];
-    expect(nextProbeStep(history, { trainedCtx: 131_072 })).toBeNull();
-  });
-
+// The ladder itself moved to shared/probeLadder.ts (and is covered by
+// shared/probeLadder.test.ts); what stays here is the per-rung verdict, which
+// is about one load rather than about the search.
+describe("N2 probe success rule", () => {
   it("treats loading-but-crawling as failure -- loading is not the same as usable", () => {
     const crawling = probeSucceeded({ oom: false, vramPeakMib: 7000, gpuTotalMib: 8192, genTps: 0.4 });
     expect(crawling.ok).toBe(false);

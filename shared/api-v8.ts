@@ -23,6 +23,30 @@ export interface VerifiedLimitDto {
   created_at: number;
 }
 
+// N2 -- one rung of a probe's ladder, as GET /api/runs/:id/probe-attempts
+// returns it. ok/oom/spill are SQLite integers (0/1), not booleans.
+export interface ProbeAttemptDto {
+  id: string;
+  run_id: string;
+  worker_id: string;
+  model_id: string;
+  seq: number;
+  candidate_ctx: number;
+  ngl: number | null;
+  ok: number;
+  oom: number;
+  spill: number;
+  vram_needed_mib: number | null;
+  vram_free_mib: number | null;
+  vram_peak_mib: number | null;
+  ram_needed_mib: number | null;
+  ram_free_mib: number | null;
+  ram_peak_mib: number | null;
+  gen_tps: number | null;
+  error: string | null;
+  created_at: number;
+}
+
 // N4 -- one llama-perplexity measurement, scoped by model (perplexity is
 // deterministic given model+build+ctx+kv+corpus, not machine-specific the
 // way a verified context ceiling is).

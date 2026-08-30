@@ -346,4 +346,17 @@ export async function profilesRoutes(app: FastifyInstance): Promise<void> {
       return { model_id: model.id, worker_id: worker.id, limits };
     }
   );
+
+  // Forgets one verified ceiling so its ProfileCards card offers "Verify
+  // with a probe" again -- without this, a stale verification (the machine's
+  // free memory shifted, or the reading was simply wrong) is stuck showing
+  // "Verified" forever, since a re-probe is the only thing that would
+  // otherwise overwrite it and ProfileCards never offers one once verified.
+  app.delete<{ Params: { id: string } }>("/api/verified-limits/:id", async (request, reply) => {
+    const limit = repo.limitsRepo.getById(request.params.id);
+    if (!limit) return reply.code(404).send({ error: "verified limit not found" });
+    assertOwnsWorker(resolveAuthUser(request)?.user.id, limit.worker_id);
+    repo.limitsRepo.deleteById(limit.id);
+    return reply.code(200).send({ ok: true });
+  });
 }

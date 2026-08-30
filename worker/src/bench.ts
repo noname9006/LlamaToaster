@@ -470,7 +470,7 @@ export function extractCudaDiagnosticLines(stderr: string): string[] {
     }
     out.push(line);
   }
-  if (elided > 0) out.push(`…[${elided} more diagnostic lines elided -- see the raw JSON dump]`);
+  if (elided > 0) out.push(`...[${elided} more diagnostic lines elided -- see the raw JSON dump]`);
   return out;
 }
 

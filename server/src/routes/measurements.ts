@@ -17,13 +17,26 @@ import type { FastifyInstance, FastifyRequest } from "fastify";
 import { repo } from "../db/repo.js";
 import { hashToken } from "../session.js";
 import { BadRequestError, ForbiddenError, NotFoundError, UnauthorizedError } from "../errors.js";
-import type { ProbeResultInput, QualityResultInput, Run, RunConfig, Worker } from "../../../shared/types.js";
+import { resolveAuthUser, assertOwnsWorker } from "../auth-middleware.js";
+import type {
+  ProbeAttemptReport,
+  ProbeResultInput,
+  QualityResultInput,
+  Run,
+  RunConfig,
+  Worker,
+} from "../../../shared/types.js";
 import { METHOD_VERSION } from "../../../shared/types.js";
 import { isKnownCacheType, CACHE_TYPE_VALUES } from "../../../shared/engineSpec.js";
 import { placementHash } from "../../../shared/configHash.js";
 
 export const MIN_PROBE_CTX = 256;
 export const MAX_PROBE_CTX = 4_194_304;
+// The ladder's own hard ceiling on loads. Was 3 when the ladder was a single
+// multiplicative retry; the coarse-to-fine search brackets then bisects, which
+// needs more rungs. Kept as a server-side bound (not just a worker constant)
+// so a misbehaving worker can't report an unbounded ladder.
+export const MAX_PROBE_ATTEMPTS = 8;
 export const DATASET_HASH_RE = /^sha256:[0-9a-f]{64}$/;
 
 // The enrolled-worker-session rule. Deliberately NOT authenticateWorker():
@@ -62,6 +75,50 @@ function requireFiniteInt(value: unknown, field: string, min: number, max: numbe
   return value;
 }
 
+// An optional measured/estimated MiB (or tok/s) reading. Absent and null both
+// mean "this worker didn't report it" and store as NULL; a present value must
+// be a finite non-negative number, never NaN/Infinity/a string -- a malformed
+// reading is rejected, never stored as data.
+function optionalNonNegative(value: unknown, field: string): number | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    throw new BadRequestError(`${field} must be a non-negative finite number or null`);
+  }
+  return value;
+}
+
+// Validates the ladder rungs before any of them reach the database. Bounds
+// mirror the trigger route's own probe-axis table (runs.ts): context within
+// the probe range, ngl within the sweep axis' [0, 1024].
+function validateProbeAttempts(attempts: unknown): ProbeAttemptReport[] {
+  if (attempts === undefined) return [];
+  if (!Array.isArray(attempts)) throw new BadRequestError("attempts must be an array");
+  if (attempts.length > MAX_PROBE_ATTEMPTS) {
+    throw new BadRequestError(`a probe performs at most ${MAX_PROBE_ATTEMPTS} loads`);
+  }
+  return attempts.map((raw, i) => {
+    const a = (raw ?? {}) as Record<string, unknown>;
+    if (typeof a.ok !== "boolean" || typeof a.oom !== "boolean" || typeof a.spill !== "boolean") {
+      throw new BadRequestError(`attempts[${i}] must carry boolean ok/oom/spill`);
+    }
+    return {
+      candidate_ctx: requireFiniteInt(a.candidate_ctx, `attempts[${i}].candidate_ctx`, MIN_PROBE_CTX, MAX_PROBE_CTX),
+      ok: a.ok,
+      oom: a.oom,
+      spill: a.spill,
+      ngl: a.ngl === undefined || a.ngl === null ? null : requireFiniteInt(a.ngl, `attempts[${i}].ngl`, 0, 1024),
+      vram_needed_mib: optionalNonNegative(a.vram_needed_mib, `attempts[${i}].vram_needed_mib`),
+      vram_free_mib: optionalNonNegative(a.vram_free_mib, `attempts[${i}].vram_free_mib`),
+      vram_peak_mib: optionalNonNegative(a.vram_peak_mib, `attempts[${i}].vram_peak_mib`),
+      ram_needed_mib: optionalNonNegative(a.ram_needed_mib, `attempts[${i}].ram_needed_mib`),
+      ram_free_mib: optionalNonNegative(a.ram_free_mib, `attempts[${i}].ram_free_mib`),
+      ram_peak_mib: optionalNonNegative(a.ram_peak_mib, `attempts[${i}].ram_peak_mib`),
+      gen_tps: optionalNonNegative(a.gen_tps, `attempts[${i}].gen_tps`),
+      error: typeof a.error === "string" ? a.error : undefined,
+    } satisfies ProbeAttemptReport;
+  });
+}
+
 export async function measurementRoutes(app: FastifyInstance): Promise<void> {
   // --- N2: probe result -----------------------------------------------------
   app.post<{ Params: { id: string }; Body: ProbeResultInput }>(
@@ -78,13 +135,7 @@ export async function measurementRoutes(app: FastifyInstance): Promise<void> {
       if (body.status !== "verified" && body.status !== "failed" && body.status !== "failed_oom") {
         throw new BadRequestError("status must be verified/failed/failed_oom");
       }
-      if (body.attempts !== undefined && !Array.isArray(body.attempts)) {
-        throw new BadRequestError("attempts must be an array");
-      }
-      if (Array.isArray(body.attempts) && body.attempts.length > 3) {
-        // Three loads max, ever -- the plan's own hard ceiling.
-        throw new BadRequestError("a probe performs at most three loads");
-      }
+      const attempts = validateProbeAttempts(body.attempts);
 
       // The KV pair and placement come from the RUN's stored spec, never the
       // payload: verification is per (machine, build, KV pair, placement).
@@ -92,6 +143,17 @@ export async function measurementRoutes(app: FastifyInstance): Promise<void> {
       if (!isKnownCacheType(cacheK) || !isKnownCacheType(cacheV)) {
         throw new BadRequestError(`probe kv_pair must be drawn from ${CACHE_TYPE_VALUES.join(", ")}`);
       }
+
+      // Every rung, not just the winner -- written before the ceiling upsert
+      // so a probe that reached no usable context still leaves the evidence
+      // of what it tried. Replaces the run's previous rows, so a worker retry
+      // reports one ladder rather than two interleaved ones.
+      repo.probeAttemptsRepo.replaceForRun({
+        run_id: run.id,
+        worker_id: worker.id,
+        model_id: run.model_id,
+        attempts,
+      });
 
       let stored = null;
       if (body.status === "verified") {
@@ -142,15 +204,27 @@ export async function measurementRoutes(app: FastifyInstance): Promise<void> {
         {
           probe_finished: true,
           outcome: body.status,
-          loads_used: body.attempts?.length ?? 0,
+          loads_used: attempts.length,
           run_id: run.id,
           worker_id: worker.id,
         },
         "probe_finished"
       );
-      return reply.code(200).send({ ok: true, limit: stored });
+      return reply.code(200).send({ ok: true, limit: stored, attempts_stored: attempts.length });
     }
   );
+
+  // The ladder behind a run's verified ceiling. Read-side authorization
+  // mirrors /api/models/:id/verified-limits: the caller must own the machine
+  // the run was dispatched to, since these rows describe that machine's
+  // memory. Worker sessions never read this -- it exists for the UI.
+  app.get<{ Params: { id: string } }>("/api/runs/:id/probe-attempts", async (request, reply) => {
+    const run = repo.getRun(undefined, request.params.id);
+    if (!run) throw new NotFoundError("run not found");
+    if (!run.worker_id) throw new NotFoundError("that run has no machine attached");
+    assertOwnsWorker(resolveAuthUser(request)?.user.id, run.worker_id);
+    return reply.send({ attempts: repo.probeAttemptsRepo.listForRun(run.id) });
+  });
 
   // --- N4: quality result ---------------------------------------------------
   app.post<{ Params: { id: string }; Body: QualityResultInput }>(

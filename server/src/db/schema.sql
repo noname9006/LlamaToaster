@@ -422,3 +422,26 @@ CREATE TABLE IF NOT EXISTS quality_results (
   UNIQUE(root_run_id, model_id, ctx_tokens, cache_type_k, cache_type_v, dataset_hash)
 );
 CREATE INDEX IF NOT EXISTS idx_quality_results_model ON quality_results(model_id);
+
+-- N2 -- every rung of a probe ladder, not just the winning one.
+-- model_machine_limits above stores the single verified ceiling that later
+-- runs consume; this stores what was actually tried to get there, so a
+-- reader can see the predicted-vs-real memory pair per load instead of
+-- taking the final number on faith. No user_id: like model_machine_limits
+-- it inherits tenancy from its run/worker and cascades away with them.
+CREATE TABLE IF NOT EXISTS probe_attempts (
+  id TEXT PRIMARY KEY,
+  run_id    TEXT NOT NULL REFERENCES runs(id)    ON DELETE CASCADE,
+  worker_id TEXT NOT NULL REFERENCES workers(id) ON DELETE CASCADE,
+  model_id  TEXT NOT NULL REFERENCES models(id)  ON DELETE CASCADE,
+  seq INTEGER NOT NULL,               -- ladder order, 0-based
+  candidate_ctx INTEGER NOT NULL,
+  ngl INTEGER,                        -- NULL from a worker predating the 2-axis ladder
+  ok INTEGER NOT NULL, oom INTEGER NOT NULL, spill INTEGER NOT NULL,
+  vram_needed_mib REAL, vram_free_mib REAL, vram_peak_mib REAL,
+  ram_needed_mib REAL,  ram_free_mib REAL,   ram_peak_mib REAL,
+  gen_tps REAL, error TEXT,
+  created_at INTEGER NOT NULL,
+  UNIQUE(run_id, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_probe_attempts_run ON probe_attempts(run_id);

@@ -2,6 +2,7 @@ import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { ProfileCards } from "../components/ProfileCards";
 import { SustainedState } from "../components/SustainedState";
 import { CurvesPanel, KneeChart } from "../components/CurvesPanel";
+import { ProbeAttempts } from "../components/ProbeAttempts";
 import { api as apiClient } from "../api/client";
 import { priceMatrix, ETA_UNAVAILABLE } from "../../../shared/pricing";
 import { useParams } from "react-router-dom";
@@ -1039,6 +1040,18 @@ export function RunDetail() {
         </div>
       )}
 
+      {/* N2 -- a probe's own ladder. First, because a probe produces no
+          scored cards, curve or sustained-state content: those sections all
+          render empty for it, so its one real result belongs at the top. */}
+      {run?.kind === "probe" && (
+        <section className="mt-6">
+          <h2 className="text-sm font-semibold uppercase tracking-wide text-muted">Context tests</h2>
+          <div className="mt-3">
+            <ProbeAttempts runId={id} refreshKey={run.status} />
+          </div>
+        </section>
+      )}
+
       {/* M3 -- the scored cards. Only once measuring has stopped: scoring a
           half-finished run would rank on a moving target. */}
       {run && (run.status === "done" || run.status === "partial") && (
@@ -1104,7 +1117,13 @@ export function RunDetail() {
         </section>
       )}
 
-      {items.length > 0 && (
+      {/* A probe's own run_item is vestigial (see Runs.tsx's formatProbeParams
+          comment): it exists only to satisfy the trigger route and carries
+          no ResultRow at all, so every sweep-shaped column below (n_prompt,
+          pp/tg tok/s, ttft, batch/ctk/fa, ...) would render blank. The
+          "Context tests" panel above is the real, purpose-built table for a
+          probe -- context/layers/RAM/VRAM per rung, every rung it ran. */}
+      {items.length > 0 && run?.kind !== "probe" && (
         <section className="mt-6">
           <div className="flex flex-wrap items-baseline justify-between gap-2">
             <h2 className="text-sm font-semibold uppercase tracking-wide text-muted">
