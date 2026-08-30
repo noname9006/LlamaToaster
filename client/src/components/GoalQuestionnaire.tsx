@@ -10,6 +10,7 @@
 // with aria-expanded; the target clamp announces via aria-live="polite".
 
 import { useEffect, useId, useMemo, useState } from "react";
+import { Link } from "react-router-dom";
 import {
   KV_PRESET_PAIRS,
   KV_PRESETS,
@@ -127,6 +128,9 @@ export interface PlacementVerifyResult {
   measuredNgl?: number | null;
   measuredVramPeakMib?: number | null;
   measuredRamPeakMib?: number | null;
+  /** When this card's Test was clicked -- epoch ms, shown compactly next to
+   * the run link so a tested card names both what it found and when. */
+  testedAt?: number;
 }
 
 const GOAL_CHOICES: { value: GoalKind; label: string }[] = [
@@ -704,6 +708,15 @@ function PlacementMatrix({
   onApplyConfig: (ngl: number, ctx: number) => void;
 }) {
   const [granularity, setGranularity] = useState<ProbeGranularity>("basic");
+  // Which card was explicitly clicked/tested last. Several modes
+  // (keep_context/balanced/fixed_offload/custom) all start from the SAME
+  // (ngl, ctx) as the user's current sliders by definition, so comparing
+  // start to the live placement would highlight all of them at once -- and
+  // permanently, since there'd be nothing to move away from. Tracking the
+  // clicked mode instead makes selection exclusive, and it still clears
+  // naturally once the sliders are dragged somewhere that mode's start no
+  // longer matches (see `selected` below).
+  const [activeMode, setActiveMode] = useState<ProbeMode | null>(null);
   // "Test all"'s own queue -- NOT six simultaneous triggers. The server's
   // §0.5 duplicate-trigger guard refuses more than one non-terminal probe
   // per (model, worker) at a time regardless of which card asked for it, so
@@ -756,6 +769,7 @@ function PlacementMatrix({
     const [next, ...rest] = testQueue;
     setTestQueue(rest);
     const start = modeStarts[next];
+    setActiveMode(next);
     placement.onVerify(start.ngl, start.ctx, next, granularity);
   }, [testQueue, placement, modeStarts, granularity]);
 
@@ -889,11 +903,17 @@ function PlacementMatrix({
                 key={mode}
                 mode={mode}
                 start={start}
-                selected={placement.ngl === start.ngl && ctx === start.ctx}
+                selected={activeMode === mode && placement.ngl === start.ngl && ctx === start.ctx}
                 busy={result?.status === "pending"}
                 result={result}
-                onApply={() => onApplyConfig(start.ngl, start.ctx)}
-                onTest={() => placement.onVerify(start.ngl, start.ctx, mode, granularity)}
+                onApply={() => {
+                  setActiveMode(mode);
+                  onApplyConfig(start.ngl, start.ctx);
+                }}
+                onTest={() => {
+                  setActiveMode(mode);
+                  placement.onVerify(start.ngl, start.ctx, mode, granularity);
+                }}
                 onReset={() => placement.onReset(mode)}
               />
             );
@@ -914,10 +934,22 @@ function formatMibShort(mib: number | null | undefined): string {
   return mib >= 1024 ? `${(mib / 1024).toFixed(1)} GiB` : `${Math.round(mib)} MiB`;
 }
 
+// Compact enough to sit on the same line as the run link: "08/30 14:07",
+// never a relative "2h ago" that would go stale while the card sits there.
+function formatTestedAt(ms: number): string {
+  const d = new Date(ms);
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  const hh = String(d.getHours()).padStart(2, "0");
+  const min = String(d.getMinutes()).padStart(2, "0");
+  return `${mm}/${dd} ${hh}:${min}`;
+}
+
 // Fixed height sized for the fullest state (blurb + start values + a result
-// line + a measured-needs line + the button row) so all 6 cards line up
-// regardless of which of those lines the current one actually has.
-const MODE_CARD_HEIGHT = "h-[186px]";
+// line + a measured-needs line + a run-link/tested-at line + the button row)
+// so all 6 cards line up regardless of which of those lines the current one
+// actually has.
+const MODE_CARD_HEIGHT = "h-[204px]";
 
 function ModeCard({
   mode,
@@ -989,6 +1021,14 @@ function ModeCard({
         {result?.status === "verified" && (result.measuredVramPeakMib != null || result.measuredRamPeakMib != null) && (
           <span className="mt-0.5 block font-mono text-[10.5px] text-muted">
             needed: {formatMibShort(result.measuredVramPeakMib)} VRAM · {formatMibShort(result.measuredRamPeakMib)} RAM
+          </span>
+        )}
+        {result?.runId && (
+          <span className="mt-0.5 block font-mono text-[10.5px] text-muted">
+            <Link to={`/runs/${result.runId}`} onClick={(e) => e.stopPropagation()} className="text-accent hover:underline">
+              Run ↗
+            </Link>
+            {result.testedAt != null ? ` · ${formatTestedAt(result.testedAt)}` : ""}
           </span>
         )}
       </div>
