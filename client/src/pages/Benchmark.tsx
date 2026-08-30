@@ -120,6 +120,18 @@ function placementStorageKey(modelId: string, workerId: string): string {
   return `llamatoaster:benchmark:placement:${modelId}:${workerId}`;
 }
 
+// The Tested-configurations cards' own in-flight/finished probe results --
+// same reasoning as chainStorageKey/placementStorageKey above, and the same
+// reason it matters MORE here: without this, navigating away from Benchmark
+// and back (or a reload) while a card's probe is still running loses the
+// only record that it was ever started. The card shows no spinner, "Test
+// all" looks idle, and the poll loop that would have picked up the eventual
+// verified/failed result never gets re-armed -- the run keeps executing
+// server-side, but this page forgets it exists.
+function verifyStatesStorageKey(modelId: string, workerId: string): string {
+  return `llamatoaster:benchmark:verify:${modelId}:${workerId}`;
+}
+
 const PRESETS_STORAGE_KEY = "llamatoaster:benchmark:presets";
 const REPEATS_STORAGE_KEY = "llamatoaster:benchmark:repeats";
 const AUTO_ADVANCE_STORAGE_KEY = "llamatoaster:benchmark:auto-advance";
@@ -498,9 +510,25 @@ export function Benchmark() {
     setGoalsUnset(restored == null);
     setChain(readJson<ChainState>(chainStorageKey(modelId, workerId)) ?? {});
     setNglOverride(readJson<number>(placementStorageKey(modelId, workerId)));
-    setVerifyStates({});
+    const restoredVerify = readJson<Partial<Record<ProbeMode, PlacementVerifyState>>>(
+      verifyStatesStorageKey(modelId, workerId)
+    );
+    setVerifyStates(restoredVerify ?? {});
+    // A card left "pending" (its probe still running server-side) when this
+    // page was last torn down has no live poll loop anymore -- the one
+    // verifyPlacement started died with the old mount. Re-arm one per
+    // restored pending card so the eventual verified/failed/failed_oom
+    // result still lands instead of the card being stuck "Testing…" forever.
+    for (const [mode, state] of Object.entries(restoredVerify ?? {}) as [ProbeMode, PlacementVerifyState][]) {
+      if (state?.status === "pending" && state.runId) startPolling(mode, state.runId);
+    }
     setPoolHaircutFrac(0);
   }, [modelId, workerId]);
+
+  useEffect(() => {
+    if (!modelId || !workerId) return;
+    writeJson(verifyStatesStorageKey(modelId, workerId), verifyStates);
+  }, [modelId, workerId, verifyStates]);
 
   useEffect(() => {
     if (!modelId || !workerId || nglOverride == null) return;
