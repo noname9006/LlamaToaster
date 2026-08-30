@@ -26,6 +26,12 @@ worker/llama-builds/
 # worker/) -- runtime output, not source.
 worker/logs/
 
+# Per-run structured log files, using the default LOG_DIR (data/run-logs/
+# next to the server's cwd, see server/src/routes/runs.ts) -- runtime
+# output, not source. Also covers the local dev-verify.db* sidecars that
+# land alongside it (already excluded by the *.db* patterns above).
+data/
+
 # Real deploy env files (created from deploy/orchestrator.env.example) --
 # environment-specific Tailscale IPs, not meant to be committed.
 *.env

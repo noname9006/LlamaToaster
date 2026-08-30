@@ -48,6 +48,7 @@ import {
   type GoalsConfig,
 } from "../goals";
 import { expandSweep } from "../../../shared/sweep";
+import type { ProbeGranularity, ProbeMode } from "../../../shared/probeLadder";
 import { priceMatrix, ETA_UNAVAILABLE } from "../../../shared/pricing";
 import type { ModelRatesResponse } from "../types";
 
@@ -136,6 +137,16 @@ interface PlacementVerifyState {
   status: "pending" | "verified" | "failed" | "failed_oom" | "error";
   detail?: string;
   verifiedCtxTokens?: number | null;
+  /** Which Tested-configurations card fired this probe. */
+  mode?: ProbeMode;
+  /** The winning rung's own placement and real measured usage -- pulled from
+   * probe_attempts once verified, since the ladder may have moved ngl away
+   * from what this card started at, and the estimate ("needed") can be
+   * meaningfully wrong (see the gemma4 SWA case) where the measured peak
+   * cannot. */
+  measuredNgl?: number | null;
+  measuredVramPeakMib?: number | null;
+  measuredRamPeakMib?: number | null;
 }
 
 // M5 -- a preset here carries INTENT (goals + repeats) and nothing machine-
@@ -388,7 +399,10 @@ export function Benchmark() {
   // default" (today's silent auto-cap), a number once the user has actually
   // dragged it. Never part of `goals`/presets -- see placementStorageKey.
   const [nglOverride, setNglOverride] = useState<number | null>(null);
-  const [verifyState, setVerifyState] = useState<PlacementVerifyState | null>(null);
+  // Keyed by mode, not a single shared slot -- every Tested-configurations
+  // card keeps its own independent result, in flight or finished, so Test
+  // All can run every mode at once without one overwriting another.
+  const [verifyStates, setVerifyStates] = useState<Partial<Record<ProbeMode, PlacementVerifyState>>>({});
   // A real failed/failed_oom verify result means the estimate was wrong at
   // that point -- bumped so the NEXT round of suggestions doesn't just
   // recompute the same number that already failed, rather than trusting the
@@ -470,7 +484,7 @@ export function Benchmark() {
       setGoalsUnset(true);
       setChain({});
       setNglOverride(null);
-      setVerifyState(null);
+      setVerifyStates({});
       setPoolHaircutFrac(0);
       return;
     }
@@ -480,7 +494,7 @@ export function Benchmark() {
     setGoalsUnset(restored == null);
     setChain(readJson<ChainState>(chainStorageKey(modelId, workerId)) ?? {});
     setNglOverride(readJson<number>(placementStorageKey(modelId, workerId)));
-    setVerifyState(null);
+    setVerifyStates({});
     setPoolHaircutFrac(0);
   }, [modelId, workerId]);
 
@@ -549,10 +563,25 @@ export function Benchmark() {
       setStageData(next);
       if (anyLive) timer = window.setTimeout(poll, 5000);
     }
+    // A backgrounded tab gets its setTimeout cadence throttled (or paused
+    // outright) by the browser, so a stage that finishes while the user is
+    // away from the tab can sit "done" without this ever re-polling to
+    // notice -- which is exactly what stalls autoAdvance below until the
+    // user does something that happens to trigger a fresh fetch. Re-poll
+    // immediately the instant the tab regains visibility so a finished
+    // stage is picked up right away rather than waiting on a timer that may
+    // not fire again for minutes.
+    function onVisible() {
+      if (document.visibilityState !== "visible") return;
+      if (timer) window.clearTimeout(timer);
+      void poll();
+    }
+    document.addEventListener("visibilitychange", onVisible);
     void poll();
     return () => {
       cancelled = true;
       if (timer) window.clearTimeout(timer);
+      document.removeEventListener("visibilitychange", onVisible);
     };
   }, [chainIds]);
 
@@ -789,11 +818,18 @@ export function Benchmark() {
   // ScoredConfig, and callable before any chain run exists (a probe root is
   // standalone, never part of the chain). f16/f16 anchors the check, same
   // convention GoalQuestionnaire's own feasibility readout already uses.
-  // Disables synchronously (setVerifyState before the await) so a
-  // double-click can never fire two triggers.
-  async function verifyPlacement(ngl: number, ctx: number): Promise<void> {
-    if (!modelId || !workerId || verifyState?.status === "pending") return;
-    setVerifyState({ ngl, ctx, runId: "", status: "pending" });
+  // Disables synchronously (setVerifyStates before the await) so a
+  // double-click on the SAME card can never fire two triggers -- a
+  // different card's own mode is untouched, so Test All can fire every mode
+  // at once.
+  async function verifyPlacement(
+    ngl: number,
+    ctx: number,
+    mode: ProbeMode,
+    granularity: ProbeGranularity
+  ): Promise<void> {
+    if (!modelId || !workerId || verifyStates[mode]?.status === "pending") return;
+    setVerifyStates((prev) => ({ ...prev, [mode]: { ngl, ctx, runId: "", status: "pending", mode } }));
     try {
       const selectedGpu = selectedGpuRawIndex != null ? visibleGpus[selectedGpuRawIndex] : undefined;
       const run = await api.triggerRun({
@@ -805,6 +841,8 @@ export function Benchmark() {
           candidate_ctx: ctx,
           placement: { ngl, slots: 1 },
           kv_pair: ["f16", "f16"],
+          mode,
+          granularity,
         },
         // Vestigial -- the worker derives its own n_prompt/n_gen from
         // candidate_ctx for a probe load (see worker/src/index.ts's
@@ -826,62 +864,143 @@ export function Benchmark() {
           repeats: 1,
         },
       });
-      setVerifyState({ ngl, ctx, runId: run.id, status: "pending" });
+      setVerifyStates((prev) => ({ ...prev, [mode]: { ngl, ctx, runId: run.id, status: "pending", mode } }));
+      startPolling(mode, run.id);
     } catch (err) {
-      setVerifyState({ ngl, ctx, runId: "", status: "error", detail: err instanceof Error ? err.message : String(err) });
+      setVerifyStates((prev) => ({
+        ...prev,
+        [mode]: { ngl, ctx, runId: "", status: "error", mode, detail: err instanceof Error ? err.message : String(err) },
+      }));
     }
   }
 
-  // Polls the probe root independently of chainIds -- it is never part of
-  // the tuning->refine->sweep chain. Coarse pass/fail/OOM comes straight off
-  // items[0] (TerminalRunItemStatus distinguishes failed_oom from failed
-  // even though the aggregate Run.status collapses both to "failed"); a
-  // verified pass then looks up the precise ceiling via the dedicated route.
+  // A card's own "reset" -- purely local, no server call. The probe run
+  // itself still exists in Runs/RunDetail regardless; this only clears the
+  // card back to its untested Apply/Test state so it can be re-run cleanly.
+  function resetVerify(mode: ProbeMode): void {
+    setVerifyStates((prev) => {
+      if (!(mode in prev)) return prev;
+      const next = { ...prev };
+      delete next[mode];
+      return next;
+    });
+  }
+
+  // Polls one card's probe root independently of chainIds -- a probe is
+  // never part of the tuning->refine->sweep chain. Coarse pass/fail/OOM comes
+  // straight off items[0] (TerminalRunItemStatus distinguishes failed_oom
+  // from failed even though the aggregate Run.status collapses both to
+  // "failed"); a verified pass then looks up the precise ceiling AND (for the
+  // card's own measured-needs line) the winning rung's real peak usage.
+  //
+  // Started IMPERATIVELY from verifyPlacement below, once per triggered run,
+  // rather than from a useEffect reactively watching verifyStates. That
+  // shape was tried first and had a real bug: an effect whose own dependency
+  // array includes the state IT ALSO WRITES gets torn down and restarted by
+  // React on every write -- including the write this very poll makes to
+  // record "verified". The teardown's `cancelled = true` fired on THIS
+  // closure before its own subsequent getVerifiedLimits/getProbeAttempts
+  // lookup could apply, so the coarse verdict always landed but the
+  // measured-needs upgrade was silently dropped every single time. Calling
+  // this directly sidesteps the whole effect-restart lifecycle; only a real
+  // component unmount (below) should ever cancel it.
+  const pollingRunIds = useRef<Set<string>>(new Set());
+  const unmountedRef = useRef(false);
+  const visibilityListeners = useRef<(() => void)[]>([]);
   useEffect(() => {
-    if (!verifyState || verifyState.status !== "pending" || !verifyState.runId) return;
-    let cancelled = false;
+    // StrictMode (main.tsx) double-invokes every effect in dev: mount, a
+    // SIMULATED unmount (runs the cleanup below), then a real remount --
+    // synchronously, before any poll ever runs. Without resetting the flag
+    // here on that remount, the simulated unmount's cleanup would leave
+    // unmountedRef permanently true, and every poll() call's first line
+    // would bail out before ever calling api.getRun -- exactly the silent
+    // "never actually polls" bug this comment is here to prevent regressing.
+    unmountedRef.current = false;
+    return () => {
+      unmountedRef.current = true;
+      visibilityListeners.current.forEach((remove) => remove());
+      visibilityListeners.current = [];
+    };
+  }, []);
+
+  function startPolling(mode: ProbeMode, runId: string): void {
+    if (pollingRunIds.current.has(runId)) return;
+    pollingRunIds.current.add(runId);
     let timer: number | undefined;
-    const runId = verifyState.runId;
+
     async function poll() {
+      if (unmountedRef.current) return;
       try {
         const res = await api.getRun(runId);
-        if (cancelled) return;
+        if (unmountedRef.current) return;
         if (TERMINAL.has(res.run.status)) {
           const item = res.items[0];
           const status: PlacementVerifyState["status"] =
             item?.status === "failed_oom" ? "failed_oom" : item?.status === "done" ? "verified" : "failed";
-          setVerifyState((prev) => (prev && prev.runId === runId ? { ...prev, status, detail: item?.detail } : prev));
+          setVerifyStates((prev) => {
+            const cur = prev[mode];
+            return cur && cur.runId === runId ? { ...prev, [mode]: { ...cur, status, detail: item?.detail } } : prev;
+          });
           if (status === "failed" || status === "failed_oom") {
             setPoolHaircutFrac((f) => Math.min(0.3, f === 0 ? 0.15 : 0.3));
           }
           if (status === "verified" && modelId && workerId) {
             try {
-              const limits = await api.getVerifiedLimits(modelId, workerId);
+              const [limits, attemptsRes] = await Promise.all([
+                api.getVerifiedLimits(modelId, workerId),
+                api.getProbeAttempts(runId),
+              ]);
               const match = limits.limits
                 .filter((l) => l.kv_type === "f16/f16")
                 .sort((a, b) => b.created_at - a.created_at)[0];
-              if (!cancelled && match) {
-                setVerifyState((prev) =>
-                  prev && prev.runId === runId ? { ...prev, verifiedCtxTokens: match.verified_ctx_tokens } : prev
-                );
+              // The largest passing context wins, ties broken by ngl -- the
+              // same rule bestLadderResult (shared/probeLadder.ts) applies
+              // server-side, so this always names the SAME rung the stored
+              // ceiling actually came from.
+              const winner = attemptsRes.attempts
+                .filter((a) => a.ok)
+                .sort((a, b) => b.candidate_ctx - a.candidate_ctx || (b.ngl ?? 0) - (a.ngl ?? 0))[0];
+              if (!unmountedRef.current && (match || winner)) {
+                setVerifyStates((prev) => {
+                  const cur = prev[mode];
+                  if (!cur || cur.runId !== runId) return prev;
+                  return {
+                    ...prev,
+                    [mode]: {
+                      ...cur,
+                      verifiedCtxTokens: match?.verified_ctx_tokens,
+                      measuredNgl: winner?.ngl ?? null,
+                      measuredVramPeakMib: winner?.vram_peak_mib ?? null,
+                      measuredRamPeakMib: winner?.ram_peak_mib ?? null,
+                    },
+                  };
+                });
               }
             } catch {
               /* advisory upgrade only -- the coarse verdict above already landed */
             }
           }
+          document.removeEventListener("visibilitychange", onVisible);
+          pollingRunIds.current.delete(runId);
           return;
         }
       } catch {
         /* transient -- keep polling */
       }
-      timer = window.setTimeout(poll, 5000);
+      if (!unmountedRef.current) timer = window.setTimeout(poll, 5000);
     }
-    void poll();
-    return () => {
-      cancelled = true;
+    // Same background-tab throttling gotcha as the chain poll above -- catch
+    // up immediately on regained visibility instead of waiting on a timer
+    // the browser may have paused.
+    function onVisible() {
+      if (document.visibilityState !== "visible") return;
       if (timer) window.clearTimeout(timer);
-    };
-  }, [verifyState?.runId, verifyState?.status, modelId, workerId]);
+      void poll();
+    }
+    document.addEventListener("visibilitychange", onVisible);
+    visibilityListeners.current.push(() => document.removeEventListener("visibilitychange", onVisible));
+    void poll();
+  }
 
   // Fires the same transition the "Start Test B"/"Start Sweep" buttons do,
   // the moment stageState says a stage is startable -- so autoAdvance is
@@ -1184,6 +1303,10 @@ export function Benchmark() {
               }}
               trainedCtx={trainedCtx}
               unset={goalsUnset}
+              // This console runs the chain over slider-expressible contexts
+              // only, so the free-form number entry would offer a value
+              // nothing downstream here can act on. New Run keeps it.
+              showCtxNumberInput={false}
               affordability={{
                 totalMib: liveVramTotalMib,
                 weightsMib: affordability?.weightsMib ?? null,
@@ -1211,8 +1334,8 @@ export function Benchmark() {
                       noGpu,
                       poolHaircutFrac,
                       onVerify: verifyPlacement,
-                      verifying: verifyState?.status === "pending",
-                      verifyResult: verifyState,
+                      onReset: resetVerify,
+                      verifyResults: verifyStates,
                     }
                   : undefined
               }
@@ -1228,7 +1351,10 @@ export function Benchmark() {
               </span>
             </div>
 
-            <label className="mt-2 flex items-center gap-2 text-[11.5px] text-muted">
+            {/* Same control, same state as the sticky "Your run" card below --
+                it governs the whole chain's behaviour, so it belongs where
+                the chain is being reviewed too, not only where it's started. */}
+            <label className="flex items-center gap-2 text-[11.5px] text-muted">
               <input
                 type="checkbox"
                 checked={autoAdvance}
@@ -1496,6 +1622,19 @@ export function Benchmark() {
             </div>
             <div className="leading-relaxed text-muted">est. {totalPriced}</div>
           </div>
+
+          {/* Sits with the start button rather than inside the chain strip:
+              it governs what happens AFTER you press start, so this is where
+              the decision is actually being made. */}
+          <label className="flex items-center gap-2 text-[11.5px] text-muted">
+            <input
+              type="checkbox"
+              checked={autoAdvance}
+              onChange={(e) => setAutoAdvance(e.target.checked)}
+              className="h-3.5 w-3.5 accent-accent"
+            />
+            Auto-start the next stage as soon as the previous one finishes
+          </label>
 
           <button
             type="button"

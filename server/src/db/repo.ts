@@ -41,6 +41,7 @@ import type {
   VramDiscrepancyPolicy,
   RunKind,
   ProbeResultInput,
+  ProbeAttemptReport,
   QualityResultInput,
 } from "../../../shared/types.js";
 import {
@@ -3249,6 +3250,68 @@ export const repo = {
         .prepare(`SELECT * FROM model_machine_limits WHERE model_id = ? ORDER BY created_at DESC`)
         .all(modelId) as VerifiedLimit[];
     },
+
+    getById(id: string): VerifiedLimit | undefined {
+      return getDb().prepare(`SELECT * FROM model_machine_limits WHERE id = ?`).get(id) as VerifiedLimit | undefined;
+    },
+
+    // Forgets a stale ceiling so ProfileCards can offer "Verify with a probe"
+    // again -- the row otherwise lives forever (a re-probe would overwrite it
+    // through the UNIQUE key, but nothing forces a re-probe without this).
+    deleteById(id: string): boolean {
+      return getDb().prepare(`DELETE FROM model_machine_limits WHERE id = ?`).run(id).changes > 0;
+    },
+  },
+
+  // N2 -- the ladder behind a verified ceiling. Replace-whole-run rather than
+  // per-row upsert: a worker retry re-runs the WHOLE ladder, so its second
+  // report is the truth and the first one's rungs never happened.
+  probeAttemptsRepo: {
+    replaceForRun(input: ProbeAttemptsInput): number {
+      const database = getDb();
+      const now = Date.now();
+      const tx = database.transaction(() => {
+        database.prepare(`DELETE FROM probe_attempts WHERE run_id = ?`).run(input.run_id);
+        const insert = database.prepare(
+          `INSERT INTO probe_attempts
+             (id, run_id, worker_id, model_id, seq, candidate_ctx, ngl,
+              ok, oom, spill, vram_needed_mib, vram_free_mib, vram_peak_mib,
+              ram_needed_mib, ram_free_mib, ram_peak_mib, gen_tps, error, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        );
+        input.attempts.forEach((a, seq) => {
+          insert.run(
+            uuid(),
+            input.run_id,
+            input.worker_id,
+            input.model_id,
+            seq,
+            a.candidate_ctx,
+            a.ngl ?? null,
+            a.ok ? 1 : 0,
+            a.oom ? 1 : 0,
+            a.spill ? 1 : 0,
+            a.vram_needed_mib ?? null,
+            a.vram_free_mib ?? null,
+            a.vram_peak_mib ?? null,
+            a.ram_needed_mib ?? null,
+            a.ram_free_mib ?? null,
+            a.ram_peak_mib ?? null,
+            a.gen_tps ?? null,
+            a.error ?? null,
+            now
+          );
+        });
+      });
+      tx();
+      return input.attempts.length;
+    },
+
+    listForRun(runId: string): ProbeAttemptRow[] {
+      return getDb()
+        .prepare(`SELECT * FROM probe_attempts WHERE run_id = ? ORDER BY seq ASC`)
+        .all(runId) as ProbeAttemptRow[];
+    },
   },
 
   // N4 -- perplexity/KLD rows. Worker retries replace through the six-column
@@ -3425,6 +3488,36 @@ export interface VerifiedLimit {
   verified_ctx_tokens: number;
   margin_observed_frac: number | null;
   method_version: number | null;
+  created_at: number;
+}
+
+export interface ProbeAttemptsInput {
+  run_id: string;
+  worker_id: string;
+  model_id: string;
+  attempts: ProbeAttemptReport[];
+}
+
+// SQLite has no boolean: ok/oom/spill come back as 0/1 and callers coerce.
+export interface ProbeAttemptRow {
+  id: string;
+  run_id: string;
+  worker_id: string;
+  model_id: string;
+  seq: number;
+  candidate_ctx: number;
+  ngl: number | null;
+  ok: number;
+  oom: number;
+  spill: number;
+  vram_needed_mib: number | null;
+  vram_free_mib: number | null;
+  vram_peak_mib: number | null;
+  ram_needed_mib: number | null;
+  ram_free_mib: number | null;
+  ram_peak_mib: number | null;
+  gen_tps: number | null;
+  error: string | null;
   created_at: number;
 }
 

@@ -480,4 +480,78 @@ describe("GET /api/models/:id/verified-limits", () => {
     const res = await fetch(`${baseUrl}/api/models/m1/verified-limits?worker=${worker.id}`);
     expect(res.status).toBe(200);
   });
+
+  // Lets a stale ceiling be forgotten so ProfileCards offers "Verify with a
+  // probe" again -- otherwise a card stuck reading "Verified" has no route
+  // back to re-testing. Authorization mirrors the GET route above exactly.
+  describe("DELETE /api/verified-limits/:id", () => {
+    it("404s for an unknown id", async () => {
+      const res = await fetch(`${baseUrl}/api/verified-limits/nope`, { method: "DELETE" });
+      expect(res.status).toBe(404);
+    });
+
+    it("a different authenticated user cannot delete another user's claimed worker's verified limit", async () => {
+      const worker = repo.workerRepo.getOrCreateByMachineId("limits-del-intruder", "limits-del-intruder");
+      const { userId } = await sessionFor("limits-del-real-owner");
+      claimWorker(worker.id, userId);
+      const { token: intruderToken } = await sessionFor("limits-del-intruder-user");
+      const limit = repo.limitsRepo.upsert({
+        worker_id: worker.id,
+        model_id: "m1",
+        llama_cpp_build: "b1",
+        cache_type_k: "f16",
+        cache_type_v: "f16",
+        placement_hash: "hash-del-1",
+        verified_ctx_tokens: 8192,
+      });
+
+      const res = await fetch(`${baseUrl}/api/verified-limits/${limit.id}`, {
+        method: "DELETE",
+        headers: authed(intruderToken),
+      });
+      expect(res.status).toBe(403);
+      expect(repo.limitsRepo.getById(limit.id)).toBeDefined();
+    });
+
+    it("the owner can delete their own machine's verified limit", async () => {
+      const worker = repo.workerRepo.getOrCreateByMachineId("limits-del-owner-ok", "limits-del-owner-ok");
+      const { userId, token } = await sessionFor("limits-del-owner");
+      claimWorker(worker.id, userId);
+      const limit = repo.limitsRepo.upsert({
+        worker_id: worker.id,
+        model_id: "m1",
+        llama_cpp_build: "b1",
+        cache_type_k: "f16",
+        cache_type_v: "f16",
+        placement_hash: "hash-del-2",
+        verified_ctx_tokens: 4096,
+      });
+
+      const res = await fetch(`${baseUrl}/api/verified-limits/${limit.id}`, {
+        method: "DELETE",
+        headers: authed(token),
+      });
+      expect(res.status).toBe(200);
+      expect(repo.limitsRepo.getById(limit.id)).toBeUndefined();
+    });
+
+    it("an unauthenticated caller (single-tenant mode) can delete any machine's verified limit regardless of ownership", async () => {
+      const worker = repo.workerRepo.getOrCreateByMachineId("limits-del-single-tenant", "limits-del-single-tenant");
+      const { userId } = await sessionFor("limits-del-single-tenant-owner");
+      claimWorker(worker.id, userId);
+      const limit = repo.limitsRepo.upsert({
+        worker_id: worker.id,
+        model_id: "m1",
+        llama_cpp_build: "b1",
+        cache_type_k: "f16",
+        cache_type_v: "f16",
+        placement_hash: "hash-del-3",
+        verified_ctx_tokens: 2048,
+      });
+
+      const res = await fetch(`${baseUrl}/api/verified-limits/${limit.id}`, { method: "DELETE" });
+      expect(res.status).toBe(200);
+      expect(repo.limitsRepo.getById(limit.id)).toBeUndefined();
+    });
+  });
 });

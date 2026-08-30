@@ -7,6 +7,7 @@ export const WORKER_INACCESSIBLE_MESSAGE = "worker is inaccessible";
 
 import type { EngineKind } from "./engineSpec.js";
 import type { TensorLayerBreakdown } from "./vramEstimate.js";
+import type { ProbeGranularity, ProbeMode } from "./probeLadder.js";
 
 // Well-known values used for auto-detection's own guess (see
 // worker/src/hardware.ts's detectBackend) and as UI suggestions -- NOT an
@@ -1012,6 +1013,11 @@ export interface ProbeTriggerSpec {
   candidate_ctx: number;
   placement: { ngl: number; n_cpu_moe?: number; slots?: number };
   kv_pair: [string, string];
+  // N2's search strategy -- see shared/probeLadder.ts. Both optional so an
+  // older client keeps working: absent means the single-axis context search
+  // over slider stops, which is what a probe did before modes existed.
+  mode?: ProbeMode;
+  granularity?: ProbeGranularity;
 }
 
 // N4 -- what a quality run was triggered to measure, echoed onto the run's
@@ -1560,9 +1566,10 @@ export interface KneeSpec {
   slots?: number[];
 }
 
-// N2 -- one probe load at a candidate context. Success = no OOM, no spill,
-// gen tok/s above floor; retried once at candidate × 0.75 on failure; three
-// loads max ever.
+// N2 -- one probe's whole ladder. Success per rung = no OOM, no spill, gen
+// tok/s above floor. The search itself (which axis moves, how far, when it
+// stops) lives in shared/probeLadder.ts; this payload only carries what that
+// module needs as inputs.
 export interface RunProbeJobPayload {
   run_id: string;
   model_id: string;
@@ -1577,15 +1584,34 @@ export interface RunProbeJobPayload {
   main_gpu?: number;
   trained_ctx?: number | null;
   gpu_total_mib?: number | null;
+  // Absent means the pre-modes behavior -- see ProbeTriggerSpec.
+  mode?: ProbeMode;
+  granularity?: ProbeGranularity;
 }
 
+// One rung of the ladder, as reported by the worker and persisted verbatim
+// into probe_attempts. Every field past `spill` is optional: a worker built
+// before these existed still validates, and its rows simply read "—".
 export interface ProbeAttemptReport {
   candidate_ctx: number;
   ok: boolean;
   oom: boolean;
   spill: boolean;
+  // The placement this rung actually loaded at. The ladder moves ngl as well
+  // as context, so a row is only interpretable alongside the ngl it used.
+  ngl?: number | null;
   vram_peak_mib?: number | null;
+  // MemorySampler's own RSS peak for the probe process -- the real measured
+  // RAM usage, alongside vram_peak_mib.
+  ram_peak_mib?: number | null;
   gen_tps?: number | null;
+  // What computeDualPoolFit PREDICTED this rung would need, and what the
+  // machine actually had free just before the load -- the predicted-vs-real
+  // pair that until now only ever reached a log line.
+  vram_needed_mib?: number | null;
+  vram_free_mib?: number | null;
+  ram_needed_mib?: number | null;
+  ram_free_mib?: number | null;
   error?: string;
 }
 

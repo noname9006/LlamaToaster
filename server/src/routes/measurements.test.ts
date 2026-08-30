@@ -15,6 +15,10 @@ let workerToken: string;
 let otherWorkerToken: string;
 let workerId: string;
 let otherWorkerId: string;
+// Read from the route module in beforeAll rather than imported statically:
+// a top-level import would pull in repo.js and pin the getDb singleton
+// before DB_PATH above takes effect.
+let MAX_PROBE_ATTEMPTS: number;
 
 const sweep = {
   n_prompt: [512],
@@ -89,7 +93,9 @@ const probeSpec = {
 
 beforeAll(async () => {
   ({ repo } = await import("../db/repo.js"));
-  const { measurementRoutes } = await import("./measurements.js");
+  const measurements = await import("./measurements.js");
+  const { measurementRoutes } = measurements;
+  MAX_PROBE_ATTEMPTS = measurements.MAX_PROBE_ATTEMPTS;
   app = Fastify({ logger: false });
   app.setErrorHandler((error: { statusCode?: number; message: string }, _req, reply) => {
     reply.code(error.statusCode ?? 500).send({ error: error.message });
@@ -215,18 +221,125 @@ describe("POST /api/runs/:id/probe-result (N2)", () => {
     expect(tooBig.status).toBe(400);
   });
 
-  it("refuses more than three loads -- the hard ceiling is part of the contract", async () => {
+  it("refuses more loads than the ladder's ceiling -- the cap is part of the contract", async () => {
     makeRun("probe-loads", { kind: "probe", worker: workerId, config: { probe: probeSpec } });
-    const res = await post(
+    const atCap = await post(
       "/api/runs/probe-loads/probe-result",
       {
         status: "verified",
         verified_ctx_tokens: 10_000,
-        attempts: [1, 2, 3, 4].map((n) => ({ candidate_ctx: n * 1000, ok: true, oom: false, spill: false })),
+        attempts: Array.from({ length: MAX_PROBE_ATTEMPTS }, (_, i) => ({
+          candidate_ctx: (i + 1) * 1000,
+          ok: true,
+          oom: false,
+          spill: false,
+        })),
+      },
+      workerToken
+    );
+    expect(atCap.status).toBe(200);
+
+    makeRun("probe-loads-2", { kind: "probe", worker: workerId, config: { probe: probeSpec } });
+    const overCap = await post(
+      "/api/runs/probe-loads-2/probe-result",
+      {
+        status: "verified",
+        verified_ctx_tokens: 10_000,
+        attempts: Array.from({ length: MAX_PROBE_ATTEMPTS + 1 }, (_, i) => ({
+          candidate_ctx: (i + 1) * 1000,
+          ok: true,
+          oom: false,
+          spill: false,
+        })),
+      },
+      workerToken
+    );
+    expect(overCap.status).toBe(400);
+  });
+
+  it("persists every ladder rung, not just the winning one", async () => {
+    makeRun("probe-rungs", { kind: "probe", worker: workerId, config: { probe: probeSpec } });
+    const res = await post(
+      "/api/runs/probe-rungs/probe-result",
+      {
+        status: "verified",
+        verified_ctx_tokens: 16_384,
+        attempts: [
+          {
+            candidate_ctx: 32_768,
+            ngl: 27,
+            ok: false,
+            oom: true,
+            spill: false,
+            vram_needed_mib: 9119,
+            vram_free_mib: 8000,
+            ram_needed_mib: 6743,
+            ram_free_mib: 32_000,
+          },
+          {
+            candidate_ctx: 16_384,
+            ngl: 27,
+            ok: true,
+            oom: false,
+            spill: false,
+            vram_needed_mib: 5000,
+            vram_free_mib: 8000,
+            vram_peak_mib: 5422,
+            ram_needed_mib: 4000,
+            ram_free_mib: 32_000,
+            gen_tps: 41.5,
+          },
+        ],
+      },
+      workerToken
+    );
+    expect(res.status).toBe(200);
+
+    const rungs = repo.probeAttemptsRepo.listForRun("probe-rungs");
+    expect(rungs).toHaveLength(2);
+    expect(rungs.map((r) => r.seq)).toEqual([0, 1]);
+    expect(rungs[0].candidate_ctx).toBe(32_768);
+    expect(rungs[0].ok).toBe(0);
+    expect(rungs[0].oom).toBe(1);
+    // The predicted-vs-real pair that previously only reached a log line.
+    expect(rungs[0].vram_needed_mib).toBe(9119);
+    expect(rungs[0].vram_free_mib).toBe(8000);
+    expect(rungs[0].vram_peak_mib).toBeNull();
+    expect(rungs[1].ok).toBe(1);
+    expect(rungs[1].ngl).toBe(27);
+    expect(rungs[1].vram_peak_mib).toBe(5422);
+    expect(rungs[1].gen_tps).toBeCloseTo(41.5, 6);
+  });
+
+  it("keeps the rungs of a failed probe, which writes no verified ceiling", async () => {
+    makeRun("probe-rungs-fail", { kind: "probe", worker: workerId, config: { probe: probeSpec } });
+    const res = await post(
+      "/api/runs/probe-rungs-fail/probe-result",
+      {
+        status: "failed_oom",
+        verified_ctx_tokens: null,
+        attempts: [{ candidate_ctx: 8192, ngl: 20, ok: false, oom: true, spill: false }],
+        error: "OOM at 8192",
+      },
+      workerToken
+    );
+    expect(res.status).toBe(200);
+    expect(repo.probeAttemptsRepo.listForRun("probe-rungs-fail")).toHaveLength(1);
+  });
+
+  it("rejects a malformed attempt reading rather than storing it as data", async () => {
+    makeRun("probe-bad-attempt", { kind: "probe", worker: workerId, config: { probe: probeSpec } });
+    const res = await post(
+      "/api/runs/probe-bad-attempt/probe-result",
+      {
+        status: "verified",
+        verified_ctx_tokens: 10_000,
+        attempts: [{ candidate_ctx: 10_000, ok: true, oom: false, spill: false, vram_peak_mib: -5 }],
       },
       workerToken
     );
     expect(res.status).toBe(400);
+    expect(repo.probeAttemptsRepo.listForRun("probe-bad-attempt")).toHaveLength(0);
   });
 
   it("records a failed probe without writing any verified ceiling", async () => {
@@ -239,6 +352,60 @@ describe("POST /api/runs/:id/probe-result (N2)", () => {
     expect(res.status).toBe(200);
     expect(repo.limitsRepo.listForModelAndWorker("m1", workerId).some((r) => r.kv_type === "q4_0/q4_0")).toBe(false);
     expect(repo.getRunItems("probe-fail")[0].status).toBe("failed_oom");
+  });
+});
+
+// Read side. Ownership binds to the MACHINE the run was dispatched to (the
+// same assertOwnsWorker gate GET /api/models/:id/verified-limits uses), not
+// to the run's own user_id -- these rows describe that machine's memory.
+describe("GET /api/runs/:id/probe-attempts", () => {
+  function authed(token: string): Record<string, string> {
+    return { authorization: `Bearer ${token}` };
+  }
+
+  async function sessionFor(login: string): Promise<{ userId: string; token: string }> {
+    const user = repo.userRepo.upsertByIdentity("github", { providerUserId: login, login, avatarUrl: null });
+    const { token } = repo.sessionRepo.create(user.id, { label: login });
+    return { userId: user.id, token };
+  }
+
+  async function claimWorker(id: string, userId: string): Promise<void> {
+    const { getDb } = await import("../db/migrate.js");
+    getDb().prepare(`UPDATE workers SET user_id = ? WHERE id = ?`).run(userId, id);
+  }
+
+  it("returns the ladder in seq order for the machine's owner", async () => {
+    makeRun("probe-read", { kind: "probe", worker: workerId, config: { probe: probeSpec } });
+    await post(
+      "/api/runs/probe-read/probe-result",
+      {
+        status: "verified",
+        verified_ctx_tokens: 8192,
+        attempts: [
+          { candidate_ctx: 16_384, ngl: 27, ok: false, oom: true, spill: false },
+          { candidate_ctx: 8192, ngl: 27, ok: true, oom: false, spill: false, gen_tps: 30 },
+        ],
+      },
+      workerToken
+    );
+
+    const { userId, token } = await sessionFor("probe-read-owner");
+    await claimWorker(workerId, userId);
+    const res = await fetch(`${baseUrl}/api/runs/probe-read/probe-attempts`, { headers: authed(token) });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { attempts: { seq: number; candidate_ctx: number }[] };
+    expect(body.attempts.map((a) => a.candidate_ctx)).toEqual([16_384, 8192]);
+  });
+
+  it("refuses a different authenticated user", async () => {
+    const { token: intruderToken } = await sessionFor("probe-read-intruder");
+    const res = await fetch(`${baseUrl}/api/runs/probe-read/probe-attempts`, { headers: authed(intruderToken) });
+    expect(res.status).toBe(403);
+  });
+
+  it("404s an unknown run rather than leaking an empty list", async () => {
+    const res = await fetch(`${baseUrl}/api/runs/no-such-run/probe-attempts`);
+    expect(res.status).toBe(404);
   });
 });
 
