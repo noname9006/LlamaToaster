@@ -70,7 +70,7 @@ export async function spawnRuntimeServer(input: SpawnRuntimeServerInput): Promis
     contextSizeOverride: input.contextSizeOverride,
   });
   input.log?.info(`llama-server ${args.join(" ")}`);
-  const proc = spawn(input.llamaServerPath, args, { stdio: ["ignore", "pipe", "pipe"] });
+  const proc = spawn(input.llamaServerPath, args, { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
   input.onSpawn?.(proc);
 
   let stderr = "";
