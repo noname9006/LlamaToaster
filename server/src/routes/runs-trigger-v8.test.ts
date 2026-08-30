@@ -345,6 +345,31 @@ describe("§0.7/N2 capability gates", () => {
     expect((job?.payload as { mode?: string; granularity?: string }).granularity).toBe("fine");
   });
 
+  // A probe (and a quality measurement, same job-type family) rides its own
+  // job type -- 'run_probe', not 'benchmark' -- so claimNextJob's flip-to-
+  // 'running' check has to name it explicitly or the run sits at 'scheduled'
+  // for its entire (often minutes-long) execution: the Runs page mislabels a
+  // live probe, and RunDetail hides its elapsed-time/Stop controls the whole
+  // time it's actually running.
+  it("flips a probe run to 'running' the moment the worker claims its run_probe job", async () => {
+    await heartbeat("v8-cap-running", { capabilities: ["benchmark", "probe-v1"] });
+    const worker = repo.workerRepo.getByMachineId("v8-cap-running")!;
+    const res = await postJson("/api/runs/trigger", {
+      model_id: "v8-model",
+      worker_id: worker.id,
+      kind: "probe",
+      probe: { candidate_ctx: 32768, placement: { ngl: 16, slots: 1 }, kv_pair: ["f16", "f16"] },
+      sweep: baseSweep,
+    });
+    expect(res.status).toBe(201);
+    const run = ((await res.json()) as { run: { id: string; status: string } }).run;
+    expect(run.status).toBe("scheduled");
+
+    const job = repo.queueRepo.claimNextJob(worker.id);
+    expect(job?.type).toBe("run_probe");
+    expect(repo.getRun(undefined, run.id)?.status).toBe("running");
+  });
+
   it("rejects an unknown probe mode or granularity rather than silently searching differently", async () => {
     await heartbeat("v8-cap-mode-bad", { capabilities: ["benchmark", "probe-v1"] });
     const worker = repo.workerRepo.getByMachineId("v8-cap-mode-bad")!;
