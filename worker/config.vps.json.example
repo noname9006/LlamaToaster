@@ -4,7 +4,7 @@
   "llama_cpp_build": "none",
   "llama_bench_path": "/home/ubuntu/LlamaToaster/worker/llama-builds/none/llama-bench",
   "model_dir": "/home/ubuntu/LlamaToaster/models",
-  "vps_url": "https://llamatoaster.com",
+  "url": "https://llamatoaster.com",
   "raw_json_dir": "/home/ubuntu/LlamaToaster/models/raw",
   "llama_cpp_builds_dir": "/home/ubuntu/LlamaToaster/worker/llama-builds",
   "bench_timeout_ms": 14400000

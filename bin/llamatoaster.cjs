@@ -105,7 +105,7 @@ Examples:
   llamatoaster                  # Start the server
   llamatoaster server           # Same as above
   llamatoaster worker           # Start a worker
-  llamatoaster setup --vps-url https://llamatoaster.com
+  llamatoaster setup --url https://llamatoaster.com
 `);
 }
 

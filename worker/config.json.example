@@ -4,7 +4,7 @@
   "llama_cpp_build": "none",
   "llama_bench_path": "C:\\llama\\llama-bench.exe",
   "model_dir": "C:\\llm",
-  "vps_url": "https://llamatoaster.com",
+  "url": "https://llamatoaster.com",
   "raw_json_dir": "C:\\llm\\raw",
   "bench_timeout_ms": 14400000
 }

@@ -5,15 +5,15 @@
 # setup-worker.sh) the home for the "llama" and "models" subfolders.
 #
 # Usage from a totally fresh machine (only bash + Node.js 22+ needed; git is
-# used if present, otherwise falls back to a plain tarball download). --vps-url
+# used if present, otherwise falls back to a plain tarball download). --url
 # is required. Omit --dir and it'll ask -- shows `df -h` (models are often
 # tens of GB each) and asks for a base folder and a name:
 #
-#   curl -fsSL https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.sh | bash -s -- --vps-url https://llamatoaster.com
+#   curl -fsSL https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.sh | bash -s -- --url https://llamatoaster.com
 #
 # Pass --dir to skip the prompts (e.g. for unattended/scripted use):
 #
-#   curl -fsSL https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.sh | bash -s -- --vps-url https://llamatoaster.com --dir ~/LlamaToaster
+#   curl -fsSL https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.sh | bash -s -- --url https://llamatoaster.com --dir ~/LlamaToaster
 #
 # Safe to re-run: if --dir already has a LlamaToaster install, it is updated
 # IN PLACE -- via git fetch + reset --hard when it is a git checkout, or a
@@ -26,7 +26,7 @@
 # --reconnect (needs an existing --dir install with a config.json in it).
 #
 # All setup-worker.sh overrides are forwarded -- see that script's own
-# header for what each one does: --worker-name --backend --vps-url
+# header for what each one does: --worker-name --backend --url
 # --reconnect --force --allow-insecure-url. Plus one bootstrap-only option:
 #   --branch <name>   git branch/ref to fetch, default "main"
 
@@ -38,7 +38,7 @@ DIR=""
 BRANCH="main"
 WORKER_NAME="Local"
 BACKEND=""
-VPS_URL=""
+URL=""
 FORCE=0
 RECONNECT=0
 ALLOW_INSECURE_URL=0
@@ -49,7 +49,7 @@ while [ $# -gt 0 ]; do
     --branch) BRANCH="$2"; shift 2 ;;
     --worker-name) WORKER_NAME="$2"; shift 2 ;;
     --backend) BACKEND="$2"; shift 2 ;;
-    --vps-url) VPS_URL="$2"; shift 2 ;;
+    --url) URL="$2"; shift 2 ;;
     --force) FORCE=1; shift ;;
     --reconnect) RECONNECT=1; shift ;;
     --allow-insecure-url) ALLOW_INSECURE_URL=1; shift ;;
@@ -58,9 +58,9 @@ while [ $# -gt 0 ]; do
 done
 
 # Not required for --reconnect: it only clears the session fields in an
-# EXISTING config.json, which already has its own vps_url saved.
-if [ -z "$VPS_URL" ] && [ "$RECONNECT" -ne 1 ]; then
-  echo "--vps-url is required, e.g. --vps-url https://llamatoaster.com" >&2
+# EXISTING config.json, which already has its own url saved.
+if [ -z "$URL" ] && [ "$RECONNECT" -ne 1 ]; then
+  echo "--url is required, e.g. --url https://llamatoaster.com" >&2
   exit 1
 fi
 
@@ -187,7 +187,7 @@ if ! npm install --ignore-scripts; then
 fi
 
 SETUP_ARGS=(--dir "$DIR" --worker-name "$WORKER_NAME")
-[ -n "$VPS_URL" ] && SETUP_ARGS+=(--vps-url "$VPS_URL")
+[ -n "$URL" ] && SETUP_ARGS+=(--url "$URL")
 [ -n "$BACKEND" ] && SETUP_ARGS+=(--backend "$BACKEND")
 [ "$FORCE" -eq 1 ] && SETUP_ARGS+=(--force)
 [ "$RECONNECT" -eq 1 ] && SETUP_ARGS+=(--reconnect)
