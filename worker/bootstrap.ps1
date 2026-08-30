@@ -5,20 +5,20 @@
 #
 # Usage from a totally fresh machine (only PowerShell needed -- Node.js is
 # installed automatically via winget if missing; git is used if present,
-# otherwise falls back to a plain zip download). -VpsUrl is required.
+# otherwise falls back to a plain zip download). -Url is required.
 # Omit -Dir and it'll ask -- lists your local drives with free space (models
 # are often tens of GB each) and asks which one, then a folder name:
 #
-#   iex "& { $(irm https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.ps1) } -VpsUrl https://llamatoaster.com"
+#   iex "& { $(irm https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.ps1) } -Url https://llamatoaster.com"
 #
 # Pass -Dir to skip the prompts (e.g. for unattended/scripted use):
 #
-#   iex "& { $(irm https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.ps1) } -VpsUrl https://llamatoaster.com -Dir F:\LlamaToaster"
+#   iex "& { $(irm https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.ps1) } -Url https://llamatoaster.com -Dir F:\LlamaToaster"
 #
 # Or download it first and run locally:
 #
 #   irm https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.ps1 -OutFile bootstrap.ps1
-#   .\bootstrap.ps1 -VpsUrl https://llamatoaster.com
+#   .\bootstrap.ps1 -Url https://llamatoaster.com
 #
 # Safe to re-run: if $Dir is already a git checkout, it's updated in place
 # (git fetch + reset --hard to latest $Branch) instead of re-cloning;
@@ -31,7 +31,7 @@
 # config.json already in it).
 #
 # All setup-worker.ps1 overrides are forwarded -- see that script's own
-# header for what each one does: -WorkerName -Backend -VpsUrl -Reconnect
+# header for what each one does: -WorkerName -Backend -Url -Reconnect
 # -Force -AllowInsecureUrl. Plus one bootstrap-only option:
 #   -Branch <name>   git branch/ref to fetch, default "main"
 
@@ -40,7 +40,7 @@ param(
     [string]$Branch = "main",
     [string]$WorkerName = "Local",
     [string]$Backend,
-    [string]$VpsUrl,
+    [string]$Url,
     [switch]$Reconnect,
     [switch]$Force,
     [switch]$AllowInsecureUrl
@@ -49,9 +49,9 @@ param(
 $ErrorActionPreference = "Stop"
 
 # Not required for -Reconnect: it only clears the session fields in an
-# EXISTING config.json, which already has its own vps_url saved.
-if (-not $VpsUrl -and -not $Reconnect) {
-    Write-Error "-VpsUrl is required, e.g. -VpsUrl https://llamatoaster.com"
+# EXISTING config.json, which already has its own url saved.
+if (-not $Url -and -not $Reconnect) {
+    Write-Error "-Url is required, e.g. -Url https://llamatoaster.com"
     exit 1
 }
 
@@ -256,7 +256,7 @@ if ($installExit -ne 0) {
 }
 
 $setupArgs = @{ Dir = $Dir; WorkerName = $WorkerName }
-if ($VpsUrl) { $setupArgs.VpsUrl = $VpsUrl }
+if ($Url) { $setupArgs.Url = $Url }
 if ($Backend) { $setupArgs.Backend = $Backend }
 if ($Force) { $setupArgs.Force = $true }
 if ($Reconnect) { $setupArgs.Reconnect = $true }

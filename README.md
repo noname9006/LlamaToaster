@@ -122,19 +122,19 @@ restarting the process, no DB write needed.
 **Brand-new machine, nothing downloaded yet?** One command fetches the
 repo, installs dependencies, and starts the worker (needs
 PowerShell/bash + Node.js 22+; uses `git` if present, otherwise falls back
-to a zip/tarball download). `-VpsUrl`/`--vps-url` (your server's real
+to a zip/tarball download). `-Url`/`--url` (your server's real
 origin) is required. It asks which drive/volume to use — showing free
 space, since models are often tens of GB each — and a folder name, then
 creates it:
 
 ```powershell
 # Windows
-iex "& { $(irm https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.ps1) } -VpsUrl https://llamatoaster.com"
+iex "& { $(irm https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.ps1) } -Url https://llamatoaster.com"
 ```
 
 ```bash
 # macOS / Linux
-curl -fsSL https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.sh | bash -s -- --vps-url https://llamatoaster.com
+curl -fsSL https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.sh | bash -s -- --url https://llamatoaster.com
 ```
 
 Pass `-Dir`/`--dir` to skip the prompt (e.g. for unattended/scripted use):
@@ -181,7 +181,7 @@ see either script's header comment for the full set of overrides
 (`-WorkerName`, `-Backend`).
 
 Already have the repo checked out? Skip straight to
-`.\worker\setup-worker.ps1 -VpsUrl https://llamatoaster.com` (or the `.sh`
+`.\worker\setup-worker.ps1 -Url https://llamatoaster.com` (or the `.sh`
 equivalent) — same idempotent behavior and folder prompt, no download step.
 
 To configure by hand instead, edit `worker/config.json`:
@@ -193,7 +193,7 @@ To configure by hand instead, edit `worker/config.json`:
   "llama_cpp_build": "b10068",
   "llama_bench_path": "C:\\llama\\llama-bench.exe",
   "model_dir": "C:\\llm",
-  "vps_url": "https://llamatoaster.com",
+  "url": "https://llamatoaster.com",
   "raw_json_dir": "C:\\llm\\raw",
   "llama_cpp_builds_dir": "C:\\llm\\llama-builds"
 }
@@ -300,7 +300,7 @@ generating and persisting the session credentials.
 4. Once `llamatoaster-server` is up, open the dashboard from your own
    machine and confirm it loads.
 5. Enrol the server's own worker exactly like any other machine:
-   `./worker/bootstrap.sh --vps-url https://<your-domain> --dir ~/llamatoaster-worker`,
+   `./worker/bootstrap.sh --url https://<your-domain> --dir ~/llamatoaster-worker`,
    then approve the printed code from your logged-in session. Note where it
    wrote `config.json`, then point `llamatoaster-worker.service`'s
    `WORKER_CONFIG=` (or `ecosystem.worker.config.cjs`'s
@@ -430,7 +430,7 @@ are meant to be driven by the SPA, not called directly).
   Tailscale IP, no reverse proxy, `AUTH_ENABLED` left off) remains a valid,
   simpler alternative if you don't need multiple real-world accounts —
   Tailscale's own WireGuard encryption covers that topology. The worker
-  installer refuses a plain `http://` `--vps-url` other than
+  installer refuses a plain `http://` `--url` other than
   localhost/127.0.0.1 by default (a real bearer credential shouldn't go out
   in the clear) — pass `--allow-insecure-url`/`-AllowInsecureUrl` for this
   mode specifically, since Tailscale's own tunnel is the encryption there,

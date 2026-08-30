@@ -35,14 +35,14 @@ export function writeRawJson(runDir: string, runId: string, data: unknown): stri
 // callers now route through withAuth the same way postHeartbeat/pollQueue
 // already do.
 export async function postRunItemUpdate(
-  vpsUrl: string,
+  url: string,
   token: string,
   runId: string,
   idx: number,
   payload: RunItemUpdateInput,
   timeoutMs = 5000
 ): Promise<void> {
-  const res = await fetch(`${vpsUrl}/api/runs/${runId}/items/${idx}`, {
+  const res = await fetch(`${url}/api/runs/${runId}/items/${idx}`, {
     method: "POST",
     headers: { "content-type": "application/json", ...authHeader(token) },
     body: JSON.stringify(payload),
@@ -59,13 +59,13 @@ export async function postRunItemUpdate(
 // secret, so the token passed here must be the per-worker credential -- the
 // same one every other authenticated call already uses.
 export async function postProbeResult(
-  vpsUrl: string,
+  url: string,
   token: string,
   runId: string,
   payload: ProbeResultInput,
   timeoutMs = 15_000
 ): Promise<void> {
-  const res = await fetch(`${vpsUrl}/api/runs/${runId}/probe-result`, {
+  const res = await fetch(`${url}/api/runs/${runId}/probe-result`, {
     method: "POST",
     headers: { "content-type": "application/json", ...authHeader(token) },
     body: JSON.stringify(payload),
@@ -78,13 +78,13 @@ export async function postProbeResult(
 }
 
 export async function postQualityResult(
-  vpsUrl: string,
+  url: string,
   token: string,
   runId: string,
   payload: QualityResultInput,
   timeoutMs = 15_000
 ): Promise<void> {
-  const res = await fetch(`${vpsUrl}/api/runs/${runId}/quality-result`, {
+  const res = await fetch(`${url}/api/runs/${runId}/quality-result`, {
     method: "POST",
     headers: { "content-type": "application/json", ...authHeader(token) },
     body: JSON.stringify(payload),
@@ -103,12 +103,12 @@ export async function postQualityResult(
 // as a Model server-side, so losing it silently would leave a fully
 // downloaded file on disk that the app never learns about.
 export async function postModelDownloadResult(
-  vpsUrl: string,
+  url: string,
   token: string,
   payload: ModelDownloadCallbackInput,
   timeoutMs = 10_000
 ): Promise<void> {
-  const res = await fetch(`${vpsUrl}/api/models/download-callback`, {
+  const res = await fetch(`${url}/api/models/download-callback`, {
     method: "POST",
     headers: { "content-type": "application/json", ...authHeader(token) },
     body: JSON.stringify(payload),
@@ -148,7 +148,7 @@ export class HttpError extends Error {
 }
 
 export async function postHeartbeat(
-  vpsUrl: string,
+  url: string,
   token: string,
   state: WorkerStatePush,
   activeJob: ActiveJobReport | null,
@@ -158,7 +158,7 @@ export async function postHeartbeat(
   activeDownloads: ActiveJobReport[],
   timeoutMs = 10_000
 ): Promise<HeartbeatResponse> {
-  const res = await fetch(`${vpsUrl}/api/worker/heartbeat`, {
+  const res = await fetch(`${url}/api/worker/heartbeat`, {
     method: "POST",
     headers: { "content-type": "application/json", ...authHeader(token) },
     body: JSON.stringify({ ...state, active_job: activeJob ?? undefined, active_downloads: activeDownloads }),
@@ -173,12 +173,12 @@ export async function postHeartbeat(
 // this call would abort spuriously on every poll that didn't get a job
 // immediately.
 export async function pollQueue(
-  vpsUrl: string,
+  url: string,
   token: string,
   state: WorkerStatePush,
   timeoutMs: number
 ): Promise<QueueJob | null> {
-  const res = await fetch(`${vpsUrl}/api/worker/queue`, {
+  const res = await fetch(`${url}/api/worker/queue`, {
     method: "POST",
     headers: { "content-type": "application/json", ...authHeader(token) },
     body: JSON.stringify(state),
@@ -194,7 +194,7 @@ export async function pollQueue(
 // required (without it, the reaper eventually treats a finished job as if
 // the worker had crashed and re-hands it out).
 export async function reportJobResult(
-  vpsUrl: string,
+  url: string,
   token: string,
   machineId: string,
   jobId: string,
@@ -205,7 +205,7 @@ export async function reportJobResult(
   // JSON-bodied worker route (queue/heartbeat) -- machine_id must travel in
   // the body itself, not just the Bearer token (which only proves "some
   // worker," not "which one").
-  const res = await fetch(`${vpsUrl}/api/worker/jobs/${jobId}/complete`, {
+  const res = await fetch(`${url}/api/worker/jobs/${jobId}/complete`, {
     method: "POST",
     headers: { "content-type": "application/json", ...authHeader(token) },
     body: JSON.stringify({ machine_id: machineId, ...outcome }),
@@ -219,14 +219,14 @@ export async function reportJobResult(
 // JSON body, since the body here is raw gzip bytes) so the server can verify
 // this machine actually executed that run before accepting it.
 export async function pushRunLog(
-  vpsUrl: string,
+  url: string,
   token: string,
   machineId: string,
   runId: string,
   gzippedBytes: Buffer,
   timeoutMs = 30_000
 ): Promise<void> {
-  const res = await fetch(`${vpsUrl}/api/runs/${runId}/log`, {
+  const res = await fetch(`${url}/api/runs/${runId}/log`, {
     method: "POST",
     headers: {
       "content-type": "application/octet-stream",
@@ -243,11 +243,11 @@ export async function pushRunLog(
 // called before this worker holds any credential at all. ---
 
 export async function startDeviceEnrolment(
-  vpsUrl: string,
+  url: string,
   info: { machine_id: string; hostname: string; platform: string; arch: string; hardware: HardwareInfo },
   timeoutMs = 10_000
 ): Promise<DeviceStartResponse> {
-  const res = await fetch(`${vpsUrl}/api/device/start`, {
+  const res = await fetch(`${url}/api/device/start`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(info),
@@ -268,8 +268,8 @@ export type DeviceTokenPoll =
 // outcome here (not thrown as an error) since "still waiting on a human" is
 // what most polls return; only a genuinely unreachable server or unexpected
 // response shape throws.
-export async function pollDeviceToken(vpsUrl: string, deviceCode: string, timeoutMs = 10_000): Promise<DeviceTokenPoll> {
-  const res = await fetch(`${vpsUrl}/api/device/token`, {
+export async function pollDeviceToken(url: string, deviceCode: string, timeoutMs = 10_000): Promise<DeviceTokenPoll> {
+  const res = await fetch(`${url}/api/device/token`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ device_code: deviceCode }),
@@ -295,11 +295,11 @@ export async function pollDeviceToken(vpsUrl: string, deviceCode: string, timeou
 // place. Authenticated with the REFRESH token, a different token space than
 // the session token every other vps-client.ts function sends.
 export async function refreshWorkerSession(
-  vpsUrl: string,
+  url: string,
   refreshToken: string,
   timeoutMs = 10_000
 ): Promise<RefreshResponse> {
-  const res = await fetch(`${vpsUrl}/api/auth/refresh`, {
+  const res = await fetch(`${url}/api/auth/refresh`, {
     method: "POST",
     headers: authHeader(refreshToken),
     signal: AbortSignal.timeout(timeoutMs),

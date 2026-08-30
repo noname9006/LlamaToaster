@@ -9,17 +9,17 @@
 # Usage (from anywhere). Safe to run every time, first setup or a plain
 # restart -- if config.json already exists, setup (and the --dir prompt) is
 # skipped entirely and this just starts the worker:
-#   ./worker/setup-worker.sh --vps-url https://llamatoaster.com
+#   ./worker/setup-worker.sh --url https://llamatoaster.com
 #
 # On first run (no config.json yet), omitting --dir shows `df -h` (models
 # are often tens of GB each) and asks for a base folder and a name. Pass
 # --dir to skip that prompt, e.g. for unattended/scripted use:
-#   ./worker/setup-worker.sh --vps-url https://llamatoaster.com --dir ~/LlamaToaster
+#   ./worker/setup-worker.sh --url https://llamatoaster.com --dir ~/LlamaToaster
 #
 # No IP or port to configure at all -- the worker has no inbound listener
 # (it long-polls the server, MULTIUSER_PLAN.md §1). The FIRST time it runs
 # with no session configured yet, it prints a short code and a URL
-# (https://<vps-url>/device) to approve it from your account -- do that once,
+# (https://<url>/device) to approve it from your account -- do that once,
 # in a browser, and it's connected. The saved session survives ordinary
 # restarts and never asks again on its own -- if it needs to reconnect (its
 # session was revoked from Settings, or its refresh token expired), pass
@@ -49,7 +49,7 @@
 #                             will treat this as a brand-new machine with no
 #                             history. Use --reconnect instead unless that's
 #                             actually what you want.
-#   --allow-insecure-url       allow a plain http:// --vps-url other than
+#   --allow-insecure-url       allow a plain http:// --url other than
 #                             localhost/127.0.0.1 (see below). Only for a
 #                             deployment you've secured another way -- e.g.
 #                             this app's own tailnet-only mode, where
@@ -69,7 +69,7 @@ set -euo pipefail
 DIR=""
 WORKER_NAME="Local"
 BACKEND=""
-VPS_URL=""
+URL=""
 FORCE=0
 RECONNECT=0
 ALLOW_INSECURE_URL=0
@@ -79,7 +79,7 @@ while [ $# -gt 0 ]; do
     --dir) DIR="$2"; shift 2 ;;
     --worker-name) WORKER_NAME="$2"; shift 2 ;;
     --backend) BACKEND="$2"; shift 2 ;;
-    --vps-url) VPS_URL="$2"; shift 2 ;;
+    --url) URL="$2"; shift 2 ;;
     --force) FORCE=1; shift ;;
     --reconnect) RECONNECT=1; shift ;;
     --allow-insecure-url) ALLOW_INSECURE_URL=1; shift ;;
@@ -166,8 +166,8 @@ if [ -f "$CONFIG_PATH" ] && [ "$FORCE" -ne 1 ] && [ "$RECONNECT" -ne 1 ]; then
 elif [ "$RECONNECT" -eq 1 ]; then
   SKIPPED_SETUP=1
 else
-  if [ -z "$VPS_URL" ]; then
-    echo "--vps-url is required on first setup, e.g. --vps-url https://llamatoaster.com" >&2
+  if [ -z "$URL" ]; then
+    echo "--url is required on first setup, e.g. --url https://llamatoaster.com" >&2
     exit 1
   fi
   # This ends up in config.json and gets a real 90-day bearer token sent to
@@ -178,18 +178,18 @@ else
   # dev/testing against a server that isn't fronted by TLS yet. Anything else
   # over http:// needs --allow-insecure-url (e.g. this app's own tailnet-only
   # mode, where Tailscale's own tunnel is the encryption, not TLS).
-  case "$VPS_URL" in
+  case "$URL" in
     https://*) ;;
     http://localhost*|http://127.0.0.1*|http://\[::1\]*) ;;
     http://*)
       if [ "$ALLOW_INSECURE_URL" -ne 1 ]; then
-        echo "--vps-url is http:// ($VPS_URL) -- that sends a real bearer credential in the clear." >&2
+        echo "--url is http:// ($URL) -- that sends a real bearer credential in the clear." >&2
         echo "Use https://, or pass --allow-insecure-url if this connection is secured another way (e.g. a Tailscale-only deployment)." >&2
         exit 1
       fi
       ;;
     *)
-      echo "--vps-url must start with https:// or http://, got: $VPS_URL" >&2
+      echo "--url must start with https:// or http://, got: $URL" >&2
       exit 1
       ;;
   esac
@@ -213,7 +213,7 @@ $( [ -n "$BACKEND" ] && printf '  "backend": "%s",\n' "$BACKEND" )
   "llama_cpp_build": "none",
   "llama_bench_path": "$LLAMA_DIR/llama-bench",
   "model_dir": "$MODELS_DIR",
-  "vps_url": "$VPS_URL",
+  "url": "$URL",
   "raw_json_dir": "$RAW_DIR",
   "llama_cpp_builds_dir": "$LLAMA_DIR"
 }

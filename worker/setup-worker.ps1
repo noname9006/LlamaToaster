@@ -8,17 +8,17 @@
 # Usage (from anywhere). Safe to run every time, first setup or a plain
 # restart -- if config.json already exists, setup (and the -Dir prompt) is
 # skipped entirely and this just starts the worker:
-#   .\worker\setup-worker.ps1 -VpsUrl https://llamatoaster.com
+#   .\worker\setup-worker.ps1 -Url https://llamatoaster.com
 #
 # On first run (no config.json yet), omitting -Dir asks which drive to use
 # (with free-space info -- models are often tens of GB each) and a folder
 # name. Pass -Dir to skip that prompt, e.g. for unattended/scripted use:
-#   .\worker\setup-worker.ps1 -VpsUrl https://llamatoaster.com -Dir F:\LlamaToaster
+#   .\worker\setup-worker.ps1 -Url https://llamatoaster.com -Dir F:\LlamaToaster
 #
 # No IP or port to configure at all -- the worker has no inbound listener
 # (it long-polls the server, MULTIUSER_PLAN.md §1). The FIRST time it runs
 # with no session configured yet, it prints a short code and a URL
-# (https://<vps-url>/device) to approve it from your account -- do that once,
+# (https://<url>/device) to approve it from your account -- do that once,
 # in a browser, and it's connected. The saved session survives ordinary
 # restarts and never asks again on its own -- if it needs to reconnect (its
 # session was revoked from Settings, or its refresh token expired), pass
@@ -56,7 +56,7 @@
 #                        treat this as a brand-new machine with no history.
 #                        Use -Reconnect instead unless that's actually what
 #                        you want.
-#   -AllowInsecureUrl     allow a plain http:// -VpsUrl other than
+#   -AllowInsecureUrl     allow a plain http:// -Url other than
 #                        localhost/127.0.0.1 (see below). Only for a
 #                        deployment you've secured another way -- e.g. this
 #                        app's own tailnet-only mode, where Tailscale's own
@@ -74,7 +74,7 @@ param(
     [string]$Dir,
     [string]$WorkerName = "Local",
     [string]$Backend,
-    [string]$VpsUrl,
+    [string]$Url,
     [switch]$Reconnect,
     [switch]$Force,
     [switch]$AllowInsecureUrl,
@@ -219,8 +219,8 @@ if ($Reconnect) {
     Write-Host "worker\config.json already exists -- skipping setup, starting the worker with it as-is." -ForegroundColor Yellow
     Write-Host "(Re-run with -Force to redo setup from scratch, or -Reconnect to just re-approve this machine.)" -ForegroundColor Yellow
 } else {
-    if (-not $VpsUrl) {
-        Write-Error "-VpsUrl is required on first setup, e.g. -VpsUrl https://llamatoaster.com"
+    if (-not $Url) {
+        Write-Error "-Url is required on first setup, e.g. -Url https://llamatoaster.com"
         exit 1
     }
     # This ends up in config.json and gets a real 90-day bearer token sent to
@@ -232,15 +232,15 @@ if ($Reconnect) {
     # else over http:// needs -AllowInsecureUrl (e.g. this app's own
     # tailnet-only mode, where Tailscale's own tunnel is the encryption, not
     # TLS).
-    $isLocalHttp = $VpsUrl -match '^http://(localhost|127\.0\.0\.1|\[::1\])'
-    if (-not $VpsUrl.StartsWith("https://") -and -not $isLocalHttp) {
-        if ($VpsUrl.StartsWith("http://") -and $AllowInsecureUrl) {
+    $isLocalHttp = $Url -match '^http://(localhost|127\.0\.0\.1|\[::1\])'
+    if (-not $Url.StartsWith("https://") -and -not $isLocalHttp) {
+        if ($Url.StartsWith("http://") -and $AllowInsecureUrl) {
             # explicitly accepted
-        } elseif ($VpsUrl.StartsWith("http://")) {
-            Write-Error "-VpsUrl is http:// ($VpsUrl) -- that sends a real bearer credential in the clear. Use https://, or pass -AllowInsecureUrl if this connection is secured another way (e.g. a Tailscale-only deployment)."
+        } elseif ($Url.StartsWith("http://")) {
+            Write-Error "-Url is http:// ($Url) -- that sends a real bearer credential in the clear. Use https://, or pass -AllowInsecureUrl if this connection is secured another way (e.g. a Tailscale-only deployment)."
             exit 1
         } else {
-            Write-Error "-VpsUrl must start with https:// or http://, got: $VpsUrl"
+            Write-Error "-Url must start with https:// or http://, got: $Url"
             exit 1
         }
     }
@@ -267,7 +267,7 @@ if ($Reconnect) {
         llama_cpp_build      = "none"
         llama_bench_path     = (Join-Path $LlamaCppDir "llama-bench.exe")
         model_dir            = $ModelsDir
-        vps_url              = $VpsUrl
+        url                  = $Url
         raw_json_dir         = $RawJsonDir
         llama_cpp_builds_dir = $LlamaCppDir
     }

@@ -149,7 +149,7 @@ interface WorkerConfig {
   llama_cpp_build: string;
   llama_bench_path: string;
   model_dir: string;
-  vps_url: string;
+  url: string;
   // Stable id this worker persists locally, generated once on first boot and
   // reused across restarts -- this, not worker_name, is what identifies this
   // machine to the server (MULTIUSER_PLAN.md §1.2). Self-announced: the
@@ -210,7 +210,15 @@ interface WorkerConfig {
 
 function loadConfig(): WorkerConfig {
   const raw = readFileSync(configPath, "utf8");
-  return JSON.parse(raw) as WorkerConfig;
+  const parsed = JSON.parse(raw) as WorkerConfig & { vps_url?: string };
+  // Back-compat for a config.json written before the vps_url -> url rename --
+  // persistConfig below re-serializes under the new key on next write, so
+  // this only ever matters for the very first load after upgrading.
+  if (parsed.url === undefined && parsed.vps_url !== undefined) {
+    parsed.url = parsed.vps_url;
+  }
+  delete parsed.vps_url;
+  return parsed;
 }
 
 const config = loadConfig();
@@ -910,7 +918,7 @@ async function safeItemTerminal(
 ): Promise<void> {
   for (let attempt = 0; ; attempt++) {
     try {
-      await withAuth((token) => postRunItemUpdate(config.vps_url, token, runId, idx, payload, 10_000));
+      await withAuth((token) => postRunItemUpdate(config.url, token, runId, idx, payload, 10_000));
       log.info(`item update ok for run ${runId} item ${idx} (status=${payload.status}, attempt ${attempt + 1})`);
       return;
     } catch (err) {
@@ -934,7 +942,7 @@ async function safeItemTerminal(
 // terminal update above catches the server up), so this deliberately doesn't
 // retry or block the caller on the network round trip.
 function sendTick(runId: string, idx: number, tick: RunItemTickInput): void {
-  withAuth((token) => postRunItemUpdate(config.vps_url, token, runId, idx, tick, 3000)).catch((err) => {
+  withAuth((token) => postRunItemUpdate(config.url, token, runId, idx, tick, 3000)).catch((err) => {
     log.debug(
       `tick failed for run ${runId} item ${idx} (non-fatal): ${err instanceof Error ? err.message : String(err)}`
     );
@@ -952,7 +960,7 @@ async function safeReportDownloadResult(payload: ModelDownloadCallbackInput): Pr
   const key = `${payload.hf_repo}/${payload.hf_file}`;
   for (let attempt = 0; ; attempt++) {
     try {
-      await withAuth((token) => postModelDownloadResult(config.vps_url, token, payload, 10_000));
+      await withAuth((token) => postModelDownloadResult(config.url, token, payload, 10_000));
       log.info(`download callback ok for ${key} (ok=${payload.ok}, attempt ${attempt + 1})`);
       return true;
     } catch (err) {
@@ -986,7 +994,7 @@ interface RunSweepItemInput {
   // buildArgs unchanged.
   mainGpu?: number;
   timeoutMs: number | undefined;
-  vpsUrl: string;
+  url: string;
   rawJsonDir: string;
   // 0 on the first run of this item; >=1 on a policy-driven retry (see
   // SweepItemOutcome.retryForVramFallback). Suffixes the raw JSON dump
@@ -2164,7 +2172,7 @@ async function pushRunLogIfPresent(runId: string): Promise<void> {
   try {
     const text = readFileSync(path, "utf8");
     const gzipped = gzipSync(Buffer.from(text, "utf8"));
-    await withAuth((token) => pushRunLog(config.vps_url, token, config.machine_id!, runId, gzipped));
+    await withAuth((token) => pushRunLog(config.url, token, config.machine_id!, runId, gzipped));
     log.info(`run ${runId}: log pushed (${gzipped.length}B gzipped)`);
   } catch (err) {
     log.warn(`run ${runId}: failed to push log (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
@@ -2554,7 +2562,7 @@ async function executeBenchmarkJob(payload: BenchmarkJob): Promise<void> {
           backend: effectiveBackend,
           mainGpu: payload.main_gpu,
           timeoutMs: config.bench_timeout_ms,
-          vpsUrl: config.vps_url,
+          url: config.url,
           rawJsonDir: rawDir,
           modelSizeBytes: payload.model.size_bytes,
           tensorBreakdown: payload.model.metadata.tensor_layer_bytes ?? null,
@@ -2757,7 +2765,7 @@ async function executeDownloadModelJob(
     } else {
       // Fallback: check HF index existence (covers mirrored/cached expected unavailable)
       try {
-        const hashes = await lookupHashes(config.vps_url, authToken, [sha256]);
+        const hashes = await lookupHashes(config.url, authToken, [sha256]);
         const match = hashes.get(sha256);
         if (match) {
           verificationState = "verified";
@@ -3143,7 +3151,7 @@ async function executeRunProbeJob(payload: RunProbeJobPayload): Promise<void> {
             attempts[attempts.length - 1]?.error ??
             "no candidate context loaded and generated above the usable floor",
         };
-    await withAuth((token) => postProbeResult(config.vps_url, token, payload.run_id, report));
+    await withAuth((token) => postProbeResult(config.url, token, payload.run_id, report));
     log.info(
       `${label}: ${report.status}` +
         (report.verified_ctx_tokens != null ? ` up to ${report.verified_ctx_tokens} tokens` : "") +
@@ -3342,7 +3350,7 @@ async function executeMeasureQualityJob(payload: MeasureQualityJobPayload): Prom
       cache_type_v: payload.kvPair[1],
       method_version: METHOD_VERSION,
     };
-    await withAuth((token) => postQualityResult(config.vps_url, token, payload.run_id, report));
+    await withAuth((token) => postQualityResult(config.url, token, payload.run_id, report));
     log.info(`${label}: ppl=${ppl.toFixed(4)} against ${payload.datasetHash}`);
   } finally {
     setRunLogFile(null);
@@ -3375,7 +3383,7 @@ function resolveQualityDatasetPath(datasetHash: string): string | null {
 
 function runPerplexity(path: string, args: string[]): Promise<string> {
   return new Promise((resolvePromise, rejectPromise) => {
-    const proc = spawn(path, args, { stdio: ["ignore", "pipe", "pipe"] });
+    const proc = spawn(path, args, { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
     activeBenchProc = proc;
     let output = "";
     proc.stdout?.on("data", (chunk: Buffer) => {
@@ -3429,7 +3437,7 @@ async function executeRefreshModelsJob(): Promise<void> {
   await runStartupReconciliation(
     config.model_dir,
     localModelCache,
-    config.vps_url,
+    config.url,
     authToken,
     config.raw_json_dir
   );
@@ -3500,7 +3508,7 @@ let sessionAuth = false;
 // can do before it has a credential.
 async function enrolDevice(): Promise<void> {
   log.info(`[worker ${config.worker_name}] no credential configured -- starting device enrolment`);
-  const start = await startDeviceEnrolment(config.vps_url, {
+  const start = await startDeviceEnrolment(config.url, {
     machine_id: config.machine_id!,
     hostname: osHostname(),
     platform: detectedHardware.platform,
@@ -3508,7 +3516,7 @@ async function enrolDevice(): Promise<void> {
     hardware: detectedHardware,
   });
   log.info(
-    `[worker ${config.worker_name}] to connect this machine, open the LlamaToaster site -> Workers page -> "Add a machine" (${config.vps_url}${start.verification_uri})`
+    `[worker ${config.worker_name}] to connect this machine, open the LlamaToaster site -> Workers page -> "Add a machine" (${config.url}${start.verification_uri})`
   );
   // A one-time credential buried in a stream of INFO lines is easy to miss
   // -- boxed banner so it's unmissable in both the console and the daily log
@@ -3527,7 +3535,7 @@ async function enrolDevice(): Promise<void> {
     "",
     `            ${paint(color, `${ansi.bold}\x1b[92m`, start.user_code)}`,
     "",
-    paint(color, ansi.dim, `  (opens at: ${config.vps_url}${start.verification_uri})`),
+    paint(color, ansi.dim, `  (opens at: ${config.url}${start.verification_uri})`),
     paint(color, ansi.dim, `  (expires in ${Math.round(start.expires_in / 60)} minutes)`),
     paint(color, `${ansi.cyan}${ansi.bold}`, border),
   ].join("\n");
@@ -3536,7 +3544,7 @@ async function enrolDevice(): Promise<void> {
   const deadline = Date.now() + start.expires_in * 1000;
   while (Date.now() < deadline) {
     await sleep(start.interval * 1000);
-    const poll = await pollDeviceToken(config.vps_url, start.device_code);
+    const poll = await pollDeviceToken(config.url, start.device_code);
     if (poll.state === "approved") {
       persistConfig({ session_token: poll.session_token, refresh_token: poll.refresh_token });
       authToken = poll.session_token;
@@ -3598,7 +3606,7 @@ async function refreshAuth(): Promise<void> {
   if (!sessionAuth || !refreshToken) throw new Error("session expired and no refresh token is available");
   if (refreshInFlight) return refreshInFlight;
   refreshInFlight = (async () => {
-    const rotated = await refreshWorkerSession(config.vps_url, refreshToken!);
+    const rotated = await refreshWorkerSession(config.url, refreshToken!);
     persistConfig({ session_token: rotated.session_token, refresh_token: rotated.refresh_token });
     authToken = rotated.session_token;
     refreshToken = rotated.refresh_token;
@@ -3659,7 +3667,7 @@ async function heartbeatTick(): Promise<void> {
   try {
     const state = await collectState();
     const res = await withAuth((token) =>
-      postHeartbeat(config.vps_url, token, state, currentJobReport, Array.from(activeDownloadReports.values()), 10_000)
+      postHeartbeat(config.url, token, state, currentJobReport, Array.from(activeDownloadReports.values()), 10_000)
     );
     // discard_job_ids is a subset of cancel_job_ids -- mark discards FIRST
     // so executeDownloadModelJob's abort handler (which may run
@@ -3755,14 +3763,14 @@ async function runDownloadJob(job: { job_id: string; payload: DownloadModelJobPa
   log.info(`claimed job ${job.job_id} (download_model)`);
   try {
     await executeDownloadModelJob(job.job_id, job.payload, controller.signal);
-    await withAuth((token) => reportJobResult(config.vps_url, token, config.machine_id!, job.job_id, { ok: true }));
+    await withAuth((token) => reportJobResult(config.url, token, config.machine_id!, job.job_id, { ok: true }));
     log.info(`job ${job.job_id} (download_model) completed`);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     log.error(`job ${job.job_id} (download_model) failed: ${message}`);
     try {
       await withAuth((token) =>
-        reportJobResult(config.vps_url, token, config.machine_id!, job.job_id, { ok: false, error: message })
+        reportJobResult(config.url, token, config.machine_id!, job.job_id, { ok: false, error: message })
       );
     } catch (reportErr) {
       log.error(
@@ -3803,7 +3811,7 @@ async function workerMain(): Promise<void> {
       }
 
       const state = await collectState();
-      const job = await withAuth((token) => pollQueue(config.vps_url, token, state, QUEUE_POLL_TIMEOUT_MS));
+      const job = await withAuth((token) => pollQueue(config.url, token, state, QUEUE_POLL_TIMEOUT_MS));
       if (!job) continue;
 
       if (job.type === "download_model") {
@@ -3824,14 +3832,14 @@ async function workerMain(): Promise<void> {
       kickHeartbeatSoon();
       try {
         await executeJob(job);
-        await withAuth((token) => reportJobResult(config.vps_url, token, config.machine_id!, job.job_id, { ok: true }));
+        await withAuth((token) => reportJobResult(config.url, token, config.machine_id!, job.job_id, { ok: true }));
         log.info(`job ${job.job_id} (${job.type}) completed`);
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         log.error(`job ${job.job_id} (${job.type}) failed: ${message}`);
         try {
           await withAuth((token) =>
-            reportJobResult(config.vps_url, token, config.machine_id!, job.job_id, {
+            reportJobResult(config.url, token, config.machine_id!, job.job_id, {
               ok: false,
               error: message,
             })
@@ -3901,7 +3909,7 @@ await ensureAuthCredential();
 void runStartupReconciliation(
   config.model_dir,
   localModelCache,
-  config.vps_url,
+  config.url,
   authToken,
   config.raw_json_dir
 ).catch((err) => {
