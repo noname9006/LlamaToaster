@@ -1752,11 +1752,12 @@ export const repo = {
   // per-item error text and finalizeRun's cancelReason, so the run-level
   // message stays honest about this being an unconfirmed/lost run, not a
   // genuine user stop (see finalizeRun's own doc comment).
-  // Called from system contexts with no user in scope (the reaper, a
-  // worker's own job-completion report) as well as the browser-facing
-  // /stop route -- see this section's own header comment above listRuns for
-  // why userId undefined means "no ownership check" rather than "match
-  // nothing."
+  // Called from system contexts with no user in scope (the reaper, and the
+  // browser-facing /stop route) for a run this server genuinely lost track
+  // of or the user asked to stop -- NOT for a worker's own job-completion
+  // failure report, which has a real reported reason and belongs on
+  // reportJobFailure below instead (see that function's own doc comment for
+  // why conflating the two mislabels a genuine error as "cancelled").
   reconcileStaleRun(userId: string | undefined, runId: string, note: string): Run | undefined {
     if (!this.getRun(userId, runId)) return undefined;
     const database = getDb();
@@ -1769,6 +1770,37 @@ export const repo = {
         )
         .run(note, now, runId);
       this.finalizeRun(runId, now, note);
+    });
+    tx();
+    return this.getRun(userId, runId);
+  },
+
+  // A worker's own job-completion report of `ok: false` -- unlike
+  // reconcileStaleRun above, this is a CONFIRMED failure with a real reason
+  // the worker gave us (e.g. the terminal-result POST itself came back 500,
+  // or install_build genuinely failed), not a case of the server losing
+  // track of a run. Marks unfinished items 'failed' (never 'cancelled' --
+  // "cancelled" reads as "stopped by user, or lost with nothing completed"
+  // everywhere else in this app, per Runs.tsx's own column description,
+  // which is actively misleading for a run that failed with a real,
+  // reported error) so finalizeRun's ordinary done/failed accounting lands
+  // on "failed" (nothing completed) or "partial" (something did) instead.
+  // finalizeRun's own error message is then a generic "N of M tests failed"
+  // summary; overwritten here with the worker's actual reported text so the
+  // run-level line stays specific instead of vague.
+  reportJobFailure(userId: string | undefined, runId: string, note: string): Run | undefined {
+    if (!this.getRun(userId, runId)) return undefined;
+    const database = getDb();
+    const now = Date.now();
+    const tx = database.transaction(() => {
+      database
+        .prepare(
+          `UPDATE run_items SET status = 'failed', error = ?, completed_at = ?
+           WHERE run_id = ? AND status NOT IN ('done','failed','failed_oom','cancelled','skipped')`
+        )
+        .run(note, now, runId);
+      this.finalizeRun(runId, now);
+      database.prepare(`UPDATE runs SET error = ? WHERE id = ?`).run(note, runId);
     });
     tx();
     return this.getRun(userId, runId);
@@ -2271,12 +2303,18 @@ export const repo = {
         // right after a claim.
         database.prepare(`UPDATE workers SET active_job_id = ? WHERE id = ?`).run(job.id, workerId);
 
-        // Only a 'benchmark' job claim means the run itself started executing
-        // -- an 'install_build' job can share the same run_id (so the reaper
-        // can reconcile the run if the install permanently fails, see
+        // A 'benchmark', 'run_probe' or 'measure_quality' claim means the run
+        // itself started executing -- those are the three job types that
+        // actually carry out a run's own work (N2/N4 ride their own job type
+        // instead of 'benchmark', see routes/runs.ts's trigger route). An
+        // 'install_build' job can share the same run_id (so the reaper can
+        // reconcile the run if the install permanently fails, see
         // markJobFailed below) but claiming it must NOT flip the run to
-        // 'running' early.
-        if (job.run_id && job.job_type === "benchmark") {
+        // 'running' early. Without run_probe/measure_quality here, a probe or
+        // quality run sat at 'scheduled' for its ENTIRE execution (the Runs
+        // page mislabeled it, RunDetail hid its elapsed-time/Stop controls)
+        // and only ever moved once its terminal result landed.
+        if (job.run_id && (job.job_type === "benchmark" || job.job_type === "run_probe" || job.job_type === "measure_quality")) {
           database
             .prepare(
               `UPDATE runs SET status = 'running', started_at = ?
