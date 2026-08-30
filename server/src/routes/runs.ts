@@ -43,6 +43,12 @@ import {
   CHAIN_WALL_CLOCK_MS,
 } from "../../../shared/types.js";
 import { CACHE_TYPE_VALUES, isKnownCacheType } from "../../../shared/engineSpec.js";
+import {
+  isProbeGranularity,
+  isProbeMode,
+  PROBE_GRANULARITIES,
+  PROBE_MODES,
+} from "../../../shared/probeLadder.js";
 import type { GoalsConfig } from "../../../shared/goals.js";
 import { normalizeGoals } from "../../../shared/goals.js";
 import { getReleases, filterReleasesForWorker, assetMatchesWorker, buildInstallPayload } from "../github-releases.js";
@@ -875,6 +881,18 @@ export async function runsRoutes(app: FastifyInstance): Promise<void> {
             return reply.code(400).send({ error: `probe.kv_pair contains "${String(t)}" -- allowed: ${CACHE_TYPE_VALUES.join(", ")}` });
           }
         }
+        // Both optional (absent = the pre-modes single-axis search), but a
+        // value that IS supplied has to be one this app knows -- an unknown
+        // mode silently falling back to a different search would make the
+        // stored spec a lie about what the probe did.
+        if (p.mode !== undefined && !isProbeMode(p.mode)) {
+          return reply.code(400).send({ error: `probe.mode must be one of ${PROBE_MODES.join(", ")}` });
+        }
+        if (p.granularity !== undefined && !isProbeGranularity(p.granularity)) {
+          return reply
+            .code(400)
+            .send({ error: `probe.granularity must be one of ${PROBE_GRANULARITIES.join(", ")}` });
+        }
       }
       // N4 -- ctx_tokens bounds mirror the probe-context table (same MIN/
       // MAX_PROBE_CTX the ingestion route validates against); dataset_hash
@@ -1131,6 +1149,8 @@ export async function runsRoutes(app: FastifyInstance): Promise<void> {
           main_gpu: body.main_gpu,
           trained_ctx: typeof model.metadata.trained_ctx === "number" ? model.metadata.trained_ctx : null,
           gpu_total_mib: worker.vram?.ok ? worker.vram.gpu_memory_total_mib : null,
+          mode: body.probe.mode,
+          granularity: body.probe.granularity,
         };
         repo.queueRepo.enqueueJob(worker.id, { type: "run_probe", payload: probePayload, runId: run.id });
       } else if (body.kind === "quality" && body.quality) {

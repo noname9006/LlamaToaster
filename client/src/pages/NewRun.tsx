@@ -934,6 +934,10 @@ export function NewRun() {
           }}
           trainedCtx={typeof selectedModel?.metadata.trained_ctx === "number" ? selectedModel.metadata.trained_ctx : null}
           unset={goalsUnset}
+          // Hand-built grids live here, so this slider subdivides between the
+          // shared stops -- and the exact-number entry stays, unlike on the
+          // Benchmark console.
+          ctxGranularity="fine"
           affordability={{
             totalMib: liveVram?.gpu_memory_total_mib ?? null,
             weightsMib:

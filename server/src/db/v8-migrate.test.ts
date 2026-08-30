@@ -152,7 +152,7 @@ describe("v8 schema evolution (§0.11)", () => {
     const { getDb } = await freshMigrateModule(dbPath);
     const db = getDb();
 
-    for (const table of ["model_machine_limits", "quality_results"]) {
+    for (const table of ["model_machine_limits", "quality_results", "probe_attempts"]) {
       const exists = db
         .prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?`)
         .get(table);
@@ -167,6 +167,22 @@ describe("v8 schema evolution (§0.11)", () => {
     // N2's re-probe key and N4's retry key.
     expect(indexesOf(db, "model_machine_limits").length).toBeGreaterThan(0);
     expect(indexesOf(db, "quality_results").length).toBeGreaterThan(0);
+    // N2's ladder rows: one row per load, ordered by seq within a run.
+    expect(indexesOf(db, "probe_attempts").length).toBeGreaterThan(0);
+    expect(columnsOf(db, "probe_attempts")).toEqual(
+      expect.arrayContaining([
+        "run_id",
+        "seq",
+        "candidate_ctx",
+        "ngl",
+        "vram_needed_mib",
+        "vram_free_mib",
+        "vram_peak_mib",
+        "ram_needed_mib",
+        "ram_free_mib",
+        "ram_peak_mib",
+      ])
+    );
     expect(() => {
       db.prepare(
         `INSERT INTO model_machine_limits (id, worker_id, model_id, llama_cpp_build, kv_type, placement_hash, verified_ctx_tokens, created_at)

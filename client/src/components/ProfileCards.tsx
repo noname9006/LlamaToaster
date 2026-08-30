@@ -100,6 +100,23 @@ export function ProfileCards({ runId, refreshKey, modelId, workerId }: ProfileCa
   const [override, setOverride] = useState<Partial<GoalsConfig> | null>(null);
   const [changing, setChanging] = useState(false);
   const [probeMsg, setProbeMsg] = useState("");
+  const [deletingLimitId, setDeletingLimitId] = useState<string | null>(null);
+
+  // Drops the stale ceiling locally the moment the delete succeeds, rather
+  // than waiting on a re-fetch -- the card's "Verify with a probe" button is
+  // gated on data.verified_limits, so this alone is what unhides it.
+  async function deleteVerifiedLimit(id: string): Promise<void> {
+    setDeletingLimitId(id);
+    try {
+      await api.deleteVerifiedLimit(id);
+      setData((prev) => (prev ? { ...prev, verified_limits: prev.verified_limits.filter((l) => l.id !== id) } : prev));
+      setProbeMsg("");
+    } catch (err) {
+      setProbeMsg(err instanceof Error ? err.message : String(err));
+    } finally {
+      setDeletingLimitId(null);
+    }
+  }
 
   // N2 -- estimate → VERIFY. The probe rides the ordinary trigger route, so
   // every §0.5 guard applies unchanged; the engine is pinned to llama-server
@@ -305,6 +322,8 @@ export function ProfileCards({ runId, refreshKey, modelId, workerId }: ProfileCa
               qualityResults={data.quality_results}
               onVerify={modelId && workerId ? verifyWithProbe : undefined}
               onMeasureQuality={modelId && workerId ? measureQuality : undefined}
+              onDeleteVerified={deleteVerifiedLimit}
+              deletingLimitId={deletingLimitId}
             />
           ))}
           {scoring.hidden.length > 0 && (
@@ -356,6 +375,8 @@ function Card({
   qualityResults,
   onVerify,
   onMeasureQuality,
+  onDeleteVerified,
+  deletingLimitId,
 }: {
   card: ProfileCard;
   goals: GoalsConfig;
@@ -363,6 +384,8 @@ function Card({
   qualityResults: QualityRowDto[];
   onVerify?: (config: ScoredConfig) => void;
   onMeasureQuality?: (config: ScoredConfig) => void;
+  onDeleteVerified: (id: string) => void;
+  deletingLimitId: string | null;
 }) {
   const verified = verifiedFor(card.config, limits);
   const quality = qualityFor(card.config, qualityResults);
@@ -431,7 +454,15 @@ function Card({
           machine at {verified.kv_type}
           {verified.margin_observed_frac != null &&
             ` · margin ${(verified.margin_observed_frac * 100).toFixed(0)} %`}
-          . Verification is per machine + build + KV pair + placement — changing any of them needs a fresh probe.
+          . Verification is per machine + build + KV pair + placement — changing any of them needs a fresh probe.{" "}
+          <button
+            type="button"
+            onClick={() => onDeleteVerified(verified.id)}
+            disabled={deletingLimitId === verified.id}
+            className="font-semibold text-danger underline decoration-dotted hover:decoration-solid disabled:opacity-40"
+          >
+            {deletingLimitId === verified.id ? "Deleting…" : "Delete & test again"}
+          </button>
         </p>
       )}
 

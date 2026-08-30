@@ -422,53 +422,32 @@ export interface ProbeAttemptOutcome {
   oom: boolean;
   spill: boolean;
   vramPeakMib: number | null;
+  /** The probe's own RSS peak (MemorySampler.stop()'s ram_peak_mib) -- the
+   * real measured RAM usage, alongside vramPeakMib. */
+  ramPeakMib?: number | null;
   genTps: number | null;
   /** Fraction of the adapter total still free at this candidate. */
   headroomFrac?: number | null;
+  /** The placement this rung loaded at -- the ladder moves ngl too. */
+  ngl?: number | null;
+  /** computeDualPoolFit's prediction for this rung, and the real free pools. */
+  vramNeededMib?: number | null;
+  vramFreeMib?: number | null;
+  ramNeededMib?: number | null;
+  ramFreeMib?: number | null;
   error?: string;
 }
 
 /** Gen tok/s floor -- excludes swap-thrash "success". */
 export const PROBE_MIN_GEN_TPS = 1;
 export const PROBE_GEN_TOKENS = 256;
-/** Three loads max, ever. */
-export const PROBE_MAX_LOADS = 3;
-export const PROBE_RETRY_FACTOR = 0.75;
-export const PROBE_HEADROOM_FACTOR = 1.33;
-export const PROBE_HEADROOM_THRESHOLD = 0.25;
 
-export interface ProbeLadderStep {
-  candidateCtx: number;
-  reason: "candidate" | "retry_smaller" | "retry_larger";
-}
-
-// Step 1-3 of N2, as a pure decision function so the ladder is testable
-// without loading a model: candidate, one retry at x0.75 on failure, and one
-// optional probe at min(trained_ctx, x1.33) when the success had > 25 %
-// headroom. Never more than three loads.
-export function nextProbeStep(
-  history: ProbeAttemptOutcome[],
-  limits: { trainedCtx: number | null }
-): ProbeLadderStep | null {
-  if (history.length >= PROBE_MAX_LOADS) return null;
-  const last = history[history.length - 1];
-  if (!last) return null;
-  if (!last.ok) {
-    // Only ONE retry downward, and only straight after the first attempt.
-    if (history.length === 1) {
-      return { candidateCtx: Math.floor(last.candidateCtx * PROBE_RETRY_FACTOR), reason: "retry_smaller" };
-    }
-    return null;
-  }
-  // Success with room to spare: optionally probe once higher.
-  const headroom = last.headroomFrac ?? null;
-  if (headroom != null && headroom > PROBE_HEADROOM_THRESHOLD && history.length < PROBE_MAX_LOADS) {
-    const bigger = Math.floor(last.candidateCtx * PROBE_HEADROOM_FACTOR);
-    const capped = limits.trainedCtx != null ? Math.min(limits.trainedCtx, bigger) : bigger;
-    if (capped > last.candidateCtx) return { candidateCtx: capped, reason: "retry_larger" };
-  }
-  return null;
-}
+// The ladder that used to live here -- one context axis, x0.75 on failure and
+// x1.33 on a roomy success, three loads max -- has been replaced by
+// shared/probeLadder.ts, which searches placement as well as context and is
+// shared with the client so the two cannot disagree about what a legal
+// context is. Only the per-rung success rule below stayed behind, because it
+// is about one load's verdict rather than about the search.
 
 // A probe's own success rule, kept next to the ladder that consumes it:
 // no OOM, no spill (vram_peak within total), and gen tok/s above the floor.

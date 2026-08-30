@@ -25,6 +25,7 @@ import {
   type ComparisonResponse,
   type ImportResponse,
   type VerifiedLimitDto,
+  type ProbeAttemptDto,
 } from "../types";
 
 export class ApiError extends Error {
@@ -296,6 +297,15 @@ export const api = {
     const params = new URLSearchParams({ worker: workerId });
     return request(`/api/models/${encodeURIComponent(modelId)}/verified-limits?${params.toString()}`);
   },
+
+  // N2 -- every rung of a probe's ladder, not just the ceiling it verified.
+  getProbeAttempts: (runId: string): Promise<{ attempts: ProbeAttemptDto[] }> =>
+    request(`/api/runs/${encodeURIComponent(runId)}/probe-attempts`),
+
+  // N2 -- forgets one verified ceiling so its card offers "Verify with a
+  // probe" again instead of showing a possibly-stale "Verified" forever.
+  deleteVerifiedLimit: (id: string): Promise<{ ok: true }> =>
+    request(`/api/verified-limits/${encodeURIComponent(id)}`, { method: "DELETE" }),
 
   // N1 -- a curve is a deterministic grouping over results, computed on read.
   getCurve: (
