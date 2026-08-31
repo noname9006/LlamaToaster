@@ -242,7 +242,10 @@ async function readNvidiaSmiVram(): Promise<VramSample | null> {
     const { stdout } = await execFileAsync(
       "nvidia-smi",
       ["--query-gpu=memory.total,memory.used", "--format=csv,noheader,nounits"],
-      { timeout: EXEC_TIMEOUT_MS }
+      // windowsHide: keep this child off the worker's visible console -- same
+      // reasoning as binary-probe.ts's helpText (console children inherit the
+      // parent console when not hidden, letting them reconfigure it).
+      { timeout: EXEC_TIMEOUT_MS, windowsHide: true }
     );
     // One line per GPU -- only the first is read, matching this app's
     // existing single-GPU-per-worker assumption elsewhere.

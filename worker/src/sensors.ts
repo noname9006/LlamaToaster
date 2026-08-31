@@ -90,7 +90,10 @@ async function readNvidiaSmiSensors(): Promise<SensorSample | null> {
     const { stdout } = await execFileAsync(
       "nvidia-smi",
       ["--query-gpu=clocks.sm,temperature.gpu", "--format=csv,noheader,nounits"],
-      { timeout: EXEC_TIMEOUT_MS }
+      // windowsHide: keep this child off the worker's visible console -- same
+      // reasoning as binary-probe.ts's helpText (console children inherit the
+      // parent console when not hidden, letting them reconfigure it).
+      { timeout: EXEC_TIMEOUT_MS, windowsHide: true }
     );
     const line = stdout.split("\n").find((l) => l.trim().length > 0);
     if (!line) return null;
