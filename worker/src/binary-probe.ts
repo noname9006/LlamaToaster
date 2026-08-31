@@ -32,7 +32,17 @@ async function helpText(path: string): Promise<string> {
     // --help exits non-zero on some llama.cpp binaries; execFile rejects on a
     // non-zero code, but the rejection still carries the captured stdout.
     try {
-      const { stdout, stderr } = await execFileAsync(path, ["--help"], { timeout: PROBE_TIMEOUT_MS });
+      // windowsHide matters here even though stdio is fully piped: a console
+      // child spawned without it still *inherits* this process's console (piping
+      // only swaps the std handles, not the console attachment), so llama.cpp's
+      // own Windows console reconfiguration inside llama-common.dll
+      // (SetConsoleOutputCP(CP_UTF8) / SetConsoleMode(VT) -- confirmed present
+      // in every installed build's imports) would execute against the worker's
+      // visible PowerShell window. conhost reacts to that with automatic font
+      // substitution -- the user's console font silently changes and never
+      // reverts. windowsHide (CREATE_NO_WINDOW) gives the probe its own hidden
+      // console, keeping those calls off the real window.
+      const { stdout, stderr } = await execFileAsync(path, ["--help"], { timeout: PROBE_TIMEOUT_MS, windowsHide: true });
       return `${stdout}\n${stderr}`;
     } catch (err) {
       const e = err as { stdout?: string; stderr?: string };
@@ -96,7 +106,7 @@ export async function readCpuIsa(path: string): Promise<string | null> {
   if (cached) return cached;
   const pending = (async () => {
     try {
-      const { stdout, stderr } = await execFileAsync(path, ["--version"], { timeout: PROBE_TIMEOUT_MS });
+      const { stdout, stderr } = await execFileAsync(path, ["--version"], { timeout: PROBE_TIMEOUT_MS, windowsHide: true });
       const fromVersion = parseCpuIsaBanner(`${stdout}\n${stderr}`);
       if (fromVersion) return fromVersion;
     } catch (err) {
