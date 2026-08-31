@@ -36,7 +36,6 @@ import {
 import {
   bestLadderResult,
   nextLadderRung,
-  snapToSafeCtx,
   PROBE_LADDER_MIN_CTX,
   PROBE_MAX_LOADS,
   type LadderAttempt,
@@ -108,6 +107,7 @@ import {
   type LocalModelState,
   isVramDiscrepancyPolicy,
   type VramDiscrepancyPolicy,
+  isValidProbeMaxLoads,
   // BENCHMARKING_PLAN_V8.md: §0.1 methodology stamp, §0.10 caveat registry,
   // §0.7/N1/N2/N4 capability advertisement.
   type CaveatFlag,
@@ -1779,6 +1779,15 @@ function getNvidiaDriverInfo(): Promise<NvidiaDriverInfo | null> {
 // run within one ~10s interval, applying from the next item onward.
 let vramDiscrepancyPolicy: VramDiscrepancyPolicy = "warn";
 
+// Operator-set hard cap on real model loads per N2 probe run (shared/
+// types.ts's AppSettings.probeMaxLoads), refreshed from HeartbeatResponse.
+// app_settings on every beat exactly like vramDiscrepancyPolicy above.
+// Seeded from shared/probeLadder.ts's own PROBE_MAX_LOADS rather than a
+// second hardcoded default, so the two can never drift apart before the
+// first heartbeat lands -- the live value from the server takes over on the
+// very first successful beat either way.
+let probeMaxLoads: number = PROBE_MAX_LOADS;
+
 // Run-scoped memo for retry_once_then_fail: set once a retry REPRODUCES the
 // hard fallback signature, proving the cause is deterministic on this machine
 // right now -- later items in the same run then fail immediately instead of
@@ -3075,7 +3084,17 @@ async function executeRunProbeJob(payload: RunProbeJobPayload): Promise<void> {
       activationsHeadroomFrac: 0,
       trainedCtx: payload.trained_ctx ?? undefined,
     });
-    return affordable.tokens > 0 ? affordable.tokens : maxCtx;
+    if (affordable.tokens > 0) return affordable.tokens;
+    // A REAL zero (the estimator had the KV geometry and still says the
+    // weights leave no room) must not fall back to the trained ceiling: that
+    // inverts "nothing fits here" into "everything fits here", which seeds a
+    // context phase at the top of the ladder and, worse, makes that ngl look
+    // like the best possible choice to bestNglForMaxContext. The floor is the
+    // honest anchor -- the ladder walks up from it on its own if the estimate
+    // was too pessimistic. Only a "unknown" verdict (no per-token geometry to
+    // reason with at all) keeps the old caller's-ceiling fallback, matching
+    // the missing-metadata guard at the top of this function.
+    return affordable.confidence === "unknown" ? maxCtx : PROBE_LADDER_MIN_CTX;
   }
 
   const ladderInput = {
@@ -3087,10 +3106,15 @@ async function executeRunProbeJob(payload: RunProbeJobPayload): Promise<void> {
     maxCtx,
     calculateNgl,
     calculateCtx,
+    // Live admin-configurable cap (see the module-level probeMaxLoads doc
+    // comment above) rather than the ladder module's own PROBE_MAX_LOADS
+    // default -- an operator's override on the supervise dashboard must
+    // actually take effect here, not just be advertised.
+    maxLoads: probeMaxLoads,
   };
   log.info(
     `${label}: ${mode} / ${granularity} ladder -- context within [${PROBE_LADDER_MIN_CTX}, ${maxCtx}], ` +
-      `layers within [0, ${nglMax}], at most ${PROBE_MAX_LOADS} loads`
+      `layers within [0, ${nglMax}], at most ${probeMaxLoads} loads`
   );
 
   try {
@@ -3124,20 +3148,24 @@ async function executeRunProbeJob(payload: RunProbeJobPayload): Promise<void> {
     }
 
     const best = bestLadderResult(attempts.map(toLadderAttempt));
-    // What later benchmark runs consume is snapped DOWN to a slider stop: a
-    // `fine` ladder can verify a context between two stops, and that exact
-    // number stays visible in probe_attempts, but a ceiling the rest of the
-    // app cannot express is not a usable ceiling. Down, never up -- rounding
-    // one upward would claim a context that was never loaded.
-    const safeCtx = best ? snapToSafeCtx(best.ctx, maxCtx) : null;
+    // Reported EXACTLY as loaded, both axes. This used to snap the context
+    // down to a slider stop before storing it, on the theory that a ceiling
+    // the rest of the app cannot express is not a usable one -- but a `fine`
+    // ladder only ever refines BETWEEN two adjacent stops, so snapping down
+    // always landed back on the lower stop `basic` had already found. That
+    // made every extra `fine` load unable to change the stored number by
+    // construction. The snap now happens where a slider value is actually
+    // needed (the Benchmark page's Apply, via snapToSafeCtx) instead of
+    // where the measurement is recorded. The layer count goes with it: the
+    // ladder routinely resolves an ngl far from the one the probe was
+    // requested at, and a ceiling filed under the requested placement is a
+    // ceiling attributed to a placement that was never verified.
     const bestAttempt = best ? attempts.find((a) => a.candidateCtx === best.ctx && a.ngl === best.ngl) : undefined;
-    if (best && safeCtx !== best.ctx) {
-      log.info(`${label}: verified ${best.ctx} tokens, stored as ${safeCtx} -- the nearest value at or below it`);
-    }
-    const report: ProbeResultInput = safeCtx != null
+    const report: ProbeResultInput = best != null
       ? {
           status: "verified",
-          verified_ctx_tokens: safeCtx,
+          verified_ctx_tokens: best.ctx,
+          verified_ngl: best.ngl,
           margin_observed_frac: bestAttempt?.headroomFrac ?? null,
           method_version: METHOD_VERSION,
           attempts: attempts.map(toProbeAttemptReport),
@@ -3154,7 +3182,9 @@ async function executeRunProbeJob(payload: RunProbeJobPayload): Promise<void> {
     await withAuth((token) => postProbeResult(config.url, token, payload.run_id, report));
     log.info(
       `${label}: ${report.status}` +
-        (report.verified_ctx_tokens != null ? ` up to ${report.verified_ctx_tokens} tokens` : "") +
+        (report.verified_ctx_tokens != null
+          ? ` up to ${report.verified_ctx_tokens} tokens at ${report.verified_ngl} layers`
+          : "") +
         ` after ${attempts.length} load(s)`
     );
   } finally {
@@ -3698,6 +3728,17 @@ async function heartbeatTick(): Promise<void> {
         log.info(
           `vram_discrepancy_policy updated from heartbeat: ${next} (${policyMeaning[next]})`
         );
+      }
+    }
+    // Same propagation channel/shape as vramDiscrepancyPolicy just above --
+    // an unrecognized/absent value keeps whatever cap is current, so an
+    // older server or a bad row can never reset a running worker's ladder
+    // budget to something unexpected.
+    if (isValidProbeMaxLoads(res.app_settings?.probeMaxLoads)) {
+      const next = res.app_settings.probeMaxLoads;
+      if (next !== probeMaxLoads) {
+        probeMaxLoads = next;
+        log.info(`probe_max_loads updated from heartbeat: ${next} (at most ${next} real model loads per N2 probe run)`);
       }
     }
   } catch (err) {

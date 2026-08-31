@@ -289,10 +289,53 @@ const COLUMN_MIGRATIONS: ColumnSpec[] = [
   { table: "workers", column: "capabilities_json", ddlType: "TEXT" },
   { table: "workers", column: "sensors_json", ddlType: "TEXT" },
   { table: "workers", column: "cpu_isa", ddlType: "TEXT" },
+  // N2 probe ladder rework -- probe_attempts is a new table (schema.sql's own
+  // CREATE TABLE IF NOT EXISTS), but a table created on disk by an
+  // in-progress version of that work before its final column set landed is
+  // still "already exists" from CREATE TABLE's point of view, so it never
+  // picks up columns added afterward. Confirmed live (2026-08-30): a VPS
+  // whose probe_attempts predates ram_peak_mib threw "SqliteError: table
+  // probe_attempts has no column named ram_peak_mib" on every probe result,
+  // discarding real completed ladder runs. Same gap shape as raw_json_path
+  // above -- listing every non-key column here (not just the one confirmed
+  // missing) so any other install that stopped at a slightly different point
+  // self-heals too; ALTER is skipped wherever a column is already present.
+  { table: "probe_attempts", column: "ngl", ddlType: "INTEGER" },
+  { table: "probe_attempts", column: "vram_needed_mib", ddlType: "REAL" },
+  { table: "probe_attempts", column: "vram_free_mib", ddlType: "REAL" },
+  { table: "probe_attempts", column: "vram_peak_mib", ddlType: "REAL" },
+  { table: "probe_attempts", column: "ram_needed_mib", ddlType: "REAL" },
+  { table: "probe_attempts", column: "ram_free_mib", ddlType: "REAL" },
+  { table: "probe_attempts", column: "ram_peak_mib", ddlType: "REAL" },
+  { table: "probe_attempts", column: "gen_tps", ddlType: "REAL" },
+  { table: "probe_attempts", column: "error", ddlType: "TEXT" },
+  // The layer count the winning rung loaded at. The ladder searches ngl in
+  // most probe modes, so the ceiling's own placement is frequently not the
+  // one the probe was requested with -- without this the row records a
+  // context verified at a placement nothing ever proved. NULL on rows written
+  // before this migration, which correctly reads as "this probe never
+  // reported one" rather than a fabricated layer count.
+  { table: "model_machine_limits", column: "verified_ngl", ddlType: "INTEGER" },
 ];
 
 function applyColumnMigrations(database: Database.Database): void {
   for (const { table, column, ddlType } of COLUMN_MIGRATIONS) {
+    // Every column here predates this function running: normally that's
+    // guaranteed because migrate() only calls this after schema.sql's CREATE
+    // TABLE statements have all executed. But the one exception is the
+    // self-heal retry above -- it calls this BEFORE schema.sql's retry pass,
+    // to backfill whatever column made the first pass abort partway through.
+    // A table defined further down schema.sql than the column that aborted
+    // it (e.g. probe_attempts, added near the end) genuinely doesn't exist
+    // yet at that point -- PRAGMA table_info on a missing table returns an
+    // empty result (not an error), so the column looks "already present"
+    // and gets skipped correctly, but the ALTER below would still throw "no
+    // such table". Skip it: the imminent retry's CREATE TABLE will create it
+    // with every current column anyway, so there is nothing to backfill.
+    const tableExists = database
+      .prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?`)
+      .get(table);
+    if (!tableExists) continue;
     const columns = database.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
     if (columns.some((c) => c.name === column)) continue;
     database.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${ddlType}`);

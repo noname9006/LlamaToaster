@@ -18,6 +18,8 @@ export interface VerifiedLimitDto {
   kv_type: string;
   placement_hash: string;
   verified_ctx_tokens: number;
+  /** Layers on GPU at the verified rung; null from a probe predating this. */
+  verified_ngl: number | null;
   margin_observed_frac: number | null;
   method_version: number | null;
   created_at: number;

@@ -170,6 +170,26 @@ export default function App() {
     }
   }
 
+  // Numeric-valued sibling of handleToggleSetting/handleSetVramPolicy above --
+  // same optimistic-apply-revert-on-failure shape, sending a specific integer
+  // instead of boolean-flipping or picking from an enum (the number input
+  // below). The server independently validates/clamps to [1, 200], so an
+  // out-of-range value here just comes back as a 400 that reverts the
+  // optimistic update.
+  async function handleSetProbeMaxLoads(value: number) {
+    if (settings === null) return;
+    const prev = settings;
+    setSettings({ ...settings, probeMaxLoads: value });
+    setSettingsError(null);
+    try {
+      const result = await api.updateSettings({ probeMaxLoads: value });
+      setSettings(result);
+    } catch (err) {
+      setSettings(prev);
+      setSettingsError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
   if (phase === "loading") {
     return <div className="flex min-h-screen items-center justify-center text-sm text-muted">Loading…</div>;
   }
@@ -273,6 +293,29 @@ export default function App() {
               <option value="retry_once_then_fail">retry_once_then_fail</option>
               <option value="fail">fail</option>
             </select>
+          </div>
+          <div className="flex items-center justify-between gap-4 rounded-lg border border-border px-3 py-2.5">
+            <div>
+              <div className="text-sm font-medium text-fg">Probe max loads</div>
+              <div className="text-xs text-muted">
+                Hard cap on how many real model loads a single N2 probe run may perform, across every search
+                phase. Default 24. Delivered to workers via their ~10s heartbeat; also enforced server-side
+                when a worker reports probe results, so a stale or misbehaving worker can't exceed it.
+              </div>
+            </div>
+            <input
+              type="number"
+              min={1}
+              max={200}
+              step={1}
+              value={settings?.probeMaxLoads ?? 24}
+              onChange={(e) => {
+                const parsed = Number.parseInt(e.target.value, 10);
+                if (Number.isFinite(parsed)) void handleSetProbeMaxLoads(parsed);
+              }}
+              disabled={settings === null}
+              className="w-24 flex-none rounded-lg border border-border bg-surface px-2.5 py-1.5 text-sm text-fg"
+            />
           </div>
         </div>
       </section>

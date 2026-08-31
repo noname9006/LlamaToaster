@@ -394,8 +394,9 @@ CREATE TABLE IF NOT EXISTS model_machine_limits (
   model_id  TEXT NOT NULL REFERENCES models(id)  ON DELETE CASCADE,
   llama_cpp_build TEXT NOT NULL,
   kv_type   TEXT NOT NULL,            -- the K/V pair probed
-  placement_hash TEXT NOT NULL,       -- hash of the placement the estimate assumed (ngl / n-cpu-moe / slots)
+  placement_hash TEXT NOT NULL,       -- hash of the placement the ceiling was VERIFIED at (ngl / n-cpu-moe / slots)
   verified_ctx_tokens INTEGER NOT NULL,
+  verified_ngl INTEGER,               -- layers on GPU at the verified rung; NULL from a probe predating the 2-axis ladder
   margin_observed_frac REAL,          -- headroom left at the verified point
   method_version INTEGER,
   created_at INTEGER NOT NULL,

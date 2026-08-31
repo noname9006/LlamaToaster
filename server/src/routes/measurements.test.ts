@@ -3,6 +3,7 @@ import { mkdtempSync, existsSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Fastify, { type FastifyInstance } from "fastify";
+import { placementHash } from "../../../shared/configHash.js";
 
 const tmpDir = mkdtempSync(join(tmpdir(), "llamatoaster-measurements-test-"));
 process.env.DB_PATH = join(tmpDir, "test.db");
@@ -190,6 +191,53 @@ describe("POST /api/runs/:id/probe-result (N2)", () => {
     expect(after[0].verified_ctx_tokens).toBe(39_000);
   });
 
+  it("keys the ceiling on the placement it was VERIFIED at, not the one requested", async () => {
+    // The ladder moves ngl in every searching mode, so a probe requested at
+    // ngl=16 routinely proves its ceiling somewhere else entirely. Filing the
+    // row under the request would attribute a loaded context to a placement
+    // that may never have loaded at all.
+    makeRun("probe-ngl", { kind: "probe", worker: workerId, config: { probe: probeSpec } });
+    const res = await post(
+      "/api/runs/probe-ngl/probe-result",
+      { status: "verified", verified_ctx_tokens: 8192, verified_ngl: 31 },
+      workerToken
+    );
+    expect(res.status).toBe(200);
+    const row = repo.limitsRepo.listForModelAndWorker("m1", workerId).find((l) => l.verified_ctx_tokens === 8192)!;
+    expect(row.verified_ngl).toBe(31);
+    expect(row.placement_hash).toBe(placementHash({ ngl: 31, n_cpu_moe: 32, slots: 1 }));
+    expect(row.placement_hash).not.toBe(placementHash({ ngl: 16, n_cpu_moe: 32, slots: 1 }));
+    // A different placement means a genuinely new row -- drop it again so the
+    // row-counting tests in this block keep seeing only what they wrote.
+    repo.limitsRepo.deleteById(row.id);
+  });
+
+  it("falls back to the requested placement for a worker that reports no verified_ngl", async () => {
+    makeRun("probe-no-ngl", { kind: "probe", worker: workerId, config: { probe: probeSpec } });
+    const res = await post(
+      "/api/runs/probe-no-ngl/probe-result",
+      { status: "verified", verified_ctx_tokens: 7000 },
+      workerToken
+    );
+    expect(res.status).toBe(200);
+    const row = repo.limitsRepo.listForModelAndWorker("m1", workerId).find((l) => l.verified_ctx_tokens === 7000)!;
+    expect(row.verified_ngl).toBeNull();
+    expect(row.placement_hash).toBe(placementHash({ ngl: 16, n_cpu_moe: 32, slots: 1 }));
+    // Same placement hash as the requested-placement row above, so this
+    // REPLACES it rather than adding one -- exactly the pre-verified_ngl
+    // behaviour, and what the row-counting test below still expects.
+  });
+
+  it("rejects an out-of-range verified_ngl rather than hashing a nonsense placement", async () => {
+    makeRun("probe-bad-ngl", { kind: "probe", worker: workerId, config: { probe: probeSpec } });
+    const res = await post(
+      "/api/runs/probe-bad-ngl/probe-result",
+      { status: "verified", verified_ctx_tokens: 6000, verified_ngl: -3 },
+      workerToken
+    );
+    expect(res.status).toBe(400);
+  });
+
   it("a different KV type yields a fresh row, never a reused verdict", async () => {
     makeRun("probe-f16", {
       kind: "probe",
@@ -255,6 +303,37 @@ describe("POST /api/runs/:id/probe-result (N2)", () => {
       workerToken
     );
     expect(overCap.status).toBe(400);
+  });
+
+  it("enforces the LIVE admin-configurable probeMaxLoads setting, not the MAX_PROBE_ATTEMPTS constant", async () => {
+    // Default is 24 (matches MAX_PROBE_ATTEMPTS) on a fresh DB -- lower it to
+    // prove the request-time check reads appSettingsRepo, not the constant.
+    expect(repo.appSettingsRepo.getProbeMaxLoads()).toBe(MAX_PROBE_ATTEMPTS);
+    repo.appSettingsRepo.setProbeMaxLoads(3);
+    try {
+      const attempt = (ctx: number) => ({ candidate_ctx: ctx, ok: true, oom: false, spill: false });
+
+      makeRun("probe-loads-live-ok", { kind: "probe", worker: workerId, config: { probe: probeSpec } });
+      const atLoweredCap = await post(
+        "/api/runs/probe-loads-live-ok/probe-result",
+        { status: "verified", verified_ctx_tokens: 10_000, attempts: [attempt(1000), attempt(2000), attempt(3000)] },
+        workerToken
+      );
+      expect(atLoweredCap.status).toBe(200);
+
+      makeRun("probe-loads-live-over", { kind: "probe", worker: workerId, config: { probe: probeSpec } });
+      const overLoweredCap = await post(
+        "/api/runs/probe-loads-live-over/probe-result",
+        { status: "verified", verified_ctx_tokens: 10_000, attempts: [attempt(1000), attempt(2000), attempt(3000), attempt(4000)] },
+        workerToken
+      );
+      expect(overLoweredCap.status).toBe(400);
+      const body = (await overLoweredCap.json()) as { error: string };
+      expect(body.error).toContain("at most 3 loads");
+    } finally {
+      // Restore the default for later tests in this file/process.
+      repo.appSettingsRepo.setProbeMaxLoads(MAX_PROBE_ATTEMPTS);
+    }
   });
 
   it("persists every ladder rung, not just the winning one", async () => {

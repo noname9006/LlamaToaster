@@ -37,6 +37,7 @@ import {
   PROBE_GRANULARITIES,
   PROBE_LADDER_MIN_CTX,
   PROBE_MAX_LOADS,
+  snapToSafeCtx,
   type ProbeGranularity,
   type ProbeMode,
 } from "../../../shared/probeLadder";
@@ -189,11 +190,28 @@ const MODE_LABEL: Record<ProbeMode, string> = {
   custom: "Custom",
 };
 
+/**
+ * What clicking a card puts on the sliders: its verified rung when it has
+ * one, its starting point otherwise. See the call site for why the context
+ * is snapped down rather than applied exactly.
+ */
+function appliedConfig(
+  result: PlacementVerifyResult | null,
+  start: { ngl: number; ctx: number },
+  trainedCtx: number | null
+): { ngl: number; ctx: number } {
+  if (result?.status !== "verified" || result.verifiedCtxTokens == null) return start;
+  return {
+    ngl: result.measuredNgl ?? start.ngl,
+    ctx: snapToSafeCtx(result.verifiedCtxTokens, trainedCtx ?? result.verifiedCtxTokens),
+  };
+}
+
 const MODE_BLURB: Record<ProbeMode, string> = {
   max_gpu: "Every layer on the GPU, then as much context as still fits.",
-  max_context: "Your placement, pushed to the largest context this machine can actually hold, then more layers if there's room.",
+  max_context: "The largest context this machine can hold — the layer split is searched for, not taken from your sliders — then more layers if there's room.",
   keep_context: "Your context is fixed; the layer split moves to make it fit.",
-  balanced: "Starts where you are and trades context against layers.",
+  balanced: "Starts where you are: more context first, then more layers if any still fit.",
   fixed_offload: "Your layer split is fixed; context moves to make it fit.",
   custom: "One load at exactly the settings above — no search.",
 };
@@ -754,6 +772,10 @@ function PlacementMatrix({
     const maxCtxStart = affordable.tokens > 0 ? Math.min(affordable.tokens, trainedCtx ?? affordable.tokens) : ctx;
     return {
       max_gpu: { ngl: placement.nglMax, ctx: PROBE_LADDER_MIN_CTX },
+      // ngl is a placeholder for the payload only: max_context searches for
+      // its own starting layer count worker-side (bestNglForMaxContext), so
+      // the card renders this one as "searched" rather than as a promise --
+      // see ModeCard's own start line.
       max_context: { ngl: placement.ngl, ctx: maxCtxStart },
       keep_context: { ngl: placement.ngl, ctx },
       balanced: { ngl: placement.ngl, ctx },
@@ -908,7 +930,15 @@ function PlacementMatrix({
                 result={result}
                 onApply={() => {
                   setActiveMode(mode);
-                  onApplyConfig(start.ngl, start.ctx);
+                  // A tested card applies what the probe PROVED, not where it
+                  // started -- the ladder routinely lands somewhere else on
+                  // both axes, and the start values are the one thing already
+                  // known not to be the answer. The context snaps DOWN to a
+                  // slider stop (a `fine` probe verifies values between two
+                  // stops, which the slider cannot express); down, never up,
+                  // so applying never claims a context that wasn't loaded.
+                  const applied = appliedConfig(result, start, trainedCtx);
+                  onApplyConfig(applied.ngl, applied.ctx);
                 }}
                 onTest={() => {
                   setActiveMode(mode);
@@ -1007,7 +1037,7 @@ function ModeCard({
       </div>
       <span className="text-[10.5px] leading-relaxed text-muted">{MODE_BLURB[mode]}</span>
       <span className="font-mono text-[11px] text-muted">
-        from {start.ngl} layers · {start.ctx.toLocaleString()} tokens
+        from {mode === "max_context" ? "searched" : `${start.ngl} layers`} · {start.ctx.toLocaleString()} tokens
       </span>
       <div className="flex-1">
         {result?.status === "verified" && (
