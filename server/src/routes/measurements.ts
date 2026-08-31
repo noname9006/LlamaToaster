@@ -32,11 +32,19 @@ import { placementHash } from "../../../shared/configHash.js";
 
 export const MIN_PROBE_CTX = 256;
 export const MAX_PROBE_CTX = 4_194_304;
+// Sanity bound on a reported verified_ngl. No real model comes close; this
+// only stops a malformed report from poisoning a placement hash.
+export const MAX_PROBE_NGL = 4096;
 // The ladder's own hard ceiling on loads. Was 3 when the ladder was a single
 // multiplicative retry; the coarse-to-fine search brackets then bisects, which
-// needs more rungs. Kept as a server-side bound (not just a worker constant)
-// so a misbehaving worker can't report an unbounded ladder.
-export const MAX_PROBE_ATTEMPTS = 8;
+// needs more rungs. Mirrors appSettingsRepo's documented probeMaxLoads
+// default (repo.ts's DEFAULT_PROBE_MAX_LOADS) -- kept exported as "the
+// shipped default" for callers/tests that want it, but the actual
+// per-request bound below is the LIVE admin-configurable value
+// (appSettingsRepo.getProbeMaxLoads()), not this constant, so an operator's
+// override on the supervise dashboard is actually enforced and a
+// misbehaving worker can't report more loads than that live setting allows.
+export const MAX_PROBE_ATTEMPTS = 24;
 export const DATASET_HASH_RE = /^sha256:[0-9a-f]{64}$/;
 
 // The enrolled-worker-session rule. Deliberately NOT authenticateWorker():
@@ -93,8 +101,12 @@ function optionalNonNegative(value: unknown, field: string): number | null {
 function validateProbeAttempts(attempts: unknown): ProbeAttemptReport[] {
   if (attempts === undefined) return [];
   if (!Array.isArray(attempts)) throw new BadRequestError("attempts must be an array");
-  if (attempts.length > MAX_PROBE_ATTEMPTS) {
-    throw new BadRequestError(`a probe performs at most ${MAX_PROBE_ATTEMPTS} loads`);
+  // Live admin-configurable cap (see shared/types.ts's AppSettings.probeMaxLoads),
+  // not the MAX_PROBE_ATTEMPTS constant above -- an operator's override on the
+  // supervise dashboard must actually be enforced here, not just advertised.
+  const maxProbeAttempts = repo.appSettingsRepo.getProbeMaxLoads();
+  if (attempts.length > maxProbeAttempts) {
+    throw new BadRequestError(`a probe performs at most ${maxProbeAttempts} loads`);
   }
   return attempts.map((raw, i) => {
     const a = (raw ?? {}) as Record<string, unknown>;
@@ -173,6 +185,18 @@ export async function measurementRoutes(app: FastifyInstance): Promise<void> {
         ) {
           throw new BadRequestError("margin_observed_frac must be a fraction in [0, 1] or null");
         }
+        // The ladder moves ngl in every mode but fixed_offload/custom, so the
+        // placement that was REQUESTED is routinely not the placement the
+        // ceiling was verified at -- keying the row on the request would file
+        // "N tokens loaded here" under a placement that may well have failed
+        // outright (max_gpu's very first rung is every layer, and that is the
+        // one that usually doesn't fit). Key on what the worker actually
+        // loaded, falling back to the request only for a worker predating the
+        // field.
+        const verifiedNgl =
+          body.verified_ngl === undefined || body.verified_ngl === null
+            ? null
+            : requireFiniteInt(body.verified_ngl, "verified_ngl", 0, MAX_PROBE_NGL);
         stored = repo.limitsRepo.upsert({
           worker_id: worker.id,
           model_id: run.model_id,
@@ -180,11 +204,12 @@ export async function measurementRoutes(app: FastifyInstance): Promise<void> {
           cache_type_k: cacheK,
           cache_type_v: cacheV,
           placement_hash: placementHash({
-            ngl: spec.placement.ngl,
+            ngl: verifiedNgl ?? spec.placement.ngl,
             n_cpu_moe: spec.placement.n_cpu_moe,
             slots: spec.placement.slots,
           }),
           verified_ctx_tokens: verifiedCtx,
+          verified_ngl: verifiedNgl,
           margin_observed_frac: body.margin_observed_frac ?? null,
           method_version: body.method_version ?? METHOD_VERSION,
         });
