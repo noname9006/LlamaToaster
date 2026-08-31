@@ -19,7 +19,7 @@ import { gzipSync } from "node:zlib";
 import { hostname as osHostname } from "node:os";
 import { pipeline } from "node:stream/promises";
 import { Readable, Transform } from "node:stream";
-import { runBench, matchOffloadLine, extractCudaDiagnosticLines, type BenchResult, type OffloadResult, type OffloadInfo, type ModelBufferSizes } from "./bench.js";
+import { runBench, matchOffloadLine, extractCudaDiagnosticLines, classifyFailure, collapseTensorLoadSpam, type BenchResult, type OffloadResult, type OffloadInfo, type ModelBufferSizes } from "./bench.js";
 import { runServerBench } from "./serverBench.js";
 import { spawn } from "node:child_process";
 // N1/N2/N5 -- the {engine:"server", spec:"off"} execution paths.
@@ -31,6 +31,7 @@ import {
   probeSucceeded,
   toBenchResult,
   PROBE_GEN_TOKENS,
+  RuntimeServerStartupError,
   type ProbeAttemptOutcome,
 } from "./runtimeBench.js";
 import {
@@ -886,25 +887,10 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
 }
 
-// Best-effort, same honest posture as this file's other diagnostic-only
-// signals (see hardware.ts, sampler.ts's VRAM comment): a signal-killed
-// process (and it wasn't our own bench_timeout_ms kill, tracked separately
-// via BenchResult.timedOut) is what an OS OOM-killer looks like from here,
-// and a handful of common allocator error phrases catch the rest. Won't be
-// 100% precise -- some non-OOM context-creation failures may still just say
-// "failed".
-const OOM_STDERR_PATTERN =
-  /out of memory|failed to allocate|cudaMalloc|insufficient memory|bad_alloc|not enough (memory|vram)/i;
-
-function classifyFailure(bench: BenchResult): "failed_oom" | "failed" {
-  if (!bench.timedOut && (bench.signal === "SIGKILL" || bench.signal === "SIGABRT")) {
-    return "failed_oom";
-  }
-  if (OOM_STDERR_PATTERN.test(bench.stderr)) {
-    return "failed_oom";
-  }
-  return "failed";
-}
+// classifyFailure and its OOM_STDERR_PATTERN now live in bench.ts (imported
+// above), so the runtime-server/probe path in runOneProbeLoad below can
+// classify a crash through the exact same rule instead of a second inline
+// regex copy.
 
 // The worker has no local record of a run once it's dispatched -- the server
 // is the only place run/item status lives. If a terminal update can't reach
@@ -1335,6 +1321,23 @@ function logDiagnosticOutput(label: string, processName: string, stderr: string)
   const filtered = filterDiagnosticOutput(stderr);
   if (!filtered) return;
   log.debug(`${label}: ${processName} raw output:\n${filtered}`);
+}
+
+const PROBE_STDERR_TAIL_CHARS = 2000;
+
+// A short, best-effort look at what actually killed a probe candidate that
+// classifyFailure could NOT tag as OOM -- otherwise the worker log is left
+// with only the bare "exited before it became ready", with no way to tell
+// "a genuine startup bug" from "an OOM phrasing this regex doesn't know"
+// without reproducing the load by hand. The TAIL (not head) is kept: the
+// actual crash reason is almost always the last thing printed, past however
+// much ordinary tensor-load spam preceded it.
+function probeStderrTail(stderr: string): string {
+  const collapsed = filterDiagnosticOutput(collapseTensorLoadSpam(stderr)).trim();
+  if (!collapsed) return "";
+  return collapsed.length > PROBE_STDERR_TAIL_CHARS
+    ? `...[${collapsed.length - PROBE_STDERR_TAIL_CHARS} earlier chars elided] ${collapsed.slice(-PROBE_STDERR_TAIL_CHARS)}`
+    : collapsed;
 }
 
 // Maps a finished BenchResult into a terminal run-item report -- shared by
@@ -2802,6 +2805,8 @@ async function executeDownloadModelJob(
       n_embd,
       n_head,
       sliding_window,
+      sliding_window_pattern,
+      shared_kv_layers,
       debugReason,
     } = await readGgufInfo(target);
     log.info(
@@ -2809,7 +2814,8 @@ async function executeDownloadModelJob(
         `quant=${quant ?? "unknown"} ` +
         `param_count=${param_count ?? "unknown"} trained_ctx=${trained_ctx ?? "unknown"} ` +
         `n_head_kv=${n_head_kv ?? "unknown"} head_dim_k=${head_dim_k ?? "unknown"} ` +
-        `head_dim_v=${head_dim_v ?? "unknown"} sliding_window=${sliding_window ?? "none"}` +
+        `head_dim_v=${head_dim_v ?? "unknown"} sliding_window=${sliding_window ?? "none"} ` +
+        `sliding_window_pattern=${sliding_window_pattern ?? "unknown"} shared_kv_layers=${shared_kv_layers ?? "none"}` +
         `${debugReason ? ` (${debugReason})` : ""}`
     );
 
@@ -2845,6 +2851,8 @@ async function executeDownloadModelJob(
       n_embd: n_embd ?? undefined,
       n_head: n_head ?? undefined,
       sliding_window: sliding_window ?? undefined,
+      sliding_window_pattern: sliding_window_pattern ?? undefined,
+      shared_kv_layers: shared_kv_layers ?? undefined,
       gguf_checked_at: Date.now(),
       last_verified: Date.now(),
       state: verificationState,
@@ -2892,6 +2900,8 @@ async function executeDownloadModelJob(
       n_embd,
       n_head,
       sliding_window,
+      sliding_window_pattern,
+      shared_kv_layers,
     });
     if (!reported) {
       // The file is on disk and hashed, but the server never learned about
@@ -2984,6 +2994,8 @@ function estimateProbeMemoryNeed(
     cacheTypeK: payload.kvPair[0],
     cacheTypeV: payload.kvPair[1],
     slidingWindow: meta.sliding_window,
+    slidingWindowPattern: meta.sliding_window_pattern,
+    sharedKvLayers: meta.shared_kv_layers,
     parallelSlots: payload.placement.slots,
     vram: { freeMib: null, totalMib: payload.gpu_total_mib ?? null },
     ram: { freeMib: null, totalMib: null },
@@ -3077,6 +3089,8 @@ async function executeRunProbeJob(payload: RunProbeJobPayload): Promise<void> {
       cacheTypeK: payload.kvPair[0],
       cacheTypeV: payload.kvPair[1],
       slidingWindow: meta.sliding_window,
+      slidingWindowPattern: meta.sliding_window_pattern,
+      sharedKvLayers: meta.shared_kv_layers,
       parallelSlots: payload.placement.slots,
       // freeVramMib is ALREADY the free budget -- maxAffordableContext's own
       // 10% headroom is calibrated against callers passing TOTAL vram, and
@@ -3127,6 +3141,16 @@ async function executeRunProbeJob(payload: RunProbeJobPayload): Promise<void> {
         `${label}: loading at candidate context ${rung.ctx}, ${rung.ngl} layers on GPU` +
           `${estimateNote ? ` -- ${estimateNote}` : ""}`
       );
+      // Live progress for the Benchmark page's Tested-configurations cards --
+      // a probe run always has exactly one run_item (idx 0, the sweep block
+      // verifyPlacement sends alongside it expands to a single combo). Best-
+      // effort/fire-and-forget, same as every other sendTick call: a probe
+      // routinely runs 5-10+ loads over several minutes, and losing one tick
+      // just means the card's live text lags until the next candidate's.
+      sendTick(payload.run_id, 0, {
+        status: "benchmarking",
+        detail: `probe load ${attempts.length + 1}: ctx ${rung.ctx.toLocaleString()} / ${rung.ngl} layers`,
+      });
       const attempt = await runOneProbeLoad({
         payload,
         modelPath,
@@ -3145,6 +3169,12 @@ async function executeRunProbeJob(payload: RunProbeJobPayload): Promise<void> {
         `${label}: candidate ${rung.ctx}/${rung.ngl} -> ${attempt.ok ? "ok" : "failed"}${actualNote}` +
           (attempt.error ? ` (${attempt.error})` : "")
       );
+      // Not classified as OOM -- the generic case a human actually has to
+      // debug, so the process output that would otherwise be discarded goes
+      // to the log rather than leaving just the bare error message above.
+      if (!attempt.ok && !attempt.oom && attempt.stderrTail) {
+        log.info(`${label}: candidate ${rung.ctx}/${rung.ngl} raw output (not classified as OOM):\n${attempt.stderrTail}`);
+      }
     }
 
     const best = bestLadderResult(attempts.map(toLadderAttempt));
@@ -3313,19 +3343,26 @@ async function runOneProbeLoad(input: ProbeLoadInput): Promise<ProbeAttemptOutco
   } catch (err) {
     const stats = sampler.stop();
     const message = err instanceof Error ? err.message : String(err);
+    // A RuntimeServerStartupError (the child died, or its health port never
+    // opened, before readiness) is the ONLY case where `server` above stays
+    // null -- spawnRuntimeServer throws before ever returning a handle -- so
+    // that error carries its own captured stderr/signal directly. Any other
+    // error (e.g. the /completion request itself failing once the server WAS
+    // ready) leaves `server` non-null, and its stderr() is still there.
+    const stderrText = err instanceof RuntimeServerStartupError ? err.stderr : (server?.stderr() ?? "");
+    const signal = err instanceof RuntimeServerStartupError ? err.signal : null;
+    const oom = classifyFailure({ stderr: stderrText, signal, timedOut: false }) === "failed_oom";
     return {
       candidateCtx,
       ok: false,
-      // The same best-effort OOM signature the sweep paths classify on.
-      oom: /out of memory|failed to allocate|cudaMalloc|insufficient memory|bad_alloc|not enough (memory|vram)/i.test(
-        message + (server?.stderr() ?? "")
-      ),
+      oom,
       spill: false,
-      vramPeakMib: null,
+      vramPeakMib: stats.vram_peak_mib,
       ramPeakMib: stats.ram_peak_mib,
       genTps: null,
       ...memoryFields,
       error: message,
+      stderrTail: !oom ? probeStderrTail(stderrText) || undefined : undefined,
     };
   } finally {
     activeBenchProc = null;

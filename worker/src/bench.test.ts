@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseModelBufferSizes, extractCudaDiagnosticLines, MAX_CUDA_DIAGNOSTIC_LINES, buildArgs, type BenchRunInput } from "./bench.js";
+import { parseModelBufferSizes, extractCudaDiagnosticLines, MAX_CUDA_DIAGNOSTIC_LINES, buildArgs, classifyFailure, type BenchRunInput } from "./bench.js";
 import type { SweepItem } from "../../shared/sweep.js";
 
 const BASE_ITEM: SweepItem = {
@@ -43,6 +43,41 @@ describe("buildArgs", () => {
     const nIdx = args.indexOf("-n");
     expect(args[nIdx + 2]).toBe("-d");
     expect(args[nIdx + 3]).toBe("2048");
+  });
+});
+
+// Shared by the sweep/bench crash path (worker/src/index.ts's runSweepItem,
+// which classifies a full BenchResult) and the N2 probe path
+// (runOneProbeLoad), so both read the exact same verdict off a minimal
+// {stderr, signal, timedOut} shape rather than each keeping its own copy.
+describe("classifyFailure", () => {
+  it("treats a signal-killed process as OOM -- the OS OOM-killer's own signature", () => {
+    expect(classifyFailure({ stderr: "", signal: "SIGKILL", timedOut: false })).toBe("failed_oom");
+    expect(classifyFailure({ stderr: "", signal: "SIGABRT", timedOut: false })).toBe("failed_oom");
+  });
+
+  it("does NOT treat our own bench_timeout_ms kill as OOM, even though it also arrives as SIGKILL", () => {
+    expect(classifyFailure({ stderr: "", signal: "SIGKILL", timedOut: true })).toBe("failed");
+  });
+
+  it("recognizes common allocator error phrases in stderr as OOM", () => {
+    expect(
+      classifyFailure({
+        stderr: "ggml_cuda_host_malloc: failed to allocate 16384.00 MiB of pinned memory: out of memory",
+        signal: null,
+        timedOut: false,
+      })
+    ).toBe("failed_oom");
+    expect(
+      classifyFailure({ stderr: "CUDA error: out of memory\ncudaMalloc failed", signal: null, timedOut: false })
+    ).toBe("failed_oom");
+  });
+
+  it("falls back to a generic failure for a crash that matches neither signature", () => {
+    expect(
+      classifyFailure({ stderr: "Segmentation fault (core dumped)", signal: null, timedOut: false })
+    ).toBe("failed");
+    expect(classifyFailure({ stderr: "", signal: null, timedOut: false })).toBe("failed");
   });
 });
 

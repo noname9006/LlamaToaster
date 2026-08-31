@@ -43,6 +43,32 @@ export interface RuntimeServerHandle {
   stop: () => Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
 }
 
+// Thrown by spawnRuntimeServer when the child dies, or never opens its
+// health port, before waitForReady is satisfied. A plain Error would lose
+// the process's captured output the instant it's thrown -- spawnRuntimeServer
+// never gets to construct/return a RuntimeServerHandle in this path, so
+// without this the caller has no way to reach stderr()/exit info at all (see
+// worker/src/index.ts's runOneProbeLoad, which used to see `server` stuck at
+// null for exactly this reason and so could never classify OOM here).
+export class RuntimeServerStartupError extends Error {
+  readonly stderr: string;
+  readonly code: number | null;
+  readonly signal: NodeJS.Signals | null;
+
+  constructor(message: string, info: { stderr: string; code: number | null; signal: NodeJS.Signals | null }) {
+    super(message);
+    this.name = "RuntimeServerStartupError";
+    this.stderr = info.stderr;
+    this.code = info.code;
+    this.signal = info.signal;
+  }
+}
+
+// Test seam, same spirit as CompletionFn below: lets a test drive a real
+// (but trivial, script-based) child process instead of needing a real
+// llama-server binary on disk just to exercise the readiness-failure path.
+export type SpawnFn = (path: string, args: string[]) => ChildProcess;
+
 export interface SpawnRuntimeServerInput {
   llamaServerPath: string;
   modelPath: string;
@@ -53,6 +79,11 @@ export interface SpawnRuntimeServerInput {
   contextSizeOverride?: number;
   log?: BenchLogger;
   onSpawn?: (proc: ChildProcess) => void;
+  spawnFn?: SpawnFn;
+}
+
+function defaultSpawn(path: string, args: string[]): ChildProcess {
+  return spawn(path, args, { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
 }
 
 export async function spawnRuntimeServer(input: SpawnRuntimeServerInput): Promise<RuntimeServerHandle> {
@@ -70,7 +101,7 @@ export async function spawnRuntimeServer(input: SpawnRuntimeServerInput): Promis
     contextSizeOverride: input.contextSizeOverride,
   });
   input.log?.info(`llama-server ${args.join(" ")}`);
-  const proc = spawn(input.llamaServerPath, args, { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+  const proc = (input.spawnFn ?? defaultSpawn)(input.llamaServerPath, args);
   input.onSpawn?.(proc);
 
   let stderr = "";
@@ -85,7 +116,19 @@ export async function spawnRuntimeServer(input: SpawnRuntimeServerInput): Promis
     proc.on("close", (code, signal) => resolve({ code, signal }));
   });
 
-  await waitForReady(input.port, Date.now() + READY_TIMEOUT_MS, closed);
+  try {
+    await waitForReady(input.port, Date.now() + READY_TIMEOUT_MS, closed);
+  } catch (err) {
+    // Still alive means this was a readiness TIMEOUT, not a death -- and
+    // since this throw means the caller never gets a handle to stop() it,
+    // leaving it running here would leak the process.
+    if (proc.exitCode == null && proc.signalCode == null) {
+      proc.kill("SIGKILL");
+    }
+    const exitInfo = await closed;
+    const message = err instanceof Error ? err.message : String(err);
+    throw new RuntimeServerStartupError(message, { stderr, ...exitInfo });
+  }
 
   return {
     proc,
@@ -436,6 +479,12 @@ export interface ProbeAttemptOutcome {
   ramNeededMib?: number | null;
   ramFreeMib?: number | null;
   error?: string;
+  /** A short, worker-log-only tail of this attempt's captured process output
+   * -- populated only when the failure was NOT classified as OOM, so a
+   * genuine startup bug is debuggable from the worker log instead of a bare
+   * "exited before it became ready". Never sent to the server: the report's
+   * own `error` already carries the short message. */
+  stderrTail?: string;
 }
 
 /** Gen tok/s floor -- excludes swap-thrash "success". */

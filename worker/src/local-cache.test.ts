@@ -123,6 +123,31 @@ describe("LocalModelCache", () => {
     await cache.close();
   });
 
+  it("re-checks GGUF headers once more when sliding_window_pattern/shared_kv_layers ship (schema version 1 -> 2)", async () => {
+    // A cache already migrated past the head_count_kv fix (version 1) still
+    // has rows read by the reader that predates these two new fields --
+    // same staleness-gate problem as every migration above, this time keyed
+    // off version 1 -> 2 rather than a new column (no column alone
+    // distinguishes "read by the older reader" from "checked, genuinely null").
+    mockDb.pragma.mockImplementation((stmt: string) => (stmt === "user_version" ? 1 : undefined));
+
+    const cache = new LocalModelCache("/test/model/dir");
+    await cache.init();
+
+    expect(mockDb.pragma).toHaveBeenCalledWith("user_version = 2");
+    await cache.close();
+  });
+
+  it("does not re-clear gguf_checked_at once the sliding_window_pattern/shared_kv_layers migration has already run", async () => {
+    mockDb.pragma.mockImplementation((stmt: string) => (stmt === "user_version" ? 2 : undefined));
+
+    const cache = new LocalModelCache("/test/model/dir");
+    await cache.init();
+
+    expect(mockDb.pragma).not.toHaveBeenCalledWith("user_version = 2");
+    await cache.close();
+  });
+
   it("should upsert a cache entry", async () => {
     const cache = new LocalModelCache("/test/model/dir");
     await cache.init();
@@ -161,6 +186,8 @@ describe("LocalModelCache", () => {
       null, // n_embd
       null, // n_head
       null, // sliding_window
+      null, // sliding_window_pattern
+      null, // shared_kv_layers
       null // tensor_layer_bytes
     );
 
