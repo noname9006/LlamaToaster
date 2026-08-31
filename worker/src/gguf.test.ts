@@ -7,9 +7,15 @@ import { readGgufInfo, quantLabelFromFileType } from "./gguf.js";
 // Minimal GGUF byte-level writer -- just enough to exercise readGgufInfo's
 // own reader, independent of any real model file. Type ids mirror gguf.ts's
 // own GGUF_TYPE map (not exported, so duplicated here deliberately).
-const T = { UINT32: 4, STRING: 8 } as const;
+const T = { UINT32: 4, STRING: 8, ARRAY: 9 } as const;
 
-type Kv = [key: string, type: number, value: number | string];
+// An ARRAY-typed value -- real Gemma-4 GGUFs write
+// gemma4.attention.sliding_window_pattern this way (one uint32 per layer)
+// rather than as a scalar period, confirmed against a real file. elemType is
+// always UINT32 here since that's the only array element type this test file
+// needs to exercise.
+type ArrayValue = { arr: number[] };
+type Kv = [key: string, type: number, value: number | string | ArrayValue];
 
 function u32(n: number): Buffer {
   const b = Buffer.alloc(4);
@@ -29,7 +35,10 @@ function kvBuffer([key, type, value]: Kv): Buffer {
   const parts = [ggufString(key), u32(type)];
   if (type === T.STRING) parts.push(ggufString(value as string));
   else if (type === T.UINT32) parts.push(u32(value as number));
-  else throw new Error(`test helper doesn't support type ${type}`);
+  else if (type === T.ARRAY) {
+    const { arr } = value as ArrayValue;
+    parts.push(u32(T.UINT32), u64(arr.length), ...arr.map(u32));
+  } else throw new Error(`test helper doesn't support type ${type}`);
   return Buffer.concat(parts);
 }
 
@@ -158,6 +167,129 @@ describe("readGgufInfo", () => {
     expect(plainInfo.sliding_window).toBeNull();
   });
 
+  // Real per-architecture periods vary (confirmed against llama.cpp's own
+  // hparam loaders): gemma2/openai-moe default to 2, cohere2/llama4/olmo2 to
+  // 4, gemma3 to 6 -- a non-6 value here is exactly the case
+  // shared/vramEstimate.ts's hardcoded "~1-in-6" fallback gets wrong.
+  it("reads sliding_window_pattern and shared_kv_layers when the header declares them as scalars", async () => {
+    const path = writeTempGguf([
+      ["general.architecture", T.STRING, "cohere2"],
+      ["cohere2.block_count", T.UINT32, 32],
+      ["cohere2.attention.sliding_window", T.UINT32, 4096],
+      ["cohere2.attention.sliding_window_pattern", T.UINT32, 4],
+      ["cohere2.attention.shared_kv_layers", T.UINT32, 2],
+    ]);
+    const info = await readGgufInfo(path);
+    expect(info.sliding_window_pattern).toBe(4);
+    expect(info.shared_kv_layers).toBe(2);
+  });
+
+  // Confirmed live against a real gemma-4-12b GGUF: its own
+  // gemma4.attention.sliding_window_pattern key is written as a full
+  // per-layer ARRAY (llama.cpp's gemma4 loader reads it via get_key_or_arr's
+  // array overload), not the scalar period other SWA architectures use. The
+  // scalar-only walk must skip it -- same convention as every other numeric
+  // field in this file -- and fall back to null rather than misreading the
+  // array's length/first element as a period, or throwing.
+  it("leaves sliding_window_pattern null (not misread) when the header writes it as a per-layer array", async () => {
+    const path = writeTempGguf([
+      ["general.architecture", T.STRING, "gemma4"],
+      ["gemma4.block_count", T.UINT32, 6],
+      ["gemma4.attention.sliding_window", T.UINT32, 1024],
+      ["gemma4.attention.sliding_window_pattern", T.ARRAY, { arr: [1, 1, 1, 1, 1, 0] }],
+    ]);
+    const info = await readGgufInfo(path);
+    expect(info.sliding_window).toBe(1024);
+    expect(info.sliding_window_pattern).toBeNull();
+    expect(info.n_layer).toBe(6);
+  });
+
+  // Confirmed live against the same real gemma-4-12b GGUF as the test above:
+  // unlike sliding_window_pattern (a per-layer boolean is-local FLAG, wrong
+  // to misread as a scalar period), attention.head_count_kv's real per-layer
+  // array holds genuine per-layer KV-head counts -- 8 for each local/
+  // sliding-window layer, 1 for the global/full-attention layer every 6th
+  // block (index 5 of every group of 6, matching sliding_window_pattern's
+  // own period). Before this fix, the ARRAY guard skipped it entirely and
+  // n_head_kv silently fell back to head_count (16 here) -- a ~16x
+  // overestimate of the real global-layer value that, compounded across
+  // shared/vramEstimate.ts's context-scaling KV formula, was the dominant
+  // cause of a reported real-world VRAM estimate growing from ~13.6 GiB to
+  // ~78.9 GiB as candidate context size grew, while the real measured peak
+  // stayed flat around 7.5-7.7 GiB. The array's LAST element is read as the
+  // representative value -- llama.cpp's own hybrid-attention layouts always
+  // anchor the global/full-attention layer at the model's last transformer
+  // block (see shared/vramEstimate.ts's swaGlobalLayersInSuffix), so index
+  // [len-1] is that layer's real value, consistent with key_length/
+  // value_length (512 here) already resolving to that same global layer's
+  // dims when those keys stay scalar-only, as they do on the real file.
+  it("resolves n_head_kv from a per-layer ARRAY as the array's last element instead of silently falling back to head_count (real Gemma-4-style head_count_kv)", async () => {
+    const path = writeTempGguf([
+      ["general.architecture", T.STRING, "gemma4"],
+      ["gemma4.block_count", T.UINT32, 6],
+      ["gemma4.attention.head_count", T.UINT32, 16],
+      ["gemma4.attention.head_count_kv", T.ARRAY, { arr: [8, 8, 8, 8, 8, 1] }],
+      ["gemma4.attention.key_length", T.UINT32, 512],
+      ["gemma4.attention.value_length", T.UINT32, 512],
+    ]);
+    const info = await readGgufInfo(path);
+    expect(info.n_head_kv).toBe(1);
+    expect(info.n_head).toBe(16);
+    expect(info.head_dim_k).toBe(512);
+    expect(info.head_dim_v).toBe(512);
+  });
+
+  // Same array-handling extended to head_count/key_length/value_length --
+  // not observed array-typed on the real Gemma-4 file (those three stayed
+  // scalar there), but the ARRAY guard was symmetric across all four
+  // attention.* fields before this fix, so any architecture that DOES write
+  // one of these as a per-layer array must resolve it the same
+  // last-element way, not silently drop it.
+  it("resolves head_count/key_length/value_length from a per-layer ARRAY the same way, for an architecture that writes those as arrays too", async () => {
+    const path = writeTempGguf([
+      ["general.architecture", T.STRING, "hypothetical-arch"],
+      ["hypothetical-arch.block_count", T.UINT32, 4],
+      ["hypothetical-arch.attention.head_count", T.ARRAY, { arr: [32, 32, 32, 16] }],
+      ["hypothetical-arch.attention.head_count_kv", T.ARRAY, { arr: [8, 8, 8, 2] }],
+      ["hypothetical-arch.attention.key_length", T.ARRAY, { arr: [128, 128, 128, 64] }],
+      ["hypothetical-arch.attention.value_length", T.ARRAY, { arr: [128, 128, 128, 64] }],
+    ]);
+    const info = await readGgufInfo(path);
+    expect(info.n_head).toBe(16);
+    expect(info.n_head_kv).toBe(2);
+    expect(info.head_dim_k).toBe(64);
+    expect(info.head_dim_v).toBe(64);
+  });
+
+  // A homogeneous per-layer array (every element identical) must resolve to
+  // that same value -- the array-vs-scalar distinction shouldn't change the
+  // answer when there's nothing heterogeneous to lose.
+  it("resolves n_head_kv from a homogeneous per-layer ARRAY as that single repeated value", async () => {
+    const path = writeTempGguf([
+      ["general.architecture", T.STRING, "uniform-arr-arch"],
+      ["uniform-arr-arch.block_count", T.UINT32, 3],
+      ["uniform-arr-arch.attention.head_count_kv", T.ARRAY, { arr: [4, 4, 4] }],
+    ]);
+    const info = await readGgufInfo(path);
+    expect(info.n_head_kv).toBe(4);
+  });
+
+  // Regression guard for the common case (the vast majority of real
+  // architectures): a plain SCALAR head_count_kv must resolve exactly as
+  // before -- the array-handling addition must not perturb the scalar path
+  // at all. Duplicates part of "prefers an explicit head_count_kv..." above
+  // deliberately, as an explicit before/after marker for this fix.
+  it("still resolves n_head_kv directly from a plain SCALAR head_count_kv, unaffected by the array-handling addition", async () => {
+    const path = writeTempGguf([
+      ["general.architecture", T.STRING, "qwen3"],
+      ["qwen3.block_count", T.UINT32, 36],
+      ["qwen3.attention.head_count", T.UINT32, 32],
+      ["qwen3.attention.head_count_kv", T.UINT32, 8],
+    ]);
+    const info = await readGgufInfo(path);
+    expect(info.n_head_kv).toBe(8);
+  });
+
   // Same architecture-prefix discipline as block_count's map: a header whose
   // hyperparameters precede general.architecture must still resolve them.
   it("resolves context/KV keys written before the architecture key", async () => {
@@ -187,6 +319,8 @@ describe("readGgufInfo", () => {
     expect(info.head_dim_v).toBeNull();
     expect(info.n_embd).toBeNull();
     expect(info.sliding_window).toBeNull();
+    expect(info.sliding_window_pattern).toBeNull();
+    expect(info.shared_kv_layers).toBeNull();
     expect(info.n_layer).toBe(12);
   });
 
