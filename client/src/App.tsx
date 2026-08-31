@@ -36,6 +36,7 @@ export default function App() {
             communitySharingAllowed: false,
             accountDeletionAllowed: true,
             workerVramDiscrepancyPolicy: "warn",
+            probeMaxLoads: 24,
           },
         })
       );

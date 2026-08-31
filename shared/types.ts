@@ -1620,6 +1620,15 @@ export type ProbeResultStatus = "verified" | "failed" | "failed_oom";
 export interface ProbeResultInput {
   status: ProbeResultStatus;
   verified_ctx_tokens: number | null;
+  /**
+   * The layer count the winning rung actually loaded at. The ladder searches
+   * this axis in most modes, so it is routinely NOT the ngl the probe was
+   * requested with -- and the stored ceiling is keyed on the placement it was
+   * verified at, not the one that was asked for. Optional so a worker
+   * predating this field still reports successfully (the server then falls
+   * back to the requested placement, exactly as it always did).
+   */
+  verified_ngl?: number | null;
   margin_observed_frac?: number | null;
   method_version?: number;
   attempts: ProbeAttemptReport[];
@@ -1751,6 +1760,19 @@ export function isVramDiscrepancyPolicy(value: unknown): value is VramDiscrepanc
   return value === "warn" || value === "retry_once_then_fail" || value === "fail";
 }
 
+// Single validity check for every boundary that accepts a probeMaxLoads
+// value from the outside -- the admin settings POST, the meta-table read (a
+// hand-edited DB row must degrade to the documented default, not poison a
+// probe run), and the worker's heartbeat ingestion. Upper bound (200) is
+// deliberately generous above the shipped default (24): high enough that no
+// realistic ladder search ever hits it, low enough that a fat-fingered
+// six-figure value on the admin dashboard can't turn one probe into an
+// effectively unbounded sequence of real model loads (each one is a
+// multi-second llama-server spawn).
+export function isValidProbeMaxLoads(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 200;
+}
+
 export interface AppSettings {
   // Whether users are allowed to turn ON the "contribute to community
   // benchmark database" toggle in Settings at all -- default false (starts
@@ -1768,6 +1790,16 @@ export interface AppSettings {
   // the shipped v1 behavior). Set from the supervise dashboard; reaches
   // workers via HeartbeatResponse.app_settings.
   workerVramDiscrepancyPolicy: VramDiscrepancyPolicy;
+  // Hard cap on how many real model loads a single N2 probe run may perform
+  // (shared/probeLadder.ts's own PROBE_MAX_LOADS is the ladder's built-in
+  // default of this same number) -- default 24. Set from the supervise
+  // dashboard; reaches workers via HeartbeatResponse.app_settings and is
+  // passed as nextLadderRung's `maxLoads` override, and is independently
+  // enforced server-side when a worker reports probe attempts
+  // (routes/measurements.ts's validateProbeAttempts) so a misbehaving or
+  // stale worker can never report more loads than the current setting
+  // allows.
+  probeMaxLoads: number;
 }
 
 // GET /api/sessions -- one row per live session for the caller's own

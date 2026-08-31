@@ -46,6 +46,7 @@ import type {
 } from "../../../shared/types.js";
 import {
   isVramDiscrepancyPolicy,
+  isValidProbeMaxLoads,
   parseCaveatFlags,
   CHAIN_WALL_CLOCK_MS,
 } from "../../../shared/types.js";
@@ -763,6 +764,11 @@ function deriveModelId(input: RegisterModelInput): string {
       : `local:${input.filename ?? ""}:${input.size_bytes ?? 0}`;
   return createHash("sha256").update(key).digest("hex");
 }
+
+// appSettingsRepo.get()'s default when no admin override has ever been
+// stored -- see that repo method's own comment for why this is a literal
+// rather than an import from shared/probeLadder.ts's own PROBE_MAX_LOADS.
+const DEFAULT_PROBE_MAX_LOADS = 24;
 
 export const repo = {
   listModels(): Model[] {
@@ -3174,19 +3180,38 @@ export const repo = {
   // table (schema.sql) rather than a dedicated table: a handful of
   // single-row/small-key-count settings, and `meta` already exists for
   // exactly this kind of thing.
+  //
+  // 24 kept as a literal here (not imported from shared/probeLadder.ts's own
+  // PROBE_MAX_LOADS) so this documented meta-table default never silently
+  // drifts if that module's own default is ever tuned for a reason unrelated
+  // to "what should the admin-configurable cap start at" -- the two are
+  // meant to agree, but this is the value that actually ships as the
+  // default, deliberately independent of the ladder module's internals.
   appSettingsRepo: {
     get(): AppSettings {
       const db = getDb();
       const read = (key: string): string | undefined =>
         (db.prepare(`SELECT value FROM meta WHERE key = ?`).get(key) as { value: string } | undefined)?.value;
       const rawPolicy = read("worker_vram_discrepancy_policy");
+      const rawProbeMaxLoads = read("probe_max_loads");
+      const parsedProbeMaxLoads = rawProbeMaxLoads === undefined ? NaN : Number(rawProbeMaxLoads);
       return {
         communitySharingAllowed: read("community_sharing_allowed") === "1",
         accountDeletionAllowed: read("account_deletion_allowed") !== "0",
         workerVramDiscrepancyPolicy: isVramDiscrepancyPolicy(rawPolicy)
           ? rawPolicy
           : "warn", // documented default -- the shipped v1 record-with-warning behavior
+        probeMaxLoads: isValidProbeMaxLoads(parsedProbeMaxLoads)
+          ? parsedProbeMaxLoads
+          : DEFAULT_PROBE_MAX_LOADS, // documented default -- see that const's own comment
       };
+    },
+
+    // Single-field convenience for callers that only need the live cap (e.g.
+    // measurements.ts's per-request validateProbeAttempts) without paying for
+    // the other meta-table reads get() does on every call.
+    getProbeMaxLoads(): number {
+      return repo.appSettingsRepo.get().probeMaxLoads;
     },
 
     setCommunitySharingAllowed(allowed: boolean): AppSettings {
@@ -3218,6 +3243,23 @@ export const repo = {
         .run(policy);
       return repo.appSettingsRepo.get();
     },
+
+    // Callers validate with isValidProbeMaxLoads before reaching here (same
+    // division of labor as the other setters above) -- this throws rather
+    // than silently clamping so a bug upstream surfaces immediately instead
+    // of quietly storing a wrong-but-in-range number.
+    setProbeMaxLoads(value: number): AppSettings {
+      if (!isValidProbeMaxLoads(value)) {
+        throw new Error(`probeMaxLoads must be an integer in [1, 200], got ${value}`);
+      }
+      getDb()
+        .prepare(
+          `INSERT INTO meta (key, value) VALUES ('probe_max_loads', ?)
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value`
+        )
+        .run(String(value));
+      return repo.appSettingsRepo.get();
+    },
   },
 
   // Total registered accounts -- the one intentionally cross-tenant number
@@ -3245,10 +3287,11 @@ export const repo = {
           .prepare(
             `INSERT INTO model_machine_limits
                (id, worker_id, model_id, llama_cpp_build, kv_type, placement_hash,
-                verified_ctx_tokens, margin_observed_frac, method_version, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                verified_ctx_tokens, verified_ngl, margin_observed_frac, method_version, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(worker_id, model_id, llama_cpp_build, kv_type, placement_hash)
              DO UPDATE SET verified_ctx_tokens = excluded.verified_ctx_tokens,
+                           verified_ngl = excluded.verified_ngl,
                            margin_observed_frac = excluded.margin_observed_frac,
                            method_version = excluded.method_version,
                            created_at = excluded.created_at`
@@ -3261,6 +3304,7 @@ export const repo = {
             kvType,
             input.placement_hash,
             input.verified_ctx_tokens,
+            input.verified_ngl ?? null,
             input.margin_observed_frac ?? null,
             input.method_version ?? null,
             now
@@ -3512,6 +3556,8 @@ export interface VerifiedLimitInput {
   cache_type_v: string;
   placement_hash: string;
   verified_ctx_tokens: number;
+  /** Layers on GPU at the verified rung -- see ProbeResultInput.verified_ngl. */
+  verified_ngl?: number | null;
   margin_observed_frac?: number | null;
   method_version?: number | null;
 }
@@ -3524,6 +3570,7 @@ export interface VerifiedLimit {
   kv_type: string;
   placement_hash: string;
   verified_ctx_tokens: number;
+  verified_ngl: number | null;
   margin_observed_frac: number | null;
   method_version: number | null;
   created_at: number;

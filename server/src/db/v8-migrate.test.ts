@@ -191,6 +191,50 @@ describe("v8 schema evolution (§0.11)", () => {
     }).toThrow(); // worker_id FK: no such worker row.
   });
 
+  it("adds verified_ngl to a model_machine_limits that already exists without it", async () => {
+    // The legacy-database drill above creates this table fresh from
+    // schema.sql, so it proves nothing about the upgrade path that actually
+    // matters here: a database from the CURRENTLY DEPLOYED version, which
+    // already has model_machine_limits but predates the two-axis verdict.
+    // That one has to come through COLUMN_MIGRATIONS instead.
+    const dbPath = makeTmpDbPath();
+    seedLegacyDatabase(dbPath);
+    const pre = new Database(dbPath);
+    pre.exec(`
+      CREATE TABLE model_machine_limits (
+        id TEXT PRIMARY KEY,
+        worker_id TEXT NOT NULL,
+        model_id  TEXT NOT NULL,
+        llama_cpp_build TEXT NOT NULL,
+        kv_type   TEXT NOT NULL,
+        placement_hash TEXT NOT NULL,
+        verified_ctx_tokens INTEGER NOT NULL,
+        margin_observed_frac REAL,
+        method_version INTEGER,
+        created_at INTEGER NOT NULL,
+        UNIQUE(worker_id, model_id, llama_cpp_build, kv_type, placement_hash)
+      );
+    `);
+    pre.prepare(
+      `INSERT INTO model_machine_limits
+         (id, worker_id, model_id, llama_cpp_build, kv_type, placement_hash, verified_ctx_tokens, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run("old-limit", "w1", "legacy-model", "b1", "f16/f16", "ph", 41_000, 1);
+    pre.close();
+
+    const { getDb } = await freshMigrateModule(dbPath);
+    const db = getDb();
+    expect(columnsOf(db, "model_machine_limits")).toContain("verified_ngl");
+    // The pre-existing ceiling survives, and reads as "this probe never
+    // reported a layer count" rather than a fabricated one.
+    const row = db.prepare(`SELECT * FROM model_machine_limits WHERE id = 'old-limit'`).get() as {
+      verified_ctx_tokens: number;
+      verified_ngl: number | null;
+    };
+    expect(row.verified_ctx_tokens).toBe(41_000);
+    expect(row.verified_ngl).toBeNull();
+  });
+
   it("creates the v8 indexes over columns that only exist after the ALTERs ran", async () => {
     const dbPath = makeTmpDbPath();
     seedLegacyDatabase(dbPath);
@@ -345,5 +389,94 @@ describe("v8 schema evolution (§0.11)", () => {
     >;
     expect(row.repo_id).toBe("org/repo");
     expect(row.deleted_at).toBeNull();
+  });
+
+  // Live incident (2026-08-30): a VPS's probe_attempts table was created by
+  // an earlier point in the N2 ladder rework, before ram_peak_mib was added
+  // to schema.sql's CREATE TABLE. CREATE TABLE IF NOT EXISTS is a no-op
+  // against that already-existing table, so every probe-result POST threw
+  // "SqliteError: table probe_attempts has no column named ram_peak_mib" and
+  // a completed probe ladder (real loads, real VRAM readings) was discarded
+  // instead of stored. Must self-heal on boot, matching every other
+  // COLUMN_MIGRATIONS entry.
+  it("backfills a probe_attempts table that predates ram_peak_mib (2026-08-30 incident)", async () => {
+    const dbPath = makeTmpDbPath();
+    seedLegacyDatabase(dbPath);
+    const seed = new Database(dbPath);
+    seed.exec(`
+      INSERT INTO workers (id, machine_id, display_name, created_at, updated_at)
+        VALUES ('legacy-worker', 'machine-1', 'Old Box', 1, 1);
+      CREATE TABLE probe_attempts (
+        id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL,
+        worker_id TEXT NOT NULL,
+        model_id TEXT NOT NULL,
+        seq INTEGER NOT NULL,
+        candidate_ctx INTEGER NOT NULL,
+        ngl INTEGER,
+        ok INTEGER NOT NULL, oom INTEGER NOT NULL, spill INTEGER NOT NULL,
+        vram_needed_mib REAL, vram_free_mib REAL,
+        ram_needed_mib REAL, ram_free_mib REAL,
+        gen_tps REAL, error TEXT,
+        created_at INTEGER NOT NULL,
+        UNIQUE(run_id, seq)
+      );
+      INSERT INTO probe_attempts (id, run_id, worker_id, model_id, seq, candidate_ctx, ngl,
+                                   ok, oom, spill, vram_needed_mib, vram_free_mib,
+                                   ram_needed_mib, ram_free_mib, gen_tps, error, created_at)
+        VALUES ('legacy-attempt', 'legacy-run', 'legacy-worker', 'legacy-model', 0, 1024, 49,
+                1, 0, 0, 7900, 8000, 0, 32000, 55.5, NULL, 1);
+    `);
+    seed.close();
+
+    const { getDb } = await freshMigrateModule(dbPath);
+    // Must not throw -- the whole point of the fix.
+    const db = getDb();
+
+    expect(columnsOf(db, "probe_attempts")).toEqual(
+      expect.arrayContaining(["vram_peak_mib", "ram_peak_mib", "ngl", "gen_tps", "error"])
+    );
+    const row = db.prepare(`SELECT * FROM probe_attempts WHERE id = 'legacy-attempt'`).get() as Record<
+      string,
+      unknown
+    >;
+    expect(row.candidate_ctx).toBe(1024);
+    expect(row.vram_peak_mib).toBeNull();
+    expect(row.ram_peak_mib).toBeNull();
+
+    // A fresh insert using every current column (what repo.ts's
+    // replaceForRun actually does) must now succeed against the backfilled
+    // table -- this is what threw "no such column" in production.
+    expect(() =>
+      db
+        .prepare(
+          `INSERT INTO probe_attempts
+             (id, run_id, worker_id, model_id, seq, candidate_ctx, ngl,
+              ok, oom, spill, vram_needed_mib, vram_free_mib, vram_peak_mib,
+              ram_needed_mib, ram_free_mib, ram_peak_mib, gen_tps, error, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        )
+        .run(
+          "new-attempt",
+          "legacy-run",
+          "legacy-worker",
+          "legacy-model",
+          1,
+          131584,
+          49,
+          1,
+          0,
+          0,
+          40566,
+          40600,
+          6907,
+          0,
+          32000,
+          0,
+          null,
+          null,
+          Date.now()
+        )
+    ).not.toThrow();
   });
 });
