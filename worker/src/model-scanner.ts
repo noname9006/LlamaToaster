@@ -432,6 +432,8 @@ export async function backfillGgufMetadata(modelDir: string, cache: LocalModelCa
       n_embd: info.n_embd ?? entry.n_embd,
       n_head: info.n_head ?? entry.n_head,
       sliding_window: info.sliding_window ?? entry.sliding_window,
+      sliding_window_pattern: info.sliding_window_pattern ?? entry.sliding_window_pattern,
+      shared_kv_layers: info.shared_kv_layers ?? entry.shared_kv_layers,
       tensor_layer_bytes: info.tensor_layer_bytes ?? entry.tensor_layer_bytes,
       gguf_checked_at: Date.now(),
       last_verified: entry.last_verified,
@@ -679,6 +681,8 @@ export async function getModelFilesWithState(
       | "n_embd"
       | "n_head"
       | "sliding_window"
+      | "sliding_window_pattern"
+      | "shared_kv_layers"
       | "tensor_layer_bytes"
     > = {};
     if (entry.n_layer != null) ggufFields.n_layer = entry.n_layer;
@@ -692,6 +696,8 @@ export async function getModelFilesWithState(
     if (entry.n_embd != null) ggufFields.n_embd = entry.n_embd;
     if (entry.n_head != null) ggufFields.n_head = entry.n_head;
     if (entry.sliding_window != null) ggufFields.sliding_window = entry.sliding_window;
+    if (entry.sliding_window_pattern != null) ggufFields.sliding_window_pattern = entry.sliding_window_pattern;
+    if (entry.shared_kv_layers != null) ggufFields.shared_kv_layers = entry.shared_kv_layers;
     if (entry.tensor_layer_bytes != null) ggufFields.tensor_layer_bytes = entry.tensor_layer_bytes;
 
     results.push({

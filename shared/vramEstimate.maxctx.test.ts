@@ -109,11 +109,68 @@ describe("maxAffordableContext (M1)", () => {
     // Local layers' bytes are capped by the window, so affordable tokens must
     // be finite and positive; naive all-layers math would wildly overcount.
     expect(swa.tokens).toBeGreaterThan(0);
-    // The solved-global formula: tokens = max(0, raw - (48-8)*1024)/8.
+    // The solved-global formula: the 40 local layers' fixed window-bound
+    // cost comes out of the budget first, then what's left is split among
+    // just the 8 layers that actually scale with context -- NOT divided
+    // across all 48 (that would undercount each global layer's real share
+    // by ~6x here, and by nLayer/g in general).
     const usableMib = 8192 * 0.9 - 2969 - 256;
-    const raw = (usableMib * 2 ** 20) / (48 * 4 * (128 * 2 + 128 * 2));
-    const expected = Math.floor(Math.max(0, raw - (48 - 8) * 1024) / 8);
+    const perLayerBytes = 4 * (128 * 2 + 128 * 2);
+    const localFixedCostMib = ((48 - 8) * 1024 * perLayerBytes) / 2 ** 20;
+    const globalBudgetMib = Math.max(0, usableMib - localFixedCostMib);
+    const expected = Math.floor((globalBudgetMib * 2 ** 20) / (perLayerBytes * 8));
     expect(swa.tokens).toBe(expected);
+  });
+
+  // A cohere2/llama4/olmo2-style model (real default period 4, confirmed
+  // against llama.cpp's own hparam loaders) declares its own
+  // slidingWindowPattern instead of relying on the Gemma-3-style hardcoded
+  // fallback -- g should be ceil(48/4)=12 global layers, not 8.
+  it("uses a declared slidingWindowPattern instead of the hardcoded ~1-in-6 fallback", () => {
+    const swa = maxAffordableContext({ ...workedExample, slidingWindow: 1024, slidingWindowPattern: 4 });
+    expect(swa.confidence).toBe("rough");
+    const usableMib = 8192 * 0.9 - 2969 - 256;
+    const perLayerBytes = 4 * (128 * 2 + 128 * 2);
+    const localFixedCostMib = ((48 - 12) * 1024 * perLayerBytes) / 2 ** 20;
+    const globalBudgetMib = Math.max(0, usableMib - localFixedCostMib);
+    const expected = Math.floor((globalBudgetMib * 2 ** 20) / (perLayerBytes * 12));
+    expect(swa.tokens).toBe(expected);
+    // Locks in that `g` (not just the fallback constant) actually changes the
+    // result -- the exact direction/magnitude of that change is this
+    // pre-existing formula's own arithmetic (see the "raw" line above; not
+    // something this fix's scope re-derives), so this only asserts it moved,
+    // not which way.
+    const fallback = maxAffordableContext({ ...workedExample, slidingWindow: 1024 });
+    expect(swa.tokens).not.toBe(fallback.tokens);
+  });
+
+  // Gemma3n/Gemma4-style KV-cache reuse: sharedKvLayers trailing blocks carry
+  // no independent KV cache at all, so they must fall out of BOTH the global
+  // and local layer counts entirely -- never priced as either.
+  it("excludes sharedKvLayers from the SWA budget entirely, shrinking need (growing affordable tokens)", () => {
+    const noShared = maxAffordableContext({ ...workedExample, slidingWindow: 1024 });
+    const shared = maxAffordableContext({ ...workedExample, slidingWindow: 1024, sharedKvLayers: 6 });
+    // Fewer real KV-allocating layers for the same usable budget -> strictly
+    // more affordable context, never less (a shared layer can only reduce
+    // need, never increase it).
+    expect(shared.tokens).toBeGreaterThan(noShared.tokens);
+    // Hand-verified: sharedKvLayers=6 removes exactly 1 global layer
+    // (swaGlobalLayersInSuffix(6,6)=1) and 5 local layers from the 48-layer
+    // suffix, leaving g=7 global / 40 local of the 42 effective layers.
+    const usableMib = 8192 * 0.9 - 2969 - 256;
+    const perLayerBytes = 4 * (128 * 2 + 128 * 2);
+    const localFixedCostMib = ((42 - 7) * 1024 * perLayerBytes) / 2 ** 20;
+    const globalBudgetMib = Math.max(0, usableMib - localFixedCostMib);
+    const expected = Math.floor((globalBudgetMib * 2 ** 20) / (perLayerBytes * 7));
+    expect(shared.tokens).toBe(expected);
+  });
+
+  // sharedKvLayers=0/undefined must be a complete no-op -- every existing SWA
+  // caller (no such field yet) gets byte-identical numbers.
+  it("sharedKvLayers 0 or undefined reproduce the exact same SWA result", () => {
+    const base = maxAffordableContext({ ...workedExample, slidingWindow: 1024 });
+    const zero = maxAffordableContext({ ...workedExample, slidingWindow: 1024, sharedKvLayers: 0 });
+    expect(zero).toEqual(base);
   });
 
   it("is advisory-only arithmetic: never negative", () => {

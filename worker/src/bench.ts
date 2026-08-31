@@ -194,6 +194,37 @@ export interface BenchResult {
   modelBufferSizes?: ModelBufferSizesByModel;
 }
 
+// Best-effort, same honest posture as this file's other diagnostic-only
+// signals (see hardware.ts, sampler.ts's VRAM comment): a signal-killed
+// process (and it wasn't our own bench_timeout_ms kill, tracked separately
+// via BenchResult.timedOut) is what an OS OOM-killer looks like from here,
+// and a handful of common allocator error phrases catch the rest. Won't be
+// 100% precise -- some non-OOM context-creation failures may still just say
+// "failed".
+export const OOM_STDERR_PATTERN =
+  /out of memory|failed to allocate|cudaMalloc|insufficient memory|bad_alloc|not enough (memory|vram)/i;
+
+// Structural subset of BenchResult -- the only fields the verdict actually
+// needs. Kept as its own type (rather than requiring a full BenchResult) so
+// the runtime-server/probe path (which never produces a BenchResult at all)
+// can classify a crash through the exact same rule as the llama-bench-CLI
+// sweep path, instead of maintaining a second copy of this regex.
+export interface FailureClassificationInput {
+  stderr: string;
+  signal: NodeJS.Signals | null;
+  timedOut: boolean;
+}
+
+export function classifyFailure(input: FailureClassificationInput): "failed_oom" | "failed" {
+  if (!input.timedOut && (input.signal === "SIGKILL" || input.signal === "SIGABRT")) {
+    return "failed_oom";
+  }
+  if (OOM_STDERR_PATTERN.test(input.stderr)) {
+    return "failed_oom";
+  }
+  return "failed";
+}
+
 // llama.cpp's own one-line model-load summary, printed once *per model
 // loaded* by either binary once that model's tensor loading finishes --
 // confirmed live against the real binaries across -ngl 0 ("0/43"), a partial

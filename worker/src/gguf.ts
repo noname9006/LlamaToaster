@@ -152,6 +152,41 @@ class GgufReader {
     }
   }
 
+  // Reads a scalar numeric value normally, or -- when the value is
+  // ARRAY-typed -- consumes the whole array and returns its LAST element.
+  // Real per-layer hyperparameter arrays (confirmed live on a real Gemma-4
+  // GGUF: gemma4.attention.head_count_kv varies 8-per-local-layer/
+  // 1-per-global-layer, not the uniform value every other architecture
+  // writes as a scalar) can't be discarded the way sliding_window_pattern's
+  // per-layer array deliberately is -- unlike that boolean is-local FLAG
+  // array, these are the actual per-layer count/dim values
+  // shared/vramEstimate.ts's single-scalar-per-model KV formula needs one
+  // honest representative of. The array's last element is exactly that
+  // representative: llama.cpp's own hybrid-attention layouts (see
+  // shared/vramEstimate.ts's swaGlobalLayersInSuffix doc comment) always
+  // anchor the global/full-attention layer at the model's LAST transformer
+  // block, so index [len-1] is that layer's real, undiscarded value -- not a
+  // guess. For a homogeneous (non-SWA) array every element is identical
+  // anyway, so this reduces to the same answer a scalar would have given.
+  async numericScalarOrArrayLast(type: number): Promise<number | undefined> {
+    if (type !== GGUF_TYPE.ARRAY) return this.numeric(type);
+    const elemType = await this.u32();
+    const len = await this.u64();
+    if (len < 0 || len > MAX_ARRAY_LEN) throw new Error(`gguf: implausible array length ${len}`);
+    let last: number | undefined;
+    for (let i = 0; i < len; i++) {
+      if (elemType === GGUF_TYPE.STRING) {
+        await this.string(); // not a real case for any numeric hparam key; just don't crash
+        continue;
+      }
+      // numeric() has no BOOL case (nothing scalar needs it) -- read it
+      // directly rather than growing that method's contract for this one
+      // array-only caller.
+      last = elemType === GGUF_TYPE.BOOL ? await this.u8() : await this.numeric(elemType);
+    }
+    return last;
+  }
+
   async skip(type: number): Promise<void> {
     const width = FIXED_WIDTH[type];
     if (width !== undefined) {
@@ -254,6 +289,21 @@ export interface GgufInfo {
   // and <architecture>.attention.* hyperparameters. n_embd/n_head are the
   // both-or-neither fallback pair kvBytesPerToken derives head dims from when
   // the explicit key/value lengths are absent.
+  //
+  // n_head_kv/head_dim_k/head_dim_v/n_head's own header keys can each be
+  // written as a full per-layer ARRAY instead of one model-wide scalar
+  // (confirmed live on a real Gemma-4 GGUF: attention.head_count_kv varies
+  // 8-per-local-layer/1-per-global-layer -- a plain multi-head vs. an
+  // extreme-GQA global layer are genuinely different hardware costs, not a
+  // conversion quirk). shared/vramEstimate.ts still models the whole KV
+  // system with ONE scalar per field, so an ARRAY-typed key here resolves to
+  // that array's LAST element -- llama.cpp's own hybrid-attention layouts
+  // always anchor the global/full-attention layer at the model's LAST
+  // transformer block (see shared/vramEstimate.ts's swaGlobalLayersInSuffix
+  // doc comment), so index [len-1] is that layer's real value, the same one
+  // key_length/value_length already resolve to when THOSE happen to stay
+  // scalar-only (as on the real Gemma-4 file this was confirmed against) --
+  // not an arbitrary pick. See GgufReader.numericScalarOrArrayLast.
   n_head_kv: number | null;
   head_dim_k: number | null;
   head_dim_v: number | null;
@@ -263,6 +313,32 @@ export interface GgufInfo {
   // with sliding-window attention (Mistral/Gemma-style); null means plain
   // full attention, where KV cache grows linearly across the whole context.
   sliding_window: number | null;
+  // <architecture>.attention.sliding_window_pattern -- the model's own
+  // global:local interleave period (llama.cpp's hparams.set_swa_pattern(N):
+  // every Nth layer, counting backward from the model's last block, is
+  // global/full-attention, the other N-1 are local/window-bound). Real
+  // per-architecture defaults vary meaningfully -- confirmed against
+  // llama.cpp's own hparam loaders: gemma2/openai-moe use 2, cohere2/llama4/
+  // olmo2 use 4, gemma3 uses 6 -- so shared/vramEstimate.ts's hardcoded
+  // "~1-in-6" fallback is only exactly right for Gemma-3-style models. Null
+  // when the key is absent, OR when the architecture instead writes this key
+  // as a full per-layer array rather than a scalar (confirmed live against a
+  // real Gemma-4 GGUF, whose own loader reads it via llama.cpp's
+  // get_key_or_arr array overload) -- the scalar-only walk below
+  // deliberately skips ARRAY-typed values here, same as it already does for
+  // every other numeric field in this file, rather than growing this
+  // fixed-shape type a variable-length per-layer array.
+  sliding_window_pattern: number | null;
+  // <architecture>.attention.shared_kv_layers -- count of TRAILING layers
+  // (the model's LAST N transformer blocks) that reuse an earlier layer's KV
+  // cache instead of allocating their own -- confirmed against llama.cpp's
+  // own gemma3n/gemma4 loader source (src/models/gemma4.cpp:
+  // hparams.n_layer_kv_from_start = n_layer_all - shared_kv_layers; layers at
+  // index >= n_layer_kv_from_start carry no independent KV allocation at
+  // all). Null/0 (the common case, and every non-Gemma3n/4 architecture)
+  // means every layer allocates its own KV cache, same as before this field
+  // existed.
+  shared_kv_layers: number | null;
   // Real per-tensor weight-byte breakdown -- see TensorLayerBreakdown. Null
   // whenever it can't be built: n_layer unresolved (nothing to size the
   // per-block arrays against), the tensor_info walk failed, or the file has
@@ -289,6 +365,8 @@ function emptyGgufInfo(debugReason: string): GgufInfo {
     n_embd: null,
     n_head: null,
     sliding_window: null,
+    sliding_window_pattern: null,
+    shared_kv_layers: null,
     tensor_layer_bytes: null,
     debugReason,
   };
@@ -333,6 +411,8 @@ export async function readGgufInfo(filePath: string): Promise<GgufInfo> {
     const embeddingLengths = new Map<string, number>();
     const headCounts = new Map<string, number>();
     const slidingWindows = new Map<string, number>();
+    const slidingWindowPatterns = new Map<string, number>();
+    const sharedKvLayerCounts = new Map<string, number>();
 
     // Deliberately walks every KV pair rather than stopping at the first
     // "tokenizer."-prefixed key: a llama.cpp-produced GGUF always puts
@@ -366,28 +446,44 @@ export async function readGgufInfo(filePath: string): Promise<GgufInfo> {
         mtpLayerCounts.set(key, await reader.numeric(valueType));
       } else if (key.endsWith(".context_length") && valueType !== GGUF_TYPE.ARRAY && valueType !== GGUF_TYPE.STRING) {
         contextLengths.set(key, await reader.numeric(valueType));
-      } else if (
-        key.endsWith(".attention.head_count_kv") &&
-        valueType !== GGUF_TYPE.ARRAY &&
-        valueType !== GGUF_TYPE.STRING
-      ) {
-        headCountKv.set(key, await reader.numeric(valueType));
-      } else if (key.endsWith(".attention.key_length") && valueType !== GGUF_TYPE.ARRAY && valueType !== GGUF_TYPE.STRING) {
-        keyLengths.set(key, await reader.numeric(valueType));
-      } else if (
-        key.endsWith(".attention.value_length") &&
-        valueType !== GGUF_TYPE.ARRAY &&
-        valueType !== GGUF_TYPE.STRING
-      ) {
-        valueLengths.set(key, await reader.numeric(valueType));
+      } else if (key.endsWith(".attention.head_count_kv") && valueType !== GGUF_TYPE.STRING) {
+        // ARRAY-typed for some architectures (real Gemma-4 files: one
+        // n_head_kv per layer, not a single model-wide value) -- see
+        // GgufReader.numericScalarOrArrayLast's doc comment for why reading
+        // the array's last element, rather than skipping it like the
+        // pre-fix code did, is the correct representative scalar here.
+        const v = await reader.numericScalarOrArrayLast(valueType);
+        if (v != null) headCountKv.set(key, v);
+      } else if (key.endsWith(".attention.key_length") && valueType !== GGUF_TYPE.STRING) {
+        const v = await reader.numericScalarOrArrayLast(valueType);
+        if (v != null) keyLengths.set(key, v);
+      } else if (key.endsWith(".attention.value_length") && valueType !== GGUF_TYPE.STRING) {
+        const v = await reader.numericScalarOrArrayLast(valueType);
+        if (v != null) valueLengths.set(key, v);
       } else if (key.endsWith(".embedding_length") && valueType !== GGUF_TYPE.ARRAY && valueType !== GGUF_TYPE.STRING) {
         embeddingLengths.set(key, await reader.numeric(valueType));
-      } else if (key.endsWith(".attention.head_count") && valueType !== GGUF_TYPE.ARRAY && valueType !== GGUF_TYPE.STRING) {
+      } else if (key.endsWith(".attention.head_count") && valueType !== GGUF_TYPE.STRING) {
         // NB: this can't collide with .head_count_kv above -- a key ending in
         // ".head_count_kv" doesn't end in ".attention.head_count".
-        headCounts.set(key, await reader.numeric(valueType));
+        const v = await reader.numericScalarOrArrayLast(valueType);
+        if (v != null) headCounts.set(key, v);
       } else if (key.endsWith(".attention.sliding_window") && valueType !== GGUF_TYPE.ARRAY && valueType !== GGUF_TYPE.STRING) {
         slidingWindows.set(key, await reader.numeric(valueType));
+      } else if (
+        key.endsWith(".attention.sliding_window_pattern") &&
+        valueType !== GGUF_TYPE.ARRAY &&
+        valueType !== GGUF_TYPE.STRING
+      ) {
+        // Array-typed for some architectures (real Gemma-4 files) -- see
+        // GgufInfo.sliding_window_pattern's doc comment for why that case is
+        // deliberately left unread here rather than handled.
+        slidingWindowPatterns.set(key, await reader.numeric(valueType));
+      } else if (
+        key.endsWith(".attention.shared_kv_layers") &&
+        valueType !== GGUF_TYPE.ARRAY &&
+        valueType !== GGUF_TYPE.STRING
+      ) {
+        sharedKvLayerCounts.set(key, await reader.numeric(valueType));
       } else {
         await reader.skip(valueType);
       }
@@ -487,6 +583,9 @@ export async function readGgufInfo(filePath: string): Promise<GgufInfo> {
       n_embd: embeddingLengths.get(`${architecture}.embedding_length`) ?? null,
       n_head: headCounts.get(`${architecture}.attention.head_count`) ?? null,
       sliding_window: slidingWindows.get(`${architecture}.attention.sliding_window`) ?? null,
+      sliding_window_pattern:
+        slidingWindowPatterns.get(`${architecture}.attention.sliding_window_pattern`) ?? null,
+      shared_kv_layers: sharedKvLayerCounts.get(`${architecture}.attention.shared_kv_layers`) ?? null,
       tensor_layer_bytes,
       debugReason:
         n_layer === null ? `architecture "${architecture}" found but no ${architecture}.block_count key` : undefined,

@@ -11,6 +11,8 @@
 
 import { useEffect, useId, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
+import { StatusDot } from "./StatusPill";
+import type { RunItemStatus } from "../types";
 import {
   KV_PRESET_PAIRS,
   KV_PRESETS,
@@ -113,6 +115,11 @@ export interface GoalQuestionnaireProps {
     /** Keyed by mode -- every card keeps its own independent result so Test
      * All can run every mode concurrently without one overwriting another. */
     verifyResults: Partial<Record<ProbeMode, PlacementVerifyResult>>;
+    /** "Test all"'s own drain queue, lifted up so it survives a remount of
+     * this component the same way verifyResults already does -- see
+     * Benchmark.tsx's testQueueStorageKey for why. */
+    testQueue: ProbeMode[];
+    onSetTestQueue: (next: ProbeMode[]) => void;
   };
 }
 
@@ -132,6 +139,11 @@ export interface PlacementVerifyResult {
   /** When this card's Test was clicked -- epoch ms, shown compactly next to
    * the run link so a tested card names both what it found and when. */
   testedAt?: number;
+  /** The in-flight run_item's own live detail text (e.g. "probe load 5: ctx
+   * 16,384 / 49 layers"), refreshed by Benchmark.tsx's poll while status is
+   * still "pending" -- see worker/src/index.ts's sendTick call in
+   * executeRunProbeJob. Absent until the worker's first tick lands. */
+  liveDetail?: string;
 }
 
 const GOAL_CHOICES: { value: GoalKind; label: string }[] = [
@@ -741,7 +753,11 @@ function PlacementMatrix({
   // firing all six at once leaves five of them rejected with a 409. This
   // drains one mode at a time instead, advancing only once nothing for this
   // pairing (from this queue or a manual Test click) is still pending.
-  const [testQueue, setTestQueue] = useState<ProbeMode[]>([]);
+  // State lives in Benchmark.tsx (placement.testQueue), not here -- a whole
+  // ladder run can take tens of minutes, and this component can remount
+  // mid-run (a reload, or selectedModel/baseLayerCount going briefly null),
+  // which used to silently drop every mode still queued after the first.
+  const { testQueue, onSetTestQueue: setTestQueue } = placement;
 
   // Where each mode STARTS. The estimate only picks the starting point; the
   // probe measures the rest, which is the whole reason these are called
@@ -906,8 +922,10 @@ function PlacementMatrix({
             </div>
             <button
               type="button"
-              title="Runs every card below in turn -- only one probe can be in flight for this model+machine at a time"
-              onClick={() => setTestQueue(Object.keys(MODE_LABEL) as ProbeMode[])}
+              title="Runs every card below in turn (except Custom, which starts from the same point as several others) -- only one probe can be in flight for this model+machine at a time"
+              onClick={() =>
+                setTestQueue((Object.keys(MODE_LABEL) as ProbeMode[]).filter((m) => m !== "custom"))
+              }
               className="rounded-lg border border-accent px-2.5 py-1 text-[11px] font-semibold text-accent hover:bg-accent/10"
             >
               Test all
@@ -920,12 +938,18 @@ function PlacementMatrix({
           {(Object.keys(MODE_LABEL) as ProbeMode[]).map((mode) => {
             const start = modeStarts[mode];
             const result = placement.verifyResults[mode] ?? null;
+            // Clicking a verified card applies what the probe PROVED (see
+            // onApply below), not its static start point -- comparing
+            // against `start` here made a verified card's own highlight
+            // vanish the instant it was clicked, since the sliders had just
+            // moved to the applied (measured) values instead.
+            const applied = appliedConfig(result, start, trainedCtx);
             return (
               <ModeCard
                 key={mode}
                 mode={mode}
                 start={start}
-                selected={activeMode === mode && placement.ngl === start.ngl && ctx === start.ctx}
+                selected={activeMode === mode && placement.ngl === applied.ngl && ctx === applied.ctx}
                 busy={result?.status === "pending"}
                 result={result}
                 onApply={() => {
@@ -975,11 +999,32 @@ function formatTestedAt(ms: number): string {
   return `${mm}/${dd} ${hh}:${min}`;
 }
 
-// Fixed height sized for the fullest state (blurb + start values + a result
-// line + a measured-needs line + a run-link/tested-at line + the button row)
-// so all 6 cards line up regardless of which of those lines the current one
-// actually has.
-const MODE_CARD_HEIGHT = "h-[204px]";
+// Fixed height sized for the fullest state (blurb + a result line + a
+// measured-needs line + a run-link/tested-at line + the button row) so all 6
+// cards line up regardless of which of those lines the current one actually
+// has.
+const MODE_CARD_HEIGHT = "h-[180px]";
+
+// Maps a card's own status vocabulary onto StatusPill's RunItemStatus so the
+// same blinking/solid/red dot used for per-row test progress elsewhere
+// (Runs.tsx, RunDetail.tsx) reads consistently here too -- "untested" (no
+// result yet) has no RunItemStatus equivalent, so it renders as "queued"
+// (grey) rather than nothing.
+function modeCardDotStatus(result: PlacementVerifyResult | null): RunItemStatus {
+  switch (result?.status) {
+    case "pending":
+      return "benchmarking";
+    case "verified":
+      return "done";
+    case "failed_oom":
+      return "failed_oom";
+    case "failed":
+    case "error":
+      return "failed";
+    default:
+      return "queued";
+  }
+}
 
 function ModeCard({
   mode,
@@ -1002,11 +1047,13 @@ function ModeCard({
 }) {
   const running = result?.status === "pending";
   const failed = result?.status === "failed" || result?.status === "failed_oom";
+  const startLabel = `from ${mode === "max_context" ? "searched" : `${start.ngl} layers`} · ${start.ctx.toLocaleString()} tokens`;
   return (
     <div
       role="button"
       tabIndex={0}
       aria-pressed={selected}
+      title={startLabel}
       onClick={onApply}
       onKeyDown={(e) => {
         if (e.key === "Enter" || e.key === " ") {
@@ -1019,7 +1066,10 @@ function ModeCard({
       }`}
     >
       <div className="flex items-start justify-between gap-1">
-        <span className="text-[11.5px] font-semibold text-fg">{MODE_LABEL[mode]}</span>
+        <span className="flex min-w-0 items-center gap-1.5 text-[11.5px] font-semibold text-fg">
+          <StatusDot status={modeCardDotStatus(result)} />
+          <span className="truncate">{MODE_LABEL[mode]}</span>
+        </span>
         {result && !running && (
           <button
             type="button"
@@ -1036,10 +1086,10 @@ function ModeCard({
         )}
       </div>
       <span className="text-[10.5px] leading-relaxed text-muted">{MODE_BLURB[mode]}</span>
-      <span className="font-mono text-[11px] text-muted">
-        from {mode === "max_context" ? "searched" : `${start.ngl} layers`} · {start.ctx.toLocaleString()} tokens
-      </span>
       <div className="flex-1">
+        {running && (
+          <span className="block font-mono text-[10.5px] text-muted">{result?.liveDetail ?? "starting…"}</span>
+        )}
         {result?.status === "verified" && (
           <span className="block font-mono text-[11px] font-semibold text-success">
             ✓ {(result.verifiedCtxTokens ?? result.ctx).toLocaleString()} tokens

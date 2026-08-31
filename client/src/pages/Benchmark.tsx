@@ -132,6 +132,16 @@ function verifyStatesStorageKey(modelId: string, workerId: string): string {
   return `llamatoaster:benchmark:verify:${modelId}:${workerId}`;
 }
 
+// "Test all"'s own drain queue -- same reasoning as verifyStatesStorageKey
+// above, and it matters here for the identical reason: a whole ladder run
+// (nine-plus loads) can run for tens of minutes, and any remount of the
+// placement panel during that window (a reload, or selectedModel/
+// baseLayerCount going briefly null) used to silently drop every mode still
+// queued behind the one already in flight.
+function testQueueStorageKey(modelId: string, workerId: string): string {
+  return `llamatoaster:benchmark:test-queue:${modelId}:${workerId}`;
+}
+
 const PRESETS_STORAGE_KEY = "llamatoaster:benchmark:presets";
 const REPEATS_STORAGE_KEY = "llamatoaster:benchmark:repeats";
 const AUTO_ADVANCE_STORAGE_KEY = "llamatoaster:benchmark:auto-advance";
@@ -163,6 +173,12 @@ interface PlacementVerifyState {
    * re-stamped by the poll's terminal/verified updates), so it reads as
    * "when the test ran" even for a still-pending or since-reset card. */
   testedAt?: number;
+  /** The run_item's own live `detail` text, refreshed on every non-terminal
+   * poll tick (see startPolling below) -- worker/src/index.ts's probe loop
+   * now calls sendTick once per candidate load, the same mechanism a sweep
+   * item's live phase text already used. Cleared implicitly once the run
+   * goes terminal (nothing writes it after that point). */
+  liveDetail?: string;
 }
 
 // M5 -- a preset here carries INTENT (goals + repeats) and nothing machine-
@@ -419,6 +435,9 @@ export function Benchmark() {
   // card keeps its own independent result, in flight or finished, so Test
   // All can run every mode at once without one overwriting another.
   const [verifyStates, setVerifyStates] = useState<Partial<Record<ProbeMode, PlacementVerifyState>>>({});
+  // "Test all"'s drain queue -- lifted up from PlacementMatrix so it can be
+  // persisted the same way verifyStates is (see testQueueStorageKey).
+  const [testQueue, setTestQueue] = useState<ProbeMode[]>([]);
   // A real failed/failed_oom verify result means the estimate was wrong at
   // that point -- bumped so the NEXT round of suggestions doesn't just
   // recompute the same number that already failed, rather than trusting the
@@ -501,6 +520,7 @@ export function Benchmark() {
       setChain({});
       setNglOverride(null);
       setVerifyStates({});
+      setTestQueue([]);
       setPoolHaircutFrac(0);
       return;
     }
@@ -514,6 +534,7 @@ export function Benchmark() {
       verifyStatesStorageKey(modelId, workerId)
     );
     setVerifyStates(restoredVerify ?? {});
+    setTestQueue(readJson<ProbeMode[]>(testQueueStorageKey(modelId, workerId)) ?? []);
     // A card left "pending" (its probe still running server-side) when this
     // page was last torn down has no live poll loop anymore -- the one
     // verifyPlacement started died with the old mount. Re-arm one per
@@ -529,6 +550,11 @@ export function Benchmark() {
     if (!modelId || !workerId) return;
     writeJson(verifyStatesStorageKey(modelId, workerId), verifyStates);
   }, [modelId, workerId, verifyStates]);
+
+  useEffect(() => {
+    if (!modelId || !workerId) return;
+    writeJson(testQueueStorageKey(modelId, workerId), testQueue);
+  }, [modelId, workerId, testQueue]);
 
   useEffect(() => {
     if (!modelId || !workerId || nglOverride == null) return;
@@ -1025,6 +1051,20 @@ export function Benchmark() {
           pollingRunIds.current.delete(runId);
           return;
         }
+        // Still running -- surface the run_item's own live detail text (the
+        // worker ticks this once per candidate load, see
+        // worker/src/index.ts's sendTick call in executeRunProbeJob) so the
+        // card shows progress instead of sitting on a bare "Testing…" until
+        // the whole ladder finishes.
+        const liveDetail = res.items[0]?.detail;
+        if (liveDetail) {
+          setVerifyStates((prev) => {
+            const cur = prev[mode];
+            return cur && cur.runId === runId && cur.liveDetail !== liveDetail
+              ? { ...prev, [mode]: { ...cur, liveDetail } }
+              : prev;
+          });
+        }
       } catch {
         /* transient -- keep polling */
       }
@@ -1377,6 +1417,8 @@ export function Benchmark() {
                       onVerify: verifyPlacement,
                       onReset: resetVerify,
                       verifyResults: verifyStates,
+                      testQueue,
+                      onSetTestQueue: setTestQueue,
                     }
                   : undefined
               }

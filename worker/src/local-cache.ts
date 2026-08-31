@@ -38,6 +38,9 @@ export interface LocalCacheEntry {
   n_embd?: number;
   n_head?: number;
   sliding_window?: number;
+  // See ModelMetadata's matching fields (shared/types.ts) for what each means.
+  sliding_window_pattern?: number;
+  shared_kv_layers?: number;
   // Real per-tensor weight-byte breakdown -- see ModelMetadata.tensor_layer_bytes
   // (shared/types.ts) and TensorLayerBreakdown (shared/vramEstimate.ts).
   // Stored as JSON text in the actual SQLite column (see SELECT_COLS/upsert/
@@ -213,6 +216,12 @@ export class LocalModelCache {
     if (!cols.some((c) => c.name === "sliding_window")) {
       this.db.exec(`ALTER TABLE local_model_cache ADD COLUMN sliding_window INTEGER`);
     }
+    if (!cols.some((c) => c.name === "sliding_window_pattern")) {
+      this.db.exec(`ALTER TABLE local_model_cache ADD COLUMN sliding_window_pattern INTEGER`);
+    }
+    if (!cols.some((c) => c.name === "shared_kv_layers")) {
+      this.db.exec(`ALTER TABLE local_model_cache ADD COLUMN shared_kv_layers INTEGER`);
+    }
     // Real per-tensor weight-byte breakdown, JSON-encoded (see
     // LocalCacheEntry.tensor_layer_bytes's doc comment) -- SQLite has no
     // array/object column type, so this is stored as TEXT like every other
@@ -244,6 +253,15 @@ export class LocalModelCache {
       this.db.exec(`UPDATE local_model_cache SET gguf_checked_at = NULL`);
       this.db.pragma("user_version = 1");
     }
+
+    // sliding_window_pattern/shared_kv_layers are new GGUF-derived columns --
+    // same one-time re-read need as the head_count_kv fix above, gated on
+    // user_version for the same reason (no new column alone distinguishes
+    // "read by the older reader" from "checked, genuinely absent").
+    if (cacheSchemaVersion < 2) {
+      this.db.exec(`UPDATE local_model_cache SET gguf_checked_at = NULL`);
+      this.db.pragma("user_version = 2");
+    }
   }
 
   // Every column, shared by all three SELECT sites (get/getAll/getBySha256)
@@ -252,7 +270,8 @@ export class LocalModelCache {
   private static readonly SELECT_COLS =
     "path, size, mtime, sha256, hf_model_id, hf_checked_at, hf_deleted_at, " +
     "n_layer, mtp_layers, quant, param_count, gguf_checked_at, last_verified, state, " +
-    "trained_ctx, n_head_kv, head_dim_k, head_dim_v, n_embd, n_head, sliding_window, tensor_layer_bytes";
+    "trained_ctx, n_head_kv, head_dim_k, head_dim_v, n_embd, n_head, sliding_window, " +
+    "sliding_window_pattern, shared_kv_layers, tensor_layer_bytes";
 
   async get(path: string): Promise<LocalCacheEntry | null> {
     if (!this.db) throw new Error("Database not initialized");
@@ -289,8 +308,8 @@ export class LocalModelCache {
 
     this.db
       .prepare(
-        `INSERT INTO local_model_cache (path, size, mtime, sha256, hf_model_id, hf_checked_at, hf_deleted_at, n_layer, mtp_layers, quant, param_count, gguf_checked_at, last_verified, state, trained_ctx, n_head_kv, head_dim_k, head_dim_v, n_embd, n_head, sliding_window, tensor_layer_bytes)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO local_model_cache (path, size, mtime, sha256, hf_model_id, hf_checked_at, hf_deleted_at, n_layer, mtp_layers, quant, param_count, gguf_checked_at, last_verified, state, trained_ctx, n_head_kv, head_dim_k, head_dim_v, n_embd, n_head, sliding_window, sliding_window_pattern, shared_kv_layers, tensor_layer_bytes)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(path) DO UPDATE SET
            size = excluded.size,
            mtime = excluded.mtime,
@@ -312,6 +331,8 @@ export class LocalModelCache {
            n_embd = excluded.n_embd,
            n_head = excluded.n_head,
            sliding_window = excluded.sliding_window,
+           sliding_window_pattern = excluded.sliding_window_pattern,
+           shared_kv_layers = excluded.shared_kv_layers,
            tensor_layer_bytes = excluded.tensor_layer_bytes`
       )
       .run(
@@ -336,6 +357,8 @@ export class LocalModelCache {
         entry.n_embd ?? null,
         entry.n_head ?? null,
         entry.sliding_window ?? null,
+        entry.sliding_window_pattern ?? null,
+        entry.shared_kv_layers ?? null,
         entry.tensor_layer_bytes ? JSON.stringify(entry.tensor_layer_bytes) : null
       );
   }
@@ -421,6 +444,8 @@ export class LocalModelCache {
     n_embd: number | null;
     n_head: number | null;
     sliding_window: number | null;
+    sliding_window_pattern: number | null;
+    shared_kv_layers: number | null;
     tensor_layer_bytes: string | null;
   }): LocalCacheEntry {
     return {
@@ -445,6 +470,8 @@ export class LocalModelCache {
       n_embd: row.n_embd ?? undefined,
       n_head: row.n_head ?? undefined,
       sliding_window: row.sliding_window ?? undefined,
+      sliding_window_pattern: row.sliding_window_pattern ?? undefined,
+      shared_kv_layers: row.shared_kv_layers ?? undefined,
       tensor_layer_bytes: parseTensorLayerBytes(row.tensor_layer_bytes),
     };
   }

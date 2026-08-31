@@ -137,6 +137,54 @@ describe("computeDualPoolFit", () => {
     expect(swa.cpu.kvMib).toBeCloseTo(plain.cpu.kvMib, 6);
   });
 
+  // A declared slidingWindowPattern overrides the hardcoded ~1-in-6 fallback.
+  // Hand-verified for kvLayerCount:9, ngl:5, period:3: totalGlobal=ceil(9/3)=3,
+  // gpuGlobal=ceil(5/3)=2, cpuGlobal=3-2=1 (vs 1/1 at the period-6 default) --
+  // a period-3 model has more global (full-ctx-scaling) layers than the
+  // fallback assumes, so this must cost strictly MORE, not less.
+  it("uses a declared slidingWindowPattern instead of the hardcoded ~1-in-6 fallback", () => {
+    const ctxTokens = 4000;
+    const slidingWindow = 512;
+    const fallback = computeDualPoolFit(dualInput({ ngl: 5, ctxTokens, slidingWindow }));
+    const period3 = computeDualPoolFit(dualInput({ ngl: 5, ctxTokens, slidingWindow, slidingWindowPattern: 3 }));
+    const expectedGpuBytes = 2048 * (2 * ctxTokens + 3 * slidingWindow);
+    const expectedCpuBytes = 2048 * (1 * ctxTokens + 3 * slidingWindow);
+    expect(period3.gpu.kvMib).toBeCloseTo(expectedGpuBytes / BYTES_PER_MIB, 6);
+    expect(period3.cpu.kvMib).toBeCloseTo(expectedCpuBytes / BYTES_PER_MIB, 6);
+    expect(period3.gpu.kvMib).toBeGreaterThan(fallback.gpu.kvMib);
+  });
+
+  // Gemma3n/Gemma4-style KV-cache reuse: sharedKvLayers trailing blocks carry
+  // no independent KV cache at all -- excluded from BOTH the global and
+  // local counts entirely, on whichever side (GPU or CPU) they land.
+  // Hand-verified for kvLayerCount:9, ngl:5, sharedKvLayers:3 (period 6
+  // default): the shared tail (the model's last 3 layers) is entirely
+  // GPU-resident (gpuKvLayers:5 >= 3), so gpuSharedInSuffix=3,
+  // cpuSharedInSuffix=0; totalGlobal=ceil(9/6)=2, totalGlobalShared=
+  // ceil(3/6)=1, gpuGlobalAll=ceil(5/6)=1, gpuGlobalShared=ceil(3/6)=1 ->
+  // gpuGlobal=0, cpuGlobal=1; gpuLocal=5-3-0=2, cpuLocal=4-0-1=3.
+  it("excludes sharedKvLayers from both global and local counts, on whichever side they land", () => {
+    const ctxTokens = 4000;
+    const slidingWindow = 512;
+    const noShared = computeDualPoolFit(dualInput({ ngl: 5, ctxTokens, slidingWindow }));
+    const shared = computeDualPoolFit(dualInput({ ngl: 5, ctxTokens, slidingWindow, sharedKvLayers: 3 }));
+    const expectedGpuBytes = 2048 * (0 * ctxTokens + 2 * slidingWindow);
+    const expectedCpuBytes = 2048 * (1 * ctxTokens + 3 * slidingWindow);
+    expect(shared.gpu.kvMib).toBeCloseTo(expectedGpuBytes / BYTES_PER_MIB, 6);
+    expect(shared.cpu.kvMib).toBeCloseTo(expectedCpuBytes / BYTES_PER_MIB, 6);
+    // Removing 3 of the GPU side's 5 KV-bearing layers from the budget
+    // entirely can only shrink GPU need, never grow it.
+    expect(shared.gpu.kvMib).toBeLessThan(noShared.gpu.kvMib);
+  });
+
+  // sharedKvLayers 0/undefined must be a complete no-op -- every existing SWA
+  // caller (no such field yet) gets byte-identical numbers.
+  it("sharedKvLayers 0 or undefined reproduce the exact same SWA split", () => {
+    const base = computeDualPoolFit(dualInput({ ngl: 5, ctxTokens: 4000, slidingWindow: 512 }));
+    const zero = computeDualPoolFit(dualInput({ ngl: 5, ctxTokens: 4000, slidingWindow: 512, sharedKvLayers: 0 }));
+    expect(zero).toEqual(base);
+  });
+
   it("reports fits:null (not false) when a pool's live reading is missing", () => {
     const missingVram = computeDualPoolFit(dualInput({ ngl: 5, vram: { freeMib: null, totalMib: null } }));
     expect(missingVram.gpu.fits).toBeNull();

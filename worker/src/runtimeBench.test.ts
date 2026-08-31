@@ -1,13 +1,17 @@
+import { spawn } from "node:child_process";
 import { describe, expect, it } from "vitest";
 import {
   executeCurvePoint,
   executeKneeLadder,
   probeSucceeded,
+  spawnRuntimeServer,
+  RuntimeServerStartupError,
   PROBE_MIN_GEN_TPS,
   type StreamedRequestInput,
 } from "./runtimeBench.js";
 import type { StreamSample } from "./loadDriver.js";
 import { CURVE_METHOD_VERSION } from "../../shared/types.js";
+import type { SweepItem } from "../../shared/sweep.js";
 
 // A fake llama-server: every request is recorded, and the reply is shaped by
 // whether the caller opted into prefix-cache reuse.
@@ -227,4 +231,124 @@ describe("N2 probe success rule", () => {
       reason: null,
     });
   });
+});
+
+// spawnRuntimeServer's readiness-failure path (the bug worker/src/index.ts's
+// runOneProbeLoad used to hit): the child dies before its health port ever
+// answers, so the ONLY way its diagnostic output can reach the caller is if
+// the thrown error itself carries it -- `server` never gets assigned in that
+// caller, since spawnRuntimeServer never returns. spawnFn drives a REAL
+// (trivial, script-based) node child process rather than a real llama-server
+// binary, mirroring this file's existing "seam tests drive instead of a real
+// llama-server" pattern for the completion function above.
+describe("spawnRuntimeServer readiness failures", () => {
+  const BASE_ITEM: SweepItem = {
+    idx: 0,
+    n_prompt: 512,
+    n_gen: 128,
+    n_depth: 0,
+    concurrency: 1,
+    threads: 4,
+    n_gpu_layers: 0,
+    batch_size: 512,
+    ubatch_size: 512,
+    cache_type_k: "f16",
+    cache_type_v: "f16",
+    flash_attn: "on",
+    mtp: "off",
+    n_gpu_layers_draft: 0,
+    n_cpu_moe: 0,
+  };
+
+  // Nothing ever listens here, so waitForReady's health-check fetches just
+  // fail (ECONNREFUSED) until the fake process's death is observed.
+  const DEAD_PORT_BASE = 48173;
+
+  function crashingSpawnFn(stderrText: string) {
+    const script = `process.stderr.write(${JSON.stringify(stderrText)}, () => { process.exit(1); });`;
+    return () => spawn(process.execPath, ["-e", script], { stdio: ["ignore", "pipe", "pipe"] });
+  }
+
+  it("carries the child's real stderr and exit code when it dies before becoming ready, OOM-shaped output", async () => {
+    const oomText = "ggml_cuda_host_malloc: failed to allocate 16384.00 MiB of pinned memory: out of memory\n";
+    await expect(
+      spawnRuntimeServer({
+        // A nonexistent binary path -- same pattern as bench.test.ts's
+        // benchInput(): the flag-support probe's spawn() hits ENOENT and
+        // resolves false quickly, since spawnFn below replaces the real
+        // spawn() call entirely and never touches this path.
+        llamaServerPath: "/nonexistent/fake-llama-server",
+        modelPath: "/models/fake.gguf",
+        port: DEAD_PORT_BASE,
+        item: BASE_ITEM,
+        slots: 1,
+        spawnFn: crashingSpawnFn(oomText),
+      })
+    ).rejects.toThrow(RuntimeServerStartupError);
+
+    try {
+      await spawnRuntimeServer({
+        llamaServerPath: "/nonexistent/fake-llama-server",
+        modelPath: "/models/fake.gguf",
+        port: DEAD_PORT_BASE,
+        item: BASE_ITEM,
+        slots: 1,
+        spawnFn: crashingSpawnFn(oomText),
+      });
+      expect.unreachable("spawnRuntimeServer should have rejected");
+    } catch (err) {
+      expect(err).toBeInstanceOf(RuntimeServerStartupError);
+      const startupErr = err as RuntimeServerStartupError;
+      expect(startupErr.stderr).toContain("out of memory");
+      expect(startupErr.code).toBe(1);
+      expect(startupErr.signal).toBeNull();
+    }
+  }, 10_000);
+
+  it("still carries stderr for a crash that is NOT OOM-shaped, rather than discarding it", async () => {
+    const crashText = "Segmentation fault (core dumped)\n";
+    try {
+      await spawnRuntimeServer({
+        llamaServerPath: "/nonexistent/fake-llama-server",
+        modelPath: "/models/fake.gguf",
+        port: DEAD_PORT_BASE + 1,
+        item: BASE_ITEM,
+        slots: 1,
+        spawnFn: crashingSpawnFn(crashText),
+      });
+      expect.unreachable("spawnRuntimeServer should have rejected");
+    } catch (err) {
+      expect(err).toBeInstanceOf(RuntimeServerStartupError);
+      const startupErr = err as RuntimeServerStartupError;
+      expect(startupErr.stderr).toContain("Segmentation fault");
+      expect(startupErr.code).toBe(1);
+    }
+  }, 10_000);
+
+  it("still returns a working handle when the child DOES become ready (regression check on the spawnFn refactor)", async () => {
+    const port = DEAD_PORT_BASE + 2;
+    const script = `
+      const http = require('http');
+      process.stderr.write('startup diagnostic line\\n');
+      const server = http.createServer((req, res) => {
+        if (req.url === '/health') { res.writeHead(200); res.end('ok'); }
+        else { res.writeHead(404); res.end(); }
+      });
+      server.listen(${port});
+    `;
+    const handle = await spawnRuntimeServer({
+      llamaServerPath: "/nonexistent/fake-llama-server",
+      modelPath: "/models/fake.gguf",
+      port,
+      item: BASE_ITEM,
+      slots: 1,
+      spawnFn: () => spawn(process.execPath, ["-e", script], { stdio: ["ignore", "pipe", "pipe"] }),
+    });
+    try {
+      expect(handle.port).toBe(port);
+      expect(handle.stderr()).toContain("startup diagnostic line");
+    } finally {
+      await handle.stop();
+    }
+  }, 10_000);
 });

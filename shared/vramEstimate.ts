@@ -314,6 +314,13 @@ export interface MaxCtxInput {
   cacheTypeK: string;
   cacheTypeV: string;
   slidingWindow?: number;
+  // <architecture>.attention.sliding_window_pattern / .shared_kv_layers --
+  // see worker/src/gguf.ts's GgufInfo doc comments for what each means and
+  // SWA_PATTERN_FALLBACK/swaGlobalLayersInSuffix for how they refine the SWA
+  // branch below. Both undefined (the common case) reproduces the exact
+  // pre-existing behavior: the hardcoded ~1-in-6 fallback, no shared layers.
+  slidingWindowPattern?: number;
+  sharedKvLayers?: number;
   // M1's own stated fallback when confidence can only be "unknown": offer
   // the full-trained_ctx load as a conservative floor candidate, explicitly
   // labeled conservative -- never invent a weights number instead.
@@ -425,21 +432,40 @@ export function residentWeightsMibFromPeak(
   return Math.max(0, Math.round(input.vramPeakMib - kvMib - scratch));
 }
 
+// Fallback global:local interleave period, used only when a model's own
+// header doesn't resolve a real one (worker/src/gguf.ts's
+// GgufInfo.sliding_window_pattern -- null either because the key is absent,
+// or because the architecture writes it as a full per-layer array rather
+// than a scalar period, confirmed live on a real Gemma-4 GGUF). Matches
+// Gemma-3's own default (llama.cpp's llama_model_gemma3::load_arch_hparams),
+// but real periods vary meaningfully by architecture -- confirmed against
+// llama.cpp's own hparam loaders: gemma2/openai-moe use 2, cohere2/llama4/
+// olmo2 use 4, gemma3 (and, empirically, a real gemma-4-12b GGUF's per-layer
+// array) use 6. This is a documented fallback, not a universally-correct
+// default: it silently UNDERcounts global layers -- and so underestimates
+// VRAM need, the unsafe direction -- for a period-2/4 architecture whose
+// file doesn't declare its own pattern.
+const SWA_PATTERN_FALLBACK = 6;
+
 // Global (full-attention) layer count within a GPU-resident SUFFIX of
 // `subsetLen` blocks, for the Gemma-style hybrid attention pattern where the
 // model's LAST block is always global and full-attention blocks repeat every
-// 6th block counting backward from there (see the module's SWA doc comments
-// below for the fuller rationale). Because that phase is anchored at the
-// model's own final block -- never at wherever a subset happens to start --
-// this count depends only on subsetLen, not on the size of the model the
-// subset was taken from: it's exact (given the pattern assumption) whether
-// the subset is the whole model (maxAffordableContext below) or the
-// GPU-resident tail of a partial --ngl offload (computeDualPoolFit's
-// gpuKvLayers further down), since llama.cpp always offloads the LAST `ngl`
-// blocks first -- i.e. the GPU side is always a suffix ending at the same
-// final block the pattern is anchored to.
-function swaGlobalLayersInSuffix(subsetLen: number): number {
-  return subsetLen <= 0 ? 0 : Math.ceil(subsetLen / 6);
+// `period`-th block counting backward from there (see the module's SWA doc
+// comments below for the fuller rationale, and SWA_PATTERN_FALLBACK's own
+// comment for what `period` defaults to and why). Because that phase is
+// anchored at the model's own final block -- never at wherever a subset
+// happens to start -- this count depends only on subsetLen (and period), not
+// on the size of the model the subset was taken from: it's exact (given the
+// pattern assumption) whether the subset is the whole model
+// (maxAffordableContext below) or the GPU-resident tail of a partial --ngl
+// offload (computeDualPoolFit's gpuKvLayers further down), since llama.cpp
+// always offloads the LAST `ngl` blocks first -- i.e. the GPU side is always
+// a suffix ending at the same final block the pattern is anchored to. The
+// same anchoring lets it also count global layers within a model's
+// shared-KV TRAILING block (see maxAffordableContext/computeDualPoolFit's
+// sharedKvLayers handling) -- that block is itself just another such suffix.
+function swaGlobalLayersInSuffix(subsetLen: number, period: number = SWA_PATTERN_FALLBACK): number {
+  return subsetLen <= 0 ? 0 : Math.ceil(subsetLen / Math.max(1, period));
 }
 
 export function maxAffordableContext(input: MaxCtxInput): MaxCtxEstimate {
@@ -468,12 +494,46 @@ export function maxAffordableContext(input: MaxCtxInput): MaxCtxEstimate {
     // SWA -- direction matters because this is the inverse. The forward
     // estimator's naive all-layers-full-context error overestimates cost;
     // here the same naivety would overestimate affordable tokens, which is
-    // the unsafe direction. Assume the Gemma-style ~1 global : 5 local
-    // interleave: local layers contribute their window-bound bytes and the
-    // global budget is solved for.
-    const g = swaGlobalLayersInSuffix(input.nLayer);
-    const rawTokens = (usableMib * 2 ** 20) / kvBytesPerTok;
-    const tokens = Math.max(0, rawTokens - (input.nLayer - g) * input.slidingWindow) / g;
+    // the unsafe direction. Uses the model's own declared global:local
+    // interleave period when available, falling back to the Gemma-3-style
+    // ~1-in-6 assumption otherwise -- see SWA_PATTERN_FALLBACK's doc comment.
+    // Local layers contribute their window-bound bytes and the global budget
+    // is solved for.
+    const period = input.slidingWindowPattern ?? SWA_PATTERN_FALLBACK;
+    // Shared (KV-reusing) layers are themselves the model's own trailing
+    // suffix (llama.cpp reuses an earlier layer's cache for exactly its LAST
+    // `sharedKvLayers` blocks -- see worker/src/gguf.ts's
+    // GgufInfo.shared_kv_layers), so subtracting a same-anchor suffix count
+    // from the whole-model count is exact given the pattern assumption, the
+    // same trick computeDualPoolFit's GPU/CPU split uses below. Clamped to
+    // nLayer-1 (never nLayer itself): llama.cpp's own gemma3n/gemma4 loader
+    // asserts at least 2 layers keep an independent KV cache, so a model
+    // literally cannot have zero real KV-allocating layers.
+    const sharedInSuffix = Math.min(Math.max(0, input.nLayer - 1), Math.max(0, input.sharedKvLayers ?? 0));
+    const totalGlobal = swaGlobalLayersInSuffix(input.nLayer, period);
+    const globalInSharedTail = swaGlobalLayersInSuffix(sharedInSuffix, period);
+    // Clamped to >=1: a model whose ENTIRE global-layer set happened to fall
+    // inside its shared tail would make this 0, which this inversion can't
+    // divide by. Treating one local layer as if it scaled with context
+    // charges MORE bytes per requested token than that layer really needs,
+    // which can only shrink the inverted "max affordable context" -- the
+    // safe direction, consistent with this whole branch's
+    // never-overestimate-affordable-tokens posture.
+    const g = Math.max(1, totalGlobal - globalInSharedTail);
+    const effectiveLayers = input.nLayer - sharedInSuffix;
+    const perLayerBytes = kvBytesPerToken({ ...input, nLayer: 1 }).bytes ?? 0;
+    // Only the g GLOBAL layers scale with the requested context; the
+    // (effectiveLayers - g) local layers are capped at slidingWindow tokens
+    // each no matter how large the context gets, so their cost is fixed --
+    // pay it out of the budget first, then divide what's left among just the
+    // g layers that actually grow. Dividing the whole budget by
+    // (perLayerBytes * effectiveLayers) here (as this used to) instead of by
+    // (perLayerBytes * g) undercounts each global layer's real share by a
+    // factor of effectiveLayers/g -- for a 49-layer model with 1-in-6 global
+    // layers, roughly 49x too little.
+    const localFixedCostMib = ((effectiveLayers - g) * input.slidingWindow * perLayerBytes) / 2 ** 20;
+    const globalBudgetMib = Math.max(0, usableMib - localFixedCostMib);
+    const tokens = (globalBudgetMib * 2 ** 20) / (perLayerBytes * g);
     return { tokens: Math.floor(tokens), confidence: "rough", binding: "kv" };
   }
 
@@ -509,9 +569,17 @@ export function maxAffordableContext(input: MaxCtxInput): MaxCtxEstimate {
 // simply whatever's left: swaGlobalLayersInSuffix(kvLayerCount) -
 // swaGlobalLayersInSuffix(gpuKvLayers) -- exact for the same reason, since
 // both counts are taken from the same anchored pattern. Confidence still
-// drops one level whenever slidingWindow is set (dualPoolConfidence below),
-// since the pattern itself (a fixed 1-global-per-6-layer interleave) is
-// still an assumption, not read from the model's own header.
+// drops one level whenever slidingWindow is set (dualPoolConfidence below):
+// even with a real slidingWindowPattern period read from the header, which
+// layers carry NO independent KV at all still relies on sharedKvLayers being
+// exactly the model's trailing N blocks (see swaGlobalLayersInSuffix's own
+// doc comment) rather than something read layer-by-layer.
+//
+// sharedKvLayers (when set) further excludes the model's trailing
+// KV-reusing blocks from both the global and local counts entirely -- see
+// GgufInfo.shared_kv_layers's doc comment -- using the same suffix-anchored
+// subtraction trick, since that trailing block is itself just another suffix
+// of the same anchored pattern.
 
 export const RAM_ESTIMATE_FIXED_OVERHEAD_MIB = 512;
 
@@ -536,6 +604,9 @@ export interface DualPoolInput {
   cacheTypeK: string;
   cacheTypeV: string;
   slidingWindow?: number;
+  // See MaxCtxInput's matching fields for what each means.
+  slidingWindowPattern?: number;
+  sharedKvLayers?: number;
   parallelSlots?: number;
   vram: PoolReading;
   ram: PoolReading;
@@ -622,23 +693,37 @@ export function computeDualPoolFit(input: DualPoolInput): DualPoolFit {
     // See this function's doc comment above: the GPU side is always a
     // suffix ending at the model's last block, so swaGlobalLayersInSuffix
     // applies directly to it; the CPU side's global count is just the
-    // model-wide total minus the GPU side's share.
-    const totalGlobal = swaGlobalLayersInSuffix(input.kvLayerCount);
-    const gpuGlobal = swaGlobalLayersInSuffix(gpuKvLayers);
-    const cpuGlobal = Math.max(0, totalGlobal - gpuGlobal);
+    // model-wide total minus the GPU side's share. Uses the model's own
+    // declared period when available, falling back to the Gemma-3-style
+    // ~1-in-6 assumption otherwise -- see SWA_PATTERN_FALLBACK's doc comment.
+    const period = input.slidingWindowPattern ?? SWA_PATTERN_FALLBACK;
+    // The shared (KV-reusing) tail is itself a suffix of the whole model,
+    // anchored at the same final block -- so splitting it across the GPU/CPU
+    // boundary is the same min()-against-gpuKvLayers trick as gpuKvLayers
+    // itself above: whichever of it lands within the GPU's own suffix stays
+    // there, the rest falls to the CPU side.
+    const sharedInSuffix = Math.min(input.kvLayerCount, Math.max(0, input.sharedKvLayers ?? 0));
+    const gpuSharedInSuffix = Math.min(gpuKvLayers, sharedInSuffix);
+    const cpuSharedInSuffix = sharedInSuffix - gpuSharedInSuffix;
+    const totalGlobal = swaGlobalLayersInSuffix(input.kvLayerCount, period);
+    const totalGlobalShared = swaGlobalLayersInSuffix(sharedInSuffix, period);
+    const gpuGlobalAll = swaGlobalLayersInSuffix(gpuKvLayers, period);
+    const gpuGlobalShared = swaGlobalLayersInSuffix(gpuSharedInSuffix, period);
+    // Shared layers carry no independent KV cache at all (see
+    // GgufInfo.shared_kv_layers) -- excluded from every count below rather
+    // than priced as global OR local. When sharedKvLayers is 0/undefined
+    // (the common case), sharedInSuffix/gpuSharedInSuffix/*Shared above are
+    // all 0 and every line below reduces to exactly the pre-existing
+    // formula.
+    const gpuGlobal = Math.max(0, gpuGlobalAll - gpuGlobalShared);
+    const cpuGlobal = Math.max(0, totalGlobal - totalGlobalShared - gpuGlobal);
+    const gpuLocal = Math.max(0, gpuKvLayers - gpuSharedInSuffix - gpuGlobal);
+    const cpuLocal = Math.max(0, cpuKvLayers - cpuSharedInSuffix - cpuGlobal);
     const perLayerBytes = kvBytesPerToken({ ...kvGeometry, nLayer: 1 }).bytes ?? 0;
     const localTokens = Math.min(input.ctxTokens, input.slidingWindow);
     const slots = Math.max(1, input.parallelSlots ?? 1);
-    gpuKvMib =
-      (perLayerBytes *
-        (gpuGlobal * input.ctxTokens + (gpuKvLayers - gpuGlobal) * localTokens) *
-        slots) /
-      BYTES_PER_MIB;
-    cpuKvMib =
-      (perLayerBytes *
-        (cpuGlobal * input.ctxTokens + (cpuKvLayers - cpuGlobal) * localTokens) *
-        slots) /
-      BYTES_PER_MIB;
+    gpuKvMib = (perLayerBytes * (gpuGlobal * input.ctxTokens + gpuLocal * localTokens) * slots) / BYTES_PER_MIB;
+    cpuKvMib = (perLayerBytes * (cpuGlobal * input.ctxTokens + cpuLocal * localTokens) * slots) / BYTES_PER_MIB;
   } else {
     gpuKvMib =
       estimateKvCacheMib({ ...kvGeometry, nLayer: gpuKvLayers, tokens: input.ctxTokens, parallelSlots: input.parallelSlots }) ??
@@ -734,6 +819,9 @@ export interface SuggestInput {
   cacheTypeK: string;
   cacheTypeV: string;
   slidingWindow?: number;
+  // See MaxCtxInput's matching fields for what each means.
+  slidingWindowPattern?: number;
+  sharedKvLayers?: number;
   parallelSlots?: number;
   vram: PoolReading;
   ram: PoolReading;
@@ -765,6 +853,8 @@ export function suggestPlacementConfigs(input: SuggestInput): SuggestionResult {
       cacheTypeK: input.cacheTypeK,
       cacheTypeV: input.cacheTypeV,
       slidingWindow: input.slidingWindow,
+      slidingWindowPattern: input.slidingWindowPattern,
+      sharedKvLayers: input.sharedKvLayers,
       parallelSlots: input.parallelSlots,
       vram: input.vram,
       ram: input.ram,

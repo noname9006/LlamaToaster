@@ -219,6 +219,15 @@ export interface ModelMetadata {
   n_embd?: number;
   n_head?: number;
   sliding_window?: number;
+  // SWA geometry beyond the plain window size -- see worker/src/gguf.ts's
+  // GgufInfo.sliding_window_pattern/shared_kv_layers for what each means and
+  // shared/vramEstimate.ts's swaGlobalLayersInSuffix/sharedKvLayers handling
+  // for how they refine the SWA VRAM estimate beyond its Gemma-3-style
+  // hardcoded fallback. Undefined for models registered before these
+  // existed, or read from a header that writes sliding_window_pattern as a
+  // per-layer array rather than a scalar (see that field's own doc comment).
+  sliding_window_pattern?: number;
+  shared_kv_layers?: number;
   // Total parameter count (raw element count across every tensor in the
   // GGUF, as Hugging Face itself computes it from the file's tensor shapes)
   // -- fetched from HF's model API at download time, see
@@ -1133,6 +1142,9 @@ export interface ModelDirFile {
   n_embd?: number | null;
   n_head?: number | null;
   sliding_window?: number | null;
+  // See ModelMetadata's matching fields for what each means.
+  sliding_window_pattern?: number | null;
+  shared_kv_layers?: number | null;
   // Real per-tensor weight-byte breakdown -- see ModelMetadata's matching
   // field. Same optional-null convention: null = tensor_info walk ran but
   // couldn't build one (e.g. n_layer unresolved), absent = old worker code.
@@ -1369,6 +1381,9 @@ export interface ModelDownloadCallbackInput {
   n_embd?: number | null;
   n_head?: number | null;
   sliding_window?: number | null;
+  // See ModelMetadata's matching fields for what each means.
+  sliding_window_pattern?: number | null;
+  shared_kv_layers?: number | null;
   // Real per-tensor weight-byte breakdown from the same GGUF header read --
   // see ModelMetadata.tensor_layer_bytes.
   tensor_layer_bytes?: TensorLayerBreakdown | null;
