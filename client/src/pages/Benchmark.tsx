@@ -132,14 +132,12 @@ function verifyStatesStorageKey(modelId: string, workerId: string): string {
   return `llamatoaster:benchmark:verify:${modelId}:${workerId}`;
 }
 
-// "Test all"'s own drain queue -- same reasoning as verifyStatesStorageKey
-// above, and it matters here for the identical reason: a whole ladder run
-// (nine-plus loads) can run for tens of minutes, and any remount of the
-// placement panel during that window (a reload, or selectedModel/
-// baseLayerCount going briefly null) used to silently drop every mode still
-// queued behind the one already in flight.
-function testQueueStorageKey(modelId: string, workerId: string): string {
-  return `llamatoaster:benchmark:test-queue:${modelId}:${workerId}`;
+// N2 batching -- which probe root new "Run test" triggers attach to, so a
+// batch survives the same remounts verifyStatesStorageKey's own comment
+// describes (a reload, or selectedModel/baseLayerCount going briefly null)
+// while its scenarios are still running/queued.
+function batchRootIdStorageKey(modelId: string, workerId: string): string {
+  return `llamatoaster:benchmark:batch-root:${modelId}:${workerId}`;
 }
 
 const PRESETS_STORAGE_KEY = "llamatoaster:benchmark:presets";
@@ -156,7 +154,10 @@ interface PlacementVerifyState {
   ngl: number;
   ctx: number;
   runId: string;
-  status: "pending" | "verified" | "failed" | "failed_oom" | "error";
+  // "cancelled" -- a user stop mid-ladder (worker/src/index.ts's
+  // stopRequested check), distinct from failed/failed_oom: it means nobody
+  // let the search finish, not that the placement doesn't fit.
+  status: "pending" | "verified" | "failed" | "failed_oom" | "cancelled" | "error";
   detail?: string;
   verifiedCtxTokens?: number | null;
   /** Which Tested-configurations card fired this probe. */
@@ -179,6 +180,12 @@ interface PlacementVerifyState {
    * item's live phase text already used. Cleared implicitly once the run
    * goes terminal (nothing writes it after that point). */
   liveDetail?: string;
+  /** Scheduled (queued, not yet claimed by the worker) vs actually running --
+   * only meaningful while status is "pending". N2 batching can leave a card
+   * queued behind an earlier batch member for a while, so this is what lets
+   * the card distinguish "waiting its turn" from "loading right now" (see
+   * GoalQuestionnaire.tsx's ModeCard). Undefined once terminal. */
+  runStatus?: "scheduled" | "running";
 }
 
 // M5 -- a preset here carries INTENT (goals + repeats) and nothing machine-
@@ -435,9 +442,11 @@ export function Benchmark() {
   // card keeps its own independent result, in flight or finished, so Test
   // All can run every mode at once without one overwriting another.
   const [verifyStates, setVerifyStates] = useState<Partial<Record<ProbeMode, PlacementVerifyState>>>({});
-  // "Test all"'s drain queue -- lifted up from PlacementMatrix so it can be
-  // persisted the same way verifyStates is (see testQueueStorageKey).
-  const [testQueue, setTestQueue] = useState<ProbeMode[]>([]);
+  // N2 batching -- the probe root every "Run test" trigger for this pairing
+  // currently attaches to, once one has been established; null means the
+  // next trigger starts a fresh batch. Lifted up so it survives a remount
+  // the same way verifyStates does (see batchRootIdStorageKey).
+  const [batchRootId, setBatchRootId] = useState<string | null>(null);
   // A real failed/failed_oom verify result means the estimate was wrong at
   // that point -- bumped so the NEXT round of suggestions doesn't just
   // recompute the same number that already failed, rather than trusting the
@@ -520,7 +529,7 @@ export function Benchmark() {
       setChain({});
       setNglOverride(null);
       setVerifyStates({});
-      setTestQueue([]);
+      setBatchRootId(null);
       setPoolHaircutFrac(0);
       return;
     }
@@ -534,7 +543,7 @@ export function Benchmark() {
       verifyStatesStorageKey(modelId, workerId)
     );
     setVerifyStates(restoredVerify ?? {});
-    setTestQueue(readJson<ProbeMode[]>(testQueueStorageKey(modelId, workerId)) ?? []);
+    setBatchRootId(readJson<string>(batchRootIdStorageKey(modelId, workerId)) ?? null);
     // A card left "pending" (its probe still running server-side) when this
     // page was last torn down has no live poll loop anymore -- the one
     // verifyPlacement started died with the old mount. Re-arm one per
@@ -553,8 +562,8 @@ export function Benchmark() {
 
   useEffect(() => {
     if (!modelId || !workerId) return;
-    writeJson(testQueueStorageKey(modelId, workerId), testQueue);
-  }, [modelId, workerId, testQueue]);
+    writeJson(batchRootIdStorageKey(modelId, workerId), batchRootId);
+  }, [modelId, workerId, batchRootId]);
 
   useEffect(() => {
     if (!modelId || !workerId || nglOverride == null) return;
@@ -878,15 +887,24 @@ export function Benchmark() {
   // convention GoalQuestionnaire's own feasibility readout already uses.
   // Disables synchronously (setVerifyStates before the await) so a
   // double-click on the SAME card can never fire two triggers -- a
-  // different card's own mode is untouched, so Test All can fire every mode
-  // at once.
+  // different card's own mode is untouched, so several modes can be fired
+  // one after another in the same "Run test" click.
+  //
+  // batchRootId, when passed, attaches this trigger as a sibling under an
+  // existing probe root (N2 batching -- see shared/types.ts's
+  // TriggerPayload.probe_batch_root_id) instead of starting a fresh one, so
+  // several modes fired from one Run test click collapse into one Runs-list
+  // row. Returns the created run's id so the caller (GoalQuestionnaire's Run
+  // test handler) can thread the FIRST call's id into the rest of the same
+  // click's triggers; undefined on failure.
   async function verifyPlacement(
     ngl: number,
     ctx: number,
     mode: ProbeMode,
-    granularity: ProbeGranularity
-  ): Promise<void> {
-    if (!modelId || !workerId || verifyStates[mode]?.status === "pending") return;
+    granularity: ProbeGranularity,
+    batchRootIdArg?: string
+  ): Promise<string | undefined> {
+    if (!modelId || !workerId || verifyStates[mode]?.status === "pending") return undefined;
     const testedAt = Date.now();
     setVerifyStates((prev) => ({ ...prev, [mode]: { ngl, ctx, runId: "", status: "pending", mode, testedAt } }));
     try {
@@ -896,6 +914,7 @@ export function Benchmark() {
         worker_id: workerId,
         kind: "probe",
         main_gpu: selectedGpu ? selectedGpuRawIndex : undefined,
+        probe_batch_root_id: batchRootIdArg,
         probe: {
           candidate_ctx: ctx,
           placement: { ngl, slots: 1 },
@@ -925,6 +944,7 @@ export function Benchmark() {
       });
       setVerifyStates((prev) => ({ ...prev, [mode]: { ngl, ctx, runId: run.id, status: "pending", mode, testedAt } }));
       startPolling(mode, run.id);
+      return run.id;
     } catch (err) {
       setVerifyStates((prev) => ({
         ...prev,
@@ -938,6 +958,35 @@ export function Benchmark() {
           detail: err instanceof Error ? err.message : String(err),
         },
       }));
+      return undefined;
+    }
+  }
+
+  // N2 batching -- fires every requested mode's verify in order (awaited
+  // sequentially so batch membership is deterministic; NOT waiting for each
+  // run to finish -- verifyPlacement's own startPolling tracks each mode
+  // independently, so every selected card shows scheduled/running in place
+  // immediately while the worker_jobs FIFO queue serializes actual
+  // execution). The first trigger of a fresh batch establishes the root;
+  // every later one in this call, and any later "Run test" click while that
+  // batch is still open, attaches to it instead of 409ing or starting a new
+  // row on the Runs list.
+  async function runModes(
+    modes: ProbeMode[],
+    modeStarts: Record<ProbeMode, { ngl: number; ctx: number }>,
+    granularity: ProbeGranularity
+  ): Promise<void> {
+    const toRun = modes.filter((m) => verifyStates[m]?.status !== "pending");
+    if (toRun.length === 0) return;
+    const batchStillOpen = Object.values(verifyStates).some((s) => s?.status === "pending");
+    let rootId = batchStillOpen ? (batchRootId ?? undefined) : undefined;
+    for (const mode of toRun) {
+      const start = modeStarts[mode];
+      const newId = await verifyPlacement(start.ngl, start.ctx, mode, granularity, rootId);
+      if (!rootId && newId) {
+        rootId = newId;
+        setBatchRootId(newId);
+      }
     }
   }
 
@@ -1002,11 +1051,23 @@ export function Benchmark() {
         if (unmountedRef.current) return;
         if (TERMINAL.has(res.run.status)) {
           const item = res.items[0];
+          // "cancelled" (a user stop, see worker/src/index.ts's stopRequested
+          // check inside executeRunProbeJob) is its own outcome, not a
+          // failure -- it means nobody let the ladder finish, not that the
+          // estimate was wrong or the placement doesn't fit.
           const status: PlacementVerifyState["status"] =
-            item?.status === "failed_oom" ? "failed_oom" : item?.status === "done" ? "verified" : "failed";
+            item?.status === "failed_oom"
+              ? "failed_oom"
+              : item?.status === "done"
+                ? "verified"
+                : item?.status === "cancelled"
+                  ? "cancelled"
+                  : "failed";
           setVerifyStates((prev) => {
             const cur = prev[mode];
-            return cur && cur.runId === runId ? { ...prev, [mode]: { ...cur, status, detail: item?.detail } } : prev;
+            return cur && cur.runId === runId
+              ? { ...prev, [mode]: { ...cur, status, detail: item?.detail, runStatus: undefined } }
+              : prev;
           });
           if (status === "failed" || status === "failed_oom") {
             setPoolHaircutFrac((f) => Math.min(0.3, f === 0 ? 0.15 : 0.3));
@@ -1055,16 +1116,24 @@ export function Benchmark() {
         // worker ticks this once per candidate load, see
         // worker/src/index.ts's sendTick call in executeRunProbeJob) so the
         // card shows progress instead of sitting on a bare "Testing…" until
-        // the whole ladder finishes.
+        // the whole ladder finishes. Also track scheduled-vs-running (N2
+        // batching can leave a card queued behind an earlier batch member
+        // for a while) so the card's dot can distinguish "waiting its turn"
+        // from "actually loading right now" instead of showing the same
+        // indicator for both.
         const liveDetail = res.items[0]?.detail;
-        if (liveDetail) {
-          setVerifyStates((prev) => {
-            const cur = prev[mode];
-            return cur && cur.runId === runId && cur.liveDetail !== liveDetail
-              ? { ...prev, [mode]: { ...cur, liveDetail } }
-              : prev;
-          });
-        }
+        const runStatus = res.run.status === "running" ? "running" : "scheduled";
+        setVerifyStates((prev) => {
+          const cur = prev[mode];
+          if (!cur || cur.runId !== runId) return prev;
+          // liveDetail only ever UPGRADES (never reverts to undefined on a
+          // poll that briefly has none -- see the original single-field
+          // version of this check above) -- runStatus, unlike liveDetail,
+          // has a real "not yet" value ("scheduled") so it's fine to set
+          // unconditionally.
+          if ((!liveDetail || cur.liveDetail === liveDetail) && cur.runStatus === runStatus) return prev;
+          return { ...prev, [mode]: { ...cur, liveDetail: liveDetail || cur.liveDetail, runStatus } };
+        });
       } catch {
         /* transient -- keep polling */
       }
@@ -1414,11 +1483,9 @@ export function Benchmark() {
                       unifiedPool,
                       noGpu,
                       poolHaircutFrac,
-                      onVerify: verifyPlacement,
+                      onRunModes: runModes,
                       onReset: resetVerify,
                       verifyResults: verifyStates,
-                      testQueue,
-                      onSetTestQueue: setTestQueue,
                     }
                   : undefined
               }

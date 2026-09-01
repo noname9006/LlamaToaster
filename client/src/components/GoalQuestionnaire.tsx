@@ -9,10 +9,9 @@
 // aria-checked; the floor reveal and the KV-preset section are disclosures
 // with aria-expanded; the target clamp announces via aria-live="polite".
 
-import { useEffect, useId, useMemo, useState } from "react";
+import { useId, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
-import { StatusDot } from "./StatusPill";
-import type { RunItemStatus } from "../types";
+import { StatusCircle, type CircleTone } from "./StatusPill";
 import {
   KV_PRESET_PAIRS,
   KV_PRESETS,
@@ -109,17 +108,23 @@ export interface GoalQuestionnaireProps {
     noGpu: boolean;
     /** A recent failed/failed_oom verify's safety margin -- see Benchmark.tsx. */
     poolHaircutFrac: number;
-    onVerify: (ngl: number, ctx: number, mode: ProbeMode, granularity: ProbeGranularity) => void;
     /** Clears one card's own result back to untested -- purely local state. */
     onReset: (mode: ProbeMode) => void;
-    /** Keyed by mode -- every card keeps its own independent result so Test
-     * All can run every mode concurrently without one overwriting another. */
+    /** Keyed by mode -- every card keeps its own independent result so
+     * several selected modes can run concurrently without one overwriting
+     * another. */
     verifyResults: Partial<Record<ProbeMode, PlacementVerifyResult>>;
-    /** "Test all"'s own drain queue, lifted up so it survives a remount of
-     * this component the same way verifyResults already does -- see
-     * Benchmark.tsx's testQueueStorageKey for why. */
-    testQueue: ProbeMode[];
-    onSetTestQueue: (next: ProbeMode[]) => void;
+    /** Fires every listed mode's probe in order (see Benchmark.tsx's
+     * runModes) -- the "Run test" button's handler. Awaited sequentially so
+     * batch membership is deterministic, but does NOT wait for each probe to
+     * FINISH: every selected mode's own card starts polling independently
+     * as soon as its trigger POST resolves, while the worker_jobs FIFO queue
+     * serializes actual execution on the worker. */
+    onRunModes: (
+      modes: ProbeMode[],
+      modeStarts: Record<ProbeMode, { ngl: number; ctx: number }>,
+      granularity: ProbeGranularity
+    ) => Promise<void>;
   };
 }
 
@@ -127,7 +132,9 @@ export interface PlacementVerifyResult {
   ngl: number;
   ctx: number;
   runId: string;
-  status: "pending" | "verified" | "failed" | "failed_oom" | "error";
+  // "cancelled" -- a user stop mid-ladder, distinct from failed/failed_oom:
+  // it means nobody let the search finish, not that the placement doesn't fit.
+  status: "pending" | "verified" | "failed" | "failed_oom" | "cancelled" | "error";
   detail?: string;
   verifiedCtxTokens?: number | null;
   mode?: ProbeMode;
@@ -144,6 +151,10 @@ export interface PlacementVerifyResult {
    * still "pending" -- see worker/src/index.ts's sendTick call in
    * executeRunProbeJob. Absent until the worker's first tick lands. */
   liveDetail?: string;
+  /** Scheduled (queued behind an earlier batch member, not yet claimed) vs
+   * actually running -- only meaningful while status is "pending". See
+   * ModeCard's own dot rendering. */
+  runStatus?: "scheduled" | "running";
 }
 
 const GOAL_CHOICES: { value: GoalKind; label: string }[] = [
@@ -747,17 +758,13 @@ function PlacementMatrix({
   // naturally once the sliders are dragged somewhere that mode's start no
   // longer matches (see `selected` below).
   const [activeMode, setActiveMode] = useState<ProbeMode | null>(null);
-  // "Test all"'s own queue -- NOT six simultaneous triggers. The server's
-  // §0.5 duplicate-trigger guard refuses more than one non-terminal probe
-  // per (model, worker) at a time regardless of which card asked for it, so
-  // firing all six at once leaves five of them rejected with a 409. This
-  // drains one mode at a time instead, advancing only once nothing for this
-  // pairing (from this queue or a manual Test click) is still pending.
-  // State lives in Benchmark.tsx (placement.testQueue), not here -- a whole
-  // ladder run can take tens of minutes, and this component can remount
-  // mid-run (a reload, or selectedModel/baseLayerCount going briefly null),
-  // which used to silently drop every mode still queued after the first.
-  const { testQueue, onSetTestQueue: setTestQueue } = placement;
+  // Which cards are checked for the next "Run test" click -- purely local,
+  // ephemeral UI state (unlike the triggers themselves, losing a selection
+  // that hasn't been run yet on a remount/reload is fine). "Test all" is a
+  // "select all" shortcut onto this same set, not a separate launch path --
+  // Run test still has to be clicked to actually fire them.
+  const [selectedModes, setSelectedModes] = useState<Set<ProbeMode>>(new Set());
+  const [running, setRunning] = useState(false);
 
   // Where each mode STARTS. The estimate only picks the starting point; the
   // probe measures the rest, which is the whole reason these are called
@@ -800,16 +807,22 @@ function PlacementMatrix({
     };
   }, [placement, affordability, trainedCtx, ctx]);
 
-  useEffect(() => {
-    if (testQueue.length === 0) return;
-    const anyPending = Object.values(placement.verifyResults).some((r) => r?.status === "pending");
-    if (anyPending) return;
-    const [next, ...rest] = testQueue;
-    setTestQueue(rest);
-    const start = modeStarts[next];
-    setActiveMode(next);
-    placement.onVerify(start.ngl, start.ctx, next, granularity);
-  }, [testQueue, placement, modeStarts, granularity]);
+  // The Run test button's handler -- fires every checked, not-already-
+  // pending mode via placement.onRunModes (Benchmark.tsx's runModes), which
+  // threads a shared batch root through all of them so they collapse into
+  // one Runs-list row instead of each 409ing or becoming its own root. Left
+  // checked afterward (not cleared) so re-clicking Run test is a no-op for
+  // modes already running -- onRunModes itself skips anything still pending.
+  async function handleRunTest(): Promise<void> {
+    const modes = [...selectedModes];
+    if (modes.length === 0) return;
+    setRunning(true);
+    try {
+      await placement.onRunModes(modes, modeStarts, granularity);
+    } finally {
+      setRunning(false);
+    }
+  }
 
   const lockedReason =
     placement.locked === "cpu"
@@ -889,9 +902,10 @@ function PlacementMatrix({
 
       {/* Tested configurations -- always shown, not only when the current
           combo fails to fit. Each card is a real search mode: clicking the
-          card moves the sliders to its starting point (highlighting it while
-          it's the active selection), Test measures what actually fits from
-          there. */}
+          card body moves the sliders to its starting point (or, once
+          verified, to what it actually proved) and highlights it; the
+          checkbox selects it for the next Run test click, which measures
+          what actually fits for every checked card at once. */}
       <div className="mt-3 border-t border-border pt-3">
         <div className="flex flex-wrap items-baseline justify-between gap-2">
           <span className="text-[13.5px] text-fg">
@@ -922,13 +936,22 @@ function PlacementMatrix({
             </div>
             <button
               type="button"
-              title="Runs every card below in turn (except Custom, which starts from the same point as several others) -- only one probe can be in flight for this model+machine at a time"
+              title="Checks every card below (except Custom, which starts from the same point as several others) -- Run test still has to be clicked to actually fire them"
               onClick={() =>
-                setTestQueue((Object.keys(MODE_LABEL) as ProbeMode[]).filter((m) => m !== "custom"))
+                setSelectedModes(new Set((Object.keys(MODE_LABEL) as ProbeMode[]).filter((m) => m !== "custom")))
               }
               className="rounded-lg border border-accent px-2.5 py-1 text-[11px] font-semibold text-accent hover:bg-accent/10"
             >
               Test all
+            </button>
+            <button
+              type="button"
+              title="Runs every checked card -- several fired together collapse into one row on the Runs list, and more can be checked and run again later while these are still going"
+              disabled={selectedModes.size === 0 || running}
+              onClick={() => void handleRunTest()}
+              className="rounded-lg bg-accent px-2.5 py-1 text-[11px] font-bold text-accent-fg disabled:opacity-40"
+            >
+              {running ? "Running…" : `Run test${selectedModes.size > 0 ? ` (${selectedModes.size})` : ""}`}
             </button>
           </div>
         </div>
@@ -952,6 +975,15 @@ function PlacementMatrix({
                 selected={activeMode === mode && placement.ngl === applied.ngl && ctx === applied.ctx}
                 busy={result?.status === "pending"}
                 result={result}
+                checked={selectedModes.has(mode)}
+                onToggleChecked={() =>
+                  setSelectedModes((prev) => {
+                    const next = new Set(prev);
+                    if (next.has(mode)) next.delete(mode);
+                    else next.add(mode);
+                    return next;
+                  })
+                }
                 onApply={() => {
                   setActiveMode(mode);
                   // A tested card applies what the probe PROVED, not where it
@@ -963,10 +995,6 @@ function PlacementMatrix({
                   // so applying never claims a context that wasn't loaded.
                   const applied = appliedConfig(result, start, trainedCtx);
                   onApplyConfig(applied.ngl, applied.ctx);
-                }}
-                onTest={() => {
-                  setActiveMode(mode);
-                  placement.onVerify(start.ngl, start.ctx, mode, granularity);
                 }}
                 onReset={() => placement.onReset(mode)}
               />
@@ -1005,24 +1033,27 @@ function formatTestedAt(ms: number): string {
 // has.
 const MODE_CARD_HEIGHT = "h-[180px]";
 
-// Maps a card's own status vocabulary onto StatusPill's RunItemStatus so the
-// same blinking/solid/red dot used for per-row test progress elsewhere
-// (Runs.tsx, RunDetail.tsx) reads consistently here too -- "untested" (no
-// result yet) has no RunItemStatus equivalent, so it renders as "queued"
-// (grey) rather than nothing.
-function modeCardDotStatus(result: PlacementVerifyResult | null): RunItemStatus {
+// Maps a card's own status vocabulary onto StatusPill's CircleTone -- the
+// same yellow-blink-while-running/yellow-static-while-queued dot used for a
+// batched run's progress elsewhere (StatusCircle's "running"/"warn" tones)
+// reads consistently here too, and N2 batching means "pending" genuinely
+// covers two different situations now: queued behind an earlier batch
+// member vs actually loading right now. "untested" (no result yet) has no
+// real outcome, so it renders "grey" rather than nothing.
+function modeCardCircleTone(result: PlacementVerifyResult | null): CircleTone {
   switch (result?.status) {
     case "pending":
-      return "benchmarking";
+      return result.runStatus === "running" ? "running" : "warn";
     case "verified":
-      return "done";
+      return "solid";
     case "failed_oom":
-      return "failed_oom";
     case "failed":
     case "error":
-      return "failed";
+      return "red";
+    case "cancelled":
+      return "cancelled";
     default:
-      return "queued";
+      return "grey";
   }
 }
 
@@ -1032,8 +1063,9 @@ function ModeCard({
   selected,
   busy,
   result,
+  checked,
+  onToggleChecked,
   onApply,
-  onTest,
   onReset,
 }: {
   mode: ProbeMode;
@@ -1041,8 +1073,9 @@ function ModeCard({
   selected: boolean;
   busy: boolean;
   result: PlacementVerifyResult | null;
+  checked: boolean;
+  onToggleChecked: () => void;
   onApply: () => void;
-  onTest: () => void;
   onReset: () => void;
 }) {
   const running = result?.status === "pending";
@@ -1067,28 +1100,42 @@ function ModeCard({
     >
       <div className="flex items-start justify-between gap-1">
         <span className="flex min-w-0 items-center gap-1.5 text-[11.5px] font-semibold text-fg">
-          <StatusDot status={modeCardDotStatus(result)} />
+          <StatusCircle tone={modeCardCircleTone(result)} />
           <span className="truncate">{MODE_LABEL[mode]}</span>
         </span>
-        {result && !running && (
-          <button
-            type="button"
-            title="Clear this card's result"
-            aria-label={`Reset ${MODE_LABEL[mode]}`}
-            onClick={(e) => {
-              e.stopPropagation();
-              onReset();
-            }}
-            className="shrink-0 rounded text-[13px] leading-none text-muted hover:text-fg"
-          >
-            ×
-          </button>
-        )}
+        <span className="flex shrink-0 items-center gap-1">
+          <input
+            type="checkbox"
+            title="Check to include this mode in the next Run test click"
+            aria-label={`Select ${MODE_LABEL[mode]} to run`}
+            checked={checked}
+            disabled={busy}
+            onClick={(e) => e.stopPropagation()}
+            onChange={onToggleChecked}
+            className="h-3.5 w-3.5 cursor-pointer accent-accent disabled:cursor-not-allowed disabled:opacity-40"
+          />
+          {result && !running && (
+            <button
+              type="button"
+              title="Clear this card's result"
+              aria-label={`Reset ${MODE_LABEL[mode]}`}
+              onClick={(e) => {
+                e.stopPropagation();
+                onReset();
+              }}
+              className="rounded text-[13px] leading-none text-muted hover:text-fg"
+            >
+              ×
+            </button>
+          )}
+        </span>
       </div>
       <span className="text-[10.5px] leading-relaxed text-muted">{MODE_BLURB[mode]}</span>
       <div className="flex-1">
         {running && (
-          <span className="block font-mono text-[10.5px] text-muted">{result?.liveDetail ?? "starting…"}</span>
+          <span className="block font-mono text-[10.5px] text-muted">
+            {result?.liveDetail ?? (result?.runStatus === "scheduled" ? "queued, waiting its turn…" : "starting…")}
+          </span>
         )}
         {result?.status === "verified" && (
           <span className="block font-mono text-[11px] font-semibold text-success">
@@ -1097,6 +1144,9 @@ function ModeCard({
           </span>
         )}
         {failed && <span className="block font-mono text-[11px] font-semibold text-danger">✗ didn’t fit</span>}
+        {result?.status === "cancelled" && (
+          <span className="block font-mono text-[11px] font-semibold text-muted">■ stopped before finishing</span>
+        )}
         {result?.status === "error" && <span className="block text-[10.5px] text-danger">Error — {result.detail ?? "unknown"}</span>}
         {result?.status === "verified" && (result.measuredVramPeakMib != null || result.measuredRamPeakMib != null) && (
           <span className="mt-0.5 block font-mono text-[10.5px] text-muted">
@@ -1111,19 +1161,6 @@ function ModeCard({
             {result.testedAt != null ? ` · ${formatTestedAt(result.testedAt)}` : ""}
           </span>
         )}
-      </div>
-      <div className="mt-1 flex gap-1.5">
-        <button
-          type="button"
-          onClick={(e) => {
-            e.stopPropagation();
-            onTest();
-          }}
-          disabled={busy}
-          className="flex-1 rounded-md bg-accent px-2 py-1 text-[11px] font-bold text-accent-fg disabled:opacity-40"
-        >
-          {running ? "Testing…" : "Test"}
-        </button>
       </div>
     </div>
   );

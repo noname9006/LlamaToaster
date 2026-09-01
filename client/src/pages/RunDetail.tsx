@@ -5,16 +5,19 @@ import { CurvesPanel, KneeChart } from "../components/CurvesPanel";
 import { ProbeAttempts } from "../components/ProbeAttempts";
 import { api as apiClient } from "../api/client";
 import { priceMatrix, ETA_UNAVAILABLE } from "../../../shared/pricing";
-import { useParams } from "react-router-dom";
+import { useParams, Link } from "react-router-dom";
 import type { ChartConfiguration } from "chart.js";
 import { api } from "../api/client";
 import {
   RunStatusPill,
+  StatusCircle,
   StatusCircleStrip,
   buildItemRepeatUnits,
   describeItemPhase,
   shortItemErrorLabel,
   REPEAT_PROGRESS_RE,
+  memberChipLabel,
+  MEMBER_CIRCLE_TONE,
 } from "../components/StatusPill";
 import { Chart } from "../components/Chart";
 import { Th, toggleSort, type SortState } from "../components/Th";
@@ -563,6 +566,16 @@ export function RunDetail() {
   // get-one-model-by-id endpoint and this list is already fetched the same
   // way by Models.tsx/NewRun.tsx.
   const [models, setModels] = useState<Model[]>([]);
+  // N2 batching -- every run sharing this probe's root (itself included).
+  // A group of one for a standalone run/other kinds, same as Runs.tsx's own
+  // grouping -- see the fetch effect below for why this is scoped to probes.
+  const [batchMembers, setBatchMembers] = useState<Run[]>([]);
+  // Bumped every poll cycle while the run is running/scheduled -- unlike
+  // run.status (which stays the SAME string value for the run's entire
+  // in-flight duration), this actually changes every tick, so it's what
+  // ProbeAttempts is keyed on below to refetch live instead of once at the
+  // start and once at the end.
+  const [pollTick, setPollTick] = useState(0);
   const timerRef = useRef<number | null>(null);
   // null = natural idx order (the sweep's own ordering) -- a running sweep's
   // default view shouldn't reshuffle mid-run; sorting only kicks in once the
@@ -597,6 +610,7 @@ export function RunDetail() {
       setResults(data.results ?? []);
       setItems(data.items ?? []);
       setPaused(data.paused ?? false);
+      setPollTick((t) => t + 1);
       // Keep polling while scheduled too -- a scheduled run flips to
       // running on its own once whatever's ahead of it on that worker
       // finishes (see server/src/routes/runs.ts's dispatchScheduledRun),
@@ -611,6 +625,31 @@ export function RunDetail() {
       if (timerRef.current) window.clearTimeout(timerRef.current);
     };
   }, [id]);
+
+  // N2 batching -- re-fetched on the same cadence as the run poll above
+  // (while it's still non-terminal) so a sibling scenario added to this
+  // batch from elsewhere (e.g. the Benchmark page, while this run is still
+  // in flight -- item 6) shows up here without a manual reload. Scoped to
+  // kind "probe" only: no other run kind ever has more than one non-terminal
+  // sibling under its root, so this would just be a wasted request for them.
+  useEffect(() => {
+    if (!run || run.kind !== "probe") {
+      setBatchMembers([]);
+      return;
+    }
+    let cancelled = false;
+    api
+      .getBatchMembers(id)
+      .then((res) => {
+        if (!cancelled) setBatchMembers(res.members);
+      })
+      .catch(() => {
+        /* best-effort -- the page still works with just this run's own ladder */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [id, run?.kind, pollTick]);
 
   useEffect(() => {
     if (!run?.worker_id) return;
@@ -1040,14 +1079,41 @@ export function RunDetail() {
         </div>
       )}
 
-      {/* N2 -- a probe's own ladder. First, because a probe produces no
+      {/* N2 -- a probe's own ladder(s). First, because a probe produces no
           scored cards, curve or sustained-state content: those sections all
-          render empty for it, so its one real result belongs at the top. */}
+          render empty for it, so its real results belong at the top. A batch
+          of several search modes (see StatusPill.tsx's memberChipLabel) gets
+          one section per member instead of just this page's own run, each
+          showing rows as they happen (refreshKey=pollTick, not run.status --
+          see pollTick's own comment for why) or a "queued" placeholder for a
+          scenario still waiting its turn behind another one on the worker. */}
       {run?.kind === "probe" && (
         <section className="mt-6">
           <h2 className="text-sm font-semibold uppercase tracking-wide text-muted">Context tests</h2>
-          <div className="mt-3">
-            <ProbeAttempts runId={id} refreshKey={run.status} />
+          <div className="mt-3 flex flex-col gap-5">
+            {batchMembers.length > 1
+              ? batchMembers.map((m) => (
+                  <div key={m.id}>
+                    <div className="mb-1.5 flex flex-wrap items-center gap-2">
+                      <StatusCircle tone={MEMBER_CIRCLE_TONE[m.status]} />
+                      <span className="text-[12.5px] font-semibold text-fg">{memberChipLabel(m)}</span>
+                      <RunStatusPill status={m.status} />
+                      {m.id !== id && (
+                        <Link to={`/runs/${m.id}`} className="text-xs text-accent hover:underline">
+                          Open ↗
+                        </Link>
+                      )}
+                    </div>
+                    {m.status === "scheduled" ? (
+                      <p className="rounded-xl border border-border bg-surface p-4 text-sm text-muted">
+                        Queued, waiting its turn behind another scenario on this worker…
+                      </p>
+                    ) : (
+                      <ProbeAttempts runId={m.id} refreshKey={pollTick} />
+                    )}
+                  </div>
+                ))
+              : <ProbeAttempts runId={id} refreshKey={pollTick} />}
           </div>
         </section>
       )}

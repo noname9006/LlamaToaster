@@ -443,6 +443,14 @@ CREATE TABLE IF NOT EXISTS probe_attempts (
   ram_needed_mib REAL,  ram_free_mib REAL,   ram_peak_mib REAL,
   gen_tps REAL, error TEXT,
   created_at INTEGER NOT NULL,
+  -- N2 batch dedup -- set when this rung was never actually loaded, but
+  -- reused verbatim from an earlier sibling run under the same batch root
+  -- that already measured this exact (candidate_ctx, ngl) point (see
+  -- server/src/routes/measurements.ts's GET .../probe-dedup and
+  -- worker/src/index.ts's executeRunProbeJob). NULL for every genuinely
+  -- measured rung, which is every rung a worker predating this column ever
+  -- reported.
+  reused_from_run_id TEXT REFERENCES runs(id) ON DELETE SET NULL,
   UNIQUE(run_id, seq)
 );
 CREATE INDEX IF NOT EXISTS idx_probe_attempts_run ON probe_attempts(run_id);

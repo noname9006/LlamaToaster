@@ -1016,6 +1016,15 @@ export interface TriggerPayload {
   // §0.5 chains -- links this run into an existing root's chain (tune→refine
   // →sweep); the server resolves the parent's root and enforces depth ≤ 3.
   parent_run_id?: string;
+  // N2 batching -- attaches this probe run as a sibling under an existing
+  // probe root (kind must be "probe"; the target run must be kind "probe"
+  // too), so several search modes fired from one "Run test" click collapse
+  // into one row on the Runs list instead of each becoming its own root.
+  // Deliberately separate from parent_run_id: a batch is a flat sibling
+  // group, not a tuning->refine->sweep chain, so it carries none of that
+  // path's chain_depth bookkeeping or its MAX_CHAIN_DEPTH limit -- a 5-mode
+  // batch would otherwise hit that cap on its 4th member.
+  probe_batch_root_id?: string;
 }
 
 export interface ProbeTriggerSpec {
@@ -1628,9 +1637,13 @@ export interface ProbeAttemptReport {
   ram_needed_mib?: number | null;
   ram_free_mib?: number | null;
   error?: string;
+  /** N2 batch dedup -- set when this rung was reused from an earlier sibling
+   * run's own measurement instead of actually being loaded (see
+   * shared/api-v8.ts's ProbeDedupPoint). */
+  reused_from_run_id?: string | null;
 }
 
-export type ProbeResultStatus = "verified" | "failed" | "failed_oom";
+export type ProbeResultStatus = "verified" | "failed" | "failed_oom" | "stopped";
 
 export interface ProbeResultInput {
   status: ProbeResultStatus;

@@ -316,6 +316,11 @@ const COLUMN_MIGRATIONS: ColumnSpec[] = [
   // before this migration, which correctly reads as "this probe never
   // reported one" rather than a fabricated layer count.
   { table: "model_machine_limits", column: "verified_ngl", ddlType: "INTEGER" },
+  // N2 batch dedup -- see schema.sql's own comment on this column. NULL on
+  // every rung reported before this migration, which correctly reads as
+  // "genuinely measured" (dedup didn't exist yet, so nothing could have been
+  // reused).
+  { table: "probe_attempts", column: "reused_from_run_id", ddlType: "TEXT REFERENCES runs(id) ON DELETE SET NULL" },
 ];
 
 function applyColumnMigrations(database: Database.Database): void {

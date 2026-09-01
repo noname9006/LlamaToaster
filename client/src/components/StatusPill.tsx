@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import type { RunStatus, RunItemStatus, RunItem } from "../types";
+import type { Run, RunConfig, RunStatus, RunItemStatus, RunItem } from "../types";
 import { formatElapsed } from "../utils";
 
 export type PillTone = "accent" | "success" | "danger" | "warning" | "muted";
@@ -34,6 +34,39 @@ export const RUN_STATUS_TONE: Record<RunStatus, PillTone> = {
 export function RunStatusPill({ status }: { status: RunStatus }) {
   return <StatusPill label={status} tone={RUN_STATUS_TONE[status]} />;
 }
+
+// §0.5's chain stages, abbreviated for a compact per-row/per-section chip
+// (Runs.tsx's row chip strip, RunDetail.tsx's per-batch-member header). Any
+// other kind (runtime/probe/quality/null) falls back to its own kind name
+// (or "run" for a legacy/standalone row) rather than a letter, since those
+// aren't part of the A/B/C tuning->refine->sweep sequence.
+const STAGE_CHIP_LABEL: Partial<Record<string, string>> = { tuning: "A", refine: "B", sweep: "C" };
+export function chipLabel(kind: string | null | undefined): string {
+  return (kind && STAGE_CHIP_LABEL[kind]) || kind || "run";
+}
+
+// A probe batch's chip names the search mode it actually ran (e.g.
+// "max_gpu") rather than the generic chipLabel(kind) fallback -- every
+// member of a probe batch shares kind "probe", so the plain kind name can't
+// tell them apart the way A/B/C already distinguishes a tuning chain's
+// stages. Shared between Runs.tsx's row chip strip and RunDetail.tsx's
+// per-batch-member Context-tests sections so both name a scenario the same way.
+export function memberChipLabel(run: Run): string {
+  if (run.kind === "probe") return (run.config as RunConfig)?.probe?.mode ?? "probe";
+  return chipLabel(run.kind);
+}
+
+// N2 batching -- yellow-blink-while-running / yellow-static-while-queued,
+// the same CircleTone StatusCircle already uses for a batched progress strip
+// elsewhere, applied here per member chip instead of per sweep-item.
+export const MEMBER_CIRCLE_TONE: Record<RunStatus, CircleTone> = {
+  running: "running",
+  scheduled: "warn",
+  done: "solid",
+  partial: "warn",
+  failed: "red",
+  cancelled: "cancelled",
+};
 
 const RUN_ITEM_STATUS_TONE: Record<RunItemStatus, PillTone> = {
   queued: "muted",
