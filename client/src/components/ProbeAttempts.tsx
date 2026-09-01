@@ -9,6 +9,7 @@
 // was invisible to anyone reading results in the app.
 
 import { useEffect, useState } from "react";
+import { Link } from "react-router-dom";
 import { api } from "../api/client";
 import type { ProbeAttemptDto } from "../types";
 
@@ -103,18 +104,29 @@ export function ProbeAttempts({ runId, refreshKey }: ProbeAttemptsProps) {
                     {a.gen_tps != null ? a.gen_tps.toFixed(1) : "—"}
                   </td>
                   <td className="px-2 py-1.5 text-muted">
-                    {a.ok ? (
-                      <>
-                        <span className="mr-1 inline-block h-2 w-2 rounded-full bg-success align-middle" /> passed
-                      </>
-                    ) : (
-                      <span
-                        title={a.error ?? undefined}
-                        className="rounded-full bg-warning-bg px-2 py-0.5 text-[10px] font-bold text-warning"
-                      >
-                        {a.oom ? "out of memory" : a.spill ? "spilled past VRAM" : "failed"}
-                      </span>
-                    )}
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      {a.ok ? (
+                        <>
+                          <span className="mr-1 inline-block h-2 w-2 rounded-full bg-success align-middle" /> passed
+                        </>
+                      ) : (
+                        <span
+                          title={a.error ?? undefined}
+                          className="rounded-full bg-warning-bg px-2 py-0.5 text-[10px] font-bold text-warning"
+                        >
+                          {a.oom ? "out of memory" : a.spill ? "spilled past VRAM" : "failed"}
+                        </span>
+                      )}
+                      {a.reused_from_run_id && (
+                        <Link
+                          to={`/runs/${a.reused_from_run_id}`}
+                          title="Reused from an earlier batch sibling's own measurement of this exact point -- not reloaded for this run"
+                          className="rounded-full bg-accent/10 px-2 py-0.5 text-[10px] font-semibold text-accent hover:underline"
+                        >
+                          ↺ reused
+                        </Link>
+                      )}
+                    </div>
                   </td>
                 </tr>
               );

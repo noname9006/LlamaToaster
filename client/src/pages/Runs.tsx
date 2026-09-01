@@ -5,25 +5,19 @@ import {
   RunStatusPill,
   StatusDot,
   StatusPill,
+  StatusCircle,
   StatusCircleStrip,
   buildProgressUnits,
   describeItemPhase,
   RUN_STATUS_TONE,
+  memberChipLabel,
+  MEMBER_CIRCLE_TONE,
 } from "../components/StatusPill";
 import { Th, toggleSort, type SortState } from "../components/Th";
-import type { Run, RunConfig, RunItem } from "../types";
+import type { Run, RunConfig, RunItem, RunStatus } from "../types";
 import { shortId, formatElapsed, formatFlashAttn } from "../utils";
 
 const TERMINAL_ITEM_STATUSES = new Set(["done", "failed", "failed_oom", "cancelled"]);
-
-// §0.5's chain stages, abbreviated for the compact per-row chip strip below.
-// Any other kind (runtime/probe/quality/null) falls back to its own kind
-// name (or "run" for a legacy/standalone row) rather than a letter, since
-// those aren't part of the A/B/C tuning->refine->sweep sequence.
-const STAGE_CHIP_LABEL: Partial<Record<string, string>> = { tuning: "A", refine: "B", sweep: "C" };
-function chipLabel(kind: string | null | undefined): string {
-  return (kind && STAGE_CHIP_LABEL[kind]) || kind || "run";
-}
 
 // One row's worth of chain: every run sharing a root_run_id (Test A's own
 // id -- see Benchmark.tsx's startStage/repo.ts's chain insert, which points
@@ -58,8 +52,34 @@ function aggregateItems(members: Run[]): { total: number; done: number; failed: 
   );
 }
 
+// A probe batch's members are independent siblings (each search mode either
+// fits or doesn't on its own), unlike a tuning->refine->sweep chain's
+// sequential, DEPENDENT stages -- a chain stage failing should still read as
+// a hard "failed" (nothing after it will ever run), but a probe scenario
+// failing/being stopped should not drag an otherwise-successful batch's
+// headline status down to "failed"/"cancelled". Gated on every member
+// sharing kind "probe" so chain display is completely untouched.
+function isProbeBatch(members: Run[]): boolean {
+  return members.length > 1 && members.every((m) => m.kind === "probe");
+}
+
+// Mirrors finalizeRun's own precedence (server/src/db/repo.ts) one level up,
+// across sibling runs instead of items within one run: a batch stopped
+// partway through reads "partial" (some scenarios did complete) rather than
+// whatever status currentMember() happens to have picked.
+function rowStatus(members: Run[]): RunStatus {
+  if (!isProbeBatch(members)) return currentMember(members).status;
+  if (members.some((m) => m.status === "running")) return "running";
+  if (members.some((m) => m.status === "scheduled")) return "scheduled";
+  const anyCancelled = members.some((m) => m.status === "cancelled");
+  const anyDone = members.some((m) => m.status === "done");
+  if (anyCancelled) return anyDone ? "partial" : "cancelled";
+  if (members.every((m) => m.status === "done")) return "done";
+  return "partial";
+}
+
 const COLUMN_DESCRIPTIONS: Record<string, string> = {
-  id: "Unique test identifier — click it to open this run's detail page. A multi-stage chain (Test A/B/C) shares one id here; the small A/B/C chips below Params jump to an individual stage.",
+  id: "Unique test identifier — click it to open this run's detail page. A multi-stage chain (Test A/B/C), or a batch of probe search modes run together, shares one id here; the small chips below Params (A/B/C, or each mode's name) jump to an individual stage/scenario.",
   worker: "Which configured machine executed this run (e.g. a GPU box vs a CPU worker).",
   model: "The GGUF model file benchmarked in this run.",
   backend: "llama.cpp compute backend the worker was configured with for this run (e.g. cpu, vulkan, cuda, rocm, sycl — whatever that worker actually uses).",
@@ -68,7 +88,7 @@ const COLUMN_DESCRIPTIONS: Record<string, string> = {
     "Every value swept per flag — p=n_prompt, n=n_gen, t=threads, ngl=n_gpu_layers, b=batch_size, " +
     "ub=ubatch_size, ctk/ctv=K/V cache type, fa=flash attention — × repeats per combination.",
   status:
-    "running / scheduled (queued behind another run on the same worker, starts automatically once it's free) / done / partial (some sweep combinations failed, or the run was lost/reconciled after some completed) / failed / cancelled (stopped by user, or lost with nothing completed), plus how many of the sweep's tests have completed.",
+    "running / scheduled (queued behind another run on the same worker, starts automatically once it's free) / done / partial (some sweep combinations failed, or the run was lost/reconciled after some completed — for a probe batch, some scenarios completed before the rest were stopped/failed) / failed / cancelled (stopped by user, or lost with nothing completed), plus how many of the sweep's tests have completed.",
   started: "When this run was triggered.",
 };
 
@@ -91,7 +111,7 @@ function groupSortValue(g: RunGroup, key: string): string | number {
     case "build":
       return cur.llama_cpp_build;
     case "status":
-      return cur.status;
+      return rowStatus(g.members);
     case "started":
     default:
       return root.started_at;
@@ -146,7 +166,6 @@ export function Runs() {
 
   const workerOptions = useMemo(() => Array.from(new Set(runs.map((r) => r.worker_name))).sort(), [runs]);
   const backendOptions = useMemo(() => Array.from(new Set(runs.map((r) => r.llama_cpp_backend))).sort(), [runs]);
-  const statusOptions = useMemo(() => Array.from(new Set(runs.map((r) => r.status))).sort(), [runs]);
 
   // §0.5's chain: every run sharing a root_run_id (Test A's own id, per
   // repo.ts's chain insert) collapses to one row. A standalone run (no
@@ -166,11 +185,17 @@ export function Runs() {
     }));
   }, [runs]);
 
+  // Derived from the same rollup the rows themselves display (rowStatus),
+  // not the raw per-run status column -- a probe batch can show "partial"
+  // as its headline status without any single underlying run row actually
+  // carrying that value, and the filter has to offer what's on screen.
+  const statusOptions = useMemo(() => Array.from(new Set(groups.map((g) => rowStatus(g.members)))).sort(), [groups]);
+
   const visibleGroups = useMemo(() => {
     let list = groups;
     if (workerFilter) list = list.filter((g) => g.members[0].worker_name === workerFilter);
     if (backendFilter) list = list.filter((g) => currentMember(g.members).llama_cpp_backend === backendFilter);
-    if (statusFilter) list = list.filter((g) => currentMember(g.members).status === statusFilter);
+    if (statusFilter) list = list.filter((g) => rowStatus(g.members) === statusFilter);
     const dir = sort.dir === "asc" ? 1 : -1;
     return [...list].sort((a, b) => {
       const av = groupSortValue(a, sort.key);
@@ -352,8 +377,14 @@ export function Runs() {
                           {g.members.length > 1 && (
                             <div className="mt-1.5 flex flex-wrap items-center gap-1">
                               {g.members.map((m) => (
-                                <Link key={m.id} to={`/runs/${m.id}`} title={`${chipLabel(m.kind)}: ${m.status}`}>
-                                  <StatusPill label={chipLabel(m.kind)} tone={RUN_STATUS_TONE[m.status]} />
+                                <Link
+                                  key={m.id}
+                                  to={`/runs/${m.id}`}
+                                  title={`${memberChipLabel(m)}: ${m.status}`}
+                                  className="inline-flex items-center gap-1"
+                                >
+                                  <StatusCircle tone={MEMBER_CIRCLE_TONE[m.status]} />
+                                  <StatusPill label={memberChipLabel(m)} tone={RUN_STATUS_TONE[m.status]} />
                                 </Link>
                               ))}
                             </div>
@@ -361,7 +392,7 @@ export function Runs() {
                         </td>
                         <td className="px-4 py-2.5">
                           <div className="flex flex-wrap items-center gap-2">
-                            <RunStatusPill status={cur.status} />
+                            <RunStatusPill status={rowStatus(g.members)} />
                             {agg.total ? (
                               <span className="text-xs text-muted">
                                 {agg.done}/{agg.total}

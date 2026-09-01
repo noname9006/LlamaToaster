@@ -3358,8 +3358,9 @@ export const repo = {
           `INSERT INTO probe_attempts
              (id, run_id, worker_id, model_id, seq, candidate_ctx, ngl,
               ok, oom, spill, vram_needed_mib, vram_free_mib, vram_peak_mib,
-              ram_needed_mib, ram_free_mib, ram_peak_mib, gen_tps, error, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+              ram_needed_mib, ram_free_mib, ram_peak_mib, gen_tps, error, created_at,
+              reused_from_run_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         );
         input.attempts.forEach((a, seq) => {
           insert.run(
@@ -3381,7 +3382,8 @@ export const repo = {
             a.ram_peak_mib ?? null,
             a.gen_tps ?? null,
             a.error ?? null,
-            now
+            now,
+            a.reused_from_run_id ?? null
           );
         });
       });
@@ -3393,6 +3395,71 @@ export const repo = {
       return getDb()
         .prepare(`SELECT * FROM probe_attempts WHERE run_id = ? ORDER BY seq ASC`)
         .all(runId) as ProbeAttemptRow[];
+    },
+
+    // N2 live progress -- posted once per rung AS it happens (see
+    // POST /api/runs/:id/probe-attempt), unlike replaceForRun above which
+    // only ever lands once, at the very end of the ladder. Upserts through
+    // the same UNIQUE(run_id, seq) key replaceForRun's own comment relies on
+    // for retry-safety, so a worker retry that re-sends an earlier seq
+    // overwrites it rather than duplicating -- and the final replaceForRun
+    // call, which still runs unchanged, harmlessly replaces these same rows
+    // with identical final data.
+    upsertOne(input: {
+      run_id: string;
+      worker_id: string;
+      model_id: string;
+      seq: number;
+      attempt: ProbeAttemptReport;
+    }): void {
+      const a = input.attempt;
+      getDb()
+        .prepare(
+          `INSERT INTO probe_attempts
+             (id, run_id, worker_id, model_id, seq, candidate_ctx, ngl,
+              ok, oom, spill, vram_needed_mib, vram_free_mib, vram_peak_mib,
+              ram_needed_mib, ram_free_mib, ram_peak_mib, gen_tps, error, created_at,
+              reused_from_run_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(run_id, seq) DO UPDATE SET
+             candidate_ctx = excluded.candidate_ctx,
+             ngl = excluded.ngl,
+             ok = excluded.ok,
+             oom = excluded.oom,
+             spill = excluded.spill,
+             vram_needed_mib = excluded.vram_needed_mib,
+             vram_free_mib = excluded.vram_free_mib,
+             vram_peak_mib = excluded.vram_peak_mib,
+             ram_needed_mib = excluded.ram_needed_mib,
+             ram_free_mib = excluded.ram_free_mib,
+             ram_peak_mib = excluded.ram_peak_mib,
+             gen_tps = excluded.gen_tps,
+             error = excluded.error,
+             created_at = excluded.created_at,
+             reused_from_run_id = excluded.reused_from_run_id`
+        )
+        .run(
+          uuid(),
+          input.run_id,
+          input.worker_id,
+          input.model_id,
+          input.seq,
+          a.candidate_ctx,
+          a.ngl ?? null,
+          a.ok ? 1 : 0,
+          a.oom ? 1 : 0,
+          a.spill ? 1 : 0,
+          a.vram_needed_mib ?? null,
+          a.vram_free_mib ?? null,
+          a.vram_peak_mib ?? null,
+          a.ram_needed_mib ?? null,
+          a.ram_free_mib ?? null,
+          a.ram_peak_mib ?? null,
+          a.gen_tps ?? null,
+          a.error ?? null,
+          Date.now(),
+          a.reused_from_run_id ?? null
+        );
     },
   },
 
@@ -3604,6 +3671,7 @@ export interface ProbeAttemptRow {
   gen_tps: number | null;
   error: string | null;
   created_at: number;
+  reused_from_run_id: string | null;
 }
 
 // N4 storage shapes.

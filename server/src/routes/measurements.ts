@@ -95,9 +95,38 @@ function optionalNonNegative(value: unknown, field: string): number | null {
   return value;
 }
 
-// Validates the ladder rungs before any of them reach the database. Bounds
-// mirror the trigger route's own probe-axis table (runs.ts): context within
-// the probe range, ngl within the sweep axis' [0, 1024].
+// Validates one ladder rung before it reaches the database. Bounds mirror
+// the trigger route's own probe-axis table (runs.ts): context within the
+// probe range, ngl within the sweep axis' [0, 1024]. Shared by
+// validateProbeAttempts below (the whole-ladder report) and the single-rung
+// live-progress endpoint, so both accept exactly the same shape.
+function validateOneProbeAttempt(raw: unknown, label: string): ProbeAttemptReport {
+  const a = (raw ?? {}) as Record<string, unknown>;
+  if (typeof a.ok !== "boolean" || typeof a.oom !== "boolean" || typeof a.spill !== "boolean") {
+    throw new BadRequestError(`${label} must carry boolean ok/oom/spill`);
+  }
+  return {
+    candidate_ctx: requireFiniteInt(a.candidate_ctx, `${label}.candidate_ctx`, MIN_PROBE_CTX, MAX_PROBE_CTX),
+    ok: a.ok,
+    oom: a.oom,
+    spill: a.spill,
+    ngl: a.ngl === undefined || a.ngl === null ? null : requireFiniteInt(a.ngl, `${label}.ngl`, 0, 1024),
+    vram_needed_mib: optionalNonNegative(a.vram_needed_mib, `${label}.vram_needed_mib`),
+    vram_free_mib: optionalNonNegative(a.vram_free_mib, `${label}.vram_free_mib`),
+    vram_peak_mib: optionalNonNegative(a.vram_peak_mib, `${label}.vram_peak_mib`),
+    ram_needed_mib: optionalNonNegative(a.ram_needed_mib, `${label}.ram_needed_mib`),
+    ram_free_mib: optionalNonNegative(a.ram_free_mib, `${label}.ram_free_mib`),
+    ram_peak_mib: optionalNonNegative(a.ram_peak_mib, `${label}.ram_peak_mib`),
+    gen_tps: optionalNonNegative(a.gen_tps, `${label}.gen_tps`),
+    error: typeof a.error === "string" ? a.error : undefined,
+    // N2 batch dedup -- the worker only ever echoes back a source_run_id the
+    // server itself handed it via GET .../probe-dedup, so a plain type check
+    // (not an existence/ownership lookup) is the same trust level every other
+    // worker-reported field on this row gets.
+    reused_from_run_id: typeof a.reused_from_run_id === "string" ? a.reused_from_run_id : null,
+  } satisfies ProbeAttemptReport;
+}
+
 function validateProbeAttempts(attempts: unknown): ProbeAttemptReport[] {
   if (attempts === undefined) return [];
   if (!Array.isArray(attempts)) throw new BadRequestError("attempts must be an array");
@@ -108,27 +137,7 @@ function validateProbeAttempts(attempts: unknown): ProbeAttemptReport[] {
   if (attempts.length > maxProbeAttempts) {
     throw new BadRequestError(`a probe performs at most ${maxProbeAttempts} loads`);
   }
-  return attempts.map((raw, i) => {
-    const a = (raw ?? {}) as Record<string, unknown>;
-    if (typeof a.ok !== "boolean" || typeof a.oom !== "boolean" || typeof a.spill !== "boolean") {
-      throw new BadRequestError(`attempts[${i}] must carry boolean ok/oom/spill`);
-    }
-    return {
-      candidate_ctx: requireFiniteInt(a.candidate_ctx, `attempts[${i}].candidate_ctx`, MIN_PROBE_CTX, MAX_PROBE_CTX),
-      ok: a.ok,
-      oom: a.oom,
-      spill: a.spill,
-      ngl: a.ngl === undefined || a.ngl === null ? null : requireFiniteInt(a.ngl, `attempts[${i}].ngl`, 0, 1024),
-      vram_needed_mib: optionalNonNegative(a.vram_needed_mib, `attempts[${i}].vram_needed_mib`),
-      vram_free_mib: optionalNonNegative(a.vram_free_mib, `attempts[${i}].vram_free_mib`),
-      vram_peak_mib: optionalNonNegative(a.vram_peak_mib, `attempts[${i}].vram_peak_mib`),
-      ram_needed_mib: optionalNonNegative(a.ram_needed_mib, `attempts[${i}].ram_needed_mib`),
-      ram_free_mib: optionalNonNegative(a.ram_free_mib, `attempts[${i}].ram_free_mib`),
-      ram_peak_mib: optionalNonNegative(a.ram_peak_mib, `attempts[${i}].ram_peak_mib`),
-      gen_tps: optionalNonNegative(a.gen_tps, `attempts[${i}].gen_tps`),
-      error: typeof a.error === "string" ? a.error : undefined,
-    } satisfies ProbeAttemptReport;
-  });
+  return attempts.map((raw, i) => validateOneProbeAttempt(raw, `attempts[${i}]`));
 }
 
 export async function measurementRoutes(app: FastifyInstance): Promise<void> {
@@ -144,8 +153,13 @@ export async function measurementRoutes(app: FastifyInstance): Promise<void> {
       if (!spec) throw new BadRequestError("that probe run has no stored probe spec");
 
       const body = request.body ?? ({} as ProbeResultInput);
-      if (body.status !== "verified" && body.status !== "failed" && body.status !== "failed_oom") {
-        throw new BadRequestError("status must be verified/failed/failed_oom");
+      if (
+        body.status !== "verified" &&
+        body.status !== "failed" &&
+        body.status !== "failed_oom" &&
+        body.status !== "stopped"
+      ) {
+        throw new BadRequestError("status must be verified/failed/failed_oom/stopped");
       }
       const attempts = validateProbeAttempts(body.attempts);
 
@@ -216,13 +230,22 @@ export async function measurementRoutes(app: FastifyInstance): Promise<void> {
       }
 
       // The run itself finalizes through the ordinary item path, so a probe
-      // shows up in the Runs list badged like anything else.
+      // shows up in the Runs list badged like anything else. "stopped" maps
+      // to the ordinary "cancelled" item status -- the same one the sweep-item
+      // loop's own stopRequested branch uses (worker/src/index.ts) -- so
+      // finalizeRun's existing no-cancelReason branch (repo.ts) reads it as a
+      // genuine user stop rather than a bench failure.
+      const itemStatus =
+        body.status === "verified" ? "done" : body.status === "stopped" ? "cancelled" : body.status;
       repo.recordRunItemTerminal(run.id, 0, {
-        status: body.status === "verified" ? "done" : body.status,
+        status: itemStatus,
         error:
           body.status === "verified"
             ? undefined
-            : (body.error ?? "probe did not reach a usable context at this placement"),
+            : (body.error ??
+              (body.status === "stopped"
+                ? "stopped by user"
+                : "probe did not reach a usable context at this placement")),
       });
 
       request.log.info(
@@ -239,6 +262,36 @@ export async function measurementRoutes(app: FastifyInstance): Promise<void> {
     }
   );
 
+  // N2 live progress -- posted once per rung AS the ladder runs (see
+  // worker/src/index.ts's executeRunProbeJob), so RunDetail's Context-tests
+  // panel can show rows appearing as they happen instead of the whole ladder
+  // landing at once when probe-result finally posts at the very end. Purely
+  // additive: probe-result's own replaceForRun call is unchanged and stays
+  // the retry-safe source of truth -- this just upserts through the same
+  // UNIQUE(run_id, seq) key (see probeAttemptsRepo.upsertOne's own comment).
+  app.post<{ Params: { id: string }; Body: { seq?: unknown } & Record<string, unknown> }>(
+    "/api/runs/:id/probe-attempt",
+    async (request, reply) => {
+      const worker = requireEnrolledWorkerSession(request);
+      const run = resolveRunForWorker(request.params.id, worker);
+      if (run.kind !== "probe") throw new BadRequestError("that run is not a probe run");
+
+      const body = request.body ?? ({} as { seq?: unknown });
+      const maxProbeAttempts = repo.appSettingsRepo.getProbeMaxLoads();
+      const seq = requireFiniteInt(body.seq, "seq", 0, maxProbeAttempts - 1);
+      const attempt = validateOneProbeAttempt(body, "attempt");
+
+      repo.probeAttemptsRepo.upsertOne({
+        run_id: run.id,
+        worker_id: worker.id,
+        model_id: run.model_id,
+        seq,
+        attempt,
+      });
+      return reply.code(200).send({ ok: true });
+    }
+  );
+
   // The ladder behind a run's verified ceiling. Read-side authorization
   // mirrors /api/models/:id/verified-limits: the caller must own the machine
   // the run was dispatched to, since these rows describe that machine's
@@ -249,6 +302,58 @@ export async function measurementRoutes(app: FastifyInstance): Promise<void> {
     if (!run.worker_id) throw new NotFoundError("that run has no machine attached");
     assertOwnsWorker(resolveAuthUser(request)?.user.id, run.worker_id);
     return reply.send({ attempts: repo.probeAttemptsRepo.listForRun(run.id) });
+  });
+
+  // N2 batch dedup -- lets a later scenario in the same batch skip a
+  // (candidate_ctx, ngl) point an earlier sibling already measured, rather
+  // than re-loading llama-server to re-discover the same answer (the
+  // motivating case: keep_context/balanced/fixed_offload routinely land on
+  // the exact same point when they all start from the same placement).
+  // Worker-authed, and every filter comes from the CALLING run's own stored
+  // root/build/kv_pair -- never from the request -- so a worker can't ask
+  // for another user's or another batch's measurements. Siblings are always
+  // fully terminal by the time this is called in practice (worker_jobs' FIFO
+  // means a worker never has two batch members running at once), but the
+  // status filter costs nothing and removes any doubt.
+  app.get<{ Params: { id: string } }>("/api/runs/:id/probe-dedup", async (request, reply) => {
+    const worker = requireEnrolledWorkerSession(request);
+    const run = resolveRunForWorker(request.params.id, worker);
+    if (run.kind !== "probe") throw new BadRequestError("that run is not a probe run");
+    const spec = (run.config as RunConfig).probe;
+    if (!spec) throw new BadRequestError("that probe run has no stored probe spec");
+
+    const rootId = run.root_run_id ?? run.id;
+    const siblings = repo
+      .listRunsUnderRoot(undefined, rootId)
+      .filter(
+        (m) =>
+          m.id !== run.id &&
+          m.kind === "probe" &&
+          m.status !== "running" &&
+          m.status !== "scheduled" &&
+          m.llama_cpp_build === run.llama_cpp_build &&
+          (m.config as RunConfig).probe?.kv_pair?.[0] === spec.kv_pair[0] &&
+          (m.config as RunConfig).probe?.kv_pair?.[1] === spec.kv_pair[1]
+      );
+
+    const points = siblings.flatMap((sibling) =>
+      repo.probeAttemptsRepo.listForRun(sibling.id).map((row) => ({
+        candidate_ctx: row.candidate_ctx,
+        ngl: row.ngl,
+        ok: row.ok === 1,
+        oom: row.oom === 1,
+        spill: row.spill === 1,
+        gen_tps: row.gen_tps,
+        vram_needed_mib: row.vram_needed_mib,
+        vram_free_mib: row.vram_free_mib,
+        vram_peak_mib: row.vram_peak_mib,
+        ram_needed_mib: row.ram_needed_mib,
+        ram_free_mib: row.ram_free_mib,
+        ram_peak_mib: row.ram_peak_mib,
+        source_run_id: sibling.id,
+      }))
+    );
+    return reply.send({ points });
   });
 
   // --- N4: quality result ---------------------------------------------------

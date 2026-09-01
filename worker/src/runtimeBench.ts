@@ -485,6 +485,11 @@ export interface ProbeAttemptOutcome {
    * "exited before it became ready". Never sent to the server: the report's
    * own `error` already carries the short message. */
   stderrTail?: string;
+  /** N2 batch dedup -- set when this "attempt" was never actually loaded,
+   * but reused verbatim from an earlier sibling run's own measurement of
+   * this exact (candidateCtx, ngl) point (see worker/src/index.ts's
+   * findDedupMatch). Names the sibling run it came from. */
+  reusedFromRunId?: string | null;
 }
 
 /** Gen tok/s floor -- excludes swap-thrash "success". */

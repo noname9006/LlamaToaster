@@ -302,6 +302,12 @@ export const api = {
   getProbeAttempts: (runId: string): Promise<{ attempts: ProbeAttemptDto[] }> =>
     request(`/api/runs/${encodeURIComponent(runId)}/probe-attempts`),
 
+  // N2 batching -- every run sharing this run's root (itself included), so a
+  // multi-mode probe batch renders as one RunDetail view instead of the
+  // caller separately discovering and fetching each sibling.
+  getBatchMembers: (runId: string): Promise<{ members: Run[] }> =>
+    request(`/api/runs/${encodeURIComponent(runId)}/batch-members`),
+
   // N2 -- forgets one verified ceiling so its card offers "Verify with a
   // probe" again instead of showing a possibly-stale "Verified" forever.
   deleteVerifiedLimit: (id: string): Promise<{ ok: true }> =>

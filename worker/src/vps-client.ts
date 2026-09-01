@@ -13,8 +13,10 @@ import type {
   RefreshResponse,
   HardwareInfo,
   ProbeResultInput,
+  ProbeAttemptReport,
   QualityResultInput,
 } from "../../shared/types.js";
+import type { ProbeDedupPoint } from "../../shared/api-v8.js";
 
 export function writeRawJson(runDir: string, runId: string, data: unknown): string {
   if (!existsSync(runDir)) mkdirSync(runDir, { recursive: true });
@@ -74,6 +76,50 @@ export async function postProbeResult(
   if (!res.ok) {
     const text = await res.text();
     throw new HttpError(res.status, `probe result failed (${res.status}): ${text}`);
+  }
+}
+
+// N2 batch dedup -- every already-measured (ctx, ngl) point from an earlier
+// sibling run under the same batch root (see server/src/routes/
+// measurements.ts's own comment on the route). Best-effort, short timeout:
+// on failure the caller just proceeds without dedup, exactly as if this
+// probe weren't part of a batch at all.
+export async function getProbeDedup(url: string, token: string, runId: string, timeoutMs = 5000): Promise<ProbeDedupPoint[]> {
+  const res = await fetch(`${url}/api/runs/${runId}/probe-dedup`, {
+    headers: { ...authHeader(token) },
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new HttpError(res.status, `probe dedup fetch failed (${res.status}): ${text}`);
+  }
+  const body = (await res.json()) as { points: ProbeDedupPoint[] };
+  return body.points;
+}
+
+// N2 live progress -- one rung, posted as it happens (see
+// worker/src/index.ts's executeRunProbeJob), so the RunDetail page can show
+// rows appearing during the ladder instead of all at once when
+// postProbeResult finally lands at the end. Best-effort by design (short
+// timeout, caller swallows the error) -- losing one tick just means the
+// panel lags until the next one, same tolerance as sendTick/postRunItemUpdate.
+export async function postProbeAttempt(
+  url: string,
+  token: string,
+  runId: string,
+  seq: number,
+  attempt: ProbeAttemptReport,
+  timeoutMs = 5000
+): Promise<void> {
+  const res = await fetch(`${url}/api/runs/${runId}/probe-attempt`, {
+    method: "POST",
+    headers: { "content-type": "application/json", ...authHeader(token) },
+    body: JSON.stringify({ seq, ...attempt }),
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new HttpError(res.status, `probe attempt tick failed (${res.status}): ${text}`);
   }
 }
 

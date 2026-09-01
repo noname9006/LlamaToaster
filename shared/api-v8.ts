@@ -47,6 +47,32 @@ export interface ProbeAttemptDto {
   gen_tps: number | null;
   error: string | null;
   created_at: number;
+  /** Set when this rung was never actually loaded, but reused verbatim from
+   * an earlier sibling run under the same N2 batch that already measured
+   * this exact (candidate_ctx, ngl) point -- see GET .../probe-dedup. Names
+   * the sibling run it came from; null for every genuinely measured rung. */
+  reused_from_run_id: string | null;
+}
+
+// N2 batch dedup -- one already-measured (ctx, ngl) point from an earlier
+// sibling run under the same batch root, as GET /api/runs/:id/probe-dedup
+// returns it. The worker consults this before spawning a candidate load so
+// several search modes fired together don't each re-measure the same point.
+export interface ProbeDedupPoint {
+  candidate_ctx: number;
+  ngl: number | null;
+  ok: boolean;
+  oom: boolean;
+  spill: boolean;
+  gen_tps: number | null;
+  vram_needed_mib: number | null;
+  vram_free_mib: number | null;
+  vram_peak_mib: number | null;
+  ram_needed_mib: number | null;
+  ram_free_mib: number | null;
+  ram_peak_mib: number | null;
+  /** Which sibling run actually measured this point. */
+  source_run_id: string;
 }
 
 // N4 -- one llama-perplexity measurement, scoped by model (perplexity is
