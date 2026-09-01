@@ -5,7 +5,7 @@
  * Zero npm dependencies.
  *
  * Usage:
- *   node scripts/pitch-to-pdf-v3.mjs <in.md> <out.pdf>
+ *   node scripts/pitch-to-pdf-v3.mjs [--variant full|combined|notrust] <in.md> <out.pdf>
  *   node scripts/pitch-to-pdf-v3.mjs --html-only <in.md> <out.html>
  *   node scripts/pitch-to-pdf-v3.mjs --shots <in.md> <outDir> [slide numbers...]
  *
@@ -165,7 +165,7 @@ i.t { font-style: normal; font-family: Consolas, 'Cascadia Mono', monospace; col
 .chip .v { color: ${ACCENT}; font-weight: 700; }
 .chip .ok { color: ${OK}; font-weight: 700; }
 
-.pains { display: flex; flex-direction: column; gap: 14px; }
+.pains { display: flex; flex-direction: column; gap: 26px; }
 .pain { display: flex; gap: 15px; align-items: flex-start; }
 .pn { flex: none; width: 42px; height: 42px; border-radius: 12px; margin-top: 1px;
   display: flex; align-items: center; justify-content: center;
@@ -221,6 +221,11 @@ ul.list li::before { content: ""; position: absolute; left: 2px; top: 9px; width
 .cat-label { position: absolute; top: -28px; right: 0; z-index: 3; }
 .catnote { font-size: 14px; line-height: 1.45; color: ${FAINT}; max-width: 430px; }
 .catnote b { color: ${MUTED}; }
+/* Family pill: hug its content instead of stretching with the flex column,
+   and centre the wrapped names so the block reads as one label. */
+.chip.archnames { align-self: center; max-width: 430px; white-space: normal;
+  flex-wrap: wrap; justify-content: center; text-align: center;
+  border-radius: 14px; line-height: 1.5; }
 
 /* 3 configuration */
 .sbody.config { gap: 40px; margin-top: 22px; }
@@ -384,6 +389,26 @@ ul.list li::before { content: ""; position: absolute; left: 2px; top: 9px; width
   font-family: 'Bahnschrift', sans-serif; font-weight: 600; font-size: 21px; color: ${INK}; }
 .sitsfoot b { color: ${ACCENT}; }
 
+/* 8+9 combined (--variant combined) */
+.sbody.trustsits { gap: 36px; margin-top: 20px; }
+.trustsits .col-left { width: 46%; justify-content: center; gap: 16px; }
+.trustsits .col-right { width: 54%; justify-content: center; gap: 12px; }
+.trustpanel { padding: 20px 22px; display: flex; flex-direction: column; gap: 15px; }
+.ts-t { font-family: 'Bahnschrift', sans-serif; font-weight: 600; font-size: 12.5px;
+  letter-spacing: 0.14em; text-transform: uppercase; color: ${MUTED}; }
+.cs-check { display: flex; gap: 12px; align-items: flex-start; }
+.cs-ck { flex: none; width: 24px; height: 24px; border-radius: 8px; margin-top: 1px;
+  display: flex; align-items: center; justify-content: center; font-size: 12px;
+  color: ${BG}; background: ${OK}; }
+.cs-body { font-size: 12.5px; line-height: 1.42; color: #C4CCDE; }
+.cs-t { font-family: 'Bahnschrift', sans-serif; font-weight: 600; font-size: 12.5px;
+  letter-spacing: 0.14em; text-transform: uppercase; color: ${MUTED}; }
+.trustsits .ctable { margin-top: 0; }
+.trustsits .ctable td { font-size: 12.5px; padding: 10px 14px; }
+.trustsits .ctable td:first-child { font-size: 14px; width: 27%; }
+.trustsits .ctable th { font-size: 10.5px; padding: 0 14px 5px; }
+.trustsits .sitsfoot { font-size: 17px; margin-top: 10px; }
+
 /* 10 ask */
 /* The header stays left-aligned like every other slide; only the ask block
    below it centres, so slide 10 reads as the same deck rather than a poster. */
@@ -398,7 +423,8 @@ ul.list li::before { content: ""; position: absolute; left: 2px; top: 9px; width
 .a-urls { display: flex; gap: 14px; }
 .a-url { display: inline-flex; align-items: center; gap: 10px; padding: 12px 26px;
   border-radius: 14px; border: 1px solid rgba(124,92,255,0.6); background: rgba(124,92,255,0.1);
-  font-family: 'Bahnschrift', sans-serif; font-weight: 600; font-size: 22px; color: ${INK}; }
+  font-family: 'Bahnschrift', sans-serif; font-weight: 600; font-size: 22px; color: ${INK};
+  text-decoration: none; }
 .a-url .u { color: ${ACCENT}; }
 .adirs { display: flex; gap: 16px; width: 100%; max-width: 1060px; }
 .adir { flex: 1; padding: 16px 20px; }
@@ -446,8 +472,8 @@ function coverSlide(o, index, total) {
   // The hero numbers are the deck's thesis in three tokens: the size of the
   // haystack, the number of axes that actually get swept, the one answer out.
   const heroes = [
-    { n: "≈4 000 000", l: "GGUF files" },
-    { n: "14", l: "swept axes" },
+    { n: "4 000 000", l: "files" },
+    { n: "11", l: "knobs" },
     { n: "1", l: "answer" },
   ];
   const heroHtml = heroes
@@ -476,21 +502,21 @@ function catalogSlide(o, index, total) {
     .filter((p) => /^[~≈\d]/.test(p))
     .slice(0, 3)
     .map((p) => {
-      const m = p.match(/^([~≈]?\s?[\d\s]+)(.*)$/);
+      const m = p.match(/^([~≈]?\s?[\d\s+]+)(.*)$/);
       return m ? { n: m[1].trim(), l: m[2].trim() } : { n: "", l: p };
     });
   const numHtml = nums
     .map((x) => `<div class="bignum"><div class="bn">${esc(x.n)}</div><div class="bl">${inline(x.l)}</div></div>`)
     .join("");
-  const archLine = o.paras.find((p) => p.startsWith("10+")) || "";
-  const tail = o.paras.filter((p) => !/^[~≈\d]/.test(p));
+  const archLine = o.paras.find((p) => /^(DeepSeek|Qwen|Nemotron)/.test(p)) || "";
+  const tail = o.paras.filter((p) => !/^[~≈\d]/.test(p) && p !== archLine);
   return `<section class="slide" id="slide-${index + 1}">
 ${glowLayer("g-left")}
 ${headerBlock(o)}
   <div class="sbody catalog">
     <div class="col col-left">
       <div class="bignums">${numHtml}</div>
-      <div class="chip vip"><span class="v">10+</span> ${inline(archLine.replace(/^10\+\s*architectures:\s*/, ""))}</div>
+      <div class="chip vip archnames">${inline(archLine.replace(/^10\+\s*architectures:\s*/, ""))}</div>
     </div>
     <div class="col col-right">
       <div class="cat-wrap">
@@ -506,9 +532,8 @@ ${footerBlock(index, total)}
 
 function configSlide(o, index, total) {
   const AXES = [
-    "context", "offload layers", "KV cache K ×9", "KV cache V ×9", "flash attention",
-    "batch", "ubatch", "threads", "prefill depth", "concurrency",
-    "MoE CPU offload", "speculative decoding", "draft offload", "llama.cpp build",
+    "context length", "threads", "GPU offload", "MoE layers", "batch", "µbatch",
+    "K cache", "V cache", "flash attention", "MTP", "KV depth",
   ];
   const axisHtml = AXES.map((a, i) =>
     `<span class="chip${i === 2 || i === 10 ? " vip" : ""}">${esc(a)}</span>`
@@ -537,8 +562,8 @@ ${headerBlock(o)}
   <div class="sbody config">
     <div class="col col-left">
       <div class="axeshead">
-        <div class="ah-n">14</div>
-        <div class="ah-t">axes, cross-multiplied<span>on every run, on every machine, for every model</span></div>
+        <div class="ah-n">11</div>
+        <div class="ah-t">knobs, cross-multiplied<span>on every run, on every machine, for every model</span></div>
       </div>
       <div class="axisfield">${axisHtml}</div>
       <div class="kicknote">${closers.map((c) => inline(c)).join("<br>")}</div>
@@ -580,10 +605,10 @@ ${headerBlock(o)}
         <div class="zero-side">
           <div class="zs-t">answers for<br>your hardware</div>
           <div class="zero-metrics">
-            <span class="chip">tok/s</span>
+            <span class="chip">pp tok/s</span>
+            <span class="chip">tg tok/s</span>
             <span class="chip">TTFT</span>
             <span class="chip">usable context</span>
-            <span class="chip">OOM-free</span>
           </div>
         </div>
       </div>
@@ -664,8 +689,8 @@ ${glowLayer("g-left")}
 ${headerBlock(o)}
   <div class="sbody fix">
     <div class="col col-left">
-      <p style="font-size:15.5px;line-height:1.5;color:#C4CCDE">${inline(left[0] || "")} ${inline(left[1] || "")}</p>
-      <p style="font-size:15.5px;line-height:1.5;color:#C4CCDE"><b>${inline(left[2] || "")}</b><br>${inline(left[3] || "")} <span style="color:${ACCENT}">${inline(left[4] || "")}</span></p>
+      <p style="font-size:15.5px;line-height:1.55;color:#C4CCDE">${inline(left[0] || "")}<br>${inline(left[1] || "")}</p>
+      <p style="font-size:15.5px;line-height:1.55;color:#C4CCDE"><b>${inline(left[2] || "")}</b><br>${inline(left[3] || "")}<br><span style="color:${ACCENT}">${inline(left[4] || "")}</span></p>
       <p style="font-family:'Bahnschrift',sans-serif;font-weight:600;font-size:25px;color:${INK};line-height:1.25">Intent in.<br><span style="color:${ACCENT}">Decision out.</span></p>
       <p style="font-size:14px;line-height:1.45;color:${FAINT}">${inline(left[8] || "")}</p>
     </div>
@@ -778,9 +803,9 @@ ${footerBlock(index, total)}
 
 function askSlide(o, index, total) {
   const dirs = [
-    { n: "01", t: "Attach a machine", s: "One command. Pull-only — nothing to port-forward, no manual llama.cpp build." },
-    { n: "02", t: "Share your numbers", s: "Opt in and your results join the k-anonymised community set — never under 5 contributors." },
-    { n: "03", t: "Star it while it's early", s: "Solo GPU owners, mixed-hardware teams, and anyone publishing reproducible numbers." },
+    { n: "01", t: "Connect your machine", s: "One command. Pull-only — nothing to port-forward, no manual llama.cpp build." },
+    { n: "02", t: "Find your optimal config", s: "State intent — goal × workload × target context — and get the profile that wins on your box." },
+    { n: "03", t: "Build the shared catalog together", s: "Every validated test becomes part of a public, searchable record." },
   ];
   const dirHtml = dirs
     .map((d) => `<div class="card adir"><div class="ad-n">${d.n}</div><div class="ad-t">${esc(d.t)}</div><div class="ad-s">${esc(d.s)}</div></div>`)
@@ -794,8 +819,7 @@ ${headerBlock(o)}
       <div class="a-lab">command connects your rig<span>a spare GPU box, an old laptop, or the CPU on your VPS</span></div>
     </div>
     <div class="a-urls">
-      <div class="a-url">github.com/<span class="u">noname9006/LlamaToaster</span></div>
-      <div class="a-url"><span class="u">llamatoaster.com</span></div>
+      <a class="a-url" href="https://llamatoaster.com/"><span class="u">llamatoaster.com</span></a>
     </div>
     <div class="adirs">${dirHtml}</div>
   </div>
@@ -803,17 +827,79 @@ ${footerBlock(index, total)}
 </section>`;
 }
 
-const RENDERERS = [
+// 8+9 merged into one slide (--variant combined): the trust checks sit in the
+// left panel, the "where it sits" comparison table on the right.
+function trustSitsSlide(o, index, total) {
+  const checks = [];
+  for (const p of o.paras) {
+    if (p.startsWith("✓")) checks.push(p.slice(1).trim());
+    else if (checks.length && !p.startsWith("The gap")) checks[checks.length - 1] += " " + p;
+  }
+  const checkHtml = checks
+    .map((c) => `<div class="cs-check"><div class="cs-ck">✓</div><div class="cs-body">${inline(c)}</div></div>`)
+    .join("");
+  const rows = o.table.filter((r) => !r.every((c) => /^-+:?$|^:?-+:?$/.test(c)));
+  const head = rows[0] || ["Tool", "What it gives you", "What it never answers"];
+  const body = rows.slice(1);
+  const bodyHtml = body
+    .map((r) => {
+      const us = r[0].includes("**");
+      const cells = r.map((c) => `<td>${inline(c.replace(/\*\*/g, ""))}</td>`).join("");
+      return `<tr class="${us ? "us" : ""}">${cells}</tr>`;
+    })
+    .join("");
+  const closer = o.paras.find((p) => p.startsWith("The gap")) || "";
+  const [a, b] = closer.split(".");
+  return `<section class="slide" id="slide-${index + 1}">
+${glowLayer("g-tr")}
+${headerBlock(o)}
+  <div class="sbody trustsits">
+    <div class="col col-left">
+      <div class="card trustpanel">
+        <div class="ts-t">Every number carries its methods</div>
+        ${checkHtml}
+      </div>
+    </div>
+    <div class="col col-right">
+      <div class="cs-t">Where it sits vs. the tools you use</div>
+      <table class="ctable">
+        <thead><tr>${head.map((h) => `<th>${esc(h)}</th>`).join("")}</tr></thead>
+        <tbody>${bodyHtml}</tbody>
+      </table>
+      <div class="sitsfoot">${esc((a || "").trim())}. <b>${esc((b || "").trim())}.</b></div>
+    </div>
+  </div>
+${footerBlock(index, total)}
+</section>`;
+}
+
+const RENDERERS_FULL = [
   coverSlide, catalogSlide, configSlide, missingSlide, whySlide,
   fixSlide, builtSlide, trustSlide, sitsSlide, askSlide,
 ];
+const RENDERERS_NOTRUST = [
+  coverSlide, catalogSlide, configSlide, missingSlide, whySlide,
+  fixSlide, builtSlide, sitsSlide, askSlide,
+];
+const RENDERERS_COMBINED = [
+  coverSlide, catalogSlide, configSlide, missingSlide, whySlide,
+  fixSlide, builtSlide, trustSitsSlide, askSlide,
+];
+const VARIANTS = {
+  full: RENDERERS_FULL,
+  combined: RENDERERS_COMBINED,
+  notrust: RENDERERS_NOTRUST,
+};
+// Back-compat: the default (no --variant) stays the 10-slide full deck.
+const RENDERERS = RENDERERS_FULL;
 
-function buildHtml(mdText) {
+function buildHtml(mdText, renderers) {
+  const rr = renderers || RENDERERS;
   const slides = parseSlides(mdText);
   const body = slides
     .map((raw, i) => {
       const o = extract(raw);
-      const fn = RENDERERS[i] || coverSlide;
+      const fn = rr[i] || coverSlide;
       return fn(o, i, slides.length);
     })
     .join("\n");
@@ -912,25 +998,34 @@ function screenshotSlide(htmlPath, outPng, n) {
   }
 }
 
-function writeTempHtml(mdText) {
+function writeTempHtml(mdText, renderers) {
   const tmpHtml = join(tmpdir(), `lt-pitch-v3-${Date.now()}.html`);
-  writeFileSync(tmpHtml, buildHtml(mdText));
+  writeFileSync(tmpHtml, buildHtml(mdText, renderers));
   return tmpHtml;
+}
+
+function argValue(args, key) {
+  const i = args.indexOf(key);
+  return i !== -1 && args.length > i + 1 ? args[i + 1] : null;
 }
 
 function main() {
   const args = process.argv.slice(2);
+  const vIdx = args.indexOf("--variant");
+  const variant = (vIdx !== -1 && args.length > vIdx + 1) ? args[vIdx + 1] : "full";
+  if (vIdx !== -1) args.splice(vIdx, 2);
+  const renderers = VARIANTS[variant] || RENDERERS;
 
   if (args[0] === "--html-only" && args.length >= 3) {
     const mdText = readFileSync(resolve(args[1]), "utf8");
-    writeFileSync(resolve(args[2]), buildHtml(mdText));
+    writeFileSync(resolve(args[2]), buildHtml(mdText, renderers));
     console.log(`HTML written: ${resolve(args[2])}`);
     return;
   }
 
   if (args[0] === "--shots" && args.length >= 3) {
     const mdText = readFileSync(resolve(args[1]), "utf8");
-    const tmpHtml = writeTempHtml(mdText);
+    const tmpHtml = writeTempHtml(mdText, renderers);
     const outDir = resolve(args[2]);
     mkdirSync(outDir, { recursive: true });
     const total = parseSlides(mdText).length;
@@ -951,8 +1046,8 @@ function main() {
     const inPath = resolve(args[0]);
     const outPdf = resolve(args[1]);
     const mdText = readFileSync(inPath, "utf8");
-    const tmpHtml = writeTempHtml(mdText);
-    console.log(`Rendering ${basename(inPath)} -> ${outPdf} (${parseSlides(mdText).length} slides)`);
+    const tmpHtml = writeTempHtml(mdText, renderers);
+    console.log(`Rendering ${basename(inPath)} -> ${outPdf} (${parseSlides(mdText).length} slides, variant ${variant})`);
     printPdf(tmpHtml, outPdf);
     try { rmSync(tmpHtml, { force: true }); } catch {}
     console.log(`PDF written: ${outPdf}`);
@@ -960,7 +1055,7 @@ function main() {
   }
 
   console.log(`Usage:
-  node scripts/pitch-to-pdf-v3.mjs <in.md> <out.pdf>
+  node scripts/pitch-to-pdf-v3.mjs [--variant full|combined|notrust] <in.md> <out.pdf>
   node scripts/pitch-to-pdf-v3.mjs --html-only <in.md> <out.html>
   node scripts/pitch-to-pdf-v3.mjs --shots <in.md> <outDir> [slide numbers...]`);
 }

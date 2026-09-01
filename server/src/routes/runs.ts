@@ -570,6 +570,18 @@ export async function runsRoutes(app: FastifyInstance): Promise<void> {
     return reply.send(gzipped);
   });
 
+  // N2 batching -- every run sharing this run's root (itself included), so a
+  // multi-mode probe batch (see TriggerPayload.probe_batch_root_id) can be
+  // rendered as one Runs-list row / one RunDetail view instead of the caller
+  // having to separately discover and fetch each sibling. Ownership-scoped
+  // the same way GET /api/runs/:id/log is.
+  app.get<{ Params: { id: string } }>("/api/runs/:id/batch-members", async (request, reply) => {
+    const authed = resolveAuthUser(request);
+    const run = repo.getRun(authed?.user.id, request.params.id);
+    if (!run) return reply.code(404).send({ error: "run not found" });
+    return { members: repo.listRunsUnderRoot(authed?.user.id, run.root_run_id ?? run.id) };
+  });
+
   // Worker -> server push of a completed run's log file (MULTIUSER_PLAN.md
   // §1.10). Dual-mode worker auth (Stage 3 session first, Stage 1 shared
   // secret as fallback -- same posture as worker-auth.ts's authenticateWorker,
@@ -964,11 +976,35 @@ export async function runsRoutes(app: FastifyInstance): Promise<void> {
         }
       }
 
+      // N2 batching -- attaches this probe as a sibling under an existing
+      // probe root (see TriggerPayload.probe_batch_root_id's own comment for
+      // why this is separate from parent_run_id/chain_depth below).
+      if (body.probe_batch_root_id !== undefined && typeof body.probe_batch_root_id !== "string") {
+        return reply.code(400).send({ error: "probe_batch_root_id must be a string" });
+      }
+      if (body.probe_batch_root_id && kind !== "probe") {
+        return reply.code(400).send({ error: "probe_batch_root_id requires kind \"probe\"" });
+      }
+      let batchRoot: Run | undefined;
+      if (body.probe_batch_root_id) {
+        batchRoot = repo.getRun(undefined, body.probe_batch_root_id);
+        if (!batchRoot || batchRoot.kind !== "probe") {
+          return reply.code(400).send({ error: "unknown or non-probe probe_batch_root_id" });
+        }
+        const batchRootOwnerId = repo.getRunOwnerId(body.probe_batch_root_id);
+        if (batchRootOwnerId != null && userId != null && batchRootOwnerId !== userId) {
+          return reply.code(403).send({ error: "that batch belongs to another user" });
+        }
+      }
+
       // §0.5 duplicate-trigger guard -- same (user, model, worker) triple with
       // the same non-NULL kind already running/scheduled. The 409 names the
-      // active root and kind.
+      // active root and kind. Bypassed when this trigger is deliberately
+      // attaching to the very batch that's already in flight -- that's not an
+      // accidental double-trigger, it's item 6's "queue more onto a running
+      // batch".
       const blocking = repo.findBlockingRun(userId, body.model_id, worker.id, kind);
-      if (blocking) {
+      if (blocking && !(batchRoot && (blocking.id === batchRoot.id || blocking.id === batchRoot.root_run_id))) {
         throw new ConflictError(
           `you already have a ${blocking.kind ?? "standalone"} run for this model on that machine (${blocking.id}). Stop it first or wait for it to finish.`
         );
@@ -981,7 +1017,12 @@ export async function runsRoutes(app: FastifyInstance): Promise<void> {
       }
       let rootRunId: string | null = null;
       let chainDepth = 0;
-      if (body.parent_run_id) {
+      if (batchRoot) {
+        // A probe batch is a flat sibling group, not a chain -- no
+        // chain_depth bookkeeping and no MAX_CHAIN_DEPTH check, matching
+        // countActiveRoots' own "probes are exempt" precedent below.
+        rootRunId = batchRoot.root_run_id ?? batchRoot.id;
+      } else if (body.parent_run_id) {
         const parent = repo.getRun(undefined, body.parent_run_id);
         if (!parent) return reply.code(400).send({ error: "unknown parent_run_id" });
         const parentOwnerId = repo.getRunOwnerId(body.parent_run_id);
@@ -1076,7 +1117,10 @@ export async function runsRoutes(app: FastifyInstance): Promise<void> {
       };
       if (goals) runConfig.goals = goals;
       if (discardFirst > 0) runConfig.discard_first_repeats = discardFirst;
-      if (rootRunId) runConfig.chain_depth = chainDepth;
+      // Not for a probe batch sibling (batchRoot set): that's a flat group,
+      // not a tuning->refine->sweep chain, so it carries no chain_depth at all
+      // rather than a meaningless stored 0.
+      if (!batchRoot && rootRunId) runConfig.chain_depth = chainDepth;
       // N2/N1/N5 -- the spec each of these run kinds executes is stored on the
       // run itself, so the worker-authed ingestion routes derive KV pair,
       // placement and context from the RUN, never from the reported payload.
@@ -1296,14 +1340,11 @@ export async function runsRoutes(app: FastifyInstance): Promise<void> {
     }
   );
 
-  // Target the RUN, not the machine (a change from the old worker-scoped
-  // /api/workers/:name/stop|pause|resume) -- the right shape once one
-  // account owns several machines (MULTIUSER_PLAN.md §1.14).
-  app.post<{ Params: { id: string } }>("/api/runs/:id/stop", async (request, reply) => {
-    const authed = resolveAuthUser(request);
-    const run = repo.getRun(authed?.user.id, request.params.id);
-    if (!run) throw new NotFoundError("run not found");
-
+  // Stops one run: cancels its never-claimed jobs outright, or signals the
+  // worker to cancel a claimed one on its next heartbeat. Shared by the
+  // /stop route below for both the targeted run and, for a probe batch,
+  // every sibling still in flight underneath it.
+  function stopOneRun(authedUserId: string | undefined, run: Run): Run {
     const jobs = repo.queueRepo.getNonTerminalJobsForRun(run.id);
     repo.queueRepo.cancelPendingJobsForRun(run.id); // never-claimed jobs -- nothing to signal, cancel outright
 
@@ -1314,15 +1355,41 @@ export async function runsRoutes(app: FastifyInstance): Promise<void> {
       // Nothing is actually executing (or the machine is unreachable) --
       // reconcile immediately instead of waiting on a lease/heartbeat that
       // may never arrive.
-      const reconciled = repo.reconcileStaleRun(authed?.user.id, run.id, "stopped by user");
-      return { run: reconciled ?? run };
+      return repo.reconcileStaleRun(authedUserId, run.id, "stopped by user") ?? run;
     }
 
     // Delivered on the worker's next heartbeat (≤10s) -- the UI shows
     // "stopping…" until the worker's own terminal item reports land.
     repo.queueRepo.requestCancelForRun(run.id);
     queueEvents.emit(worker.id);
-    return { run };
+    return run;
+  }
+
+  // Target the RUN, not the machine (a change from the old worker-scoped
+  // /api/workers/:name/stop|pause|resume) -- the right shape once one
+  // account owns several machines (MULTIUSER_PLAN.md §1.14).
+  app.post<{ Params: { id: string } }>("/api/runs/:id/stop", async (request, reply) => {
+    const authed = resolveAuthUser(request);
+    const run = repo.getRun(authed?.user.id, request.params.id);
+    if (!run) throw new NotFoundError("run not found");
+
+    // Cascade to every sibling under the same root that's still in flight --
+    // "stop" on a probe batch means stop the whole batch (the currently-
+    // running scenario AND any not-yet-started ones still queued behind it),
+    // not just whichever member happens to be displayed. A no-op for an
+    // ordinary standalone run or a tuning/refine/sweep chain stage: those
+    // never have more than one non-terminal sibling under a root by
+    // construction, so this loop covers just `run` itself in practice.
+    const siblings = repo.listRunsUnderRoot(authed?.user.id, run.root_run_id ?? run.id);
+    for (const sibling of siblings) {
+      if (sibling.id === run.id) continue;
+      if (sibling.status === "running" || sibling.status === "scheduled") {
+        stopOneRun(authed?.user.id, sibling);
+      }
+    }
+
+    const updated = stopOneRun(authed?.user.id, run);
+    return { run: updated };
   });
 
   app.post<{ Params: { id: string } }>("/api/runs/:id/pause", async (request) => {

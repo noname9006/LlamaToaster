@@ -68,6 +68,8 @@ import {
   refreshWorkerSession,
   HttpError,
   postProbeResult,
+  postProbeAttempt,
+  getProbeDedup,
   postQualityResult,
 } from "./vps-client.js";
 import { log, configureLogging, setRunLogFile, ansi, paint, colorsEnabled } from "./log.js";
@@ -122,6 +124,7 @@ import {
   type CurvePointSpec,
   type KneeSpec,
 } from "../../shared/types.js";
+import type { ProbeDedupPoint } from "../../shared/api-v8.js";
 import { detectThermalThrottle, detectSensorAvailability, LHM_HTTP_PORT, type SensorAvailability } from "./sensors.js";
 import { readCpuIsa } from "./binary-probe.js";
 import { resolveVramDiscrepancyAction } from "./vram-policy.js";
@@ -931,6 +934,18 @@ function sendTick(runId: string, idx: number, tick: RunItemTickInput): void {
   withAuth((token) => postRunItemUpdate(config.url, token, runId, idx, tick, 3000)).catch((err) => {
     log.debug(
       `tick failed for run ${runId} item ${idx} (non-fatal): ${err instanceof Error ? err.message : String(err)}`
+    );
+  });
+}
+
+// N2 live progress -- same fire-and-forget posture as sendTick above: losing
+// one rung's tick is harmless (the final postProbeResult call at the end of
+// the ladder still reports everything through replaceForRun), so this
+// deliberately doesn't retry or block the ladder loop on the round trip.
+function sendProbeAttemptTick(runId: string, seq: number, attempt: ProbeAttemptReport): void {
+  withAuth((token) => postProbeAttempt(config.url, token, runId, seq, attempt)).catch((err) => {
+    log.debug(
+      `probe attempt tick failed for run ${runId} seq ${seq} (non-fatal): ${err instanceof Error ? err.message : String(err)}`
     );
   });
 }
@@ -3041,6 +3056,20 @@ async function executeRunProbeJob(payload: RunProbeJobPayload): Promise<void> {
   const attempts: ProbeAttemptOutcome[] = [];
   const mode = payload.mode ?? "max_context";
   const granularity = payload.granularity ?? "basic";
+
+  // N2 batch dedup -- an earlier sibling scenario in the same batch may
+  // already have measured some of the (ctx, ngl) points this ladder is
+  // about to try (keep_context/balanced/fixed_offload routinely start from
+  // and land on the same point). Best-effort: an empty/failed fetch just
+  // means every candidate gets genuinely measured, same as before this
+  // existed.
+  const dedupPoints = await withAuth((token) => getProbeDedup(config.url, token, payload.run_id)).catch(() => []);
+  if (dedupPoints.length > 0) {
+    log.info(`${label}: ${dedupPoints.length} point(s) already measured by an earlier batch sibling`);
+  }
+  function findDedupMatch(ctx: number, ngl: number): ProbeDedupPoint | undefined {
+    return dedupPoints.find((p) => p.candidate_ctx === ctx && p.ngl === ngl);
+  }
   // The ladder never probes above what the model was trained for. With no
   // trained_ctx in the header there is no honest ceiling to search toward, so
   // the caller's own candidate stands as one rather than inventing a bound.
@@ -3131,10 +3160,50 @@ async function executeRunProbeJob(payload: RunProbeJobPayload): Promise<void> {
       `layers within [0, ${nglMax}], at most ${probeMaxLoads} loads`
   );
 
+  let stoppedMidLadder = false;
   try {
     for (;;) {
+      // Checked before every rung, same as the sweep-item loop above -- a
+      // stop request only kills whatever candidate is loading RIGHT NOW
+      // (requestStop's activeBenchProc.kill), so without this the ladder just
+      // keeps trying lower and lower layer counts on its own until it either
+      // converges or exhausts maxLoads, reporting a real (but user-uninvited)
+      // failed/failed_oom instead of the stop the user actually asked for.
+      if (stopRequested) {
+        stoppedMidLadder = true;
+        break;
+      }
       const rung = nextLadderRung({ ...ladderInput, history: attempts.map(toLadderAttempt) });
       if (!rung) break;
+      // N2 batch dedup -- an earlier sibling already measured this EXACT
+      // point, so reuse its outcome instead of spawning llama-server to
+      // rediscover the same answer. Still feeds nextLadderRung's bisection
+      // (attempts.push below) and still gets a live tick, just with no real
+      // load in between.
+      const dedupMatch = findDedupMatch(rung.ctx, rung.ngl);
+      if (dedupMatch) {
+        log.info(
+          `${label}: candidate ${rung.ctx}/${rung.ngl} reused from batch sibling ${dedupMatch.source_run_id} -- not reloaded`
+        );
+        const reusedAttempt: ProbeAttemptOutcome = {
+          candidateCtx: rung.ctx,
+          ngl: rung.ngl,
+          ok: dedupMatch.ok,
+          oom: dedupMatch.oom,
+          spill: dedupMatch.spill,
+          vramPeakMib: dedupMatch.vram_peak_mib,
+          ramPeakMib: dedupMatch.ram_peak_mib,
+          genTps: dedupMatch.gen_tps,
+          vramNeededMib: dedupMatch.vram_needed_mib,
+          vramFreeMib: dedupMatch.vram_free_mib,
+          ramNeededMib: dedupMatch.ram_needed_mib,
+          ramFreeMib: dedupMatch.ram_free_mib,
+          reusedFromRunId: dedupMatch.source_run_id,
+        };
+        attempts.push(reusedAttempt);
+        sendProbeAttemptTick(payload.run_id, attempts.length - 1, toProbeAttemptReport(reusedAttempt));
+        continue;
+      }
       const estimate = estimateProbeMemoryNeed(payload, rung.ctx, rung.ngl);
       const estimateNote = describeEstimatedMemoryNeed(estimate);
       log.info(
@@ -3160,7 +3229,17 @@ async function executeRunProbeJob(payload: RunProbeJobPayload): Promise<void> {
         estimate,
         label,
       });
+      // A stop mid-load kills the child the same way an OOM would, so this
+      // attempt's ok/oom fields describe the kill, not the config -- discard
+      // it rather than recording a fake failure for a candidate that was
+      // never actually let run to completion.
+      if (stopRequested) {
+        stoppedMidLadder = true;
+        log.info(`${label}: candidate ${rung.ctx}/${rung.ngl} discarded -- stopped mid-load`);
+        break;
+      }
       attempts.push(attempt);
+      sendProbeAttemptTick(payload.run_id, attempts.length - 1, toProbeAttemptReport(attempt));
       // Actual observed peak alongside the "estimated need" line logged
       // before this load started -- lets a log reader compare predicted vs
       // real without cross-referencing anything else.
@@ -3200,15 +3279,27 @@ async function executeRunProbeJob(payload: RunProbeJobPayload): Promise<void> {
           method_version: METHOD_VERSION,
           attempts: attempts.map(toProbeAttemptReport),
         }
-      : {
-          status: attempts.some((a) => a.oom) ? "failed_oom" : "failed",
-          verified_ctx_tokens: null,
-          method_version: METHOD_VERSION,
-          attempts: attempts.map(toProbeAttemptReport),
-          error:
-            attempts[attempts.length - 1]?.error ??
-            "no candidate context loaded and generated above the usable floor",
-        };
+      : stoppedMidLadder
+        ? {
+            // Distinct from failed/failed_oom: the ladder was interrupted by
+            // the user, not exhausted -- reporting a real OOM/failure verdict
+            // here would tell the user their model doesn't fit anywhere, when
+            // all that's actually known is that nobody let the search finish.
+            status: "stopped",
+            verified_ctx_tokens: null,
+            method_version: METHOD_VERSION,
+            attempts: attempts.map(toProbeAttemptReport),
+            error: "stopped by user before the ladder found a usable placement",
+          }
+        : {
+            status: attempts.some((a) => a.oom) ? "failed_oom" : "failed",
+            verified_ctx_tokens: null,
+            method_version: METHOD_VERSION,
+            attempts: attempts.map(toProbeAttemptReport),
+            error:
+              attempts[attempts.length - 1]?.error ??
+              "no candidate context loaded and generated above the usable floor",
+          };
     await withAuth((token) => postProbeResult(config.url, token, payload.run_id, report));
     log.info(
       `${label}: ${report.status}` +
@@ -3244,6 +3335,7 @@ function toProbeAttemptReport(attempt: ProbeAttemptOutcome): ProbeAttemptReport 
     ram_free_mib: attempt.ramFreeMib,
     ram_peak_mib: attempt.ramPeakMib,
     error: attempt.error,
+    reused_from_run_id: attempt.reusedFromRunId,
   };
 }
 

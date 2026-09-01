@@ -50,19 +50,26 @@ function post(path: string, body: unknown, token?: string) {
 
 function makeRun(
   id: string,
-  opts: { kind?: string; worker: string; config?: Record<string, unknown> } = { worker: "" }
+  opts: {
+    kind?: string;
+    worker: string;
+    config?: Record<string, unknown>;
+    root_run_id?: string;
+    llama_cpp_build?: string;
+    status?: string;
+  } = { worker: "" }
 ): void {
   repo.createRun(undefined, {
     id,
     kind: (opts.kind as never) ?? null,
-    root_run_id: id,
+    root_run_id: opts.root_run_id ?? id,
     worker_id: opts.worker,
     worker_name: "w",
-    llama_cpp_build: "b1",
+    llama_cpp_build: opts.llama_cpp_build ?? "b1",
     llama_cpp_backend: "cpu",
     model_id: "m1",
     config: { model_id: "m1", sweep, ...(opts.config ?? {}) } as never,
-    status: "running",
+    status: (opts.status as never) ?? "running",
     started_at: Date.now(),
   } as never);
   repo.createRunItems(undefined, id, [
@@ -390,6 +397,36 @@ describe("POST /api/runs/:id/probe-result (N2)", () => {
     expect(rungs[1].gen_tps).toBeCloseTo(41.5, 6);
   });
 
+  // Same field, same validator, the OTHER call site -- the final ladder
+  // report goes through validateProbeAttempts/validateOneProbeAttempt too.
+  it("keeps reused_from_run_id through the final replaceForRun report, not just the live tick", async () => {
+    // reused_from_run_id is a real FK (schema.sql) -- the sibling it names
+    // has to exist, same as any production dedup source would.
+    makeRun("probe-rungs-reused-sibling", { kind: "probe", worker: workerId, config: { probe: probeSpec } });
+    makeRun("probe-rungs-reused", { kind: "probe", worker: workerId, config: { probe: probeSpec } });
+    const res = await post(
+      "/api/runs/probe-rungs-reused/probe-result",
+      {
+        status: "verified",
+        verified_ctx_tokens: 8192,
+        attempts: [
+          {
+            candidate_ctx: 8192,
+            ngl: 20,
+            ok: true,
+            oom: false,
+            spill: false,
+            reused_from_run_id: "probe-rungs-reused-sibling",
+          },
+        ],
+      },
+      workerToken
+    );
+    expect(res.status).toBe(200);
+    const rungs = repo.probeAttemptsRepo.listForRun("probe-rungs-reused");
+    expect(rungs[0].reused_from_run_id).toBe("probe-rungs-reused-sibling");
+  });
+
   it("keeps the rungs of a failed probe, which writes no verified ceiling", async () => {
     makeRun("probe-rungs-fail", { kind: "probe", worker: workerId, config: { probe: probeSpec } });
     const res = await post(
@@ -431,6 +468,289 @@ describe("POST /api/runs/:id/probe-result (N2)", () => {
     expect(res.status).toBe(200);
     expect(repo.limitsRepo.listForModelAndWorker("m1", workerId).some((r) => r.kv_type === "q4_0/q4_0")).toBe(false);
     expect(repo.getRunItems("probe-fail")[0].status).toBe("failed_oom");
+  });
+
+  // A user stop mid-ladder must read as "cancelled", never "failed"/"failed_oom"
+  // -- see worker/src/index.ts's stopRequested check inside executeRunProbeJob's
+  // ladder loop. Distinguishing this from an ordinary failure is the whole
+  // point: a stop means "nobody let the search finish", not "this doesn't fit
+  // anywhere".
+  it("records a user stop as cancelled, not failed, and writes no verified ceiling", async () => {
+    makeRun("probe-stopped", {
+      kind: "probe",
+      worker: workerId,
+      config: { probe: { ...probeSpec, kv_pair: ["q5_0", "q5_0"] } },
+    });
+    const res = await post(
+      "/api/runs/probe-stopped/probe-result",
+      {
+        status: "stopped",
+        verified_ctx_tokens: null,
+        attempts: [{ candidate_ctx: 8192, ngl: 30, ok: true, oom: false, spill: false }],
+        error: "stopped by user before the ladder found a usable placement",
+      },
+      workerToken
+    );
+    expect(res.status).toBe(200);
+    expect(repo.probeAttemptsRepo.listForRun("probe-stopped")).toHaveLength(1);
+    expect(repo.limitsRepo.listForModelAndWorker("m1", workerId).some((r) => r.kv_type === "q5_0/q5_0")).toBe(false);
+    const item = repo.getRunItems("probe-stopped")[0];
+    expect(item.status).toBe("cancelled");
+    expect(item.error).toBe("stopped by user before the ladder found a usable placement");
+    expect(repo.getRun(undefined, "probe-stopped")?.status).toBe("cancelled");
+  });
+
+  it("falls back to a generic 'stopped by user' error when the worker sends none", async () => {
+    makeRun("probe-stopped-no-error", {
+      kind: "probe",
+      worker: workerId,
+      config: { probe: { ...probeSpec, kv_pair: ["q4_1", "q4_1"] } },
+    });
+    const res = await post(
+      "/api/runs/probe-stopped-no-error/probe-result",
+      { status: "stopped", verified_ctx_tokens: null, attempts: [] },
+      workerToken
+    );
+    expect(res.status).toBe(200);
+    expect(repo.getRunItems("probe-stopped-no-error")[0].error).toBe("stopped by user");
+  });
+
+  it("rejects a status outside verified/failed/failed_oom/stopped", async () => {
+    makeRun("probe-bad-status", { kind: "probe", worker: workerId, config: { probe: probeSpec } });
+    const res = await post(
+      "/api/runs/probe-bad-status/probe-result",
+      { status: "cancelled", verified_ctx_tokens: null, attempts: [] },
+      workerToken
+    );
+    expect(res.status).toBe(400);
+  });
+});
+
+// N2 live progress -- one rung at a time, posted WHILE the ladder is still
+// running (unlike probe-result, which only ever lands once at the very end).
+describe("POST /api/runs/:id/probe-attempt (N2 live progress)", () => {
+  it("stores a rung immediately, before the ladder ever finishes", async () => {
+    makeRun("probe-tick-a", { kind: "probe", worker: workerId, config: { probe: probeSpec } });
+    const res = await post(
+      "/api/runs/probe-tick-a/probe-attempt",
+      { seq: 0, candidate_ctx: 8192, ngl: 20, ok: true, oom: false, spill: false, gen_tps: 42.5 },
+      workerToken
+    );
+    expect(res.status).toBe(200);
+    const rows = repo.probeAttemptsRepo.listForRun("probe-tick-a");
+    expect(rows).toHaveLength(1);
+    expect(rows[0].seq).toBe(0);
+    expect(rows[0].ok).toBe(1);
+    expect(rows[0].gen_tps).toBe(42.5);
+    // Not yet finalized -- an in-progress probe's run_item stays non-terminal
+    // until the real probe-result call, unlike the batched replaceForRun path.
+    expect(repo.getRunItems("probe-tick-a")[0].status).not.toBe("done");
+  });
+
+  // N2 batch dedup -- a reused rung's provenance has to actually survive the
+  // request validator (validateOneProbeAttempt) to reach the database; this
+  // caught a real bug where the validator rebuilt the attempt object without
+  // copying this field through at all.
+  it("stores reused_from_run_id when the worker reports a dedup-skipped rung", async () => {
+    makeRun("probe-tick-reused-sibling", { kind: "probe", worker: workerId, config: { probe: probeSpec } });
+    makeRun("probe-tick-reused", { kind: "probe", worker: workerId, config: { probe: probeSpec } });
+    const res = await post(
+      "/api/runs/probe-tick-reused/probe-attempt",
+      {
+        seq: 0,
+        candidate_ctx: 8192,
+        ngl: 20,
+        ok: true,
+        oom: false,
+        spill: false,
+        reused_from_run_id: "probe-tick-reused-sibling",
+      },
+      workerToken
+    );
+    expect(res.status).toBe(200);
+    const rows = repo.probeAttemptsRepo.listForRun("probe-tick-reused");
+    expect(rows[0].reused_from_run_id).toBe("probe-tick-reused-sibling");
+  });
+
+  it("upserts by seq -- a retried tick for the same rung overwrites, never duplicates", async () => {
+    makeRun("probe-tick-b", { kind: "probe", worker: workerId, config: { probe: probeSpec } });
+    await post(
+      "/api/runs/probe-tick-b/probe-attempt",
+      { seq: 2, candidate_ctx: 4096, ngl: 10, ok: false, oom: true, spill: false },
+      workerToken
+    );
+    const retry = await post(
+      "/api/runs/probe-tick-b/probe-attempt",
+      { seq: 2, candidate_ctx: 4096, ngl: 10, ok: true, oom: false, spill: false, gen_tps: 12 },
+      workerToken
+    );
+    expect(retry.status).toBe(200);
+    const rows = repo.probeAttemptsRepo.listForRun("probe-tick-b");
+    expect(rows).toHaveLength(1);
+    expect(rows[0].ok).toBe(1);
+    expect(rows[0].gen_tps).toBe(12);
+  });
+
+  it("accumulates multiple rungs across separate calls, in seq order", async () => {
+    makeRun("probe-tick-c", { kind: "probe", worker: workerId, config: { probe: probeSpec } });
+    for (let seq = 0; seq < 3; seq++) {
+      const res = await post(
+        "/api/runs/probe-tick-c/probe-attempt",
+        { seq, candidate_ctx: 4096 * (seq + 1), ngl: 10, ok: true, oom: false, spill: false },
+        workerToken
+      );
+      expect(res.status).toBe(200);
+    }
+    const rows = repo.probeAttemptsRepo.listForRun("probe-tick-c");
+    expect(rows.map((r) => r.seq)).toEqual([0, 1, 2]);
+    expect(rows.map((r) => r.candidate_ctx)).toEqual([4096, 8192, 12288]);
+  });
+
+  it("rejects a non-probe run, an unenrolled caller, and a seq past the loads cap", async () => {
+    makeRun("probe-tick-notprobe", { worker: workerId });
+    const notProbe = await post(
+      "/api/runs/probe-tick-notprobe/probe-attempt",
+      { seq: 0, candidate_ctx: 4096, ngl: 10, ok: true, oom: false, spill: false },
+      workerToken
+    );
+    expect(notProbe.status).toBe(400);
+
+    makeRun("probe-tick-noauth", { kind: "probe", worker: workerId, config: { probe: probeSpec } });
+    const noAuth = await post("/api/runs/probe-tick-noauth/probe-attempt", {
+      seq: 0,
+      candidate_ctx: 4096,
+      ngl: 10,
+      ok: true,
+      oom: false,
+      spill: false,
+    });
+    expect(noAuth.status).toBe(401);
+
+    makeRun("probe-tick-badseq", { kind: "probe", worker: workerId, config: { probe: probeSpec } });
+    const badSeq = await post(
+      "/api/runs/probe-tick-badseq/probe-attempt",
+      { seq: MAX_PROBE_ATTEMPTS, candidate_ctx: 4096, ngl: 10, ok: true, oom: false, spill: false },
+      workerToken
+    );
+    expect(badSeq.status).toBe(400);
+  });
+});
+
+// N2 batch dedup -- lets a later scenario in the same batch skip a point an
+// earlier sibling already measured.
+describe("GET /api/runs/:id/probe-dedup", () => {
+  it("surfaces an earlier sibling's rungs to a same-root, same-build, same-kv probe", async () => {
+    makeRun("dedup-root", { kind: "probe", worker: workerId, config: { probe: probeSpec }, status: "done" });
+    await post(
+      "/api/runs/dedup-root/probe-attempt",
+      { seq: 0, candidate_ctx: 8192, ngl: 20, ok: true, oom: false, spill: false, gen_tps: 30 },
+      workerToken
+    );
+    await post(
+      "/api/runs/dedup-root/probe-attempt",
+      { seq: 1, candidate_ctx: 16384, ngl: 20, ok: false, oom: true, spill: false },
+      workerToken
+    );
+    makeRun("dedup-sibling", {
+      kind: "probe",
+      worker: workerId,
+      config: { probe: probeSpec },
+      root_run_id: "dedup-root",
+    });
+
+    const res = await fetch(`${baseUrl}/api/runs/dedup-sibling/probe-dedup`, {
+      headers: { authorization: `Bearer ${workerToken}` },
+    });
+    expect(res.status).toBe(200);
+    const { points } = (await res.json()) as {
+      points: { candidate_ctx: number; ngl: number | null; ok: boolean; oom: boolean; source_run_id: string }[];
+    };
+    expect(points).toHaveLength(2);
+    expect(points.every((p) => p.source_run_id === "dedup-root")).toBe(true);
+    const ok = points.find((p) => p.candidate_ctx === 8192);
+    expect(ok?.ok).toBe(true);
+    const oom = points.find((p) => p.candidate_ctx === 16384);
+    expect(oom?.oom).toBe(true);
+  });
+
+  it("excludes a sibling with a different KV pair -- not the same measurement", async () => {
+    makeRun("dedup-root-2", {
+      kind: "probe",
+      worker: workerId,
+      config: { probe: { ...probeSpec, kv_pair: ["f16", "f16"] } },
+      status: "done",
+    });
+    await post(
+      "/api/runs/dedup-root-2/probe-attempt",
+      { seq: 0, candidate_ctx: 8192, ngl: 20, ok: true, oom: false, spill: false },
+      workerToken
+    );
+    makeRun("dedup-sibling-2", {
+      kind: "probe",
+      worker: workerId,
+      config: { probe: { ...probeSpec, kv_pair: ["q8_0", "q8_0"] } },
+      root_run_id: "dedup-root-2",
+    });
+
+    const res = await fetch(`${baseUrl}/api/runs/dedup-sibling-2/probe-dedup`, {
+      headers: { authorization: `Bearer ${workerToken}` },
+    });
+    const { points } = (await res.json()) as { points: unknown[] };
+    expect(points).toHaveLength(0);
+  });
+
+  it("excludes a sibling built against a different llama.cpp build", async () => {
+    makeRun("dedup-root-3", {
+      kind: "probe",
+      worker: workerId,
+      config: { probe: probeSpec },
+      status: "done",
+      llama_cpp_build: "b1",
+    });
+    await post(
+      "/api/runs/dedup-root-3/probe-attempt",
+      { seq: 0, candidate_ctx: 8192, ngl: 20, ok: true, oom: false, spill: false },
+      workerToken
+    );
+    makeRun("dedup-sibling-3", {
+      kind: "probe",
+      worker: workerId,
+      config: { probe: probeSpec },
+      root_run_id: "dedup-root-3",
+      llama_cpp_build: "b2",
+    });
+
+    const res = await fetch(`${baseUrl}/api/runs/dedup-sibling-3/probe-dedup`, {
+      headers: { authorization: `Bearer ${workerToken}` },
+    });
+    const { points } = (await res.json()) as { points: unknown[] };
+    expect(points).toHaveLength(0);
+  });
+
+  it("ignores a still-running/scheduled sibling and never includes the caller's own root-of-one", async () => {
+    makeRun("dedup-standalone", { kind: "probe", worker: workerId, config: { probe: probeSpec } });
+    await post(
+      "/api/runs/dedup-standalone/probe-attempt",
+      { seq: 0, candidate_ctx: 8192, ngl: 20, ok: true, oom: false, spill: false },
+      workerToken
+    );
+    const res = await fetch(`${baseUrl}/api/runs/dedup-standalone/probe-dedup`, {
+      headers: { authorization: `Bearer ${workerToken}` },
+    });
+    const { points } = (await res.json()) as { points: unknown[] };
+    expect(points).toHaveLength(0);
+  });
+
+  it("rejects a non-probe run and an unenrolled caller", async () => {
+    makeRun("dedup-notprobe", { worker: workerId });
+    const notProbe = await fetch(`${baseUrl}/api/runs/dedup-notprobe/probe-dedup`, {
+      headers: { authorization: `Bearer ${workerToken}` },
+    });
+    expect(notProbe.status).toBe(400);
+
+    makeRun("dedup-noauth", { kind: "probe", worker: workerId, config: { probe: probeSpec } });
+    const noAuth = await fetch(`${baseUrl}/api/runs/dedup-noauth/probe-dedup`);
+    expect(noAuth.status).toBe(401);
   });
 });
 
