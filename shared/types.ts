@@ -1908,7 +1908,8 @@ export interface AdminStats {
   // Unique accounts -- one row per provider-independent user (schema.sql's
   // users table), so the row count IS the distinct-user count.
   users: number;
-  // Unique machine configurations ever connected -- one row per machine_id.
+  // Unique machine configurations ever connected -- one row per machine_id,
+  // excluding enrolments that never heartbeated even once.
   machines: number;
   // Unique models ACTUALLY TESTED -- distinct models referenced by at least
   // one run, NOT the full registered-models list (a downloaded-but-never-run
@@ -1923,7 +1924,9 @@ export interface AdminStats {
   // must not count as performed yet. Includes partial runs' items per the
   // "at least partially completed" reading.
   tests: number;
-  // Every run row ever created (runs are inserted at trigger time).
+  // Individual physical executions (items x repeats), not run/job rows --
+  // matches client/src/pages/Dashboard.tsx's own "Total runs" vocabulary
+  // ("runs" means repeats (-r), not sweep combinations or job rows).
   runs: number;
 }
 

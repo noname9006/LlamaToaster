@@ -155,9 +155,18 @@ describe("admin routes, cross-tenant by design", () => {
       status: "running" as const,
       started_at: Date.now(),
     };
-    repo.createTest(owner.id, { ...baseRun, id: "admin-stats-run-a", model_id: "admin-stats-model-a", config: { model_id: "admin-stats-model-a" } as never });
+    // sweep.repeats: 2 so the runs assertion below actually exercises the
+    // items x repeats multiplication, not just item counting.
+    repo.createTest(owner.id, {
+      ...baseRun,
+      id: "admin-stats-run-a",
+      model_id: "admin-stats-model-a",
+      config: { model_id: "admin-stats-model-a", sweep: { repeats: 2 } } as never,
+    });
     // Second run so model-b counts as tested too -- its quant can only come
-    // from metadata.quant, since "opaque-name.gguf" parses to nothing.
+    // from metadata.quant, since "opaque-name.gguf" parses to nothing. No
+    // items created for this one, so it contributes 0 to `runs` regardless
+    // of repeats.
     repo.createTest(owner.id, { ...baseRun, id: "admin-stats-run-b", model_id: "admin-stats-model-b", config: { model_id: "admin-stats-model-b" } as never });
     const sweepItem = (idx: number) => ({
       idx,
@@ -183,10 +192,44 @@ describe("admin routes, cross-tenant by design", () => {
     // count it.
 
     const after = await fetchStats();
-    expect(after.runs - before.runs).toBe(2);
+    // Individual physical executions (items x repeats), not run rows: run-a
+    // has 3 items at repeats=2 (=6), run-b has 0 items (=0) -- NOT the 2 run
+    // rows a raw COUNT(*) FROM runs would give.
+    expect(after.runs - before.runs).toBe(6);
     expect(after.modelsTested - before.modelsTested).toBe(2);
     expect(after.quants - before.quants).toBe(2);
     expect(after.tests - before.tests).toBe(2);
+  });
+
+  it("GET /api/admin/stats.machines excludes enrolments that never heartbeated", async () => {
+    const adminToken = await superadminSession();
+    const headers = withHost(ADMIN_HOST, { authorization: `Bearer ${adminToken}` });
+    const fetchStats = async (): Promise<AdminStats> =>
+      (await (await fetch(`${baseUrl}/api/admin/stats`, { headers })).json()) as AdminStats;
+    const before = await fetchStats();
+
+    // Enrolled but abandoned -- never sent a single heartbeat. Must not
+    // count as a machine (it never actually connected).
+    repo.workerRepo.getOrCreateByMachineId("admin-stats-machine-abandoned", "abandoned-box");
+    // Enrolled and heartbeated at least once -- must count.
+    const connected = repo.workerRepo.getOrCreateByMachineId("admin-stats-machine-connected", "connected-box");
+    repo.workerRepo.recordHeartbeat(
+      connected.id,
+      {
+        machine_id: "admin-stats-machine-connected",
+        capabilities: [],
+        hostname: "connected-box",
+        backend: "cpu",
+        hardware: { platform: "linux", arch: "x64", cpu: { manufacturer: "x", brand: "x", flags: [], cores: 4 }, gpu: [] },
+        installed_builds: [],
+        model_files: [],
+        status: "idle",
+      },
+      null
+    );
+
+    const after = await fetchStats();
+    expect(after.machines - before.machines).toBe(1);
   });
 
   it("GET /api/admin/runs sees a run belonging to a DIFFERENT user (cross-tenant, by design)", async () => {
