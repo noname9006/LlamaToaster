@@ -80,23 +80,23 @@ async function heartbeat(machineId: string, opts: { backend?: string; installed?
 // the fourth test in the file would start hitting that quota instead of
 // exercising the route it is actually about.
 function drainActiveRuns(): void {
-  for (const run of repo.listRuns(undefined)) {
+  for (const run of repo.listTests(undefined)) {
     if (run.status === "running" || run.status === "scheduled") {
-      repo.reconcileStaleRun(undefined, run.id, "test cleanup");
+      repo.reconcileStaleTest(undefined, run.id, "test cleanup");
     }
   }
 }
 
 beforeAll(async () => {
   ({ repo } = await import("../db/repo.js"));
-  const { runsRoutes } = await import("./runs.js");
+  const { testsRoutes } = await import("./tests.js");
   const { queueRoutes } = await import("./queue.js");
 
   app = Fastify({ logger: false });
   app.setErrorHandler((error: { statusCode?: number; message: string }, _req, reply) => {
     reply.code(error.statusCode ?? 500).send({ error: error.message });
   });
-  await app.register(runsRoutes);
+  await app.register(testsRoutes);
   await app.register(queueRoutes);
   await app.listen({ port: 0, host: "127.0.0.1" });
   const address = app.server.address();
@@ -183,8 +183,54 @@ describe("POST /api/runs/trigger", () => {
     const claimed = repo.queueRepo.claimNextJob(worker.id);
     expect(claimed?.type).toBe("benchmark");
 
-    const updated = repo.getRun(undefined, run.id);
+    const updated = repo.getTest(undefined, run.id);
     expect(updated?.status).toBe("running");
+  });
+});
+
+// The Run -> Test rename kept every /api/runs/... path registered as a
+// backward-compat alias (see tests.ts) so an already-deployed worker or open
+// browser tab isn't broken by the rollout. Everything above this point
+// exercises those legacy paths (proving the alias itself works); this block
+// separately confirms the new /api/tests/... paths -- what client/worker
+// code now actually calls -- work end to end too.
+describe("/api/tests/... (the current, non-legacy path)", () => {
+  it("GET /api/tests lists a triggered test, and GET /api/tests/:id fetches it", async () => {
+    await heartbeat("tests-path-list", { backend: "cpu", installed: true });
+    const worker = repo.workerRepo.getByMachineId("tests-path-list")!;
+    const triggerRes = await postJson("/api/tests/trigger", {
+      model_id: "model-1",
+      worker_id: worker.id,
+      sweep: baseSweep,
+    });
+    expect(triggerRes.status).toBe(201);
+    const { run } = (await triggerRes.json()) as { run: { id: string } };
+
+    const listRes = await fetch(`${baseUrl}/api/tests`);
+    expect(listRes.status).toBe(200);
+    const { runs } = (await listRes.json()) as { runs: { id: string }[] };
+    expect(runs.some((r) => r.id === run.id)).toBe(true);
+
+    const getRes = await fetch(`${baseUrl}/api/tests/${run.id}`);
+    expect(getRes.status).toBe(200);
+    const got = (await getRes.json()) as { run: { id: string } };
+    expect(got.run.id).toBe(run.id);
+  });
+
+  it("POST /api/tests/:id/stop stops a scheduled test", async () => {
+    await heartbeat("tests-path-stop", { backend: "cpu", installed: true });
+    const worker = repo.workerRepo.getByMachineId("tests-path-stop")!;
+    const triggerRes = await postJson("/api/tests/trigger", {
+      model_id: "model-1",
+      worker_id: worker.id,
+      sweep: baseSweep,
+    });
+    const { run } = (await triggerRes.json()) as { run: { id: string } };
+
+    const stopRes = await postJson(`/api/tests/${run.id}/stop`, {});
+    expect(stopRes.status).toBe(200);
+    const updated = repo.getTest(undefined, run.id);
+    expect(updated?.status).toBe("cancelled");
   });
 });
 
@@ -201,7 +247,7 @@ describe("run stop/pause/resume", () => {
 
     const stopRes = await postJson(`/api/runs/${run.id}/stop`, {});
     expect(stopRes.status).toBe(200);
-    const stopped = repo.getRun(undefined, run.id);
+    const stopped = repo.getTest(undefined, run.id);
     expect(stopped?.status).toBe("cancelled");
   });
 
@@ -220,7 +266,7 @@ describe("run stop/pause/resume", () => {
     expect(stopRes.status).toBe(200);
     // Still 'running' -- not reconciled synchronously; the worker must see
     // cancel_requested on its next heartbeat and report items cancelled.
-    expect(repo.getRun(undefined, run.id)?.status).toBe("running");
+    expect(repo.getTest(undefined, run.id)?.status).toBe("running");
 
     const hb = await heartbeat("stop-claimed", { backend: "cpu", installed: true });
     // heartbeat() doesn't send active_job by default -- verify the flag is
@@ -275,7 +321,7 @@ describe("run stop/pause/resume", () => {
     expect(repo.queueRepo.claimNextJob(worker.id)).toBeUndefined();
 
     // The run itself must have been reconciled, not left 'running' forever.
-    const finalRun = repo.getRun(undefined, run.id);
+    const finalRun = repo.getTest(undefined, run.id);
     expect(finalRun?.status).not.toBe("running");
   });
 
@@ -325,7 +371,7 @@ describe("run stop/pause/resume", () => {
     }
 
     expect(repo.queueRepo.getJob(claimed.job_id)?.status).toBe("failed");
-    const finalRun = repo.getRun(undefined, run.id);
+    const finalRun = repo.getTest(undefined, run.id);
     expect(finalRun?.status).not.toBe("running");
   });
 
@@ -439,7 +485,7 @@ describe("run stop/pause/resume cross-user isolation (§4.3)", () => {
 });
 
 describe("run log push/pull (§1.10)", () => {
-  async function createRun(machineId: string) {
+  async function createTest(machineId: string) {
     await heartbeat(machineId, { backend: "cpu", installed: true });
     const worker = repo.workerRepo.getByMachineId(machineId)!;
     const res = await postJson("/api/runs/trigger", { model_id: "model-1", worker_id: worker.id, sweep: baseSweep });
@@ -448,13 +494,13 @@ describe("run log push/pull (§1.10)", () => {
   }
 
   it("404s before any log has been pushed", async () => {
-    const { runId } = await createRun("log-none");
+    const { runId } = await createTest("log-none");
     const res = await fetch(`${baseUrl}/api/runs/${runId}/log`);
     expect(res.status).toBe(404);
   });
 
   it("round-trips a pushed log: gzip in, gzip out, decompresses to the original text", async () => {
-    const { worker, runId } = await createRun("log-roundtrip");
+    const { worker, runId } = await createTest("log-roundtrip");
     const zlib = await import("node:zlib");
     const original = "build b1234 (cuda)\n[pp 512] 120.4 tok/s\n[tg 128] 45.2 tok/s\nrun completed\n";
     const gzipped = zlib.gzipSync(Buffer.from(original, "utf8"));
@@ -484,7 +530,7 @@ describe("run log push/pull (§1.10)", () => {
   });
 
   it("rejects a push from a machine that did not execute the run", async () => {
-    const { runId } = await createRun("log-owner");
+    const { runId } = await createTest("log-owner");
     await heartbeat("log-intruder", { backend: "cpu", installed: true });
     const zlib = await import("node:zlib");
     const res = await fetch(`${baseUrl}/api/runs/${runId}/log`, {
@@ -500,7 +546,7 @@ describe("run log push/pull (§1.10)", () => {
   });
 
   it("rejects a push with a wrong bearer token", async () => {
-    const { runId } = await createRun("log-badtoken");
+    const { runId } = await createTest("log-badtoken");
     const zlib = await import("node:zlib");
     const res = await fetch(`${baseUrl}/api/runs/${runId}/log`, {
       method: "POST",
@@ -521,7 +567,7 @@ describe("run log push/pull (§1.10)", () => {
 // that closes that gap: a Stage 3 worker session (resolves a specific
 // worker.id) or the Stage 1 shared secret (trusts the run's own worker_id).
 describe("POST /api/runs/:id/items/:idx worker auth (§4.3 fix)", () => {
-  async function createRun(machineId: string) {
+  async function createTest(machineId: string) {
     await heartbeat(machineId, { backend: "cpu", installed: true });
     const worker = repo.workerRepo.getByMachineId(machineId)!;
     const res = await postJson("/api/runs/trigger", { model_id: "model-1", worker_id: worker.id, sweep: baseSweep });
@@ -541,19 +587,19 @@ describe("POST /api/runs/:id/items/:idx worker auth (§4.3 fix)", () => {
   }
 
   it("rejects a call with no token at all", async () => {
-    const { runId } = await createRun("items-no-token");
+    const { runId } = await createTest("items-no-token");
     const res = await postItemUpdate(runId, 0, { status: "loading" });
     expect(res.status).toBe(401);
   });
 
   it("rejects a wrong shared token", async () => {
-    const { runId } = await createRun("items-wrong-token");
+    const { runId } = await createTest("items-wrong-token");
     const res = await postItemUpdate(runId, 0, { status: "loading" }, "not-the-right-secret");
     expect(res.status).toBe(401);
   });
 
   it("accepts a tick and a terminal update from the correct shared token (Stage 1 fallback)", async () => {
-    const { runId } = await createRun("items-shared-token");
+    const { runId } = await createTest("items-shared-token");
     const tick = await postItemUpdate(runId, 0, { status: "loading" }, "runs-test-secret");
     expect(tick.status).toBe(200);
     const terminal = await postItemUpdate(runId, 0, { status: "failed", error: "x" }, "runs-test-secret");
@@ -565,7 +611,7 @@ describe("POST /api/runs/:id/items/:idx worker auth (§4.3 fix)", () => {
     // trusts the RUN's own worker_id (no machine_id in this route's payload
     // to check against directly), so a run with none can never be reported
     // on by anyone, matching this route's own doc comment.
-    const { runId } = await createRun("items-no-worker-run");
+    const { runId } = await createTest("items-no-worker-run");
     const db = (await import("../db/migrate.js")).getDb();
     db.prepare(`UPDATE runs SET worker_id = NULL WHERE id = ?`).run(runId);
     const res = await postItemUpdate(runId, 0, { status: "loading" }, "runs-test-secret");
@@ -573,7 +619,7 @@ describe("POST /api/runs/:id/items/:idx worker auth (§4.3 fix)", () => {
   });
 
   it("accepts a Stage 3 worker session that matches the run's own worker", async () => {
-    const { worker, runId } = await createRun("items-session-owner");
+    const { worker, runId } = await createTest("items-session-owner");
     const user = repo.userRepo.upsertByIdentity("github", { providerUserId: "items-owner", login: "owner", avatarUrl: null });
     const { token } = repo.sessionRepo.create(user.id, { isWorker: true, workerId: worker.id, label: worker.displayName });
 
@@ -582,7 +628,7 @@ describe("POST /api/runs/:id/items/:idx worker auth (§4.3 fix)", () => {
   });
 
   it("rejects a Stage 3 worker session belonging to a DIFFERENT machine than the run's own worker", async () => {
-    const { runId } = await createRun("items-session-victim");
+    const { runId } = await createTest("items-session-victim");
     await heartbeat("items-session-intruder", { backend: "cpu", installed: true });
     const intruder = repo.workerRepo.getByMachineId("items-session-intruder")!;
     const user = repo.userRepo.upsertByIdentity("github", { providerUserId: "items-intruder", login: "intruder", avatarUrl: null });
@@ -593,7 +639,7 @@ describe("POST /api/runs/:id/items/:idx worker auth (§4.3 fix)", () => {
   });
 
   it("rejects a browser (non-worker) session presented as a worker token", async () => {
-    const { runId } = await createRun("items-browser-session");
+    const { runId } = await createTest("items-browser-session");
     const user = repo.userRepo.upsertByIdentity("github", { providerUserId: "items-browser", login: "browser-user", avatarUrl: null });
     const { token } = repo.sessionRepo.create(user.id, { label: "browser tab" }); // isWorker defaults false
 
@@ -734,7 +780,7 @@ describe("N3 comparison_member_failed fires when a member's own results reveal d
       expect(failedCalls.length).toBeGreaterThan(0);
       expect(failedCalls[0][0]).toMatchObject({
         comparison_member_failed: true,
-        member_run_id: runB.id,
+        member_test_id: runB.id,
         reason: "method_version",
       });
     } finally {

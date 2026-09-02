@@ -262,9 +262,13 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
       const worker = requireOnlineWorker(resolveAuthUser(request)?.user.id, request.params.id);
       const { file } = request.query;
       if (!file) throw new BadRequestError("file is required");
-      repo.queueRepo.enqueueJob(worker.id, { type: "delete_model_file", payload: { filename: file } });
+      const jobId = repo.queueRepo.enqueueJob(worker.id, { type: "delete_model_file", payload: { filename: file } });
       queueEvents.emit(worker.id);
-      return reply.code(202).send({ ok: true, queued: true });
+      // job_id lets the client poll GET /api/workers/:id/jobs/:jobId (same
+      // pattern as refresh_models below) and only refresh the Models page's
+      // Local/Remote locations once the file is actually gone, instead of
+      // racing ahead of a job the worker hasn't even claimed yet.
+      return reply.code(202).send({ ok: true, queued: true, job_id: jobId });
     }
   );
 

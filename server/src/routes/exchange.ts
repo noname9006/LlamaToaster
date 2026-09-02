@@ -1,11 +1,11 @@
 // BENCHMARKING_PLAN_V8.md N7 -- export a run (or a whole chain root) as a
 // self-describing bundle, and import one back with per-row validation.
 
-import type { FastifyInstance } from "fastify";
+import type { FastifyInstance, FastifyRequest, FastifyReply } from "fastify";
 import { v4 as uuid } from "uuid";
 import { repo } from "../db/repo.js";
 import { resolveAuthUser } from "../auth-middleware.js";
-import type { ResultRow, Run, RunConfig } from "../../../shared/types.js";
+import type { ResultRow, Test, TestConfig } from "../../../shared/types.js";
 import {
   BUNDLE_FORMAT,
   BUNDLE_FORMAT_VERSION,
@@ -55,7 +55,7 @@ function toBundleRow(row: ResultRow): BundleRow {
   });
 }
 
-function buildBundle(run: Run, rows: ResultRow[]): Bundle {
+function buildBundle(run: Test, rows: ResultRow[]): Bundle {
   const model = repo.getModel(run.model_id);
   const bundleRows = rows.map(toBundleRow);
   const versions = [...new Set(bundleRows.map((r) => r.method_version ?? null))];
@@ -77,7 +77,7 @@ function buildBundle(run: Run, rows: ResultRow[]): Bundle {
       llama_cpp_build: run.llama_cpp_build ?? null,
       // The full stored configuration, M2's goals block included, so results
       // stay reproducible without reference to whatever the defaults were.
-      config: (run.config ?? {}) as RunConfig & Record<string, unknown>,
+      config: (run.config ?? {}) as TestConfig & Record<string, unknown>,
     },
     // Anonymized hardware class -- GPU name and a VRAM bucket, no serials and
     // no machine identity.
@@ -105,29 +105,31 @@ function buildBundle(run: Run, rows: ResultRow[]): Bundle {
 }
 
 export async function exchangeRoutes(app: FastifyInstance): Promise<void> {
-  app.get<{ Params: { id: string }; Querystring: { scope?: string } }>(
-    "/api/runs/:id/export",
-    async (request, reply) => {
+  const exportTestHandler = async (
+    request: FastifyRequest<{ Params: { id: string }; Querystring: { scope?: string } }>,
+    reply: FastifyReply
+  ) => {
       const authed = resolveAuthUser(request);
       const userId = authed?.user.id;
-      const run = repo.getRun(userId, request.params.id);
+      const run = repo.getTest(userId, request.params.id);
       if (!run) return reply.code(404).send({ error: "run not found" });
 
       const rows: ResultRow[] = [];
       if (request.query.scope === "root") {
-        for (const member of repo.listRunsUnderRoot(userId, run.root_run_id ?? run.id)) {
-          rows.push(...repo.getResultsForRun(member.id));
+        for (const member of repo.listTestsUnderRoot(userId, run.root_run_id ?? run.id)) {
+          rows.push(...repo.getResultsForTest(member.id));
         }
       } else {
-        rows.push(...repo.getResultsForRun(run.id));
+        rows.push(...repo.getResultsForTest(run.id));
       }
 
       const bundle = buildBundle(run, rows);
       reply.header("content-type", "application/json; charset=utf-8");
       reply.header("content-disposition", `attachment; filename="llamatoaster-${run.id}.json"`);
       return reply.send(JSON.stringify(bundle, null, 2));
-    }
-  );
+  };
+  app.get("/api/tests/:id/export", exportTestHandler);
+  app.get("/api/runs/:id/export", exportTestHandler);
 
   app.post<{ Body: { bundle?: unknown; opt_in_scoring?: boolean } }>(
     "/api/import",

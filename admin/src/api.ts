@@ -1,4 +1,4 @@
-import type { AdminStats, AdminRunSummary, AdminRunFilters, AdminUserSummary, AppSettings } from "./types";
+import type { AdminStats, AdminTestSummary, AdminTestFilters, AdminUserSummary, AppSettings } from "./types";
 
 export class ApiError extends Error {
   status: number;
@@ -37,7 +37,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return data as T;
 }
 
-function filtersToQuery(filters: AdminRunFilters): string {
+function filtersToQuery(filters: AdminTestFilters): string {
   const params = new URLSearchParams();
   if (filters.userId) params.set("userId", filters.userId);
   if (filters.workerId) params.set("workerId", filters.workerId);
@@ -50,8 +50,8 @@ function filtersToQuery(filters: AdminRunFilters): string {
 export const api = {
   getStats: (): Promise<AdminStats> => request("/api/admin/stats"),
 
-  listRuns: (filters: AdminRunFilters = {}): Promise<{ runs: AdminRunSummary[] }> =>
-    request(`/api/admin/runs${filtersToQuery(filters)}`),
+  listTests: (filters: AdminTestFilters = {}): Promise<{ runs: AdminTestSummary[] }> =>
+    request(`/api/admin/tests${filtersToQuery(filters)}`),
 
   listUsers: (): Promise<{ users: AdminUserSummary[] }> => request("/api/admin/users"),
 

@@ -947,21 +947,28 @@ export async function runIndexTick(): Promise<{ indexed: number; repos: number }
   // so a duplicate scan has no other effect).
   const toScan = new Set<string>();
 
+  // Progress-marker writes (backlog cursor, recent/lastModified bookmarks)
+  // computed below but deferred until every repo discovered this tick has
+  // actually been scanned -- see the flush after the scan loop for why.
+  const pendingWrites: Array<() => void> = [];
+
   try {
     if (!isBacklogComplete()) {
       const startCursor = getBacklogCursor();
       const { repoIds, nextCursor, complete, newestCreatedAtMs } = await scanNewRepos(backlogBatch, startCursor);
       for (const repoId of repoIds) toScan.add(repoId);
-      setBacklogCursor(nextCursor);
+      pendingWrites.push(() => setBacklogCursor(nextCursor));
       // Seed the top-up bookmark from the very first page, not just at wrap
       // -- lets the recency sweep start covering new uploads from tick 1
       // instead of waiting for the (multi-week) backlog walk to finish.
       if (getRecentBookmark() == null && newestCreatedAtMs != null) {
-        setRecentBookmark(newestCreatedAtMs);
+        pendingWrites.push(() => setRecentBookmark(newestCreatedAtMs));
       }
       if (complete && nextCursor === null) {
-        setBacklogComplete(true);
-        log.info("[hf-index] backlog walk complete -- newest→oldest catalog fully covered, switching to recent-only top-up");
+        pendingWrites.push(() => {
+          setBacklogComplete(true);
+          log.info("[hf-index] backlog walk complete -- newest→oldest catalog fully covered, switching to recent-only top-up");
+        });
       }
     }
 
@@ -974,7 +981,7 @@ export async function runIndexTick(): Promise<{ indexed: number; repos: number }
     // sweep would jump the bookmark past repos that were never returned,
     // permanently skipping them.
     if (recentComplete && newestSeenMs != null && (bookmarkMs == null || newestSeenMs > bookmarkMs)) {
-      setRecentBookmark(newestSeenMs);
+      pendingWrites.push(() => setRecentBookmark(newestSeenMs));
     }
     if (recentIds.length > 0) {
       log.info(`[hf-index] recent sweep: ${recentIds.length} repos (bookmark ${bookmarkMs ? new Date(bookmarkMs).toISOString() : "none"} → ${newestSeenMs ? new Date(newestSeenMs).toISOString() : "none"})`);
@@ -1022,28 +1029,34 @@ export async function runIndexTick(): Promise<{ indexed: number; repos: number }
       // redundant with the backlog walk already doing that in a different
       // order) before it could ever settle into its normal cheap mode.
       lastModifiedOutcome = "seeded";
-      setLastModifiedResumeCursor(null);
-      setLastModifiedResumeNewest(null);
-      if (newestModifiedMs != null) {
-        setLastModifiedBookmark(newestModifiedMs);
-      }
+      pendingWrites.push(() => {
+        setLastModifiedResumeCursor(null);
+        setLastModifiedResumeNewest(null);
+        if (newestModifiedMs != null) {
+          setLastModifiedBookmark(newestModifiedMs);
+        }
+      });
     } else if (lastModifiedComplete) {
       // Caught up -- clear burst-resume state and advance the bookmark.
       // Same "only advance on a completed sweep" rule as the recent
       // bookmark above -- an error- or limit-truncated sweep must not jump
       // the bookmark past repos it never actually returned.
       lastModifiedOutcome = "complete";
-      setLastModifiedResumeCursor(null);
-      setLastModifiedResumeNewest(null);
-      if (newestModifiedMs != null && newestModifiedMs > lastModifiedBookmarkMs) {
-        setLastModifiedBookmark(newestModifiedMs);
-      }
+      pendingWrites.push(() => {
+        setLastModifiedResumeCursor(null);
+        setLastModifiedResumeNewest(null);
+        if (newestModifiedMs != null && newestModifiedMs > lastModifiedBookmarkMs) {
+          setLastModifiedBookmark(newestModifiedMs);
+        }
+      });
     } else {
       // Still mid-burst: persist where this call stopped so the next tick
       // resumes forward instead of restarting at the top.
       lastModifiedOutcome = "resuming";
-      setLastModifiedResumeCursor(nextResumeCursor);
-      if (newestModifiedMs != null) setLastModifiedResumeNewest(newestModifiedMs);
+      pendingWrites.push(() => {
+        setLastModifiedResumeCursor(nextResumeCursor);
+        if (newestModifiedMs != null) setLastModifiedResumeNewest(newestModifiedMs);
+      });
     }
     if (changedIds.length > 0 || lastModifiedOutcome === "seeded") {
       const suffix =
@@ -1079,9 +1092,36 @@ export async function runIndexTick(): Promise<{ indexed: number; repos: number }
       // "index-scan" vs "on-demand-verify" (verifyRepoInBackground) is the
       // operationally useful distinction: background bulk indexing vs a real
       // worker's hash-lookup needing a specific repo re-checked right now.
-      const result = await scanHfRepo(repoId, HF_INDEX_TIMEOUT_MS, "index-scan");
-      indexedTotal += result.indexed;
+      try {
+        const result = await scanHfRepo(repoId, HF_INDEX_TIMEOUT_MS, "index-scan");
+        indexedTotal += result.indexed;
+      } catch (err) {
+        // scanHfRepo already swallows HF-fetch errors internally and only
+        // throws from its own DB writes (e.g. a transient SQLITE_BUSY) --
+        // skip just this repo rather than aborting the rest of toScan, and
+        // critically don't let it skip the pendingWrites flush below (an
+        // uncaught throw here would leave this repo's cursor/bookmark
+        // already-computed advance stuck in memory, silently discarded,
+        // instead of retried next tick).
+        const msg = err instanceof Error ? err.message : String(err);
+        log.warn(`[hf-index] scanHfRepo threw for ${repoId}: ${msg} -- skipping, will retry if rediscovered`);
+      }
     }
+
+    // Only now -- after every repo discovered this tick has actually been
+    // scanned (or explicitly skipped above) -- persist the cursor/bookmark
+    // advances computed earlier. Writing them eagerly at discovery time (the
+    // original design) let a mid-tick process crash or DB error silently and
+    // permanently strand whatever was still in toScan: the marker would
+    // already point past that batch, so no future tick would ever revisit
+    // it. Deferring the writes means a crash here just leaves the markers
+    // exactly where they were -- the next tick re-discovers (and
+    // idempotently re-scans, via upsertHfGgufEntry's ON CONFLICT) the same
+    // batch instead of losing it. Diagnosed 2026-09-02: this ordering was the
+    // dominant cause of hf_gguf_index undercounting HF's real catalog by
+    // ~2% (thousands of repos that were discovered but never actually
+    // scanned before a restart).
+    for (const write of pendingWrites) write();
 
     lastTickAt = now;
   } finally {

@@ -535,7 +535,7 @@ interface SpecDecodeCheck {
   metrics?: SpecDecodeMetrics;
   // Set for every non-confirmed outcome (missing counters, 0 drafted, 0
   // accepted) so the caller can fold it into the item's stored warning --
-  // the same field RunDetail.tsx already renders in red for a "done" item
+  // the same field TestDetail.tsx already renders in red for a "done" item
   // that still has something worth flagging (see the ppSummary/tgSummary
   // .warning pattern below). Left undefined only when accepted > 0.
   warning?: string;
@@ -583,7 +583,7 @@ async function checkSpecDecodeMetrics(port: number, label: string, repeats: numb
 // own reported stddev_ts verbatim -- so the two paths must use the identical
 // formula or "stddev" would silently mean two different things depending on
 // which engine produced a given row, even though both feed the same
-// RunDetail/Compare.tsx columns side by side. n<2 has no well-defined sample
+// TestDetail/Compare.tsx columns side by side. n<2 has no well-defined sample
 // variance (0/0) -- returns 0 rather than NaN/Infinity, since "not enough
 // data to measure spread" is a more honest zero-cost default than surfacing
 // not-a-number to the UI.
@@ -967,7 +967,7 @@ export async function runServerBench(input: ServerBenchRunInput): Promise<BenchR
     }
     // Surfaced regardless of whether a tg row exists at all (e.g. a
     // pp-only item still ran with --spec-type draft-mtp) so a silently
-    // no-op'd draft model is visible on the item itself (RunDetail.tsx
+    // no-op'd draft model is visible on the item itself (TestDetail.tsx
     // renders bench.warning in red via item.error), not just in this
     // worker's own console/log file.
     if (specDecode.warning) warnings.push(specDecode.warning);

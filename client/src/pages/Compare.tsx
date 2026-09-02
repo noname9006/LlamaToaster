@@ -5,7 +5,7 @@ import { Chart } from "../components/Chart";
 import { ComparisonView } from "../components/ComparisonView";
 import { NewComparison } from "../components/NewComparison";
 import { ImportBundle } from "../components/ImportBundle";
-import type { Run, ResultRow } from "../types";
+import type { Test, ResultRow } from "../types";
 import { shortId, formatFlashAttn } from "../utils";
 
 interface ColumnDef {
@@ -13,7 +13,7 @@ interface ColumnDef {
   name: string;
 }
 
-// Carries the same suspect-measurement metadata RunDetail.tsx flags
+// Carries the same suspect-measurement metadata TestDetail.tsx flags
 // (see resultSuspectTitle there) alongside the plain number this page used
 // to store -- suspect_count/suspect_samples are only ever populated by the
 // llama-server/MTP path (worker/src/serverBench.ts) for a reading that was
@@ -116,7 +116,7 @@ function comboLabel(r: ResultRow): string {
 }
 
 export function Compare() {
-  const [runs, setRuns] = useState<Run[]>([]);
+  const [runs, setRuns] = useState<Test[]>([]);
   const [selected, setSelected] = useState<string[]>([]);
   // N3 -- comparison GROUPS are their own object: several runs sharing one
   // comparison_id, where the interesting variable is the model file and
@@ -128,7 +128,7 @@ export function Compare() {
   const [comparisonGroups, setComparisonGroups] = useState<string[]>([]);
 
   async function refreshRuns() {
-    const list = await api.listRuns();
+    const list = await api.listTests();
     setRuns(list.filter((r) => r.status === "done"));
     setComparisonGroups([
       ...new Set(list.map((r) => r.comparison_id).filter((id): id is string => typeof id === "string" && id.length > 0)),
@@ -149,7 +149,7 @@ export function Compare() {
     // sweeps, in a different order, with different sizes.
     const all = await Promise.all(
       selected.map(async (id) => {
-        const d = await api.getRun(id);
+        const d = await api.getTest(id);
         return { id, name: `${d.run.worker_name} ${d.run.id.slice(0, 8)}`, results: d.results ?? [] };
       })
     );
@@ -244,9 +244,9 @@ export function Compare() {
 
   return (
     <div>
-      <h1 className="text-2xl font-semibold text-fg">Compare runs</h1>
+      <h1 className="text-2xl font-semibold text-fg">Compare tests</h1>
       <p className="mt-2 max-w-2xl text-sm text-muted">
-        Select 2+ runs to compare avg tokens/s side by side. Runs with different sweep configs
+        Select 2+ tests to compare avg tokens/s side by side. Tests with different sweep configs
         are matched by test config, not position — a config missing from a run shows as "—".
         A <span className="text-warning">⚠ highlighted</span> bar or cell means at least one
         repeat behind that average was flagged as an implausible reading (most often the known
@@ -297,7 +297,7 @@ export function Compare() {
       </section>
 
       {runs.length === 0 ? (
-        <p className="mt-4 text-sm text-muted">No completed runs yet.</p>
+        <p className="mt-4 text-sm text-muted">No completed tests yet.</p>
       ) : (
         <div className="mt-4 flex flex-wrap gap-2">
           {runs.map((r) => (

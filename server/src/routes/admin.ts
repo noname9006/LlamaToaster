@@ -1,4 +1,4 @@
-import type { FastifyInstance } from "fastify";
+import type { FastifyInstance, FastifyRequest } from "fastify";
 import { repo } from "../db/repo.js";
 import { resolveAuthUser } from "../auth-middleware.js";
 import type { AuthenticatedRequest } from "../auth-middleware.js";
@@ -7,7 +7,7 @@ import { loadExportRows, formatResultsExport } from "./results.js";
 import {
   isVramDiscrepancyPolicy,
   isValidProbeMaxLoads,
-  type AdminRunFilters,
+  type AdminTestFilters,
   type AppSettings,
 } from "../../../shared/types.js";
 
@@ -46,18 +46,20 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
 
   app.get("/api/admin/stats", async () => repo.adminRepo.stats());
 
-  app.get<{ Querystring: AdminRunFilters }>("/api/admin/runs", async (req) => {
-    return { runs: repo.adminRepo.listRuns(req.query) };
-  });
+  const listTestsAdminHandler = async (req: FastifyRequest<{ Querystring: AdminTestFilters }>) => {
+    return { runs: repo.adminRepo.listTests(req.query) };
+  };
+  app.get("/api/admin/tests", listTestsAdminHandler);
+  app.get("/api/admin/runs", listTestsAdminHandler);
 
   // Same CSV/MD/JSON shapes as the main site's own GET /api/results/export
   // (see formatResultsExport's own doc comment) but unscoped -- every
   // tenant's results, by design, not just the caller's own.
-  app.get<{ Querystring: { format?: string; runs?: string } }>(
+  app.get<{ Querystring: { format?: string; tests?: string } }>(
     "/api/admin/results/export",
     async (req, reply) => {
       const format = (req.query.format ?? "json").toLowerCase();
-      const runIds = req.query.runs ? req.query.runs.split(",").map((s) => s.trim()).filter(Boolean) : undefined;
+      const runIds = req.query.tests ? req.query.tests.split(",").map((s) => s.trim()).filter(Boolean) : undefined;
       const rows = loadExportRows(undefined, runIds);
       const { contentType, filename, body } = formatResultsExport(rows, format);
       reply.header("content-type", contentType);

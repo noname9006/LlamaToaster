@@ -3,10 +3,10 @@
 // enqueues anything and never re-measures. Changing the goal is a different
 // query string over the same rows.
 
-import type { FastifyInstance } from "fastify";
+import type { FastifyInstance, FastifyRequest, FastifyReply } from "fastify";
 import { repo } from "../db/repo.js";
 import { resolveAuthUser, assertOwnsWorker } from "../auth-middleware.js";
-import type { Model, ResultRow, RunConfig } from "../../../shared/types.js";
+import type { Model, ResultRow, TestConfig } from "../../../shared/types.js";
 import { scoreProfiles, tupleKey, type ScoringRow, type ScoringResult } from "../../../shared/scoring.js";
 import type { ConfigHashInput } from "../../../shared/configHash.js";
 import { maxAffordableContext, residentWeightsMibFromPeak } from "../../../shared/vramEstimate.js";
@@ -225,16 +225,17 @@ function toScoringRow(row: ResultRow, idxOffset: number): ScoringRow {
 }
 
 export async function profilesRoutes(app: FastifyInstance): Promise<void> {
-  app.get<{ Params: { id: string }; Querystring: Record<string, string | undefined> }>(
-    "/api/runs/:id/profiles",
-    async (request, reply) => {
+  const getProfilesHandler = async (
+    request: FastifyRequest<{ Params: { id: string }; Querystring: Record<string, string | undefined> }>,
+    reply: FastifyReply
+  ) => {
       const authed = resolveAuthUser(request);
       const userId = authed?.user.id;
-      const run = repo.getRun(userId, request.params.id);
+      const run = repo.getTest(userId, request.params.id);
       if (!run) return reply.code(404).send({ error: "run not found" });
 
       const rootRunId = run.root_run_id ?? run.id;
-      const chainRuns = repo.listChainScoringRuns(userId, rootRunId);
+      const chainRuns = repo.listChainScoringTests(userId, rootRunId);
       // A run that is itself excluded from scoring (a probe, a comparison
       // member) still answers here -- with an empty universe and the tallies
       // that say why, never a silent 404.
@@ -248,11 +249,11 @@ export async function profilesRoutes(app: FastifyInstance): Promise<void> {
       let repeats: number | undefined;
       let discardFirst = 0;
       for (const chainRun of chainRuns) {
-        const config = chainRun.config as RunConfig;
+        const config = chainRun.config as TestConfig;
         repeats = repeats ?? config?.sweep?.repeats;
         discardFirst = Math.max(discardFirst, config?.discard_first_repeats ?? 0);
-        const results = repo.getResultsForRun(chainRun.id);
-        for (const item of repo.getRunItems(chainRun.id)) {
+        const results = repo.getResultsForTest(chainRun.id);
+        for (const item of repo.getTestItems(chainRun.id)) {
           itemStatusByIdx[offset + item.idx] = item.status;
         }
         for (const result of results) {
@@ -276,7 +277,7 @@ export async function profilesRoutes(app: FastifyInstance): Promise<void> {
         offset += 10_000;
       }
 
-      const storedGoals = (run.config as RunConfig)?.goals;
+      const storedGoals = (run.config as TestConfig)?.goals;
       const fromQuery = goalsFromQuery(storedGoals, request.query);
       const clamped = clampTarget(fromQuery.goals, model);
 
@@ -319,12 +320,13 @@ export async function profilesRoutes(app: FastifyInstance): Promise<void> {
         target_ctx_clamped: clamped.clamped,
       };
       return body;
-    }
-  );
+  };
+  app.get("/api/tests/:id/profiles", getProfilesHandler);
+  app.get("/api/runs/:id/profiles", getProfilesHandler);
 
   // N2's verified ceilings, readable WITHOUT an existing sweep run -- the
   // Benchmark page's live fit matrix needs this before any chain run exists,
-  // whereas /api/runs/:id/profiles above only ever surfaces it as a
+  // whereas /api/tests/:id/profiles above only ever surfaces it as a
   // side-effect of already owning a run tied to the same model+worker. This
   // is new surface area, so it authorizes the same way every other
   // worker-scoped GET route does (assertOwnsWorker, see /api/workers/:id/vram)

@@ -5,7 +5,7 @@ import { join } from "node:path";
 import Fastify, { type FastifyInstance } from "fastify";
 
 // Multi-user Stage 4 (MULTIUSER_PLAN.md §4.3): GET /api/results/export
-// scoping. Also exercises the real recordRunItemTerminal path (not a raw
+// scoping. Also exercises the real recordTestItemTerminal path (not a raw
 // SQL insert) so this test would have caught the actual bug found while
 // writing it: results.user_id was never populated at insert time, silently
 // making every export return nothing for anyone once scoping shipped.
@@ -49,11 +49,11 @@ async function sessionFor(login: string) {
 }
 
 // Builds one real, terminal, successful result row owned by `owner` --
-// through the actual repo write path (createRun -> createRunItems ->
-// recordRunItemTerminal), not a raw SQL insert, so this exercises exactly
+// through the actual repo write path (createTest -> createTestItems ->
+// recordTestItemTerminal), not a raw SQL insert, so this exercises exactly
 // what the real worker item-tick route triggers.
 function createOwnedResult(owner: { userId: string }, runId: string): void {
-  repo.createRun(owner.userId, {
+  repo.createTest(owner.userId, {
     id: runId,
     worker_name: "box",
     llama_cpp_build: "b1",
@@ -63,7 +63,7 @@ function createOwnedResult(owner: { userId: string }, runId: string): void {
     status: "running",
     started_at: Date.now(),
   });
-  repo.createRunItems(owner.userId, runId, [
+  repo.createTestItems(owner.userId, runId, [
     {
       idx: 0,
       n_prompt: 512,
@@ -79,7 +79,7 @@ function createOwnedResult(owner: { userId: string }, runId: string): void {
       n_gpu_layers_draft: 0,
     } as never,
   ]);
-  repo.recordRunItemTerminal(runId, 0, {
+  repo.recordTestItemTerminal(runId, 0, {
     status: "done",
     ram_peak_mib: 100,
     vram_peak_mib: null,
@@ -125,10 +125,10 @@ function createOwnedResult(owner: { userId: string }, runId: string): void {
 describe("GET /api/results/export cross-user isolation (§4.3)", () => {
   it("results.user_id is actually populated by the real write path (regression guard)", () => {
     const owner = { userId: "regression-check-owner" };
-    // upsertByIdentity needed for the FK -- createRun's user_id references users(id).
+    // upsertByIdentity needed for the FK -- createTest's user_id references users(id).
     const user = repo.userRepo.upsertByIdentity("github", { providerUserId: "regression-check", login: "r", avatarUrl: null });
     createOwnedResult({ userId: user.id }, "regression-check-run");
-    const rows = repo.getResultsForRun("regression-check-run");
+    const rows = repo.getResultsForTest("regression-check-run");
     expect(rows.length).toBe(1);
     void owner;
   });

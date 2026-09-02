@@ -12,7 +12,7 @@ const HF_META_TIMEOUT_MS = 15_000;
 // Multi-user Stage 4 (MULTIUSER_PLAN.md §4.5): GET /api/models/hf-updates
 // fans out to HF per distinct repo, which with a global catalog scales with
 // total users, not just this operator's own model list -- a 10-minute
-// server-side cache keyed by repo keeps repeat New Run page loads (by
+// server-side cache keyed by repo keeps repeat Custom Test page loads (by
 // anyone, for any model sharing that repo) from re-asking HF the same
 // question. Module-level (not per-request), same pattern as ai.ts's
 // modelCooldownUntil -- reset on process restart, which is fine for a
@@ -101,7 +101,7 @@ export async function modelsRoutes(app: FastifyInstance): Promise<void> {
         error: `cannot delete model: ${resultCount} run result(s) reference it`,
       });
     }
-    const runningCount = repo.countRunningRunsForModel(existing.id);
+    const runningCount = repo.countRunningTestsForModel(existing.id);
     if (runningCount > 0) {
       return reply.code(409).send({
         error: `cannot delete model: ${runningCount} run(s) still in progress against it`,
@@ -261,7 +261,7 @@ export async function modelsRoutes(app: FastifyInstance): Promise<void> {
     return { locations, unreachable };
   });
 
-  // Live per-model check against Hugging Face for the New Run model picker's
+  // Live per-model check against Hugging Face for the Custom Test model picker's
   // "Updated X ago" / "possibly newer on HF" hints -- deliberately not
   // persisted anywhere (unlike param_count/n_layer's backfill routes above):
   // this should reflect HF's *current* state on every picker load, not a

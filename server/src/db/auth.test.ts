@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { repo as RepoType } from "./repo.js";
 import type { getDb as GetDbType } from "./migrate.js";
-import type { RunConfig } from "../../../shared/types.js";
+import type { TestConfig } from "../../../shared/types.js";
 
 // getDb() (migrate.ts) is a module-level singleton keyed on process.env.DB_PATH
 // at first call -- set it before importing repo.js so this test file gets its
@@ -110,14 +110,14 @@ describe("userRepo.deleteAccount", () => {
     });
     expect(repo.getModelCreatedBy(model.id)).toBe(owner.id);
 
-    repo.createRun(owner.id, {
+    repo.createTest(owner.id, {
       id: "delete-owner-run",
       worker_name: "delete-owner-machine",
       worker_id: worker.id,
       llama_cpp_build: "b1",
       llama_cpp_backend: "cpu",
       model_id: model.id,
-      config: { model_id: model.id } as RunConfig,
+      config: { model_id: model.id } as TestConfig,
       status: "done",
       started_at: Date.now(),
     });

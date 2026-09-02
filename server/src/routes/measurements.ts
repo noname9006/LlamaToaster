@@ -13,7 +13,7 @@
 //  * Payload bounds mirror the sweep-axis table; out-of-bounds is a 400,
 //    never a silent clamp, and a malformed reading is never stored as data.
 
-import type { FastifyInstance, FastifyRequest } from "fastify";
+import type { FastifyInstance, FastifyRequest, FastifyReply } from "fastify";
 import { repo } from "../db/repo.js";
 import { hashToken } from "../session.js";
 import { BadRequestError, ForbiddenError, NotFoundError, UnauthorizedError } from "../errors.js";
@@ -22,8 +22,8 @@ import type {
   ProbeAttemptReport,
   ProbeResultInput,
   QualityResultInput,
-  Run,
-  RunConfig,
+  Test,
+  TestConfig,
   Worker,
 } from "../../../shared/types.js";
 import { METHOD_VERSION } from "../../../shared/types.js";
@@ -67,8 +67,8 @@ function requireEnrolledWorkerSession(request: FastifyRequest): Worker {
 }
 
 // The run named in the URL is the authority on which machine may report.
-function resolveRunForWorker(runId: string, worker: Worker): Run {
-  const run = repo.getRun(undefined, runId);
+function resolveTestForWorker(runId: string, worker: Worker): Test {
+  const run = repo.getTest(undefined, runId);
   if (!run) throw new NotFoundError("run not found");
   if (!run.worker_id || run.worker_id !== worker.id) {
     throw new ForbiddenError("this run was dispatched to a different machine");
@@ -142,14 +142,15 @@ function validateProbeAttempts(attempts: unknown): ProbeAttemptReport[] {
 
 export async function measurementRoutes(app: FastifyInstance): Promise<void> {
   // --- N2: probe result -----------------------------------------------------
-  app.post<{ Params: { id: string }; Body: ProbeResultInput }>(
-    "/api/runs/:id/probe-result",
-    async (request, reply) => {
+  const postProbeResultHandler = async (
+    request: FastifyRequest<{ Params: { id: string }; Body: ProbeResultInput }>,
+    reply: FastifyReply
+  ) => {
       const worker = requireEnrolledWorkerSession(request);
-      const run = resolveRunForWorker(request.params.id, worker);
+      const run = resolveTestForWorker(request.params.id, worker);
       if (run.kind !== "probe") throw new BadRequestError("that run is not a probe run");
 
-      const spec = (run.config as RunConfig).probe;
+      const spec = (run.config as TestConfig).probe;
       if (!spec) throw new BadRequestError("that probe run has no stored probe spec");
 
       const body = request.body ?? ({} as ProbeResultInput);
@@ -174,7 +175,7 @@ export async function measurementRoutes(app: FastifyInstance): Promise<void> {
       // so a probe that reached no usable context still leaves the evidence
       // of what it tried. Replaces the run's previous rows, so a worker retry
       // reports one ladder rather than two interleaved ones.
-      repo.probeAttemptsRepo.replaceForRun({
+      repo.probeAttemptsRepo.replaceForTest({
         run_id: run.id,
         worker_id: worker.id,
         model_id: run.model_id,
@@ -233,11 +234,11 @@ export async function measurementRoutes(app: FastifyInstance): Promise<void> {
       // shows up in the Runs list badged like anything else. "stopped" maps
       // to the ordinary "cancelled" item status -- the same one the sweep-item
       // loop's own stopRequested branch uses (worker/src/index.ts) -- so
-      // finalizeRun's existing no-cancelReason branch (repo.ts) reads it as a
+      // finalizeTest's existing no-cancelReason branch (repo.ts) reads it as a
       // genuine user stop rather than a bench failure.
       const itemStatus =
         body.status === "verified" ? "done" : body.status === "stopped" ? "cancelled" : body.status;
-      repo.recordRunItemTerminal(run.id, 0, {
+      repo.recordTestItemTerminal(run.id, 0, {
         status: itemStatus,
         error:
           body.status === "verified"
@@ -259,21 +260,23 @@ export async function measurementRoutes(app: FastifyInstance): Promise<void> {
         "probe_finished"
       );
       return reply.code(200).send({ ok: true, limit: stored, attempts_stored: attempts.length });
-    }
-  );
+  };
+  app.post("/api/tests/:id/probe-result", postProbeResultHandler);
+  app.post("/api/runs/:id/probe-result", postProbeResultHandler);
 
   // N2 live progress -- posted once per rung AS the ladder runs (see
   // worker/src/index.ts's executeRunProbeJob), so RunDetail's Context-tests
   // panel can show rows appearing as they happen instead of the whole ladder
   // landing at once when probe-result finally posts at the very end. Purely
-  // additive: probe-result's own replaceForRun call is unchanged and stays
+  // additive: probe-result's own replaceForTest call is unchanged and stays
   // the retry-safe source of truth -- this just upserts through the same
   // UNIQUE(run_id, seq) key (see probeAttemptsRepo.upsertOne's own comment).
-  app.post<{ Params: { id: string }; Body: { seq?: unknown } & Record<string, unknown> }>(
-    "/api/runs/:id/probe-attempt",
-    async (request, reply) => {
+  const postProbeAttemptHandler = async (
+    request: FastifyRequest<{ Params: { id: string }; Body: { seq?: unknown } & Record<string, unknown> }>,
+    reply: FastifyReply
+  ) => {
       const worker = requireEnrolledWorkerSession(request);
-      const run = resolveRunForWorker(request.params.id, worker);
+      const run = resolveTestForWorker(request.params.id, worker);
       if (run.kind !== "probe") throw new BadRequestError("that run is not a probe run");
 
       const body = request.body ?? ({} as { seq?: unknown });
@@ -289,20 +292,23 @@ export async function measurementRoutes(app: FastifyInstance): Promise<void> {
         attempt,
       });
       return reply.code(200).send({ ok: true });
-    }
-  );
+  };
+  app.post("/api/tests/:id/probe-attempt", postProbeAttemptHandler);
+  app.post("/api/runs/:id/probe-attempt", postProbeAttemptHandler);
 
   // The ladder behind a run's verified ceiling. Read-side authorization
   // mirrors /api/models/:id/verified-limits: the caller must own the machine
   // the run was dispatched to, since these rows describe that machine's
   // memory. Worker sessions never read this -- it exists for the UI.
-  app.get<{ Params: { id: string } }>("/api/runs/:id/probe-attempts", async (request, reply) => {
-    const run = repo.getRun(undefined, request.params.id);
+  const getProbeAttemptsHandler = async (request: FastifyRequest<{ Params: { id: string } }>, reply: FastifyReply) => {
+    const run = repo.getTest(undefined, request.params.id);
     if (!run) throw new NotFoundError("run not found");
     if (!run.worker_id) throw new NotFoundError("that run has no machine attached");
     assertOwnsWorker(resolveAuthUser(request)?.user.id, run.worker_id);
-    return reply.send({ attempts: repo.probeAttemptsRepo.listForRun(run.id) });
-  });
+    return reply.send({ attempts: repo.probeAttemptsRepo.listForTest(run.id) });
+  };
+  app.get("/api/tests/:id/probe-attempts", getProbeAttemptsHandler);
+  app.get("/api/runs/:id/probe-attempts", getProbeAttemptsHandler);
 
   // N2 batch dedup -- lets a later scenario in the same batch skip a
   // (candidate_ctx, ngl) point an earlier sibling already measured, rather
@@ -315,16 +321,16 @@ export async function measurementRoutes(app: FastifyInstance): Promise<void> {
   // fully terminal by the time this is called in practice (worker_jobs' FIFO
   // means a worker never has two batch members running at once), but the
   // status filter costs nothing and removes any doubt.
-  app.get<{ Params: { id: string } }>("/api/runs/:id/probe-dedup", async (request, reply) => {
+  const getProbeDedupHandler = async (request: FastifyRequest<{ Params: { id: string } }>, reply: FastifyReply) => {
     const worker = requireEnrolledWorkerSession(request);
-    const run = resolveRunForWorker(request.params.id, worker);
+    const run = resolveTestForWorker(request.params.id, worker);
     if (run.kind !== "probe") throw new BadRequestError("that run is not a probe run");
-    const spec = (run.config as RunConfig).probe;
+    const spec = (run.config as TestConfig).probe;
     if (!spec) throw new BadRequestError("that probe run has no stored probe spec");
 
     const rootId = run.root_run_id ?? run.id;
     const siblings = repo
-      .listRunsUnderRoot(undefined, rootId)
+      .listTestsUnderRoot(undefined, rootId)
       .filter(
         (m) =>
           m.id !== run.id &&
@@ -332,12 +338,12 @@ export async function measurementRoutes(app: FastifyInstance): Promise<void> {
           m.status !== "running" &&
           m.status !== "scheduled" &&
           m.llama_cpp_build === run.llama_cpp_build &&
-          (m.config as RunConfig).probe?.kv_pair?.[0] === spec.kv_pair[0] &&
-          (m.config as RunConfig).probe?.kv_pair?.[1] === spec.kv_pair[1]
+          (m.config as TestConfig).probe?.kv_pair?.[0] === spec.kv_pair[0] &&
+          (m.config as TestConfig).probe?.kv_pair?.[1] === spec.kv_pair[1]
       );
 
     const points = siblings.flatMap((sibling) =>
-      repo.probeAttemptsRepo.listForRun(sibling.id).map((row) => ({
+      repo.probeAttemptsRepo.listForTest(sibling.id).map((row) => ({
         candidate_ctx: row.candidate_ctx,
         ngl: row.ngl,
         ok: row.ok === 1,
@@ -354,14 +360,17 @@ export async function measurementRoutes(app: FastifyInstance): Promise<void> {
       }))
     );
     return reply.send({ points });
-  });
+  };
+  app.get("/api/tests/:id/probe-dedup", getProbeDedupHandler);
+  app.get("/api/runs/:id/probe-dedup", getProbeDedupHandler);
 
   // --- N4: quality result ---------------------------------------------------
-  app.post<{ Params: { id: string }; Body: QualityResultInput }>(
-    "/api/runs/:id/quality-result",
-    async (request, reply) => {
+  const postQualityResultHandler = async (
+    request: FastifyRequest<{ Params: { id: string }; Body: QualityResultInput }>,
+    reply: FastifyReply
+  ) => {
       const worker = requireEnrolledWorkerSession(request);
-      const run = resolveRunForWorker(request.params.id, worker);
+      const run = resolveTestForWorker(request.params.id, worker);
       if (run.kind !== "quality") throw new BadRequestError("that run is not a quality run");
 
       const body = request.body ?? ({} as QualityResultInput);
@@ -407,13 +416,14 @@ export async function measurementRoutes(app: FastifyInstance): Promise<void> {
       // always finalizes its one run_item (idx 0) here, the same place a
       // probe's own result route does. Without this the run never reaches a
       // terminal status: nothing else ever reports this item done.
-      repo.recordRunItemTerminal(run.id, 0, { status: "done" });
+      repo.recordTestItemTerminal(run.id, 0, { status: "done" });
 
       request.log.info(
         { quality_job_finished: true, outcome: "ok", run_id: run.id, worker_id: worker.id },
         "quality_job_finished"
       );
       return reply.code(200).send({ ok: true, quality: row });
-    }
-  );
+  };
+  app.post("/api/tests/:id/quality-result", postQualityResultHandler);
+  app.post("/api/runs/:id/quality-result", postQualityResultHandler);
 }

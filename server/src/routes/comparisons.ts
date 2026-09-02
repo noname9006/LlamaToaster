@@ -5,7 +5,7 @@
 import type { FastifyInstance, FastifyBaseLogger } from "fastify";
 import { repo } from "../db/repo.js";
 import { resolveAuthUser } from "../auth-middleware.js";
-import type { Run, RunConfig } from "../../../shared/types.js";
+import type { Test, TestConfig } from "../../../shared/types.js";
 import {
   checkComparisonFairness,
   gridSignature,
@@ -15,8 +15,8 @@ import {
   type FairnessViolation,
 } from "../../../shared/comparison.js";
 
-export function factsForRun(run: Run): ComparisonFairnessFacts {
-  const config = run.config as RunConfig;
+export function factsForTest(run: Test): ComparisonFairnessFacts {
+  const config = run.config as TestConfig;
   return {
     worker_id: run.worker_id ?? null,
     llama_cpp_build: run.llama_cpp_build ?? null,
@@ -34,20 +34,20 @@ export function factsForRun(run: Run): ComparisonFairnessFacts {
 // once the member has actually run.
 export function recheckComparisonMember(
   comparisonId: string,
-  run: Run,
+  run: Test,
   log?: FastifyBaseLogger
 ): FairnessViolation[] {
   const members = repo.listComparisonMembers(comparisonId);
   const reference = members.find((m) => m.id !== run.id);
   if (!reference) return [];
-  const referenceFacts = { ...factsForRun(reference), method_version: methodVersionOf(reference.id) };
-  const candidateFacts = { ...factsForRun(run), method_version: methodVersionOf(run.id) };
+  const referenceFacts = { ...factsForTest(reference), method_version: methodVersionOf(reference.id) };
+  const candidateFacts = { ...factsForTest(run), method_version: methodVersionOf(run.id) };
   const violations = checkComparisonFairness(referenceFacts, candidateFacts);
   for (const violation of violations) {
     log?.warn(
       {
         comparison_member_failed: true,
-        member_run_id: run.id,
+        member_test_id: run.id,
         reason: violation.field,
         expected: violation.expected,
         found: violation.found,
@@ -59,7 +59,7 @@ export function recheckComparisonMember(
 }
 
 function methodVersionOf(runId: string): number | null {
-  const rows = repo.getResultsForRun(runId);
+  const rows = repo.getResultsForTest(runId);
   const versions = new Set(rows.map((r) => r.method_version ?? null).filter((v): v is number => v != null));
   return versions.size === 1 ? [...versions][0] : null;
 }
@@ -77,10 +77,10 @@ export async function comparisonRoutes(app: FastifyInstance): Promise<void> {
         run.id === reference.id
           ? []
           : checkComparisonFairness(
-              { ...factsForRun(reference), method_version: methodVersionOf(reference.id) },
-              { ...factsForRun(run), method_version: methodVersionOf(run.id) }
+              { ...factsForTest(reference), method_version: methodVersionOf(reference.id) },
+              { ...factsForTest(run), method_version: methodVersionOf(run.id) }
             );
-      const results = repo.getResultsForRun(run.id);
+      const results = repo.getResultsForTest(run.id);
       // Per-model BEST config row: the fastest tg, with its own pp partner.
       const tgRows = results.filter((r) => r.test_type === "tg");
       const best = tgRows.sort((a, b) => b.avg_tps - a.avg_tps)[0];
@@ -118,7 +118,7 @@ export async function comparisonRoutes(app: FastifyInstance): Promise<void> {
         request.log.warn(
           {
             comparison_member_failed: true,
-            member_run_id: row.run_id,
+            member_test_id: row.run_id,
             reason: violation.field,
           },
           "comparison_member_failed"

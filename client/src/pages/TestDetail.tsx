@@ -9,7 +9,7 @@ import { useParams, Link } from "react-router-dom";
 import type { ChartConfiguration } from "chart.js";
 import { api } from "../api/client";
 import {
-  RunStatusPill,
+  TestStatusPill,
   StatusCircle,
   StatusCircleStrip,
   buildItemRepeatUnits,
@@ -24,9 +24,9 @@ import { Th, toggleSort, type SortState } from "../components/Th";
 import { Tooltip } from "../components/Tooltip";
 import { IconInfo } from "../components/icons";
 import type {
-  Run,
+  Test,
   ResultRow,
-  RunItem,
+  TestItem,
   GpuMemoryAccuracyLevel,
   GpuMemoryMeasurementSource,
   Model,
@@ -285,7 +285,7 @@ const STATUS_FILTERS: { value: StatusFilter; label: string }[] = [
   { value: "cancelled", label: "Cancelled" },
 ];
 
-function matchesStatusFilter(status: RunItem["status"], filter: StatusFilter): boolean {
+function matchesStatusFilter(status: TestItem["status"], filter: StatusFilter): boolean {
   switch (filter) {
     case "queued":
       return status === "queued";
@@ -417,7 +417,7 @@ interface MemoryCells {
 // terminal), not like "free" (which run_items *does* track from the item's
 // first tick). The whole-system "used avg"/"used max" columns likewise have
 // no live-tick column -- dash while running, real value once terminal.
-function memoryCells(item: RunItem, result: ResultRow | undefined): MemoryCells {
+function memoryCells(item: TestItem, result: ResultRow | undefined): MemoryCells {
   const terminal = TERMINAL_ITEM_STATUSES.has(item.status);
   const ramFree = result?.ram_free_before_mib ?? item.ram_free_before_mib;
   // The proc avg/max columns keep the legacy per-process RAM behavior
@@ -462,7 +462,7 @@ function memoryCells(item: RunItem, result: ResultRow | undefined): MemoryCells 
 // header-click sort below. `results` may hold up to two rows for one idx
 // (a pp row and a tg row from the same llama-bench process, see
 // worker/src/index.ts's runSweepItem) -- picked apart by test_type below.
-function mergedSortValue(item: RunItem, results: ResultRow[] | undefined, key: string): number | string {
+function mergedSortValue(item: TestItem, results: ResultRow[] | undefined, key: string): number | string {
   const anyResult = results?.[0];
   const ppResult = results?.find((r) => r.test_type === "pp");
   const tgResult = results?.find((r) => r.test_type === "tg");
@@ -545,16 +545,16 @@ function mergedSortValue(item: RunItem, results: ResultRow[] | undefined, key: s
   }
 }
 
-export function RunDetail() {
+export function TestDetail() {
   const { id = "" } = useParams();
-  const [run, setRun] = useState<Run | null>(null);
+  const [run, setRun] = useState<Test | null>(null);
   const [results, setResults] = useState<ResultRow[]>([]);
-  const [items, setItems] = useState<RunItem[]>([]);
+  const [items, setItems] = useState<TestItem[]>([]);
   const [now, setNow] = useState(() => Date.now());
   const [paused, setPaused] = useState(false);
   const [controlPending, setControlPending] = useState(false);
   const [controlError, setControlError] = useState("");
-  // Subheader hardware line (arch/cpu/gpu/os) -- not on Run itself, so
+  // Subheader hardware line (arch/cpu/gpu/os) -- not on Test itself, so
   // resolved from the same GET /api/workers list WorkerCard/NewRun already
   // use, matched by run.worker_id. Best-effort: stays undefined (line just
   // omits those bits) for a run predating worker_id, or whose machine was
@@ -569,7 +569,7 @@ export function RunDetail() {
   // N2 batching -- every run sharing this probe's root (itself included).
   // A group of one for a standalone run/other kinds, same as Runs.tsx's own
   // grouping -- see the fetch effect below for why this is scoped to probes.
-  const [batchMembers, setBatchMembers] = useState<Run[]>([]);
+  const [batchMembers, setBatchMembers] = useState<Test[]>([]);
   // Bumped every poll cycle while the run is running/scheduled -- unlike
   // run.status (which stays the SAME string value for the run's entire
   // in-flight duration), this actually changes every tick, so it's what
@@ -587,7 +587,7 @@ export function RunDetail() {
   // so by the time an item moves from "processing" to "generating" the pp
   // reading is already overwritten server-side and gone from `items`. The
   // real averaged pp result only exists once the *whole* item (both phases)
-  // finishes (see shared/types.ts's RunItemTerminalInput -- results are only
+  // finishes (see shared/types.ts's TestItemTerminalInput -- results are only
   // sent in the terminal update, never mid-item), so without this the PP
   // column would blank out for the entire tg phase instead of holding the
   // last thing it actually measured. Mutated directly during render (not in
@@ -604,7 +604,7 @@ export function RunDetail() {
   useEffect(() => {
     let cancelled = false;
     async function poll() {
-      const data = await api.getRun(id);
+      const data = await api.getTest(id);
       if (cancelled) return;
       setRun(data.run);
       setResults(data.results ?? []);
@@ -685,10 +685,10 @@ export function RunDetail() {
     setControlError("");
     try {
       if (paused) {
-        await api.resumeRun(run.id);
+        await api.resumeTest(run.id);
         setPaused(false);
       } else {
-        await api.pauseRun(run.id);
+        await api.pauseTest(run.id);
         setPaused(true);
       }
     } catch (err) {
@@ -707,7 +707,7 @@ export function RunDetail() {
     setControlPending(true);
     setControlError("");
     try {
-      await api.stopRun(run.id);
+      await api.stopTest(run.id);
     } catch (err) {
       setControlError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -879,7 +879,7 @@ export function RunDetail() {
   // tokens ÷ measured tg speed) -- per-item rather than a flat average
   // seconds-per-run, since sweep combinations can have very different
   // n_prompt/n_gen values.
-  const estimateRepeatSeconds = (it: RunItem): number => {
+  const estimateRepeatSeconds = (it: TestItem): number => {
     let s = 0;
     if (it.n_prompt > 0 && effectivePpTps) s += it.n_prompt / effectivePpTps;
     if (it.n_gen > 0 && effectiveTgTps) s += it.n_gen / effectiveTgTps;
@@ -950,7 +950,7 @@ export function RunDetail() {
   // system_memory_total_mb once one exists -- same numbers either way (both
   // ultimately read si.mem().total on that worker), just available sooner.
   // backend_device_name is preferred over hw.gpu for the GPU label since
-  // it's Run's own two-tier-detected value for whatever actually ran this
+  // it's Test's own two-tier-detected value for whatever actually ran this
   // benchmark, not just whatever's currently in the box.
   const hw = workerInfo?.hardware;
   const cpuLabel = hw?.cpu.brand || hw?.cpu.manufacturer || undefined;
@@ -1012,7 +1012,7 @@ export function RunDetail() {
     setMeasureMsg(`Enqueueing ${contexts.length} curve point(s)${priceLabel}…`);
 
     try {
-      await apiClient.triggerRun({
+      await apiClient.triggerTest({
         model_id: run.model_id,
         worker_id: run.worker_id,
         kind: "runtime",
@@ -1030,7 +1030,7 @@ export function RunDetail() {
   return (
     <div>
       <h1 className="text-2xl font-semibold text-fg">
-        Run <code className="text-lg text-muted">{shortId(id)}</code>
+        Test <code className="text-lg text-muted">{shortId(id)}</code>
       </h1>
       {run && (
         <div className="mt-2 flex flex-col gap-1 text-sm text-muted">
@@ -1044,7 +1044,7 @@ export function RunDetail() {
             {draftModel && ` (draft model: ${draftModel.filename})`}
           </p>
           <p className="flex flex-wrap items-center gap-2">
-            <RunStatusPill status={run.status} />
+            <TestStatusPill status={run.status} />
             {run.status === "running" && <span>· {formatElapsed(now - run.started_at)} elapsed</span>}
             {run.status === "running" && paused && <span className="text-warning">· paused</span>}
             {run.error && <span className="text-danger">· {run.error}</span>}
@@ -1097,9 +1097,9 @@ export function RunDetail() {
                     <div className="mb-1.5 flex flex-wrap items-center gap-2">
                       <StatusCircle tone={MEMBER_CIRCLE_TONE[m.status]} />
                       <span className="text-[12.5px] font-semibold text-fg">{memberChipLabel(m)}</span>
-                      <RunStatusPill status={m.status} />
+                      <TestStatusPill status={m.status} />
                       {m.id !== id && (
-                        <Link to={`/runs/${m.id}`} className="text-xs text-accent hover:underline">
+                        <Link to={`/tests/${m.id}`} className="text-xs text-accent hover:underline">
                           Open ↗
                         </Link>
                       )}
@@ -1109,11 +1109,11 @@ export function RunDetail() {
                         Queued, waiting its turn behind another scenario on this worker…
                       </p>
                     ) : (
-                      <ProbeAttempts runId={m.id} refreshKey={pollTick} />
+                      <ProbeAttempts testId={m.id} refreshKey={pollTick} />
                     )}
                   </div>
                 ))
-              : <ProbeAttempts runId={id} refreshKey={pollTick} />}
+              : <ProbeAttempts testId={id} refreshKey={pollTick} />}
           </div>
         </section>
       )}
@@ -1124,7 +1124,7 @@ export function RunDetail() {
         <section className="mt-6">
           <h2 className="text-sm font-semibold uppercase tracking-wide text-muted">Scored profiles</h2>
           <div className="mt-3">
-            <ProfileCards runId={id} refreshKey={run.status} modelId={run.model_id} workerId={run.worker_id ?? null} />
+            <ProfileCards testId={id} refreshKey={run.status} modelId={run.model_id} workerId={run.worker_id ?? null} />
           </div>
         </section>
       )}
@@ -1141,7 +1141,7 @@ export function RunDetail() {
               targetCtx={runGoals?.target_ctx ?? null}
               onMeasureMissing={handleMeasureMissingPoints}
             />
-            <KneeChart runId={id} />
+            <KneeChart testId={id} />
             {measureMsg && <p className="text-xs text-muted">{measureMsg}</p>}
           </div>
         </section>
@@ -1152,7 +1152,7 @@ export function RunDetail() {
         <section className="mt-6">
           <h2 className="text-sm font-semibold uppercase tracking-wide text-muted">Sustained state</h2>
           <div className="mt-3">
-            <SustainedState runId={id} refreshKey={run.status} />
+            <SustainedState testId={id} refreshKey={run.status} />
           </div>
           <p className="mt-3 text-xs leading-relaxed text-muted">
             Provenance: rows are stamped with the methodology version that produced them; clock and temperature ride
@@ -1163,7 +1163,7 @@ export function RunDetail() {
               shared number travels with the pipeline that produced it. */}
           <div className="mt-3 flex flex-wrap items-center gap-3">
             <a
-              href={apiClient.bundleExportUrl(id, "run")}
+              href={apiClient.bundleExportUrl(id, "test")}
               className="rounded-lg border border-border px-3 py-1.5 text-xs font-semibold text-fg hover:border-accent/40 hover:text-accent"
             >
               Export bundle ⤓
@@ -1655,7 +1655,7 @@ export function RunDetail() {
         <p className="mt-3 space-x-4 text-sm">
           {results.length > 0 && (
             <a href={api.exportUrl("csv", [id])} download className="text-accent hover:underline">
-              Export run CSV
+              Export test CSV
             </a>
           )}
           {/* Shown once something failed outright, or once any "done" item
@@ -1663,7 +1663,7 @@ export function RunDetail() {
               fully clean run's per-run log has nothing more to add beyond
               the results table above. */}
           {(statusCounts.failed > 0 || hasFlaggedItems) && (
-            <a href={api.runLogUrl(id)} download className="text-accent hover:underline">
+            <a href={api.testLogUrl(id)} download className="text-accent hover:underline">
               Download logs
             </a>
           )}
