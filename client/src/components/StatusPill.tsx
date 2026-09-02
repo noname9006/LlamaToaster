@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import type { Run, RunConfig, RunStatus, RunItemStatus, RunItem } from "../types";
+import type { Test, TestConfig, TestStatus, TestItemStatus, TestItem } from "../types";
 import { formatElapsed } from "../utils";
 
 export type PillTone = "accent" | "success" | "danger" | "warning" | "muted";
@@ -22,7 +22,7 @@ export function StatusPill({ label, tone }: { label: string; tone: PillTone }) {
   );
 }
 
-export const RUN_STATUS_TONE: Record<RunStatus, PillTone> = {
+export const TEST_STATUS_TONE: Record<TestStatus, PillTone> = {
   running: "accent",
   scheduled: "muted",
   done: "success",
@@ -31,12 +31,12 @@ export const RUN_STATUS_TONE: Record<RunStatus, PillTone> = {
   cancelled: "muted",
 };
 
-export function RunStatusPill({ status }: { status: RunStatus }) {
-  return <StatusPill label={status} tone={RUN_STATUS_TONE[status]} />;
+export function TestStatusPill({ status }: { status: TestStatus }) {
+  return <StatusPill label={status} tone={TEST_STATUS_TONE[status]} />;
 }
 
 // §0.5's chain stages, abbreviated for a compact per-row/per-section chip
-// (Runs.tsx's row chip strip, RunDetail.tsx's per-batch-member header). Any
+// (Tests.tsx's row chip strip, TestDetail.tsx's per-batch-member header). Any
 // other kind (runtime/probe/quality/null) falls back to its own kind name
 // (or "run" for a legacy/standalone row) rather than a letter, since those
 // aren't part of the A/B/C tuning->refine->sweep sequence.
@@ -49,17 +49,17 @@ export function chipLabel(kind: string | null | undefined): string {
 // "max_gpu") rather than the generic chipLabel(kind) fallback -- every
 // member of a probe batch shares kind "probe", so the plain kind name can't
 // tell them apart the way A/B/C already distinguishes a tuning chain's
-// stages. Shared between Runs.tsx's row chip strip and RunDetail.tsx's
+// stages. Shared between Tests.tsx's row chip strip and TestDetail.tsx's
 // per-batch-member Context-tests sections so both name a scenario the same way.
-export function memberChipLabel(run: Run): string {
-  if (run.kind === "probe") return (run.config as RunConfig)?.probe?.mode ?? "probe";
+export function memberChipLabel(run: Test): string {
+  if (run.kind === "probe") return (run.config as TestConfig)?.probe?.mode ?? "probe";
   return chipLabel(run.kind);
 }
 
 // N2 batching -- yellow-blink-while-running / yellow-static-while-queued,
 // the same CircleTone StatusCircle already uses for a batched progress strip
 // elsewhere, applied here per member chip instead of per sweep-item.
-export const MEMBER_CIRCLE_TONE: Record<RunStatus, CircleTone> = {
+export const MEMBER_CIRCLE_TONE: Record<TestStatus, CircleTone> = {
   running: "running",
   scheduled: "warn",
   done: "solid",
@@ -68,7 +68,7 @@ export const MEMBER_CIRCLE_TONE: Record<RunStatus, CircleTone> = {
   cancelled: "cancelled",
 };
 
-const RUN_ITEM_STATUS_TONE: Record<RunItemStatus, PillTone> = {
+const TEST_ITEM_STATUS_TONE: Record<TestItemStatus, PillTone> = {
   queued: "muted",
   loading: "accent",
   processing: "accent",
@@ -83,7 +83,7 @@ const RUN_ITEM_STATUS_TONE: Record<RunItemStatus, PillTone> = {
   skipped: "muted",
 };
 
-const RUN_ITEM_STATUS_LABEL: Record<RunItemStatus, string> = {
+const TEST_ITEM_STATUS_LABEL: Record<TestItemStatus, string> = {
   queued: "queued",
   loading: "loading",
   processing: "processing",
@@ -96,11 +96,11 @@ const RUN_ITEM_STATUS_LABEL: Record<RunItemStatus, string> = {
   skipped: "skipped",
 };
 
-export function RunItemStatusPill({ status }: { status: RunItemStatus }) {
-  return <StatusPill label={RUN_ITEM_STATUS_LABEL[status]} tone={RUN_ITEM_STATUS_TONE[status]} />;
+export function TestItemStatusPill({ status }: { status: TestItemStatus }) {
+  return <StatusPill label={TEST_ITEM_STATUS_LABEL[status]} tone={TEST_ITEM_STATUS_TONE[status]} />;
 }
 
-// Short, constant label for the dense per-row "detail" column (RunDetail.tsx)
+// Short, constant label for the dense per-row "detail" column (TestDetail.tsx)
 // when an item has something in `error` -- shown instead of the actual error
 // text, which stays available via that cell's title/tooltip. At the
 // column's narrow fixed width ("11ch", sized for the longest normal phase
@@ -110,7 +110,7 @@ export function RunItemStatusPill({ status }: { status: RunItemStatus }) {
 // "debug log: <path>" line at the end of every test pointing at its full
 // raw dump -- see worker/src/index.ts) or a hover, not baked into the table
 // layout.
-export function shortItemErrorLabel(status: RunItemStatus): string {
+export function shortItemErrorLabel(status: TestItemStatus): string {
   switch (status) {
     case "failed":
       return "stopped with an error";
@@ -130,7 +130,7 @@ export function shortItemErrorLabel(status: RunItemStatus): string {
 // Human-readable phase text for a non-terminal item. Terminal items
 // (done/failed/cancelled) aren't meaningfully described this way -- callers
 // should show their error/result instead.
-export function describeItemPhase(item: RunItem): string {
+export function describeItemPhase(item: TestItem): string {
   switch (item.status) {
     case "queued":
       return "queued";
@@ -153,7 +153,7 @@ export function describeItemPhase(item: RunItem): string {
 
 type DotState = "grey" | "blink" | "solid" | "red" | "cancelled" | "skipped";
 
-const RUN_ITEM_DOT_STATE: Record<RunItemStatus, DotState> = {
+const TEST_ITEM_DOT_STATE: Record<TestItemStatus, DotState> = {
   queued: "grey",
   loading: "blink",
   processing: "blink",
@@ -166,18 +166,18 @@ const RUN_ITEM_DOT_STATE: Record<RunItemStatus, DotState> = {
   skipped: "skipped",
 };
 
-// Compact status indicator for a dense per-row table (the full RunItemStatusPill
+// Compact status indicator for a dense per-row table (the full TestItemStatusPill
 // above is more legible standalone but too wide to repeat once per row of a
 // full test table): grey = not started yet, slowly blinking green = the
 // currently running test, solid green = done, red = failed/failed_oom (an
 // error or a test that never finished).
-export function StatusDot({ status }: { status: RunItemStatus }) {
-  const state = RUN_ITEM_DOT_STATE[status];
+export function StatusDot({ status }: { status: TestItemStatus }) {
+  const state = TEST_ITEM_DOT_STATE[status];
   return (
     <span
       className={`status-dot status-dot--${state}`}
-      title={RUN_ITEM_STATUS_LABEL[status]}
-      aria-label={RUN_ITEM_STATUS_LABEL[status]}
+      title={TEST_ITEM_STATUS_LABEL[status]}
+      aria-label={TEST_ITEM_STATUS_LABEL[status]}
     />
   );
 }
@@ -243,12 +243,12 @@ export function StatusSplitCircle({
   );
 }
 
-const RUNNING_ITEM_STATUSES = new Set<RunItemStatus>(["loading", "processing", "generating", "benchmarking"]);
+const RUNNING_ITEM_STATUSES = new Set<TestItemStatus>(["loading", "processing", "generating", "benchmarking"]);
 
-function comboIsRunning(status: RunItemStatus): boolean {
+function comboIsRunning(status: TestItemStatus): boolean {
   return RUNNING_ITEM_STATUSES.has(status);
 }
-export function comboTone(status: RunItemStatus): CircleTone {
+export function comboTone(status: TestItemStatus): CircleTone {
   if (comboIsRunning(status)) return "running";
   if (status === "failed" || status === "failed_oom") return "red";
   if (status === "done") return "solid";
@@ -327,7 +327,7 @@ export function StatusCircleStrip({ units }: { units: RepeatUnit[] }) {
 export const REPEAT_PROGRESS_RE = /run (\d+)\/(\d+)/;
 
 // Builds the unit list a StatusCircleStrip renders for a whole run's
-// progress (used by the Runs list page, one strip per Run row, summarizing
+// progress (used by the Runs list page, one strip per Test row, summarizing
 // every sweep item in that run). Every finished/queued sweep item
 // contributes exactly one unit (its overall combo outcome) -- but the
 // single currently-running item (at most one at a time, since items
@@ -335,12 +335,12 @@ export const REPEAT_PROGRESS_RE = /run (\d+)\/(\d+)/;
 // into one unit per repeat (-r) as soon as it starts running, so a sweep
 // with one combo repeated 14 times shows 14 dots from the start (warmup
 // included), not just 1 -- "runs" in this app's own language means repeats
-// ("Runs averaged per combination" on the New Run page), not sweep combos.
+// ("Runs averaged per combination" on the Custom Test page), not sweep combos.
 // Before the worker's live "run X/Y" marker is parseable (during warmup, or
 // on older llama-bench builds without --progress support), repeat 1 is
 // assumed current. Falls back to a single "running" unit only when
 // repeats <= 1.
-export function buildProgressUnits(items: RunItem[], repeats: number): StatusCircleUnit[] {
+export function buildProgressUnits(items: TestItem[], repeats: number): StatusCircleUnit[] {
   const units: StatusCircleUnit[] = [];
   for (const it of items) {
     const repeatUnits = buildRepeatUnits(it, repeats);
@@ -360,7 +360,7 @@ export function buildProgressUnits(items: RunItem[], repeats: number): StatusCir
 // Once running, the full set of repeat dots shows immediately -- repeat 1
 // is assumed current until the worker's live "run X/Y" marker is parseable
 // (see buildProgressUnits' comment for why that can lag, e.g. warmup).
-export function buildRepeatUnits(item: RunItem, repeats: number): StatusCircleUnit[] | null {
+export function buildRepeatUnits(item: TestItem, repeats: number): StatusCircleUnit[] | null {
   if (!comboIsRunning(item.status) || repeats <= 1) return null;
   const match = REPEAT_PROGRESS_RE.exec(item.detail ?? "");
   const currentRep = match ? Number(match[1]) : 1;
@@ -374,7 +374,7 @@ export function buildRepeatUnits(item: RunItem, repeats: number): StatusCircleUn
   return units;
 }
 
-// Mirrors shared/sweep.ts's deriveTestType (also inlined in RunDetail.tsx's
+// Mirrors shared/sweep.ts's deriveTestType (also inlined in TestDetail.tsx's
 // testTypeLabel) -- kept local per the boundary note there.
 function deriveTestType(nPrompt: number, nGen: number): "pp" | "tg" | "pg" {
   if (nGen === 0) return "pp";
@@ -402,7 +402,7 @@ function deriveTestType(nPrompt: number, nGen: number): "pp" | "tg" | "pg" {
 // Outside that live+attributable window (queued/done/failed/cancelled, or
 // the older-llama-bench fallback "benchmarking" status with no per-phase
 // marker to key off), falls back to the old single-tone-per-repeat dots.
-export function buildItemRepeatUnits(item: RunItem, repeats: number): RepeatUnit[] {
+export function buildItemRepeatUnits(item: TestItem, repeats: number): RepeatUnit[] {
   const n = Math.max(repeats, 1);
   const testType = deriveTestType(item.n_prompt, item.n_gen);
   if (testType === "pg" && (item.status === "processing" || item.status === "generating")) {

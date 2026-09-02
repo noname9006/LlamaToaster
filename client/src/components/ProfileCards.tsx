@@ -86,7 +86,7 @@ function qualityFor(config: ScoredConfig, results: QualityRowDto[]): QualityRowD
 }
 
 export interface ProfileCardsProps {
-  runId: string;
+  testId: string;
   /** Re-fetched whenever the run's own status changes. */
   refreshKey?: unknown;
   /** N2 -- needed to enqueue a probe for the card's own placement. */
@@ -94,7 +94,7 @@ export interface ProfileCardsProps {
   workerId?: string | null;
 }
 
-export function ProfileCards({ runId, refreshKey, modelId, workerId }: ProfileCardsProps) {
+export function ProfileCards({ testId, refreshKey, modelId, workerId }: ProfileCardsProps) {
   const [data, setData] = useState<ProfilesResponse | null>(null);
   const [error, setError] = useState("");
   const [override, setOverride] = useState<Partial<GoalsConfig> | null>(null);
@@ -141,7 +141,7 @@ export function ProfileCards({ runId, refreshKey, modelId, workerId }: ProfileCa
     }
     setProbeMsg(isUnknown ? "Enqueueing a conservative full-trained-context probe…" : "Enqueueing probe…");
     try {
-      await api.triggerRun({
+      await api.triggerTest({
         model_id: modelId,
         worker_id: workerId,
         kind: "probe",
@@ -202,7 +202,7 @@ export function ProfileCards({ runId, refreshKey, modelId, workerId }: ProfileCa
     const ctxTokens = data?.goals.target_ctx ?? (config.referenceDepth > 0 ? config.referenceDepth : 4096);
     setQualityMsg("Enqueueing quality measurement…");
     try {
-      await api.triggerRun({
+      await api.triggerTest({
         model_id: modelId,
         worker_id: workerId,
         kind: "quality",
@@ -238,7 +238,7 @@ export function ProfileCards({ runId, refreshKey, modelId, workerId }: ProfileCa
   useEffect(() => {
     let cancelled = false;
     api
-      .getProfiles(runId, override ? { ...override } : undefined)
+      .getProfiles(testId, override ? { ...override } : undefined)
       .then((res) => {
         if (!cancelled) {
           setData(res);
@@ -251,7 +251,7 @@ export function ProfileCards({ runId, refreshKey, modelId, workerId }: ProfileCa
     return () => {
       cancelled = true;
     };
-  }, [runId, refreshKey, override]);
+  }, [testId, refreshKey, override]);
 
   if (error) return <p className="mt-2 text-sm text-danger">Could not score this run: {error}</p>;
   if (!data) return <p className="mt-2 text-sm text-muted">Scoring…</p>;

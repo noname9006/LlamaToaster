@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type {
-  RunItemUpdateInput,
+  TestItemUpdateInput,
   ModelDownloadCallbackInput,
   WorkerStatePush,
   ActiveJobReport,
@@ -26,25 +26,25 @@ export function writeRawJson(runDir: string, runId: string, data: unknown): stri
 }
 
 // Single endpoint for both tiers of per-item reporting (see shared/types.ts's
-// RunItemTickInput/RunItemTerminalInput) -- the caller decides how to treat
+// TestItemTickInput/TestItemTerminalInput) -- the caller decides how to treat
 // failures: worker/src/index.ts awaits-and-swallows for ticks, and wraps
 // this in its own retry-with-backoff for terminal outcomes.
 //
 // Multi-user Stage 4 (MULTIUSER_PLAN.md §4.3): now Bearer-authenticated like
 // every other pull-queue call below -- this route used to accept an
 // unauthenticated POST at all (a real gap the server-side fix closes; see
-// server/src/routes/runs.ts's own comment on it), so worker/src/index.ts's
+// server/src/routes/tests.ts's own comment on it), so worker/src/index.ts's
 // callers now route through withAuth the same way postHeartbeat/pollQueue
 // already do.
-export async function postRunItemUpdate(
+export async function postTestItemUpdate(
   url: string,
   token: string,
   runId: string,
   idx: number,
-  payload: RunItemUpdateInput,
+  payload: TestItemUpdateInput,
   timeoutMs = 5000
 ): Promise<void> {
-  const res = await fetch(`${url}/api/runs/${runId}/items/${idx}`, {
+  const res = await fetch(`${url}/api/tests/${runId}/items/${idx}`, {
     method: "POST",
     headers: { "content-type": "application/json", ...authHeader(token) },
     body: JSON.stringify(payload),
@@ -67,7 +67,7 @@ export async function postProbeResult(
   payload: ProbeResultInput,
   timeoutMs = 15_000
 ): Promise<void> {
-  const res = await fetch(`${url}/api/runs/${runId}/probe-result`, {
+  const res = await fetch(`${url}/api/tests/${runId}/probe-result`, {
     method: "POST",
     headers: { "content-type": "application/json", ...authHeader(token) },
     body: JSON.stringify(payload),
@@ -85,7 +85,7 @@ export async function postProbeResult(
 // on failure the caller just proceeds without dedup, exactly as if this
 // probe weren't part of a batch at all.
 export async function getProbeDedup(url: string, token: string, runId: string, timeoutMs = 5000): Promise<ProbeDedupPoint[]> {
-  const res = await fetch(`${url}/api/runs/${runId}/probe-dedup`, {
+  const res = await fetch(`${url}/api/tests/${runId}/probe-dedup`, {
     headers: { ...authHeader(token) },
     signal: AbortSignal.timeout(timeoutMs),
   });
@@ -98,11 +98,11 @@ export async function getProbeDedup(url: string, token: string, runId: string, t
 }
 
 // N2 live progress -- one rung, posted as it happens (see
-// worker/src/index.ts's executeRunProbeJob), so the RunDetail page can show
+// worker/src/index.ts's executeRunProbeJob), so the TestDetail page can show
 // rows appearing during the ladder instead of all at once when
 // postProbeResult finally lands at the end. Best-effort by design (short
 // timeout, caller swallows the error) -- losing one tick just means the
-// panel lags until the next one, same tolerance as sendTick/postRunItemUpdate.
+// panel lags until the next one, same tolerance as sendTick/postTestItemUpdate.
 export async function postProbeAttempt(
   url: string,
   token: string,
@@ -111,7 +111,7 @@ export async function postProbeAttempt(
   attempt: ProbeAttemptReport,
   timeoutMs = 5000
 ): Promise<void> {
-  const res = await fetch(`${url}/api/runs/${runId}/probe-attempt`, {
+  const res = await fetch(`${url}/api/tests/${runId}/probe-attempt`, {
     method: "POST",
     headers: { "content-type": "application/json", ...authHeader(token) },
     body: JSON.stringify({ seq, ...attempt }),
@@ -130,7 +130,7 @@ export async function postQualityResult(
   payload: QualityResultInput,
   timeoutMs = 15_000
 ): Promise<void> {
-  const res = await fetch(`${url}/api/runs/${runId}/quality-result`, {
+  const res = await fetch(`${url}/api/tests/${runId}/quality-result`, {
     method: "POST",
     headers: { "content-type": "application/json", ...authHeader(token) },
     body: JSON.stringify(payload),
@@ -144,7 +144,7 @@ export async function postQualityResult(
 
 // Reports a model download's terminal outcome (success or failure) once the
 // background transfer in worker/src/index.ts's POST /models/download
-// settles. Same retry-with-backoff posture as postRunItemUpdate's terminal
+// settles. Same retry-with-backoff posture as postTestItemUpdate's terminal
 // use above -- this is what actually gets a completed download registered
 // as a Model server-side, so losing it silently would leave a fully
 // downloaded file on disk that the app never learns about.
@@ -260,11 +260,11 @@ export async function reportJobResult(
   if (!res.ok) throw new HttpError(res.status, `job completion report failed (${res.status}): ${await res.text()}`);
 }
 
-// Pushes a completed run's gzipped log file -- see server/src/routes/runs.ts's
-// POST /api/runs/:id/log. Identified by X-Machine-Id (not machine_id in a
+// Pushes a completed run's gzipped log file -- see server/src/routes/tests.ts's
+// POST /api/tests/:id/log. Identified by X-Machine-Id (not machine_id in a
 // JSON body, since the body here is raw gzip bytes) so the server can verify
 // this machine actually executed that run before accepting it.
-export async function pushRunLog(
+export async function pushTestLog(
   url: string,
   token: string,
   machineId: string,
@@ -272,7 +272,7 @@ export async function pushRunLog(
   gzippedBytes: Buffer,
   timeoutMs = 30_000
 ): Promise<void> {
-  const res = await fetch(`${url}/api/runs/${runId}/log`, {
+  const res = await fetch(`${url}/api/tests/${runId}/log`, {
     method: "POST",
     headers: {
       "content-type": "application/octet-stream",

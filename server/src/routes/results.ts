@@ -314,12 +314,12 @@ export function formatResultsExport(
 }
 
 export async function resultsRoutes(app: FastifyInstance): Promise<void> {
-  app.get<{ Querystring: { format?: string; runs?: string } }>(
+  app.get<{ Querystring: { format?: string; tests?: string } }>(
     "/api/results/export",
     async (request, reply) => {
       const format = (request.query.format ?? "json").toLowerCase();
-      const runIds = request.query.runs
-        ? request.query.runs.split(",").map((s) => s.trim()).filter(Boolean)
+      const runIds = request.query.tests
+        ? request.query.tests.split(",").map((s) => s.trim()).filter(Boolean)
         : undefined;
       // Multi-user Stage 4 (MULTIUSER_PLAN.md §4.3): scoped to the caller's
       // own results once authenticated; resolveAuthUser returns null (no

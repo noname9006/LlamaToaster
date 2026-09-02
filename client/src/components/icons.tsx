@@ -239,7 +239,7 @@ export function IconSettings(props: SVGProps<SVGSVGElement>) {
 
 // The Benchmark console's nav glyph -- a measurement trace, deliberately
 // distinct from IconBarChart (Compare, which reads stored results) and
-// IconPlusCircle (New Run, which builds one grid by hand).
+// IconPlusCircle (Custom Test, which builds one grid by hand).
 export function IconActivity(props: SVGProps<SVGSVGElement>) {
   return (
     <Icon {...props}>

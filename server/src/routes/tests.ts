@@ -1,4 +1,4 @@
-import type { FastifyInstance } from "fastify";
+import type { FastifyInstance, FastifyRequest, FastifyReply } from "fastify";
 import { v4 as uuid } from "uuid";
 import { mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
@@ -9,28 +9,28 @@ import { userOrIpKeyGenerator, resolveAuthUser, assertOwnsWorker } from "../auth
 import { BadRequestError, ConflictError, ForbiddenError, NotFoundError, UnauthorizedError } from "../errors.js";
 import type {
   TriggerPayload,
-  Run,
-  RunConfig,
+  Test,
+  TestConfig,
   Backend,
-  RunItemUpdateInput,
+  TestItemUpdateInput,
   Model,
   Worker,
   InstallBuildJobPayload,
   BenchmarkJob,
-  RunProbeJobPayload,
+  TestProbeJobPayload,
   MeasureQualityJobPayload,
 } from "../../../shared/types.js";
 import { MIN_PROBE_CTX, MAX_PROBE_CTX, DATASET_HASH_RE } from "./measurements.js";
 import { recheckComparisonMember } from "./comparisons.js";
 import {
-  isTerminalRunItemInput,
+  isTerminalTestItemInput,
   isMtpDraftModel,
   backendVisibleGpus,
   GPU_MEMORY_ACCURACY_LEVELS,
   GPU_MEMORY_MEASUREMENT_SOURCES,
-  RUN_KINDS,
+  TEST_KINDS,
 } from "../../../shared/types.js";
-import type { RunKind } from "../../../shared/types.js";
+import type { TestKind } from "../../../shared/types.js";
 import { expandSweep, validateDepthRule, validateConcurrencyRule } from "../../../shared/sweep.js";
 import {
   MAX_SWEEP_ITEMS,
@@ -357,7 +357,7 @@ function validateIngestResult(value: unknown): string | null {
 // Covers both tiers of worker->server item updates: best-effort ticks
 // (loading/processing/generating/benchmarking) and the retried terminal
 // outcome (done/failed/failed_oom). See shared/types.ts's
-// RunItemTickInput/RunItemTerminalInput for the two shapes this discriminates.
+// TestItemTickInput/TestItemTerminalInput for the two shapes this discriminates.
 function validateRunItemUpdate(payload: unknown): string | null {
   if (!payload || typeof payload !== "object") return "payload must be an object";
   const p = payload as Record<string, unknown>;
@@ -442,7 +442,7 @@ async function resolveBuildForRun(
   }
 
   // Tier-1 backend_device_name fallback (see shared/types.ts's
-  // Run.backend_device_name) -- from the worker's own cached hardware, not a
+  // Test.backend_device_name) -- from the worker's own cached hardware, not a
   // live fetch.
   let deviceName: string | undefined;
   if (worker.hardware) {
@@ -506,14 +506,14 @@ const LOG_DIR = process.env.LOG_DIR ?? join(process.cwd(), "data", "run-logs");
 const MAX_LOG_BYTES = 5 * 1024 * 1024;
 
 function runLogPath(runId: string): string {
-  // Run ids are server-generated UUIDs (see createRun's uuid()), never
+  // Test ids are server-generated UUIDs (see createTest's uuid()), never
   // user-controlled path segments -- no traversal risk from this value, but
   // the param still comes off the URL, so it's validated as a run id (an
   // existing `runs` row) before ever reaching this function regardless.
   return join(LOG_DIR, `run-${runId}.log.gz`);
 }
 
-export async function runsRoutes(app: FastifyInstance): Promise<void> {
+export async function testsRoutes(app: FastifyInstance): Promise<void> {
   // Raw gzip bytes, not JSON -- Fastify has no built-in parser for this
   // content type. Scoped to this plugin's own routes only (Fastify's
   // content-type parsers are subject to the same encapsulation as routes).
@@ -521,45 +521,49 @@ export async function runsRoutes(app: FastifyInstance): Promise<void> {
     done(null, body);
   });
 
-  app.get("/api/runs", async (request) => {
-    // Multi-user Stage 4 (MULTIUSER_PLAN.md §4.3): scoped to the caller's own
-    // runs once authenticated; every run in single-tenant mode (AUTH_ENABLED
-    // off), unchanged from before this scoping existed.
+  // Multi-user Stage 4 (MULTIUSER_PLAN.md §4.3): scoped to the caller's own
+  // runs once authenticated; every run in single-tenant mode (AUTH_ENABLED
+  // off), unchanged from before this scoping existed.
+  const listTestsHandler = async (request: FastifyRequest) => {
     const authed = resolveAuthUser(request);
-    return { runs: repo.listRuns(authed?.user.id) };
-  });
+    return { runs: repo.listTests(authed?.user.id) };
+  };
+  app.get("/api/tests", listTestsHandler);
+  app.get("/api/runs", listTestsHandler);
 
-  app.get<{ Params: { id: string } }>(
-    "/api/runs/:id",
-    // Polled every ~1-2s by every open Runs/RunDetail tab while any run is
-    // active -- logLevel: "silent" suppresses Fastify's default per-request
-    // log pair for just this route; index.ts's polling-summary hook counts
-    // these instead and reports volume once a minute.
-    { logLevel: "silent" },
-    async (request, reply) => {
-      const authed = resolveAuthUser(request);
-      const data = repo.getRunWithResults(authed?.user.id, request.params.id);
-      if (!data) return reply.code(404).send({ error: "run not found" });
-      // No live worker probe anymore -- liveness/staleness are handled
-      // server-side now: a dead worker's claimed job is caught by the lease
-      // reaper (index.ts's reapExpiredLeases), not by this route reaching
-      // out on every poll. `paused` reflects the same per-worker flag the
-      // heartbeat handler delivers control from (MULTIUSER_PLAN.md §1.6/§1.7/§1.14).
-      const paused =
-        data.run.status === "running" && data.run.worker_id
-          ? repo.workerRepo.getPauseRequested(data.run.worker_id)
-          : undefined;
-      return { ...data, paused };
-    }
-  );
+  // Polled every ~1-2s by every open Tests/TestDetail tab while any run is
+  // active -- logLevel: "silent" suppresses Fastify's default per-request
+  // log pair for just this route; index.ts's polling-summary hook counts
+  // these instead and reports volume once a minute.
+  const getTestByIdHandler = async (request: FastifyRequest<{ Params: { id: string } }>, reply: FastifyReply) => {
+    const authed = resolveAuthUser(request);
+    const data = repo.getTestWithResults(authed?.user.id, request.params.id);
+    if (!data) return reply.code(404).send({ error: "run not found" });
+    // No live worker probe anymore -- liveness/staleness are handled
+    // server-side now: a dead worker's claimed job is caught by the lease
+    // reaper (index.ts's reapExpiredLeases), not by this route reaching
+    // out on every poll. `paused` reflects the same per-worker flag the
+    // heartbeat handler delivers control from (MULTIUSER_PLAN.md §1.6/§1.7/§1.14).
+    const paused =
+      data.run.status === "running" && data.run.worker_id
+        ? repo.workerRepo.getPauseRequested(data.run.worker_id)
+        : undefined;
+    return { ...data, paused };
+  };
+  // Registered under both the current path and the legacy /api/runs/... one
+  // it replaces -- an already-deployed worker binary or open browser tab may
+  // still be calling the old path during the rollout. Drop the legacy
+  // registration once every worker is confirmed updated.
+  app.get("/api/tests/:id", { logLevel: "silent" }, getTestByIdHandler);
+  app.get("/api/runs/:id", { logLevel: "silent" }, getTestByIdHandler);
 
   // Reads the log the worker pushed on job completion (POST below) -- no
   // outbound call to any worker. 404 both when the run doesn't exist and
   // when it exists but never got a log pushed (a run that failed before
   // producing one, or predates this feature).
-  app.get<{ Params: { id: string } }>("/api/runs/:id/log", async (request, reply) => {
+  const getTestLogHandler = async (request: FastifyRequest<{ Params: { id: string } }>, reply: FastifyReply) => {
     const authed = resolveAuthUser(request);
-    const run = repo.getRun(authed?.user.id, request.params.id);
+    const run = repo.getTest(authed?.user.id, request.params.id);
     if (!run) return reply.code(404).send({ error: "run not found" });
     const path = runLogPath(run.id);
     if (!existsSync(path)) return reply.code(404).send({ error: "no log file for this run" });
@@ -568,19 +572,23 @@ export async function runsRoutes(app: FastifyInstance): Promise<void> {
     reply.header("content-encoding", "gzip");
     reply.header("content-disposition", `attachment; filename="run-${run.id}.log"`);
     return reply.send(gzipped);
-  });
+  };
+  app.get("/api/tests/:id/log", getTestLogHandler);
+  app.get("/api/runs/:id/log", getTestLogHandler);
 
   // N2 batching -- every run sharing this run's root (itself included), so a
   // multi-mode probe batch (see TriggerPayload.probe_batch_root_id) can be
-  // rendered as one Runs-list row / one RunDetail view instead of the caller
+  // rendered as one Tests-list row / one TestDetail view instead of the caller
   // having to separately discover and fetch each sibling. Ownership-scoped
-  // the same way GET /api/runs/:id/log is.
-  app.get<{ Params: { id: string } }>("/api/runs/:id/batch-members", async (request, reply) => {
+  // the same way GET /api/tests/:id/log is.
+  const getBatchMembersHandler = async (request: FastifyRequest<{ Params: { id: string } }>, reply: FastifyReply) => {
     const authed = resolveAuthUser(request);
-    const run = repo.getRun(authed?.user.id, request.params.id);
+    const run = repo.getTest(authed?.user.id, request.params.id);
     if (!run) return reply.code(404).send({ error: "run not found" });
-    return { members: repo.listRunsUnderRoot(authed?.user.id, run.root_run_id ?? run.id) };
-  });
+    return { members: repo.listTestsUnderRoot(authed?.user.id, run.root_run_id ?? run.id) };
+  };
+  app.get("/api/tests/:id/batch-members", getBatchMembersHandler);
+  app.get("/api/runs/:id/batch-members", getBatchMembersHandler);
 
   // Worker -> server push of a completed run's log file (MULTIUSER_PLAN.md
   // §1.10). Dual-mode worker auth (Stage 3 session first, Stage 1 shared
@@ -589,52 +597,45 @@ export async function runsRoutes(app: FastifyInstance): Promise<void> {
   // function directly: it expects to read machine_id out of a JSON req.body,
   // but this route's body is raw gzip bytes, so the shared-secret fallback
   // here resolves the machine from the X-Machine-Id header instead.
-  app.post<{ Params: { id: string } }>(
-    "/api/runs/:id/log",
-    { bodyLimit: MAX_LOG_BYTES },
-    async (request, reply) => {
-      const auth = request.headers.authorization;
-      const token = auth?.startsWith("Bearer ") ? auth.slice("Bearer ".length) : undefined;
-      if (!token) throw new UnauthorizedError("missing worker token");
+  const postTestLogHandler = async (request: FastifyRequest<{ Params: { id: string } }>, reply: FastifyReply) => {
+    const auth = request.headers.authorization;
+    const token = auth?.startsWith("Bearer ") ? auth.slice("Bearer ".length) : undefined;
+    if (!token) throw new UnauthorizedError("missing worker token");
 
-      let worker: Worker | undefined;
-      const session = repo.sessionRepo.getByTokenHash(hashToken(token));
-      if (session && session.expiresAt >= Date.now() && session.isWorker && session.workerId) {
-        worker = repo.workerRepo.getWorker(session.workerId);
-      }
-      if (!worker) {
-        const expected = process.env.WORKER_SHARED_TOKEN;
-        if (!expected || !safeEqual(token, expected)) throw new UnauthorizedError("invalid worker token");
-        const machineId = request.headers["x-machine-id"];
-        if (typeof machineId !== "string" || !machineId) {
-          throw new BadRequestError("X-Machine-Id header is required");
-        }
-        worker = repo.workerRepo.getByMachineId(machineId);
-        if (!worker) throw new UnauthorizedError("unknown machine");
-      }
-
-      const run = repo.getRun(undefined, request.params.id);
-      if (!run) throw new NotFoundError("run not found");
-      if (run.worker_id !== worker.id) {
-        throw new ForbiddenError("this machine did not execute this run");
-      }
-
-      const body = request.body;
-      if (!Buffer.isBuffer(body) || body.length === 0) {
-        throw new BadRequestError("request body must be non-empty gzip bytes");
-      }
-      mkdirSync(LOG_DIR, { recursive: true });
-      writeFileSync(runLogPath(run.id), body);
-      return reply.code(200).send({ ok: true });
+    let worker: Worker | undefined;
+    const session = repo.sessionRepo.getByTokenHash(hashToken(token));
+    if (session && session.expiresAt >= Date.now() && session.isWorker && session.workerId) {
+      worker = repo.workerRepo.getWorker(session.workerId);
     }
-  );
+    if (!worker) {
+      const expected = process.env.WORKER_SHARED_TOKEN;
+      if (!expected || !safeEqual(token, expected)) throw new UnauthorizedError("invalid worker token");
+      const machineId = request.headers["x-machine-id"];
+      if (typeof machineId !== "string" || !machineId) {
+        throw new BadRequestError("X-Machine-Id header is required");
+      }
+      worker = repo.workerRepo.getByMachineId(machineId);
+      if (!worker) throw new UnauthorizedError("unknown machine");
+    }
 
-  app.post<{ Body: TriggerPayload }>(
-    "/api/runs/trigger",
-    // §2.6: 30/hour, keyed on user (falls back to IP when AUTH_ENABLED is
-    // off / caller has no session -- there's no user to attribute it to yet).
-    { config: { rateLimit: { max: 30, timeWindow: "1 hour", keyGenerator: userOrIpKeyGenerator } } },
-    async (request, reply) => {
+    const run = repo.getTest(undefined, request.params.id);
+    if (!run) throw new NotFoundError("run not found");
+    if (run.worker_id !== worker.id) {
+      throw new ForbiddenError("this machine did not execute this run");
+    }
+
+    const body = request.body;
+    if (!Buffer.isBuffer(body) || body.length === 0) {
+      throw new BadRequestError("request body must be non-empty gzip bytes");
+    }
+    mkdirSync(LOG_DIR, { recursive: true });
+    writeFileSync(runLogPath(run.id), body);
+    return reply.code(200).send({ ok: true });
+  };
+  app.post("/api/tests/:id/log", { bodyLimit: MAX_LOG_BYTES }, postTestLogHandler);
+  app.post("/api/runs/:id/log", { bodyLimit: MAX_LOG_BYTES }, postTestLogHandler);
+
+  const triggerTestHandler = async (request: FastifyRequest<{ Body: TriggerPayload }>, reply: FastifyReply) => {
       // Multi-user Stage 4 (MULTIUSER_PLAN.md §4.3): the run's owner. undefined
       // in single-tenant mode (AUTH_ENABLED off), matching every other
       // scoped call in this route.
@@ -651,8 +652,8 @@ export async function runsRoutes(app: FastifyInstance): Promise<void> {
       // §0.5 -- run kind. Absent/undefined = NULL standalone, byte-identical
       // to every legacy payload.
       const kind = body.kind ?? null;
-      if (body.kind !== undefined && !RUN_KINDS.includes(body.kind)) {
-        return reply.code(400).send({ error: `kind must be one of ${RUN_KINDS.join("/")}` });
+      if (body.kind !== undefined && !TEST_KINDS.includes(body.kind)) {
+        return reply.code(400).send({ error: `kind must be one of ${TEST_KINDS.join("/")}` });
       }
       if (body.kind === "probe" && !body.probe) {
         return reply.code(400).send({ error: "probe runs require a probe block" });
@@ -685,7 +686,7 @@ export async function runsRoutes(app: FastifyInstance): Promise<void> {
       // expandSweep silently drops any flash_attn:"off" combo paired with a
       // quantized cache type (llama.cpp refuses those outright -- see its
       // own comment) -- a sweep built entirely out of such combos would
-      // otherwise create a Run with zero run_items and nothing to ever mark
+      // otherwise create a Test with zero run_items and nothing to ever mark
       // it finished, rather than surfacing why upfront.
       const expanded = expandSweep(body.sweep);
       if (expanded.length === 0) {
@@ -764,7 +765,7 @@ export async function runsRoutes(app: FastifyInstance): Promise<void> {
       // or an explicit companion drafter model (Gemma-4-style, --model-draft).
       // Checked here, before any run/run_items rows exist, same posture as
       // ensureActiveBuild below -- a sweep that can't actually run shouldn't
-      // leave a permanently-misleading "failed" Run behind.
+      // leave a permanently-misleading "failed" Test behind.
       let mtpModel: Model | undefined;
       if (body.sweep.mtp.includes("on")) {
         const modelMtpCapable = typeof model.metadata.mtp_layers === "number" && model.metadata.mtp_layers > 0;
@@ -790,7 +791,7 @@ export async function runsRoutes(app: FastifyInstance): Promise<void> {
       // ordinary sweeps with a shared comparison_id, and the interesting
       // variable is the model file, so same worker / build / backend / GPU /
       // flags / repeats are all held fixed.
-      let comparisonReference: Run | undefined;
+      let comparisonReference: Test | undefined;
       if (body.comparison_id) {
         const existingMembers = repo.listComparisonMembers(body.comparison_id, userId);
         if (existingMembers.length >= MAX_COMPARISON_MEMBERS) {
@@ -985,13 +986,13 @@ export async function runsRoutes(app: FastifyInstance): Promise<void> {
       if (body.probe_batch_root_id && kind !== "probe") {
         return reply.code(400).send({ error: "probe_batch_root_id requires kind \"probe\"" });
       }
-      let batchRoot: Run | undefined;
+      let batchRoot: Test | undefined;
       if (body.probe_batch_root_id) {
-        batchRoot = repo.getRun(undefined, body.probe_batch_root_id);
+        batchRoot = repo.getTest(undefined, body.probe_batch_root_id);
         if (!batchRoot || batchRoot.kind !== "probe") {
           return reply.code(400).send({ error: "unknown or non-probe probe_batch_root_id" });
         }
-        const batchRootOwnerId = repo.getRunOwnerId(body.probe_batch_root_id);
+        const batchRootOwnerId = repo.getTestOwnerId(body.probe_batch_root_id);
         if (batchRootOwnerId != null && userId != null && batchRootOwnerId !== userId) {
           return reply.code(403).send({ error: "that batch belongs to another user" });
         }
@@ -1003,7 +1004,7 @@ export async function runsRoutes(app: FastifyInstance): Promise<void> {
       // attaching to the very batch that's already in flight -- that's not an
       // accidental double-trigger, it's item 6's "queue more onto a running
       // batch".
-      const blocking = repo.findBlockingRun(userId, body.model_id, worker.id, kind);
+      const blocking = repo.findBlockingTest(userId, body.model_id, worker.id, kind);
       if (blocking && !(batchRoot && (blocking.id === batchRoot.id || blocking.id === batchRoot.root_run_id))) {
         throw new ConflictError(
           `you already have a ${blocking.kind ?? "standalone"} run for this model on that machine (${blocking.id}). Stop it first or wait for it to finish.`
@@ -1023,9 +1024,9 @@ export async function runsRoutes(app: FastifyInstance): Promise<void> {
         // countActiveRoots' own "probes are exempt" precedent below.
         rootRunId = batchRoot.root_run_id ?? batchRoot.id;
       } else if (body.parent_run_id) {
-        const parent = repo.getRun(undefined, body.parent_run_id);
+        const parent = repo.getTest(undefined, body.parent_run_id);
         if (!parent) return reply.code(400).send({ error: "unknown parent_run_id" });
-        const parentOwnerId = repo.getRunOwnerId(body.parent_run_id);
+        const parentOwnerId = repo.getTestOwnerId(body.parent_run_id);
         if (parentOwnerId != null && userId != null && parentOwnerId !== userId) {
           return reply.code(403).send({ error: "parent run belongs to another user" });
         }
@@ -1084,10 +1085,10 @@ export async function runsRoutes(app: FastifyInstance): Promise<void> {
             llama_cpp_build: comparisonReference.llama_cpp_build ?? null,
             llama_cpp_backend: comparisonReference.llama_cpp_backend ?? null,
             backend_device_name: comparisonReference.backend_device_name ?? null,
-            repeats: (comparisonReference.config as RunConfig)?.sweep?.repeats ?? null,
+            repeats: (comparisonReference.config as TestConfig)?.sweep?.repeats ?? null,
             method_version: null,
             grid_signature: gridSignature(
-              (comparisonReference.config as RunConfig)?.sweep as unknown as Record<string, unknown>
+              (comparisonReference.config as TestConfig)?.sweep as unknown as Record<string, unknown>
             ),
           },
           candidateFacts
@@ -1096,7 +1097,7 @@ export async function runsRoutes(app: FastifyInstance): Promise<void> {
           request.log.warn(
             {
               comparison_member_failed: true,
-              member_run_id: null,
+              member_test_id: null,
               reason: violations[0].field,
               comparison_id: body.comparison_id,
             },
@@ -1108,7 +1109,7 @@ export async function runsRoutes(app: FastifyInstance): Promise<void> {
 
       // EXPLICIT field list -- never spread the request body into an insert.
       const runId = uuid();
-      const runConfig: RunConfig = {
+      const runConfig: TestConfig = {
         model_id: body.model_id,
         mtp_model_id: mtpModel?.id,
         main_gpu: body.main_gpu,
@@ -1128,12 +1129,12 @@ export async function runsRoutes(app: FastifyInstance): Promise<void> {
       if (body.quality) runConfig.quality = body.quality;
       if (body.curve_point) runConfig.curve_point = body.curve_point;
       if (body.knee) runConfig.knee = body.knee;
-      const run: Run = {
+      const run: Test = {
         id: runId,
         // §0.5 -- denormalized at creation; points at the run itself for
         // standalone runs.
         root_run_id: rootRunId ?? runId,
-        kind: kind as RunKind | null,
+        kind: kind as TestKind | null,
         comparison_id: body.comparison_id ?? null,
         worker_id: worker.id,
         worker_name: worker.displayName, // point-in-time snapshot; the export reads this directly
@@ -1150,7 +1151,7 @@ export async function runsRoutes(app: FastifyInstance): Promise<void> {
         status: "scheduled",
         started_at: Date.now(),
       };
-      repo.createRun(userId, run);
+      repo.createTest(userId, run);
       // A context-curve run gets one item PER MEASURED CONTEXT, not the
       // sweep's own cross-product -- the sweep here only supplies the
       // placement/KV template (expanded[0]); n_prompt is overwritten per
@@ -1159,7 +1160,7 @@ export async function runsRoutes(app: FastifyInstance): Promise<void> {
       const items = body.curve_point
         ? curveContexts.map((ctx, i) => ({ ...expanded[0], idx: i, n_prompt: ctx }))
         : expanded;
-      repo.createRunItems(userId, run.id, items);
+      repo.createTestItems(userId, run.id, items);
       request.log.info(
         { run_id: run.id, worker: worker.id, model_id: body.model_id, items: items.length, kind },
         "run created"
@@ -1177,7 +1178,7 @@ export async function runsRoutes(app: FastifyInstance): Promise<void> {
         // to llama-server (the tok/s floor is meaningless on llama-bench,
         // which has no request lifecycle) and it performs at most three loads
         // ever, so it never rides the sweep executor.
-        const probePayload: RunProbeJobPayload = {
+        const probePayload: TestProbeJobPayload = {
           run_id: run.id,
           model_id: body.model_id,
           model,
@@ -1233,15 +1234,19 @@ export async function runsRoutes(app: FastifyInstance): Promise<void> {
       queueEvents.emit(worker.id);
 
       return reply.code(201).send({ run, warning: budgetWarning });
-    }
-  );
+  };
+  // §2.6: 30/hour, keyed on user (falls back to IP when AUTH_ENABLED is off /
+  // caller has no session -- there's no user to attribute it to yet).
+  const triggerTestRouteOpts = { config: { rateLimit: { max: 30, timeWindow: "1 hour", keyGenerator: userOrIpKeyGenerator } } };
+  app.post("/api/tests/trigger", triggerTestRouteOpts, triggerTestHandler);
+  app.post("/api/runs/trigger", triggerTestRouteOpts, triggerTestHandler);
 
   // Replaces the old whole-run /ingest: the worker now reports one sweep
   // combination at a time (see shared/sweep.ts's expandSweep), so a crash on
   // one item doesn't lose the rest. Two tiers share this route -- a
   // best-effort progress tick (loading/processing/generating/benchmarking)
   // and a terminal outcome (done/failed/failed_oom) -- discriminated by
-  // `status`, matching shared/types.ts's RunItemTickInput/RunItemTerminalInput.
+  // `status`, matching shared/types.ts's TestItemTickInput/TestItemTerminalInput.
   //
   // Multi-user Stage 4 fix (MULTIUSER_PLAN.md §4.3): this route had NO worker
   // authentication at all before this -- not /api/worker/*-prefixed, not in
@@ -1250,19 +1255,19 @@ export async function runsRoutes(app: FastifyInstance): Promise<void> {
   // against any run. Dual-mode like the /log route above: a Stage 3 session
   // resolves a specific worker.id directly; the Stage 1 shared-secret
   // fallback trusts the RUN's own worker_id instead of requiring a
-  // machine_id in this route's tick/terminal payload (RunItemUpdateInput has
+  // machine_id in this route's tick/terminal payload (TestItemUpdateInput has
   // no such field, and never did) -- the same "the shared secret means SOME
   // worker" trust model Stage 1 already had everywhere else, just now
   // actually checked here too.
-  app.post<{ Params: { id: string; idx: string }; Body: RunItemUpdateInput }>(
-    "/api/runs/:id/items/:idx",
-    // Same rationale as GET /api/runs/:id above -- the worker ticks this
-    // every couple seconds for progress. logLevel: "silent" only suppresses
-    // Fastify's automatic per-request pair; the two explicit app.log calls
-    // below (validation rejection, terminal outcome) still print since they
-    // go through the top-level logger, not this route's silenced child one.
-    { logLevel: "silent" },
-    async (request, reply) => {
+  // Same rationale as GET /api/tests/:id above -- the worker ticks this
+  // every couple seconds for progress. logLevel: "silent" only suppresses
+  // Fastify's automatic per-request pair; the two explicit app.log calls
+  // below (validation rejection, terminal outcome) still print since they
+  // go through the top-level logger, not this route's silenced child one.
+  const postTestItemHandler = async (
+    request: FastifyRequest<{ Params: { id: string; idx: string }; Body: TestItemUpdateInput }>,
+    reply: FastifyReply
+  ) => {
       const { id } = request.params;
       const idx = Number(request.params.idx);
       if (!Number.isInteger(idx) || idx < 0) {
@@ -1273,7 +1278,7 @@ export async function runsRoutes(app: FastifyInstance): Promise<void> {
       const token = auth?.startsWith("Bearer ") ? auth.slice("Bearer ".length) : undefined;
       if (!token) throw new UnauthorizedError("missing worker token");
 
-      const run = repo.getRun(undefined, id);
+      const run = repo.getTest(undefined, id);
       if (!run) return reply.code(404).send({ error: "run not found" });
 
       let authorizedAsWorkerId: string | null | undefined;
@@ -1299,13 +1304,13 @@ export async function runsRoutes(app: FastifyInstance): Promise<void> {
       }
       const body = request.body;
 
-      if (isTerminalRunItemInput(body)) {
+      if (isTerminalTestItemInput(body)) {
         app.log[body.status === "done" ? "info" : "error"](
           { run_id: id, idx, status: body.status, error: body.error },
           "item terminal update received"
         );
         const wasTerminal = run.status !== "running" && run.status !== "scheduled";
-        const updatedRun = repo.recordRunItemTerminal(id, idx, body);
+        const updatedRun = repo.recordTestItemTerminal(id, idx, body);
         if (!updatedRun) return reply.code(404).send({ error: "run not found" });
         const nowTerminal = updatedRun.status !== "running" && updatedRun.status !== "scheduled";
         if (!wasTerminal && nowTerminal) {
@@ -1335,18 +1340,19 @@ export async function runsRoutes(app: FastifyInstance): Promise<void> {
         return reply.code(200).send({ ok: true, run_status: updatedRun.status });
       }
 
-      repo.updateRunItemTick(id, idx, body);
+      repo.updateTestItemTick(id, idx, body);
       return reply.code(200).send({ ok: true });
-    }
-  );
+  };
+  app.post("/api/tests/:id/items/:idx", { logLevel: "silent" }, postTestItemHandler);
+  app.post("/api/runs/:id/items/:idx", { logLevel: "silent" }, postTestItemHandler);
 
   // Stops one run: cancels its never-claimed jobs outright, or signals the
   // worker to cancel a claimed one on its next heartbeat. Shared by the
   // /stop route below for both the targeted run and, for a probe batch,
   // every sibling still in flight underneath it.
-  function stopOneRun(authedUserId: string | undefined, run: Run): Run {
-    const jobs = repo.queueRepo.getNonTerminalJobsForRun(run.id);
-    repo.queueRepo.cancelPendingJobsForRun(run.id); // never-claimed jobs -- nothing to signal, cancel outright
+  function stopOneRun(authedUserId: string | undefined, run: Test): Test {
+    const jobs = repo.queueRepo.getNonTerminalJobsForTest(run.id);
+    repo.queueRepo.cancelPendingJobsForTest(run.id); // never-claimed jobs -- nothing to signal, cancel outright
 
     const worker = run.worker_id ? repo.workerRepo.getWorker(run.worker_id) : undefined;
     const anyClaimed = jobs.some((j) => j.status === "claimed");
@@ -1355,12 +1361,12 @@ export async function runsRoutes(app: FastifyInstance): Promise<void> {
       // Nothing is actually executing (or the machine is unreachable) --
       // reconcile immediately instead of waiting on a lease/heartbeat that
       // may never arrive.
-      return repo.reconcileStaleRun(authedUserId, run.id, "stopped by user") ?? run;
+      return repo.reconcileStaleTest(authedUserId, run.id, "stopped by user") ?? run;
     }
 
     // Delivered on the worker's next heartbeat (≤10s) -- the UI shows
     // "stopping…" until the worker's own terminal item reports land.
-    repo.queueRepo.requestCancelForRun(run.id);
+    repo.queueRepo.requestCancelForTest(run.id);
     queueEvents.emit(worker.id);
     return run;
   }
@@ -1368,9 +1374,9 @@ export async function runsRoutes(app: FastifyInstance): Promise<void> {
   // Target the RUN, not the machine (a change from the old worker-scoped
   // /api/workers/:name/stop|pause|resume) -- the right shape once one
   // account owns several machines (MULTIUSER_PLAN.md §1.14).
-  app.post<{ Params: { id: string } }>("/api/runs/:id/stop", async (request, reply) => {
+  const stopTestHandler = async (request: FastifyRequest<{ Params: { id: string } }>) => {
     const authed = resolveAuthUser(request);
-    const run = repo.getRun(authed?.user.id, request.params.id);
+    const run = repo.getTest(authed?.user.id, request.params.id);
     if (!run) throw new NotFoundError("run not found");
 
     // Cascade to every sibling under the same root that's still in flight --
@@ -1380,7 +1386,7 @@ export async function runsRoutes(app: FastifyInstance): Promise<void> {
     // ordinary standalone run or a tuning/refine/sweep chain stage: those
     // never have more than one non-terminal sibling under a root by
     // construction, so this loop covers just `run` itself in practice.
-    const siblings = repo.listRunsUnderRoot(authed?.user.id, run.root_run_id ?? run.id);
+    const siblings = repo.listTestsUnderRoot(authed?.user.id, run.root_run_id ?? run.id);
     for (const sibling of siblings) {
       if (sibling.id === run.id) continue;
       if (sibling.status === "running" || sibling.status === "scheduled") {
@@ -1390,23 +1396,29 @@ export async function runsRoutes(app: FastifyInstance): Promise<void> {
 
     const updated = stopOneRun(authed?.user.id, run);
     return { run: updated };
-  });
+  };
+  app.post("/api/tests/:id/stop", stopTestHandler);
+  app.post("/api/runs/:id/stop", stopTestHandler);
 
-  app.post<{ Params: { id: string } }>("/api/runs/:id/pause", async (request) => {
+  const pauseTestHandler = async (request: FastifyRequest<{ Params: { id: string } }>) => {
     const authed = resolveAuthUser(request);
-    const run = repo.getRun(authed?.user.id, request.params.id);
+    const run = repo.getTest(authed?.user.id, request.params.id);
     if (!run) throw new NotFoundError("run not found");
     if (!run.worker_id) throw new ConflictError("run has no assigned machine");
     repo.workerRepo.setPauseRequested(run.worker_id, true);
     return { ok: true };
-  });
+  };
+  app.post("/api/tests/:id/pause", pauseTestHandler);
+  app.post("/api/runs/:id/pause", pauseTestHandler);
 
-  app.post<{ Params: { id: string } }>("/api/runs/:id/resume", async (request) => {
+  const resumeTestHandler = async (request: FastifyRequest<{ Params: { id: string } }>) => {
     const authed = resolveAuthUser(request);
-    const run = repo.getRun(authed?.user.id, request.params.id);
+    const run = repo.getTest(authed?.user.id, request.params.id);
     if (!run) throw new NotFoundError("run not found");
     if (!run.worker_id) throw new ConflictError("run has no assigned machine");
     repo.workerRepo.setPauseRequested(run.worker_id, false);
     return { ok: true };
-  });
+  };
+  app.post("/api/tests/:id/resume", resumeTestHandler);
+  app.post("/api/runs/:id/resume", resumeTestHandler);
 }

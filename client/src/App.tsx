@@ -5,9 +5,9 @@ import { ChatPanel } from "./components/ChatPanel";
 import { Dashboard } from "./pages/Dashboard";
 import { Models } from "./pages/Models";
 import { Benchmark } from "./pages/Benchmark";
-import { NewRun } from "./pages/NewRun";
-import { Runs } from "./pages/Runs";
-import { RunDetail } from "./pages/RunDetail";
+import { CustomTest } from "./pages/CustomTest";
+import { Tests } from "./pages/Tests";
+import { TestDetail } from "./pages/TestDetail";
 import { Compare } from "./pages/Compare";
 import { Workers } from "./pages/Workers";
 import { Login } from "./pages/Login";
@@ -79,9 +79,9 @@ export default function App() {
             <Route path="/" element={<Dashboard />} />
             <Route path="/models" element={<Models />} />
             <Route path="/benchmark" element={<Benchmark />} />
-            <Route path="/new-run" element={<NewRun />} />
-            <Route path="/runs" element={<Runs />} />
-            <Route path="/runs/:id" element={<RunDetail />} />
+            <Route path="/custom-test" element={<CustomTest />} />
+            <Route path="/tests" element={<Tests />} />
+            <Route path="/tests/:id" element={<TestDetail />} />
             <Route path="/compare" element={<Compare />} />
             <Route path="/workers" element={<Workers />} />
             <Route path="/device" element={<Device />} />

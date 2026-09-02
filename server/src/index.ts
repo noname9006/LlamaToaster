@@ -5,7 +5,7 @@ import fastifyRateLimit from "@fastify/rate-limit";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { readFileSync, existsSync } from "node:fs";
-import { runsRoutes } from "./routes/runs.js";
+import { testsRoutes } from "./routes/tests.js";
 import { profilesRoutes } from "./routes/profiles.js";
 import { measurementRoutes } from "./routes/measurements.js";
 import { curveRoutes } from "./routes/curves.js";
@@ -118,7 +118,7 @@ app.register(fastifyCookie);
 // traffic than any of the specifically-budgeted routes below.
 app.register(fastifyRateLimit, { global: false });
 
-app.register(runsRoutes);
+app.register(testsRoutes);
 // BENCHMARKING_PLAN_V8.md M3 -- scored profile cards, pure post-processing
 // over stored results (changing goals never re-measures).
 app.register(profilesRoutes);
@@ -174,14 +174,21 @@ if (AUTH_ENABLED) {
 }
 
 // GET /api/runs/:id and the tick leg of POST /api/runs/:id/items/:idx are
-// polled every ~1-2s by every open Runs/RunDetail tab and by the worker
+// polled every ~1-2s by every open Tests/TestDetail tab and by the worker
 // itself while a run is active -- both routes set logLevel: "silent" (see
-// routes/runs.ts) so they no longer emit Fastify's default per-request log
+// routes/tests.ts) so they no longer emit Fastify's default per-request log
 // pair. This hook counts them instead and flushes one summary line per
 // minute, so the *volume* of polling traffic is still visible without
 // drowning out every other log line during a run.
+// Each route is registered under both its current path and the legacy
+// /api/runs/... one it replaces (see routes/tests.ts) -- both patterns are
+// listed here so polling volume is suppressed/counted the same either way
+// during the rollout. Drop the /api/runs/... entries once every worker and
+// browser tab is confirmed off the legacy path.
 const POLLING_ROUTES = [
+  { method: "GET", url: "/api/tests/:id" },
   { method: "GET", url: "/api/runs/:id" },
+  { method: "POST", url: "/api/tests/:id/items/:idx" },
   { method: "POST", url: "/api/runs/:id/items/:idx" },
 ] as const;
 
