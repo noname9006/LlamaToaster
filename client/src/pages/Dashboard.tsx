@@ -87,7 +87,11 @@ export function Dashboard() {
   // it's actionable. Abandoned enrolments (never heartbeated) don't count; a
   // machine that's merely powered off right now still does.
   const machinesEverConnected = workers.filter((w) => w.lastHeartbeatAt !== null).length;
-  const testsTotal = runs.reduce((sum, r) => sum + (r.items_total ?? 0), 0);
+  // Terminal outcomes only (done/failed/failed_oom/cancelled) -- a still-
+  // queued or in-flight item hasn't been performed yet, so items_total alone
+  // (which counts those too) overcounts. Matches the admin dashboard's own
+  // "Tests performed" definition (server/src/db/repo.ts's adminRepo.stats).
+  const testsTotal = runs.reduce((sum, r) => sum + (r.items_done ?? 0) + (r.items_failed ?? 0) + (r.items_cancelled ?? 0), 0);
   // "Runs" in this app's own vocabulary means repeats (-r), not sweep
   // combinations or job rows -- see TestDetail.tsx's own totalRuns (items x
   // repeats) for the per-run version of this same math. A raw runs.length
