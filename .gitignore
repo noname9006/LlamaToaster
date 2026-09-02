@@ -1,5 +1,6 @@
 node_modules/
 plans/
+docs/
 
 # Planning documents -- local working drafts, not project source
 *PLAN*.md
