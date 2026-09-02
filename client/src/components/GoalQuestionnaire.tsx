@@ -758,6 +758,13 @@ function PlacementMatrix({
   const [selectedModes, setSelectedModes] = useState<Set<ProbeMode>>(new Set());
   const [running, setRunning] = useState(false);
 
+  // Suppresses the "might not fit" warning once a real test has already run
+  // at exactly this (ngl, ctx) -- a completed result (verified or failed)
+  // already answers the question the estimate can only guess at.
+  const alreadyTestedCurrentConfig = Object.values(placement.verifyResults).some(
+    (r) => r != null && r.status !== "pending" && r.ngl === placement.ngl && r.ctx === ctx
+  );
+
   // Where each mode STARTS. The estimate only picks the starting point; the
   // probe measures the rest, which is the whole reason these are called
   // tested rather than suggested configurations. Modes that search from the
@@ -866,25 +873,30 @@ function PlacementMatrix({
         </div>
       )}
 
-      <p className="mt-2 rounded-lg border border-warning/20 bg-warning/5 px-3 py-2 text-[11px] leading-relaxed text-muted">
-        <b className="text-fg">Estimate only, not a guarantee.</b> Flat per-layer average — weakest for
-        Mixture-of-Experts models — and doesn't account for the real compute/scratch buffer, which varies with batch
-        size and architecture. Verify below before trusting it for a real run.
-        {placement.poolHaircutFrac > 0 && (
-          <>
-            {" "}
-            A recent verify came back short, so free memory above is shown with a{" "}
-            {Math.round(placement.poolHaircutFrac * 100)}% safety margin until the next successful verify.
-          </>
-        )}
-      </p>
-
-      {dualFit?.fits === false && suggestions?.outcome === "cannot_run" && (
-        <p className="mt-3 rounded-lg border border-dashed border-danger/40 p-3 text-[12px] leading-relaxed text-danger">
-          <b>This model cannot run on this machine</b> — no combination of offload placement and context length fits
-          VRAM and RAM together.
+      <div className="mt-2 flex items-center gap-2 rounded-lg border border-warning/20 bg-warning/5 px-3 py-2 text-[11px] leading-relaxed text-muted">
+        <p>
+          <b className="text-fg">Estimate only, not a guarantee.</b> Flat per-layer average — weakest for
+          Mixture-of-Experts models — and doesn't account for the real compute/scratch buffer, which varies with
+          batch size and architecture. Verify below before trusting it for a real run.
+          {placement.poolHaircutFrac > 0 && (
+            <>
+              {" "}
+              A recent verify came back short, so free memory above is shown with a{" "}
+              {Math.round(placement.poolHaircutFrac * 100)}% safety margin until the next successful verify.
+            </>
+          )}
         </p>
-      )}
+        {dualFit?.fits === false && suggestions?.outcome === "cannot_run" && !alreadyTestedCurrentConfig && (
+          <span
+            className="shrink-0 self-center text-[15px] text-danger"
+            title="May fail to run. Test results will show the actual outcome."
+            aria-label="May fail to run. Test results will show the actual outcome."
+          >
+            ⚠️
+          </span>
+        )}
+      </div>
+
       {dualFit?.fits === false && suggestions?.outcome === "unknown" && (
         <p className="mt-3 rounded-lg border border-dashed border-border p-3 text-[12px] leading-relaxed text-muted">
           Not enough data to suggest a fix yet — waiting on a live memory reading from this machine, or this model's
