@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { api, ApiError } from "./api";
-import type { AdminStats, AdminRunSummary, AppSettings } from "./types";
+import type { AdminStats, AdminTestSummary, AppSettings } from "./types";
 
 type Phase = "loading" | "unauthorized" | "ready" | "error";
 
@@ -76,7 +76,7 @@ export default function App() {
   const [phase, setPhase] = useState<Phase>("loading");
   const [errorMessage, setErrorMessage] = useState("");
   const [stats, setStats] = useState<AdminStats | null>(null);
-  const [runs, setRuns] = useState<AdminRunSummary[]>([]);
+  const [runs, setTests] = useState<AdminTestSummary[]>([]);
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [settingsError, setSettingsError] = useState<string | null>(null);
 
@@ -86,10 +86,10 @@ export default function App() {
   const [statusFilter, setStatusFilter] = useState("");
 
   useEffect(() => {
-    Promise.all([api.getStats(), api.listRuns(), api.getSettings()])
+    Promise.all([api.getStats(), api.listTests(), api.getSettings()])
       .then(([s, r, settingsResult]) => {
         setStats(s);
-        setRuns(r.runs);
+        setTests(r.runs);
         setSettings(settingsResult);
         setPhase("ready");
       })
@@ -109,7 +109,7 @@ export default function App() {
   }, []);
 
   // Client-side filtering over the one fetched batch (capped at 500 rows
-  // server-side, see repo.ts's adminRepo.listRuns) -- feels instant, and
+  // server-side, see repo.ts's adminRepo.listTests) -- feels instant, and
   // avoids a round trip per filter change for a table this size. The
   // server's own ?userId=/?workerId=/?backend=/?status= querystring support
   // (routes/admin.ts, exercised by admin.test.ts) stays available for any
@@ -125,7 +125,7 @@ export default function App() {
   const backends = useMemo(() => [...new Set(runs.map((r) => r.llamaCppBackend))].sort(), [runs]);
   const statuses = useMemo(() => [...new Set(runs.map((r) => r.status))].sort(), [runs]);
 
-  const filteredRuns = useMemo(
+  const filteredTests = useMemo(
     () =>
       runs.filter(
         (r) =>
@@ -322,7 +322,7 @@ export default function App() {
 
       <section className="mt-8">
         <div className="flex flex-wrap items-center justify-between gap-3">
-          <h2 className="text-lg font-semibold text-fg">Runs</h2>
+          <h2 className="text-lg font-semibold text-fg">Tests</h2>
           <div className="flex flex-wrap gap-2">
             <a
               href={api.exportUrl("csv")}
@@ -360,7 +360,7 @@ export default function App() {
               </tr>
             </thead>
             <tbody>
-              {filteredRuns.map((r) => (
+              {filteredTests.map((r) => (
                 <tr key={r.id} className="border-t border-border">
                   <td className="px-3 py-2 text-fg">{r.userDisplayName ?? "—"}</td>
                   <td className="px-3 py-2 text-fg">{r.workerDisplayName ?? "—"}</td>
@@ -373,7 +373,7 @@ export default function App() {
                   <td className="px-3 py-2 text-muted">{formatDate(r.startedAt)}</td>
                 </tr>
               ))}
-              {filteredRuns.length === 0 && (
+              {filteredTests.length === 0 && (
                 <tr>
                   <td colSpan={7} className="px-3 py-6 text-center text-muted">
                     No runs match these filters.

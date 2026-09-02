@@ -1,17 +1,17 @@
 // BENCHMARKING_PLAN_V8.md's benchmark console -- the page laid out in
 // docs/Benchmark - Proposed Layout (standalone).html: a numbered 1-2-3
-// wizard (pairing -> goal -> chain) beside a sticky "Your run" summary,
+// wizard (pairing -> goal -> chain) beside a sticky "Your test" summary,
 // replacing the stacked-sections layout screen 1 of
 // docs/benchmark-page-mockup-v8.html originally sketched.
 //
-// The difference from NewRun.tsx (which stays, unchanged, at /new-run) is
+// The difference from CustomTest.tsx (which stays, unchanged, at /custom-test) is
 // WHO builds the grid. There, the user builds one flat cross-product by
 // hand and every trigger is a standalone root. Here the user states intent
 // -- model, machine, the M2 questionnaire, a repeat count -- and the page
 // derives the three-stage chain §0.5 defines (tuning -> refine -> sweep),
 // each stage a real run linked to the previous one by `parent_run_id`, which
 // is what makes the server resolve them to one `root_run_id` and score them
-// as one universe (repo.ts's listChainScoringRuns).
+// as one universe (repo.ts's listChainScoringTests).
 //
 // Two properties are load-bearing here and are why nothing on this page
 // shows a hardcoded number the way the mockup's static HTML does:
@@ -33,10 +33,10 @@ import { api } from "../api/client";
 import { useWorkerStatuses } from "../api/useWorkerStatus";
 import { ModelPicker } from "../components/ModelPicker";
 import { GoalQuestionnaire, KV_PRESET_LABEL } from "../components/GoalQuestionnaire";
-import { RunStatusPill } from "../components/StatusPill";
+import { TestStatusPill } from "../components/StatusPill";
 import { IconArrowRight, IconChevronDown, IconInfo } from "../components/icons";
 import { backendVisibleGpus } from "../types";
-import type { Model, Run, ResultRow, RunKind, SweepConfig } from "../types";
+import type { Model, Test, ResultRow, TestKind, SweepConfig } from "../types";
 import { formatBytes, formatGpuLabel } from "../utils";
 import { estimateSafeNgl, estimateVramNeededMib, maxAffordableContext } from "../vramEstimate";
 import {
@@ -89,16 +89,16 @@ const TERMINAL: ReadonlySet<string> = new Set(["done", "partial", "failed", "can
 
 // --- persistence -----------------------------------------------------------
 //
-// The pairing keys are deliberately the SAME ones NewRun.tsx writes: which
+// The pairing keys are deliberately the SAME ones CustomTest.tsx writes: which
 // machine and model you were last looking at is one fact about the session,
 // not one per page, and a user moving between the two surfaces should not
 // have to re-pick. The goals key is shared for the same reason plus M5's:
 // goals describe the workload, not the page that captured them.
 
-const LAST_WORKER_STORAGE_KEY = "llamatoaster:new-run:last-worker";
+const LAST_WORKER_STORAGE_KEY = "llamatoaster:custom-test:last-worker";
 
 function lastModelStorageKey(workerId: string): string {
-  return `llamatoaster:new-run:last-model:${workerId}`;
+  return `llamatoaster:custom-test:last-model:${workerId}`;
 }
 
 function goalsStorageKey(modelId: string, workerId: string): string {
@@ -153,7 +153,7 @@ type ChainState = Partial<Record<StageKind, string>>;
 interface PlacementVerifyState {
   ngl: number;
   ctx: number;
-  runId: string;
+  testId: string;
   // "cancelled" -- a user stop mid-ladder (worker/src/index.ts's
   // stopRequested check), distinct from failed/failed_oom: it means nobody
   // let the search finish, not that the placement doesn't fit.
@@ -423,7 +423,7 @@ export function Benchmark() {
   const [scoringDetailsOpen, setScoringDetailsOpen] = useState(false);
 
   const [chain, setChain] = useState<ChainState>({});
-  const [stageData, setStageData] = useState<Record<string, { run: Run; results: ResultRow[] }>>({});
+  const [stageData, setStageData] = useState<Record<string, { run: Test; results: ResultRow[] }>>({});
   const [busyStage, setBusyStage] = useState<StageKind | null>(null);
   const [msg, setMsg] = useState("");
   const [autoAdvance, setAutoAdvance] = useState<boolean>(() => readJson<boolean>(AUTO_ADVANCE_STORAGE_KEY) ?? false);
@@ -550,7 +550,7 @@ export function Benchmark() {
     // restored pending card so the eventual verified/failed/failed_oom
     // result still lands instead of the card being stuck "Testing…" forever.
     for (const [mode, state] of Object.entries(restoredVerify ?? {}) as [ProbeMode, PlacementVerifyState][]) {
-      if (state?.status === "pending" && state.runId) startPolling(mode, state.runId);
+      if (state?.status === "pending" && state.testId) startPolling(mode, state.testId);
     }
     setPoolHaircutFrac(0);
   }, [modelId, workerId]);
@@ -615,11 +615,11 @@ export function Benchmark() {
     let cancelled = false;
     let timer: number | undefined;
     async function poll() {
-      const next: Record<string, { run: Run; results: ResultRow[] }> = {};
+      const next: Record<string, { run: Test; results: ResultRow[] }> = {};
       let anyLive = false;
       for (const id of chainIds) {
         try {
-          const res = await api.getRun(id);
+          const res = await api.getTest(id);
           next[id] = { run: res.run, results: res.results };
           if (!TERMINAL.has(res.run.status)) anyLive = true;
         } catch {
@@ -790,9 +790,9 @@ export function Benchmark() {
       STAGES.map((stage) => {
         const sweep = sweepForStage(stage, stageInputs(stage));
         const items = expandSweep(sweep);
-        const runId = chain[stage];
-        const data = runId ? stageData[runId] : undefined;
-        return { stage, sweep, itemCount: items.length, runId, run: data?.run, results: data?.results ?? [] };
+        const testId = chain[stage];
+        const data = testId ? stageData[testId] : undefined;
+        return { stage, sweep, itemCount: items.length, testId, run: data?.run, results: data?.results ?? [] };
       }),
     [stageInputs, chain, stageData]
   );
@@ -857,10 +857,10 @@ export function Benchmark() {
     setMsg(`Queuing ${STAGE_TITLE[stage]}…`);
     try {
       const selectedGpu = selectedGpuRawIndex != null ? visibleGpus[selectedGpuRawIndex] : undefined;
-      const run = await api.triggerRun({
+      const run = await api.triggerTest({
         model_id: modelId,
         worker_id: workerId,
-        kind: stage as RunKind,
+        kind: stage as TestKind,
         parent_run_id: parentRunId,
         main_gpu: selectedGpu ? selectedGpuRawIndex : undefined,
         sweep: plan.sweep,
@@ -893,7 +893,7 @@ export function Benchmark() {
   // batchRootId, when passed, attaches this trigger as a sibling under an
   // existing probe root (N2 batching -- see shared/types.ts's
   // TriggerPayload.probe_batch_root_id) instead of starting a fresh one, so
-  // several modes fired from one Run test click collapse into one Runs-list
+  // several modes fired from one Run test click collapse into one Tests-list
   // row. Returns the created run's id so the caller (GoalQuestionnaire's Run
   // test handler) can thread the FIRST call's id into the rest of the same
   // click's triggers; undefined on failure.
@@ -906,10 +906,10 @@ export function Benchmark() {
   ): Promise<string | undefined> {
     if (!modelId || !workerId || verifyStates[mode]?.status === "pending") return undefined;
     const testedAt = Date.now();
-    setVerifyStates((prev) => ({ ...prev, [mode]: { ngl, ctx, runId: "", status: "pending", mode, testedAt } }));
+    setVerifyStates((prev) => ({ ...prev, [mode]: { ngl, ctx, testId: "", status: "pending", mode, testedAt } }));
     try {
       const selectedGpu = selectedGpuRawIndex != null ? visibleGpus[selectedGpuRawIndex] : undefined;
-      const run = await api.triggerRun({
+      const run = await api.triggerTest({
         model_id: modelId,
         worker_id: workerId,
         kind: "probe",
@@ -942,7 +942,7 @@ export function Benchmark() {
           repeats: 1,
         },
       });
-      setVerifyStates((prev) => ({ ...prev, [mode]: { ngl, ctx, runId: run.id, status: "pending", mode, testedAt } }));
+      setVerifyStates((prev) => ({ ...prev, [mode]: { ngl, ctx, testId: run.id, status: "pending", mode, testedAt } }));
       startPolling(mode, run.id);
       return run.id;
     } catch (err) {
@@ -951,7 +951,7 @@ export function Benchmark() {
         [mode]: {
           ngl,
           ctx,
-          runId: "",
+          testId: "",
           status: "error",
           mode,
           testedAt,
@@ -1004,8 +1004,8 @@ export function Benchmark() {
 
   // Polls one card's probe root independently of chainIds -- a probe is
   // never part of the tuning->refine->sweep chain. Coarse pass/fail/OOM comes
-  // straight off items[0] (TerminalRunItemStatus distinguishes failed_oom
-  // from failed even though the aggregate Run.status collapses both to
+  // straight off items[0] (TerminalTestItemStatus distinguishes failed_oom
+  // from failed even though the aggregate Test.status collapses both to
   // "failed"); a verified pass then looks up the precise ceiling AND (for the
   // card's own measured-needs line) the winning rung's real peak usage.
   //
@@ -1029,7 +1029,7 @@ export function Benchmark() {
     // synchronously, before any poll ever runs. Without resetting the flag
     // here on that remount, the simulated unmount's cleanup would leave
     // unmountedRef permanently true, and every poll() call's first line
-    // would bail out before ever calling api.getRun -- exactly the silent
+    // would bail out before ever calling api.getTest -- exactly the silent
     // "never actually polls" bug this comment is here to prevent regressing.
     unmountedRef.current = false;
     return () => {
@@ -1039,15 +1039,15 @@ export function Benchmark() {
     };
   }, []);
 
-  function startPolling(mode: ProbeMode, runId: string): void {
-    if (pollingRunIds.current.has(runId)) return;
-    pollingRunIds.current.add(runId);
+  function startPolling(mode: ProbeMode, testId: string): void {
+    if (pollingRunIds.current.has(testId)) return;
+    pollingRunIds.current.add(testId);
     let timer: number | undefined;
 
     async function poll() {
       if (unmountedRef.current) return;
       try {
-        const res = await api.getRun(runId);
+        const res = await api.getTest(testId);
         if (unmountedRef.current) return;
         if (TERMINAL.has(res.run.status)) {
           const item = res.items[0];
@@ -1065,7 +1065,7 @@ export function Benchmark() {
                   : "failed";
           setVerifyStates((prev) => {
             const cur = prev[mode];
-            return cur && cur.runId === runId
+            return cur && cur.testId === testId
               ? { ...prev, [mode]: { ...cur, status, detail: item?.detail, runStatus: undefined } }
               : prev;
           });
@@ -1076,7 +1076,7 @@ export function Benchmark() {
             try {
               const [limits, attemptsRes] = await Promise.all([
                 api.getVerifiedLimits(modelId, workerId),
-                api.getProbeAttempts(runId),
+                api.getProbeAttempts(testId),
               ]);
               const match = limits.limits
                 .filter((l) => l.kv_type === "f16/f16")
@@ -1091,7 +1091,7 @@ export function Benchmark() {
               if (!unmountedRef.current && (match || winner)) {
                 setVerifyStates((prev) => {
                   const cur = prev[mode];
-                  if (!cur || cur.runId !== runId) return prev;
+                  if (!cur || cur.testId !== testId) return prev;
                   return {
                     ...prev,
                     [mode]: {
@@ -1109,7 +1109,7 @@ export function Benchmark() {
             }
           }
           document.removeEventListener("visibilitychange", onVisible);
-          pollingRunIds.current.delete(runId);
+          pollingRunIds.current.delete(testId);
           return;
         }
         // Still running -- surface the run_item's own live detail text (the
@@ -1125,7 +1125,7 @@ export function Benchmark() {
         const runStatus = res.run.status === "running" ? "running" : "scheduled";
         setVerifyStates((prev) => {
           const cur = prev[mode];
-          if (!cur || cur.runId !== runId) return prev;
+          if (!cur || cur.testId !== testId) return prev;
           // liveDetail only ever UPGRADES (never reverts to undefined on a
           // poll that briefly has none -- see the original single-field
           // version of this check above) -- runStatus, unlike liveDetail,
@@ -1219,8 +1219,8 @@ export function Benchmark() {
         <p className="mt-2 max-w-3xl text-sm text-muted">
           State the goal; the console derives the chain — two tuning passes, then the sweep that produces scored
           cards, each a real run linked to the last. Building a grid by hand instead lives on{" "}
-          <Link to="/new-run" className="text-accent hover:underline">
-            New Run
+          <Link to="/custom-test" className="text-accent hover:underline">
+            Custom Test
           </Link>
           .
         </p>
@@ -1421,7 +1421,7 @@ export function Benchmark() {
                       every KV type is zero — binding constraint <span className="font-mono">weights-placement</span>,
                       not KV. The lever is offload, not cache quality: the sweep stage already carries a lower{" "}
                       <span className="font-mono">-ngl</span> point, and <span className="font-mono">--n-cpu-moe</span>{" "}
-                      on New Run moves expert weights off the card entirely. Advisory, as always — nothing is removed
+                      on Custom Test moves expert weights off the card entirely. Advisory, as always — nothing is removed
                       from the grid over it.
                     </p>
                   ) : (
@@ -1455,7 +1455,7 @@ export function Benchmark() {
               unset={goalsUnset}
               // This console runs the chain over slider-expressible contexts
               // only, so the free-form number entry would offer a value
-              // nothing downstream here can act on. New Run keeps it.
+              // nothing downstream here can act on. Custom Test keeps it.
               showCtxNumberInput={false}
               affordability={{
                 totalMib: liveVramTotalMib,
@@ -1501,7 +1501,7 @@ export function Benchmark() {
               </span>
             </div>
 
-            {/* Same control, same state as the sticky "Your run" card below --
+            {/* Same control, same state as the sticky "Your test" card below --
                 it governs the whole chain's behaviour, so it belongs where
                 the chain is being reviewed too, not only where it's started. */}
             <label className="flex items-center gap-2 text-[11.5px] text-muted">
@@ -1538,7 +1538,7 @@ export function Benchmark() {
                         )}
                         <b className="text-[12.5px] text-fg">{STAGE_TITLE[plan.stage]}</b>
                       </div>
-                      {plan.run && <RunStatusPill status={plan.run.status} />}
+                      {plan.run && <TestStatusPill status={plan.run.status} />}
                       <div className="font-mono text-[10.5px] leading-relaxed text-muted">
                         {plan.itemCount > 0 ? (
                           <>
@@ -1558,9 +1558,9 @@ export function Benchmark() {
                       )}
 
                       <div className="mt-auto flex flex-col gap-1 pt-1">
-                        {plan.runId ? (
+                        {plan.testId ? (
                           <Link
-                            to={`/runs/${plan.runId}`}
+                            to={`/tests/${plan.testId}`}
                             className="text-center text-[11px] font-semibold text-accent hover:underline"
                           >
                             View run →
@@ -1583,7 +1583,7 @@ export function Benchmark() {
                             may go straight from the coarse winner to the
                             scored sweep, which is depth 2 of the 3 §0.5
                             allows. */}
-                        {plan.stage === "sweep" && !plan.runId && !chain.refine && chain.tuning && (
+                        {plan.stage === "sweep" && !plan.testId && !chain.refine && chain.tuning && (
                           <button
                             type="button"
                             disabled={busyStage != null || stageState("refine") === "blocked"}
@@ -1612,7 +1612,7 @@ export function Benchmark() {
                       : "Balanced + Low Memory"}
                 </div>
                 {cardsRunId ? (
-                  <Link to={`/runs/${cardsRunId}`} className="mt-1 text-[11px] font-semibold text-accent hover:underline">
+                  <Link to={`/tests/${cardsRunId}`} className="mt-1 text-[11px] font-semibold text-accent hover:underline">
                     Open scored cards →
                   </Link>
                 ) : (
@@ -1622,15 +1622,6 @@ export function Benchmark() {
                 )}
               </div>
             </div>
-
-            {vramCap && (
-              <p className="rounded-lg border border-warning/30 bg-warning-bg px-3 py-2 text-xs leading-relaxed text-warning">
-                <b>Offload capped at {vramCap.safeNgl} layers.</b> Full offload of this model is estimated at ~
-                {formatBytes(vramCap.neededMib * 1024 * 1024)} against ~{formatBytes(vramCap.freeMib * 1024 * 1024)} free
-                on this machine right now. Every stage above runs at the capped value. The estimate is a flat per-layer
-                average — weakest exactly for Mixture-of-Experts models — so it is shown rather than applied silently.
-              </p>
-            )}
 
             <div>
               <button
@@ -1665,7 +1656,7 @@ export function Benchmark() {
                     <b className="text-fg">Held fields keep their reasons.</b> Threads are held at {threads} (one less
                     than this machine's cores): these stages target fully offloaded configurations where{" "}
                     <span className="font-mono">-t</span> barely bites. On CPU-bound rows it is the dominant variable
-                    and stays an axis on the New Run page, with the running build's own ISA provenance recorded
+                    and stays an axis on the Custom Test page, with the running build's own ISA provenance recorded
                     alongside those rows.{" "}
                     {goals.target_ctx != null ? (
                       <>
@@ -1729,7 +1720,7 @@ export function Benchmark() {
 
         {/* Right column -- the sticky run summary ---------------------------- */}
         <aside className="sticky top-6 flex w-[300px] shrink-0 flex-col gap-3.5 rounded-xl border border-border bg-surface p-5">
-          <span className="text-sm font-bold text-fg">Your run</span>
+          <span className="text-sm font-bold text-fg">Your test</span>
 
           {ready ? (
             <div className="flex flex-col gap-0.5">
@@ -1802,7 +1793,7 @@ export function Benchmark() {
 
           <div className="text-[11px] leading-relaxed text-muted">
             {cardsRunId ? (
-              <Link to={`/runs/${cardsRunId}`} className="font-semibold text-accent hover:underline">
+              <Link to={`/tests/${cardsRunId}`} className="font-semibold text-accent hover:underline">
                 Open scored cards →
               </Link>
             ) : (

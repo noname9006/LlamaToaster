@@ -48,7 +48,7 @@ export interface CurvePoint {
    */
   superseded: boolean;
   /** The item this point came from -- what makes two same-second points distinct. */
-  runId: string;
+  testId: string;
   idx: number;
   /** Stable identity used as the second key of the (created_at, id) total order. */
   pointId: string;
@@ -103,7 +103,7 @@ export function buildCurve(rows: CurveSourceRow[]): CurvePoint[] {
       methodVersion: (pp ?? tg)!.method_version ?? null,
       caveatFlags: flags,
       superseded: false,
-      runId: cell.rows[0].run_id,
+      testId: cell.rows[0].run_id,
       idx: cell.rows[0].idx,
       pointId: cell.rows.map((r) => r.id).sort()[0],
       excluded: evicted || shifted,

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { api } from "../api/client";
-import type { Worker, Run, LlamaCppRelease, ActiveJobReport } from "../types";
+import type { Worker, Test, LlamaCppRelease, ActiveJobReport } from "../types";
 import { extractCudaVariant, cudaDriverSupports } from "../types";
 import { StatusPill, WorkerStatusPill, ElapsedSince } from "./StatusPill";
 import { IconCheck, IconChevronDown, IconDownload, IconPencil, IconTrash } from "./icons";
@@ -222,7 +222,7 @@ export function WorkerCard({ worker, onRefresh }: { worker: Worker; onRefresh: (
   // available-builds fetch below re-runs immediately instead of waiting for
   // its next periodic tick.
   const [buildsNonce, setBuildsNonce] = useState(0);
-  const [activeRun, setActiveRun] = useState<Run | undefined>(undefined);
+  const [activeTest, setActiveTest] = useState<Test | undefined>(undefined);
   const [renaming, setRenaming] = useState(false);
   const [nameDraft, setNameDraft] = useState(worker.displayName);
   // Manual OS override, only ever consulted when this worker's own reported
@@ -266,28 +266,28 @@ export function WorkerCard({ worker, onRefresh }: { worker: Worker; onRefresh: (
     };
   }, [worker.id, installedSignature, buildsNonce]);
 
-  // Worker.activeRunId only names the run (MULTIUSER_PLAN.md §1.16's "no
+  // Worker.activeTestId only names the run (MULTIUSER_PLAN.md §1.16's "no
   // outbound HTTP" also means no inline model_filename/started_at without
   // this second small fetch) -- resolved separately so the running-banner
   // below can show what the old worker-pushed WorkerCurrentRun did.
   useEffect(() => {
-    if (!worker.activeRunId) {
-      setActiveRun(undefined);
+    if (!worker.activeTestId) {
+      setActiveTest(undefined);
       return;
     }
     let cancelled = false;
     api
-      .getRun(worker.activeRunId)
+      .getTest(worker.activeTestId)
       .then((d) => {
-        if (!cancelled) setActiveRun(d.run);
+        if (!cancelled) setActiveTest(d.run);
       })
       .catch(() => {
-        if (!cancelled) setActiveRun(undefined);
+        if (!cancelled) setActiveTest(undefined);
       });
     return () => {
       cancelled = true;
     };
-  }, [worker.activeRunId]);
+  }, [worker.activeTestId]);
 
   async function handleShutdown() {
     const busyNote =
@@ -307,7 +307,7 @@ export function WorkerCard({ worker, onRefresh }: { worker: Worker; onRefresh: (
   async function handleRemove() {
     if (
       !window.confirm(
-        `Remove ${worker.displayName}? This deletes it from the Workers list -- its run history is kept, but if this machine reconnects later it'll need to be re-approved as if it were new.`
+        `Remove ${worker.displayName}? This deletes it from the Workers list -- its test history is kept, but if this machine reconnects later it'll need to be re-approved as if it were new.`
       )
     ) {
       return;
@@ -352,10 +352,10 @@ export function WorkerCard({ worker, onRefresh }: { worker: Worker; onRefresh: (
   const driverCudaVersion = worker.hardware?.nvidia_driver?.cuda_version ?? null;
 
   // A serial job in its downloading/extracting phase with no run attached is
-  // a build install in flight (benchmark jobs always carry activeRunId) --
+  // a build install in flight (benchmark jobs always carry activeTestId) --
   // render it as a real progress bar instead of the plain busy text.
   const installProgress =
-    !inaccessible && !worker.activeRunId && worker.activeJobProgress
+    !inaccessible && !worker.activeTestId && worker.activeJobProgress
       ? worker.activeJobProgress.phase === "downloading" || worker.activeJobProgress.phase === "extracting"
         ? worker.activeJobProgress
         : undefined
@@ -515,11 +515,11 @@ export function WorkerCard({ worker, onRefresh }: { worker: Worker; onRefresh: (
       </details>
       {!inaccessible && worker.status === "busy" && (
         <>
-          {activeRun ? (
+          {activeTest ? (
             <p className="mt-3 text-sm text-fg">
-              Running <span className="font-medium">{activeRun.model_filename ?? activeRun.model_id}</span>{" "}
+              Running <span className="font-medium">{activeTest.model_filename ?? activeTest.model_id}</span>{" "}
               <span className="text-muted">
-                — <ElapsedSince startedAt={activeRun.started_at} />
+                — <ElapsedSince startedAt={activeTest.started_at} />
               </span>
             </p>
           ) : installProgress ? (

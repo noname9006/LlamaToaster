@@ -155,10 +155,10 @@ describe("admin routes, cross-tenant by design", () => {
       status: "running" as const,
       started_at: Date.now(),
     };
-    repo.createRun(owner.id, { ...baseRun, id: "admin-stats-run-a", model_id: "admin-stats-model-a", config: { model_id: "admin-stats-model-a" } as never });
+    repo.createTest(owner.id, { ...baseRun, id: "admin-stats-run-a", model_id: "admin-stats-model-a", config: { model_id: "admin-stats-model-a" } as never });
     // Second run so model-b counts as tested too -- its quant can only come
     // from metadata.quant, since "opaque-name.gguf" parses to nothing.
-    repo.createRun(owner.id, { ...baseRun, id: "admin-stats-run-b", model_id: "admin-stats-model-b", config: { model_id: "admin-stats-model-b" } as never });
+    repo.createTest(owner.id, { ...baseRun, id: "admin-stats-run-b", model_id: "admin-stats-model-b", config: { model_id: "admin-stats-model-b" } as never });
     const sweepItem = (idx: number) => ({
       idx,
       n_prompt: 512,
@@ -176,9 +176,9 @@ describe("admin routes, cross-tenant by design", () => {
       n_gpu_layers_draft: 0,
       n_cpu_moe: 0,
     });
-    repo.createRunItems(undefined, "admin-stats-run-a", [sweepItem(0), sweepItem(1), sweepItem(2)]);
-    repo.recordRunItemTerminal("admin-stats-run-a", 0, { status: "done" });
-    repo.recordRunItemTerminal("admin-stats-run-a", 1, { status: "failed_oom" });
+    repo.createTestItems(undefined, "admin-stats-run-a", [sweepItem(0), sweepItem(1), sweepItem(2)]);
+    repo.recordTestItemTerminal("admin-stats-run-a", 0, { status: "done" });
+    repo.recordTestItemTerminal("admin-stats-run-a", 1, { status: "failed_oom" });
     // idx 2 stays 'queued' -- planned but never performed, so tests must not
     // count it.
 
@@ -193,7 +193,7 @@ describe("admin routes, cross-tenant by design", () => {
     const adminToken = await superadminSession();
     const owner = repo.userRepo.upsertByIdentity("github", { providerUserId: "admin-runs-owner", login: "owner", avatarUrl: null });
     repo.registerModel({ id: "admin-runs-model", filename: "m.gguf", size_bytes: 1, source: "local", metadata: {} });
-    repo.createRun(owner.id, {
+    repo.createTest(owner.id, {
       id: "admin-visible-run",
       worker_name: "someones-box",
       llama_cpp_build: "b1",

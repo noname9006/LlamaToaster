@@ -124,7 +124,7 @@ export function CurvesPanel({ modelId, workerId, build, targetCtx, onMeasureMiss
           <tbody>
             {curve.points.map((point) => (
               <tr
-                key={`${point.runId}:${point.idx}:${point.effectiveCtx}`}
+                key={`${point.testId}:${point.idx}:${point.effectiveCtx}`}
                 className={point.superseded || point.excluded ? "border-b border-border/40 opacity-60" : "border-b border-border/40"}
               >
                 <td className="px-2 py-1.5 font-mono text-fg">{formatCtx(point.effectiveCtx)}</td>
@@ -207,13 +207,13 @@ export function CurvesPanel({ modelId, workerId, build, targetCtx, onMeasureMiss
 
 // N5 -- the knee: the smallest slot count whose TTFT p95 exceeds 2× its
 // slots=1 value. Derived on read, never a stored verdict.
-export function KneeChart({ runId }: { runId: string }) {
+export function KneeChart({ testId }: { testId: string }) {
   const [knee, setKnee] = useState<KneeResponse | null>(null);
 
   useEffect(() => {
     let cancelled = false;
     api
-      .getKnee(runId)
+      .getKnee(testId)
       .then((res) => {
         if (!cancelled) setKnee(res);
       })
@@ -223,7 +223,7 @@ export function KneeChart({ runId }: { runId: string }) {
     return () => {
       cancelled = true;
     };
-  }, [runId]);
+  }, [testId]);
 
   if (!knee || knee.samples.length === 0) return null;
   const max = Math.max(...knee.samples.map((s) => s.ttftP95Ms ?? 0), knee.thresholdMs ?? 0, 1);

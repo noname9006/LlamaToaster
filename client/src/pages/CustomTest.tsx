@@ -92,10 +92,10 @@ function rememberSweep(modelId: string, workerId: string, sweep: Sweep): void {
 // Same "remember across visits" idea as the sweep above, but for the
 // worker+model pairing itself -- last worker picked overall, and (since a
 // worker's registered models differ) last model picked *for that worker*.
-const LAST_WORKER_STORAGE_KEY = "llamatoaster:new-run:last-worker";
+const LAST_WORKER_STORAGE_KEY = "llamatoaster:custom-test:last-worker";
 
 function lastModelStorageKey(workerId: string): string {
-  return `llamatoaster:new-run:last-model:${workerId}`;
+  return `llamatoaster:custom-test:last-model:${workerId}`;
 }
 
 interface LastModelSelection {
@@ -265,7 +265,7 @@ function field<K extends keyof Sweep>(
   };
 }
 
-export function NewRun() {
+export function CustomTest() {
   const [models, setModels] = useState<Model[]>([]);
   const [modelId, setModelId] = useState("");
   // Companion --model-draft model for a base model whose MTP head isn't
@@ -287,7 +287,7 @@ export function NewRun() {
   const [selectedGpuRawIndex, setSelectedGpuRawIndex] = useState<number | undefined>(undefined);
   // Set once the user confirms switching backends for a GPU the worker's own
   // default backend can't see at all (see the GPU <select>'s onChange below)
-  // -- the specific backend confirmed, forwarded as RunConfig.main_gpu_backend
+  // -- the specific backend confirmed, forwarded as TestConfig.main_gpu_backend
   // so the server installs (without disturbing the worker's own default) and
   // the worker runs this one sweep against it. Cleared whenever the
   // selection changes back to Auto or a GPU the default backend already
@@ -515,7 +515,7 @@ export function NewRun() {
   const selectedGpu = selectedGpuRawIndex != null ? gpuList[selectedGpuRawIndex] : undefined;
   // mainGpu sent to the server must be relative to whichever backend will
   // actually run this request (see shared/types.ts's backendVisibleGpus'
-  // doc comment on RunConfig.main_gpu) -- not selectedGpuRawIndex above,
+  // doc comment on TestConfig.main_gpu) -- not selectedGpuRawIndex above,
   // which is just this picker's own display order.
   const mainGpuForSubmitRaw =
     selectedGpu && effectiveBackend ? backendVisibleGpus(gpuList, effectiveBackend).indexOf(selectedGpu) : -1;
@@ -755,7 +755,7 @@ export function NewRun() {
     setSubmitting(true);
     setMsg("Queuing…");
     try {
-      const run = await api.triggerRun({
+      const run = await api.triggerTest({
         model_id: modelId,
         worker_id: workerId,
         mtp_model_id: mtpModelId || undefined,
@@ -774,7 +774,7 @@ export function NewRun() {
       // 'running' once the worker actually claims the job off its queue
       // (MULTIUSER_PLAN.md §1.12/§1.13), which can take up to one queue-poll
       // cycle even for an idle machine.
-      setMsg("Run scheduled ✓");
+      setMsg("Test scheduled ✓");
     } catch (err) {
       setMsg(`Error: ${err instanceof Error ? err.message : String(err)}`);
     } finally {
@@ -845,7 +845,7 @@ export function NewRun() {
     const nGen = sweep.n_gen[0] ?? 128;
     setWorkflowMsg("Enqueueing the concurrency ladder…");
     try {
-      const run = await api.triggerRun({
+      const run = await api.triggerTest({
         model_id: modelId,
         worker_id: workerId,
         kind: "runtime",
@@ -916,7 +916,7 @@ export function NewRun() {
 
   return (
     <div>
-      <h1 className="text-2xl font-semibold text-fg">New Run</h1>
+      <h1 className="text-2xl font-semibold text-fg">Custom Test</h1>
       <p className="mt-2 max-w-2xl text-sm text-muted">
         Every combination of the values below is expanded into one llama-bench sweep, averaged
         over the repeat count.
@@ -1434,12 +1434,12 @@ export function NewRun() {
             disabled={submitting}
             className="rounded-lg bg-accent px-5 py-2 text-sm font-semibold text-accent-fg disabled:opacity-50"
           >
-            Trigger run
+            Trigger test
           </button>
           {msg && <span className="text-sm text-muted">{msg}</span>}
           {lastRunId && (
-            <Link to={`/runs/${lastRunId}`} className="text-sm text-accent hover:underline">
-              View run →
+            <Link to={`/tests/${lastRunId}`} className="text-sm text-accent hover:underline">
+              View test →
             </Link>
           )}
         </div>

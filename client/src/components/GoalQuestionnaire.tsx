@@ -65,7 +65,7 @@ export interface GoalQuestionnaireProps {
   /**
    * Whether the exact-number entry beside the context slider is shown.
    * The Benchmark console hides it (the slider's own stops are the only
-   * contexts its chain is meant to run), while New Run keeps it for hand-built
+   * contexts its chain is meant to run), while Custom Test keeps it for hand-built
    * grids. The "don't know" reset lives OUTSIDE this block deliberately --
    * hiding it too would leave the Benchmark page no way back to
    * `target_ctx: null`, which is the target_unverified marker M3 depends on.
@@ -131,7 +131,7 @@ export interface GoalQuestionnaireProps {
 export interface PlacementVerifyResult {
   ngl: number;
   ctx: number;
-  runId: string;
+  testId: string;
   // "cancelled" -- a user stop mid-ladder, distinct from failed/failed_oom:
   // it means nobody let the search finish, not that the placement doesn't fit.
   status: "pending" | "verified" | "failed" | "failed_oom" | "cancelled" | "error";
@@ -232,7 +232,7 @@ function appliedConfig(
 
 const MODE_BLURB: Record<ProbeMode, string> = {
   max_gpu: "Every layer on the GPU, then as much context as still fits.",
-  max_context: "The largest context this machine can hold — the layer split is searched for, not taken from your sliders — then more layers if there's room.",
+  max_context: "The largest context this machine can hold.",
   keep_context: "Your context is fixed; the layer split moves to make it fit.",
   balanced: "Starts where you are: more context first, then more layers if any still fit.",
   fixed_offload: "Your layer split is fixed; context moves to make it fit.",
@@ -256,7 +256,7 @@ const FINE_SLIDER_DIVISIONS = 4;
 
 /**
  * The slider's own stops. "coarse" is the shared list unchanged; "fine" adds
- * evenly spaced values between each pair so the New Run page can express a
+ * evenly spaced values between each pair so the Custom Test page can express a
  * context the Benchmark page's coarser slider cannot.
  */
 function sliderStops(maxCtx: number, granularity: "coarse" | "fine"): number[] {
@@ -749,20 +749,12 @@ function PlacementMatrix({
   onApplyConfig: (ngl: number, ctx: number) => void;
 }) {
   const [granularity, setGranularity] = useState<ProbeGranularity>("basic");
-  // Which card was explicitly clicked/tested last. Several modes
-  // (keep_context/balanced/fixed_offload/custom) all start from the SAME
-  // (ngl, ctx) as the user's current sliders by definition, so comparing
-  // start to the live placement would highlight all of them at once -- and
-  // permanently, since there'd be nothing to move away from. Tracking the
-  // clicked mode instead makes selection exclusive, and it still clears
-  // naturally once the sliders are dragged somewhere that mode's start no
-  // longer matches (see `selected` below).
-  const [activeMode, setActiveMode] = useState<ProbeMode | null>(null);
-  // Which cards are checked for the next "Run test" click -- purely local,
+  // Which cards are selected for the next "Run test" click -- purely local,
   // ephemeral UI state (unlike the triggers themselves, losing a selection
-  // that hasn't been run yet on a remount/reload is fine). "Test all" is a
-  // "select all" shortcut onto this same set, not a separate launch path --
-  // Run test still has to be clicked to actually fire them.
+  // that hasn't been run yet on a remount/reload is fine). Selecting a card
+  // IS clicking it (there's no separate checkbox); "Select all" is a
+  // shortcut onto this same set, not a separate launch path -- Run test
+  // still has to be clicked to actually fire them.
   const [selectedModes, setSelectedModes] = useState<Set<ProbeMode>>(new Set());
   const [running, setRunning] = useState(false);
 
@@ -874,7 +866,7 @@ function PlacementMatrix({
         </div>
       )}
 
-      <p className="mt-2 text-[11px] leading-relaxed text-muted">
+      <p className="mt-2 rounded-lg border border-warning/20 bg-warning/5 px-3 py-2 text-[11px] leading-relaxed text-muted">
         <b className="text-fg">Estimate only, not a guarantee.</b> Flat per-layer average — weakest for
         Mixture-of-Experts models — and doesn't account for the real compute/scratch buffer, which varies with batch
         size and architecture. Verify below before trusting it for a real run.
@@ -902,10 +894,9 @@ function PlacementMatrix({
 
       {/* Tested configurations -- always shown, not only when the current
           combo fails to fit. Each card is a real search mode: clicking the
-          card body moves the sliders to its starting point (or, once
-          verified, to what it actually proved) and highlights it; the
-          checkbox selects it for the next Run test click, which measures
-          what actually fits for every checked card at once. */}
+          card body both selects it for the next Run test click (highlighted
+          = selected) and moves the sliders to its starting point, or once
+          verified, to what it actually proved. */}
       <div className="mt-3 border-t border-border pt-3">
         <div className="flex flex-wrap items-baseline justify-between gap-2">
           <span className="text-[13.5px] text-fg">
@@ -936,13 +927,17 @@ function PlacementMatrix({
             </div>
             <button
               type="button"
-              title="Checks every card below (except Custom, which starts from the same point as several others) -- Run test still has to be clicked to actually fire them"
+              title="Selects every card below (except Custom, which starts from the same point as several others) -- click again to clear the selection. Run test still has to be clicked to actually fire them"
               onClick={() =>
-                setSelectedModes(new Set((Object.keys(MODE_LABEL) as ProbeMode[]).filter((m) => m !== "custom")))
+                setSelectedModes((prev) => {
+                  const selectable = (Object.keys(MODE_LABEL) as ProbeMode[]).filter((m) => m !== "custom");
+                  const allSelected = selectable.every((m) => prev.has(m));
+                  return allSelected ? new Set() : new Set(selectable);
+                })
               }
               className="rounded-lg border border-accent px-2.5 py-1 text-[11px] font-semibold text-accent hover:bg-accent/10"
             >
-              Test all
+              Select all
             </button>
             <button
               type="button"
@@ -961,31 +956,23 @@ function PlacementMatrix({
           {(Object.keys(MODE_LABEL) as ProbeMode[]).map((mode) => {
             const start = modeStarts[mode];
             const result = placement.verifyResults[mode] ?? null;
-            // Clicking a verified card applies what the probe PROVED (see
-            // onApply below), not its static start point -- comparing
-            // against `start` here made a verified card's own highlight
-            // vanish the instant it was clicked, since the sliders had just
-            // moved to the applied (measured) values instead.
-            const applied = appliedConfig(result, start, trainedCtx);
+            const busy = result?.status === "pending";
             return (
               <ModeCard
                 key={mode}
                 mode={mode}
                 start={start}
-                selected={activeMode === mode && placement.ngl === applied.ngl && ctx === applied.ctx}
-                busy={result?.status === "pending"}
+                selected={selectedModes.has(mode)}
+                busy={busy}
                 result={result}
-                checked={selectedModes.has(mode)}
-                onToggleChecked={() =>
+                onActivate={() => {
+                  if (busy) return;
                   setSelectedModes((prev) => {
                     const next = new Set(prev);
                     if (next.has(mode)) next.delete(mode);
                     else next.add(mode);
                     return next;
-                  })
-                }
-                onApply={() => {
-                  setActiveMode(mode);
+                  });
                   // A tested card applies what the probe PROVED, not where it
                   // started -- the ladder routinely lands somewhere else on
                   // both axes, and the start values are the one thing already
@@ -1063,9 +1050,7 @@ function ModeCard({
   selected,
   busy,
   result,
-  checked,
-  onToggleChecked,
-  onApply,
+  onActivate,
   onReset,
 }: {
   mode: ProbeMode;
@@ -1073,9 +1058,7 @@ function ModeCard({
   selected: boolean;
   busy: boolean;
   result: PlacementVerifyResult | null;
-  checked: boolean;
-  onToggleChecked: () => void;
-  onApply: () => void;
+  onActivate: () => void;
   onReset: () => void;
 }) {
   const running = result?.status === "pending";
@@ -1086,49 +1069,38 @@ function ModeCard({
       role="button"
       tabIndex={0}
       aria-pressed={selected}
+      aria-disabled={busy}
       title={startLabel}
-      onClick={onApply}
+      onClick={onActivate}
       onKeyDown={(e) => {
         if (e.key === "Enter" || e.key === " ") {
           e.preventDefault();
-          onApply();
+          onActivate();
         }
       }}
-      className={`flex ${MODE_CARD_HEIGHT} w-[188px] shrink-0 cursor-pointer flex-col gap-1 rounded-lg border p-2.5 transition-colors ${
-        selected ? "border-accent bg-accent/10" : "border-border bg-surface hover:border-accent/40"
-      }`}
+      className={`flex ${MODE_CARD_HEIGHT} w-[188px] shrink-0 flex-col gap-1 rounded-lg border p-2.5 transition-colors ${
+        busy ? "cursor-not-allowed" : "cursor-pointer"
+      } ${selected ? "border-accent bg-accent/10" : "border-border bg-surface hover:border-accent/40"}`}
     >
       <div className="flex items-start justify-between gap-1">
         <span className="flex min-w-0 items-center gap-1.5 text-[11.5px] font-semibold text-fg">
           <StatusCircle tone={modeCardCircleTone(result)} />
           <span className="truncate">{MODE_LABEL[mode]}</span>
         </span>
-        <span className="flex shrink-0 items-center gap-1">
-          <input
-            type="checkbox"
-            title="Check to include this mode in the next Run test click"
-            aria-label={`Select ${MODE_LABEL[mode]} to run`}
-            checked={checked}
-            disabled={busy}
-            onClick={(e) => e.stopPropagation()}
-            onChange={onToggleChecked}
-            className="h-3.5 w-3.5 cursor-pointer accent-accent disabled:cursor-not-allowed disabled:opacity-40"
-          />
-          {result && !running && (
-            <button
-              type="button"
-              title="Clear this card's result"
-              aria-label={`Reset ${MODE_LABEL[mode]}`}
-              onClick={(e) => {
-                e.stopPropagation();
-                onReset();
-              }}
-              className="rounded text-[13px] leading-none text-muted hover:text-fg"
-            >
-              ×
-            </button>
-          )}
-        </span>
+        {result && !running && (
+          <button
+            type="button"
+            title="Clear this card's result"
+            aria-label={`Reset ${MODE_LABEL[mode]}`}
+            onClick={(e) => {
+              e.stopPropagation();
+              onReset();
+            }}
+            className="shrink-0 rounded text-[13px] leading-none text-muted hover:text-fg"
+          >
+            ×
+          </button>
+        )}
       </div>
       <span className="text-[10.5px] leading-relaxed text-muted">{MODE_BLURB[mode]}</span>
       <div className="flex-1">
@@ -1153,10 +1125,10 @@ function ModeCard({
             needed: {formatMibShort(result.measuredVramPeakMib)} VRAM · {formatMibShort(result.measuredRamPeakMib)} RAM
           </span>
         )}
-        {result?.runId && (
+        {result?.testId && (
           <span className="mt-0.5 block font-mono text-[10.5px] text-muted">
-            <Link to={`/runs/${result.runId}`} onClick={(e) => e.stopPropagation()} className="text-accent hover:underline">
-              Run ↗
+            <Link to={`/tests/${result.testId}`} onClick={(e) => e.stopPropagation()} className="text-accent hover:underline">
+              Test ↗
             </Link>
             {result.testedAt != null ? ` · ${formatTestedAt(result.testedAt)}` : ""}
           </span>

@@ -154,8 +154,8 @@ export const CURVE_METHOD_VERSION = 2;
 // it into the 'standalone' (NULL) bucket would make it collide with the
 // duplicate-trigger guard against unrelated standalone runs on the same
 // (user, model, worker) triple.
-export const RUN_KINDS = ["tuning", "refine", "sweep", "runtime", "probe", "quality"] as const;
-export type RunKind = (typeof RUN_KINDS)[number];
+export const TEST_KINDS = ["tuning", "refine", "sweep", "runtime", "probe", "quality"] as const;
+export type TestKind = (typeof TEST_KINDS)[number];
 
 // §0.5 budgets.
 export const MAX_SWEEP_ITEMS = 20_000;
@@ -289,7 +289,7 @@ const MTP_FILENAME_PATTERN = /(^|\/)mtp[-_.]/i;
 // rather than trusting a persisted metadata.mtp_role flag alone. This keeps
 // models registered before a detection-logic fix (or that otherwise ended up
 // with stale/missing metadata.mtp_role) correctly classified everywhere --
-// grouping, the New Run model picker, and the trigger route's run-eligibility
+// grouping, the Custom Test model picker, and the trigger route's run-eligibility
 // check -- with no backfill migration needed, since n_layer/mtp_layers/
 // filename are the only real inputs metadata.mtp_role was ever derived from
 // in the first place. See worker/src/gguf.ts and server/src/routes/
@@ -367,7 +367,7 @@ export interface SweepConfig {
   repeats: number;
 }
 
-export interface RunConfig {
+export interface TestConfig {
   model_id: string;
   // Which registered model to pass as llama-server's --model-draft when any
   // sweep item has mtp "on" and the base model's own mtp_layers isn't set
@@ -435,9 +435,9 @@ export interface RunConfig {
 // running (or queued) against it; sits in that worker's FIFO queue and
 // flips to "running" on its own once the run ahead of it finalizes (see
 // server/src/routes/runs.ts's dispatchScheduledRun).
-export type RunStatus = "running" | "scheduled" | "done" | "partial" | "failed" | "cancelled";
+export type TestStatus = "running" | "scheduled" | "done" | "partial" | "failed" | "cancelled";
 
-export interface Run {
+export interface Test {
   id: string;
   // §0.5 -- denormalized at creation, immutable. Points at the run itself
   // for standalone runs; chain children point at their root. Chain-scoped
@@ -445,7 +445,7 @@ export interface Run {
   root_run_id?: string | null;
   // §0.5 -- 'tuning' | 'refine' | 'sweep' | 'runtime', NULL = standalone.
   // N2 adds 'probe'. Undefined on runs predating the column.
-  kind?: RunKind | null;
+  kind?: TestKind | null;
   // N3 -- groups model-vs-model comparison members; null otherwise.
   comparison_id?: string | null;
   worker_name: string;
@@ -469,8 +469,8 @@ export interface Run {
   backend_device_name?: string;
   model_id: string;
   model_filename?: string;
-  config: RunConfig;
-  status: RunStatus;
+  config: TestConfig;
+  status: TestStatus;
   error?: string;
   started_at: number;
   completed_at?: number;
@@ -497,10 +497,10 @@ export interface ResultRow {
   model_id: string;
   // The backend/device that actually produced this result -- denormalized
   // from the parent run (runs.llama_cpp_backend/backend_device_name, see
-  // Run's own doc comments) via a JOIN in server/src/db/repo.ts's
+  // Test's own doc comments) via a JOIN in server/src/db/repo.ts's
   // getResultsForRun, not stored per-row: a run's backend can't vary between
   // its own items. backend_device_name is null exactly when the run's
-  // two-tier detection (see Run) hasn't captured one at all.
+  // two-tier detection (see Test) hasn't captured one at all.
   backend_type: Backend;
   backend_device_name: string | null;
   test_type: TestType;
@@ -863,7 +863,7 @@ export interface IngestResultInput {
 
 // --- Per-item live progress (one llama-bench process per sweep combo) ---
 
-export type RunItemStatus =
+export type TestItemStatus =
   | "queued"
   | "loading"
   | "processing"
@@ -878,14 +878,14 @@ export type RunItemStatus =
   // eligibility gates treat skipped items as non-disqualifying.
   | "skipped";
 
-const TERMINAL_RUN_ITEM_STATUSES = ["done", "failed", "failed_oom", "cancelled", "skipped"] as const;
-export type TerminalRunItemStatus = (typeof TERMINAL_RUN_ITEM_STATUSES)[number];
+const TERMINAL_TEST_ITEM_STATUSES = ["done", "failed", "failed_oom", "cancelled", "skipped"] as const;
+export type TerminalTestItemStatus = (typeof TERMINAL_TEST_ITEM_STATUSES)[number];
 
-export function isTerminalRunItemStatus(status: RunItemStatus): status is TerminalRunItemStatus {
-  return (TERMINAL_RUN_ITEM_STATUSES as readonly string[]).includes(status);
+export function isTerminalTestItemStatus(status: TestItemStatus): status is TerminalTestItemStatus {
+  return (TERMINAL_TEST_ITEM_STATUSES as readonly string[]).includes(status);
 }
 
-export interface RunItem {
+export interface TestItem {
   id: string;
   run_id: string;
   idx: number;
@@ -903,7 +903,7 @@ export interface RunItem {
   mtp: string;
   n_gpu_layers_draft: number;
   n_cpu_moe: number;
-  status: RunItemStatus;
+  status: TestItemStatus;
   detail?: string;
   ram_mib?: number | null;
   vram_mib?: number | null;
@@ -925,7 +925,7 @@ export interface RunItem {
 // Fire-and-forget progress ticks -- worker sends these best-effort with a
 // short timeout while an item is loading/running; losing one is harmless
 // since the next tick or the terminal update below catches the DB up.
-export interface RunItemTickInput {
+export interface TestItemTickInput {
   status: "loading" | "processing" | "generating" | "benchmarking";
   detail?: string;
   ram_mib?: number;
@@ -943,13 +943,13 @@ export interface RunItemTickInput {
 // (same posture as the old whole-run ingest they replace), since they're
 // what permanently records history: a "done" result becomes a `results` row,
 // a failure closes out that item with no result.
-export interface RunItemTerminalInput {
+export interface TestItemTerminalInput {
   // "skipped" (§0.7): an unsupported flag disables its axis rather than
   // failing every item -- never measured, so scoring's eligibility gates
   // treat it as non-disqualifying.
-  status: TerminalRunItemStatus;
+  status: TerminalTestItemStatus;
   error?: string;
-  // Tier-2 device-name upgrade (see Run.backend_device_name) -- only ever
+  // Tier-2 device-name upgrade (see Test.backend_device_name) -- only ever
   // sent alongside status "done" from the llama-bench path, when that item's
   // llama-bench JSON output included a gpu_info string (worker/src/index.ts's
   // runSweepItem). Absent on every other item; the server applies it as a
@@ -968,10 +968,10 @@ export interface RunItemTerminalInput {
   results?: IngestResultInput[];
 }
 
-export type RunItemUpdateInput = RunItemTickInput | RunItemTerminalInput;
+export type TestItemUpdateInput = TestItemTickInput | TestItemTerminalInput;
 
-export function isTerminalRunItemInput(input: RunItemUpdateInput): input is RunItemTerminalInput {
-  return isTerminalRunItemStatus(input.status);
+export function isTerminalTestItemInput(input: TestItemUpdateInput): input is TestItemTerminalInput {
+  return isTerminalTestItemStatus(input.status);
 }
 
 export interface TriggerPayload {
@@ -980,12 +980,12 @@ export interface TriggerPayload {
   // not name, from Stage 1 onward (MULTIUSER_PLAN.md §1.16). A machine's
   // display name can be renamed without breaking anything that referenced it.
   worker_id: string;
-  // See RunConfig.mtp_model_id -- same field, forwarded through the trigger
+  // See TestConfig.mtp_model_id -- same field, forwarded through the trigger
   // request rather than looked up server-side from anything else.
   mtp_model_id?: string;
-  // See RunConfig.main_gpu -- same field, forwarded through unchanged.
+  // See TestConfig.main_gpu -- same field, forwarded through unchanged.
   main_gpu?: number;
-  // See RunConfig.main_gpu_backend -- same field, forwarded through
+  // See TestConfig.main_gpu_backend -- same field, forwarded through
   // unchanged.
   main_gpu_backend?: Backend;
   sweep: Omit<SweepConfig, "model_id">;
@@ -996,7 +996,7 @@ export interface TriggerPayload {
   // §0.5 -- run kind. Absent = standalone (NULL), byte-identical to legacy
   // payloads. 'probe' rides the `probe` block below; 'runtime' rides
   // `runtime_spec`.
-  kind?: RunKind;
+  kind?: TestKind;
   // N2 -- probe-run trigger block (kind must be "probe"). Refused unless the
   // target worker advertises `probe-v1`.
   probe?: ProbeTriggerSpec;
@@ -1339,7 +1339,7 @@ export interface HfFileEntry {
 }
 
 // Worker -> server callback reporting a model download's terminal outcome --
-// mirrors RunItemTerminalInput's role for /run (see worker/src/index.ts's
+// mirrors TestItemTerminalInput's role for /run (see worker/src/index.ts's
 // POST /models/download, which now acks fast and runs the actual transfer in
 // the background rather than blocking the whole HTTP round trip on it).
 // Retried with backoff by the worker (safeReportDownloadResult), so
@@ -1436,10 +1436,10 @@ export interface Worker {
   // both derived from the SAME worker_jobs row (its run_id and progress_json,
   // extended on every heartbeat, see repo.ts's queueRepo.extendLeaseAndGetFlags)
   // so a card/dashboard needs no extra round trip to show "what" and "how
-  // far along". Undefined whenever activeJobId is null. activeRunId is only
+  // far along". Undefined whenever activeJobId is null. activeTestId is only
   // ever set for a 'benchmark' job -- an install/download job has no run to
   // point at, just activeJobProgress's phase/bytes.
-  activeRunId?: string;
+  activeTestId?: string;
   activeJobProgress?: ActiveJobReport;
   // Concurrently-running download_model jobs (worker/src/index.ts's
   // downloadJobPool) -- separate from activeJobProgress above, which is
@@ -1594,7 +1594,7 @@ export interface KneeSpec {
 // tok/s above floor. The search itself (which axis moves, how far, when it
 // stops) lives in shared/probeLadder.ts; this payload only carries what that
 // module needs as inputs.
-export interface RunProbeJobPayload {
+export interface TestProbeJobPayload {
   run_id: string;
   model_id: string;
   // The full record, exactly as BenchmarkJob carries it: the worker resolves
@@ -1679,7 +1679,7 @@ export const DEFAULT_QUALITY_DATASET_LICENSE = "Original composition for this pr
 export interface MeasureQualityJobPayload {
   run_id: string;
   model_id: string;
-  // See RunProbeJobPayload.model -- same reason.
+  // See TestProbeJobPayload.model -- same reason.
   model: Model;
   ctxTokens: number;
   kvPair: [string, string];
@@ -1729,7 +1729,7 @@ export type QueueJob =
   // like cancel/pause) so it takes its place behind whatever job is already
   // running instead of yanking the process mid-benchmark.
   | { job_id: string; type: "shutdown_worker"; payload: Record<string, never> }
-  | { job_id: string; type: "run_probe"; payload: RunProbeJobPayload }
+  | { job_id: string; type: "run_probe"; payload: TestProbeJobPayload }
   | { job_id: string; type: "measure_quality"; payload: MeasureQualityJobPayload };
 
 // --- Multi-user Stage 2: auth (MULTIUSER_PLAN.md §2) ---
@@ -1900,8 +1900,8 @@ export type DeviceApproveResponse =
 // Multi-user Stage 5 (MULTIUSER_PLAN.md §5.1) -- the admin surface's own
 // wire shapes, reachable only from the admin origin (supervise.*) by a
 // superadmin-listed identity. Deliberately separate from the main app's
-// Run/Worker types rather than reusing them with optional fields bolted on:
-// this is cross-tenant data (every user's runs, not the caller's own), and a
+// Test/Worker types rather than reusing them with optional fields bolted on:
+// this is cross-tenant data (every user's tests, not the caller's own), and a
 // shared shape would risk a field meant only for admin eyes (userDisplayName,
 // workerDisplayName) leaking into a response type the main app also uses.
 export interface AdminStats {
@@ -1927,7 +1927,7 @@ export interface AdminStats {
   runs: number;
 }
 
-export interface AdminRunSummary {
+export interface AdminTestSummary {
   id: string;
   userId: string | null;
   userDisplayName: string | null;
@@ -1947,7 +1947,7 @@ export interface AdminRunSummary {
 
 // GET /api/admin/runs's own filter querystring -- every field optional,
 // unset means "don't filter on this."
-export interface AdminRunFilters {
+export interface AdminTestFilters {
   userId?: string;
   workerId?: string;
   backend?: string;

@@ -26,19 +26,19 @@ function needVsFree(needed: number | null, free: number | null): string | null {
 }
 
 export interface ProbeAttemptsProps {
-  runId: string;
+  testId: string;
   /** Re-fetched whenever the run's own status changes. */
   refreshKey?: unknown;
 }
 
-export function ProbeAttempts({ runId, refreshKey }: ProbeAttemptsProps) {
+export function ProbeAttempts({ testId, refreshKey }: ProbeAttemptsProps) {
   const [attempts, setAttempts] = useState<ProbeAttemptDto[] | null>(null);
   const [error, setError] = useState("");
 
   useEffect(() => {
     let cancelled = false;
     api
-      .getProbeAttempts(runId)
+      .getProbeAttempts(testId)
       .then((res) => {
         if (cancelled) return;
         setAttempts(res.attempts);
@@ -50,7 +50,7 @@ export function ProbeAttempts({ runId, refreshKey }: ProbeAttemptsProps) {
     return () => {
       cancelled = true;
     };
-  }, [runId, refreshKey]);
+  }, [testId, refreshKey]);
 
   if (error) return <p className="text-sm text-danger">Could not load this probe's loads: {error}</p>;
   if (!attempts) return <p className="text-sm text-muted">Loading probe loads…</p>;
@@ -119,7 +119,7 @@ export function ProbeAttempts({ runId, refreshKey }: ProbeAttemptsProps) {
                       )}
                       {a.reused_from_run_id && (
                         <Link
-                          to={`/runs/${a.reused_from_run_id}`}
+                          to={`/tests/${a.reused_from_run_id}`}
                           title="Reused from an earlier batch sibling's own measurement of this exact point -- not reloaded for this run"
                           className="rounded-full bg-accent/10 px-2 py-0.5 text-[10px] font-semibold text-accent hover:underline"
                         >

@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { repo as RepoType } from "./repo.js";
 import type { getDb as GetDbType } from "./migrate.js";
-import type { RunConfig } from "../../../shared/types.js";
+import type { TestConfig } from "../../../shared/types.js";
 
 // Multi-user Stage 4 (MULTIUSER_PLAN.md §4.2): repo.claimLegacyHistory's own
 // isolated test file -- getDb() is a module-level singleton keyed on
@@ -29,7 +29,7 @@ afterAll(() => {
 });
 
 // Simulates a row that predates AUTH_ENABLED -- inserted via raw SQL rather
-// than repo.createRun/createRunItems/etc, which (as of this same Stage 4
+// than repo.createTest/createTestItems/etc, which (as of this same Stage 4
 // change) always stamp a real userId when one is passed. A real legacy row
 // has NULL because no such column existed, or no user was logged in, when it
 // was written.
@@ -60,13 +60,13 @@ describe("repo.claimLegacyHistory", () => {
       login: "real-owner",
       avatarUrl: null,
     });
-    repo.createRun(originalOwner.id, {
+    repo.createTest(originalOwner.id, {
       id: "owned-run-1",
       worker_name: "box",
       llama_cpp_build: "b1",
       llama_cpp_backend: "cpu",
       model_id: "m1",
-      config: { model_id: "m1" } as RunConfig,
+      config: { model_id: "m1" } as TestConfig,
       status: "done",
       started_at: Date.now(),
     });

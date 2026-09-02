@@ -75,23 +75,23 @@ async function heartbeat(
 // tests' scheduled runs would otherwise count against the same (global,
 // single-tenant) quota.
 function drainActiveRuns() {
-  for (const run of repo.listRuns(undefined)) {
+  for (const run of repo.listTests(undefined)) {
     if (run.status === "running" || run.status === "scheduled") {
-      repo.reconcileStaleRun(undefined, run.id, "test cleanup");
+      repo.reconcileStaleTest(undefined, run.id, "test cleanup");
     }
   }
 }
 
 beforeAll(async () => {
   ({ repo } = await import("../db/repo.js"));
-  const { runsRoutes } = await import("./runs.js");
+  const { testsRoutes } = await import("./tests.js");
   const { queueRoutes } = await import("./queue.js");
 
   app = Fastify({ logger: false });
   app.setErrorHandler((error: { statusCode?: number; message: string }, _req, reply) => {
     reply.code(error.statusCode ?? 500).send({ error: error.message });
   });
-  await app.register(runsRoutes);
+  await app.register(testsRoutes);
   await app.register(queueRoutes);
   await app.listen({ port: 0, host: "127.0.0.1" });
   const address = app.server.address();
@@ -367,7 +367,7 @@ describe("§0.7/N2 capability gates", () => {
 
     const job = repo.queueRepo.claimNextJob(worker.id);
     expect(job?.type).toBe("run_probe");
-    expect(repo.getRun(undefined, run.id)?.status).toBe("running");
+    expect(repo.getTest(undefined, run.id)?.status).toBe("running");
   });
 
   it("rejects an unknown probe mode or granularity rather than silently searching differently", async () => {
@@ -422,7 +422,7 @@ describe("§0.7/N2 capability gates", () => {
     expect(res.status).toBe(201);
     const run = ((await res.json()) as { run: { id: string; kind: string } }).run;
     expect(run.kind).toBe("quality");
-    const jobs = repo.queueRepo.getNonTerminalJobsForRun(run.id);
+    const jobs = repo.queueRepo.getNonTerminalJobsForTest(run.id);
     expect(jobs.map((j) => j.jobType)).toContain("measure_quality");
   });
 
@@ -506,7 +506,7 @@ describe("§0.7/N2 capability gates", () => {
     });
     expect(res.status).toBe(201);
     const run = ((await res.json()) as { run: { id: string } }).run;
-    const items = repo.getRunItems(run.id);
+    const items = repo.getTestItems(run.id);
     expect(items.map((i) => i.idx).sort((a, b) => a - b)).toEqual([0, 1, 2]);
     expect(items.map((i) => i.n_prompt).sort((a, b) => a - b)).toEqual([2048, 4096, 8192]);
   });
@@ -552,9 +552,9 @@ describe("N2 probe batching", () => {
     const firstRun = ((await first.json()) as { run: { id: string; root_run_id: string } }).run;
     expect(firstRun.root_run_id).toBe(firstRun.id);
     // Still non-terminal -- claimNextJob is never called here, so the sibling
-    // trigger below has to bypass findBlockingRun on its own merits, not
+    // trigger below has to bypass findBlockingTest on its own merits, not
     // because the first run happened to finish first.
-    expect(repo.getRun(undefined, firstRun.id)?.status).toBe("scheduled");
+    expect(repo.getTest(undefined, firstRun.id)?.status).toBe("scheduled");
 
     const second = await triggerProbe(worker.id, { probe_batch_root_id: firstRun.id });
     expect(second.status).toBe(201);
@@ -622,7 +622,7 @@ describe("N2 probe batching", () => {
       const run = ((await res.json()) as { run: { id: string; config: { chain_depth?: number } } }).run;
       expect(run.config.chain_depth).toBeUndefined();
     }
-    const members = repo.listRunsUnderRoot(undefined, rootId);
+    const members = repo.listTestsUnderRoot(undefined, rootId);
     expect(members).toHaveLength(5);
   });
 
@@ -659,7 +659,7 @@ describe("N2 probe batching", () => {
     // run_probe job's run to 'running' in the same transaction (repo.ts).
     const claimed = repo.queueRepo.claimNextJob(worker.id);
     expect(claimed?.type).toBe("run_probe");
-    expect(repo.getRun(undefined, firstRunId)?.status).toBe("running");
+    expect(repo.getTest(undefined, firstRunId)?.status).toBe("running");
 
     const second = await triggerProbe(worker.id, { probe_batch_root_id: firstRunId });
     expect(second.status).toBe(201);
@@ -686,9 +686,9 @@ describe("N2 probe batching", () => {
     const stopRes = await postJson(`/api/runs/${firstRunId}/stop`, {});
     expect(stopRes.status).toBe(200);
 
-    expect(repo.getRun(undefined, firstRunId)?.status).toBe("cancelled");
-    expect(repo.getRun(undefined, secondRunId)?.status).toBe("cancelled");
-    expect(repo.getRun(undefined, thirdRunId)?.status).toBe("cancelled");
+    expect(repo.getTest(undefined, firstRunId)?.status).toBe("cancelled");
+    expect(repo.getTest(undefined, secondRunId)?.status).toBe("cancelled");
+    expect(repo.getTest(undefined, thirdRunId)?.status).toBe("cancelled");
   });
 });
 
@@ -823,7 +823,7 @@ describe("§0.5 chain quotas", () => {
     await heartbeat("v8-wallclock");
     const worker = repo.workerRepo.getByMachineId("v8-wallclock")!;
     repo.registerModel({ id: "v8-old-model", filename: "old.gguf", size_bytes: 1, source: "local", metadata: {} });
-    repo.createRun(undefined, {
+    repo.createTest(undefined, {
       id: "v8-old-root",
       kind: "sweep",
       worker_id: worker.id,
@@ -835,13 +835,13 @@ describe("§0.5 chain quotas", () => {
       status: "running",
       started_at: Date.now() - 49 * 3600 * 1000,
     });
-    repo.createRunItems(
+    repo.createTestItems(
       undefined,
       "v8-old-root",
       [{ idx: 0, n_prompt: 1, n_gen: 1, n_depth: 0, concurrency: 1, threads: 1, n_gpu_layers: 0, batch_size: 1, ubatch_size: 1, cache_type_k: "f16", cache_type_v: "f16", flash_attn: "on", mtp: "off", n_gpu_layers_draft: 0, n_cpu_moe: 0 }]
     );
     const cancelled = repo.cancelExpiredRoots();
     expect(cancelled).toContain("v8-old-root");
-    expect(repo.getRun(undefined, "v8-old-root")!.status).not.toBe("running");
+    expect(repo.getTest(undefined, "v8-old-root")!.status).not.toBe("running");
   });
 });

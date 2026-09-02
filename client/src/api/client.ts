@@ -2,9 +2,9 @@ import {
   WORKER_INACCESSIBLE_MESSAGE,
   type Model,
   type RegisterModelInput,
-  type Run,
+  type Test,
   type ResultRow,
-  type RunItem,
+  type TestItem,
   type TriggerPayload,
   type Worker,
   type WorkerVramInfo,
@@ -116,8 +116,10 @@ export const api = {
   // Queues deletion of a model's file on one machine's model_dir -- never
   // touches the model registry row. Fire-and-forget under the pull model:
   // resolves once the job is queued, not once the worker actually deletes
-  // it (see server/src/routes/workers.ts).
-  deleteModelFileFromWorker: (workerId: string, filename: string): Promise<{ ok: true; queued: true }> =>
+  // it (see server/src/routes/workers.ts). job_id lets the caller poll
+  // getJobStatus and only refresh locations once the delete has actually
+  // happened, same pattern refreshModels below uses.
+  deleteModelFileFromWorker: (workerId: string, filename: string): Promise<{ ok: true; queued: true; job_id: string }> =>
     request(`/api/workers/${encodeURIComponent(workerId)}/models?file=${encodeURIComponent(filename)}`, {
       method: "DELETE",
     }),
@@ -130,7 +132,7 @@ export const api = {
 
   // Permanently removes a machine from the Workers page -- distinct from
   // Settings' session revoke, which only kicks it off and leaves the row
-  // (and card) in place. Run history is untouched (see server/src/db/
+  // (and card) in place. Test history is untouched (see server/src/db/
   // repo.ts's deleteWorker doc comment); reconnecting afterward re-enrols as
   // a brand-new machine.
   deleteWorker: (workerId: string): Promise<{ ok: true }> =>
@@ -240,31 +242,31 @@ export const api = {
   ): Promise<{ status: "pending" | "claimed" | "completed" | "failed" | "cancelled" }> =>
     request(`/api/workers/${encodeURIComponent(workerId)}/downloads/${encodeURIComponent(jobId)}`),
 
-  listRuns: (): Promise<Run[]> => request<{ runs: Run[] }>("/api/runs").then((d) => d.runs),
+  listTests: (): Promise<Test[]> => request<{ runs: Test[] }>("/api/tests").then((d) => d.runs),
 
-  getRun: (id: string): Promise<{ run: Run; results: ResultRow[]; items: RunItem[]; paused?: boolean }> =>
-    request(`/api/runs/${encodeURIComponent(id)}`),
+  getTest: (id: string): Promise<{ run: Test; results: ResultRow[]; items: TestItem[]; paused?: boolean }> =>
+    request(`/api/tests/${encodeURIComponent(id)}`),
 
-  triggerRun: (payload: TriggerPayload): Promise<Run> =>
-    request<{ run: Run }>("/api/runs/trigger", postJson(payload)).then((d) => d.run),
+  triggerTest: (payload: TriggerPayload): Promise<Test> =>
+    request<{ run: Test }>("/api/tests/trigger", postJson(payload)).then((d) => d.run),
 
-  // Pause/resume/stop target the RUN now, not a worker-scoped endpoint --
+  // Pause/resume/stop target the TEST now, not a worker-scoped endpoint --
   // the right shape once one account can own several machines
   // (MULTIUSER_PLAN.md §1.14). Delivered to the worker on its next
   // heartbeat (≤10s), not synchronously.
-  pauseRun: (runId: string): Promise<{ ok: true }> => request(`/api/runs/${encodeURIComponent(runId)}/pause`, postJson({})),
+  pauseTest: (testId: string): Promise<{ ok: true }> => request(`/api/tests/${encodeURIComponent(testId)}/pause`, postJson({})),
 
-  resumeRun: (runId: string): Promise<{ ok: true }> =>
-    request(`/api/runs/${encodeURIComponent(runId)}/resume`, postJson({})),
+  resumeTest: (testId: string): Promise<{ ok: true }> =>
+    request(`/api/tests/${encodeURIComponent(testId)}/resume`, postJson({})),
 
-  stopRun: (runId: string): Promise<{ run: Run }> => request(`/api/runs/${encodeURIComponent(runId)}/stop`, postJson({})),
+  stopTest: (testId: string): Promise<{ run: Test }> => request(`/api/tests/${encodeURIComponent(testId)}/stop`, postJson({})),
 
   // --- BENCHMARKING_PLAN_V8.md read paths ---------------------------------
 
   // M3 -- scored profile cards. Changing the goal is a query string over the
   // SAME stored rows; nothing is re-measured.
   getProfiles: (
-    runId: string,
+    testId: string,
     goals?: { goal?: string; target_ctx?: number | null; workload?: string; speed_floor_frac?: number; kv_preset?: string }
   ): Promise<ProfilesResponse> => {
     const params = new URLSearchParams();
@@ -274,7 +276,7 @@ export const api = {
     if (goals?.speed_floor_frac != null) params.set("speed_floor_frac", String(goals.speed_floor_frac));
     if (goals && "target_ctx" in goals) params.set("target_ctx", goals.target_ctx == null ? "" : String(goals.target_ctx));
     const query = params.toString();
-    return request(`/api/runs/${encodeURIComponent(runId)}/profiles${query ? `?${query}` : ""}`);
+    return request(`/api/tests/${encodeURIComponent(testId)}/profiles${query ? `?${query}` : ""}`);
   },
 
   // §0.6 -- the rate table an ETA prices from, with the provenance label that
@@ -288,7 +290,7 @@ export const api = {
   },
 
   // N2 -- verified ceilings for a model+machine, readable without an
-  // existing sweep run (see GET /api/runs/:id/profiles's own verified_limits
+  // existing sweep run (see GET /api/tests/:id/profiles's own verified_limits
   // for the other read path, reachable only once a run exists).
   getVerifiedLimits: (
     modelId: string,
@@ -299,14 +301,14 @@ export const api = {
   },
 
   // N2 -- every rung of a probe's ladder, not just the ceiling it verified.
-  getProbeAttempts: (runId: string): Promise<{ attempts: ProbeAttemptDto[] }> =>
-    request(`/api/runs/${encodeURIComponent(runId)}/probe-attempts`),
+  getProbeAttempts: (testId: string): Promise<{ attempts: ProbeAttemptDto[] }> =>
+    request(`/api/tests/${encodeURIComponent(testId)}/probe-attempts`),
 
   // N2 batching -- every run sharing this run's root (itself included), so a
-  // multi-mode probe batch renders as one RunDetail view instead of the
+  // multi-mode probe batch renders as one TestDetail view instead of the
   // caller separately discovering and fetching each sibling.
-  getBatchMembers: (runId: string): Promise<{ members: Run[] }> =>
-    request(`/api/runs/${encodeURIComponent(runId)}/batch-members`),
+  getBatchMembers: (testId: string): Promise<{ members: Test[] }> =>
+    request(`/api/tests/${encodeURIComponent(testId)}/batch-members`),
 
   // N2 -- forgets one verified ceiling so its card offers "Verify with a
   // probe" again instead of showing a possibly-stale "Verified" forever.
@@ -327,32 +329,32 @@ export const api = {
   },
 
   // N5 -- derived on read, never a stored verdict.
-  getKnee: (runId: string): Promise<KneeResponse> => request(`/api/runs/${encodeURIComponent(runId)}/knee`),
+  getKnee: (testId: string): Promise<KneeResponse> => request(`/api/tests/${encodeURIComponent(testId)}/knee`),
 
   // N6 -- the throttle ratio and the PRICED re-run offer. Offered, never scheduled.
-  getSustained: (runId: string): Promise<SustainedResponse> =>
-    request(`/api/runs/${encodeURIComponent(runId)}/sustained`),
+  getSustained: (testId: string): Promise<SustainedResponse> =>
+    request(`/api/tests/${encodeURIComponent(testId)}/sustained`),
 
   // N3 -- the comparison table plus its blocking fairness verdicts.
   getComparison: (comparisonId: string): Promise<ComparisonResponse> =>
     request(`/api/comparisons/${encodeURIComponent(comparisonId)}`),
 
   // N7 -- the export bundle carries its own methods section.
-  bundleExportUrl: (runId: string, scope: "run" | "root" = "run"): string =>
-    `/api/runs/${encodeURIComponent(runId)}/export?scope=${scope}`,
+  bundleExportUrl: (testId: string, scope: "test" | "root" = "test"): string =>
+    `/api/tests/${encodeURIComponent(testId)}/export?scope=${scope}`,
 
   importBundle: (bundle: unknown, optInScoring = false): Promise<ImportResponse> =>
     request("/api/import", postJson({ bundle, opt_in_scoring: optInScoring })),
 
-  exportUrl: (format: "json" | "csv" | "md", runIds?: string[]): string => {
+  exportUrl: (format: "json" | "csv" | "md", testIds?: string[]): string => {
     const params = new URLSearchParams({ format });
-    if (runIds?.length) params.set("runs", runIds.join(","));
+    if (testIds?.length) params.set("tests", testIds.join(","));
     return `/api/results/export?${params.toString()}`;
   },
 
   // The worker pushes its log on job completion; this just reads it back
-  // off disk (see server/src/routes/runs.ts's GET /api/runs/:id/log).
-  runLogUrl: (id: string): string => `/api/runs/${encodeURIComponent(id)}/log`,
+  // off disk (see server/src/routes/tests.ts's GET /api/tests/:id/log).
+  testLogUrl: (id: string): string => `/api/tests/${encodeURIComponent(id)}/log`,
 
   getAiStatus: (): Promise<{ configured: boolean; model?: string; quota?: { remainingHour: number; remainingDay: number } }> =>
     request("/api/ai/status"),
@@ -401,7 +403,7 @@ export const api = {
     ),
 
   // Live (not persisted) Hugging Face check, keyed by model id -- powers the
-  // New Run model picker's "Updated X ago" label and "possibly newer on HF"
+  // Custom Test model picker's "Updated X ago" label and "possibly newer on HF"
   // hint. See server/src/routes/models.ts's /api/models/hf-updates.
   getModelHfUpdates: (): Promise<Record<string, string | null>> =>
     request<{ updates: Record<string, string | null> }>("/api/models/hf-updates").then((d) => d.updates),

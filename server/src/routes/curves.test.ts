@@ -91,7 +91,7 @@ function result(testType: "pp" | "tg", tps: number, over: Record<string, unknown
 }
 
 function makeRun(id: string, kind: string | null, items: ReturnType<typeof item>[]): void {
-  repo.createRun(undefined, {
+  repo.createTest(undefined, {
     id,
     kind: kind as never,
     root_run_id: id,
@@ -105,7 +105,7 @@ function makeRun(id: string, kind: string | null, items: ReturnType<typeof item>
     status: "running",
     started_at: Date.now(),
   } as never);
-  repo.createRunItems(undefined, id, items as never);
+  repo.createTestItems(undefined, id, items as never);
 }
 
 beforeAll(async () => {
@@ -133,7 +133,7 @@ beforeAll(async () => {
   // Three measured curve points on the server engine, all METHOD_VERSION 2.
   makeRun("curve-run", "runtime", [0, 1, 2].map((idx) => item(idx, { n_prompt: [8192, 16384, 32768][idx] })));
   [8192, 16384, 32768].forEach((ctx, idx) => {
-    repo.recordRunItemTerminal("curve-run", idx, {
+    repo.recordTestItemTerminal("curve-run", idx, {
       status: "done",
       results: [
         result("pp", 310, { n_prompt: ctx, engine: "server", ttft_ms_p50: (ctx / 310) * 1000, ttft_n: 1 }),
@@ -145,7 +145,7 @@ beforeAll(async () => {
   // An ordinary METHOD_VERSION 1 runtime row at the same context: it must not
   // land in the curve.
   makeRun("ordinary-run", null, [item(0, { n_prompt: 8192 })]);
-  repo.recordRunItemTerminal("ordinary-run", 0, {
+  repo.recordTestItemTerminal("ordinary-run", 0, {
     status: "done",
     results: [result("tg", 99, { n_prompt: 8192, engine: "server", method_version: 1 })] as never,
   });
@@ -239,7 +239,7 @@ describe("GET /api/runs/:id/knee (N5)", () => {
       { slots: 4, tps: 101, ttft: 226_000 },
       { slots: 8, tps: 108, ttft: 415_000 },
     ].forEach((row, idx) => {
-      repo.recordRunItemTerminal("knee-run", idx, {
+      repo.recordTestItemTerminal("knee-run", idx, {
         status: "done",
         results: [
           result("tg", row.tps, {
@@ -271,14 +271,14 @@ describe("GET /api/runs/:id/sustained (N6)", () => {
     makeRun("thermal-run", null, [0, 1, 2].map((idx) => item(idx)));
     // Two of three items throttled: past 1/3.
     [0, 1].forEach((idx) => {
-      repo.recordRunItemTerminal("thermal-run", idx, {
+      repo.recordTestItemTerminal("thermal-run", idx, {
         status: "done",
         results: [
           result("tg", 38, { method_version: 1, caveat_flags: ["thermally_throttled"], gpu_temp_c_max: 89 }),
         ] as never,
       });
     });
-    repo.recordRunItemTerminal("thermal-run", 2, {
+    repo.recordTestItemTerminal("thermal-run", 2, {
       status: "done",
       results: [result("tg", 41, { method_version: 1 })] as never,
     });
@@ -302,12 +302,12 @@ describe("GET /api/runs/:id/sustained (N6)", () => {
 
   it("does not offer a re-run when a single item out of many is flagged", async () => {
     makeRun("thermal-quiet", null, [0, 1, 2, 3].map((idx) => item(idx)));
-    repo.recordRunItemTerminal("thermal-quiet", 0, {
+    repo.recordTestItemTerminal("thermal-quiet", 0, {
       status: "done",
       results: [result("tg", 38, { method_version: 1, caveat_flags: ["thermally_throttled"] })] as never,
     });
     [1, 2, 3].forEach((idx) =>
-      repo.recordRunItemTerminal("thermal-quiet", idx, {
+      repo.recordTestItemTerminal("thermal-quiet", idx, {
         status: "done",
         results: [result("tg", 41, { method_version: 1 })] as never,
       })

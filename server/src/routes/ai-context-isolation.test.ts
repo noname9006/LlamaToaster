@@ -67,7 +67,7 @@ describe("buildContextSnapshot cross-user isolation (§4.6)", () => {
     const ownerB = repo.userRepo.upsertByIdentity("github", { providerUserId: "ai-ctx-results-b", login: "rb", avatarUrl: null });
 
     function createResult(runId: string, owner: { id: string }, workerName: string) {
-      repo.createRun(owner.id, {
+      repo.createTest(owner.id, {
         id: runId,
         worker_name: workerName,
         llama_cpp_build: "b1",
@@ -77,7 +77,7 @@ describe("buildContextSnapshot cross-user isolation (§4.6)", () => {
         status: "running",
         started_at: Date.now(),
       });
-      repo.createRunItems(owner.id, runId, [
+      repo.createTestItems(owner.id, runId, [
         {
           idx: 0,
           n_prompt: 512,
@@ -93,7 +93,7 @@ describe("buildContextSnapshot cross-user isolation (§4.6)", () => {
           n_gpu_layers_draft: 0,
         } as never,
       ]);
-      repo.recordRunItemTerminal(runId, 0, {
+      repo.recordTestItemTerminal(runId, 0, {
         status: "done",
         ram_peak_mib: 100,
         vram_peak_mib: null,

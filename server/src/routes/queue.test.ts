@@ -335,7 +335,7 @@ describe("POST /api/worker/jobs/:jobId/complete", () => {
   it("failing a benchmark job fails its run (not 'cancelled') and cancels any still-pending sibling job", async () => {
     const worker = repo.workerRepo.getOrCreateByMachineId("complete-fail", "complete-fail");
     const runId = "run-complete-fail";
-    repo.createRun(undefined, {
+    repo.createTest(undefined, {
       id: runId,
       kind: null,
       root_run_id: runId,
@@ -348,7 +348,7 @@ describe("POST /api/worker/jobs/:jobId/complete", () => {
       status: "scheduled",
       started_at: Date.now(),
     } as never);
-    repo.createRunItems(undefined, runId, [
+    repo.createTestItems(undefined, runId, [
       { idx: 0, n_prompt: 1, n_gen: 1, n_depth: 0, concurrency: 1, threads: 1, n_gpu_layers: 0, batch_size: 1, ubatch_size: 1, cache_type_k: "f16", cache_type_v: "f16", flash_attn: "on", mtp: "off", n_gpu_layers_draft: 0, n_cpu_moe: 0 },
     ] as never);
     // A sibling install_build job for the same run, enqueued first so it's
@@ -377,7 +377,7 @@ describe("POST /api/worker/jobs/:jobId/complete", () => {
     // worker's real reported reason, never "cancelled" -- that label is
     // reserved for a genuine user stop or a run this server lost track of,
     // neither of which happened here (see repo.ts's reportJobFailure).
-    const run = repo.getRun(undefined, runId);
+    const run = repo.getTest(undefined, runId);
     expect(run?.status).toBe("failed");
     expect(run?.error).toBe("install failed");
   });

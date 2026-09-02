@@ -11,14 +11,14 @@ import type {
   Model,
   ModelMetadata,
   RegisterModelInput,
-  Run,
-  RunConfig,
-  RunStatus,
+  Test,
+  TestConfig,
+  TestStatus,
   ResultRow,
   IngestResultInput,
-  RunItem,
-  RunItemTickInput,
-  RunItemTerminalInput,
+  TestItem,
+  TestItemTickInput,
+  TestItemTerminalInput,
   GpuMemoryAccuracyLevel,
   Worker,
   WorkerStatePush,
@@ -27,8 +27,8 @@ import type {
   AuthUser,
   SessionInfo,
   AdminStats,
-  AdminRunSummary,
-  AdminRunFilters,
+  AdminTestSummary,
+  AdminTestFilters,
   AdminUserSummary,
   CommunityAggregateRow,
   CommunityAggregateFilters,
@@ -39,7 +39,7 @@ import type {
   TestType,
   AppSettings,
   VramDiscrepancyPolicy,
-  RunKind,
+  TestKind,
   ProbeResultInput,
   ProbeAttemptReport,
   QualityResultInput,
@@ -66,15 +66,15 @@ interface ModelRow {
   created_at: number;
 }
 
-interface RunRow {
+interface TestRow {
   id: string;
   root_run_id?: string | null;
   kind?: string | null;
   comparison_id?: string | null;
   // Multi-user Stage 4/5: present on every real row (COLUMN_MIGRATIONS,
-  // §4.1) but deliberately absent from the public Run type mapRun produces
+  // §4.1) but deliberately absent from the public Test type mapTest produces
   // (same "DB-internal only" posture as models.created_by) -- declared here
-  // only because adminRepo.listRuns (§5.1) is the one place that reads it
+  // only because adminRepo.listTests (§5.1) is the one place that reads it
   // back out, for cross-tenant display.
   user_id?: string | null;
   worker_name: string;
@@ -95,7 +95,7 @@ interface RunRow {
   items_cancelled?: number;
 }
 
-interface RunItemRow {
+interface TestItemRow {
   id: string;
   run_id: string;
   idx: number;
@@ -134,7 +134,7 @@ interface ResultRowRaw {
   run_id: string;
   idx: number | null;
   model_id: string;
-  // Denormalized from the parent run via getResultsForRun's JOIN, not a
+  // Denormalized from the parent run via getResultsForTest's JOIN, not a
   // physical column on `results` itself -- see ResultRow's own doc comment.
   backend_type: string;
   backend_device_name: string | null;
@@ -406,21 +406,21 @@ function mapModel(row: ModelRow): Model {
   };
 }
 
-function mapRun(row: RunRow): Run {
+function mapTest(row: TestRow): Test {
   return {
     id: row.id,
     root_run_id: row.root_run_id ?? row.id,
-    kind: (row.kind as RunKind | null) ?? null,
+    kind: (row.kind as TestKind | null) ?? null,
     comparison_id: row.comparison_id ?? null,
     worker_name: row.worker_name,
     worker_id: row.worker_id ?? undefined,
     llama_cpp_build: row.llama_cpp_build,
-    llama_cpp_backend: row.llama_cpp_backend as Run["llama_cpp_backend"],
+    llama_cpp_backend: row.llama_cpp_backend as Test["llama_cpp_backend"],
     backend_device_name: row.backend_device_name ?? undefined,
     model_id: row.model_id,
     model_filename: row.model_filename ?? undefined,
     config: JSON.parse(row.config),
-    status: row.status as RunStatus,
+    status: row.status as TestStatus,
     error: row.error ?? undefined,
     started_at: row.started_at,
     completed_at: row.completed_at ?? undefined,
@@ -431,7 +431,7 @@ function mapRun(row: RunRow): Run {
   };
 }
 
-function mapRunItem(row: RunItemRow): RunItem {
+function mapTestItem(row: TestItemRow): TestItem {
   return {
     id: row.id,
     run_id: row.run_id,
@@ -450,7 +450,7 @@ function mapRunItem(row: RunItemRow): RunItem {
     mtp: row.mtp,
     n_gpu_layers_draft: row.n_gpu_layers_draft,
     n_cpu_moe: row.n_cpu_moe,
-    status: row.status as RunItem["status"],
+    status: row.status as TestItem["status"],
     detail: row.detail ?? undefined,
     ram_mib: row.ram_mib,
     vram_mib: row.vram_mib,
@@ -592,7 +592,7 @@ function mapWorker(row: WorkerRow): Worker {
     status: deriveWorkerStatus(row),
     lastHeartbeatAt: row.last_heartbeat_at,
     activeJobId: row.active_job_id,
-    activeRunId: row.active_job_run_id ?? undefined,
+    activeTestId: row.active_job_run_id ?? undefined,
     activeJobProgress: row.active_job_progress_json
       ? safeParseJson<ActiveJobReport | null>(row.active_job_progress_json, null) ?? undefined
       : undefined,
@@ -872,7 +872,7 @@ export const repo = {
   // that item (and potentially the whole run) would be stuck "running"
   // forever with no result and no clear error. Block deletion up front
   // instead.
-  countRunningRunsForModel(modelId: string): number {
+  countRunningTestsForModel(modelId: string): number {
     const row = getDb()
       .prepare("SELECT COUNT(*) as n FROM runs WHERE model_id = ? AND status = 'running'")
       .get(modelId) as { n: number };
@@ -895,7 +895,7 @@ export const repo = {
   // is what makes that a single query instead of two near-duplicate ones.
   // Once a real userId is passed, this is the actual enforcement: ownership
   // is checked in SQL, not layered on afterward.
-  listRuns(userId: string | undefined): Run[] {
+  listTests(userId: string | undefined): Test[] {
     const rows = getDb()
       .prepare(
         `SELECT runs.*, m.filename AS model_filename,
@@ -908,11 +908,11 @@ export const repo = {
          WHERE (? IS NULL OR runs.user_id = ?)
          ORDER BY runs.started_at DESC`
       )
-      .all(userId ?? null, userId ?? null) as RunRow[];
-    return rows.map(mapRun);
+      .all(userId ?? null, userId ?? null) as TestRow[];
+    return rows.map(mapTest);
   },
 
-  getRun(userId: string | undefined, id: string): Run | undefined {
+  getTest(userId: string | undefined, id: string): Test | undefined {
     const row = getDb()
       .prepare(
         `SELECT runs.*, m.filename AS model_filename,
@@ -924,15 +924,15 @@ export const repo = {
          LEFT JOIN models m ON m.id = runs.model_id
          WHERE runs.id = ? AND (? IS NULL OR runs.user_id = ?)`
       )
-      .get(id, userId ?? null, userId ?? null) as RunRow | undefined;
-    return row ? mapRun(row) : undefined;
+      .get(id, userId ?? null, userId ?? null) as TestRow | undefined;
+    return row ? mapTest(row) : undefined;
   },
 
-  getRunWithResults(userId: string | undefined, id: string): { run: Run; results: ResultRow[]; items: RunItem[] } | undefined {
-    const run = this.getRun(userId, id);
+  getTestWithResults(userId: string | undefined, id: string): { run: Test; results: ResultRow[]; items: TestItem[] } | undefined {
+    const run = this.getTest(userId, id);
     if (!run) return undefined;
-    const results = this.getResultsForRun(id);
-    const items = this.getRunItems(id);
+    const results = this.getResultsForTest(id);
+    const items = this.getTestItems(id);
     return { run, results, items };
   },
 
@@ -1117,7 +1117,7 @@ export const repo = {
 
   // Every run under one chain root, whatever its kind -- the chain-scoped
   // read §0.5 makes an indexed equality predicate (idx_runs_root).
-  listRunsUnderRoot(userId: string | undefined, rootRunId: string): Run[] {
+  listTestsUnderRoot(userId: string | undefined, rootRunId: string): Test[] {
     const rows = getDb()
       .prepare(
         `SELECT runs.*, m.filename AS model_filename,
@@ -1128,8 +1128,8 @@ export const repo = {
            AND (? IS NULL OR runs.user_id = ?)
          ORDER BY runs.started_at ASC`
       )
-      .all(rootRunId, userId ?? null, userId ?? null) as RunRow[];
-    return rows.map(mapRun);
+      .all(rootRunId, userId ?? null, userId ?? null) as TestRow[];
+    return rows.map(mapTest);
   },
 
   // §0.3 scoring universe for one chain: every run under the root whose kind
@@ -1137,7 +1137,7 @@ export const repo = {
   // that predate the kind column keep producing profiles), with N3's
   // comparison members excluded: trimmed comparison grids must not compete
   // with Test A's full-grid profiles.
-  listChainScoringRuns(userId: string | undefined, rootRunId: string): Run[] {
+  listChainScoringTests(userId: string | undefined, rootRunId: string): Test[] {
     const rows = getDb()
       .prepare(
         `SELECT runs.*, m.filename AS model_filename,
@@ -1150,15 +1150,15 @@ export const repo = {
            AND runs.comparison_id IS NULL
          ORDER BY runs.started_at ASC`
       )
-      .all(rootRunId, userId ?? null, userId ?? null) as RunRow[];
-    return rows.map(mapRun);
+      .all(rootRunId, userId ?? null, userId ?? null) as TestRow[];
+    return rows.map(mapTest);
   },
 
   // §0.5 duplicate-trigger guard -- a caller's NON-terminal run matching
   // (user_id, model_id, worker_id) with the same non-NULL kind blocks a new
   // trigger; roots only (root_run_id IS NULL OR root_run_id = id); NULL-kind
   // matches only NULL-kind. The 409 body names the active root and kind.
-  findBlockingRun(
+  findBlockingTest(
     userId: string | undefined,
     modelId: string,
     workerId: string,
@@ -1215,7 +1215,7 @@ export const repo = {
     return maxDepth;
   },
 
-  getRunOwnerId(runId: string): string | null | undefined {
+  getTestOwnerId(runId: string): string | null | undefined {
     const row = getDb().prepare(`SELECT user_id FROM runs WHERE id = ?`).get(runId) as
       | { user_id: string | null }
       | undefined;
@@ -1224,7 +1224,7 @@ export const repo = {
 
   // N3 -- every member of one comparison group, oldest first (the first is
   // the fairness reference every later member is checked against).
-  listComparisonMembers(comparisonId: string, userId?: string | undefined): Run[] {
+  listComparisonMembers(comparisonId: string, userId?: string | undefined): Test[] {
     const rows = getDb()
       .prepare(
         `SELECT runs.*, m.filename AS model_filename,
@@ -1237,8 +1237,8 @@ export const repo = {
          WHERE runs.comparison_id = ? AND (? IS NULL OR runs.user_id = ?)
          ORDER BY runs.started_at ASC`
       )
-      .all(comparisonId, userId ?? null, userId ?? null) as RunRow[];
-    return rows.map(mapRun);
+      .all(comparisonId, userId ?? null, userId ?? null) as TestRow[];
+    return rows.map(mapTest);
   },
 
   listComparisonMemberRepeats(comparisonId: string): number[] {
@@ -1248,7 +1248,7 @@ export const repo = {
     const repeats: number[] = [];
     for (const row of rows) {
       try {
-        const cfg = JSON.parse(row.config) as RunConfig;
+        const cfg = JSON.parse(row.config) as TestConfig;
         if (typeof cfg.sweep?.repeats === "number") repeats.push(cfg.sweep.repeats);
       } catch {
         /* unparseable legacy config -- skip */
@@ -1291,7 +1291,7 @@ export const repo = {
         .all(root);
       if (stillRunning.length === 0) continue;
       for (const r of stillRunning) {
-        this.reconcileStaleRun(undefined, (r as { id: string }).id, "chain exceeded its 48 hour wall clock");
+        this.reconcileStaleTest(undefined, (r as { id: string }).id, "chain exceeded its 48 hour wall clock");
         cancelledIds.push((r as { id: string }).id);
       }
     }
@@ -1304,7 +1304,7 @@ export const repo = {
   // so repeating an identical string on every row would be pure noise).
   // Mirrors worker_name's own existing JOIN in the CSV/MD export
   // (server/src/routes/results.ts).
-  getResultsForRun(runId: string): ResultRow[] {
+  getResultsForTest(runId: string): ResultRow[] {
     const rows = getDb()
       .prepare(
         `SELECT r.*, runs.llama_cpp_backend AS backend_type, runs.backend_device_name AS backend_device_name
@@ -1322,8 +1322,8 @@ export const repo = {
   // observability event: denominator is every non-cancelled item, skipped
   // included; numerator is items with >=1 result flagged thermally_throttled.
   thermallyFlaggedRatio(runId: string): { ratio: number; flagged: number; denominator: number } {
-    const items = this.getRunItems(runId);
-    const results = this.getResultsForRun(runId);
+    const items = this.getTestItems(runId);
+    const results = this.getResultsForTest(runId);
     const flaggedIdx = new Set(
       results.filter((r) => (r.caveat_flags ?? []).includes("thermally_throttled")).map((r) => r.idx)
     );
@@ -1346,7 +1346,7 @@ export const repo = {
       .run(cutoff).changes;
   },
 
-  createRun(userId: string | undefined, run: Run): void {
+  createTest(userId: string | undefined, run: Test): void {
     getDb()
       .prepare(
         `INSERT INTO runs (id, root_run_id, kind, comparison_id, user_id, worker_name, worker_id, llama_cpp_build, llama_cpp_backend, backend_device_name, model_id, config, status, error, started_at, completed_at)
@@ -1378,7 +1378,7 @@ export const repo = {
   // against -- both sides compute it by calling shared/sweep.ts's
   // expandSweep on the exact same sweep JSON, so there's no separate
   // registration round trip.
-  createRunItems(userId: string | undefined, runId: string, items: SweepItem[]): void {
+  createTestItems(userId: string | undefined, runId: string, items: SweepItem[]): void {
     const database = getDb();
     const insert = database.prepare(
       `INSERT INTO run_items
@@ -1413,11 +1413,11 @@ export const repo = {
     tx(items);
   },
 
-  getRunItems(runId: string): RunItem[] {
+  getTestItems(runId: string): TestItem[] {
     const rows = getDb()
       .prepare("SELECT * FROM run_items WHERE run_id = ? ORDER BY idx ASC")
-      .all(runId) as RunItemRow[];
-    return rows.map(mapRunItem);
+      .all(runId) as TestItemRow[];
+    return rows.map(mapTestItem);
   },
 
   // Best-effort progress tick (loading/processing/generating/benchmarking) --
@@ -1426,7 +1426,7 @@ export const repo = {
   // vram_free_before_mib are set once via COALESCE-on-existing-value (same
   // pattern as started_at) since they're only ever sent on an item's very
   // first tick.
-  updateRunItemTick(runId: string, idx: number, patch: RunItemTickInput): void {
+  updateTestItemTick(runId: string, idx: number, patch: TestItemTickInput): void {
     getDb()
       .prepare(
         `UPDATE run_items SET
@@ -1458,15 +1458,15 @@ export const repo = {
   // successful item, and -- once every item for the run is terminal --
   // finalizes the run itself (done/partial/failed). Returns undefined if the
   // run doesn't exist so the route can 404 instead of silently no-op'ing.
-  recordRunItemTerminal(runId: string, idx: number, input: RunItemTerminalInput): Run | undefined {
+  recordTestItemTerminal(runId: string, idx: number, input: TestItemTerminalInput): Test | undefined {
     const database = getDb();
     // undefined userId -- this is a worker-authenticated write, not a
     // browser request; the route verifies worker.id === run.worker_id itself
     // before ever calling this (MULTIUSER_PLAN.md §4.3's own distinction:
     // worker-reported writes are authorized by worker identity, not user id).
-    const run = this.getRun(undefined, runId);
+    const run = this.getTest(undefined, runId);
     if (!run) return undefined;
-    // The public Run type deliberately doesn't expose user_id (kept
+    // The public Test type deliberately doesn't expose user_id (kept
     // DB-internal, same as models.created_by) -- read it directly so every
     // `results` row inserted below can be denormalized-stamped with the same
     // owner as its parent run (§4.3: results.user_id, unlike run_items',
@@ -1629,9 +1629,9 @@ export const repo = {
       }
 
       // Tier-2 backend_device_name upgrade (see shared/types.ts's
-      // Run.backend_device_name) -- a plain UPDATE, not COALESCE: the Tier-1
-      // fallback is always written first at trigger time (createRun,
-      // routes/runs.ts's resolveBuildForRun), strictly before any item can
+      // Test.backend_device_name) -- a plain UPDATE, not COALESCE: the Tier-1
+      // fallback is always written first at trigger time (createTest,
+      // routes/tests.ts's resolveBuildForRun), strictly before any item can
       // go terminal, so this write is always the intended upgrade, never a
       // downgrade.
       if (input.backend_device_name) {
@@ -1639,12 +1639,12 @@ export const repo = {
       }
 
       if (this.countUnfinishedItems(runId) === 0) {
-        this.finalizeRun(runId, now);
+        this.finalizeTest(runId, now);
       }
     });
     tx();
 
-    return this.getRun(undefined, runId);
+    return this.getTest(undefined, runId);
   },
 
   countUnfinishedItems(runId: string): number {
@@ -1659,21 +1659,21 @@ export const repo = {
 
   // Derives the run's overall status from its items' final statuses. Only
   // meaningful once countUnfinishedItems(runId) === 0 -- callers are
-  // responsible for that check (recordRunItemTerminal does it after every
-  // terminal write; failAllRunItems calls it directly since it just made
+  // responsible for that check (recordTestItemTerminal does it after every
+  // terminal write; failAllTestItems calls it directly since it just made
   // that true itself).
   //
   // cancelReason distinguishes *why* items ended up 'cancelled': omitted
   // (the default) means a genuine per-item user stop (worker/src/index.ts's
   // stopRequested loop, reported one item at a time through the normal
-  // recordRunItemTerminal path) -- "stopped by user" is accurate there.
-  // reconcileStaleRun passes an explicit reason instead, since its
+  // recordTestItemTerminal path) -- "stopped by user" is accurate there.
+  // reconcileStaleTest passes an explicit reason instead, since its
   // 'cancelled' items were never actually confirmed stopped by anyone --
   // the DB just lost track of a run the worker itself had already moved on
   // from (its own terminal report may have been rejected or never arrived).
   // Labelling that "stopped by user" too would be a lie the user has no way
   // to tell apart from a real stop.
-  finalizeRun(runId: string, completedAt: number = Date.now(), cancelReason?: string): void {
+  finalizeTest(runId: string, completedAt: number = Date.now(), cancelReason?: string): void {
     const counts = getDb()
       .prepare(
         `SELECT
@@ -1686,7 +1686,7 @@ export const repo = {
       )
       .get(runId) as { done: number; skipped: number; oom: number; cancelled: number; total: number };
 
-    let status: RunStatus;
+    let status: TestStatus;
     let error: string | null = null;
     if (counts.cancelled > 0) {
       // A genuine user stop always reads "cancelled" regardless of how much
@@ -1728,16 +1728,16 @@ export const repo = {
   },
 
   // Used when the worker rejects a trigger or is unreachable -- the run's
-  // items already exist (created up front, see routes/runs.ts) but nothing
+  // items already exist (created up front, see routes/tests.ts) but nothing
   // ever ran, so mark all of them failed rather than leaving a permanently
   // "queued" list for a run that never started.
   // userId is an ownership check, not a value written anywhere here -- a run
   // whose items are all still pre-existing rows already carries its own
-  // user_id from createRunItems; this just refuses to act on a run the
+  // user_id from createTestItems; this just refuses to act on a run the
   // caller doesn't own (undefined = system context, no check -- see this
-  // section's own header comment above listRuns).
-  failAllRunItems(userId: string | undefined, runId: string, error: string): void {
-    if (!this.getRun(userId, runId)) return;
+  // section's own header comment above listTests).
+  failAllTestItems(userId: string | undefined, runId: string, error: string): void {
+    if (!this.getTest(userId, runId)) return;
     const database = getDb();
     const now = Date.now();
     const tx = database.transaction(() => {
@@ -1747,7 +1747,7 @@ export const repo = {
            WHERE run_id = ? AND status NOT IN ('done','failed','failed_oom','cancelled','skipped')`
         )
         .run(error, now, runId);
-      this.finalizeRun(runId, now);
+      this.finalizeTest(runId, now);
     });
     tx();
   },
@@ -1755,17 +1755,17 @@ export const repo = {
   // Marks a run's still-unfinished items 'cancelled' (not 'failed' --
   // nothing here indicates an actual bench failure, just that the worker
   // isn't tracking this run anymore) and finalizes it. `note` is both the
-  // per-item error text and finalizeRun's cancelReason, so the run-level
+  // per-item error text and finalizeTest's cancelReason, so the run-level
   // message stays honest about this being an unconfirmed/lost run, not a
-  // genuine user stop (see finalizeRun's own doc comment).
+  // genuine user stop (see finalizeTest's own doc comment).
   // Called from system contexts with no user in scope (the reaper, and the
   // browser-facing /stop route) for a run this server genuinely lost track
   // of or the user asked to stop -- NOT for a worker's own job-completion
   // failure report, which has a real reported reason and belongs on
   // reportJobFailure below instead (see that function's own doc comment for
   // why conflating the two mislabels a genuine error as "cancelled").
-  reconcileStaleRun(userId: string | undefined, runId: string, note: string): Run | undefined {
-    if (!this.getRun(userId, runId)) return undefined;
+  reconcileStaleTest(userId: string | undefined, runId: string, note: string): Test | undefined {
+    if (!this.getTest(userId, runId)) return undefined;
     const database = getDb();
     const now = Date.now();
     const tx = database.transaction(() => {
@@ -1775,27 +1775,27 @@ export const repo = {
            WHERE run_id = ? AND status NOT IN ('done','failed','failed_oom','cancelled','skipped')`
         )
         .run(note, now, runId);
-      this.finalizeRun(runId, now, note);
+      this.finalizeTest(runId, now, note);
     });
     tx();
-    return this.getRun(userId, runId);
+    return this.getTest(userId, runId);
   },
 
   // A worker's own job-completion report of `ok: false` -- unlike
-  // reconcileStaleRun above, this is a CONFIRMED failure with a real reason
+  // reconcileStaleTest above, this is a CONFIRMED failure with a real reason
   // the worker gave us (e.g. the terminal-result POST itself came back 500,
   // or install_build genuinely failed), not a case of the server losing
   // track of a run. Marks unfinished items 'failed' (never 'cancelled' --
   // "cancelled" reads as "stopped by user, or lost with nothing completed"
-  // everywhere else in this app, per Runs.tsx's own column description,
+  // everywhere else in this app, per Tests.tsx's own column description,
   // which is actively misleading for a run that failed with a real,
-  // reported error) so finalizeRun's ordinary done/failed accounting lands
+  // reported error) so finalizeTest's ordinary done/failed accounting lands
   // on "failed" (nothing completed) or "partial" (something did) instead.
-  // finalizeRun's own error message is then a generic "N of M tests failed"
+  // finalizeTest's own error message is then a generic "N of M tests failed"
   // summary; overwritten here with the worker's actual reported text so the
   // run-level line stays specific instead of vague.
-  reportJobFailure(userId: string | undefined, runId: string, note: string): Run | undefined {
-    if (!this.getRun(userId, runId)) return undefined;
+  reportJobFailure(userId: string | undefined, runId: string, note: string): Test | undefined {
+    if (!this.getTest(userId, runId)) return undefined;
     const database = getDb();
     const now = Date.now();
     const tx = database.transaction(() => {
@@ -1805,11 +1805,11 @@ export const repo = {
            WHERE run_id = ? AND status NOT IN ('done','failed','failed_oom','cancelled','skipped')`
         )
         .run(note, now, runId);
-      this.finalizeRun(runId, now);
+      this.finalizeTest(runId, now);
       database.prepare(`UPDATE runs SET error = ? WHERE id = ?`).run(note, runId);
     });
     tx();
-    return this.getRun(userId, runId);
+    return this.getTest(userId, runId);
   },
 
   // --- Multi-user Stage 1: workers (MULTIUSER_PLAN.md §1.2/§1.5/§1.6) ---
@@ -2304,7 +2304,7 @@ export const repo = {
         // Set immediately, in the same transaction as the claim -- NOT left
         // to wait for the worker's first heartbeat (which reports active_job
         // and would otherwise be the only thing that ever writes this).
-        // Without this, Worker.status/activeRunId/activeJobProgress would
+        // Without this, Worker.status/activeTestId/activeJobProgress would
         // all read stale ("idle", no run) for up to one heartbeat interval
         // right after a claim.
         database.prepare(`UPDATE workers SET active_job_id = ? WHERE id = ?`).run(job.id, workerId);
@@ -2312,13 +2312,13 @@ export const repo = {
         // A 'benchmark', 'run_probe' or 'measure_quality' claim means the run
         // itself started executing -- those are the three job types that
         // actually carry out a run's own work (N2/N4 ride their own job type
-        // instead of 'benchmark', see routes/runs.ts's trigger route). An
+        // instead of 'benchmark', see routes/tests.ts's trigger route). An
         // 'install_build' job can share the same run_id (so the reaper can
         // reconcile the run if the install permanently fails, see
         // markJobFailed below) but claiming it must NOT flip the run to
         // 'running' early. Without run_probe/measure_quality here, a probe or
-        // quality run sat at 'scheduled' for its ENTIRE execution (the Runs
-        // page mislabeled it, RunDetail hid its elapsed-time/Stop controls)
+        // quality run sat at 'scheduled' for its ENTIRE execution (the Tests
+        // page mislabeled it, TestDetail hid its elapsed-time/Stop controls)
         // and only ever moved once its terminal result landed.
         if (job.run_id && (job.job_type === "benchmark" || job.job_type === "run_probe" || job.job_type === "measure_quality")) {
           database
@@ -2374,7 +2374,7 @@ export const repo = {
     // to two (install_build + benchmark, both stamped with the same run_id),
     // so stop/pause and the reaper need to account for either one, not just
     // "the most recent." MULTIUSER_PLAN.md §1.14.
-    getNonTerminalJobsForRun(runId: string): { id: string; workerId: string; status: string; jobType: string }[] {
+    getNonTerminalJobsForTest(runId: string): { id: string; workerId: string; status: string; jobType: string }[] {
       const rows = getDb()
         .prepare(
           `SELECT id, worker_id, status, job_type FROM worker_jobs
@@ -2399,7 +2399,7 @@ export const repo = {
     // anything, and by the reaper cleaning up a benchmark job that would
     // otherwise be orphaned after its sibling install_build permanently
     // fails (see index.ts's reapExpiredLeases).
-    cancelPendingJobsForRun(runId: string): void {
+    cancelPendingJobsForTest(runId: string): void {
       getDb()
         .prepare(`UPDATE worker_jobs SET status = 'cancelled', completed_at = ? WHERE run_id = ? AND status = 'pending'`)
         .run(Date.now(), runId);
@@ -2425,11 +2425,11 @@ export const repo = {
       getDb().prepare(`UPDATE worker_jobs SET cancel_requested = 1, discard_requested = 1 WHERE id = ?`).run(jobId);
     },
 
-    // Run-scoped version of requestCancel -- flags every currently-claimed
+    // Test-scoped version of requestCancel -- flags every currently-claimed
     // job for a run (in practice at most one: a run's install_build and
     // benchmark jobs are never claimed simultaneously, since the worker
     // executes its queue strictly one job at a time).
-    requestCancelForRun(runId: string): void {
+    requestCancelForTest(runId: string): void {
       getDb().prepare(`UPDATE worker_jobs SET cancel_requested = 1 WHERE run_id = ? AND status = 'claimed'`).run(runId);
     },
 
@@ -2964,7 +2964,7 @@ export const repo = {
     // Capped at 500 rows: this is an operator glancing at recent activity,
     // not a full-history export (that's GET /api/admin/results/export,
     // which has no such cap).
-    listRuns(filters: AdminRunFilters): AdminRunSummary[] {
+    listTests(filters: AdminTestFilters): AdminTestSummary[] {
       const rows = getDb()
         .prepare(
           `SELECT runs.*, u.display_name AS user_display_name, w.display_name AS worker_display_name,
@@ -2992,7 +2992,7 @@ export const repo = {
           filters.backend ?? null,
           filters.status ?? null,
           filters.status ?? null
-        ) as (RunRow & { user_display_name: string | null; worker_display_name: string | null })[];
+        ) as (TestRow & { user_display_name: string | null; worker_display_name: string | null })[];
       return rows.map((row) => ({
         id: row.id,
         userId: row.user_id ?? null,
@@ -3349,7 +3349,7 @@ export const repo = {
   // per-row upsert: a worker retry re-runs the WHOLE ladder, so its second
   // report is the truth and the first one's rungs never happened.
   probeAttemptsRepo: {
-    replaceForRun(input: ProbeAttemptsInput): number {
+    replaceForTest(input: ProbeAttemptsInput): number {
       const database = getDb();
       const now = Date.now();
       const tx = database.transaction(() => {
@@ -3391,18 +3391,18 @@ export const repo = {
       return input.attempts.length;
     },
 
-    listForRun(runId: string): ProbeAttemptRow[] {
+    listForTest(runId: string): ProbeAttemptRow[] {
       return getDb()
         .prepare(`SELECT * FROM probe_attempts WHERE run_id = ? ORDER BY seq ASC`)
         .all(runId) as ProbeAttemptRow[];
     },
 
     // N2 live progress -- posted once per rung AS it happens (see
-    // POST /api/runs/:id/probe-attempt), unlike replaceForRun above which
+    // POST /api/tests/:id/probe-attempt), unlike replaceForTest above which
     // only ever lands once, at the very end of the ladder. Upserts through
-    // the same UNIQUE(run_id, seq) key replaceForRun's own comment relies on
+    // the same UNIQUE(run_id, seq) key replaceForTest's own comment relies on
     // for retry-safety, so a worker retry that re-sends an earlier seq
-    // overwrites it rather than duplicating -- and the final replaceForRun
+    // overwrites it rather than duplicating -- and the final replaceForTest
     // call, which still runs unchanged, harmlessly replaces these same rows
     // with identical final data.
     upsertOne(input: {
@@ -3708,7 +3708,7 @@ export interface QualityRow {
 // Builds the *physical-column* subset of ResultRow -- deliberately excludes
 // backend_type/backend_device_name, which aren't physical columns on
 // `results` at all (see ResultRow's own doc comment: they're a JOIN done in
-// getResultsForRun, only known once a row is read back with its parent run,
+// getResultsForTest, only known once a row is read back with its parent run,
 // never at insert time here).
 function buildResultRow(
   runId: string,
@@ -3841,7 +3841,7 @@ function configHashInputFromResult(
 
 function deriveEngineForResult(
   row: Pick<ResultRow, "mtp">,
-  run: Run
+  run: Test
 ): EngineKind {
   if (row.mtp === "on") return "server";
   if (run.kind === "runtime" || run.kind === "probe") return "server";

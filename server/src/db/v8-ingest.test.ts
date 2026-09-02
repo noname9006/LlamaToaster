@@ -45,7 +45,7 @@ const baseResult = {
 
 function makeRun(id: string, kind: string | null = "runtime", rootId?: string) {
   repo.registerModel({ id: `${id}-model`, filename: `${id}.gguf`, size_bytes: 10, source: "local", metadata: {} });
-  repo.createRun(undefined, {
+  repo.createTest(undefined, {
     id,
     root_run_id: rootId ?? id,
     kind: kind as never,
@@ -57,7 +57,7 @@ function makeRun(id: string, kind: string | null = "runtime", rootId?: string) {
     status: "running",
     started_at: Date.now(),
   });
-  repo.createRunItems(
+  repo.createTestItems(
     undefined,
     id,
     [0, 1].map((idx) => ({
@@ -91,7 +91,7 @@ function terminal(runId: string, idx: number, overrides: Record<string, unknown>
     ...(idx === 1 ? { mtp: "on", avg_tps: 1500 } : {}),
     ...(overrides as object),
   });
-  return repo.recordRunItemTerminal(runId, idx, {
+  return repo.recordTestItemTerminal(runId, idx, {
     status: "done",
     results: [mk("pp"), mk("tg")] as never,
   })!;
@@ -115,7 +115,7 @@ describe("§0.8 twin join and speedup statuses", () => {
     terminal("twin-ok", 0); // baseline (runtime run -> engine server)
     terminal("twin-ok", 1, { avg_tps: 1500 });
 
-    const results = repo.getResultsForRun("twin-ok");
+    const results = repo.getResultsForTest("twin-ok");
     const spec = results.find((r) => r.mtp === "on")!;
     const baseline = results.find((r) => r.mtp !== "on")!;
     expect(spec.speedup_status).toBe("ok");
@@ -131,7 +131,7 @@ describe("§0.8 twin join and speedup statuses", () => {
   it("stamps METHOD_VERSION and prompt_offset verbatim from the worker report", () => {
     makeRun("twin-stamp");
     terminal("twin-stamp", 0, { method_version: 1, prompt_offset: 274 });
-    const results = repo.getResultsForRun("twin-stamp");
+    const results = repo.getResultsForTest("twin-stamp");
     expect(results[0].method_version).toBe(1);
     expect(results[0].prompt_offset).toBe(274);
   });
@@ -140,7 +140,7 @@ describe("§0.8 twin join and speedup statuses", () => {
     makeRun("twin-offset");
     terminal("twin-offset", 0, { method_version: 1, prompt_offset: 0 });
     terminal("twin-offset", 1, { avg_tps: 2000, method_version: 1, prompt_offset: 137 });
-    const results = repo.getResultsForRun("twin-offset");
+    const results = repo.getResultsForTest("twin-offset");
     const spec = results.find((r) => r.mtp === "on")!;
     const baseline = results.find((r) => r.mtp !== "on")!;
     expect(spec.speedup_status).toBe("unverified");
@@ -151,11 +151,11 @@ describe("§0.8 twin join and speedup statuses", () => {
   it("marks unavailable when no baseline exists yet, then upgrades when the baseline lands later", () => {
     makeRun("twin-late");
     terminal("twin-late", 1, { avg_tps: 1200, method_version: 1, prompt_offset: 0 });
-    let spec = repo.getResultsForRun("twin-late").find((r) => r.mtp === "on")!;
+    let spec = repo.getResultsForTest("twin-late").find((r) => r.mtp === "on")!;
     expect(spec.speedup_status).toBe("unavailable");
 
     terminal("twin-late", 0, { method_version: 1, prompt_offset: 0 });
-    const results = repo.getResultsForRun("twin-late");
+    const results = repo.getResultsForTest("twin-late");
     spec = results.find((r) => r.mtp === "on")!;
     expect(spec.speedup_status).toBe("ok");
     expect(results.find((r) => r.mtp !== "on")!.speedup_status).toBe("ok");
@@ -165,19 +165,19 @@ describe("§0.8 twin join and speedup statuses", () => {
     makeRun("twin-zero-spec");
     terminal("twin-zero-spec", 0, { method_version: 1, prompt_offset: 0 });
     terminal("twin-zero-spec", 1, { avg_tps: 900, spec_drafted: 0, spec_accepted: 0, method_version: 1, prompt_offset: 0 });
-    expect(repo.getResultsForRun("twin-zero-spec").find((r) => r.mtp === "on")!.speedup_status).toBe("unverified");
+    expect(repo.getResultsForTest("twin-zero-spec").find((r) => r.mtp === "on")!.speedup_status).toBe("unverified");
 
     makeRun("twin-suspect");
     terminal("twin-suspect", 0, { method_version: 1, prompt_offset: 0, sample_count: 3, suspect_count: 3 });
     terminal("twin-suspect", 1, { avg_tps: 800, method_version: 1, prompt_offset: 0 });
-    expect(repo.getResultsForRun("twin-suspect").find((r) => r.mtp === "on")!.speedup_status).toBe("unverified");
+    expect(repo.getResultsForTest("twin-suspect").find((r) => r.mtp === "on")!.speedup_status).toBe("unverified");
   });
 
   it("marks unverified when the pair's method versions differ", () => {
     makeRun("twin-version");
     terminal("twin-version", 0, { method_version: undefined });
     terminal("twin-version", 1, { avg_tps: 1600 });
-    const results = repo.getResultsForRun("twin-version");
+    const results = repo.getResultsForTest("twin-version");
     expect(results.find((r) => r.mtp === "on")!.speedup_status).toBe("unverified");
   });
 
@@ -187,12 +187,12 @@ describe("§0.8 twin join and speedup statuses", () => {
     // Two separate roots, identical configs: no twin either side.
     terminal("twin-root-a", 1, { avg_tps: 1300, method_version: 1, prompt_offset: 0 });
     terminal("twin-root-b", 0, { method_version: 1, prompt_offset: 0 });
-    const a = repo.getResultsForRun("twin-root-a").find((r) => r.mtp === "on")!;
+    const a = repo.getResultsForTest("twin-root-a").find((r) => r.mtp === "on")!;
     expect(a.speedup_status).toBe("unavailable");
 
     // Same root but different n_depth: no join.
     repo.registerModel({ id: "depth-model", filename: "d.gguf", size_bytes: 10, source: "local", metadata: {} });
-    repo.createRun(undefined, {
+    repo.createTest(undefined, {
       id: "twin-depth",
       kind: "runtime",
       worker_name: "w",
@@ -203,7 +203,7 @@ describe("§0.8 twin join and speedup statuses", () => {
       status: "running",
       started_at: Date.now(),
     });
-    repo.createRunItems(
+    repo.createTestItems(
       undefined,
       "twin-depth",
       [
@@ -213,7 +213,7 @@ describe("§0.8 twin join and speedup statuses", () => {
     );
     terminal("twin-depth", 0, { n_depth: 4096, method_version: 1, prompt_offset: 0 });
     terminal("twin-depth", 1, { n_depth: 0, avg_tps: 1400, method_version: 1, prompt_offset: 0 });
-    const depthSpec = repo.getResultsForRun("twin-depth").find((r) => r.mtp === "on")!;
+    const depthSpec = repo.getResultsForTest("twin-depth").find((r) => r.mtp === "on")!;
     expect(depthSpec.speedup_status).toBe("unavailable");
   });
 });
@@ -221,7 +221,7 @@ describe("§0.8 twin join and speedup statuses", () => {
 describe("skipped items (§0.7)", () => {
   it("skipped items are terminal, do not fail the run, and surface in the error line", () => {
     repo.registerModel({ id: "skip-model", filename: "s.gguf", size_bytes: 10, source: "local", metadata: {} });
-    repo.createRun(undefined, {
+    repo.createTest(undefined, {
       id: "skip-run",
       worker_name: "w",
       llama_cpp_build: "b1",
@@ -231,7 +231,7 @@ describe("skipped items (§0.7)", () => {
       status: "running",
       started_at: Date.now(),
     });
-    repo.createRunItems(
+    repo.createTestItems(
       undefined,
       "skip-run",
       [0, 1].map((idx) => ({
@@ -252,11 +252,11 @@ describe("skipped items (§0.7)", () => {
         n_cpu_moe: 0,
       }))
     );
-    repo.recordRunItemTerminal("skip-run", 0, { status: "done" });
-    const run = repo.recordRunItemTerminal("skip-run", 1, { status: "skipped", error: "flag not supported by this build" })!;
+    repo.recordTestItemTerminal("skip-run", 0, { status: "done" });
+    const run = repo.recordTestItemTerminal("skip-run", 1, { status: "skipped", error: "flag not supported by this build" })!;
     expect(run.status).toBe("done");
     expect(run.error).toContain("1 of 2 tests skipped");
-    const items = repo.getRunItems("skip-run");
+    const items = repo.getTestItems("skip-run");
     expect(items[1].status).toBe("skipped");
   });
 });
@@ -270,7 +270,7 @@ describe("M6 thermal columns (storage)", () => {
       gpu_clock_samples: [2480, 2479, 2100, 1971],
       caveat_flags: ["thermally_throttled"],
     });
-    const row = repo.getResultsForRun("thermal-store")[0];
+    const row = repo.getResultsForTest("thermal-store")[0];
     expect(row.gpu_temp_c_max).toBe(89);
     expect(row.gpu_clock_mhz_min).toBe(1971);
     expect(row.gpu_clock_samples).toEqual([2480, 2479, 2100, 1971]);

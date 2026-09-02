@@ -1,4 +1,4 @@
-// Shared model-grouping logic for the Models page and the New Run model
+// Shared model-grouping logic for the Models page and the Custom Test model
 // picker, so "which files count as the same model" and "which draft file is
 // this model's MTP companion" are answered identically in both places.
 import { modelAuthor, modelFamily } from "./utils";

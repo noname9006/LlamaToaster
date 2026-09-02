@@ -57,12 +57,12 @@ import {
 } from "../../shared/vramEstimate.js";
 import {
   writeRawJson,
-  postRunItemUpdate,
+  postTestItemUpdate,
   postModelDownloadResult,
   postHeartbeat,
   pollQueue,
   reportJobResult,
-  pushRunLog,
+  pushTestLog,
   startDeviceEnrolment,
   pollDeviceToken,
   refreshWorkerSession,
@@ -93,10 +93,10 @@ import {
   type IngestResultInput,
   type Backend,
   type InstalledBuild,
-  type RunItemTickInput,
-  type RunItemTerminalInput,
+  type TestItemTickInput,
+  type TestItemTerminalInput,
   type ModelDownloadCallbackInput,
-  type TerminalRunItemStatus,
+  type TerminalTestItemStatus,
   type ModelDirFile,
   type WorkerStatePush,
   type ActiveJobReport,
@@ -116,7 +116,7 @@ import {
   type CaveatFlag,
   METHOD_VERSION,
   WORKER_CAPABILITIES,
-  type RunProbeJobPayload,
+  type TestProbeJobPayload,
   type ProbeResultInput,
   type ProbeAttemptReport,
   type MeasureQualityJobPayload,
@@ -273,9 +273,9 @@ const localModelCache = await createLocalModelCache(config.model_dir);
 
 // One dedicated, structured log file per run (see setRunLogFile/
 // executeBenchmarkJob below), separate from the shared daily worker-*.log
-// above -- pushed to the server on completion (pushRunLogIfPresent) and
-// served back via GET /api/runs/:id/log, surfaced in the UI next to the CSV
-// export whenever a run has a failed test (see RunDetail.tsx).
+// above -- pushed to the server on completion (pushTestLogIfPresent) and
+// served back via GET /api/tests/:id/log, surfaced in the UI next to the CSV
+// export whenever a run has a failed test (see TestDetail.tsx).
 const runLogsDir = join(logDir, "runs");
 try {
   mkdirSync(runLogsDir, { recursive: true });
@@ -313,7 +313,7 @@ if (!config.backend) {
 // "model (4.0 GB)" / "model (1024 MB shared)" for a HardwareInfo.gpu entry --
 // used only in log output (see the startup GPU: line and formatDeviceSelection
 // below), never in backend_device_name itself, which stays just the plain
-// name since that's what feeds RunDetail.tsx's "<name> (<backend>)" label.
+// name since that's what feeds TestDetail.tsx's "<name> (<backend>)" label.
 function formatGpuEntry(g: { model: string; vendor: string; vram_mb?: number | null; vram_dynamic?: boolean }): string {
   const name = g.model || g.vendor || "unknown";
   if (g.vram_mb == null) return name;
@@ -735,7 +735,7 @@ const DEFAULT_MTP_SERVER_PORT = 8899;
 // (collectState below). Set/cleared only by workerMain's own loop.
 let busy = false;
 
-// Run-level pause/stop control -- reset at the start of every benchmark job
+// Test-level pause/stop control -- reset at the start of every benchmark job
 // (see executeBenchmarkJob below). llama-bench runs every repeat (-r) of one
 // sweep item inside a single process invocation, so there's no safe way to
 // pause mid-item without corrupting that repeat's timing -- pause only takes
@@ -903,11 +903,11 @@ function sleep(ms: number): Promise<void> {
 async function safeItemTerminal(
   runId: string,
   idx: number,
-  payload: RunItemTerminalInput
+  payload: TestItemTerminalInput
 ): Promise<void> {
   for (let attempt = 0; ; attempt++) {
     try {
-      await withAuth((token) => postRunItemUpdate(config.url, token, runId, idx, payload, 10_000));
+      await withAuth((token) => postTestItemUpdate(config.url, token, runId, idx, payload, 10_000));
       log.info(`item update ok for run ${runId} item ${idx} (status=${payload.status}, attempt ${attempt + 1})`);
       return;
     } catch (err) {
@@ -930,8 +930,8 @@ async function safeItemTerminal(
 // Fire-and-forget: losing one tick is harmless (the next tick or the
 // terminal update above catches the server up), so this deliberately doesn't
 // retry or block the caller on the network round trip.
-function sendTick(runId: string, idx: number, tick: RunItemTickInput): void {
-  withAuth((token) => postRunItemUpdate(config.url, token, runId, idx, tick, 3000)).catch((err) => {
+function sendTick(runId: string, idx: number, tick: TestItemTickInput): void {
+  withAuth((token) => postTestItemUpdate(config.url, token, runId, idx, tick, 3000)).catch((err) => {
     log.debug(
       `tick failed for run ${runId} item ${idx} (non-fatal): ${err instanceof Error ? err.message : String(err)}`
     );
@@ -977,7 +977,7 @@ async function safeReportDownloadResult(payload: ModelDownloadCallbackInput): Pr
   }
 }
 
-interface RunSweepItemInput {
+interface TestSweepItemInput {
   runId: string;
   item: SweepItem;
   repeats: number;
@@ -991,7 +991,7 @@ interface RunSweepItemInput {
   tensorBreakdown: TensorLayerBreakdown | null;
   llamaBenchPath: string;
   backend: Backend;
-  // See shared/types.ts's RunConfig.main_gpu -- forwarded to bench.ts's
+  // See shared/types.ts's TestConfig.main_gpu -- forwarded to bench.ts's
   // buildArgs unchanged.
   mainGpu?: number;
   timeoutMs: number | undefined;
@@ -1072,14 +1072,14 @@ function formatRunLogHeader(
 // single llama-bench/llama-server process covers all of that test's
 // repeats and either produces a usable result or doesn't), "runs" scales
 // that up by the configured repeat count for a figure in the vocabulary the
-// rest of this app uses for -r (see RunDetail.tsx's own "runs means
+// rest of this app uses for -r (see TestDetail.tsx's own "runs means
 // repeats" comment) -- a done test's repeats all completed, a failed one's
 // produced nothing usable, and a cancelled one's never started at all.
 function formatRunLogFooter(
   runId: string,
   itemCount: number,
   repeats: number,
-  statusCounts: Partial<Record<TerminalRunItemStatus, number>>,
+  statusCounts: Partial<Record<TerminalTestItemStatus, number>>,
   stoppedEarly: boolean
 ): string {
   const done = statusCounts.done ?? 0;
@@ -1219,7 +1219,7 @@ function formatOffloadLine(
   return `offload: ${main}${draft}${note}`;
 }
 
-// Mirrors the ram/vram columns RunDetail.tsx's results table shows (free,
+// Mirrors the ram/vram columns TestDetail.tsx's results table shows (free,
 // avg, max, total, plus the accuracy/source tag behind the little info icon
 // next to each vram figure -- see AccuracyIcon in that file) so the same
 // numbers a person would see in the UI are visible directly in this log.
@@ -1254,7 +1254,7 @@ function formatMemoryLines(stats: SampleStats, baseline: FreeMemoryBaseline): st
   return [ramLine, vramLine];
 }
 
-// pp/tg avg+stddev, same numbers RunDetail.tsx's "PP tok/s"/"TG tok/s"
+// pp/tg avg+stddev, same numbers TestDetail.tsx's "PP tok/s"/"TG tok/s"
 // columns show once a test finishes (hover-for-stddev there, always-shown
 // here). sample_count/suspect_count are only ever set by the llama-server/
 // MTP path (see serverBench.ts's buildPhaseSummary) -- undefined on the
@@ -1269,7 +1269,7 @@ function formatResultsLine(results: IngestResultInput[]): string {
     .join("  ");
 }
 
-// Same estimate RunDetail.tsx's TTFT column derives (n_prompt ÷ PP speed) --
+// Same estimate TestDetail.tsx's TTFT column derives (n_prompt ÷ PP speed) --
 // not a directly measured request latency, see that column's own tooltip.
 function formatTtftLine(results: IngestResultInput[]): string | null {
   const pp = results.find((r) => r.test_type === "pp" || r.test_type === "pg");
@@ -1279,7 +1279,7 @@ function formatTtftLine(results: IngestResultInput[]): string | null {
 }
 
 // Draft-model acceptance rate for an MTP item's tg row, same figure
-// RunDetail.tsx's "mtp" column shows on hover (see serverBench.ts's
+// TestDetail.tsx's "mtp" column shows on hover (see serverBench.ts's
 // checkSpecDecodeMetrics, which is what actually populates spec_drafted/
 // spec_accepted). Absent on every non-MTP row, and on an MTP row whose
 // /metrics call never confirmed anything at all (see that function's own
@@ -1605,7 +1605,7 @@ async function finalizeSweepItemResult(
       gpu_layers_resident_est: mainResident.layers,
       gpu_layers_resident_est_draft: draftResident.layers,
     }));
-    // One structured block per test, covering everything RunDetail.tsx's
+    // One structured block per test, covering everything TestDetail.tsx's
     // results table shows for this row (params, actual offload, pp/tg
     // avg+stddev, TTFT estimate, ram/vram free/avg/peak, MTP acceptance rate)
     // plus which engine produced it -- see the format* helpers above. This
@@ -1623,7 +1623,7 @@ async function finalizeSweepItemResult(
     // above (either path -- computed once, up front, from data both engines
     // already produce) are combined here into one string -- surfaced via the
     // same `error` field a failed item uses, since recordRunItemTerminal
-    // stores it unconditionally regardless of status, and RunDetail.tsx
+    // stores it unconditionally regardless of status, and TestDetail.tsx
     // already prefers item.error over the normal detail text for any status.
     // Without this, a "done" item with a silently dropped tg reading (the
     // original MTP bug report) or a silently-not-really-offloaded model (the
@@ -1704,7 +1704,7 @@ async function finalizeSweepItemResult(
       vram_avg_mib: stats.vram_avg_mib,
       results,
       // Tier-2 backend_device_name upgrade (see shared/types.ts's
-      // Run.backend_device_name) -- undefined on the llama-server/MTP path,
+      // Test.backend_device_name) -- undefined on the llama-server/MTP path,
       // which never sets bench.gpu_info (confirmed live: llama-server prints
       // no device-enumeration line at any verbosity), so this naturally
       // no-ops there without any extra branching. Only applied when this run
@@ -1723,7 +1723,7 @@ async function finalizeSweepItemResult(
   // A user-requested stop kills this exact process (SIGKILL, via the
   // heartbeat's cancel_job_ids control) -- report it as "cancelled", not a
   // genuine failure, so it doesn't read as something having gone wrong.
-  const status: TerminalRunItemStatus = stopRequested ? "cancelled" : classifyFailure(bench);
+  const status: TerminalTestItemStatus = stopRequested ? "cancelled" : classifyFailure(bench);
   const errorMessage = stopRequested
     ? "cancelled by user"
     : bench.code === 0
@@ -1806,7 +1806,7 @@ let vramDiscrepancyPolicy: VramDiscrepancyPolicy = "warn";
 // very first successful beat either way.
 let probeMaxLoads: number = PROBE_MAX_LOADS;
 
-// Run-scoped memo for retry_once_then_fail: set once a retry REPRODUCES the
+// Test-scoped memo for retry_once_then_fail: set once a retry REPRODUCES the
 // hard fallback signature, proving the cause is deterministic on this machine
 // right now -- later items in the same run then fail immediately instead of
 // each paying their own extra bench just to re-confirm the same thing.
@@ -1820,7 +1820,7 @@ let vramFallbackConfirmedPersistent = false;
 // deliberately posted no terminal report yet. The caller re-invokes with
 // attempt=1 and tallies whatever comes back.
 interface SweepItemOutcome {
-  status: TerminalRunItemStatus;
+  status: TerminalTestItemStatus;
   retryForVramFallback?: true;
 }
 
@@ -1828,14 +1828,14 @@ interface SweepItemOutcome {
 // its progress live, and always resolves (never throws) regardless of
 // outcome -- so the caller's loop over every item in the sweep can continue
 // unconditionally instead of one bad combination aborting the rest.
-async function runSweepItem(input: RunSweepItemInput): Promise<SweepItemOutcome> {
+async function runSweepItem(input: TestSweepItemInput): Promise<SweepItemOutcome> {
   const { runId, item, backend } = input;
   const label = `run ${runId} item ${item.idx}`;
   const itemStartedAt = Date.now();
   const attempt = input.attempt ?? 0;
 
   const testType = deriveTestType(item.n_prompt, item.n_gen);
-  const benchmarkingPhase: RunItemTickInput["status"] =
+  const benchmarkingPhase: TestItemTickInput["status"] =
     testType === "pp" ? "processing" : testType === "tg" ? "generating" : "benchmarking";
 
   log.info(
@@ -1859,7 +1859,7 @@ async function runSweepItem(input: RunSweepItemInput): Promise<SweepItemOutcome>
   });
 
   const sampler = new MemorySampler();
-  let phase: RunItemTickInput["status"] = "loading";
+  let phase: TestItemTickInput["status"] = "loading";
   let detail: string | undefined;
   let lastStderrAt = Date.now();
   let sawStderr = false;
@@ -2045,25 +2045,25 @@ async function runSweepItem(input: RunSweepItemInput): Promise<SweepItemOutcome>
   }
 }
 
-interface RunSweepItemViaServerInput {
+interface TestSweepItemViaServerInput {
   runId: string;
   item: SweepItem;
   repeats: number;
   modelPath: string;
-  // See RunSweepItemInput.modelSizeBytes above -- same purpose.
+  // See TestSweepItemInput.modelSizeBytes above -- same purpose.
   modelSizeBytes: number;
-  // See RunSweepItemInput.tensorBreakdown above -- same purpose.
+  // See TestSweepItemInput.tensorBreakdown above -- same purpose.
   tensorBreakdown: TensorLayerBreakdown | null;
   mtpModelPath: string | undefined;
   llamaServerPath: string;
   port: number;
   backend: Backend;
-  // See shared/types.ts's RunConfig.main_gpu -- forwarded to serverBench.ts's
+  // See shared/types.ts's TestConfig.main_gpu -- forwarded to serverBench.ts's
   // buildArgs unchanged.
   mainGpu?: number;
   timeoutMs: number | undefined;
   rawJsonDir: string;
-  // See RunSweepItemInput.attempt above.
+  // See TestSweepItemInput.attempt above.
   attempt?: number;
 }
 
@@ -2075,7 +2075,7 @@ interface RunSweepItemViaServerInput {
 // reporting is simpler here: serverBench.ts drives its own repeat loop
 // directly, so ticks come from a plain callback rather than regex-scraped
 // subprocess stderr.
-async function runSweepItemViaServer(input: RunSweepItemViaServerInput): Promise<SweepItemOutcome> {
+async function runSweepItemViaServer(input: TestSweepItemViaServerInput): Promise<SweepItemOutcome> {
   const { runId, item, backend } = input;
   const label = `run ${runId} item ${item.idx} (mtp)`;
   const attempt = input.attempt ?? 0;
@@ -2193,13 +2193,13 @@ async function runSweepItemViaServer(input: RunSweepItemViaServerInput): Promise
 // runs still get a log). A failure here is logged but never thrown -- losing
 // the log is unfortunate, not a reason to fail the whole job when every item
 // already reported its own outcome individually.
-async function pushRunLogIfPresent(runId: string): Promise<void> {
+async function pushTestLogIfPresent(runId: string): Promise<void> {
   const path = runLogFilePath(runId);
   if (!existsSync(path)) return;
   try {
     const text = readFileSync(path, "utf8");
     const gzipped = gzipSync(Buffer.from(text, "utf8"));
-    await withAuth((token) => pushRunLog(config.url, token, config.machine_id!, runId, gzipped));
+    await withAuth((token) => pushTestLog(config.url, token, config.machine_id!, runId, gzipped));
     log.info(`run ${runId}: log pushed (${gzipped.length}B gzipped)`);
   } catch (err) {
     log.warn(`run ${runId}: failed to push log (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
@@ -2352,7 +2352,7 @@ async function executeRuntimeBenchmarkJob(
     }
     setRunLogFile(null);
     updateJobReport({ phase: "finalizing", detail: "pushing run log" });
-    await pushRunLogIfPresent(payload.run_id);
+    await pushTestLogIfPresent(payload.run_id);
     return;
   }
 
@@ -2447,7 +2447,7 @@ async function executeRuntimeBenchmarkJob(
   } finally {
     setRunLogFile(null);
     updateJobReport({ phase: "finalizing", detail: "pushing run log" });
-    await pushRunLogIfPresent(payload.run_id);
+    await pushTestLogIfPresent(payload.run_id);
   }
 }
 
@@ -2516,8 +2516,8 @@ async function executeBenchmarkJob(payload: BenchmarkJob): Promise<void> {
   // run's own finish line can report a success/fail breakdown instead of
   // just "finished all N test(s)" with no indication of how many of those
   // actually succeeded.
-  const statusCounts: Partial<Record<TerminalRunItemStatus, number>> = {};
-  const tally = (status: TerminalRunItemStatus): void => {
+  const statusCounts: Partial<Record<TerminalTestItemStatus, number>> = {};
+  const tally = (status: TerminalTestItemStatus): void => {
     statusCounts[status] = (statusCounts[status] ?? 0) + 1;
   };
   try {
@@ -2613,7 +2613,7 @@ async function executeBenchmarkJob(payload: BenchmarkJob): Promise<void> {
   } finally {
     setRunLogFile(null);
     updateJobReport({ phase: "finalizing", detail: "pushing run log" });
-    await pushRunLogIfPresent(payload.run_id);
+    await pushTestLogIfPresent(payload.run_id);
   }
 }
 
@@ -2988,7 +2988,7 @@ async function executeDownloadModelJob(
 // caller then logs the candidate context with no estimate rather than a
 // fabricated one.
 function estimateProbeMemoryNeed(
-  payload: RunProbeJobPayload,
+  payload: TestProbeJobPayload,
   candidateCtx: number,
   ngl: number
 ): { vramMib: number; ramMib: number } | null {
@@ -3042,7 +3042,7 @@ function describeEstimatedMemoryNeed(estimate: { vramMib: number; ramMib: number
 // moves, how far, and when to stop. This function is only the loop that turns
 // its decisions into real model loads, so the strategy stays testable without
 // a GPU.
-async function executeRunProbeJob(payload: RunProbeJobPayload): Promise<void> {
+async function executeRunProbeJob(payload: TestProbeJobPayload): Promise<void> {
   const modelPath = await resolveModelPath(payload.model);
   if (!existsSync(modelPath)) throw new Error(`model file not found at ${modelPath}`);
   const resolvedBuild = getInstalledBuild(buildsDir, payload.llama_cpp_build);
@@ -3310,7 +3310,7 @@ async function executeRunProbeJob(payload: RunProbeJobPayload): Promise<void> {
     );
   } finally {
     setRunLogFile(null);
-    await pushRunLogIfPresent(payload.run_id);
+    await pushTestLogIfPresent(payload.run_id);
   }
 }
 
@@ -3340,7 +3340,7 @@ function toProbeAttemptReport(attempt: ProbeAttemptOutcome): ProbeAttemptReport 
 }
 
 interface ProbeLoadInput {
-  payload: RunProbeJobPayload;
+  payload: TestProbeJobPayload;
   modelPath: string;
   serverPath: string;
   candidateCtx: number;
@@ -3513,7 +3513,7 @@ async function executeMeasureQualityJob(payload: MeasureQualityJobPayload): Prom
     log.info(`${label}: ppl=${ppl.toFixed(4)} against ${payload.datasetHash}`);
   } finally {
     setRunLogFile(null);
-    await pushRunLogIfPresent(payload.run_id);
+    await pushTestLogIfPresent(payload.run_id);
   }
 }
 
@@ -4027,6 +4027,13 @@ async function workerMain(): Promise<void> {
         pauseRequested = false;
         stopRequested = false;
         activeBenchProc = null;
+        // Same instant-visibility kick as claiming a job above -- several job
+        // types (delete_model_file, refresh_models, delete_build,
+        // activate_build) change state a heartbeat reports (model_files,
+        // llama.cpp builds), and without this the server's cached view stays
+        // stale for up to a full idle HEARTBEAT_INTERVAL_MS after the job is
+        // actually done.
+        kickHeartbeatSoon();
       }
     } catch (err) {
       log.error(`worker loop error: ${err instanceof Error ? err.message : String(err)}`);

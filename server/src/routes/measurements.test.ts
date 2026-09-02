@@ -59,7 +59,7 @@ function makeRun(
     status?: string;
   } = { worker: "" }
 ): void {
-  repo.createRun(undefined, {
+  repo.createTest(undefined, {
     id,
     kind: (opts.kind as never) ?? null,
     root_run_id: opts.root_run_id ?? id,
@@ -72,7 +72,7 @@ function makeRun(
     status: (opts.status as never) ?? "running",
     started_at: Date.now(),
   } as never);
-  repo.createRunItems(undefined, id, [
+  repo.createTestItems(undefined, id, [
     {
       idx: 0,
       n_prompt: 512,
@@ -381,7 +381,7 @@ describe("POST /api/runs/:id/probe-result (N2)", () => {
     );
     expect(res.status).toBe(200);
 
-    const rungs = repo.probeAttemptsRepo.listForRun("probe-rungs");
+    const rungs = repo.probeAttemptsRepo.listForTest("probe-rungs");
     expect(rungs).toHaveLength(2);
     expect(rungs.map((r) => r.seq)).toEqual([0, 1]);
     expect(rungs[0].candidate_ctx).toBe(32_768);
@@ -399,7 +399,7 @@ describe("POST /api/runs/:id/probe-result (N2)", () => {
 
   // Same field, same validator, the OTHER call site -- the final ladder
   // report goes through validateProbeAttempts/validateOneProbeAttempt too.
-  it("keeps reused_from_run_id through the final replaceForRun report, not just the live tick", async () => {
+  it("keeps reused_from_run_id through the final replaceForTest report, not just the live tick", async () => {
     // reused_from_run_id is a real FK (schema.sql) -- the sibling it names
     // has to exist, same as any production dedup source would.
     makeRun("probe-rungs-reused-sibling", { kind: "probe", worker: workerId, config: { probe: probeSpec } });
@@ -423,7 +423,7 @@ describe("POST /api/runs/:id/probe-result (N2)", () => {
       workerToken
     );
     expect(res.status).toBe(200);
-    const rungs = repo.probeAttemptsRepo.listForRun("probe-rungs-reused");
+    const rungs = repo.probeAttemptsRepo.listForTest("probe-rungs-reused");
     expect(rungs[0].reused_from_run_id).toBe("probe-rungs-reused-sibling");
   });
 
@@ -440,7 +440,7 @@ describe("POST /api/runs/:id/probe-result (N2)", () => {
       workerToken
     );
     expect(res.status).toBe(200);
-    expect(repo.probeAttemptsRepo.listForRun("probe-rungs-fail")).toHaveLength(1);
+    expect(repo.probeAttemptsRepo.listForTest("probe-rungs-fail")).toHaveLength(1);
   });
 
   it("rejects a malformed attempt reading rather than storing it as data", async () => {
@@ -455,7 +455,7 @@ describe("POST /api/runs/:id/probe-result (N2)", () => {
       workerToken
     );
     expect(res.status).toBe(400);
-    expect(repo.probeAttemptsRepo.listForRun("probe-bad-attempt")).toHaveLength(0);
+    expect(repo.probeAttemptsRepo.listForTest("probe-bad-attempt")).toHaveLength(0);
   });
 
   it("records a failed probe without writing any verified ceiling", async () => {
@@ -467,7 +467,7 @@ describe("POST /api/runs/:id/probe-result (N2)", () => {
     );
     expect(res.status).toBe(200);
     expect(repo.limitsRepo.listForModelAndWorker("m1", workerId).some((r) => r.kv_type === "q4_0/q4_0")).toBe(false);
-    expect(repo.getRunItems("probe-fail")[0].status).toBe("failed_oom");
+    expect(repo.getTestItems("probe-fail")[0].status).toBe("failed_oom");
   });
 
   // A user stop mid-ladder must read as "cancelled", never "failed"/"failed_oom"
@@ -492,12 +492,12 @@ describe("POST /api/runs/:id/probe-result (N2)", () => {
       workerToken
     );
     expect(res.status).toBe(200);
-    expect(repo.probeAttemptsRepo.listForRun("probe-stopped")).toHaveLength(1);
+    expect(repo.probeAttemptsRepo.listForTest("probe-stopped")).toHaveLength(1);
     expect(repo.limitsRepo.listForModelAndWorker("m1", workerId).some((r) => r.kv_type === "q5_0/q5_0")).toBe(false);
-    const item = repo.getRunItems("probe-stopped")[0];
+    const item = repo.getTestItems("probe-stopped")[0];
     expect(item.status).toBe("cancelled");
     expect(item.error).toBe("stopped by user before the ladder found a usable placement");
-    expect(repo.getRun(undefined, "probe-stopped")?.status).toBe("cancelled");
+    expect(repo.getTest(undefined, "probe-stopped")?.status).toBe("cancelled");
   });
 
   it("falls back to a generic 'stopped by user' error when the worker sends none", async () => {
@@ -512,7 +512,7 @@ describe("POST /api/runs/:id/probe-result (N2)", () => {
       workerToken
     );
     expect(res.status).toBe(200);
-    expect(repo.getRunItems("probe-stopped-no-error")[0].error).toBe("stopped by user");
+    expect(repo.getTestItems("probe-stopped-no-error")[0].error).toBe("stopped by user");
   });
 
   it("rejects a status outside verified/failed/failed_oom/stopped", async () => {
@@ -537,14 +537,14 @@ describe("POST /api/runs/:id/probe-attempt (N2 live progress)", () => {
       workerToken
     );
     expect(res.status).toBe(200);
-    const rows = repo.probeAttemptsRepo.listForRun("probe-tick-a");
+    const rows = repo.probeAttemptsRepo.listForTest("probe-tick-a");
     expect(rows).toHaveLength(1);
     expect(rows[0].seq).toBe(0);
     expect(rows[0].ok).toBe(1);
     expect(rows[0].gen_tps).toBe(42.5);
     // Not yet finalized -- an in-progress probe's run_item stays non-terminal
-    // until the real probe-result call, unlike the batched replaceForRun path.
-    expect(repo.getRunItems("probe-tick-a")[0].status).not.toBe("done");
+    // until the real probe-result call, unlike the batched replaceForTest path.
+    expect(repo.getTestItems("probe-tick-a")[0].status).not.toBe("done");
   });
 
   // N2 batch dedup -- a reused rung's provenance has to actually survive the
@@ -568,7 +568,7 @@ describe("POST /api/runs/:id/probe-attempt (N2 live progress)", () => {
       workerToken
     );
     expect(res.status).toBe(200);
-    const rows = repo.probeAttemptsRepo.listForRun("probe-tick-reused");
+    const rows = repo.probeAttemptsRepo.listForTest("probe-tick-reused");
     expect(rows[0].reused_from_run_id).toBe("probe-tick-reused-sibling");
   });
 
@@ -585,7 +585,7 @@ describe("POST /api/runs/:id/probe-attempt (N2 live progress)", () => {
       workerToken
     );
     expect(retry.status).toBe(200);
-    const rows = repo.probeAttemptsRepo.listForRun("probe-tick-b");
+    const rows = repo.probeAttemptsRepo.listForTest("probe-tick-b");
     expect(rows).toHaveLength(1);
     expect(rows[0].ok).toBe(1);
     expect(rows[0].gen_tps).toBe(12);
@@ -601,7 +601,7 @@ describe("POST /api/runs/:id/probe-attempt (N2 live progress)", () => {
       );
       expect(res.status).toBe(200);
     }
-    const rows = repo.probeAttemptsRepo.listForRun("probe-tick-c");
+    const rows = repo.probeAttemptsRepo.listForTest("probe-tick-c");
     expect(rows.map((r) => r.seq)).toEqual([0, 1, 2]);
     expect(rows.map((r) => r.candidate_ctx)).toEqual([4096, 8192, 12288]);
   });

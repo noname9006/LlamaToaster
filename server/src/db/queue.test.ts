@@ -155,11 +155,11 @@ describe("workerRepo.getOrCreateByMachineId", () => {
   });
 });
 
-describe("Worker.activeRunId / activeJobProgress (client-facing progress plumbing)", () => {
+describe("Worker.activeTestId / activeJobProgress (client-facing progress plumbing)", () => {
   it("is undefined for a worker with no active job", () => {
     const worker = repo.workerRepo.getOrCreateByMachineId("machine-no-job", "box");
     const fetched = repo.workerRepo.getWorker(worker.id)!;
-    expect(fetched.activeRunId).toBeUndefined();
+    expect(fetched.activeTestId).toBeUndefined();
     expect(fetched.activeJobProgress).toBeUndefined();
   });
 
@@ -182,11 +182,11 @@ describe("Worker.activeRunId / activeJobProgress (client-facing progress plumbin
 
     const fetched = repo.workerRepo.getWorker(worker.id)!;
     expect(fetched.activeJobId).toBe(jobId);
-    expect(fetched.activeRunId).toBe("run-r1");
+    expect(fetched.activeTestId).toBe("run-r1");
     expect(fetched.activeJobProgress).toMatchObject({ phase: "benchmarking", item_idx: 2, items_total: 8 });
   });
 
-  it("leaves activeRunId undefined for a non-benchmark job (e.g. download_model), but still surfaces progress", () => {
+  it("leaves activeTestId undefined for a non-benchmark job (e.g. download_model), but still surfaces progress", () => {
     const worker = repo.workerRepo.getOrCreateByMachineId("machine-active-download", "box");
     const jobId = repo.queueRepo.enqueueJob(worker.id, {
       type: "download_model",
@@ -201,7 +201,7 @@ describe("Worker.activeRunId / activeJobProgress (client-facing progress plumbin
     });
 
     const fetched = repo.workerRepo.getWorker(worker.id)!;
-    expect(fetched.activeRunId).toBeUndefined();
+    expect(fetched.activeTestId).toBeUndefined();
     expect(fetched.activeJobProgress).toMatchObject({ phase: "downloading", bytes: 500_000_000, total_bytes: 5_000_000_000 });
   });
 
@@ -217,7 +217,7 @@ describe("Worker.activeRunId / activeJobProgress (client-facing progress plumbin
 
     const all = repo.workerRepo.listWorkers();
     const found = all.find((w) => w.id === worker.id);
-    expect(found?.activeRunId).toBe("run-r3");
+    expect(found?.activeTestId).toBe("run-r3");
     expect(found?.activeJobProgress?.phase).toBe("loading");
   });
 

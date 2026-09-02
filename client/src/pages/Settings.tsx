@@ -182,7 +182,7 @@ export function Settings() {
           All benchmarks run through this platform are automatically saved to our database, including
           hardware configurations, OS details, models, and test results. Your privacy is strictly
           protected: all shared data is fully anonymized, ensuring no other user can ever associate your
-          account or machines with your test runs.
+          account or machines with your tests.
         </p>
         <div className="mt-3 flex items-center justify-between rounded-lg border border-border px-3 py-2.5">
           <span className="text-sm font-medium text-fg">Contribute to the community benchmark database</span>
@@ -274,7 +274,7 @@ export function Settings() {
         <section className="mt-8">
           <h2 className="text-sm font-semibold text-danger">Danger zone</h2>
           <p className="mt-1 text-sm text-muted">
-            Permanently deletes your account: every linked sign-in, active session, machine, run, and
+            Permanently deletes your account: every linked sign-in, active session, machine, test, and
             result. Models you registered stay in the shared catalog for other users, just no longer
             attributed to you. This cannot be undone —{" "}
             <a href="/api/results/export?format=csv" className="text-accent hover:underline">

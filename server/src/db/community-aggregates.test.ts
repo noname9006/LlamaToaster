@@ -30,8 +30,8 @@ afterAll(() => {
 
 // Raw SQL throughout, same posture as legacy-history.test.ts -- this test
 // needs precise control over which user/worker/run/result combination lands
-// in which group cell, which going through the normal createRun/
-// recordRunItemTerminal pipeline (designed around one worker executing one
+// in which group cell, which going through the normal createTest/
+// recordTestItemTerminal pipeline (designed around one worker executing one
 // sweep at a time) would make far more verbose for no benefit.
 function insertUser(id: string, shareBenchmarks: boolean): void {
   getDb()

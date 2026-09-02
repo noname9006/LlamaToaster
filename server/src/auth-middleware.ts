@@ -38,14 +38,21 @@ export const PUBLIC_PATHS = new Set([
 // inline instead of calling authenticateWorker() directly, since neither has
 // a JSON req.body with a machine_id field to read the Stage 1 fallback's
 // identity from (the run-log push's body is raw gzip bytes; the item-tick
-// body is a RunItemUpdateInput, which never carried machine_id -- see
+// body is a TestItemUpdateInput, which never carried machine_id -- see
 // routes/runs.ts's own comments on each for how each resolves the caller
 // instead). Keyed on (method, url) together, unlike the /api/worker/ prefix
 // check, because both URL patterns are ALSO used by a GET/browser-session
 // caller (log download, run detail polling) -- only the POST leg of each is
 // worker-to-server.
+// Each /api/runs/... entry below is paired with the /api/tests/... path it's
+// migrating to (see routes/tests.ts's backward-compat aliasing) -- both must
+// stay listed while a not-yet-updated worker binary may still be calling the
+// legacy path. Drop the /api/runs/... entries once every worker is confirmed
+// off it.
 const WORKER_AUTHENTICATED_ROUTES = new Set([
+  "POST /api/tests/:id/log",
   "POST /api/runs/:id/log",
+  "POST /api/tests/:id/items/:idx",
   "POST /api/runs/:id/items/:idx",
   // Worker -> server download-completion callback (routes/workers.ts) -- was
   // missed when auth was bolted on, so every download's callback 401'd with
@@ -56,7 +63,9 @@ const WORKER_AUTHENTICATED_ROUTES = new Set([
   // handlers enforce a STRICTER rule than authenticateWorker's dual mode:
   // an enrolled worker session only, never the shared deployment secret,
   // because these rows feed verified claims other tenants see.
+  "POST /api/tests/:id/probe-result",
   "POST /api/runs/:id/probe-result",
+  "POST /api/tests/:id/quality-result",
   "POST /api/runs/:id/quality-result",
 ]);
 

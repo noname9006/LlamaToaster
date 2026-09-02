@@ -2,14 +2,14 @@ import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { api } from "../api/client";
 import { StatCard } from "../components/StatCard";
-import { RunStatusPill, StatusPill, type PillTone } from "../components/StatusPill";
+import { TestStatusPill, StatusPill, type PillTone } from "../components/StatusPill";
 import { TokSpeedDemo } from "../components/TokSpeedDemo";
-import type { Run, Worker } from "../types";
+import type { Test, Worker } from "../types";
 import { shortId, formatGpuLabel } from "../utils";
 
 // Multi-user Stage 5 (MULTIUSER_PLAN.md §5.2): "machines, not users" for
 // every number EXCEPT the "Users" stat card below -- every other number and
-// machine shown here comes from api.listWorkers()/api.listRuns(), both
+// machine shown here comes from api.listWorkers()/api.listTests(), both
 // already scoped to the caller's own account once authenticated (Stage 4's
 // own §4.3/§4.5 scoping) and unfiltered in single-tenant mode (AUTH_ENABLED
 // off), unchanged from before that scoping existed. "Users" is a deliberate,
@@ -49,7 +49,7 @@ function MachineRow({ worker }: { worker: Worker }) {
 }
 
 export function Dashboard() {
-  const [runs, setRuns] = useState<Run[]>([]);
+  const [runs, setRuns] = useState<Test[]>([]);
   const [workers, setWorkers] = useState<Worker[]>([]);
   const [userCount, setUserCount] = useState<number | null>(null);
   const [loaded, setLoaded] = useState(false);
@@ -63,7 +63,7 @@ export function Dashboard() {
     let cancelled = false;
     async function poll() {
       try {
-        const [r, w, s] = await Promise.all([api.listRuns(), api.listWorkers(), api.getStats()]);
+        const [r, w, s] = await Promise.all([api.listTests(), api.listWorkers(), api.getStats()]);
         if (cancelled) return;
         setRuns(r);
         setWorkers(w);
@@ -89,7 +89,7 @@ export function Dashboard() {
   const machinesEverConnected = workers.filter((w) => w.lastHeartbeatAt !== null).length;
   const testsTotal = runs.reduce((sum, r) => sum + (r.items_total ?? 0), 0);
   // "Runs" in this app's own vocabulary means repeats (-r), not sweep
-  // combinations or job rows -- see RunDetail.tsx's own totalRuns (items x
+  // combinations or job rows -- see TestDetail.tsx's own totalRuns (items x
   // repeats) for the per-run version of this same math. A raw runs.length
   // (job-row count) would undercount relative to testsTotal above, since
   // one job's several sweep combinations each get counted as one test but
@@ -131,13 +131,13 @@ export function Dashboard() {
       )}
 
       <section className="mt-8">
-        <h2 className="text-sm font-semibold uppercase tracking-wide text-muted">Recent runs</h2>
-        {loaded && recent.length === 0 && <p className="mt-2 text-sm text-muted">No runs yet.</p>}
+        <h2 className="text-sm font-semibold uppercase tracking-wide text-muted">Recent tests</h2>
+        {loaded && recent.length === 0 && <p className="mt-2 text-sm text-muted">No tests yet.</p>}
         <div className="mt-2 flex flex-col divide-y divide-border overflow-hidden rounded-xl border border-border bg-surface">
           {recent.map((r) => (
             <Link
               key={r.id}
-              to={`/runs/${r.id}`}
+              to={`/tests/${r.id}`}
               className="flex items-center gap-3 px-4 py-3 text-sm transition-colors hover:bg-white/5"
             >
               <code className="text-muted">{shortId(r.id)}</code>
@@ -149,7 +149,7 @@ export function Dashboard() {
                     {r.items_done}/{r.items_total}
                   </span>
                 ) : null}
-                <RunStatusPill status={r.status} />
+                <TestStatusPill status={r.status} />
               </span>
             </Link>
           ))}

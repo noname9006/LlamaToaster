@@ -13,11 +13,11 @@ const NAV_ITEMS: NavItem[] = [
   { to: "/", label: "Dashboard", icon: IconGrid, end: true },
   { to: "/models", label: "Models", icon: IconBox },
   // The v8 console (BENCHMARKING_PLAN_V8.md, docs/benchmark-page-mockup-v8.html):
-  // state the goal, the page derives the tuning->refine->sweep chain. "New Run"
+  // state the goal, the page derives the tuning->refine->sweep chain. "Custom Test"
   // stays beside it as the hand-built single-grid path.
   { to: "/benchmark", label: "Benchmark", icon: IconActivity },
-  { to: "/new-run", label: "New Run", icon: IconPlusCircle },
-  { to: "/runs", label: "Runs", icon: IconList },
+  { to: "/custom-test", label: "Custom Test", icon: IconPlusCircle },
+  { to: "/tests", label: "Tests", icon: IconList },
   { to: "/compare", label: "Compare", icon: IconBarChart },
   { to: "/workers", label: "Workers", icon: IconServer },
 ];

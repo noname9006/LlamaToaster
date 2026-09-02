@@ -30,9 +30,9 @@ function abandonJob(job: ReapableJob, reason: string, log: ReaperLogger, event: 
   if (job.run_id) {
     // undefined userId -- the reaper has no request/user context, and a
     // stale job's run needs reconciling regardless of who owns it (see
-    // repo.ts's reconcileStaleRun doc comment, MULTIUSER_PLAN.md §4.3).
-    repo.reconcileStaleRun(undefined, job.run_id, reason);
-    repo.queueRepo.cancelPendingJobsForRun(job.run_id);
+    // repo.ts's reconcileStaleTest doc comment, MULTIUSER_PLAN.md §4.3).
+    repo.reconcileStaleTest(undefined, job.run_id, reason);
+    repo.queueRepo.cancelPendingJobsForTest(job.run_id);
   }
   log.warn({ job_id: job.id, run_id: job.run_id, cancel_requested: !!job.cancel_requested }, event);
 }

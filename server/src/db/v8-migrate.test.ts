@@ -445,7 +445,7 @@ describe("v8 schema evolution (§0.11)", () => {
     expect(row.ram_peak_mib).toBeNull();
 
     // A fresh insert using every current column (what repo.ts's
-    // replaceForRun actually does) must now succeed against the backfilled
+    // replaceForTest actually does) must now succeed against the backfilled
     // table -- this is what threw "no such column" in production.
     expect(() =>
       db

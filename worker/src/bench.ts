@@ -20,7 +20,7 @@ export interface BenchRunInput {
   llamaBenchPath: string;
   backend: string;
   // Index into the worker's detected GPU list (see shared/types.ts's
-  // RunConfig.main_gpu) -- restricts this run to one GPU on a multi-GPU
+  // TestConfig.main_gpu) -- restricts this run to one GPU on a multi-GPU
   // worker. Applied as `-sm none -mg <index>` in buildArgs below: split-mode
   // "none" is required alongside --main-gpu, since llama.cpp's default split
   // mode ("layer") still spreads the model across every visible GPU
@@ -170,7 +170,7 @@ export interface BenchResult {
   // Radeon RX 6600 XT", "AMD Ryzen 5 5600X 6-Core Processor") -- confirmed
   // live these are always present in that JSON, no flags needed. Used by
   // worker/src/index.ts's runSweepItem for the Tier-2 backend_device_name
-  // upgrade (see shared/types.ts's Run.backend_device_name). Undefined on
+  // upgrade (see shared/types.ts's Test.backend_device_name). Undefined on
   // the llama-server/MTP path, which has no JSON output at all, and
   // undefined here too if stdout failed to parse.
   gpu_info?: string;

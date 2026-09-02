@@ -4,11 +4,11 @@
 // behind the §0.9 k-anonymity floor, which lives in the community-aggregate
 // path, not here.
 
-import type { FastifyInstance } from "fastify";
+import type { FastifyInstance, FastifyRequest, FastifyReply } from "fastify";
 import { repo } from "../db/repo.js";
 import { resolveAuthUser } from "../auth-middleware.js";
 import { buildCurve, buildLadder, deriveKnee, type CurveSourceRow } from "../../../shared/curves.js";
-import { CURVE_METHOD_VERSION, type ResultRow, type RunConfig } from "../../../shared/types.js";
+import { CURVE_METHOD_VERSION, type ResultRow, type TestConfig } from "../../../shared/types.js";
 import { maxAffordableContext, residentWeightsMibFromPeak } from "../../../shared/vramEstimate.js";
 import { priceMatrix, priceRate, type RateCandidate } from "../../../shared/pricing.js";
 
@@ -174,17 +174,17 @@ export async function curveRoutes(app: FastifyInstance): Promise<void> {
   // (denominator: ALL non-cancelled items, skipped included) offers a priced
   // re-run of just those items after cooldown. NEVER automatic: this route
   // reports, the user decides.
-  app.get<{ Params: { id: string } }>("/api/runs/:id/sustained", async (request, reply) => {
+  const getSustainedHandler = async (request: FastifyRequest<{ Params: { id: string } }>, reply: FastifyReply) => {
     const authed = resolveAuthUser(request);
     const userId = authed?.user.id;
-    const run = repo.getRun(userId, request.params.id);
+    const run = repo.getTest(userId, request.params.id);
     if (!run) return reply.code(404).send({ error: "run not found" });
 
-    const items = repo.getRunItems(run.id);
+    const items = repo.getTestItems(run.id);
     const { ratio, denominator } = repo.thermallyFlaggedRatio(run.id);
     const flaggedIdx = new Set(
       repo
-        .getResultsForRun(run.id)
+        .getResultsForTest(run.id)
         .filter((r) => (r.caveat_flags ?? []).includes("thermally_throttled"))
         .map((r) => r.idx)
     );
@@ -194,7 +194,7 @@ export async function curveRoutes(app: FastifyInstance): Promise<void> {
     // this read-only GET, which the UI polls repeatedly and would otherwise
     // multiply the same event by every page view.
 
-    const config = run.config as RunConfig;
+    const config = run.config as TestConfig;
     const repeats = config?.sweep?.repeats ?? 1;
     const rows = repo.listCurveRows(userId, run.model_id, { workerId: run.worker_id ?? undefined });
     const candidates: RateCandidate[] = rows
@@ -240,25 +240,29 @@ export async function curveRoutes(app: FastifyInstance): Promise<void> {
           : `discarding from ${repeats} repeats would leave n = ${repeats - 1} and break the stability gate's n >= 3 floor`,
       },
     };
-  });
+  };
+  app.get("/api/tests/:id/sustained", getSustainedHandler);
+  app.get("/api/runs/:id/sustained", getSustainedHandler);
 
   // N5 -- the knee is a DERIVED read, not a stored verdict.
-  app.get<{ Params: { id: string } }>("/api/runs/:id/knee", async (request, reply) => {
+  const getKneeHandler = async (request: FastifyRequest<{ Params: { id: string } }>, reply: FastifyReply) => {
     const authed = resolveAuthUser(request);
     const userId = authed?.user.id;
-    const run = repo.getRun(userId, request.params.id);
+    const run = repo.getTest(userId, request.params.id);
     if (!run) return reply.code(404).send({ error: "run not found" });
     const rootRunId = run.root_run_id ?? run.id;
     const rows: ResultRow[] = [];
-    for (const member of repo.listRunsUnderRoot(userId, rootRunId)) {
-      rows.push(...repo.getResultsForRun(member.id));
+    for (const member of repo.listTestsUnderRoot(userId, rootRunId)) {
+      rows.push(...repo.getResultsForTest(member.id));
     }
     const knee = deriveKnee(rows.map(toCurveRow));
     return {
       run_id: run.id,
       root_run_id: rootRunId,
-      spec: (run.config as RunConfig).knee ?? null,
+      spec: (run.config as TestConfig).knee ?? null,
       ...knee,
     };
-  });
+  };
+  app.get("/api/tests/:id/knee", getKneeHandler);
+  app.get("/api/runs/:id/knee", getKneeHandler);
 }

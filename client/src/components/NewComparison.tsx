@@ -121,7 +121,7 @@ export function NewComparison({ onCreated }: { onCreated: (comparisonId: string)
     const failures: string[] = [];
     for (const modelId of selectedModelIds) {
       try {
-        await api.triggerRun({
+        await api.triggerTest({
           model_id: modelId,
           worker_id: worker.id,
           kind: "sweep",

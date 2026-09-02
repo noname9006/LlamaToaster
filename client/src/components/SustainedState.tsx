@@ -9,13 +9,13 @@ import { useEffect, useState } from "react";
 import { api } from "../api/client";
 import type { SustainedResponse } from "../types";
 
-export function SustainedState({ runId, refreshKey }: { runId: string; refreshKey?: unknown }) {
+export function SustainedState({ testId, refreshKey }: { testId: string; refreshKey?: unknown }) {
   const [data, setData] = useState<SustainedResponse | null>(null);
 
   useEffect(() => {
     let cancelled = false;
     api
-      .getSustained(runId)
+      .getSustained(testId)
       .then((res) => {
         if (!cancelled) setData(res);
       })
@@ -25,7 +25,7 @@ export function SustainedState({ runId, refreshKey }: { runId: string; refreshKe
     return () => {
       cancelled = true;
     };
-  }, [runId, refreshKey]);
+  }, [testId, refreshKey]);
 
   if (!data) return null;
   const flagged = data.flagged_items.length;

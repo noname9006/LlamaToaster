@@ -126,6 +126,31 @@ function persistThisMachineWorkerId(workerId: string | null): void {
   }
 }
 
+// Every worker's models section starts collapsed -- which ones the user has
+// expanded is purely a per-browser display preference, remembered the same
+// way THIS_MACHINE_WORKER_KEY is (localStorage, not sessionStorage) so it
+// survives across visits on the same machine.
+const OPEN_WORKER_SECTIONS_KEY = "llamatoaster:models-open-worker-ids";
+
+function loadOpenWorkerIds(): string[] {
+  try {
+    const raw = localStorage.getItem(OPEN_WORKER_SECTIONS_KEY);
+    if (!raw) return [];
+    const parsed: unknown = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.filter((v): v is string => typeof v === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+function persistOpenWorkerIds(ids: string[]): void {
+  try {
+    localStorage.setItem(OPEN_WORKER_SECTIONS_KEY, JSON.stringify(ids));
+  } catch {
+    /* localStorage unavailable -- open/collapsed state just won't survive a refresh */
+  }
+}
+
 // `downloading`/`progress`/`speeds` below used to be keyed by bare filename
 // alone, which collided whenever two downloads shared a filename -- common
 // for GGUF quants, since many uploaders reuse fixed names like
@@ -318,6 +343,7 @@ export function Models() {
   const [addMsg, setAddMsg] = useState("");
   const [manualAddOpen, setManualAddOpen] = useState(loadManualAddOpen);
   const [thisMachineWorkerId, setThisMachineWorkerId] = useState<string | null>(loadThisMachineWorkerId);
+  const [openWorkerIds, setOpenWorkerIds] = useState<string[]>(loadOpenWorkerIds);
 
   const [hfQuery, setHfQuery] = useState(() => loadPersistedHfSearch()?.query ?? "");
   // hfPages holds every raw HF search page fetched so far (each with its own
@@ -444,32 +470,6 @@ export function Models() {
     [workers, filteredModels, locations, sortField, sortDir]
   );
 
-  // Which machine counts as "in use" on page load, so its models section
-  // opens expanded while every other machine's stays collapsed (the flat
-  // list of every worker's models expanded at once got unwieldy once a user
-  // has more than one or two machines). The user's own pairing (this
-  // browser said "I'm the laptop") wins outright since it's an explicit,
-  // per-device statement -- nothing server-derived should override it. Only
-  // once that's unset (or points at a worker that's since been removed) do
-  // we fall back to guessing: a worker actually running a benchmark right
-  // now (status "busy") is the next-clearest signal, then whichever
-  // configured worker most recently heartbeated (idle machines heartbeat
-  // too, offline ones stop), then just the first configured worker so the
-  // page never opens with every section collapsed. Computed once workers
-  // are loaded -- workers isn't re-fetched after mount, so this stays stable
-  // and doesn't fight a user's own manual expand/collapse afterward.
-  const activeWorkerId = useMemo(() => {
-    if (workers.length === 0) return null;
-    if (thisMachineWorkerId && workers.some((w) => w.id === thisMachineWorkerId)) return thisMachineWorkerId;
-    const busy = workers.find((w) => w.status === "busy");
-    if (busy) return busy.id;
-    const heartbeating = workers.filter((w) => w.status !== "offline" && w.lastHeartbeatAt != null);
-    if (heartbeating.length > 0) {
-      return heartbeating.reduce((a, b) => (b.lastHeartbeatAt! > a.lastHeartbeatAt! ? b : a)).id;
-    }
-    return workers[0].id;
-  }, [workers, thisMachineWorkerId]);
-
   // Sort is applied server-side now (server/src/hf.ts) -- params filtering
   // stays client-side (HF's search API has no equivalent). Pages are built
   // FROM the filtered results, not the other way around: every fetched raw
@@ -580,12 +580,41 @@ export function Models() {
     setDeletingKey(key);
     setModelsMsg("");
     try {
-      await api.deleteModelFileFromWorker(worker.id, filename);
+      const res = await api.deleteModelFileFromWorker(worker.id, filename);
       setModelsMsg(`Queued: delete ${m.filename} from ${worker.displayName}`);
-      await Promise.all([loadModels(), loadLocations()]);
+      // Poll job status until the worker actually claims and finishes the
+      // delete (same pattern as handleRefreshModels above) before refreshing
+      // locations -- an immediate reload here used to race the job: the
+      // worker hasn't deleted the file yet (it may not even have claimed the
+      // job), so /api/models/locations still reported this worker as an
+      // owner and the row never disappeared until an unrelated page reload
+      // happened to land after the next heartbeat.
+      const jobId = res.job_id;
+      const workerId = worker.id;
+      const maxPolls = 30; // ~30 * 2s = 1 minute max
+      let polls = 0;
+      const poll = async () => {
+        polls++;
+        try {
+          const job = await api.getJobStatus(workerId, jobId);
+          if (job.status === "completed" || job.status === "failed" || job.status === "cancelled") {
+            await Promise.all([loadModels(), loadLocations()]);
+            setDeletingKey((k) => (k === key ? null : k));
+            return;
+          }
+        } catch {
+          // Job not found or transient -- fall back to reloading anyway after a few polls
+        }
+        if (polls >= maxPolls) {
+          await Promise.all([loadModels(), loadLocations()]);
+          setDeletingKey((k) => (k === key ? null : k));
+          return;
+        }
+        setTimeout(poll, 2000);
+      };
+      setTimeout(poll, 2000);
     } catch (err) {
       setModelsMsg(`Error: ${err instanceof Error ? err.message : String(err)}`);
-    } finally {
       setDeletingKey(null);
     }
   }
@@ -634,6 +663,10 @@ export function Models() {
   useEffect(() => {
     persistDownloads(downloading);
   }, [downloading]);
+
+  useEffect(() => {
+    persistOpenWorkerIds(openWorkerIds);
+  }, [openWorkerIds]);
 
   useEffect(() => {
     persistHfSearch({
@@ -1374,9 +1407,6 @@ export function Models() {
                     </option>
                   ))}
                 </select>
-                <span className="text-xs text-muted/70">
-                  Remembered on this browser only -- keeps its models section open by default.
-                </span>
               </label>
             )}
 
@@ -1384,15 +1414,20 @@ export function Models() {
               {modelsByWorker.map(({ worker, subset, groups, orphans }) => (
                 <details
                   key={worker.id}
-                  open={worker.id === activeWorkerId}
+                  open={openWorkerIds.includes(worker.id)}
+                  onToggle={(e) => {
+                    const isOpen = e.currentTarget.open;
+                    setOpenWorkerIds((ids) => {
+                      if (isOpen) return ids.includes(worker.id) ? ids : [...ids, worker.id];
+                      return ids.includes(worker.id) ? ids.filter((id) => id !== worker.id) : ids;
+                    });
+                  }}
                   className="group rounded-xl border border-border bg-surface"
                 >
                   <summary className="flex cursor-pointer items-center justify-between px-4 py-2.5 text-sm font-semibold text-fg">
                     <span className="flex items-center gap-2">
                       {worker.displayName}
-                      {worker.id === activeWorkerId && (
-                        <StatusPill label={worker.id === thisMachineWorkerId ? "this machine" : "in use"} tone="accent" />
-                      )}
+                      {worker.id === thisMachineWorkerId && <StatusPill label="this machine" tone="accent" />}
                       <span className="text-xs font-normal text-muted">
                         ({subset.length} file{subset.length === 1 ? "" : "s"}
                         {subset.length > 0 ? ` · ${formatBytes(subset.reduce((n, m) => n + m.size_bytes, 0))}` : ""})

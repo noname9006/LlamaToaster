@@ -93,7 +93,7 @@ beforeAll(async () => {
     metadata: { quant: "Q4_K_M", trained_ctx: 32_768, n_layer: 48, n_head_kv: 4, head_dim_k: 128, head_dim_v: 128 },
   });
 
-  repo.createRun(undefined, {
+  repo.createTest(undefined, {
     id: "run-export",
     kind: "sweep",
     root_run_id: "run-export",
@@ -111,7 +111,7 @@ beforeAll(async () => {
     status: "running",
     started_at: Date.now(),
   } as never);
-  repo.createRunItems(undefined, "run-export", [
+  repo.createTestItems(undefined, "run-export", [
     {
       idx: 0,
       n_prompt: 512,
@@ -130,7 +130,7 @@ beforeAll(async () => {
       n_cpu_moe: 0,
     },
   ] as never);
-  repo.recordRunItemTerminal("run-export", 0, {
+  repo.recordTestItemTerminal("run-export", 0, {
     status: "done",
     results: [result("pp", 1400), result("tg", 41)] as never,
   });
@@ -189,7 +189,7 @@ describe("POST /api/import (N7)", () => {
     const body = (await res.json()) as { run_id: string; imported_rows: number; opted_into_scoring: boolean };
     expect(body.imported_rows).toBe(2);
     expect(body.opted_into_scoring).toBe(false);
-    const rows = repo.getResultsForRun(body.run_id);
+    const rows = repo.getResultsForTest(body.run_id);
     expect(rows.map((r) => r.config_hash).sort()).toEqual(bundle.rows.map((r) => r.config_hash).sort());
     expect(rows.every((r) => r.imported_bundle_id != null)).toBe(true);
   });

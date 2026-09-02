@@ -135,7 +135,7 @@ function makeScoredRun(
   configs: { ngl: number; pp: number; tg: number; vramPeak?: number }[],
   extra: Partial<{ goals: unknown; kind: string }> = {}
 ): void {
-  repo.createRun(undefined, {
+  repo.createTest(undefined, {
     id: runId,
     kind: (extra.kind as never) ?? "sweep",
     worker_id: null as never,
@@ -147,13 +147,13 @@ function makeScoredRun(
     status: "running",
     started_at: Date.now(),
   });
-  repo.createRunItems(
+  repo.createTestItems(
     undefined,
     runId,
     configs.map((c, i) => item(i, { n_gpu_layers: c.ngl })) as never
   );
   configs.forEach((c, i) => {
-    repo.recordRunItemTerminal(runId, i, {
+    repo.recordTestItemTerminal(runId, i, {
       status: "done",
       results: [
         result("pp", c.pp, { n_gpu_layers: c.ngl, vram_peak_mib: c.vramPeak ?? 4000 }),
@@ -239,7 +239,7 @@ describe("GET /api/runs/:id/profiles (M3)", () => {
   });
 
   it("excludes N3 comparison members from profile scoring", async () => {
-    repo.createRun(undefined, {
+    repo.createTest(undefined, {
       id: "run-cmp",
       kind: "sweep",
       comparison_id: "cmp-1",
@@ -252,8 +252,8 @@ describe("GET /api/runs/:id/profiles (M3)", () => {
       status: "running",
       started_at: Date.now(),
     });
-    repo.createRunItems(undefined, "run-cmp", [item(0)] as never);
-    repo.recordRunItemTerminal("run-cmp", 0, {
+    repo.createTestItems(undefined, "run-cmp", [item(0)] as never);
+    repo.recordTestItemTerminal("run-cmp", 0, {
       status: "done",
       results: [result("pp", 9999), result("tg", 999)] as never,
     });
@@ -277,7 +277,7 @@ describe("GET /api/runs/:id/profiles (M3)", () => {
     // picked so residentWeightsMibFromPeak backs out to the worked example's
     // 2969 MiB (context 640 tokens -> 60 MiB of KV at 96 KiB/token, +256
     // scratch): 2969 + 60 + 256 = 3285.
-    repo.createRun(undefined, {
+    repo.createTest(undefined, {
       id: "run-interp-baseline",
       kind: "sweep",
       worker_id: worker.id,
@@ -289,8 +289,8 @@ describe("GET /api/runs/:id/profiles (M3)", () => {
       status: "running",
       started_at: Date.now(),
     });
-    repo.createRunItems(undefined, "run-interp-baseline", [item(0)] as never);
-    repo.recordRunItemTerminal("run-interp-baseline", 0, {
+    repo.createTestItems(undefined, "run-interp-baseline", [item(0)] as never);
+    repo.recordTestItemTerminal("run-interp-baseline", 0, {
       status: "done",
       results: [
         result("pp", 1000, { vram_peak_mib: 3285, gpu_memory_total_mb: 8192 }),
@@ -301,7 +301,7 @@ describe("GET /api/runs/:id/profiles (M3)", () => {
     // Target run: the SAME placement, SAME worker+model, but its own VRAM
     // reading is unusable (e.g. the GPU read failed) -- null, not just
     // absent.
-    repo.createRun(undefined, {
+    repo.createTest(undefined, {
       id: "run-interp-target",
       kind: "sweep",
       worker_id: worker.id,
@@ -313,8 +313,8 @@ describe("GET /api/runs/:id/profiles (M3)", () => {
       status: "running",
       started_at: Date.now(),
     });
-    repo.createRunItems(undefined, "run-interp-target", [item(0)] as never);
-    repo.recordRunItemTerminal("run-interp-target", 0, {
+    repo.createTestItems(undefined, "run-interp-target", [item(0)] as never);
+    repo.recordTestItemTerminal("run-interp-target", 0, {
       status: "done",
       results: [
         result("pp", 1000, { vram_peak_mib: null, gpu_memory_total_mb: null }),
@@ -336,7 +336,7 @@ describe("GET /api/runs/:id/profiles (M3)", () => {
 
   it("offers a conservative floor candidate (full trained_ctx) when neither this chain nor a prior run has usable VRAM data", async () => {
     const worker = repo.workerRepo.getOrCreateByMachineId("profiles-no-data-worker", "profiles-no-data-worker");
-    repo.createRun(undefined, {
+    repo.createTest(undefined, {
       id: "run-no-vram-data",
       kind: "sweep",
       worker_id: worker.id,
@@ -348,8 +348,8 @@ describe("GET /api/runs/:id/profiles (M3)", () => {
       status: "running",
       started_at: Date.now(),
     });
-    repo.createRunItems(undefined, "run-no-vram-data", [item(0)] as never);
-    repo.recordRunItemTerminal("run-no-vram-data", 0, {
+    repo.createTestItems(undefined, "run-no-vram-data", [item(0)] as never);
+    repo.recordTestItemTerminal("run-no-vram-data", 0, {
       status: "done",
       results: [
         result("pp", 1000, { vram_peak_mib: null, gpu_memory_total_mb: null }),
