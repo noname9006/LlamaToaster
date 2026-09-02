@@ -2920,8 +2920,40 @@ export const repo = {
       const scalar = (sql: string): number => (db.prepare(sql).get() as { n: number }).n;
 
       const users = scalar(`SELECT COUNT(*) AS n FROM users`);
-      const machines = scalar(`SELECT COUNT(DISTINCT machine_id) AS n FROM workers`);
-      const runs = scalar(`SELECT COUNT(*) AS n FROM runs`);
+      // "Ever connected" per the AdminStats doc comment -- a worker row
+      // created by enrolment but never heartbeated (abandoned before
+      // approval, or approved but never actually started) must not inflate
+      // this, same as client/src/pages/Dashboard.tsx's own
+      // machinesEverConnected filter.
+      const machines = scalar(
+        `SELECT COUNT(DISTINCT machine_id) AS n FROM workers WHERE last_heartbeat_at IS NOT NULL`
+      );
+
+      // Individual physical executions (items x repeats), not run/job rows --
+      // this app's own "runs" vocabulary, see Dashboard.tsx's own totalRuns
+      // and its header comment ("'Runs' ... means repeats (-r), not sweep
+      // combinations or job rows"). A raw COUNT(*) FROM runs would count Test
+      // entities instead, which is a different number entirely once anyone
+      // uses sweep repeats > 1.
+      const runRows = db
+        .prepare(
+          `SELECT runs.config AS config,
+                  (SELECT COUNT(*) FROM run_items WHERE run_items.run_id = runs.id) AS items_total
+           FROM runs`
+        )
+        .all() as { config: string; items_total: number }[];
+      let runs = 0;
+      for (const row of runRows) {
+        let repeats = 1;
+        try {
+          const cfg = JSON.parse(row.config) as TestConfig;
+          if (typeof cfg.sweep?.repeats === "number") repeats = cfg.sweep.repeats;
+        } catch {
+          // corrupt config blob -- fall back to repeats=1, same as a run with
+          // no sweep config at all
+        }
+        runs += row.items_total * repeats;
+      }
 
       // Models tested + quants tested share the same tested-model universe:
       // distinct models referenced by at least one run (GROUP BY m.id collapses
