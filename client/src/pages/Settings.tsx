@@ -176,39 +176,36 @@ export function Settings() {
         </div>
       </section>
 
-      <section className="mt-8">
-        <h2 className="text-sm font-semibold text-fg">Community benchmark data</h2>
-        <p className="mt-1 text-sm text-muted">
-          All benchmarks run through this platform are automatically saved to our database, including
-          hardware configurations, OS details, models, and test results. Your privacy is strictly
-          protected: all shared data is fully anonymized, ensuring no other user can ever associate your
-          account or machines with your tests.
-        </p>
-        <div className="mt-3 flex items-center justify-between rounded-lg border border-border px-3 py-2.5">
-          <span className="text-sm font-medium text-fg">Contribute to the community benchmark database</span>
-          <button
-            type="button"
-            role="switch"
-            aria-checked={shareBenchmarks ?? false}
-            onClick={() => void handleToggleShareBenchmarks()}
-            disabled={shareBenchmarks === null || !appSettings?.communitySharingAllowed}
-            className={`relative h-6 w-11 flex-none rounded-full transition-colors disabled:opacity-50 ${
-              shareBenchmarks ? "bg-accent" : "bg-white/10"
-            }`}
-          >
-            <span
-              className={`absolute left-0.5 top-0.5 h-5 w-5 rounded-full bg-white transition-transform ${
-                shareBenchmarks ? "translate-x-[22px]" : "translate-x-0"
-              }`}
-            />
-          </button>
-        </div>
-        {appSettings !== null && !appSettings.communitySharingAllowed && (
-          <p className="mt-1.5 text-xs text-muted">
-            Your operator hasn&apos;t turned this on for this deployment yet.
+      {appSettings?.communitySharingAllowed && (
+        <section className="mt-8">
+          <h2 className="text-sm font-semibold text-fg">Community benchmark data</h2>
+          <p className="mt-1 text-sm text-muted">
+            All benchmarks run through this platform are automatically saved to our database, including
+            hardware configurations, OS details, models, and test results. Your privacy is strictly
+            protected: all shared data is fully anonymized, ensuring no other user can ever associate your
+            account or machines with your tests.
           </p>
-        )}
-      </section>
+          <div className="mt-3 flex items-center justify-between rounded-lg border border-border px-3 py-2.5">
+            <span className="text-sm font-medium text-fg">Contribute to the community benchmark database</span>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={shareBenchmarks ?? false}
+              onClick={() => void handleToggleShareBenchmarks()}
+              disabled={shareBenchmarks === null}
+              className={`relative h-6 w-11 flex-none rounded-full transition-colors disabled:opacity-50 ${
+                shareBenchmarks ? "bg-accent" : "bg-white/10"
+              }`}
+            >
+              <span
+                className={`absolute left-0.5 top-0.5 h-5 w-5 rounded-full bg-white transition-transform ${
+                  shareBenchmarks ? "translate-x-[22px]" : "translate-x-0"
+                }`}
+              />
+            </button>
+          </div>
+        </section>
+      )}
 
       <section className="mt-8">
         <div className="flex items-center justify-between">
