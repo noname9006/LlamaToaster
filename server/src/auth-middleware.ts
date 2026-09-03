@@ -159,7 +159,13 @@ export async function authMiddleware(req: FastifyRequest): Promise<void> {
   // query-string-carrying) req.url instead.
   if (routeUrl === undefined) return;
   if (PUBLIC_PATHS.has(routeUrl)) return;
-  if (req.method === "GET" && !routeUrl.startsWith("/api/")) return; // SPA static assets
+  // SPA static assets. HEAD counts as GET here: Fastify derives a HEAD route
+  // from every GET one, so gating HEAD behind a session made HEAD and GET
+  // disagree on the SAME public URL (HEAD / answered 401 while GET / answered
+  // 200), which breaks link previews, uptime checks and anything else that
+  // probes with HEAD. A HEAD response carries no body, so this exposes
+  // nothing GET doesn't already serve publicly.
+  if ((req.method === "GET" || req.method === "HEAD") && !routeUrl.startsWith("/api/")) return;
   // Workers keep their own auth (worker-auth.ts's authenticateWorker,
   // called explicitly inside each handler), never this middleware's user
   // session (MULTIUSER_PLAN.md §1.15: "the protocol... stay identical; only

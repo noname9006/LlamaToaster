@@ -32,6 +32,9 @@ beforeAll(async () => {
   // A representative mix -- exercises every branch authMiddleware has to
   // decide between, without needing the real routes/*.ts files registered.
   app.get("/health", async () => ({ ok: true }));
+  // Stands in for the SPA that @fastify/static serves at "/" -- a non-/api
+  // GET route, which Fastify also answers for HEAD.
+  app.get("/", async () => "<!doctype html>");
   app.get("/api/auth/status", async (req) => ({ user: resolveAuthUser(req)?.user ?? null }));
   app.get("/api/protected", async (req) => ({ user: (req as unknown as { user: unknown }).user }));
   app.post("/api/worker/queue", async () => ({ ok: true }));
@@ -132,6 +135,18 @@ describe("authMiddleware", () => {
   it("POST /api/models/download-callback is exempt -- worker credential, not a user session (regression: 401'd \"no session\" before this route was added to WORKER_AUTHENTICATED_ROUTES)", async () => {
     const res = await fetch(`${baseUrl}/api/models/download-callback`, { method: "POST" });
     expect(res.status).toBe(200);
+  });
+
+  it("answers HEAD on a public non-API route the same as GET (regression: HEAD / 401'd while GET / was 200, so uptime checks and link previews saw the site as down)", async () => {
+    const get = await fetch(`${baseUrl}/`);
+    const head = await fetch(`${baseUrl}/`, { method: "HEAD" });
+    expect(get.status).toBe(200);
+    expect(head.status).toBe(200);
+  });
+
+  it("still requires a session for HEAD on an /api/ route -- the exemption is scoped to static assets", async () => {
+    const res = await fetch(`${baseUrl}/api/protected`, { method: "HEAD" });
+    expect(res.status).toBe(401);
   });
 
   it("an unmatched route fails closed (never treated as public)", async () => {
