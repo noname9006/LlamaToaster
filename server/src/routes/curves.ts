@@ -1,8 +1,8 @@
 // BENCHMARKING_PLAN_V8.md N1 + N5 read paths. Both compute on read over
 // ordinary `results` rows; neither materializes anything. The curve endpoint
 // serves the caller's OWN rows -- other tenants' contributions surface only
-// behind the §0.9 k-anonymity floor, which lives in the community-aggregate
-// path, not here.
+// through the consent-gated, identity-free community-aggregate path (see
+// repo.ts's communityRepo), not here.
 
 import type { FastifyInstance, FastifyRequest, FastifyReply } from "fastify";
 import { repo } from "../db/repo.js";

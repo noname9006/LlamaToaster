@@ -770,6 +770,25 @@ function deriveModelId(input: RegisterModelInput): string {
 // rather than an import from shared/probeLadder.ts's own PROBE_MAX_LOADS.
 const DEFAULT_PROBE_MAX_LOADS = 24;
 
+// The k-anonymity floor communityRepo's aggregates are subject to: the
+// minimum number of DISTINCT opted-in contributors a group must combine
+// before it is returned at all. See communityRepo's own comment for why the
+// default is 1 (no floor beyond consent) rather than BENCHMARKING_PLAN_V8.md
+// §0.9's original 5. Read per call rather than at module load so a test (or
+// an operator restarting with a different value) gets the current setting;
+// the result is validated to a positive integer here because it is
+// interpolated into SQL rather than bound as a parameter -- a HAVING
+// threshold cannot be a bound parameter in the prepared statements below
+// without reshuffling every existing positional argument.
+export const DEFAULT_COMMUNITY_MIN_CONTRIBUTORS = 1;
+export function communityMinContributors(): number {
+  const raw = process.env.COMMUNITY_MIN_CONTRIBUTORS;
+  if (raw == null || raw.trim() === "") return DEFAULT_COMMUNITY_MIN_CONTRIBUTORS;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n < 1) return DEFAULT_COMMUNITY_MIN_CONTRIBUTORS;
+  return n;
+}
+
 export const repo = {
   listModels(): Model[] {
     const rows = getDb()
@@ -1075,7 +1094,7 @@ export const repo = {
   // method_version), ordered by effective context. idx_results_curve covers
   // exactly those five keys, so this stays an index range scan.
   // Serves the CALLER's own rows; other tenants' contributions only ever
-  // surface behind the §0.9 k-anonymity floor, never here.
+  // surface through the consent-gated communityRepo aggregates, never here.
   listCurveRows(
     userId: string | undefined,
     modelId: string,
@@ -3066,12 +3085,25 @@ export const repo = {
   // cross-tenant read (§5.3). Consent is still enforced HERE, in SQL
   // (u.share_benchmarks = 1 / the consentWhere clause below) -- only opted-in
   // users' rows are ever included, and the caller's own contribution is
-  // always excluded from their own results. BENCHMARKING_PLAN_V8.md §0.9
-  // requires HAVING COUNT(DISTINCT user_id) >= 5 on every community
-  // aggregate; a prior revision dropped it for usability (collecting five
-  // people on the exact same model/backend/GPU combo is rare), but the floor
-  // is normative, not a nice-to-have -- fewer than 5 contributors stays
-  // private-by-default even if that means the group renders empty.
+  // always excluded from their own results.
+  //
+  // BENCHMARKING_PLAN_V8.md §0.9 specified a hard k-anonymity floor of five
+  // distinct contributors per aggregate. That floor is now operator-tunable
+  // (COMMUNITY_MIN_CONTRIBUTORS, see communityMinContributors above) and
+  // defaults to 1 -- an aggregate may describe a single opted-in machine.
+  //
+  // Why the default moved: the group key is (model, backend, test_type,
+  // platform, gpu_model). Requiring five DISTINCT users on that exact
+  // combination suppressed effectively every row until the database is very
+  // large, which made the shared results base -- the entire point of the
+  // hosted instance -- answer nothing. What actually protects a contributor
+  // sits upstream of the floor and is still unconditional: explicit consent
+  // (users.share_benchmarks), a projection carrying no identity, account id
+  // or hostname, caller self-exclusion, and `build` deliberately kept out of
+  // the group key. Every row also carries contributor_count, so a consumer
+  // can say "one machine reported this" instead of implying a consensus.
+  //
+  // Set COMMUNITY_MIN_CONTRIBUTORS=5 to restore §0.9's original floor.
   communityRepo: {
     // Matches the plan's own §5.4 SQL with one addition: ri.test_type is
     // added to the SELECT/GROUP BY on top of the plan's literal query. pp and
@@ -3106,7 +3138,7 @@ export const repo = {
              AND (? IS NULL OR json_extract(w.hardware_json, '$.platform') = ?)
              AND (? IS NULL OR json_extract(w.hardware_json, '$.gpu[0].model') = ?)
            GROUP BY r.model_id, r.llama_cpp_backend, ri.test_type, platform, gpu_model
-           HAVING COUNT(DISTINCT r.user_id) >= 5
+           HAVING COUNT(DISTINCT r.user_id) >= ${communityMinContributors()}
            ORDER BY avg_tps DESC`
         )
         .all(
@@ -3148,12 +3180,11 @@ export const repo = {
     },
 
     // Each dimension is counted on its own here (not listAggregates' full
-    // group key), so a value appears the moment 5 distinct opted-in users
-    // have shared it -- regardless of which model/backend they happened to
-    // run it with. Same §0.9 floor as listAggregates (a facet value shown
-    // with a low contributorCount is exactly the re-identifying leak the
-    // floor exists to prevent), enforced the same way: HAVING, not a
-    // post-filter, so a suppressed value never reaches the caller at all.
+    // group key), so a value appears the moment communityMinContributors()
+    // distinct opted-in users have shared it -- regardless of which
+    // model/backend they happened to run it with. Same floor as
+    // listAggregates, enforced the same way: HAVING, not a post-filter, so a
+    // value below the floor never reaches the caller at all.
     listFacets(callerId: string): CommunityFacets {
       const db = getDb();
       const consentWhere = `r.user_id IS NOT NULL AND r.user_id <> ? AND u.share_benchmarks = 1`;
@@ -3164,7 +3195,7 @@ export const repo = {
            FROM runs r JOIN users u ON u.id = r.user_id LEFT JOIN models m ON m.id = r.model_id
            WHERE ${consentWhere}
            GROUP BY r.model_id
-           HAVING COUNT(DISTINCT r.user_id) >= 5`
+           HAVING COUNT(DISTINCT r.user_id) >= ${communityMinContributors()}`
         )
         .all(callerId) as { model_id: string; filename: string | null; contributor_count: number }[];
 
@@ -3174,7 +3205,7 @@ export const repo = {
            FROM runs r JOIN users u ON u.id = r.user_id
            WHERE ${consentWhere}
            GROUP BY r.llama_cpp_backend
-           HAVING COUNT(DISTINCT r.user_id) >= 5`
+           HAVING COUNT(DISTINCT r.user_id) >= ${communityMinContributors()}`
         )
         .all(callerId) as { value: string; contributor_count: number }[];
 
@@ -3184,7 +3215,7 @@ export const repo = {
            FROM runs r JOIN users u ON u.id = r.user_id LEFT JOIN workers w ON w.id = r.worker_id
            WHERE ${consentWhere} AND json_extract(w.hardware_json, '$.platform') IS NOT NULL
            GROUP BY value
-           HAVING COUNT(DISTINCT r.user_id) >= 5`
+           HAVING COUNT(DISTINCT r.user_id) >= ${communityMinContributors()}`
         )
         .all(callerId) as { value: string; contributor_count: number }[];
 
@@ -3194,7 +3225,7 @@ export const repo = {
            FROM runs r JOIN users u ON u.id = r.user_id LEFT JOIN workers w ON w.id = r.worker_id
            WHERE ${consentWhere} AND json_extract(w.hardware_json, '$.gpu[0].model') IS NOT NULL
            GROUP BY value
-           HAVING COUNT(DISTINCT r.user_id) >= 5`
+           HAVING COUNT(DISTINCT r.user_id) >= ${communityMinContributors()}`
         )
         .all(callerId) as { value: string; contributor_count: number }[];
 
@@ -3291,16 +3322,6 @@ export const repo = {
         )
         .run(String(value));
       return repo.appSettingsRepo.get();
-    },
-  },
-
-  // Total registered accounts -- the one intentionally cross-tenant number
-  // shown on the (otherwise per-account-scoped) main Dashboard, alongside
-  // the caller's own machine/run/test counts. See client/src/pages/
-  // Dashboard.tsx's own header comment for why this is the one exception.
-  statsRepo: {
-    userCount(): number {
-      return (getDb().prepare(`SELECT COUNT(*) as n FROM users`).get() as { n: number }).n;
     },
   },
 

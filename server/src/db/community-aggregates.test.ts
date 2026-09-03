@@ -82,7 +82,22 @@ function insertResult(
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-describe("repo.communityRepo (§5.4 consent + self-exclusion + §0.9 k-anonymity floor)", () => {
+// communityMinContributors() reads COMMUNITY_MIN_CONTRIBUTORS per call, so a
+// test can exercise a specific floor without reimporting the module. Restores
+// whatever was there before, including "not set at all".
+function withFloor<T>(floor: number | null, fn: () => T): T {
+  const prev = process.env.COMMUNITY_MIN_CONTRIBUTORS;
+  if (floor === null) delete process.env.COMMUNITY_MIN_CONTRIBUTORS;
+  else process.env.COMMUNITY_MIN_CONTRIBUTORS = String(floor);
+  try {
+    return fn();
+  } finally {
+    if (prev === undefined) delete process.env.COMMUNITY_MIN_CONTRIBUTORS;
+    else process.env.COMMUNITY_MIN_CONTRIBUTORS = prev;
+  }
+}
+
+describe("repo.communityRepo (§5.4 consent + self-exclusion + the contributor floor)", () => {
   const modelId = "community-model-1";
 
   beforeAll(() => {
@@ -110,21 +125,42 @@ describe("repo.communityRepo (§5.4 consent + self-exclusion + §0.9 k-anonymity
     insertRun("run8", "u8-optout", "w8", modelId, "cuda", "b9999");
     insertResult("run8", "u8-optout", modelId, "tg", 999, 8000, 20000);
 
-    // Group Y: a single opted-in contributor on a rare GPU -- exactly the
-    // shape BENCHMARKING_PLAN_V8.md §0.9's k-anonymity floor exists to
-    // suppress. This group must stay private-by-default: it never appears in
-    // listAggregates or listFacets no matter who asks, even though the row
-    // itself is perfectly valid data.
+    // Group Y: a single opted-in contributor on a rare GPU. Visible under the
+    // default floor of 1 (with contributorCount: 1, so a consumer can caveat
+    // it), suppressed entirely once an operator raises
+    // COMMUNITY_MIN_CONTRIBUTORS -- both directions are asserted below.
     insertUser("u7-lonely", true);
     insertWorker("w7", "linux", "RTX 3060");
     insertRun("run7", "u7-lonely", "w7", modelId, "cuda", "b2000");
     insertResult("run7", "u7-lonely", modelId, "tg", 40, 6000, 10000);
   });
 
-  it("suppresses a group below the 5-distinct-contributor floor (§0.9)", () => {
-    const rows = repo.communityRepo.listAggregates("some-other-caller");
+  it("suppresses a group below an operator-raised contributor floor", () => {
+    const rows = withFloor(5, () => repo.communityRepo.listAggregates("some-other-caller"));
     const rtx3060 = rows.find((r) => r.gpuModel === "RTX 3060");
     expect(rtx3060).toBeUndefined();
+  });
+
+  it("returns a single-contributor group under the default floor, labelled as such", () => {
+    const rows = withFloor(null, () => repo.communityRepo.listAggregates("some-other-caller"));
+    const rtx3060 = rows.find((r) => r.gpuModel === "RTX 3060");
+    expect(rtx3060).toBeDefined();
+    // The row is what makes a young database useful at all -- but it carries
+    // its own sample size, so nothing downstream can present one machine as
+    // a consensus.
+    expect(rtx3060!.contributorCount).toBe(1);
+  });
+
+  it("ignores a malformed or out-of-range floor instead of failing open or closed", () => {
+    for (const bad of ["0", "-3", "abc", "2.5", ""]) {
+      const rows = withFloor(bad as unknown as number, () =>
+        repo.communityRepo.listAggregates("some-other-caller")
+      );
+      // Falls back to the default of 1: the lonely group is present, and the
+      // query ran at all (a non-numeric value interpolated into the HAVING
+      // clause would be a SQL error, not an empty result).
+      expect(rows.find((r) => r.gpuModel === "RTX 3060")).toBeDefined();
+    }
   });
 
   it("excludes the caller's own contribution from both the group and its average, and drops build from the key", () => {
@@ -159,8 +195,8 @@ describe("repo.communityRepo (§5.4 consent + self-exclusion + §0.9 k-anonymity
     expect(tgRow!.contributorCount).toBe(6);
   });
 
-  it("every returned row clears the 5-contributor floor and carries no UUID- or username-shaped value", () => {
-    const rows = repo.communityRepo.listAggregates("some-other-caller");
+  it("every returned row clears the configured floor and carries no UUID- or username-shaped value", () => {
+    const rows = withFloor(5, () => repo.communityRepo.listAggregates("some-other-caller"));
     expect(rows.length).toBeGreaterThan(0);
     for (const row of rows) {
       expect(row.contributorCount).toBeGreaterThanOrEqual(5);
@@ -178,8 +214,8 @@ describe("repo.communityRepo (§5.4 consent + self-exclusion + §0.9 k-anonymity
     }
   });
 
-  it("listFacets applies the same §0.9 floor as listAggregates", () => {
-    const facets = repo.communityRepo.listFacets("u1");
+  it("listFacets applies the same floor as listAggregates", () => {
+    const facets = withFloor(5, () => repo.communityRepo.listFacets("u1"));
     const gpu4090 = facets.gpuModels.find((g) => g.value === "RTX 4090");
     expect(gpu4090).toBeDefined();
     expect(gpu4090!.contributorCount).toBe(5); // u1 excluded, u8-optout excluded by consent
