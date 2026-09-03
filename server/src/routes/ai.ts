@@ -100,9 +100,13 @@ const TOOLS = [
     },
   },
   // Multi-user Stage 5 (MULTIUSER_PLAN.md §5.4): the assistant's only window
-  // into other users' data, and it can only ever see k-anonymised aggregates
-  // -- every row repo.communityRepo returns already describes five or more
-  // people, never fewer, and never a username or machine id. Requires
+  // into other users' data, and it can only ever see aggregates -- every row
+  // repo.communityRepo returns is restricted to users who opted in, excludes
+  // the caller's own contribution, and carries no username, account id or
+  // machine id. It does carry contributorCount, which the assistant should
+  // quote rather than presenting a one-machine row as a consensus (rows may
+  // describe a single contributor unless the operator raises
+  // COMMUNITY_MIN_CONTRIBUTORS -- see repo.ts's communityRepo). Requires
   // sign-in (see runTool below); with AUTH_ENABLED off or no session, both
   // tools return an error result instead of data.
   {

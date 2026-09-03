@@ -2,7 +2,8 @@
 
 This is a solo-maintained project — response times vary, but contributions
 are welcome. This doc covers the mechanics; for what the app actually does
-and why, see [README.md](README.md) and [MULTIUSER_PLAN.md](MULTIUSER_PLAN.md).
+and why, see [README.md](README.md) and
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Project layout
 
@@ -67,8 +68,9 @@ areas most likely to silently break.
 - Commit messages: short, imperative, explain the *why* over the *what*
   where it's not obvious (`git log` has plenty of examples).
 - If your change affects deployment, env vars, or the worker protocol,
-  update the relevant section of `README.md` / `MULTIUSER_PLAN.md` in the
-  same PR.
+  update the relevant section of `README.md` / `docs/ARCHITECTURE.md` in
+  the same PR. The specs under `docs/plans/` are historical — don't edit
+  them to describe new behavior.
 
 ## Reporting bugs / requesting features
 

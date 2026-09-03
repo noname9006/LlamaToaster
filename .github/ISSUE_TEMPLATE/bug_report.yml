@@ -1,0 +1,90 @@
+name: Bug report
+description: Something in LlamaToaster behaves incorrectly
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please don't report security vulnerabilities here — see
+        [SECURITY.md](https://github.com/noname9006/LlamaToaster/blob/main/SECURITY.md)
+        for private reporting.
+
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: Where did this happen?
+      options:
+        - llamatoaster.com (the hosted instance)
+        - Self-hosted, with accounts (AUTH_ENABLED=true)
+        - Self-hosted, single-user (no login)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Which part?
+      options:
+        - Worker (benchmark box)
+        - Server / API
+        - Dashboard UI
+        - AI assistant
+        - Model download / Hugging Face index
+        - Not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened, and what did you expect instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Registered model X from repo Y
+        2. Triggered a sweep with -ngl 0..40, ctx 4096
+        3. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: hardware
+    attributes:
+      label: Machine and build
+      description: >
+        Only if the worker is involved. GPU + VRAM, CPU, RAM, OS, the
+        llama.cpp build tag and backend, and the model file (repo/filename or
+        quant) — most benchmark bugs are specific to one of these.
+      placeholder: |
+        GPU: RTX 4090 24GB (driver 566.36, CUDA 12.7)
+        CPU: Ryzen 7800X3D, 64GB RAM
+        OS: Windows 11
+        llama.cpp: b10068, cuda backend
+        Model: unsloth/Qwen3-30B-A3B-GGUF, Q4_K_M
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log output
+      description: >
+        Server console, or the worker's own log (worker/logs/worker-YYYY-MM-DD.log,
+        or the per-test log downloadable from a failed test). Redact anything
+        you don't want public.
+      render: shell
+    validations:
+      required: false
+
+  - type: input
+    id: version
+    attributes:
+      label: Version / commit
+      placeholder: "v2.0.0, or the commit hash you're running"
+    validations:
+      required: false
