@@ -356,6 +356,26 @@ export function Models() {
   // covers the next display page or the cursor runs out.
   const [hfPages, setHfPages] = useState<HfPage[]>(() => loadPersistedHfSearch()?.pages ?? []);
   const [hfPageIndex, setHfPageIndex] = useState(() => loadPersistedHfSearch()?.pageIndex ?? 0);
+  // Monotonic "search world" counter. Any change that invalidates already-fetched
+  // HF pages -- a fresh query/sort (runFreshHfSearch) or a params-filter change
+  // that re-chunks the filtered buffer -- bumps it. Every async fetch/fill path
+  // captures it before awaiting and refuses to commit its (now stale) result
+  // afterwards, so a slow in-flight pagination can never overwrite a newer
+  // search's pages or advance the page index past what the current filter
+  // actually matches (the "empty page" bug). See ensurePageFilled,
+  // goToNextHfPage and runFreshHfSearch.
+  const hfSearchEpochRef = useRef(0);
+  const bumpHfSearchEpoch = () => {
+    hfSearchEpochRef.current += 1;
+  };
+  // Count of user-triggered HF operations (fresh search / Next-page fill) still
+  // in flight. Only the LAST one to finish clears the `searching` flag -- if a
+  // superseded request drew its finally-run first, it mustn't re-enable the Next
+  // button while a newer search is still placing its page-0: a Next clicked into
+  // that gap would build on the half-replaced pages the epoch guard hasn't seen
+  // yet. With Next kept disabled for the whole overlap, fills can only ever
+  // start from a stable, current search world.
+  const hfBusyRef = useRef(0);
   const [expandedRepo, setExpandedRepo] = useState<string | null>(() => loadPersistedHfSearch()?.expandedRepo ?? null);
   const [filesByRepo, setFilesByRepo] = useState<Record<string, HfFileEntry[]>>(
     () => loadPersistedHfSearch()?.filesByRepo ?? {}
@@ -493,6 +513,17 @@ export function Models() {
   // Next" when Next is actually a dead end.
   const hasMoreHfPages =
     filteredHfResults.length > (hfPageIndex + 1) * HF_PAGE_SIZE || !!hfPages[hfPages.length - 1]?.nextCursor;
+  // Highest index the currently-filtered buffer can actually back a full page
+  // with -- a hard floor against structurally-empty pages. hfPageIndex only
+  // ever advances to a position the fill logic proved non-empty, but stale
+  // sessionStorage restores and the narrow window between a filter change and
+  // an in-flight commit could still point past the data; clamping here makes an
+  // empty display page impossible regardless of how the index got there.
+  const maxHfPageIndex = Math.max(0, Math.ceil(filteredHfResults.length / HF_PAGE_SIZE) - 1);
+
+  useEffect(() => {
+    setHfPageIndex((i) => Math.min(i, maxHfPageIndex));
+  }, [maxHfPageIndex]);
 
   async function loadModels() {
     setModels(await api.listModels());
@@ -918,6 +949,11 @@ export function Models() {
   // than reading hfSortField/hfSortDir off state so a control's own onChange
   // can pass its *new* value without waiting a render for state to catch up.
   async function runFreshHfSearch(field: HfSortField, dir: SortDir) {
+    // This replaces the entire search world -- any ensurePageFilled/Next fill
+    // still in flight belongs to the old one and must not commit afterwards.
+    bumpHfSearchEpoch();
+    const epoch = hfSearchEpochRef.current;
+    hfBusyRef.current += 1;
     setHfMsg("");
     setExpandedRepo(null);
     setSearching(true);
@@ -927,13 +963,18 @@ export function Models() {
         sort: HF_SORT_SERVER_FIELD[field],
         direction: field === "relevance" ? undefined : dir === "asc" ? 1 : -1,
       });
+      // A newer query/sort/filter took over while we were fetching -- don't
+      // stomp on its pages with this stale result.
+      if (hfSearchEpochRef.current !== epoch) return;
       setHfPages([{ results, nextCursor }]);
       setHfPageIndex(0);
       if (!results.length) setHfMsg("No repos found.");
     } catch (err) {
+      if (hfSearchEpochRef.current !== epoch) return;
       setHfMsg(`Search error: ${err instanceof Error ? err.message : String(err)}`);
     } finally {
-      setSearching(false);
+      hfBusyRef.current -= 1;
+      if (hfBusyRef.current <= 0) setSearching(false);
     }
   }
 
@@ -958,18 +999,27 @@ export function Models() {
   // set topped up, a page can only ever be non-full at the true end of the
   // results, never because a raw HF page happened to filter down to nothing.
   //
+  // `epoch` is the search world the caller started under; if it moves on
+  // mid-loop (fresh query/sort, or a filter change), the remaining fetches are
+  // abandoned -- they'd only be discarded by the caller's epoch guard anyway --
+  // so no more HF API calls are spent on a result set nobody is viewing.
+  //
   // Called from two places: goToNextHfPage (targeting the page it's about
   // to advance to) and the effect below (targeting whatever page is
   // *already* current -- covers landing on an under-filled page without any
   // Next click at all, e.g. right after a fresh search or a filter change,
   // which is exactly the "empty page" bug this whole redesign exists to fix).
-  async function ensurePageFilled(targetIndex: number): Promise<{ pages: HfPage[]; filteredCount: number }> {
+  async function ensurePageFilled(
+    targetIndex: number,
+    epoch: number
+  ): Promise<{ pages: HfPage[]; filteredCount: number; capped: boolean }> {
     let pages = hfPages;
     const filterFn = (r: HfRepoSearchResult) => paramsInRange(paramsBFromText(r.id), hfParamsLoIndex, hfParamsHiIndex);
     let filteredCount = pages.flatMap((p) => p.results).filter(filterFn).length;
     const needed = (targetIndex + 1) * HF_PAGE_SIZE;
     let attempts = 0;
     while (filteredCount < needed && pages[pages.length - 1]?.nextCursor && attempts < MAX_AUTO_FETCH_PAGES) {
+      if (epoch !== hfSearchEpochRef.current) break;
       const cursor = pages[pages.length - 1].nextCursor!;
       const { results, nextCursor } = await api.searchHf({
         q: hfQuery,
@@ -981,25 +1031,47 @@ export function Models() {
       filteredCount = pages.flatMap((p) => p.results).filter(filterFn).length;
       attempts++;
     }
-    return { pages, filteredCount };
+    // True only when the MAX_AUTO_FETCH_PAGES cap stopped the loop with the
+    // cursor still live (vs. the cursor genuinely running out) -- lets callers
+    // distinguish "there is genuinely nothing further" from "didn't dig far
+    // enough yet, keep clicking Next".
+    const capped =
+      attempts >= MAX_AUTO_FETCH_PAGES && filteredCount < needed && !!pages[pages.length - 1]?.nextCursor;
+    return { pages, filteredCount, capped };
   }
 
   async function goToNextHfPage() {
     setHfMsg("");
     setSearching(true);
+    hfBusyRef.current += 1;
+    const fromIndex = hfPageIndex;
+    const epoch = hfSearchEpochRef.current;
     try {
-      const newIndex = hfPageIndex + 1;
-      const { pages, filteredCount } = await ensurePageFilled(newIndex);
+      const { pages, filteredCount, capped } = await ensurePageFilled(fromIndex + 1, epoch);
+      // The query/sort/filter changed while the fill was fetching -- these
+      // pages belong to an old search world. Drop them rather than overwriting
+      // newer state (which could also advance the index past what the new,
+      // narrower filter matches, landing on a fully empty page).
+      if (hfSearchEpochRef.current !== epoch) return;
       if (pages !== hfPages) setHfPages(pages);
-      if (filteredCount > newIndex * HF_PAGE_SIZE) {
-        setHfPageIndex(newIndex);
+      if (filteredCount > (fromIndex + 1) * HF_PAGE_SIZE) {
+        setHfPageIndex(fromIndex + 1);
+      } else if (capped) {
+        // Reached MAX_AUTO_FETCH_PAGES with the cursor still live -- more
+        // matches are plausibly a fetch or two away, so don't declare the
+        // result set exhausted.
+        setHfMsg(
+          "Haven't pulled enough matching results yet -- click Next to keep looking, or widen the filter above."
+        );
       } else {
         setHfMsg("No further results match your parameter filter.");
       }
     } catch (err) {
+      if (hfSearchEpochRef.current !== epoch) return;
       setHfMsg(`Search error: ${err instanceof Error ? err.message : String(err)}`);
     } finally {
-      setSearching(false);
+      hfBusyRef.current -= 1;
+      if (hfBusyRef.current <= 0) setSearching(false);
     }
   }
 
@@ -1010,10 +1082,16 @@ export function Models() {
   // despite plenty of matches being just one more fetch away.
   useEffect(() => {
     let cancelled = false;
+    const epoch = hfSearchEpochRef.current;
     void (async () => {
       try {
-        const { pages } = await ensurePageFilled(hfPageIndex);
-        if (!cancelled) setHfPages((prev) => (pages === prev ? prev : pages));
+        const { pages } = await ensurePageFilled(hfPageIndex, epoch);
+        // `cancelled` covers this effect being torn down by a newer run; the
+        // epoch check additionally covers the search world changing without a
+        // re-run of this effect (e.g. a fresh query landing via runFreshHfSearch).
+        if (!cancelled && hfSearchEpochRef.current === epoch) {
+          setHfPages((prev) => (pages === prev ? prev : pages));
+        }
       } catch {
         // transient -- the user can still hit Next/Prev manually, which retries
       }
@@ -1720,6 +1798,10 @@ export function Models() {
                     // what the new, narrower filter leaves in the buffer --
                     // back to page 1, same as changing sort already does.
                     setHfPageIndex(0);
+                    // Bump the epoch too so any fill/advance that was mid-flight
+                    // under the previous filter can't commit stale pages or
+                    // re-advance the index afterwards.
+                    bumpHfSearchEpoch();
                   }}
                 />
               </label>
@@ -1765,6 +1847,7 @@ export function Models() {
                     setHfParamsLoIndex(0);
                     setHfParamsHiIndex(PARAMS_STOPS.length - 1);
                     setHfPageIndex(0);
+                    bumpHfSearchEpoch();
                   }}
                   className="rounded-lg border border-border px-3 py-1.5 text-sm text-muted hover:border-accent/40 hover:text-accent"
                 >
