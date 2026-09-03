@@ -3,7 +3,6 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/noname9006/LlamaToaster/actions/workflows/test.yml"><img src="https://github.com/noname9006/LlamaToaster/actions/workflows/test.yml/badge.svg" alt="Test"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
   <img src="https://img.shields.io/badge/node-%3E%3D22-brightgreen" alt="Node >= 22">
 </p>
