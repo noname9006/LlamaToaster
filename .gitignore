@@ -1,8 +1,11 @@
 node_modules/
-plans/
 
-# Planning documents -- local working drafts, not project source
+# Local working drafts of planning documents. The design specs the source
+# actually cites (MULTIUSER_PLAN.md, BENCHMARKING_PLAN_V8.md) live in
+# docs/plans/ and are tracked -- see docs/ARCHITECTURE.md.
+/plans/
 *PLAN*.md
+!docs/plans/*PLAN*.md
 
 # Claude Code session runtime state (e.g. launch.json, scheduled_tasks.lock)
 # -- created by the Claude Code app itself when used against this folder,
@@ -45,3 +48,7 @@ worker/config.vps.json
 # Per-model "working" MTP prompt offset, learned live by worker/src/serverBench.ts
 # (see its DEFAULT_OFFSET_STORE_PATH) -- runtime state, not source.
 worker/mtp-offsets.json
+
+# Throwaway verification scripts and screenshot dumps from local debugging
+# sessions -- never project source.
+scripts/_*

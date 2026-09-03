@@ -20,6 +20,7 @@
     "worker": "tsx worker/src/index.ts",
     "test": "vitest run",
     "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
     "build": "npm run build --prefix client",
     "build:admin": "npm run build --prefix admin",
     "dev:client": "npm run dev --prefix client",

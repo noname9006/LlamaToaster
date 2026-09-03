@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/noname9006/LlamaToaster/security/advisories/new
+    about: Report privately instead of opening a public issue — see SECURITY.md.
+  - name: llama.cpp itself
+    url: https://github.com/ggml-org/llama.cpp/issues
+    about: Crashes, wrong output or performance problems inside llama-bench/llama-server belong upstream.

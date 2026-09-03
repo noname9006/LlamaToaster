@@ -304,7 +304,7 @@ describe("extractCudaDiagnosticLines", () => {
     const result = extractCudaDiagnosticLines(stderr);
     expect(result).toHaveLength(MAX_CUDA_DIAGNOSTIC_LINES + 1);
     expect(result[MAX_CUDA_DIAGNOSTIC_LINES]).toBe(
-      "…[4 more diagnostic lines elided -- see the raw JSON dump]"
+      "...[4 more diagnostic lines elided -- see the raw JSON dump]"
     );
   });
 

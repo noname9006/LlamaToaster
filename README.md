@@ -1,22 +1,92 @@
-# LlamaToaster — LLM Benchmark Web App
+<p align="center">
+  <img src="assets/logo.png" alt="LlamaToaster" width="320">
+</p>
 
-Benchmark orchestrator: a **server** (Fastify API + a React SPA + SQLite)
-dispatches sweeps to one or more **workers** (your own GPU/CPU boxes), which
-run `llama-bench` (or `llama-server`, for MTP/speculative-decoding
-benchmarks) and post results back as they complete. Multi-user: sign in with
-GitHub, each account sees only its own machines and runs; a superadmin gets
-a separate, read-only cross-tenant view on its own origin.
+<p align="center">
+  <a href="https://github.com/noname9006/LlamaToaster/actions/workflows/test.yml"><img src="https://github.com/noname9006/LlamaToaster/actions/workflows/test.yml/badge.svg" alt="Test"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
+  <img src="https://img.shields.io/badge/node-%3E%3D22-brightgreen" alt="Node >= 22">
+</p>
 
-Workers are **pull-only** — they long-poll the server for work and heartbeat
-their own status; the server never opens a connection to a worker. That
-means a worker can live anywhere with outbound HTTPS (your home GPU rig, a
-cloud box, the server's own machine) with nothing to port-forward or
-firewall-open on the worker side.
+**Find the llama.cpp settings your own hardware actually runs best, then
+compare them against everyone else's.** Point LlamaToaster at a model and a
+machine, and it sweeps the parameter space with `llama-bench` /
+`llama-server`, records every measurement, and hands you the configuration to
+put in your real inference command line.
 
-Architecture, schema, and security model follow
-[`MULTIUSER_PLAN.md`](./MULTIUSER_PLAN.md) — auth, the pull-queue worker
-protocol, device-flow machine enrolment, the admin surface, and the
-reasoning behind most of what's described in this document.
+👉 **[llamatoaster.com](https://llamatoaster.com)** — the hosted instance.
+Sign in with GitHub, connect a machine, start testing.
+
+## What you get
+
+- **Optimal configs for your box, not someone's blog post.** Sweep `-ngl`,
+  context, batch sizes, `--n-cpu-moe`, speculative decoding and more, on
+  *your* GPU, with *your* build of llama.cpp. What comes out is the setting
+  you paste into your own `llama-server`/`llama-cli` run.
+- **An AI assistant that reads the numbers so you don't have to.** Instead of
+  staring at a results table, ask what's actually limiting you, which
+  parameter moved the needle, and what to try next. It reads your own tests
+  directly.
+- **A GGUF index keyed by content hash.** Around 4 million GGUF files from
+  Hugging Face, indexed by sha256 — so a model file is identified by what it
+  *is*, not by whatever it was renamed to on disk, and the same file mirrored
+  across repos doesn't turn into three different entries.
+- **A shared results base that gets better as it grows.** As more machines
+  report in, the assistant can answer from the accumulated data rather than
+  from your tests alone — eventually predicting good settings for hardware
+  it has seen before, without you re-running the whole sweep yourself.
+
+That last point is the reason to use the hosted instance rather than a
+private copy: the value compounds across contributors. One person's sweep on
+an RTX 4090 is a data point; a few thousand of them is a map of local LLM
+inference.
+
+## Two ways to run it
+
+**Use the hosted instance** — nothing to deploy. Sign in at
+[llamatoaster.com](https://llamatoaster.com), then run one command on the
+machine you want to benchmark (Windows PowerShell shown; macOS/Linux and the
+full flow are under
+[Running a worker](#running-a-worker-gpu-or-cpu-box)):
+
+```powershell
+iex "& { $(irm https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.ps1) } -Url https://llamatoaster.com"
+```
+
+The worker prints a short code, you approve it in the browser, and it starts
+taking jobs. It only ever makes outbound HTTPS calls — nothing to
+port-forward, nothing listening on your network.
+
+**Self-host the whole thing** — server, workers and all, on your own
+infrastructure. Everything below covers this. It works completely
+standalone (including with no login at all), but a private instance is an
+island: it never sees, and never contributes to, the shared results base.
+
+## What is collected, and what isn't
+
+If you use llamatoaster.com, this is what leaves your machine:
+
+- **Hardware and OS**: CPU model/flags/core count, GPU vendor/model/VRAM,
+  total RAM, OS platform and architecture, NVIDIA driver and CUDA version,
+  and the machine's hostname (it becomes the default display name — rename it
+  in the UI any time).
+- **Benchmark results**: the configurations tested and what they measured.
+- **Your GitHub account**, because that's how sign-in works: the numeric
+  account id, login and avatar. The OAuth scope requested is `read:user`
+  only — **not** `user:email`, and nothing that grants access to your
+  repositories.
+
+What is *not* collected: your email address, your prompts or any content you
+generate (benchmarks run on synthetic tokens — LlamaToaster never sees what
+you actually use a model for), the model files themselves, or anything about
+your machine beyond the hardware inventory above.
+
+**Sharing with other users is opt-in and identity-free.** Settings →
+"Share my benchmarks with the community" controls whether your results feed
+the shared base at all. When they do, other people reach them only as
+aggregates through the assistant — averages grouped by model, backend,
+platform and GPU model, each carrying how many contributors it came from.
+No username, no account id, no hostname, and never your own rows back to you.
 
 ## Layout
 
@@ -27,6 +97,17 @@ admin/    React + Vite + Tailwind SPA (superadmin-only cross-tenant view, served
 worker/   runs on each benchmark box: long-polls the server, spawns llama-bench/llama-server
 shared/   TypeScript types shared by server, worker, and client
 ```
+
+Workers are **pull-only**: they long-poll the server for work and heartbeat
+their own status, and the server never opens a connection to a worker. A
+worker can therefore live anywhere with outbound HTTPS — a home GPU rig, a
+cloud box, the server's own machine — with nothing to port-forward or
+firewall-open on its side.
+
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) covers the rest: the
+pull-queue protocol and its lease/reaper machinery, the schema, auth and
+multi-tenancy, device-flow machine enrolment, and the admin surface — plus
+the reasoning behind most of what's described in this document.
 
 ## Prerequisites
 
@@ -104,8 +185,11 @@ Each account sees only its own machines, runs, and models it registered —
 enforced in SQL, not just hidden in the UI. The one exception is the AI
 assistant, which can also show **anonymised, aggregated** benchmark numbers
 contributed by other users who opted in (Settings → "Share my benchmarks
-with the community") — never a username, never a group of fewer than 5
-distinct contributors.
+with the community") — never a username, account id or hostname, never the
+caller's own rows, and always with the number of contributors the aggregate
+came from. Set `COMMUNITY_MIN_CONTRIBUTORS=<n>` to additionally suppress any
+aggregate built from fewer than *n* distinct contributors (default `1`, i.e.
+a single opted-in machine may be summarised — labelled as such).
 
 **Superadmin** (optional, on top of `AUTH_ENABLED`): set
 `SUPERADMIN_IDENTITIES=github:<your-numeric-github-id>` (comma-separated for
@@ -325,8 +409,9 @@ driven by the SPA, not called directly).
 
 Every write is scoped to the caller's own account in SQL, machine enrolment
 is worker-initiated (device flow, nothing sensitive crosses browser→
-terminal), community benchmark aggregates are k-anonymised, and the
-superadmin surface lives on a separate hostname that 404s for anyone else.
+terminal), community benchmark data is consent-gated and exposed only as
+identity-free aggregates, and the superadmin surface lives on a separate
+hostname that 404s for anyone else.
 Full detail, plus how to put the app behind TLS for a public deployment, is
 in [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
 

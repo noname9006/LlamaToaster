@@ -98,10 +98,16 @@ generating and persisting the session credentials.
 - **The AI assistant's system prompt is server-owned** — a client-supplied
   `system` message is discarded outright, so `curl`ing the chat endpoint
   directly can't override its instructions or its per-user data scoping.
-- **Community benchmark aggregates are k-anonymised in SQL**, not just
-  stripped of a username column: any group describing fewer than 5 distinct
-  contributors is never returned, opt-in (Settings), and never includes the
-  querying user's own data.
+- **Community benchmark aggregates are consent-gated in SQL**, not just
+  stripped of a username column: only users who opted in (Settings) are
+  included, the querying user's own rows never are, and the projection
+  carries no username, account id, hostname or build — every row is an
+  average over a (model, backend, test type, platform, GPU model) group,
+  with the contributor count alongside it. Set `COMMUNITY_MIN_CONTRIBUTORS`
+  to suppress groups built from fewer than *n* distinct contributors; the
+  default is `1`, so a single opted-in machine can be summarised (labelled
+  with `contributorCount: 1`). `COMMUNITY_MIN_CONTRIBUTORS=5` restores the
+  original k-anonymity floor.
 - **The superadmin surface lives on a separate hostname** (`ADMIN_PUBLIC_URL`)
   and is unreachable from the main site even with a valid superadmin
   session — a request with the wrong `Host` header 404s before any auth

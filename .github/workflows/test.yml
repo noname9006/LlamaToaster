@@ -5,13 +5,42 @@ on:
     branches: [main]
   pull_request:
 
+# Nothing here needs write access to the repo.
+permissions:
+  contents: read
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - run: npm install
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            client/package-lock.json
+            admin/package-lock.json
+
+      # `npm ci` at the root also installs client/ and admin/ through the
+      # root package.json's postinstall hook.
+      - run: npm ci
+
+      - name: Typecheck (server, worker, shared)
+        run: npm run typecheck
+
       - run: npm test
+
+      # Both SPAs are built from source at deploy time, so a broken build is
+      # a broken release even when every test passes.
+      - name: Build client SPA
+        run: npm run build
+
+      - name: Build admin SPA
+        run: npm run build:admin
