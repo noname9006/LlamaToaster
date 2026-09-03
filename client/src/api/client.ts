@@ -26,6 +26,7 @@ import {
   type ImportResponse,
   type VerifiedLimitDto,
   type ProbeAttemptDto,
+  type AdminStats,
 } from "../types";
 
 export class ApiError extends Error {
@@ -408,9 +409,9 @@ export const api = {
   getModelHfUpdates: (): Promise<Record<string, string | null>> =>
     request<{ updates: Record<string, string | null> }>("/api/models/hf-updates").then((d) => d.updates),
 
-  // The one intentionally cross-tenant number on the (otherwise
-  // per-account-scoped) Dashboard -- see Dashboard.tsx's own header comment.
-  getStats: (): Promise<{ users: number }> => request("/api/stats"),
+  // The platform-wide stat-card numbers on the Dashboard -- see
+  // Dashboard.tsx's own header comment.
+  getStats: (): Promise<AdminStats> => request("/api/stats"),
 
   // Hash lookup: sends SHA-256 hashes of local files and gets back the
   // matching HF metadata (repo_id, filename, revision) so the Models page
