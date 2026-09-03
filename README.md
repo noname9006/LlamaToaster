@@ -5,7 +5,6 @@
 <p align="center">
   <a href="https://llamatoaster.com"><img src="https://img.shields.io/badge/try%20it-llamatoaster.com-f5a623" alt="Try it at llamatoaster.com"></a>
   <a href="https://llamatoaster.com"><img src="https://img.shields.io/website?url=https%3A%2F%2Fllamatoaster.com%2Fhealth&up_message=online&down_message=offline&label=status" alt="Hosted instance status"></a>
-  <img src="https://img.shields.io/github/last-commit/noname9006/LlamaToaster" alt="Last commit">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
   <img src="https://img.shields.io/badge/node-%3E%3D22-brightgreen" alt="Node >= 22">
 </p>
