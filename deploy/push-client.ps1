@@ -7,21 +7,31 @@
 # configured). Once the app is public (MULTIUSER_PLAN.md §6.1), the VPS is
 # still reachable over the tailnet for operator access, so that stays the
 # default -- but pass -PublicHost to deploy over the public hostname instead
-# (e.g. if you're somewhere without a working Tailscale connection):
+# (e.g. if you're somewhere without a working Tailscale connection).
+#
+# The Tailscale IP itself is never hardcoded here -- pass -VpsHost, or set
+# $env:LLAMATOASTER_VPS_HOST once (e.g. in your PowerShell profile) so you
+# don't have to pass it every time.
 #
 # Usage:
-#   .\deploy\push-client.ps1
+#   .\deploy\push-client.ps1 -VpsHost 100.x.x.x
+#   $env:LLAMATOASTER_VPS_HOST = "100.x.x.x"; .\deploy\push-client.ps1
 #   .\deploy\push-client.ps1 -PublicHost llamatoaster.com
 #   .\deploy\push-client.ps1 -VpsHost 203.0.113.10 -VpsUser deploy
 
 param(
-    [string]$VpsHost = "100.122.1.111",
+    [string]$VpsHost = $env:LLAMATOASTER_VPS_HOST,
     [string]$PublicHost,
     [string]$VpsUser = "ubuntu",
     [string]$PmApp = "llamatoaster-server"
 )
 
 if ($PublicHost) { $VpsHost = $PublicHost }
+
+if (-not $VpsHost) {
+    Write-Error "No target host. Pass -VpsHost <ip-or-hostname>, -PublicHost <domain>, or set `$env:LLAMATOASTER_VPS_HOST."
+    exit 1
+}
 
 $RemoteClientDir = "~/LlamaToaster/client/"
 $RemoteAdminDir = "~/LlamaToaster/admin/"

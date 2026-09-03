@@ -3,7 +3,18 @@
   "version": "2.0.0",
   "private": true,
   "description": "LLM Benchmark Web App (Lean MVP) — VPS orchestrator + worker",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/noname9006/LlamaToaster.git"
+  },
+  "engines": {
+    "node": ">=22"
+  },
   "type": "module",
+  "bin": {
+    "llamatoaster": "bin/llamatoaster.cjs"
+  },
   "scripts": {
     "server": "tsx server/src/index.ts",
     "worker": "tsx worker/src/index.ts",
