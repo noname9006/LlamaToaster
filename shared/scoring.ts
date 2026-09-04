@@ -331,13 +331,14 @@ export function scoreProfiles(input: ScoringInput): ScoringResult {
     const ppRows = bucket.rows.filter((r) => r.test_type === "pp");
     const tgRows = bucket.rows.filter((r) => r.test_type === "tg");
 
-    // A failed/failed_oom item in the tuple's sub-run disqualifies it; a
-    // `skipped` item does not -- it was never measured. Both land in the
-    // missing_pp_or_tg tally, which is the closed registry's bucket for "this
-    // tuple never produced the pair scoring needs".
+    // A failed/failed_oom/failed_unsupported item in the tuple's sub-run
+    // disqualifies it; a `skipped` item does not -- it was never measured.
+    // Both land in the missing_pp_or_tg tally, which is the closed
+    // registry's bucket for "this tuple never produced the pair scoring
+    // needs".
     const itemFailed = bucket.rows.some((r) => {
       const status = input.itemStatusByIdx?.[r.idx];
-      return status === "failed" || status === "failed_oom";
+      return status === "failed" || status === "failed_oom" || status === "failed_unsupported";
     });
     if (itemFailed || ppRows.length === 0 || tgRows.length === 0) {
       tallies.missing_pp_or_tg++;

@@ -140,7 +140,7 @@ function validateSweep(sweep: unknown): string | null {
 }
 
 const TICK_STATUSES = new Set(["loading", "processing", "generating", "benchmarking"]);
-const TERMINAL_STATUSES = new Set(["done", "failed", "failed_oom", "cancelled", "skipped"]);
+const TERMINAL_STATUSES = new Set(["done", "failed", "failed_oom", "failed_unsupported", "cancelled", "skipped"]);
 const VALID_TEST_TYPES = new Set(["pp", "tg", "pg"]);
 const NUMERIC_RESULT_FIELDS = [
   "n_prompt",

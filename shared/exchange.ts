@@ -5,7 +5,14 @@
 // exactly that row.
 
 import { configHash, type ConfigHashInput } from "./configHash.js";
-import type { CaveatFlag, TestType } from "./types.js";
+import {
+  CURVE_METHOD_VERSION,
+  LEGACY_CURVE_METHOD_VERSION,
+  METHOD_VERSION,
+  SERVER_METHOD_VERSION,
+  type CaveatFlag,
+  type TestType,
+} from "./types.js";
 import type { GoalsConfig } from "./goals.js";
 
 export const BUNDLE_FORMAT = "llamatoaster.bundle";
@@ -118,9 +125,12 @@ export interface MethodsSection {
 // Every shared number carries its own methods section. Keyed to
 // method_version so a mixed-vintage bundle explains both vintages.
 export function methodsFor(methodVersion: number): MethodsSection {
-  if (methodVersion >= 2) {
+  // Ordered newest first, and every historical vintage keeps its own section:
+  // this describes what a STORED row was measured by, so relabelling an old
+  // row with today's pipeline would be a lie about data already shared.
+  if (methodVersion >= CURVE_METHOD_VERSION) {
     return {
-      method_version: 2,
+      method_version: CURVE_METHOD_VERSION,
       summary:
         "Context-curve choreography: a discarded warm-up on a nonce prompt, one cold timed prefill whose first streamed chunk is the TTFT reading, then warm repeats against the prefix cache for generation statistics.",
       pipeline: [
@@ -130,16 +140,48 @@ export function methodsFor(methodVersion: number): MethodsSection {
         "warm repeats: identical prompt with cache_prompt -- any repeat reporting prompt_n > 0 re-prefilled and flags cache_evicted",
         "implausibility filter rejects physically impossible rates; wall-clock fallback readings are marked suspect",
         "stability gate: stddev <= max(10 % of mean, 0.5 tok/s), n >= 3",
+        "filler prompt: a tokenized mixed-register passage (prose, code, equations, structured data, non-Latin scripts), every register holding an equal share of the prompt at every size and interleaved below the ubatch so each batch sees all of them",
+      ],
+    };
+  }
+  if (methodVersion === LEGACY_CURVE_METHOD_VERSION) {
+    return {
+      method_version: LEGACY_CURVE_METHOD_VERSION,
+      summary:
+        "Context-curve choreography, measured before the filler prompt was rewritten: a discarded warm-up on a nonce prompt, one cold timed prefill whose first streamed chunk is the TTFT reading, then warm repeats against the prefix cache for generation statistics.",
+      pipeline: [
+        "warm-up: a short nonce prompt, n_predict 8, excluded from statistics by construction",
+        "cold timed prefill: full prompt, streamed, n_predict 1, ignore_eos -- first-chunk arrival is TTFT (single sample, labeled as such)",
+        "pp for the point comes from that same response's timings.prompt_ms / prompt_n",
+        "warm repeats: identical prompt with cache_prompt -- any repeat reporting prompt_n > 0 re-prefilled and flags cache_evicted",
+        "implausibility filter rejects physically impossible rates; wall-clock fallback readings are marked suspect",
+        "stability gate: stddev <= max(10 % of mean, 0.5 tok/s), n >= 3",
+        "filler prompt: a low-entropy synthetic token range -- on a mixture-of-experts model with experts on CPU this reads well above a realistic prompt, so prefill from this vintage is not comparable with later rows",
+      ],
+    };
+  }
+  if (methodVersion >= SERVER_METHOD_VERSION) {
+    return {
+      method_version: SERVER_METHOD_VERSION,
+      summary:
+        "Measured through llama-server rather than llama-bench: a streamed request lifecycle, and a synthetic prompt this project controls. Split from the core vintage when that prompt became a mixed-register passage -- on a mixture-of-experts model with experts on CPU, the previous low-entropy filler collapsed expert routing and read 70% above llama-bench on the same model and flags.",
+      pipeline: [
+        "filler prompt: a tokenized mixed-register passage (prose, code, equations, structured data, non-Latin scripts), every register holding an equal share of the prompt at every size and interleaved below the ubatch so each batch sees all of them",
+        "greedy decoding (temperature 0) with ignore_eos, so a repeat is reproducible and both engines decode the same number of tokens",
+        "a rejected generation is retried on a rotated prompt, then once under a grammar; a reading that needed the grammar is flagged grammar_constrained",
+        "implausibility filter rejects physically impossible rates; suspect readings are kept and flagged, never silently erased",
+        "sample (n-1) standard deviation, matching llama-bench's own formula",
       ],
     };
   }
   return {
-    method_version: 1,
+    method_version: METHOD_VERSION,
     summary:
       "Core methodology: warmed benchmark repeats, streamed clock where the engine has a request lifecycle, an implausibility filter on both sides of any pair, and a stddev floor in the stability gate.",
     pipeline: [
       "warm-up before the timed repeats",
       "streamed clock on the llama-server path; llama-bench does its own internal repeat averaging",
+      "llama-bench builds its own prompt internally (uniformly random vocabulary ids), which this project cannot supply or change",
       "implausibility filter rejects physically impossible rates (the ~1e6 tok/s timer-bug class)",
       "suspect readings are kept and flagged, never silently erased",
       "sample (n-1) standard deviation, matching llama-bench's own formula",
