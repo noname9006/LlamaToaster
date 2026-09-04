@@ -539,8 +539,9 @@ describe("POST /api/runs/:id/probe-result (N2)", () => {
       config: { probe: { ...probeSpec, kv_pair: ["q5_1", "q5_1"] } },
     });
     const friendlyMessage =
-      "This model's output was rejected by llama-server as invalid -- testing can't run correctly for it on this build. " +
-      "This is a known llama.cpp limitation with 'thinking'/reasoning-style models (see ggml-org/llama.cpp#19869), not a hardware or configuration problem.";
+      "llama-server rejected this model's generated output as invalid: llama.cpp's chat-output parser fails a whole " +
+      "response over one invalid UTF-8 byte, and no server flag disables that check (ggml-org/llama.cpp#25072). " +
+      "This is an upstream llama.cpp limitation, not a hardware or configuration problem.";
     const res = await post(
       "/api/runs/probe-unsupported/probe-result",
       {
@@ -556,6 +557,13 @@ describe("POST /api/runs/:id/probe-result (N2)", () => {
     const item = repo.getTestItems("probe-unsupported")[0];
     expect(item.status).toBe("failed_unsupported");
     expect(item.error).toBe(friendlyMessage);
+    // Live-confirmed regression: countUnfinishedItems' own hardcoded terminal-
+    // status list (server/src/db/repo.ts) didn't originally include
+    // failed_unsupported, so finalizeTest was never called and the run stayed
+    // "running" forever even though its only item had gone terminal -- the UI
+    // kept showing a live elapsed timer for a run the worker had already
+    // completed and pushed a log for.
+    expect(repo.getTest(undefined, "probe-unsupported")?.status).toBe("failed");
   });
 });
 

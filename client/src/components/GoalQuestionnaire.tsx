@@ -1159,10 +1159,12 @@ function ModeCard({
           </span>
         )}
         {failedCapacity && <span className="block font-mono text-[11px] font-semibold text-danger">✗ didn’t fit</span>}
+        {/* The section-level warning banner above already carries the full
+            message once -- repeating it per card is redundant. This just
+            matches failedCapacity's own terse label; the "Test ↗" link
+            below (same as any other terminal card) is where the detail is. */}
         {failedUnsupported && (
-          <span className="block text-[10.5px] font-semibold leading-snug text-danger">
-            ✗ this model can't be tested — {result?.detail ?? "llama-server rejected its own output"}
-          </span>
+          <span className="block font-mono text-[11px] font-semibold text-danger">✗ can't be tested</span>
         )}
         {result?.status === "cancelled" && (
           <span className="block font-mono text-[11px] font-semibold text-muted">■ stopped before finishing</span>
