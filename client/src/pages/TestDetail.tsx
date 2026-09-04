@@ -269,6 +269,8 @@ const CAVEAT_FLAG_REASON: Record<string, string> = {
     "a warm repeat re-prefilled the prompt, so the prefix cache did not hold and this point drops out of the curve",
   context_shift:
     "a context shift appeared in the logs and this build has no --no-context-shift, which silently corrupts TTFT comparability",
+  grammar_constrained:
+    "llama-server rejected this model's unconstrained output as invalid UTF-8, so the reading only came back under a sampling grammar -- the row is KEPT as a usable signal, but constrained sampling has its own overhead and this rate is not comparable with an unconstrained one",
 };
 
 const TERMINAL_ITEM_STATUSES = new Set([
