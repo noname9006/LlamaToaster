@@ -9,7 +9,7 @@
 
 import { spawn, type ChildProcess } from "node:child_process";
 import type { IngestResultInput } from "../../shared/types.js";
-import { CURVE_METHOD_VERSION, METHOD_VERSION } from "../../shared/types.js";
+import { CURVE_METHOD_VERSION, SERVER_METHOD_VERSION, type CaveatFlag } from "../../shared/types.js";
 import type { SweepItem } from "../../shared/sweep.js";
 import {
   collapseTensorLoadSpam,
@@ -18,8 +18,8 @@ import {
   type BenchLogger,
   type BenchResult,
 } from "./bench.js";
+import { buildPromptTokens, fetchFillerBlocks, type FillerBlocks } from "./fillerPrompt.js";
 import {
-  buildPromptTokens,
   buildServerArgs,
   contextSizeForSlots,
   curveCaveatFlags,
@@ -178,6 +178,13 @@ export interface StreamedRequestInput {
   cachePrompt: boolean;
   slot?: number;
   signal?: AbortSignal;
+  /**
+   * GBNF constraining what may be sampled. Only ever set by the last-resort
+   * retry below, and only for a model that cannot otherwise produce a parseable
+   * response at all -- constrained sampling has its own cost, so any row
+   * measured this way is flagged grammar_constrained.
+   */
+  grammar?: string;
 }
 
 // Thrown when llama-server accepts a /completion request (HTTP 200, stream
@@ -200,21 +207,104 @@ export class LlamaServerOutputError extends Error {
   }
 }
 
-// The one signature we've actually root-caused (see ggml-org/llama.cpp
-// #19869 and friends): llama-server's structured-output ("Content-only")
-// parser rejecting a "thinking"-template model's raw output, reproduced live
-// against build b10793 -- confirmed independent of --reasoning-format,
-// --skip-chat-parsing, -rea off and --reasoning-budget, all of which still
-// hit the identical failure. Anything else gets a plainer fallback rather
-// than falsely claiming this specific diagnosis for an error we haven't seen.
+// The one signature we've actually root-caused: llama.cpp's chat-output PEG
+// parser hard-failing the whole response over a single invalid-UTF-8 byte in
+// the generated text (ggml-org/llama.cpp#25072 -- see fillerPrompt.ts for the
+// mechanism and why no server flag or request field makes it tolerant).
+//
+// The usual cause was our OWN filler prompt, which used to be built from raw
+// single-byte token ids and reliably provoked byte-fragment output; that is
+// fixed at the source in fillerPrompt.ts. This stays as the guard for the
+// residual case (a model that emits an invalid byte anyway -- observed on MTP
+// builds), and anything that is not this signature gets a plainer fallback
+// rather than falsely claiming this diagnosis.
 function describeLlamaServerError(rawMessage: string): string {
-  if (rawMessage.includes("Content-only")) {
+  if (/does not match the expected .*format/i.test(rawMessage)) {
     return (
-      "This model's output was rejected by llama-server as invalid -- testing can't run correctly for it on this build. " +
-      "This is a known llama.cpp limitation with 'thinking'/reasoning-style models (see ggml-org/llama.cpp#19869), not a hardware or configuration problem."
+      "llama-server rejected this model's generated output as invalid: llama.cpp's chat-output parser fails a whole " +
+      "response over one invalid UTF-8 byte, and no server flag disables that check (ggml-org/llama.cpp#25072). " +
+      "This is an upstream llama.cpp limitation, not a hardware or configuration problem."
     );
   }
   return `llama-server reported an error during generation: ${rawMessage}`;
+}
+
+// --- Recovering from the parser failure -------------------------------------
+//
+// Three attempts, each with a different prompt, then one grammar-constrained
+// attempt as a last resort. Mirrors the MTP path's ladder (serverBench.ts) --
+// which the context tests never had: before this, a single
+// LlamaServerOutputError propagated straight out and index.ts marked the whole
+// probe ladder fatal, so one unlucky request abandoned every remaining
+// placement.
+//
+// Retrying with a DIFFERENT prompt is the whole point: sampling is greedy
+// (temperature 0), so a byte-for-byte identical retry provably fails
+// identically -- confirmed live on the MTP path, 3 attempts out of 3.
+const MAX_COMPLETION_ATTEMPTS = 3;
+// Rotates the filler on each retry. Same constant, and the same reasoning, as
+// serverBench.ts's RETRY_PROMPT_SHIFT.
+const RETRY_PROMPT_SHIFT = 137;
+
+// The last resort. Confirmed live against b10793: the exact request that fails
+// with "does not match the expected Content-only format" succeeds under a
+// grammar, because the sampler can no longer reach a token whose bytes are an
+// invalid UTF-8 fragment. Deliberately plain ASCII -- the point is to make an
+// invalid byte unreachable, not to shape the text.
+const FALLBACK_GRAMMAR = 'root ::= [a-zA-Z0-9 ,.;:!?\\n]+';
+
+export interface ResilientCompletionInput {
+  completion: CompletionFn;
+  port: number;
+  tokenCount: number;
+  offset: number;
+  nonce: number;
+  blocks: FillerBlocks;
+  nPredict: number;
+  cachePrompt: boolean;
+  slot?: number;
+  log?: BenchLogger;
+}
+
+export interface ResilientCompletion {
+  sample: StreamSample;
+  /** True when only the grammar-constrained attempt produced a reading. */
+  grammarConstrained: boolean;
+}
+
+export async function completeWithRetries(input: ResilientCompletionInput): Promise<ResilientCompletion> {
+  const attemptAt = (offset: number, grammar?: string) =>
+    input.completion({
+      port: input.port,
+      promptTokens: buildPromptTokens(input.tokenCount, offset, input.nonce, input.blocks),
+      nPredict: input.nPredict,
+      cachePrompt: input.cachePrompt,
+      slot: input.slot,
+      ...(grammar ? { grammar } : {}),
+    });
+
+  for (let attempt = 0; attempt < MAX_COMPLETION_ATTEMPTS; attempt++) {
+    const offset = input.offset + attempt * RETRY_PROMPT_SHIFT;
+    try {
+      return { sample: await attemptAt(offset), grammarConstrained: false };
+    } catch (err) {
+      // Only the parser failure is worth another prompt; anything else (a dead
+      // server, a timeout) fails fast rather than being retried three times.
+      if (!(err instanceof LlamaServerOutputError)) throw err;
+      input.log?.warn(
+        `llama-server rejected its own output at prompt offset ${offset} ` +
+          `(attempt ${attempt + 1}/${MAX_COMPLETION_ATTEMPTS}): ${err.rawMessage}`
+      );
+    }
+  }
+
+  input.log?.warn(
+    "every unconstrained attempt was rejected; retrying under a grammar so this configuration " +
+      "still yields a reading -- the row will be flagged grammar_constrained"
+  );
+  // A failure here is genuine and stays fatal: nothing about this model can
+  // generate through this endpoint, and no other placement will differ.
+  return { sample: await attemptAt(input.offset, FALLBACK_GRAMMAR), grammarConstrained: true };
 }
 
 // TTFT is the arrival of the FIRST streamed chunk, measured here rather than
@@ -238,6 +328,7 @@ export async function streamedCompletion(input: StreamedRequestInput): Promise<S
       cache_prompt: input.cachePrompt,
       ignore_eos: true,
       temperature: 0,
+      ...(input.grammar ? { grammar: input.grammar } : {}),
     }),
   });
   if (!res.ok || !res.body) {
@@ -311,6 +402,12 @@ export interface CurvePointExecutionInput {
   serverLog: string;
   supportsNoContextShift: boolean;
   completion?: CompletionFn;
+  /**
+   * Tokenized filler blocks (see fillerPrompt.ts). Omit and they are fetched
+   * from the running server, which is the only way to get ids valid in this
+   * model's vocabulary; supplied explicitly only by tests.
+   */
+  fillerBlocks?: FillerBlocks;
   log?: BenchLogger;
 }
 
@@ -328,6 +425,7 @@ export interface CurvePointExecution {
 //   * warm_repeat -> the tg row's rate, stddev and e2e mean.
 export async function executeCurvePoint(input: CurvePointExecutionInput): Promise<CurvePointExecution> {
   const completion = input.completion ?? streamedCompletion;
+  const fillerBlocks = input.fillerBlocks ?? (await fetchFillerBlocks(input.port));
   const plan = planCurvePoint({
     promptTokens: input.effectiveCtx,
     nGen: input.nGen,
@@ -335,14 +433,21 @@ export async function executeCurvePoint(input: CurvePointExecutionInput): Promis
   });
 
   const samples: (StreamSample & { requestClass: RequestClass })[] = [];
+  let grammarConstrained = false;
   for (const step of plan) {
-    const sample = await completion({
+    const outcome = await completeWithRetries({
+      completion,
       port: input.port,
-      promptTokens: buildPromptTokens(step.promptTokens, input.promptOffset ?? 0, step.nonce),
+      tokenCount: step.promptTokens,
+      offset: input.promptOffset ?? 0,
+      nonce: step.nonce,
+      blocks: fillerBlocks,
       nPredict: step.nPredict,
       cachePrompt: step.cachePrompt,
+      log: input.log,
     });
-    samples.push({ ...sample, requestClass: step.requestClass });
+    grammarConstrained ||= outcome.grammarConstrained;
+    samples.push({ ...outcome.sample, requestClass: step.requestClass });
   }
 
   const cold = samples.find((s) => s.requestClass === "cold_timed");
@@ -352,6 +457,7 @@ export async function executeCurvePoint(input: CurvePointExecutionInput): Promis
     serverLog: input.serverLog,
     supportsNoContextShift: input.supportsNoContextShift,
   });
+  if (grammarConstrained) caveats.push("grammar_constrained");
 
   const results: IngestResultInput[] = [];
   const shared = {
@@ -366,9 +472,11 @@ export async function executeCurvePoint(input: CurvePointExecutionInput): Promis
     mtp: "off",
     n_gpu_layers_draft: 0,
     n_cpu_moe: 0,
-    // Choreographed points stamp METHOD_VERSION 2 -- cold-timed prefill plus
+    // Choreographed points stamp their own vintage -- cold-timed prefill plus
     // warm-repeat statistics is a real semantics change under §0.1, and that
-    // stamp is what keeps ordinary runtime rows out of curves.
+    // stamp is what keeps ordinary runtime rows out of curves. Bumped again
+    // when the filler prompt became a mixed-register passage, which moved
+    // measured MoE prefill by 58%.
     method_version: CURVE_METHOD_VERSION,
     caveat_flags: caveats,
     prompt_offset: input.promptOffset ?? 0,
@@ -440,6 +548,8 @@ export interface KneeExecutionInput {
   port: number;
   promptOffset?: number;
   completion?: CompletionFn;
+  /** See CurvePointExecutionInput.fillerBlocks. */
+  fillerBlocks?: FillerBlocks;
   log?: BenchLogger;
   /** Called before each slot count so the caller can restart the server with the right --parallel. */
   beforeSlotCount?: (slots: number) => Promise<number>;
@@ -452,22 +562,32 @@ export async function executeKneeLadder(input: KneeExecutionInput): Promise<Inge
   const rows: IngestResultInput[] = [];
   for (const slots of input.slots) {
     const port = (await input.beforeSlotCount?.(slots)) ?? input.port;
+    // Re-fetched per slot count because beforeSlotCount restarts the server
+    // (same model, so the same blocks -- but this never assumes that).
+    const fillerBlocks = input.fillerBlocks ?? (await fetchFillerBlocks(port));
     const batchSamples: StreamSample[] = [];
+    let grammarConstrained = false;
     for (let repeat = 0; repeat < Math.max(1, input.repeats); repeat++) {
       const plan = planConcurrentBatch({ slots, promptTokens: input.nPrompt, nGen: input.nGen });
       // Simultaneous, not sequential -- that is the whole measurement.
       const batch = await Promise.all(
         plan.map((step) =>
-          completion({
+          completeWithRetries({
+            completion,
             port,
-            promptTokens: buildPromptTokens(step.promptTokens, input.promptOffset ?? 0, step.nonce + repeat * 1000),
+            tokenCount: step.promptTokens,
+            offset: input.promptOffset ?? 0,
+            nonce: step.nonce + repeat * 1000,
+            blocks: fillerBlocks,
             nPredict: step.nPredict,
             cachePrompt: false,
             slot: step.slot,
+            log: input.log,
           })
         )
       );
-      batchSamples.push(...batch);
+      if (batch.some((b) => b.grammarConstrained)) grammarConstrained = true;
+      batchSamples.push(...batch.map((b) => b.sample));
     }
     const summary = summarizeStreams(batchSamples);
     const shared = {
@@ -482,7 +602,8 @@ export async function executeKneeLadder(input: KneeExecutionInput): Promise<Inge
       mtp: "off",
       n_gpu_layers_draft: 0,
       n_cpu_moe: 0,
-      method_version: METHOD_VERSION,
+      method_version: SERVER_METHOD_VERSION,
+      caveat_flags: grammarConstrained ? (["grammar_constrained"] as CaveatFlag[]) : undefined,
       concurrency: slots,
       ttft_ms_p50: summary.ttftP50Ms,
       ttft_ms_p95: summary.ttftP95Ms,
