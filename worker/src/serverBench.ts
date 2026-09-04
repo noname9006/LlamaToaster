@@ -16,6 +16,8 @@ import {
   type OffloadResult,
 } from "./bench.js";
 import { estimateResidentGpuLayersFromBufferSizes } from "../../shared/vramEstimate.js";
+import { buildPromptTokens, fetchFillerBlocks, type FillerBlocks } from "./fillerPrompt.js";
+import { SERVER_METHOD_VERSION } from "../../shared/types.js";
 
 // Drives llama-server over HTTP to benchmark MTP (multi-token-prediction)
 // speculative decoding -- llama-bench itself has no --spec-type/--model-draft
@@ -63,20 +65,11 @@ const STOP_GRACE_MS = 5000;
 // (special tokens, its internal bookkeeping) never rejects a request that's
 // exactly at the context-size edge.
 const CONTEXT_MARGIN = 256;
-// Cycled through (not repeated verbatim) to build a synthetic prompt of
-// exactly n_prompt tokens -- mirrors llama-bench's own "-p is a token count,
-// not real text, content is irrelevant to what's being measured" semantics
-// (see llm-benchmark-plan-v2.md), sent as a pre-tokenized array rather than
-// a text string so the token count is exact rather than tokenizer-dependent.
-// Deliberately NOT a single token repeated hundreds of times in a row --
-// confirmed live against a real MTP build that an all-identical-token
-// prompt reliably drove speculative decoding into producing invalid UTF-8
-// output bytes (llama-server's own response parser then hard-fails with a
-// "Content-only format" 500 before any timings come back at all). Cycling
-// through a range keeps the same "count is all that matters" property
-// without being a maximally repetitive, out-of-distribution edge case.
-const FILLER_TOKEN_RANGE_START = 100;
-const FILLER_TOKEN_RANGE_SIZE = 500;
+// The synthetic filler prompt itself lives in fillerPrompt.ts -- including
+// the long-form explanation of the invalid-UTF-8 parser failure below, and
+// why the prompt is built from server-tokenized real text rather than a raw
+// range of token ids (the old scheme's ids landed in the vocabulary's raw
+// single-byte region and provoked exactly this failure).
 
 // A single /completion call, retried this many times total before the repeat
 // is allowed to fail the whole item -- see isRetryableServerParseFailure.
@@ -92,8 +85,10 @@ const MAX_COMPLETION_ATTEMPTS = 3;
 // unlike the INCOMPLETE case, this path does not check the parser's lenient
 // flag at all. So there is no request field or server flag that makes this
 // tolerant: ONE invalid byte anywhere in a generation fails the entire
-// response, even under the simplest possible chat format. MTP/speculative
-// decoding occasionally emits such a byte (observed live: a short run of
+// response, even under the simplest possible chat format. The dominant source
+// of such a byte was our own filler prompt (raw single-byte token ids -- now
+// fixed at the source, see fillerPrompt.ts); what remains is MTP/speculative
+// decoding occasionally emitting one (observed live: a short run of
 // invalid-UTF-8 characters, followed by otherwise-clean, coherent generated
 // text -- consistent with the accept/reject boundary landing mid-way through
 // what should have been an atomic multi-byte token sequence). Bounded retry
@@ -106,9 +101,9 @@ const MAX_COMPLETION_ATTEMPTS = 3;
 // pipeline is random). Deliberately narrow (matches this exact message
 // shape) so a genuinely different server error still fails fast.
 const RETRYABLE_SERVER_PARSE_FAILURE = /does not match the expected .*format/i;
-// Added to FILLER_TOKEN_RANGE_START on each retry attempt (see runCompletion
-// below) so a retry sends a genuinely different token sequence rather than
-// replaying the exact request that just failed -- see the comment above.
+// Rotates the filler prompt on each retry attempt (see runCompletion below)
+// so a retry sends a genuinely different token sequence rather than replaying
+// the exact request that just failed -- see the comment above.
 const RETRY_PROMPT_SHIFT = 137;
 
 function isRetryableServerParseFailure(err: unknown): boolean {
@@ -401,26 +396,20 @@ function evaluateRate(
   return { value, suspect: value <= 0 || value > ceiling };
 }
 
-function syntheticPrompt(n: number, offset = 0): number[] {
-  return Array.from(
-    { length: Math.max(0, n) },
-    (_, i) => FILLER_TOKEN_RANGE_START + ((i + offset) % FILLER_TOKEN_RANGE_SIZE)
-  );
-}
-
 async function runCompletion(
   port: number,
   nPrompt: number,
   nGen: number,
   timeoutMs: number,
-  promptOffset = 0
+  promptOffset = 0,
+  fillerBlocks: FillerBlocks = []
 ): Promise<CompletionOutcome> {
   const startedAt = performance.now();
   const res = await fetch(`http://127.0.0.1:${port}/completion`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
-      prompt: syntheticPrompt(nPrompt, promptOffset),
+      prompt: buildPromptTokens(nPrompt, promptOffset, 0, fillerBlocks),
       n_predict: nGen,
       // Without this, llama-server stops as soon as it samples an EOS/stop
       // token instead of decoding all nGen tokens -- confirmed live on an
@@ -715,6 +704,11 @@ export async function runServerBench(input: ServerBenchRunInput): Promise<BenchR
     // further once the sampler's telemetry is in.
     log?.info(`${label}: offload: ${formatOffloadForLog(offload, modelBufferSizes)} (claimed)`);
 
+    // Fetched here (not earlier) because it needs a server that has finished
+    // loading the model -- /tokenize answers in that model's own vocabulary.
+    // Throws rather than degrading: see fetchFillerBlocks.
+    const fillerBlocks = await fetchFillerBlocks(input.port);
+
     const offsetStorePath = input.offsetStorePath ?? DEFAULT_OFFSET_STORE_PATH;
     const offsetKey = offsetStoreKey(input.modelPath, input.mtpModelPath);
     // Updated in place whenever a non-preferred offset succeeds, so later
@@ -772,7 +766,7 @@ export async function runServerBench(input: ServerBenchRunInput): Promise<BenchR
       for (let attempt = 1; ; attempt++) {
         const promptOffset = candidates[attempt - 1];
         try {
-          outcome = await runCompletion(input.port, item.n_prompt, item.n_gen, timeoutMs, promptOffset);
+          outcome = await runCompletion(input.port, item.n_prompt, item.n_gen, timeoutMs, promptOffset, fillerBlocks);
           if (promptOffset !== preferredOffset) {
             preferredOffset = promptOffset;
             saveWorkingOffset(offsetStorePath, offsetKey, preferredOffset, log);
@@ -889,6 +883,10 @@ export async function runServerBench(input: ServerBenchRunInput): Promise<BenchR
     const specDecode = await checkSpecDecodeMetrics(input.port, label, input.repeats, log);
 
     const commonFields = {
+      // Measured through llama-server, so it carries the server vintage rather
+      // than the shared one -- the mixed-register filler prompt changed what
+      // this path measures, and llama-bench rows must not be invalidated with it.
+      method_version: SERVER_METHOD_VERSION,
       n_prompt: item.n_prompt,
       n_gen: item.n_gen,
       n_threads: item.threads,

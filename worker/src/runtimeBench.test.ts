@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  completeWithRetries,
   executeCurvePoint,
   executeKneeLadder,
   probeSucceeded,
@@ -43,6 +44,14 @@ function fakeServer(opts: { evictOnRepeat?: number; coldPromptMs?: number } = {}
   return { completion, requests };
 }
 
+// Supplied explicitly so no test reaches for a real /tokenize -- fetchFillerBlocks
+// throws rather than degrading, which is the point of it.
+const BLOCKS = [
+  Array.from({ length: 31 }, (_, i) => 1000 + i),
+  Array.from({ length: 43 }, (_, i) => 2000 + i),
+  Array.from({ length: 37 }, (_, i) => 3000 + i),
+];
+
 describe("N1 curve-point execution", () => {
   it("runs the three request classes in order and never averages them together", async () => {
     const server = fakeServer();
@@ -53,6 +62,7 @@ describe("N1 curve-point execution", () => {
       port: 1,
       serverLog: "",
       supportsNoContextShift: true,
+      fillerBlocks: BLOCKS,
       completion: server.completion,
     });
     expect(server.requests).toHaveLength(6); // 1 warm/discard + 1 cold + 4 warm
@@ -79,6 +89,51 @@ describe("N1 curve-point execution", () => {
     expect(tg.repeat_samples).toHaveLength(4);
   });
 
+  // The filler prompt has to be built from ids that decode to valid UTF-8 in
+  // the model's OWN vocabulary, or llama.cpp's chat-output parser rejects the
+  // generation it provokes -- and it has to carry every register, or MoE
+  // prefill reads up to 58% fast (see fillerPrompt.ts).
+  it("builds every prompt out of the supplied filler blocks, carrying every register", async () => {
+    const server = fakeServer();
+    const all = new Set(BLOCKS.flat());
+    await executeCurvePoint({
+      effectiveCtx: 256,
+      nGen: 8,
+      repeats: 2,
+      port: 1,
+      serverLog: "",
+      supportsNoContextShift: true,
+      fillerBlocks: BLOCKS,
+      completion: server.completion,
+    });
+    expect(server.requests.length).toBeGreaterThan(0);
+    expect(server.requests.every((r) => r.promptTokens.every((t) => all.has(t)))).toBe(true);
+    const measured = server.requests[server.requests.length - 1].promptTokens;
+    expect(new Set(measured.map((t) => Math.floor(t / 1000))).size).toBe(BLOCKS.length);
+  });
+
+  it("asks the running server to tokenize the filler when no blocks are supplied", async () => {
+    const server = fakeServer();
+    const fetchMock = vi.fn(async (..._args: unknown[]) => Response.json({ tokens: [9000, 9001, 9002] }));
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      await executeCurvePoint({
+        effectiveCtx: 256,
+        nGen: 8,
+        repeats: 2,
+        port: 1,
+        serverLog: "",
+        supportsNoContextShift: true,
+        completion: server.completion,
+      });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+    expect(fetchMock).toHaveBeenCalled();
+    expect(fetchMock.mock.calls.some((c) => String(c[0]).includes("/tokenize"))).toBe(true);
+    expect(server.requests.every((r) => r.promptTokens.every((t) => t >= 9000))).toBe(true);
+  });
+
   it("stamps METHOD_VERSION 2 so ordinary runtime rows can never land in a curve", async () => {
     const server = fakeServer();
     const execution = await executeCurvePoint({
@@ -88,6 +143,7 @@ describe("N1 curve-point execution", () => {
       port: 1,
       serverLog: "",
       supportsNoContextShift: true,
+      fillerBlocks: BLOCKS,
       completion: server.completion,
     });
     expect(execution.results.every((r) => r.method_version === CURVE_METHOD_VERSION)).toBe(true);
@@ -102,6 +158,7 @@ describe("N1 curve-point execution", () => {
       port: 1,
       serverLog: "",
       supportsNoContextShift: true,
+      fillerBlocks: BLOCKS,
       completion: server.completion,
     });
     expect(execution.results.every((r) => (r.caveat_flags ?? []).includes("cache_evicted"))).toBe(true);
@@ -117,6 +174,7 @@ describe("N1 curve-point execution", () => {
       port: 1,
       serverLog: "",
       supportsNoContextShift: true,
+      fillerBlocks: BLOCKS,
       completion: server.completion,
     });
     expect(execution.results.every((r) => (r.caveat_flags ?? []).length === 0)).toBe(true);
@@ -132,6 +190,7 @@ describe("N1 curve-point execution", () => {
       port: 1,
       serverLog: "slot update_slots: slot context shift, n_keep = 0",
       supportsNoContextShift: false,
+      fillerBlocks: BLOCKS,
       completion: server.completion,
     });
     expect(execution.results.every((r) => (r.caveat_flags ?? []).includes("context_shift"))).toBe(true);
@@ -153,6 +212,7 @@ describe("N1 curve-point execution", () => {
       port: 1,
       serverLog: "",
       supportsNoContextShift: true,
+      fillerBlocks: BLOCKS,
       completion,
     });
     const pp = execution.results.find((r) => r.test_type === "pp")!;
@@ -184,6 +244,7 @@ describe("N5 knee ladder execution", () => {
       nGen: 128,
       repeats: 1,
       slots: [1, 2, 4],
+      fillerBlocks: BLOCKS,
       port: 1,
       completion,
     });
@@ -206,7 +267,7 @@ describe("N5 knee ladder execution", () => {
         slot: input.slot ?? 0,
       };
     };
-    await executeKneeLadder({ nPrompt: 64, nGen: 8, repeats: 1, slots: [4], port: 1, completion });
+    await executeKneeLadder({ nPrompt: 64, nGen: 8, repeats: 1, slots: [4], port: 1, fillerBlocks: BLOCKS, completion });
     expect(new Set(prompts).size).toBe(4);
   });
 });
@@ -355,15 +416,134 @@ describe("spawnRuntimeServer readiness failures", () => {
   }, 10_000);
 });
 
-// Live-reproduced against a real Qwen3.5/3.8 "thinking" GGUF on llama.cpp
-// b10793: llama-server accepts a raw /completion request (HTTP 200, stream
-// opens normally) and then emits an {"error":...} SSE frame instead of real
-// content -- its chat-format output validator rejecting the model's own
-// generated text. Confirmed independent of --reasoning-format,
+// The context tests used to have no recovery at all: one LlamaServerOutputError
+// propagated out and index.ts marked the whole probe ladder fatal, abandoning
+// every remaining placement over a single request. The MTP path had had a retry
+// ladder for months.
+describe("parser-failure recovery", () => {
+  const parserError = () =>
+    new LlamaServerOutputError("rejected", "The model produced output that does not match the expected Content-only format");
+
+  const sample = (): StreamSample => ({
+    ttftMs: 10,
+    e2eMs: 20,
+    tokensPredicted: 8,
+    promptN: 64,
+    promptMs: 5,
+    slot: 0,
+  });
+
+  function recorder(failures: number) {
+    const seen: { first: number; grammar?: string }[] = [];
+    let calls = 0;
+    const completion = async (input: StreamedRequestInput): Promise<StreamSample> => {
+      seen.push({ first: input.promptTokens[0], grammar: input.grammar });
+      if (calls++ < failures) throw parserError();
+      return sample();
+    };
+    return { completion, seen };
+  }
+
+  it("retries on a DIFFERENT prompt, because an identical greedy retry provably fails identically", async () => {
+    const { completion, seen } = recorder(1);
+    const out = await completeWithRetries({
+      completion, port: 1, tokenCount: 64, offset: 0, nonce: 0,
+      blocks: BLOCKS, nPredict: 8, cachePrompt: false,
+    });
+    expect(out.grammarConstrained).toBe(false);
+    expect(seen).toHaveLength(2);
+    expect(seen[1].first).not.toBe(seen[0].first);
+    expect(seen.every((r) => r.grammar === undefined)).toBe(true);
+  });
+
+  it("falls back to a grammar only after every unconstrained attempt is rejected, and says so", async () => {
+    const { completion, seen } = recorder(3);
+    const out = await completeWithRetries({
+      completion, port: 1, tokenCount: 64, offset: 0, nonce: 0,
+      blocks: BLOCKS, nPredict: 8, cachePrompt: false,
+    });
+    expect(out.grammarConstrained).toBe(true);
+    expect(seen).toHaveLength(4);
+    // Three unconstrained attempts, each on its own prompt, then the grammar.
+    expect(seen.slice(0, 3).every((r) => r.grammar === undefined)).toBe(true);
+    expect(new Set(seen.slice(0, 3).map((r) => r.first)).size).toBe(3);
+    expect(seen[3].grammar).toMatch(/^root ::=/);
+  });
+
+  it("stays fatal when even the grammar attempt is rejected -- no other placement will differ", async () => {
+    const completion = async (): Promise<StreamSample> => {
+      throw parserError();
+    };
+    await expect(
+      completeWithRetries({
+        completion, port: 1, tokenCount: 64, offset: 0, nonce: 0,
+        blocks: BLOCKS, nPredict: 8, cachePrompt: false,
+      })
+    ).rejects.toBeInstanceOf(LlamaServerOutputError);
+  });
+
+  it("does not burn retries on an error that another prompt cannot fix", async () => {
+    let calls = 0;
+    const completion = async (): Promise<StreamSample> => {
+      calls++;
+      throw new Error("llama-server /completion returned 503");
+    };
+    await expect(
+      completeWithRetries({
+        completion, port: 1, tokenCount: 64, offset: 0, nonce: 0,
+        blocks: BLOCKS, nPredict: 8, cachePrompt: false,
+      })
+    ).rejects.toThrow("503");
+    expect(calls).toBe(1);
+  });
+
+  it("flags a curve point whose reading only came back under a grammar", async () => {
+    let calls = 0;
+    const completion = async (input: StreamedRequestInput): Promise<StreamSample> => {
+      // Only the very first request needs the grammar; the flag must still
+      // reach the row, since that request is the cold TIMED prefill.
+      if (!input.grammar && calls++ < 3) throw parserError();
+      return { ...sample(), promptN: input.promptTokens.length };
+    };
+    const execution = await executeCurvePoint({
+      effectiveCtx: 256,
+      nGen: 8,
+      repeats: 2,
+      port: 1,
+      serverLog: "",
+      supportsNoContextShift: true,
+      fillerBlocks: BLOCKS,
+      completion,
+    });
+    expect(execution.results.length).toBeGreaterThan(0);
+    expect(execution.results.every((r) => (r.caveat_flags ?? []).includes("grammar_constrained"))).toBe(true);
+  });
+
+  it("leaves the flag off when nothing needed constraining", async () => {
+    const server = fakeServer();
+    const execution = await executeCurvePoint({
+      effectiveCtx: 256,
+      nGen: 8,
+      repeats: 2,
+      port: 1,
+      serverLog: "",
+      supportsNoContextShift: true,
+      fillerBlocks: BLOCKS,
+      completion: server.completion,
+    });
+    expect(execution.results.every((r) => !(r.caveat_flags ?? []).includes("grammar_constrained"))).toBe(true);
+  });
+});
+
+// Live-reproduced against a real Qwen3.8 GGUF on llama.cpp b10793:
+// llama-server accepts a raw /completion request (HTTP 200, stream opens
+// normally) and then emits an {"error":...} SSE frame instead of real content
+// -- its chat-output PEG parser hard-failing over one invalid UTF-8 byte in
+// the generated text. Confirmed independent of --reasoning-format,
 // --skip-chat-parsing, -rea off, --reasoning-budget and ignore_eos (see
-// ggml-org/llama.cpp#19869 and friends). Before this, streamedCompletion had
-// no way to see that frame as anything other than "the model generated zero
-// tokens" -- see the two tests below.
+// ggml-org/llama.cpp#25072, and fillerPrompt.ts for the mechanism). Before
+// this, streamedCompletion had no way to see that frame as anything other
+// than "the model generated zero tokens" -- see the two tests below.
 describe("streamedCompletion / llama-server SSE error frames", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
@@ -397,8 +577,8 @@ describe("streamedCompletion / llama-server SSE error frames", () => {
     );
     const call = streamedCompletion({ port: 1, promptTokens: [100, 101, 102], nPredict: 8, cachePrompt: false });
     await expect(call).rejects.toBeInstanceOf(LlamaServerOutputError);
-    await expect(call).rejects.toThrow(/testing can't run correctly for it on this build/);
-    await expect(call).rejects.toThrow(/ggml-org\/llama\.cpp#19869/);
+    await expect(call).rejects.toThrow(/one invalid UTF-8 byte/);
+    await expect(call).rejects.toThrow(/ggml-org\/llama\.cpp#25072/);
   });
 
   it("falls back to a plainer message for an error signature it hasn't seen before, without claiming this specific diagnosis", async () => {

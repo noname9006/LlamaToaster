@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { CURVE_METHOD_VERSION } from "../../../shared/types.js";
 import { mkdtempSync, existsSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -85,7 +86,7 @@ function result(testType: "pp" | "tg", tps: number, over: Record<string, unknown
     gpu_memory_model_peak_source: null,
     sample_count: 5,
     suspect_count: 0,
-    method_version: 2,
+    method_version: CURVE_METHOD_VERSION,
     ...over,
   };
 }
@@ -168,7 +169,7 @@ describe("GET /api/models/:id/curve (N1)", () => {
       points: { effectiveCtx: number; tg: number | null; ttftN: number | null }[];
       method_version: number;
     };
-    expect(body.method_version).toBe(2);
+    expect(body.method_version).toBe(CURVE_METHOD_VERSION);
     expect(body.points.map((p) => p.effectiveCtx)).toEqual([8192, 16384, 32768]);
     // Cold TTFT points are visibly single-shot.
     expect(body.points.every((p) => p.ttftN === 1)).toBe(true);
