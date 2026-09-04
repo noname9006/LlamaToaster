@@ -180,6 +180,43 @@ export interface StreamedRequestInput {
   signal?: AbortSignal;
 }
 
+// Thrown when llama-server accepts a /completion request (HTTP 200, stream
+// opens normally) but then emits an `{"error":...}` SSE frame mid-stream
+// instead of real content -- e.g. its chat-format output validator rejecting
+// the model's own generated text. Distinct from a thrown network/HTTP error
+// so callers (the N2 ladder) can tell "this model can't generate through
+// this endpoint at all" apart from an ordinary too-slow/OOM candidate and
+// stop trying further placements instead of re-discovering the same failure
+// at every rung.
+export class LlamaServerOutputError extends Error {
+  constructor(
+    message: string,
+    /** llama-server's own error text, unmodified -- kept for the log even
+     * when `message` above has been rewritten into something readable. */
+    public readonly rawMessage: string
+  ) {
+    super(message);
+    this.name = "LlamaServerOutputError";
+  }
+}
+
+// The one signature we've actually root-caused (see ggml-org/llama.cpp
+// #19869 and friends): llama-server's structured-output ("Content-only")
+// parser rejecting a "thinking"-template model's raw output, reproduced live
+// against build b10793 -- confirmed independent of --reasoning-format,
+// --skip-chat-parsing, -rea off and --reasoning-budget, all of which still
+// hit the identical failure. Anything else gets a plainer fallback rather
+// than falsely claiming this specific diagnosis for an error we haven't seen.
+function describeLlamaServerError(rawMessage: string): string {
+  if (rawMessage.includes("Content-only")) {
+    return (
+      "This model's output was rejected by llama-server as invalid -- testing can't run correctly for it on this build. " +
+      "This is a known llama.cpp limitation with 'thinking'/reasoning-style models (see ggml-org/llama.cpp#19869), not a hardware or configuration problem."
+    );
+  }
+  return `llama-server reported an error during generation: ${rawMessage}`;
+}
+
 // TTFT is the arrival of the FIRST streamed chunk, measured here rather than
 // derived from n_prompt/pp -- which is precisely the semantics change §0.1
 // says increments METHOD_VERSION.
@@ -223,19 +260,30 @@ export async function streamedCompletion(input: StreamedRequestInput): Promise<S
       if (!line.startsWith("data:")) continue;
       const payload = line.slice("data:".length).trim();
       if (!payload || payload === "[DONE]") continue;
+      let parsed: {
+        timings?: { prompt_n?: number; prompt_ms?: number; predicted_n?: number };
+        tokens_predicted?: number;
+        error?: { message?: string; code?: number; type?: string };
+      };
       try {
-        const parsed = JSON.parse(payload) as {
-          timings?: { prompt_n?: number; prompt_ms?: number; predicted_n?: number };
-          tokens_predicted?: number;
-        };
-        if (parsed.timings) {
-          if (typeof parsed.timings.prompt_n === "number") promptN = parsed.timings.prompt_n;
-          if (typeof parsed.timings.prompt_ms === "number") promptMs = parsed.timings.prompt_ms;
-        }
-        if (typeof parsed.tokens_predicted === "number") tokensPredicted = parsed.tokens_predicted;
+        parsed = JSON.parse(payload);
       } catch {
-        /* a partial SSE frame; the next chunk completes it */
+        continue; // a partial SSE frame; the next chunk completes it
       }
+      // A hard failure arrives as HTTP 200 + a normal-looking SSE stream that
+      // just carries an {"error":...} frame instead of content/timings -- not
+      // a thrown fetch/HTTP error, so the checks below would otherwise never
+      // see it and this would look identical to "the model generated zero
+      // tokens" (see LlamaServerOutputError's doc comment).
+      if (parsed.error) {
+        const rawMessage = parsed.error.message ?? JSON.stringify(parsed.error);
+        throw new LlamaServerOutputError(describeLlamaServerError(rawMessage), rawMessage);
+      }
+      if (parsed.timings) {
+        if (typeof parsed.timings.prompt_n === "number") promptN = parsed.timings.prompt_n;
+        if (typeof parsed.timings.prompt_ms === "number") promptMs = parsed.timings.prompt_ms;
+      }
+      if (typeof parsed.tokens_predicted === "number") tokensPredicted = parsed.tokens_predicted;
     }
   }
   const e2eMs = Date.now() - startedAt;
@@ -479,6 +527,12 @@ export interface ProbeAttemptOutcome {
   ramNeededMib?: number | null;
   ramFreeMib?: number | null;
   error?: string;
+  /** Set when this attempt failed in a way no other (ctx, ngl) rung can fix
+   * -- currently just a LlamaServerOutputError (the model's own output
+   * rejected by llama-server independent of placement, see runtimeBench.ts).
+   * Tells the ladder loop to stop searching immediately instead of re-
+   * discovering the identical failure at every remaining rung. */
+  fatal?: boolean;
   /** A short, worker-log-only tail of this attempt's captured process output
    * -- populated only when the failure was NOT classified as OOM, so a
    * genuine startup bug is debuggable from the worker log instead of a bare

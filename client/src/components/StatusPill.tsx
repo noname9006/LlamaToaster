@@ -77,6 +77,11 @@ const TEST_ITEM_STATUS_TONE: Record<TestItemStatus, PillTone> = {
   done: "success",
   failed: "danger",
   failed_oom: "danger",
+  // Not a capacity/config failure the user could fix -- llama-server
+  // rejected the model's own output the same way at every placement tried.
+  // Still danger-toned (it IS a failure), distinguished from plain "failed"
+  // only by its label/tooltip.
+  failed_unsupported: "danger",
   cancelled: "muted",
   // §0.7 -- never measured (an unsupported flag disabled its axis), which is
   // a different outcome from "failed" and reads as its own muted tone.
@@ -92,6 +97,7 @@ const TEST_ITEM_STATUS_LABEL: Record<TestItemStatus, string> = {
   done: "done",
   failed: "failed",
   failed_oom: "failed (oom)",
+  failed_unsupported: "unsupported model",
   cancelled: "cancelled",
   skipped: "skipped",
 };
@@ -116,6 +122,8 @@ export function shortItemErrorLabel(status: TestItemStatus): string {
       return "stopped with an error";
     case "failed_oom":
       return "stopped — out of memory";
+    case "failed_unsupported":
+      return "this model can't be tested";
     case "cancelled":
       return "stopped by user";
     default:
@@ -162,6 +170,7 @@ const TEST_ITEM_DOT_STATE: Record<TestItemStatus, DotState> = {
   done: "solid",
   failed: "red",
   failed_oom: "red",
+  failed_unsupported: "red",
   cancelled: "cancelled",
   skipped: "skipped",
 };
@@ -250,7 +259,7 @@ function comboIsRunning(status: TestItemStatus): boolean {
 }
 export function comboTone(status: TestItemStatus): CircleTone {
   if (comboIsRunning(status)) return "running";
-  if (status === "failed" || status === "failed_oom") return "red";
+  if (status === "failed" || status === "failed_oom" || status === "failed_unsupported") return "red";
   if (status === "done") return "solid";
   if (status === "cancelled") return "cancelled";
   return "grey";
