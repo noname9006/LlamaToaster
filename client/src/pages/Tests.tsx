@@ -17,7 +17,7 @@ import { Th, toggleSort, type SortState } from "../components/Th";
 import type { Test, TestConfig, TestItem, TestStatus } from "../types";
 import { shortId, formatElapsed, formatFlashAttn } from "../utils";
 
-const TERMINAL_ITEM_STATUSES = new Set(["done", "failed", "failed_oom", "cancelled"]);
+const TERMINAL_ITEM_STATUSES = new Set(["done", "failed", "failed_oom", "failed_unsupported", "cancelled", "skipped"]);
 
 // One row's worth of chain: every test sharing a root_run_id (Test A's own
 // id -- see Benchmark.tsx's startStage/repo.ts's chain insert, which points

@@ -515,7 +515,7 @@ describe("POST /api/runs/:id/probe-result (N2)", () => {
     expect(repo.getTestItems("probe-stopped-no-error")[0].error).toBe("stopped by user");
   });
 
-  it("rejects a status outside verified/failed/failed_oom/stopped", async () => {
+  it("rejects a status outside verified/failed/failed_oom/failed_unsupported/stopped", async () => {
     makeRun("probe-bad-status", { kind: "probe", worker: workerId, config: { probe: probeSpec } });
     const res = await post(
       "/api/runs/probe-bad-status/probe-result",
@@ -523,6 +523,39 @@ describe("POST /api/runs/:id/probe-result (N2)", () => {
       workerToken
     );
     expect(res.status).toBe(400);
+  });
+
+  // failed_unsupported (worker/src/runtimeBench.ts's LlamaServerOutputError):
+  // not a capacity/config failure -- llama-server rejected the model's own
+  // output the same way at every placement the ladder tried. Passes straight
+  // through to its own TerminalTestItemStatus value, parallel to failed_oom,
+  // so callers can tell "this model can't be tested at all" apart from an
+  // ordinary failure programmatically -- and the human-readable reason must
+  // survive intact in the item's error text either way.
+  it("records a failed_unsupported probe as its own distinct item status carrying the friendly reason, and writes no verified ceiling", async () => {
+    makeRun("probe-unsupported", {
+      kind: "probe",
+      worker: workerId,
+      config: { probe: { ...probeSpec, kv_pair: ["q5_1", "q5_1"] } },
+    });
+    const friendlyMessage =
+      "This model's output was rejected by llama-server as invalid -- testing can't run correctly for it on this build. " +
+      "This is a known llama.cpp limitation with 'thinking'/reasoning-style models (see ggml-org/llama.cpp#19869), not a hardware or configuration problem.";
+    const res = await post(
+      "/api/runs/probe-unsupported/probe-result",
+      {
+        status: "failed_unsupported",
+        verified_ctx_tokens: null,
+        attempts: [{ candidate_ctx: 1024, ngl: 20, ok: false, oom: false, spill: false, error: friendlyMessage }],
+        error: friendlyMessage,
+      },
+      workerToken
+    );
+    expect(res.status).toBe(200);
+    expect(repo.limitsRepo.listForModelAndWorker("m1", workerId).some((r) => r.kv_type === "q5_1/q5_1")).toBe(false);
+    const item = repo.getTestItems("probe-unsupported")[0];
+    expect(item.status).toBe("failed_unsupported");
+    expect(item.error).toBe(friendlyMessage);
   });
 });
 

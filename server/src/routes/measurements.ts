@@ -158,9 +158,10 @@ export async function measurementRoutes(app: FastifyInstance): Promise<void> {
         body.status !== "verified" &&
         body.status !== "failed" &&
         body.status !== "failed_oom" &&
+        body.status !== "failed_unsupported" &&
         body.status !== "stopped"
       ) {
-        throw new BadRequestError("status must be verified/failed/failed_oom/stopped");
+        throw new BadRequestError("status must be verified/failed/failed_oom/failed_unsupported/stopped");
       }
       const attempts = validateProbeAttempts(body.attempts);
 
@@ -235,9 +236,12 @@ export async function measurementRoutes(app: FastifyInstance): Promise<void> {
       // to the ordinary "cancelled" item status -- the same one the sweep-item
       // loop's own stopRequested branch uses (worker/src/index.ts) -- so
       // finalizeTest's existing no-cancelReason branch (repo.ts) reads it as a
-      // genuine user stop rather than a bench failure.
-      const itemStatus =
-        body.status === "verified" ? "done" : body.status === "stopped" ? "cancelled" : body.status;
+      // genuine user stop rather than a bench failure. "failed_unsupported"
+      // passes straight through: TerminalTestItemStatus has its own value for
+      // it, parallel to failed_oom, so callers can tell "this model can't be
+      // tested at all" apart from an ordinary failure programmatically
+      // instead of pattern-matching the error text.
+      const itemStatus = body.status === "verified" ? "done" : body.status === "stopped" ? "cancelled" : body.status;
       repo.recordTestItemTerminal(run.id, 0, {
         status: itemStatus,
         error:

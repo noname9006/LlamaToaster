@@ -1,10 +1,12 @@
 import { spawn } from "node:child_process";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   executeCurvePoint,
   executeKneeLadder,
   probeSucceeded,
   spawnRuntimeServer,
+  streamedCompletion,
+  LlamaServerOutputError,
   RuntimeServerStartupError,
   PROBE_MIN_GEN_TPS,
   type StreamedRequestInput,
@@ -351,4 +353,78 @@ describe("spawnRuntimeServer readiness failures", () => {
       await handle.stop();
     }
   }, 10_000);
+});
+
+// Live-reproduced against a real Qwen3.5/3.8 "thinking" GGUF on llama.cpp
+// b10793: llama-server accepts a raw /completion request (HTTP 200, stream
+// opens normally) and then emits an {"error":...} SSE frame instead of real
+// content -- its chat-format output validator rejecting the model's own
+// generated text. Confirmed independent of --reasoning-format,
+// --skip-chat-parsing, -rea off, --reasoning-budget and ignore_eos (see
+// ggml-org/llama.cpp#19869 and friends). Before this, streamedCompletion had
+// no way to see that frame as anything other than "the model generated zero
+// tokens" -- see the two tests below.
+describe("streamedCompletion / llama-server SSE error frames", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  function sseResponse(dataLines: unknown[]): Response {
+    const body = dataLines.map((line) => `data: ${JSON.stringify(line)}\n\n`).join("") + "data: [DONE]\n\n";
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(body));
+        controller.close();
+      },
+    });
+    return new Response(stream, { status: 200 });
+  }
+
+  it("throws a friendly, specific LlamaServerOutputError for the known Content-only parser rejection", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        sseResponse([
+          {
+            error: {
+              code: 500,
+              message: "The model produced output that does not match the expected Content-only format",
+              type: "server_error",
+            },
+          },
+        ])
+      )
+    );
+    const call = streamedCompletion({ port: 1, promptTokens: [100, 101, 102], nPredict: 8, cachePrompt: false });
+    await expect(call).rejects.toBeInstanceOf(LlamaServerOutputError);
+    await expect(call).rejects.toThrow(/testing can't run correctly for it on this build/);
+    await expect(call).rejects.toThrow(/ggml-org\/llama\.cpp#19869/);
+  });
+
+  it("falls back to a plainer message for an error signature it hasn't seen before, without claiming this specific diagnosis", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => sseResponse([{ error: { code: 500, message: "something else entirely broke" } }]))
+    );
+    const call = streamedCompletion({ port: 1, promptTokens: [1], nPredict: 1, cachePrompt: false });
+    await expect(call).rejects.toBeInstanceOf(LlamaServerOutputError);
+    await expect(call).rejects.toThrow("llama-server reported an error during generation: something else entirely broke");
+    await expect(call).rejects.not.toThrow(/Content-only/);
+  });
+
+  it("still parses a normal streamed completion correctly (regression check on separating JSON.parse from the error check)", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        sseResponse([
+          { content: " hi", tokens_predicted: 1 },
+          { content: " there", tokens_predicted: 2, timings: { prompt_n: 4, prompt_ms: 12 } },
+        ])
+      )
+    );
+    const sample = await streamedCompletion({ port: 1, promptTokens: [1, 2, 3, 4], nPredict: 2, cachePrompt: false });
+    expect(sample.tokensPredicted).toBe(2);
+    expect(sample.promptN).toBe(4);
+    expect(sample.promptMs).toBe(12);
+  });
 });
