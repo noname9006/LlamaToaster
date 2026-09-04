@@ -125,6 +125,12 @@ export interface GoalQuestionnaireProps {
       modeStarts: Record<ProbeMode, { ngl: number; ctx: number }>,
       granularity: ProbeGranularity
     ) => Promise<void>;
+    /** Selected modes NOT yet fired -- runModes holds every mode but the
+     * first back until that first one's own result is known (a
+     * failed_unsupported outcome is model/build-wide, so the rest would just
+     * re-discover the identical wall). Purely local UI state so these cards
+     * can say why nothing is happening yet instead of looking inert. */
+    heldModes: Set<ProbeMode>;
   };
 }
 
@@ -134,7 +140,10 @@ export interface PlacementVerifyResult {
   testId: string;
   // "cancelled" -- a user stop mid-ladder, distinct from failed/failed_oom:
   // it means nobody let the search finish, not that the placement doesn't fit.
-  status: "pending" | "verified" | "failed" | "failed_oom" | "cancelled" | "error";
+  // "failed_unsupported" -- llama-server rejected the model's own output the
+  // same way at every placement tried (see runtimeBench.ts's
+  // LlamaServerOutputError); no placement this card could pick would fix it.
+  status: "pending" | "verified" | "failed" | "failed_oom" | "failed_unsupported" | "cancelled" | "error";
   detail?: string;
   verifiedCtxTokens?: number | null;
   mode?: ProbeMode;
@@ -964,11 +973,20 @@ function PlacementMatrix({
         </div>
         <p className="mt-1.5 text-[11px] leading-relaxed text-muted">{GRANULARITY_BLURB[granularity]}</p>
 
+        {Object.values(placement.verifyResults).some((r) => r?.status === "failed_unsupported") && (
+          <p className="mt-1.5 rounded-lg border border-danger/40 bg-danger/10 px-2.5 py-1.5 text-[11px] font-semibold leading-relaxed text-danger">
+            This model can't be tested on this machine right now — llama-server rejects its own generated output the
+            same way at every placement, so every other card below would just fail identically. See the failing
+            card's own message for detail, or the run's log for the raw diagnostic.
+          </p>
+        )}
+
         <div className="mt-2 flex flex-wrap gap-2">
           {(Object.keys(MODE_LABEL) as ProbeMode[]).map((mode) => {
             const start = modeStarts[mode];
             const result = placement.verifyResults[mode] ?? null;
             const busy = result?.status === "pending";
+            const held = placement.heldModes.has(mode);
             return (
               <ModeCard
                 key={mode}
@@ -976,9 +994,10 @@ function PlacementMatrix({
                 start={start}
                 selected={selectedModes.has(mode)}
                 busy={busy}
+                held={held}
                 result={result}
                 onActivate={() => {
-                  if (busy) return;
+                  if (busy || held) return;
                   setSelectedModes((prev) => {
                     const next = new Set(prev);
                     if (next.has(mode)) next.delete(mode);
@@ -1046,6 +1065,7 @@ function modeCardCircleTone(result: PlacementVerifyResult | null): CircleTone {
     case "verified":
       return "solid";
     case "failed_oom":
+    case "failed_unsupported":
     case "failed":
     case "error":
       return "red";
@@ -1061,6 +1081,7 @@ function ModeCard({
   start,
   selected,
   busy,
+  held,
   result,
   onActivate,
   onReset,
@@ -1069,19 +1090,26 @@ function ModeCard({
   start: { ngl: number; ctx: number };
   selected: boolean;
   busy: boolean;
+  /** Selected for this "Run test" click, but deliberately not fired yet --
+   * runModes is waiting on the first requested mode's own result before
+   * deciding whether this one is even worth queuing (see
+   * GoalQuestionnaireProps.placement.heldModes' doc comment). */
+  held: boolean;
   result: PlacementVerifyResult | null;
   onActivate: () => void;
   onReset: () => void;
 }) {
   const running = result?.status === "pending";
-  const failed = result?.status === "failed" || result?.status === "failed_oom";
+  const failedCapacity = result?.status === "failed" || result?.status === "failed_oom";
+  const failedUnsupported = result?.status === "failed_unsupported";
+  const inert = busy || held;
   const startLabel = `from ${mode === "max_context" ? "searched" : `${start.ngl} layers`} · ${start.ctx.toLocaleString()} tokens`;
   return (
     <div
       role="button"
       tabIndex={0}
       aria-pressed={selected}
-      aria-disabled={busy}
+      aria-disabled={inert}
       title={startLabel}
       onClick={onActivate}
       onKeyDown={(e) => {
@@ -1091,12 +1119,12 @@ function ModeCard({
         }
       }}
       className={`flex ${MODE_CARD_HEIGHT} w-[188px] shrink-0 flex-col gap-1 rounded-lg border p-2.5 transition-colors ${
-        busy ? "cursor-not-allowed" : "cursor-pointer"
+        inert ? "cursor-not-allowed" : "cursor-pointer"
       } ${selected ? "border-accent bg-accent/10" : "border-border bg-surface hover:border-accent/40"}`}
     >
       <div className="flex items-start justify-between gap-1">
         <span className="flex min-w-0 items-center gap-1.5 text-[11.5px] font-semibold text-fg">
-          <StatusCircle tone={modeCardCircleTone(result)} />
+          <StatusCircle tone={held ? "warn" : modeCardCircleTone(result)} />
           <span className="truncate">{MODE_LABEL[mode]}</span>
         </span>
         {result && !running && (
@@ -1116,6 +1144,9 @@ function ModeCard({
       </div>
       <span className="text-[10.5px] leading-relaxed text-muted">{MODE_BLURB[mode]}</span>
       <div className="flex-1">
+        {held && (
+          <span className="block font-mono text-[10.5px] text-muted">waiting on the first test's result…</span>
+        )}
         {running && (
           <span className="block font-mono text-[10.5px] text-muted">
             {result?.liveDetail ?? (result?.runStatus === "scheduled" ? "queued, waiting its turn…" : "starting…")}
@@ -1127,7 +1158,12 @@ function ModeCard({
             {result.measuredNgl != null ? ` · ${result.measuredNgl} layers` : ""}
           </span>
         )}
-        {failed && <span className="block font-mono text-[11px] font-semibold text-danger">✗ didn’t fit</span>}
+        {failedCapacity && <span className="block font-mono text-[11px] font-semibold text-danger">✗ didn’t fit</span>}
+        {failedUnsupported && (
+          <span className="block text-[10.5px] font-semibold leading-snug text-danger">
+            ✗ this model can't be tested — {result?.detail ?? "llama-server rejected its own output"}
+          </span>
+        )}
         {result?.status === "cancelled" && (
           <span className="block font-mono text-[11px] font-semibold text-muted">■ stopped before finishing</span>
         )}

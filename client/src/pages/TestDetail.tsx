@@ -271,7 +271,14 @@ const CAVEAT_FLAG_REASON: Record<string, string> = {
     "a context shift appeared in the logs and this build has no --no-context-shift, which silently corrupts TTFT comparability",
 };
 
-const TERMINAL_ITEM_STATUSES = new Set(["done", "failed", "failed_oom", "cancelled", "skipped"]);
+const TERMINAL_ITEM_STATUSES = new Set([
+  "done",
+  "failed",
+  "failed_oom",
+  "failed_unsupported",
+  "cancelled",
+  "skipped",
+]);
 const RUNNING_ITEM_STATUSES = new Set(["loading", "processing", "generating", "benchmarking"]);
 
 type StatusFilter = "all" | "queued" | "running" | "done" | "failed" | "cancelled";
@@ -294,7 +301,7 @@ function matchesStatusFilter(status: TestItem["status"], filter: StatusFilter): 
     case "done":
       return status === "done";
     case "failed":
-      return status === "failed" || status === "failed_oom";
+      return status === "failed" || status === "failed_oom" || status === "failed_unsupported";
     case "cancelled":
       return status === "cancelled";
     default:

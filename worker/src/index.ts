@@ -32,6 +32,7 @@ import {
   toBenchResult,
   PROBE_GEN_TOKENS,
   RuntimeServerStartupError,
+  LlamaServerOutputError,
   type ProbeAttemptOutcome,
 } from "./runtimeBench.js";
 import {
@@ -2347,7 +2348,21 @@ async function executeRuntimeBenchmarkJob(
           vram_avg_mib: stats.vram_avg_mib,
         });
         // One point failing (OOM at a large context, say) must not stop the
-        // rest of the ladder from being measured.
+        // rest of the ladder from being measured -- UNLESS it's a
+        // LlamaServerOutputError, which fails the same way regardless of
+        // context size (confirmed live across every placement for the model
+        // that surfaced this). Remaining contexts would just re-discover the
+        // identical failure one at a time, so skip them instead.
+        if (err instanceof LlamaServerOutputError) {
+          log.info(`${label}: model-level failure, not context-specific -- skipping the remaining context sizes`);
+          for (let j = i + 1; j < contexts.length; j++) {
+            await safeItemTerminal(payload.run_id, j, {
+              status: "skipped",
+              error: "skipped -- an earlier context size in this run hit the same model-level failure",
+            });
+          }
+          break;
+        }
       }
     }
     setRunLogFile(null);
@@ -3161,6 +3176,7 @@ async function executeRunProbeJob(payload: TestProbeJobPayload): Promise<void> {
   );
 
   let stoppedMidLadder = false;
+  let fatalError: string | undefined;
   try {
     for (;;) {
       // Checked before every rung, same as the sweep-item loop above -- a
@@ -3254,6 +3270,16 @@ async function executeRunProbeJob(payload: TestProbeJobPayload): Promise<void> {
       if (!attempt.ok && !attempt.oom && attempt.stderrTail) {
         log.info(`${label}: candidate ${rung.ctx}/${rung.ngl} raw output (not classified as OOM):\n${attempt.stderrTail}`);
       }
+      // A fatal attempt (see ProbeAttemptOutcome.fatal's doc comment) fails
+      // the same way at every placement -- confirmed live across the full
+      // ngl range for the model that surfaced this. Searching further would
+      // just re-spend the remaining load budget re-discovering the identical
+      // failure instead of reporting it once and stopping.
+      if (attempt.fatal) {
+        fatalError = attempt.error;
+        log.info(`${label}: candidate ${rung.ctx}/${rung.ngl} failed in a way no other placement can fix -- stopping the ladder`);
+        break;
+      }
     }
 
     const best = bestLadderResult(attempts.map(toLadderAttempt));
@@ -3291,15 +3317,28 @@ async function executeRunProbeJob(payload: TestProbeJobPayload): Promise<void> {
             attempts: attempts.map(toProbeAttemptReport),
             error: "stopped by user before the ladder found a usable placement",
           }
-        : {
-            status: attempts.some((a) => a.oom) ? "failed_oom" : "failed",
-            verified_ctx_tokens: null,
-            method_version: METHOD_VERSION,
-            attempts: attempts.map(toProbeAttemptReport),
-            error:
-              attempts[attempts.length - 1]?.error ??
-              "no candidate context loaded and generated above the usable floor",
-          };
+        : fatalError != null
+          ? {
+              // Distinct from failed/failed_oom for the same reason as
+              // "stopped" above: this isn't "no placement fits", it's "this
+              // model can't be tested at all on this build" -- a different
+              // fact the UI should say plainly rather than folding into a
+              // capacity-sounding verdict.
+              status: "failed_unsupported",
+              verified_ctx_tokens: null,
+              method_version: METHOD_VERSION,
+              attempts: attempts.map(toProbeAttemptReport),
+              error: fatalError,
+            }
+          : {
+              status: attempts.some((a) => a.oom) ? "failed_oom" : "failed",
+              verified_ctx_tokens: null,
+              method_version: METHOD_VERSION,
+              attempts: attempts.map(toProbeAttemptReport),
+              error:
+                attempts[attempts.length - 1]?.error ??
+                "no candidate context loaded and generated above the usable floor",
+            };
     await withAuth((token) => postProbeResult(config.url, token, payload.run_id, report));
     log.info(
       `${label}: ${report.status}` +
@@ -3435,6 +3474,31 @@ async function runOneProbeLoad(input: ProbeLoadInput): Promise<ProbeAttemptOutco
   } catch (err) {
     const stats = sampler.stop();
     const message = err instanceof Error ? err.message : String(err);
+    // llama-server accepted the request and generated *something* -- this
+    // isn't a load/capacity failure at all, and no other (ctx, ngl) rung will
+    // fare any differently (confirmed live: identical across every layer
+    // count from full-GPU down to CPU-only). Short-circuits the ladder below
+    // instead of re-running the same doomed request up to maxLoads times.
+    if (err instanceof LlamaServerOutputError) {
+      return {
+        candidateCtx,
+        ok: false,
+        oom: false,
+        spill: false,
+        vramPeakMib: stats.vram_peak_mib,
+        ramPeakMib: stats.ram_peak_mib,
+        genTps: null,
+        ...memoryFields,
+        error: message,
+        fatal: true,
+        // llama-server's own error text, unrewritten -- `error` above may
+        // have been replaced with a friendlier sentence that no longer
+        // quotes it directly, so this is where the raw diagnostic survives
+        // for the worker log. Not real process stderr, so it skips
+        // probeStderrTail's tensor-load-spam filtering, which doesn't apply.
+        stderrTail: err.rawMessage,
+      };
+    }
     // A RuntimeServerStartupError (the child died, or its health port never
     // opened, before readiness) is the ONLY case where `server` above stays
     // null -- spawnRuntimeServer throws before ever returning a handle -- so

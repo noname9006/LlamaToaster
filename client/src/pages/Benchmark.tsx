@@ -36,7 +36,7 @@ import { GoalQuestionnaire, KV_PRESET_LABEL } from "../components/GoalQuestionna
 import { TestStatusPill } from "../components/StatusPill";
 import { IconArrowRight, IconChevronDown, IconInfo } from "../components/icons";
 import { backendVisibleGpus } from "../types";
-import type { Model, Test, ResultRow, TestKind, SweepConfig } from "../types";
+import type { Model, Test, TestItem, ResultRow, TestKind, SweepConfig } from "../types";
 import { formatBytes, formatGpuLabel } from "../utils";
 import { estimateSafeNgl, estimateVramNeededMib, maxAffordableContext } from "../vramEstimate";
 import {
@@ -157,7 +157,11 @@ interface PlacementVerifyState {
   // "cancelled" -- a user stop mid-ladder (worker/src/index.ts's
   // stopRequested check), distinct from failed/failed_oom: it means nobody
   // let the search finish, not that the placement doesn't fit.
-  status: "pending" | "verified" | "failed" | "failed_oom" | "cancelled" | "error";
+  // "failed_unsupported" -- llama-server rejected the model's own output the
+  // same way at every placement tried (see runtimeBench.ts's
+  // LlamaServerOutputError); not a capacity/config problem this card's own
+  // placement could ever fix.
+  status: "pending" | "verified" | "failed" | "failed_oom" | "failed_unsupported" | "cancelled" | "error";
   detail?: string;
   verifiedCtxTokens?: number | null;
   /** Which Tested-configurations card fired this probe. */
@@ -452,6 +456,11 @@ export function Benchmark() {
   // recompute the same number that already failed, rather than trusting the
   // live reading at full confidence forever.
   const [poolHaircutFrac, setPoolHaircutFrac] = useState(0);
+  // When more than one mode is triggered together, the modes NOT yet fired
+  // while runModes waits on the first one's own result -- purely local UI
+  // state (never persisted) so their cards can say why nothing is happening
+  // yet instead of looking inert. See runModes below.
+  const [heldForPrecheck, setHeldForPrecheck] = useState<Set<ProbeMode>>(new Set());
 
   useEffect(() => {
     (async () => {
@@ -962,6 +971,24 @@ export function Benchmark() {
     }
   }
 
+  // One-off poll, independent of startPolling's own per-card loop below (which
+  // drives the card's live UI, not this decision) -- used only to learn
+  // whether the FIRST mode in a multi-mode "Run test" hit failed_unsupported
+  // before deciding whether the rest are even worth queuing. Same interval
+  // and terminality check as startPolling's poll() for consistency.
+  async function waitForProbeTerminal(testId: string): Promise<TestItem["status"] | undefined> {
+    for (;;) {
+      if (unmountedRef.current) return undefined;
+      try {
+        const res = await api.getTest(testId);
+        if (TERMINAL.has(res.run.status)) return res.items[0]?.status;
+      } catch {
+        /* transient -- keep polling, same tolerance as the main poll loop */
+      }
+      await new Promise((r) => setTimeout(r, 5000));
+    }
+  }
+
   // N2 batching -- fires every requested mode's verify in order (awaited
   // sequentially so batch membership is deterministic; NOT waiting for each
   // run to finish -- verifyPlacement's own startPolling tracks each mode
@@ -971,6 +998,15 @@ export function Benchmark() {
   // every later one in this call, and any later "Run test" click while that
   // batch is still open, attaches to it instead of 409ing or starting a new
   // row on the Runs list.
+  //
+  // EXCEPT when more than one mode is requested at once: a
+  // LlamaServerOutputError-driven failed_unsupported outcome is model/build-
+  // wide, not placement-specific (confirmed live -- see runtimeBench.ts's
+  // LlamaServerOutputError doc comment), so every OTHER selected mode would
+  // just re-discover the identical wall. In that case only the first
+  // requested mode fires immediately; the rest are held (see
+  // heldForPrecheck, purely local UI state) until that first one's own
+  // result is known, and only launched if it wasn't that failure.
   async function runModes(
     modes: ProbeMode[],
     modeStarts: Record<ProbeMode, { ngl: number; ctx: number }>,
@@ -980,13 +1016,38 @@ export function Benchmark() {
     if (toRun.length === 0) return;
     const batchStillOpen = Object.values(verifyStates).some((s) => s?.status === "pending");
     let rootId = batchStillOpen ? (batchRootId ?? undefined) : undefined;
-    for (const mode of toRun) {
-      const start = modeStarts[mode];
-      const newId = await verifyPlacement(start.ngl, start.ctx, mode, granularity, rootId);
-      if (!rootId && newId) {
-        rootId = newId;
-        setBatchRootId(newId);
+
+    if (toRun.length === 1) {
+      const start = modeStarts[toRun[0]];
+      const newId = await verifyPlacement(start.ngl, start.ctx, toRun[0], granularity, rootId);
+      if (!rootId && newId) setBatchRootId(newId);
+      return;
+    }
+
+    const [first, ...rest] = toRun;
+    setHeldForPrecheck(new Set(rest));
+    try {
+      const firstStart = modeStarts[first];
+      const firstId = await verifyPlacement(firstStart.ngl, firstStart.ctx, first, granularity, rootId);
+      if (!firstId) return; // verifyPlacement already recorded the "error" state on `first`'s own card
+      if (!rootId) {
+        rootId = firstId;
+        setBatchRootId(firstId);
       }
+      const outcome = await waitForProbeTerminal(firstId);
+      // Unmounted mid-wait (undefined outcome) -- don't fire the rest into a
+      // torn-down component, same as stopping for a genuine fatal result.
+      if (outcome === "failed_unsupported" || unmountedRef.current) return;
+      for (const mode of rest) {
+        const start = modeStarts[mode];
+        const newId = await verifyPlacement(start.ngl, start.ctx, mode, granularity, rootId);
+        if (!rootId && newId) {
+          rootId = newId;
+          setBatchRootId(newId);
+        }
+      }
+    } finally {
+      if (!unmountedRef.current) setHeldForPrecheck(new Set());
     }
   }
 
@@ -1058,15 +1119,23 @@ export function Benchmark() {
           const status: PlacementVerifyState["status"] =
             item?.status === "failed_oom"
               ? "failed_oom"
-              : item?.status === "done"
-                ? "verified"
-                : item?.status === "cancelled"
-                  ? "cancelled"
-                  : "failed";
+              : item?.status === "failed_unsupported"
+                ? "failed_unsupported"
+                : item?.status === "done"
+                  ? "verified"
+                  : item?.status === "cancelled"
+                    ? "cancelled"
+                    : "failed";
           setVerifyStates((prev) => {
             const cur = prev[mode];
+            // item.error (the terminal reason, e.g. a friendly
+            // LlamaServerOutputError message) over item.detail (the last
+            // in-flight tick text, e.g. "probe load 8: ctx 1024 / 0 layers")
+            // -- recordTestItemTerminal never clears `detail`, so without
+            // this a failed card keeps showing stale progress text instead
+            // of why it actually failed.
             return cur && cur.testId === testId
-              ? { ...prev, [mode]: { ...cur, status, detail: item?.detail, runStatus: undefined } }
+              ? { ...prev, [mode]: { ...cur, status, detail: item?.error ?? item?.detail, runStatus: undefined } }
               : prev;
           });
           if (status === "failed" || status === "failed_oom") {
@@ -1486,6 +1555,7 @@ export function Benchmark() {
                       onRunModes: runModes,
                       onReset: resetVerify,
                       verifyResults: verifyStates,
+                      heldModes: heldForPrecheck,
                     }
                   : undefined
               }

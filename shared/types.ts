@@ -872,13 +872,27 @@ export type TestItemStatus =
   | "done"
   | "failed"
   | "failed_oom"
+  // Not a capacity/config failure -- llama-server rejected the model's own
+  // generated output the same way at every placement tried (a
+  // LlamaServerOutputError, see worker/src/runtimeBench.ts). Distinct from
+  // failed/failed_oom so callers can tell "this model can't be tested at
+  // all" apart from an ordinary too-slow/OOM outcome that a different
+  // placement might still pass.
+  | "failed_unsupported"
   | "cancelled"
   // §0.7 -- an unsupported flag disables its axis (items become skipped with
   // a reason) rather than failing every item. Never measured; scoring's
   // eligibility gates treat skipped items as non-disqualifying.
   | "skipped";
 
-const TERMINAL_TEST_ITEM_STATUSES = ["done", "failed", "failed_oom", "cancelled", "skipped"] as const;
+const TERMINAL_TEST_ITEM_STATUSES = [
+  "done",
+  "failed",
+  "failed_oom",
+  "failed_unsupported",
+  "cancelled",
+  "skipped",
+] as const;
 export type TerminalTestItemStatus = (typeof TERMINAL_TEST_ITEM_STATUSES)[number];
 
 export function isTerminalTestItemStatus(status: TestItemStatus): status is TerminalTestItemStatus {
@@ -1643,7 +1657,12 @@ export interface ProbeAttemptReport {
   reused_from_run_id?: string | null;
 }
 
-export type ProbeResultStatus = "verified" | "failed" | "failed_oom" | "stopped";
+// failed_unsupported: not a capacity/config failure at all -- llama-server
+// rejected the model's own generated output the same way at every placement
+// tried (see worker/src/runtimeBench.ts's LlamaServerOutputError). Distinct
+// from failed/failed_oom so the UI can say "this model can't be tested"
+// instead of implying a VRAM/RAM/config problem the user could fix.
+export type ProbeResultStatus = "verified" | "failed" | "failed_oom" | "failed_unsupported" | "stopped";
 
 export interface ProbeResultInput {
   status: ProbeResultStatus;
