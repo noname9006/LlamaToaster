@@ -147,7 +147,22 @@ export const METHOD_VERSION = 1;
 // statistics) are a real semantics change under §0.1, so they stamp this
 // instead -- which is also what keeps ordinary runtime rows' warm-biased TTFT
 // out of curves without a dedicated marker column.
-export const CURVE_METHOD_VERSION = 2;
+export const CURVE_METHOD_VERSION = 4;
+
+// Rows measured THROUGH llama-server (N5's concurrency ladder and the MTP
+// path). Split out from METHOD_VERSION when the synthetic filler prompt became
+// a tokenized mixed-register passage: on a mixture-of-experts model with
+// experts on CPU, that change alone moved measured prefill by 58% (the old
+// filler collapsed expert routing and read 70% above llama-bench on the same
+// model and flags). llama-bench builds its own prompt internally, so its rows
+// are untouched by that change and stay at METHOD_VERSION -- bumping the
+// shared constant would have falsely invalidated them.
+export const SERVER_METHOD_VERSION = 3;
+
+// The curve vintage that shipped before the filler-prompt rewrite. Kept as a
+// named constant because stored rows still carry it and N7 bundles still have
+// to describe how they were measured.
+export const LEGACY_CURVE_METHOD_VERSION = 2;
 
 // N2 added 'probe'; N4's quality measurement gets its own kind too, for the
 // same reason -- a single perplexity measurement is not a sweep, and folding
@@ -178,6 +193,12 @@ export const CAVEAT_FLAGS = [
   "thermally_throttled",
   "cache_evicted",
   "context_shift",
+  // The reading only came back at all because generation was constrained by a
+  // grammar -- llama.cpp's chat-output parser rejects any response containing
+  // one invalid UTF-8 byte, and some models emit one unprompted. Constrained
+  // sampling carries its own overhead, so such a row is a usable signal but
+  // not directly comparable with an unconstrained one.
+  "grammar_constrained",
 ] as const;
 export type CaveatFlag = (typeof CAVEAT_FLAGS)[number];
 

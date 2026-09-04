@@ -26,6 +26,7 @@ import { spawn } from "node:child_process";
 import {
   spawnRuntimeServer,
   streamedCompletion,
+  completeWithRetries,
   executeCurvePoint,
   executeKneeLadder,
   probeSucceeded,
@@ -42,7 +43,8 @@ import {
   PROBE_MAX_LOADS,
   type LadderAttempt,
 } from "../../shared/probeLadder.js";
-import { buildPromptTokens, DEFAULT_KNEE_SLOTS } from "./loadDriver.js";
+import { DEFAULT_KNEE_SLOTS } from "./loadDriver.js";
+import { fetchFillerBlocks } from "./fillerPrompt.js";
 import { supportsFlag } from "./binary-probe.js";
 import { MemorySampler, captureFreeMemoryBaseline, type SampleStats, type FreeMemoryBaseline } from "./sampler.js";
 import { readGpuMemory, readNvidiaDriverInfo, type NvidiaDriverInfo } from "./vram.js";
@@ -3438,12 +3440,29 @@ async function runOneProbeLoad(input: ProbeLoadInput): Promise<ProbeAttemptOutco
         sampler.start(proc.pid, payload.llama_cpp_backend, TICK_INTERVAL_MS);
       },
     });
-    const sample = await streamedCompletion({
+    // Retries a rejected generation on a rotated prompt, and falls back to a
+    // grammar-constrained attempt, rather than letting one parser failure mark
+    // the whole ladder fatal (see completeWithRetries).
+    const { sample, grammarConstrained } = await completeWithRetries({
+      completion: streamedCompletion,
       port: server.port,
-      promptTokens: buildPromptTokens(64),
+      tokenCount: 64,
+      offset: 0,
+      nonce: 0,
+      blocks: await fetchFillerBlocks(server.port),
       nPredict: PROBE_GEN_TOKENS,
       cachePrompt: false,
+      log,
     });
+    if (grammarConstrained) {
+      // The rung still answers what the probe asks -- does this placement load
+      // and generate -- but its rate carries constrained-sampling overhead, so
+      // it is not a throughput reading anyone should compare.
+      log.warn(
+        `${input.label}: this configuration only generated under a grammar constraint; ` +
+          `treating it as usable, but its ${PROBE_GEN_TOKENS}-token rate is not comparable`
+      );
+    }
     const genTps =
       sample.e2eMs > sample.ttftMs && sample.tokensPredicted > 0
         ? (sample.tokensPredicted / (sample.e2eMs - sample.ttftMs)) * 1000

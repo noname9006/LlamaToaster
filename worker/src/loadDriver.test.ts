@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 import {
-  buildPromptTokens,
   buildServerArgs,
   contextSizeForSlots,
   curveCaveatFlags,
@@ -13,6 +12,7 @@ import {
   summarizeStreams,
   type StreamSample,
 } from "./loadDriver.js";
+import { buildPromptTokens } from "./fillerPrompt.js";
 
 const item = {
   threads: 8,
@@ -67,21 +67,6 @@ describe("server arguments for the spec-off engine pair", () => {
       supportsNoContextShift: true,
     });
     expect(with_).toContain("--no-context-shift");
-  });
-});
-
-describe("prompt construction", () => {
-  it("produces exactly the requested token count", () => {
-    expect(buildPromptTokens(8192)).toHaveLength(8192);
-  });
-
-  it("gives each nonce a distinct sequence, so the prefix cache cannot dedupe streams", () => {
-    const a = buildPromptTokens(64, 0, 1);
-    const b = buildPromptTokens(64, 0, 2);
-    expect(a).not.toEqual(b);
-    // Distinct from the very first token: a shared prefix is exactly what
-    // would let a later stream read artificially fast.
-    expect(a[0]).not.toBe(b[0]);
   });
 });
 
@@ -226,7 +211,7 @@ describe("N5 concurrent batch", () => {
     expect(new Set(batch.map((s) => s.nonce)).size).toBe(4);
     // Never nonce 0 -- that is the measured curve prompt.
     expect(batch.every((s) => s.nonce !== 0)).toBe(true);
-    const prompts = batch.map((s) => buildPromptTokens(8, 0, s.nonce).join(","));
+    const prompts = batch.map((s) => buildPromptTokens(8, 0, s.nonce, [[7, 8, 9, 10]]).join(","));
     expect(new Set(prompts).size).toBe(4);
   });
 

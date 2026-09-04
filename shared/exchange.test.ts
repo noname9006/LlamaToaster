@@ -9,6 +9,12 @@ import {
   type Bundle,
   type BundleRow,
 } from "./exchange.js";
+import {
+  CURVE_METHOD_VERSION,
+  LEGACY_CURVE_METHOD_VERSION,
+  METHOD_VERSION,
+  SERVER_METHOD_VERSION,
+} from "./types.js";
 
 function bundleRow(over: Partial<BundleRow> = {}): BundleRow {
   return stampConfigHash({
@@ -93,9 +99,20 @@ describe("N7 export bundle", () => {
   });
 
   it("embeds a methods section keyed to the method version", () => {
-    expect(methodsFor(1).pipeline.join(" ")).toContain("stddev");
-    expect(methodsFor(2).summary).toContain("cold timed prefill");
-    expect(methodsFor(2).pipeline.join(" ")).toContain("cache_evicted");
+    expect(methodsFor(METHOD_VERSION).pipeline.join(" ")).toContain("stddev");
+    expect(methodsFor(CURVE_METHOD_VERSION).summary).toContain("cold timed prefill");
+    expect(methodsFor(CURVE_METHOD_VERSION).pipeline.join(" ")).toContain("cache_evicted");
+    // Server-measured rows say so, and say what the prompt was.
+    expect(methodsFor(SERVER_METHOD_VERSION).pipeline.join(" ")).toContain("mixed-register");
+    expect(methodsFor(SERVER_METHOD_VERSION).pipeline.join(" ")).toContain("grammar_constrained");
+    // A stored row from before the filler rewrite keeps its OWN description --
+    // relabelling it with today's pipeline would misdescribe shared data.
+    expect(methodsFor(LEGACY_CURVE_METHOD_VERSION).method_version).toBe(LEGACY_CURVE_METHOD_VERSION);
+    expect(methodsFor(LEGACY_CURVE_METHOD_VERSION).summary).toContain("before the filler prompt was rewritten");
+    expect(methodsFor(LEGACY_CURVE_METHOD_VERSION).pipeline.join(" ")).toContain("not comparable");
+    // llama-bench rows were never affected by the filler change; their section
+    // says why nothing about the prompt is ours to control.
+    expect(methodsFor(METHOD_VERSION).pipeline.join(" ")).toContain("builds its own prompt");
   });
 });
 

@@ -1670,7 +1670,7 @@ export const repo = {
     const row = getDb()
       .prepare(
         `SELECT COUNT(*) as n FROM run_items
-         WHERE run_id = ? AND status NOT IN ('done','failed','failed_oom','cancelled','skipped')`
+         WHERE run_id = ? AND status NOT IN ('done','failed','failed_oom','failed_unsupported','cancelled','skipped')`
       )
       .get(runId) as { n: number };
     return row.n;
@@ -1763,7 +1763,7 @@ export const repo = {
       database
         .prepare(
           `UPDATE run_items SET status = 'failed', error = ?, completed_at = ?
-           WHERE run_id = ? AND status NOT IN ('done','failed','failed_oom','cancelled','skipped')`
+           WHERE run_id = ? AND status NOT IN ('done','failed','failed_oom','failed_unsupported','cancelled','skipped')`
         )
         .run(error, now, runId);
       this.finalizeTest(runId, now);
@@ -1791,7 +1791,7 @@ export const repo = {
       database
         .prepare(
           `UPDATE run_items SET status = 'cancelled', error = ?, completed_at = ?
-           WHERE run_id = ? AND status NOT IN ('done','failed','failed_oom','cancelled','skipped')`
+           WHERE run_id = ? AND status NOT IN ('done','failed','failed_oom','failed_unsupported','cancelled','skipped')`
         )
         .run(note, now, runId);
       this.finalizeTest(runId, now, note);
@@ -1821,7 +1821,7 @@ export const repo = {
       database
         .prepare(
           `UPDATE run_items SET status = 'failed', error = ?, completed_at = ?
-           WHERE run_id = ? AND status NOT IN ('done','failed','failed_oom','cancelled','skipped')`
+           WHERE run_id = ? AND status NOT IN ('done','failed','failed_oom','failed_unsupported','cancelled','skipped')`
         )
         .run(note, now, runId);
       this.finalizeTest(runId, now);
@@ -3001,10 +3001,10 @@ export const repo = {
       }
 
       // Terminal outcomes only -- the same finished set countUnfinishedItems
-      // defines ('done','failed','failed_oom','cancelled'); still-'queued' or
-      // in-flight items haven't been performed yet.
+      // defines ('done','failed','failed_oom','failed_unsupported','cancelled');
+      // still-'queued' or in-flight items haven't been performed yet.
       const tests = scalar(
-        `SELECT COUNT(*) AS n FROM run_items WHERE status IN ('done','failed','failed_oom','cancelled')`
+        `SELECT COUNT(*) AS n FROM run_items WHERE status IN ('done','failed','failed_oom','failed_unsupported','cancelled')`
       );
 
       return { users, machines, modelsTested, quants: quants.size, tests, runs };

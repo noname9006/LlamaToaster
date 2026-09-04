@@ -18,9 +18,6 @@ import type { CaveatFlag } from "../../shared/types.js";
 // exactly at the context-size edge. Same constant serverBench.ts uses.
 export const CONTEXT_MARGIN = 256;
 
-export const FILLER_TOKEN_RANGE_START = 100;
-export const FILLER_TOKEN_RANGE_SIZE = 500;
-
 // Slot accounting (N1/N5, stated identically in both): per-slot demand is the
 // full prompt plus the generation budget, and -c covers every slot. At
 // parallel 1 this equals the existing sizing.
@@ -104,20 +101,6 @@ export function buildServerArgs(input: ServerArgsInput): string[] {
   // the logs then show a shift happened anyway.
   if (input.supportsNoContextShift) args.push("--no-context-shift");
   return args;
-}
-
-// A synthetic prompt of exactly n tokens, sent pre-tokenized so the count is
-// exact rather than tokenizer-dependent. `nonce` shifts the sequence: N5's
-// concurrent streams each carry a DISTINCT suffix so the prefix cache cannot
-// dedupe them (otherwise later streams read artificially fast against a warm
-// prefix), and N1's warm/discard request uses a nonce prompt distinct from
-// the measured one so it never seeds the measured prefix into the cache.
-export function buildPromptTokens(tokenCount: number, offset = 0, nonce = 0): number[] {
-  const tokens: number[] = [];
-  for (let i = 0; i < tokenCount; i++) {
-    tokens.push(FILLER_TOKEN_RANGE_START + offset + ((i + nonce * 7919) % FILLER_TOKEN_RANGE_SIZE));
-  }
-  return tokens;
 }
 
 // --- Streaming measurement --------------------------------------------------
