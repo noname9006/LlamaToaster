@@ -40,10 +40,24 @@ export interface ProbeAttemptDto {
   spill: number;
   vram_needed_mib: number | null;
   vram_free_mib: number | null;
+  /** WHOLE-ADAPTER VRAM peak (every process on the GPU combined), despite the
+   * name -- see shared/types.ts's ProbeAttemptReport.vram_peak_mib. Pair with
+   * vram_process_peak_mib below for the llama.cpp-only figure. */
   vram_peak_mib: number | null;
   ram_needed_mib: number | null;
   ram_free_mib: number | null;
+  /** This process's own RAM peak (per-pid RSS) -- pair with ram_total_peak_mib
+   * below for the whole-system figure. */
   ram_peak_mib: number | null;
+  /** This process's own (llama.cpp-only) peak VRAM usage, as distinct from
+   * vram_peak_mib's whole-adapter reading. Null wherever the backend/platform
+   * never attributed a reading to this pid during the whole load (not a
+   * measured 0), including every worker predating this reading. */
+  vram_process_peak_mib: number | null;
+  /** Whole-system RAM peak (every process combined), the RAM-side counterpart
+   * to vram_peak_mib's whole-adapter reading. Null from a worker predating
+   * this reading. */
+  ram_total_peak_mib: number | null;
   /** This process's peak system-RAM-backed GPU allocation (Windows WDDM
    * "Shared Usage" or Linux amdgpu GTT) -- the direct measured figure for
    * "how much silently spilled into system RAM", alongside vram_peak_mib's
