@@ -5,7 +5,6 @@ import {
   estimateSafeNgl,
   estimateVramNeededMib,
   detectHostBackedFallback,
-  HOST_BACKED_BOOTSTRAP_FRAC,
   isPrefillCliff,
   HOST_BACKED_SLOPE_RATIO,
   isVramDiscrepancy,
