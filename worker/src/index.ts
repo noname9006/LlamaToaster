@@ -30,6 +30,7 @@ import {
   executeCurvePoint,
   executeKneeLadder,
   probeSucceeded,
+  toProbeAttemptReport,
   toBenchResult,
   PROBE_GEN_TOKENS,
   RuntimeServerStartupError,
@@ -3559,30 +3560,6 @@ function toLadderAttempt(attempt: ProbeAttemptOutcome): LadderAttempt {
   };
 }
 
-function toProbeAttemptReport(attempt: ProbeAttemptOutcome): ProbeAttemptReport {
-  return {
-    candidate_ctx: attempt.candidateCtx,
-    ok: attempt.ok,
-    oom: attempt.oom,
-    spill: attempt.spill,
-    ngl: attempt.ngl,
-    vram_peak_mib: attempt.vramPeakMib,
-    gen_tps: attempt.genTps,
-    vram_needed_mib: attempt.vramNeededMib,
-    vram_free_mib: attempt.vramFreeMib,
-    ram_needed_mib: attempt.ramNeededMib,
-    ram_free_mib: attempt.ramFreeMib,
-    ram_peak_mib: attempt.ramPeakMib,
-    vram_process_peak_mib: attempt.vramProcessPeakMib,
-    ram_total_peak_mib: attempt.ramTotalPeakMib,
-    vram_shared_peak_mib: attempt.vramSharedPeakMib,
-    error: attempt.error,
-    reused_from_run_id: attempt.reusedFromRunId,
-    vram_discrepancy: attempt.vramDiscrepancy,
-    gpu_layers_resident_est: attempt.gpuLayersResidentEst,
-    gpu_layers_resident_exact: attempt.gpuLayersResidentExact,
-  };
-}
 
 interface ProbeLoadInput {
   payload: TestProbeJobPayload;
