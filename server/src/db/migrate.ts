@@ -337,6 +337,14 @@ const COLUMN_MIGRATIONS: ColumnSpec[] = [
   // this column. NULL on every rung reported before this migration or by a
   // worker predating the reading.
   { table: "probe_attempts", column: "vram_shared_peak_mib", ddlType: "REAL" },
+  // Context tests table split "VRAM peak"/"RAM peak" into total/per-process
+  // sub-columns -- vram_peak_mib and ram_peak_mib above already held one
+  // half each (whole-adapter and per-process respectively); these two are
+  // the other half. See schema.sql's own comment on both. NULL on every
+  // rung reported before this migration or by a worker predating the
+  // reading.
+  { table: "probe_attempts", column: "vram_process_peak_mib", ddlType: "REAL" },
+  { table: "probe_attempts", column: "ram_total_peak_mib", ddlType: "REAL" },
 ];
 
 function applyColumnMigrations(database: Database.Database): void {

@@ -25,6 +25,10 @@ function mib(value: number | null): string {
 // same visual weight as real measured columns (free, peak, shared) reads as
 // a fact it isn't. The estimate still drives the ladder's own search and the
 // "possible VRAM fallback" check below, just not this on-screen ratio.
+// Paired against the TOTAL (whole-adapter/whole-system) peak, not the
+// per-process one -- "free" was always measured whole-adapter/whole-system
+// too (there's no such thing as "free" scoped to a process that doesn't
+// exist yet), so that's the only pairing that's actually apples-to-apples.
 function usedVsFree(peak: number | null, free: number | null): string | null {
   if (peak == null || free == null || free <= 0) return null;
   return `${Math.round((peak / free) * 100)}% of free`;
@@ -99,24 +103,38 @@ export function ProbeAttempts({ testId, refreshKey }: ProbeAttemptsProps) {
       <div className="mt-3 overflow-x-auto">
         <table className="w-full text-xs">
           <thead>
+            <tr className="border-b border-border/60 text-left text-[10px] uppercase tracking-wide text-muted">
+              <th className="px-2 py-1.5" rowSpan={2}>#</th>
+              <th className="px-2 py-1.5" rowSpan={2}>context</th>
+              <th className="px-2 py-1.5 text-right" rowSpan={2}>offload</th>
+              <th className="px-2 py-1.5 text-right" rowSpan={2}>resident</th>
+              <th className="px-2 py-1.5 text-right" rowSpan={2}>VRAM free</th>
+              <th className="px-2 py-1.5 text-center" colSpan={2}>VRAM Peak</th>
+              <th className="px-2 py-1.5 text-right" rowSpan={2}>shared</th>
+              <th className="px-2 py-1.5 text-right" rowSpan={2}>RAM free</th>
+              <th className="px-2 py-1.5 text-center" colSpan={2}>RAM Peak</th>
+              <th className="px-2 py-1.5 text-right" rowSpan={2}>gen tok/s</th>
+              <th className="px-2 py-1.5" rowSpan={2}>result</th>
+            </tr>
             <tr className="border-b border-border text-left text-[10px] uppercase tracking-wide text-muted">
-              <th className="px-2 py-1.5">#</th>
-              <th className="px-2 py-1.5">context</th>
-              <th className="px-2 py-1.5 text-right">offload</th>
-              <th className="px-2 py-1.5 text-right">resident</th>
-              <th className="px-2 py-1.5 text-right">VRAM free</th>
-              <th className="px-2 py-1.5 text-right">VRAM peak</th>
-              <th className="px-2 py-1.5 text-right">shared</th>
-              <th className="px-2 py-1.5 text-right">RAM free</th>
-              <th className="px-2 py-1.5 text-right">RAM peak</th>
-              <th className="px-2 py-1.5 text-right">gen tok/s</th>
-              <th className="px-2 py-1.5">result</th>
+              <th className="px-2 py-1.5 text-right" title="Whole-adapter -- every process on this GPU combined, not just this load">
+                total
+              </th>
+              <th className="px-2 py-1.5 text-right" title="This load's own process only">
+                per process
+              </th>
+              <th className="px-2 py-1.5 text-right" title="Whole-system -- every process on this machine combined, not just this load">
+                total
+              </th>
+              <th className="px-2 py-1.5 text-right" title="This load's own process only">
+                per process
+              </th>
             </tr>
           </thead>
           <tbody>
             {attempts.map((a) => {
               const vramRatio = usedVsFree(a.vram_peak_mib, a.vram_free_mib);
-              const ramRatio = usedVsFree(a.ram_peak_mib, a.ram_free_mib);
+              const ramRatio = usedVsFree(a.ram_total_peak_mib, a.ram_free_mib);
               const resident = residentCell(a);
               return (
                 <tr key={a.id} className="border-b border-border/40">
@@ -134,6 +152,7 @@ export function ProbeAttempts({ testId, refreshKey }: ProbeAttemptsProps) {
                   <td className="px-2 py-1.5 text-right font-mono text-muted" title={vramRatio ?? undefined}>
                     {mib(a.vram_peak_mib)}
                   </td>
+                  <td className="px-2 py-1.5 text-right font-mono text-muted">{mib(a.vram_process_peak_mib)}</td>
                   <td
                     className={`px-2 py-1.5 text-right font-mono ${a.vram_shared_peak_mib ? "font-bold text-warning" : "text-muted"}`}
                     title={
@@ -148,8 +167,9 @@ export function ProbeAttempts({ testId, refreshKey }: ProbeAttemptsProps) {
                   </td>
                   <td className="px-2 py-1.5 text-right font-mono text-muted">{mib(a.ram_free_mib)}</td>
                   <td className="px-2 py-1.5 text-right font-mono text-muted" title={ramRatio ?? undefined}>
-                    {mib(a.ram_peak_mib)}
+                    {mib(a.ram_total_peak_mib)}
                   </td>
+                  <td className="px-2 py-1.5 text-right font-mono text-muted">{mib(a.ram_peak_mib)}</td>
                   <td className="px-2 py-1.5 text-right font-mono text-muted">
                     {a.gen_tps != null ? a.gen_tps.toFixed(1) : "—"}
                   </td>
@@ -195,7 +215,7 @@ export function ProbeAttempts({ testId, refreshKey }: ProbeAttemptsProps) {
             })}
             {attempts.length === 0 && (
               <tr>
-                <td colSpan={11} className="px-2 py-3 text-muted">
+                <td colSpan={13} className="px-2 py-3 text-muted">
                   This probe recorded no loads. A probe run that never reached the machine leaves no rungs.
                 </td>
               </tr>
@@ -211,14 +231,21 @@ export function ProbeAttempts({ testId, refreshKey }: ProbeAttemptsProps) {
         report wasn't captured (the load failed before tensor loading finished, or an older build). Every other
         number in this row — <b className="text-fg">free</b>, <b className="text-fg">peak</b>,{" "}
         <b className="text-fg">shared</b> — is a direct measurement, not a prediction: free is what the machine
-        actually had available just before the load, peak is what the load really used. A row flagged{" "}
-        <b className="text-warning">⚠ possible VRAM fallback</b> means peak came in far below what the ladder's own
-        pre-load estimate expected this offload to need — a sign the load silently ran (partly) from system RAM
-        instead of true GPU memory, without llama.cpp reporting any error; how it's handled — warn, retry once, or
-        fail — is the worker's VRAM-discrepancy policy. <b className="text-fg">Shared</b> is that same spillover, but
-        measured directly rather than inferred: the worker's own OS-level reading of how much of this process's
-        memory was system RAM the driver backed as GPU-accessible memory instead of real dedicated VRAM. It's blank
-        when no such counter exists for this worker's backend, which is different from a confirmed zero.
+        actually had available just before the load. <b className="text-fg">Peak</b> is split into{" "}
+        <b className="text-fg">total</b> (every process on the GPU/machine combined, not just this load — the same
+        thing "free" measures, which is why the two are comparable) and{" "}
+        <b className="text-fg">per process</b> (this load's own usage in isolation, when the backend could attribute
+        it). They're genuinely different numbers, not two views of the same one: something else running on the same
+        GPU or machine at the same time shows up in total but not per process, while per process can read "—" more
+        often than total does — the tool/counter that attributes usage to this specific process can lag a fresh
+        spawn, or never catch up at all on a very short load. A row flagged{" "}
+        <b className="text-warning">⚠ possible VRAM fallback</b> means VRAM peak (total) came in far below what the
+        ladder's own pre-load estimate expected this offload to need — a sign the load silently ran (partly) from
+        system RAM instead of true GPU memory, without llama.cpp reporting any error; how it's handled — warn, retry
+        once, or fail — is the worker's VRAM-discrepancy policy. <b className="text-fg">Shared</b> is that same
+        spillover, but measured directly rather than inferred: the worker's own OS-level reading of how much of this
+        process's memory was system RAM the driver backed as GPU-accessible memory instead of real dedicated VRAM.
+        It's blank when no such counter exists for this worker's backend, which is different from a confirmed zero.
       </p>
     </div>
   );

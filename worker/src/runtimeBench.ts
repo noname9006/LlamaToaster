@@ -640,10 +640,26 @@ export interface ProbeAttemptOutcome {
   ok: boolean;
   oom: boolean;
   spill: boolean;
+  /** MemorySampler's vram_peak_mib -- WHOLE-ADAPTER despite the name (every
+   * process on the GPU combined). vramProcessPeakMib below is the
+   * llama.cpp-only figure. */
   vramPeakMib: number | null;
   /** The probe's own RSS peak (MemorySampler.stop()'s ram_peak_mib) -- the
-   * real measured RAM usage, alongside vramPeakMib. */
+   * real measured, per-process RAM usage, alongside vramPeakMib. Pairs with
+   * ramTotalPeakMib below the same way vramProcessPeakMib pairs with
+   * vramPeakMib. */
   ramPeakMib?: number | null;
+  /** MemorySampler's vram_process_peak_mib -- this load's own (llama.cpp-
+   * only) peak VRAM usage, as distinct from vramPeakMib's whole-adapter
+   * reading above. Undefined/null wherever the backend/platform never
+   * attributed a reading to this pid during the whole load (not a measured
+   * 0) -- more likely here than for vramPeakMib, since per-process
+   * attribution can lag a fresh spawn or never catch up on a short load. */
+  vramProcessPeakMib?: number | null;
+  /** MemorySampler's ram_total_peak_mib -- whole-system RAM in use (every
+   * process combined), the RAM-side counterpart to vramPeakMib's
+   * whole-adapter reading. */
+  ramTotalPeakMib?: number | null;
   /** The probe's own peak system-RAM-backed GPU allocation (MemorySampler's
    * vram_process_shared_peak_mib -- vram.ts's GpuMemoryReading.processShared:
    * Windows WDDM "Shared Usage" or Linux amdgpu GTT). The DIRECT measured

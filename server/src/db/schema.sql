@@ -441,6 +441,18 @@ CREATE TABLE IF NOT EXISTS probe_attempts (
   ok INTEGER NOT NULL, oom INTEGER NOT NULL, spill INTEGER NOT NULL,
   vram_needed_mib REAL, vram_free_mib REAL, vram_peak_mib REAL,
   ram_needed_mib REAL,  ram_free_mib REAL,   ram_peak_mib REAL,
+  -- vram_peak_mib above is WHOLE-ADAPTER (every process on the GPU combined)
+  -- despite its name; this is the llama.cpp-only figure the name alone would
+  -- suggest. NULL wherever the backend/platform never attributed a reading
+  -- to this pid during the whole load (not a measured 0) -- more likely here
+  -- than for vram_peak_mib, since per-process attribution can lag a fresh
+  -- spawn or never catch up on a very short load. NULL on every rung
+  -- reported before this migration.
+  vram_process_peak_mib REAL,
+  -- Whole-system RAM peak (every process combined), the RAM-side counterpart
+  -- to vram_peak_mib's whole-adapter reading -- ram_peak_mib above is already
+  -- per-process. NULL on every rung reported before this migration.
+  ram_total_peak_mib REAL,
   -- This process's peak system-RAM-backed GPU allocation (Windows WDDM
   -- "Shared Usage" or Linux amdgpu GTT) -- the direct measured figure for
   -- "how much silently spilled into system RAM", alongside vram_peak_mib's

@@ -1661,10 +1661,33 @@ export interface ProbeAttemptReport {
   // The placement this rung actually loaded at. The ladder moves ngl as well
   // as context, so a row is only interpretable alongside the ngl it used.
   ngl?: number | null;
+  // MemorySampler's used.mib stream -- WHOLE-ADAPTER usage (every process on
+  // the GPU combined, worker/src/vram.ts's GpuMemoryReading.used doc
+  // comment: "never process-isolated"), despite the name. Kept as-is for
+  // back-compat with every existing consumer (CSV columns, the
+  // vram_discrepancy heuristic); vram_process_peak_mib below is the
+  // llama.cpp-only figure this name alone would suggest.
   vram_peak_mib?: number | null;
-  // MemorySampler's own RSS peak for the probe process -- the real measured
-  // RAM usage, alongside vram_peak_mib.
+  // MemorySampler's own RSS peak for the probe process -- the real measured,
+  // per-process RAM usage. Pairs with ram_total_peak_mib below the same way
+  // vram_process_peak_mib pairs with vram_peak_mib, just with the
+  // total/per-process roles on the opposite field names (RAM's per-process
+  // reading came first here; VRAM's whole-adapter reading did).
   ram_peak_mib?: number | null;
+  // MemorySampler's vram_process_peak_mib -- this process's OWN peak VRAM
+  // usage (nvidia-smi --query-compute-apps, Windows' "GPU Process Memory"
+  // counter, rocm-smi --showpids/fdinfo), as distinct from vram_peak_mib's
+  // whole-adapter reading above. Absent wherever the backend/platform never
+  // attributed a reading to this pid during the whole load (not a measured
+  // 0), including every worker predating this reading -- which is more
+  // likely here than for vram_peak_mib: per-process attribution can lag a
+  // fresh spawn or never catch up on a very short load.
+  vram_process_peak_mib?: number | null;
+  // MemorySampler's ram_total_peak_mib -- WHOLE-SYSTEM RAM in use (every
+  // process combined, si.mem().active), the RAM-side counterpart to
+  // vram_peak_mib's whole-adapter reading. Absent from a worker predating
+  // this reading.
+  ram_total_peak_mib?: number | null;
   // MemorySampler's vram_process_shared_peak_mib -- this same process's peak
   // system-RAM-backed GPU allocation (Windows WDDM "Shared Usage" or Linux
   // amdgpu GTT, see worker/src/vram.ts's GpuMemoryReading.processShared). The

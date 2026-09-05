@@ -3422,9 +3422,10 @@ export const repo = {
           `INSERT INTO probe_attempts
              (id, run_id, worker_id, model_id, seq, candidate_ctx, ngl,
               ok, oom, spill, vram_needed_mib, vram_free_mib, vram_peak_mib,
-              ram_needed_mib, ram_free_mib, ram_peak_mib, vram_shared_peak_mib, gen_tps, error, created_at,
+              ram_needed_mib, ram_free_mib, ram_peak_mib, vram_process_peak_mib, ram_total_peak_mib,
+              vram_shared_peak_mib, gen_tps, error, created_at,
               reused_from_run_id, vram_discrepancy, gpu_layers_resident_est, gpu_layers_resident_exact)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         );
         input.attempts.forEach((a, seq) => {
           insert.run(
@@ -3444,6 +3445,8 @@ export const repo = {
             a.ram_needed_mib ?? null,
             a.ram_free_mib ?? null,
             a.ram_peak_mib ?? null,
+            a.vram_process_peak_mib ?? null,
+            a.ram_total_peak_mib ?? null,
             a.vram_shared_peak_mib ?? null,
             a.gen_tps ?? null,
             a.error ?? null,
@@ -3486,9 +3489,10 @@ export const repo = {
           `INSERT INTO probe_attempts
              (id, run_id, worker_id, model_id, seq, candidate_ctx, ngl,
               ok, oom, spill, vram_needed_mib, vram_free_mib, vram_peak_mib,
-              ram_needed_mib, ram_free_mib, ram_peak_mib, vram_shared_peak_mib, gen_tps, error, created_at,
+              ram_needed_mib, ram_free_mib, ram_peak_mib, vram_process_peak_mib, ram_total_peak_mib,
+              vram_shared_peak_mib, gen_tps, error, created_at,
               reused_from_run_id, vram_discrepancy, gpu_layers_resident_est, gpu_layers_resident_exact)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(run_id, seq) DO UPDATE SET
              candidate_ctx = excluded.candidate_ctx,
              ngl = excluded.ngl,
@@ -3501,6 +3505,8 @@ export const repo = {
              ram_needed_mib = excluded.ram_needed_mib,
              ram_free_mib = excluded.ram_free_mib,
              ram_peak_mib = excluded.ram_peak_mib,
+             vram_process_peak_mib = excluded.vram_process_peak_mib,
+             ram_total_peak_mib = excluded.ram_total_peak_mib,
              vram_shared_peak_mib = excluded.vram_shared_peak_mib,
              gen_tps = excluded.gen_tps,
              error = excluded.error,
@@ -3527,6 +3533,8 @@ export const repo = {
           a.ram_needed_mib ?? null,
           a.ram_free_mib ?? null,
           a.ram_peak_mib ?? null,
+          a.vram_process_peak_mib ?? null,
+          a.ram_total_peak_mib ?? null,
           a.vram_shared_peak_mib ?? null,
           a.gen_tps ?? null,
           a.error ?? null,
@@ -3744,6 +3752,8 @@ export interface ProbeAttemptRow {
   ram_needed_mib: number | null;
   ram_free_mib: number | null;
   ram_peak_mib: number | null;
+  vram_process_peak_mib: number | null;
+  ram_total_peak_mib: number | null;
   vram_shared_peak_mib: number | null;
   gen_tps: number | null;
   error: string | null;
