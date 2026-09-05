@@ -1456,6 +1456,30 @@ export function Models() {
                   Clear filters
                 </button>
               )}
+              {workers.length > 1 && (
+                // Refresh Models below acts on whichever worker downloadWorker
+                // points at -- with 2+ workers and no prior interaction with
+                // the "Download to worker" picker further down the page (the
+                // only other control for this same state), downloadWorker
+                // stayed "" and the button silently did nothing. Surfacing the
+                // picker right here makes the target explicit instead of
+                // depending on an unrelated section of the page.
+                <label className="flex flex-col gap-1.5 text-sm">
+                  <span className="text-muted">Worker to refresh</span>
+                  <select
+                    value={downloadWorker}
+                    onChange={(e) => setDownloadWorker(e.target.value)}
+                    className="rounded-lg border border-border bg-surface px-3 py-1.5 text-fg outline-none focus:border-accent"
+                  >
+                    <option value="">select…</option>
+                    {workers.map((w) => (
+                      <option key={w.id} value={w.id}>
+                        {w.displayName}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              )}
               <button
                 type="button"
                 onClick={handleRefreshModels}
