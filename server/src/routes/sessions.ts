@@ -106,17 +106,21 @@ export async function sessionRoutes(app: FastifyInstance): Promise<void> {
   // (routes/ai.ts's community tools) are gated on. Returns the updated
   // AuthUser shape so the client can update its local state from the
   // response rather than re-fetching /api/auth/status. Turning it ON also
-  // requires the operator's own communitySharingAllowed gate (Settings
-  // greys the toggle out client-side for the same reason, but this is the
-  // enforcement a direct API call can't bypass); turning it OFF is always
-  // allowed regardless, since that can only ever narrow what's shared.
+  // requires both of the operator's own gates, communitySharingAllowed and
+  // communityUserChoiceAllowed (Settings hides the toggle client-side for
+  // the same reason, but this is the enforcement a direct API call can't
+  // bypass); turning it OFF is always allowed regardless of either gate,
+  // since that can only ever narrow what's shared.
   app.post<{ Body: { enabled?: boolean } }>("/api/auth/share-benchmarks", async (req, reply) => {
     const { user } = req as AuthenticatedRequest;
     if (typeof req.body?.enabled !== "boolean") {
       return reply.code(400).send({ error: "enabled must be a boolean" });
     }
-    if (req.body.enabled && !repo.appSettingsRepo.get().communitySharingAllowed) {
-      return reply.code(403).send({ error: "community benchmark sharing is currently disabled by the operator" });
+    if (req.body.enabled) {
+      const settings = repo.appSettingsRepo.get();
+      if (!settings.communitySharingAllowed || !settings.communityUserChoiceAllowed) {
+        return reply.code(403).send({ error: "community benchmark sharing is currently disabled by the operator" });
+      }
     }
     const updated = repo.userRepo.setShareBenchmarks(user.id, req.body.enabled);
     return { shareBenchmarks: updated.shareBenchmarks };
