@@ -397,6 +397,120 @@ describe("POST /api/runs/:id/probe-result (N2)", () => {
     expect(rungs[1].gen_tps).toBeCloseTo(41.5, 6);
   });
 
+  it("stores vram_discrepancy per rung, distinguishing false from not-checked", async () => {
+    makeRun("probe-vram-discrepancy", { kind: "probe", worker: workerId, config: { probe: probeSpec } });
+    const res = await post(
+      "/api/runs/probe-vram-discrepancy/probe-result",
+      {
+        status: "verified",
+        verified_ctx_tokens: 4096,
+        attempts: [
+          { candidate_ctx: 4096, ngl: 41, ok: true, oom: false, spill: false, vram_discrepancy: true },
+          { candidate_ctx: 2048, ngl: 41, ok: true, oom: false, spill: false, vram_discrepancy: false },
+          { candidate_ctx: 1024, ngl: 41, ok: true, oom: false, spill: false },
+        ],
+      },
+      workerToken
+    );
+    expect(res.status).toBe(200);
+
+    const rungs = repo.probeAttemptsRepo.listForTest("probe-vram-discrepancy");
+    expect(rungs.map((r) => r.vram_discrepancy)).toEqual([1, 0, null]);
+  });
+
+  it("stores vram_shared_peak_mib -- the direct measured spilled-to-RAM figure", async () => {
+    makeRun("probe-vram-shared", { kind: "probe", worker: workerId, config: { probe: probeSpec } });
+    const res = await post(
+      "/api/runs/probe-vram-shared/probe-result",
+      {
+        status: "verified",
+        verified_ctx_tokens: 4096,
+        attempts: [
+          { candidate_ctx: 4096, ngl: 41, ok: true, oom: false, spill: false, vram_shared_peak_mib: 12000 },
+          // A worker predating the reading -- field never sent.
+          { candidate_ctx: 2048, ngl: 41, ok: true, oom: false, spill: false },
+        ],
+      },
+      workerToken
+    );
+    expect(res.status).toBe(200);
+
+    const rungs = repo.probeAttemptsRepo.listForTest("probe-vram-shared");
+    expect(rungs.map((r) => r.vram_shared_peak_mib)).toEqual([12000, null]);
+  });
+
+  it("rejects a non-boolean vram_discrepancy", async () => {
+    makeRun("probe-vram-discrepancy-bad", { kind: "probe", worker: workerId, config: { probe: probeSpec } });
+    const res = await post(
+      "/api/runs/probe-vram-discrepancy-bad/probe-result",
+      {
+        status: "verified",
+        verified_ctx_tokens: 4096,
+        attempts: [{ candidate_ctx: 4096, ngl: 41, ok: true, oom: false, spill: false, vram_discrepancy: "yes" }],
+      },
+      workerToken
+    );
+    expect(res.status).toBe(400);
+  });
+
+  it("stores claimed-vs-landed layer counts per rung", async () => {
+    makeRun("probe-resident-layers", { kind: "probe", worker: workerId, config: { probe: probeSpec } });
+    const res = await post(
+      "/api/runs/probe-resident-layers/probe-result",
+      {
+        status: "verified",
+        verified_ctx_tokens: 4096,
+        attempts: [
+          // Claimed 41, only 13 actually landed (an exact count).
+          {
+            candidate_ctx: 4096,
+            ngl: 41,
+            ok: true,
+            oom: false,
+            spill: false,
+            gpu_layers_resident_est: 13,
+            gpu_layers_resident_exact: true,
+          },
+          // Claimed 20, matches -- a coarse (non-exact) estimate.
+          {
+            candidate_ctx: 2048,
+            ngl: 20,
+            ok: true,
+            oom: false,
+            spill: false,
+            gpu_layers_resident_est: 20,
+            gpu_layers_resident_exact: false,
+          },
+          // A worker predating the check -- neither field sent.
+          { candidate_ctx: 1024, ngl: 20, ok: true, oom: false, spill: false },
+        ],
+      },
+      workerToken
+    );
+    expect(res.status).toBe(200);
+
+    const rungs = repo.probeAttemptsRepo.listForTest("probe-resident-layers");
+    expect(rungs.map((r) => [r.gpu_layers_resident_est, r.gpu_layers_resident_exact])).toEqual([
+      [13, 1],
+      [20, 0],
+      [null, null],
+    ]);
+  });
+
+  it("rejects an out-of-range gpu_layers_resident_est", async () => {
+    makeRun("probe-resident-layers-bad", { kind: "probe", worker: workerId, config: { probe: probeSpec } });
+    const res = await post(
+      "/api/runs/probe-resident-layers-bad/probe-result",
+      {
+        status: "verified",
+        verified_ctx_tokens: 4096,
+        attempts: [{ candidate_ctx: 4096, ngl: 41, ok: true, oom: false, spill: false, gpu_layers_resident_est: -1 }],
+      },
+      workerToken
+    );
+    expect(res.status).toBe(400);
+  });
+
   // Same field, same validator, the OTHER call site -- the final ladder
   // report goes through validateProbeAttempts/validateOneProbeAttempt too.
   it("keeps reused_from_run_id through the final replaceForTest report, not just the live tick", async () => {
@@ -684,7 +798,19 @@ describe("GET /api/runs/:id/probe-dedup", () => {
     makeRun("dedup-root", { kind: "probe", worker: workerId, config: { probe: probeSpec }, status: "done" });
     await post(
       "/api/runs/dedup-root/probe-attempt",
-      { seq: 0, candidate_ctx: 8192, ngl: 20, ok: true, oom: false, spill: false, gen_tps: 30 },
+      {
+        seq: 0,
+        candidate_ctx: 8192,
+        ngl: 20,
+        ok: true,
+        oom: false,
+        spill: false,
+        gen_tps: 30,
+        vram_discrepancy: true,
+        gpu_layers_resident_est: 12,
+        gpu_layers_resident_exact: true,
+        vram_shared_peak_mib: 9500,
+      },
       workerToken
     );
     await post(
@@ -704,14 +830,36 @@ describe("GET /api/runs/:id/probe-dedup", () => {
     });
     expect(res.status).toBe(200);
     const { points } = (await res.json()) as {
-      points: { candidate_ctx: number; ngl: number | null; ok: boolean; oom: boolean; source_run_id: string }[];
+      points: {
+        candidate_ctx: number;
+        ngl: number | null;
+        ok: boolean;
+        oom: boolean;
+        vram_discrepancy: boolean;
+        gpu_layers_resident_est: number | null;
+        gpu_layers_resident_exact: boolean;
+        vram_shared_peak_mib: number | null;
+        source_run_id: string;
+      }[];
     };
     expect(points).toHaveLength(2);
     expect(points.every((p) => p.source_run_id === "dedup-root")).toBe(true);
     const ok = points.find((p) => p.candidate_ctx === 8192);
     expect(ok?.ok).toBe(true);
+    // The signal a later sibling in the same batch needs to carry forward
+    // without re-measuring: a discrepancy flagged on the ORIGINAL load.
+    expect(ok?.vram_discrepancy).toBe(true);
+    expect(ok?.gpu_layers_resident_est).toBe(12);
+    expect(ok?.gpu_layers_resident_exact).toBe(true);
+    expect(ok?.vram_shared_peak_mib).toBe(9500);
     const oom = points.find((p) => p.candidate_ctx === 16384);
     expect(oom?.oom).toBe(true);
+    // Never checked on this rung (no vram_discrepancy sent) -- coerces to
+    // false, not left undefined, same as ok/oom/spill's own coercion.
+    expect(oom?.vram_discrepancy).toBe(false);
+    expect(oom?.gpu_layers_resident_est).toBeNull();
+    expect(oom?.gpu_layers_resident_exact).toBe(false);
+    expect(oom?.vram_shared_peak_mib).toBeNull();
   });
 
   it("excludes a sibling with a different KV pair -- not the same measurement", async () => {

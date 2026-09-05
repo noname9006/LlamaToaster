@@ -707,9 +707,11 @@ export interface ResultRow {
   // available (see worker/src/bench.ts's parseModelBufferSizes), or from the
   // VRAM-discrepancy heuristic on a run where that report was missing and
   // the claim looked wrong. llama.cpp's own count above reflects buffer
-  // *assignment*, never residency, and Windows' NVIDIA driver can silently
-  // back those assignments with system RAM (CUDA sysmem fallback) -- this is
-  // the "~" figure shown next to such a claim so logs/UI/CSV can say
+  // *assignment*, never residency, and Windows can silently back those
+  // assignments with system RAM instead of erroring on an oversubscribed
+  // allocation -- confirmed on both NVIDIA/CUDA and AMD/Vulkan, so this isn't
+  // a CUDA-specific quirk -- this is the "~" figure shown next to such a claim
+  // so logs/UI/CSV can say
   // "claimed 33/33, ~=30 actually resident" instead of endorsing the claim.
   // Null whenever nothing was claimed (ngl=0 / cpu backend) or no buffer
   // report/baseline existed to derive a figure from. Base model only -- the
@@ -1663,6 +1665,14 @@ export interface ProbeAttemptReport {
   // MemorySampler's own RSS peak for the probe process -- the real measured
   // RAM usage, alongside vram_peak_mib.
   ram_peak_mib?: number | null;
+  // MemorySampler's vram_process_shared_peak_mib -- this same process's peak
+  // system-RAM-backed GPU allocation (Windows WDDM "Shared Usage" or Linux
+  // amdgpu GTT, see worker/src/vram.ts's GpuMemoryReading.processShared). The
+  // DIRECT measured answer to "how much silently spilled into system RAM
+  // instead of erroring" -- vram_discrepancy below only ever INFERS that from
+  // a needed-vs-peak gap. Null wherever no such counter/file exists at all
+  // (not a measured 0), including every worker predating this reading.
+  vram_shared_peak_mib?: number | null;
   gen_tps?: number | null;
   // What computeDualPoolFit PREDICTED this rung would need, and what the
   // machine actually had free just before the load -- the predicted-vs-real
@@ -1676,6 +1686,26 @@ export interface ProbeAttemptReport {
    * run's own measurement instead of actually being loaded (see
    * shared/api-v8.ts's ProbeDedupPoint). */
   reused_from_run_id?: string | null;
+  /** True when this rung's observed vram_peak_mib came in far below
+   * vram_needed_mib for the ngl it claimed -- worker/src/runtimeBench.ts's
+   * probeSucceeded, via shared/vramEstimate.ts's isVramDiscrepancy. The same
+   * silent-sysmem-fallback signature shared/vramEstimate.ts's top comment
+   * documents (confirmed on both NVIDIA/CUDA and AMD/Vulkan): llama.cpp's own
+   * offload claim only reflects buffer assignment, never residency. Absent
+   * from a worker predating this check. */
+  vram_discrepancy?: boolean;
+  /** How many of `ngl`'s claimed layers actually landed in a GPU buffer, per
+   * llama.cpp's own post-allocation buffer-size report (worker/src/bench.ts's
+   * parseModelBufferSizes, via worker/src/index.ts's computeResidentLayers) --
+   * the same claimed-vs-landed check ResultRow.gpu_layers_resident_est already
+   * runs on the sweep path. Null when ngl<=0, an older worker, or the load
+   * failed before tensor loading finished. */
+  gpu_layers_resident_est?: number | null;
+  /** True when gpu_layers_resident_est came from llama.cpp's own per-layer
+   * "assigned to device" lines (an exact count, only printed under -v),
+   * false when it's the coarser buffer-byte-ratio estimate. Meaningless when
+   * gpu_layers_resident_est is null. */
+  gpu_layers_resident_exact?: boolean;
 }
 
 // failed_unsupported: not a capacity/config failure at all -- llama-server
@@ -1802,9 +1832,9 @@ export interface AuthStatus {
 
 // Operator-controlled toggles, set from the admin/supervise dashboard (see
 // routes/admin.ts's GET/POST /api/admin/settings) and stored in the `meta`
-// key-value table (server/src/db/schema.sql) rather than a dedicated table --
-// there are only ever these two flags. Absent key reads as the documented
-// default on each field below (repo.ts's appSettingsRepo.get()).
+// key-value table (server/src/db/schema.sql) rather than a dedicated table.
+// Absent key reads as the documented default on each field below (repo.ts's
+// appSettingsRepo.get()).
 // How a worker's own post-run VRAM-discrepancy detection (finalizeSweepItemResult's
 // claimed-vs-actual offload check) translates into item outcomes:
 //   warn                 -- record results normally, attach the warning (original behavior)
@@ -1842,12 +1872,28 @@ export function isValidProbeMaxLoads(value: unknown): value is number {
 }
 
 export interface AppSettings {
-  // Whether users are allowed to turn ON the "contribute to community
-  // benchmark database" toggle in Settings at all -- default false (starts
-  // greyed out). Also enforced server-side (POST /api/auth/share-benchmarks,
-  // and the AI assistant's community tools in routes/ai.ts) so a direct API
-  // call can't bypass a disabled toggle.
+  // Master switch for the whole community-benchmark feature -- default false
+  // (nothing shared yet on a fresh deployment). When off, the AI assistant's
+  // community tools (routes/ai.ts) refuse to run, and Settings hides the
+  // whole "Community benchmark data" section entirely (not merely greys it
+  // out -- see communityUserChoiceAllowed below for what governs the toggle
+  // inside that section). Also enforced server-side
+  // (POST /api/auth/share-benchmarks) so a direct API call can't bypass it.
   communitySharingAllowed: boolean;
+  // Whether individual users get their own say over communitySharingAllowed's
+  // default -- default true. Each user's own consent flag
+  // (users.share_benchmarks, schema.sql) defaults to on, so this doesn't
+  // decide whether sharing happens; it decides whether a user can see and
+  // change their own flag. On: Settings shows the "Contribute to the
+  // community benchmark database" toggle so each user can opt out (or back
+  // in). Off: that toggle is hidden -- each user's already-stored flag keeps
+  // being enforced exactly as-is (community aggregate queries never consult
+  // this field), there's just no self-service control to change it while
+  // it's hidden. Only meaningful while communitySharingAllowed is also on;
+  // the admin dashboard greys this toggle out otherwise. Also enforced
+  // server-side (POST /api/auth/share-benchmarks) alongside
+  // communitySharingAllowed, for the same reason.
+  communityUserChoiceAllowed: boolean;
   // Whether the self-service "delete my account" flow is exposed at all --
   // default true (matches the shipped v1 behavior). When false, Settings
   // hides the whole Danger zone section, and DELETE /api/auth/account

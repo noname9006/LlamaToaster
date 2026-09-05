@@ -135,6 +135,121 @@ describe("upsertHfGgufEntry", () => {
   });
 });
 
+describe("lookupHfGgufHashes", () => {
+  it("prefers a live match over a soft-deleted one for the same hash", () => {
+    // Reproduces the real "pleasen/model" incident (2026-09-05): the same
+    // content byte-for-byte in two repos, one of which has since been
+    // deleted from HF -- the live one must win regardless of row order.
+    hfIndex.upsertHfGgufEntry({
+      sha256: "sha-collision-a",
+      repo_id: "test/dead-mirror",
+      filename: "model.gguf",
+      revision: "main",
+      file_size: 1,
+      last_seen: Date.now(),
+      deleted_at: null,
+    });
+    hfIndex.markRepoDeleted("test/dead-mirror", Date.now());
+    hfIndex.upsertHfGgufEntry({
+      sha256: "sha-collision-a",
+      repo_id: "test/real-repo",
+      filename: "real.gguf",
+      revision: "main",
+      file_size: 1,
+      last_seen: Date.now(),
+      deleted_at: null,
+    });
+
+    const found = hfIndex.lookupHfGgufHashes(["sha-collision-a"]);
+    expect(found).toHaveLength(1);
+    expect(found[0].repo_id).toBe("test/real-repo");
+    expect(found[0].deleted_at).toBeNull();
+  });
+
+  it("still returns a deleted match when every row for the hash is deleted", () => {
+    hfIndex.upsertHfGgufEntry({
+      sha256: "sha-all-gone",
+      repo_id: "test/all-gone-a",
+      filename: "a.gguf",
+      revision: "main",
+      file_size: 1,
+      last_seen: Date.now(),
+      deleted_at: null,
+    });
+    hfIndex.upsertHfGgufEntry({
+      sha256: "sha-all-gone",
+      repo_id: "test/all-gone-b",
+      filename: "b.gguf",
+      revision: "main",
+      file_size: 1,
+      last_seen: Date.now(),
+      deleted_at: null,
+    });
+    hfIndex.markRepoDeleted("test/all-gone-a", Date.now());
+    hfIndex.markRepoDeleted("test/all-gone-b", Date.now());
+
+    const found = hfIndex.lookupHfGgufHashes(["sha-all-gone"]);
+    expect(found).toHaveLength(1);
+    expect(found[0].deleted_at).not.toBeNull();
+  });
+
+  it("among equally-live matches, prefers the most recently seen", () => {
+    const older = Date.now() - 100_000;
+    const newer = Date.now();
+    hfIndex.upsertHfGgufEntry({
+      sha256: "sha-recency",
+      repo_id: "test/stale-source",
+      filename: "old.gguf",
+      revision: "main",
+      file_size: 1,
+      last_seen: older,
+      deleted_at: null,
+    });
+    hfIndex.upsertHfGgufEntry({
+      sha256: "sha-recency",
+      repo_id: "test/fresh-source",
+      filename: "new.gguf",
+      revision: "main",
+      file_size: 1,
+      last_seen: newer,
+      deleted_at: null,
+    });
+
+    const found = hfIndex.lookupHfGgufHashes(["sha-recency"]);
+    expect(found).toHaveLength(1);
+    expect(found[0].repo_id).toBe("test/fresh-source");
+  });
+
+  it("breaks an exact last_seen tie deterministically by repo_id", () => {
+    const now = Date.now();
+    hfIndex.upsertHfGgufEntry({
+      sha256: "sha-tie",
+      repo_id: "test/z-repo",
+      filename: "z.gguf",
+      revision: "main",
+      file_size: 1,
+      last_seen: now,
+      deleted_at: null,
+    });
+    hfIndex.upsertHfGgufEntry({
+      sha256: "sha-tie",
+      repo_id: "test/a-repo",
+      filename: "a.gguf",
+      revision: "main",
+      file_size: 1,
+      last_seen: now,
+      deleted_at: null,
+    });
+
+    // Run both orderings of the underlying scan to prove the result doesn't
+    // depend on SQLite's (unspecified) row order for this query.
+    const found1 = hfIndex.lookupHfGgufHashes(["sha-tie"]);
+    const found2 = hfIndex.lookupHfGgufHashes(["sha-tie"]);
+    expect(found1[0].repo_id).toBe("test/a-repo");
+    expect(found2[0].repo_id).toBe("test/a-repo");
+  });
+});
+
 describe("findStaleRepos", () => {
   it("excludes repos already soft-deleted", () => {
     const staleTs = Date.now() - 1000;

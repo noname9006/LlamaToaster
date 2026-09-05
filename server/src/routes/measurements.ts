@@ -95,6 +95,23 @@ function optionalNonNegative(value: unknown, field: string): number | null {
   return value;
 }
 
+// Absent/null both mean "this worker didn't check" and store as undefined; a
+// present value must be a real boolean, never a truthy-ish string/number.
+function optionalBoolean(value: unknown, field: string): boolean | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "boolean") {
+    throw new BadRequestError(`${field} must be a boolean or null`);
+  }
+  return value;
+}
+
+// Optional sibling of requireFiniteInt -- absent/null both mean "not
+// reported" and store as null, a present value must satisfy the same bounds.
+function optionalFiniteInt(value: unknown, field: string, min: number, max: number): number | null {
+  if (value === undefined || value === null) return null;
+  return requireFiniteInt(value, field, min, max);
+}
+
 // Validates one ladder rung before it reaches the database. Bounds mirror
 // the trigger route's own probe-axis table (runs.ts): context within the
 // probe range, ngl within the sweep axis' [0, 1024]. Shared by
@@ -117,6 +134,7 @@ function validateOneProbeAttempt(raw: unknown, label: string): ProbeAttemptRepor
     ram_needed_mib: optionalNonNegative(a.ram_needed_mib, `${label}.ram_needed_mib`),
     ram_free_mib: optionalNonNegative(a.ram_free_mib, `${label}.ram_free_mib`),
     ram_peak_mib: optionalNonNegative(a.ram_peak_mib, `${label}.ram_peak_mib`),
+    vram_shared_peak_mib: optionalNonNegative(a.vram_shared_peak_mib, `${label}.vram_shared_peak_mib`),
     gen_tps: optionalNonNegative(a.gen_tps, `${label}.gen_tps`),
     error: typeof a.error === "string" ? a.error : undefined,
     // N2 batch dedup -- the worker only ever echoes back a source_run_id the
@@ -124,6 +142,9 @@ function validateOneProbeAttempt(raw: unknown, label: string): ProbeAttemptRepor
     // (not an existence/ownership lookup) is the same trust level every other
     // worker-reported field on this row gets.
     reused_from_run_id: typeof a.reused_from_run_id === "string" ? a.reused_from_run_id : null,
+    vram_discrepancy: optionalBoolean(a.vram_discrepancy, `${label}.vram_discrepancy`),
+    gpu_layers_resident_est: optionalFiniteInt(a.gpu_layers_resident_est, `${label}.gpu_layers_resident_est`, 0, 1024),
+    gpu_layers_resident_exact: optionalBoolean(a.gpu_layers_resident_exact, `${label}.gpu_layers_resident_exact`),
   } satisfies ProbeAttemptReport;
 }
 
@@ -360,6 +381,10 @@ export async function measurementRoutes(app: FastifyInstance): Promise<void> {
         ram_needed_mib: row.ram_needed_mib,
         ram_free_mib: row.ram_free_mib,
         ram_peak_mib: row.ram_peak_mib,
+        vram_shared_peak_mib: row.vram_shared_peak_mib,
+        vram_discrepancy: row.vram_discrepancy === 1,
+        gpu_layers_resident_est: row.gpu_layers_resident_est,
+        gpu_layers_resident_exact: row.gpu_layers_resident_exact === 1,
         source_run_id: sibling.id,
       }))
     );
