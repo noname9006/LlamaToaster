@@ -5,7 +5,9 @@ import { fileURLToPath } from "node:url";
 import type { IngestResultInput } from "../../shared/types.js";
 import type { SweepItem } from "../../shared/sweep.js";
 import {
+  appendBoundedOutput,
   collapseTensorLoadSpam,
+  MAX_CAPTURED_PROCESS_OUTPUT_CHARS,
   parseModelBufferSizes,
   parseOffloadLayers,
   type BenchLogger,
@@ -17,6 +19,7 @@ import {
 } from "./bench.js";
 import { estimateResidentGpuLayersFromBufferSizes } from "../../shared/vramEstimate.js";
 import { buildPromptTokens, fetchFillerBlocks, type FillerBlocks } from "./fillerPrompt.js";
+import { supportsFlag } from "./binary-probe.js";
 import { SERVER_METHOD_VERSION } from "../../shared/types.js";
 
 // Drives llama-server over HTTP to benchmark MTP (multi-token-prediction)
@@ -198,7 +201,7 @@ function buildOffsetCandidates(preferred: number, maxAttempts: number): number[]
   return candidates;
 }
 
-function buildArgs(input: ServerBenchRunInput): string[] {
+async function buildArgs(input: ServerBenchRunInput): Promise<string[]> {
   const item = input.item;
   const args = [
     "-m",
@@ -246,16 +249,20 @@ function buildArgs(input: ServerBenchRunInput): string[] {
     // verbosity (3, "info") prints none of the "load_tensors: offloaded
     // X/Y layers to GPU" detail worker/src/index.ts's parseOffloadLayers
     // needs. --help documents the scale as 0=generic, 1=error, 2=warning,
-    // 3=info (default), 4=trace, 5=debug. Confirmed live against the
-    // installed b10405 build (both at model load and mid-generation via a
-    // real /completion request) that 4 already surfaces the offload line
-    // plus every other diagnostic worth keeping (slot lifecycle, context
-    // checkpoints, print_timing) while producing zero of the level-5 "debug"
-    // per-token/per-draft-candidate trace lines that flooded the mirrored
-    // worker log at the previously-used 999 -- see logDiagnosticOutput in
-    // worker/src/index.ts.
+    // 3=info (default), 4=trace, 5=debug. Level 4 was used for a while
+    // (confirmed live against b10405 that it surfaces the offload line plus
+    // every other diagnostic worth keeping while skipping level 5's
+    // per-token/per-draft-candidate trace) but that same trace is the ONLY
+    // level that also prints bench.ts's LAYER_DEVICE_LINE_RE lines ("layer N
+    // assigned to device ..."), llama.cpp's own ground truth for how many
+    // layers actually landed on the GPU -- at level 4 that number was always
+    // a byte-ratio guess. 5 trades a bounded amount of extra per-token noise
+    // (see bench.ts's appendBoundedOutput, which now caps the live capture
+    // regardless of level) for an exact count instead of an estimate. See
+    // logDiagnosticOutput in worker/src/index.ts for how the mirrored worker
+    // log stays uncluttered either way.
     "--verbosity",
-    "4",
+    "5",
   ];
   if (input.mainGpu != null) {
     args.push("-sm", "none", "-mg", String(input.mainGpu));
@@ -266,6 +273,19 @@ function buildArgs(input: ServerBenchRunInput): string[] {
   // mtpModelPath branch.
   if (item.n_cpu_moe > 0) {
     args.push("--n-cpu-moe", String(item.n_cpu_moe));
+  }
+  // §0.7 probe, same pattern as loadDriver.ts's buildServerArgs (see its own
+  // comment for the full rationale): --fit (default "on" on builds that have
+  // it) auto-adjusts whichever of -ngl/-c/-ts/-ot were left unset to fit free
+  // device memory. -ngl and -c are always explicit above, but -ot (what
+  // --n-cpu-moe just above is a friendlier alias for) is only ever set when
+  // n_cpu_moe>0 -- at 0, an MTP item's MoE placement is genuinely unset, so
+  // --fit could silently push experts to CPU on a model that doesn't fully
+  // fit at the requested -ngl. Forcing it off closes that gap unconditionally
+  // rather than depending on whether --n-cpu-moe would otherwise have
+  // shielded -ot from the fitter on its own.
+  if (await supportsFlag(input.llamaServerPath, "--fit").catch(() => false)) {
+    args.push("--fit", "off");
   }
   if (input.mtpModelPath) {
     args.push("--model-draft", input.mtpModelPath);
@@ -644,7 +664,7 @@ async function stopServer(
 export async function runServerBench(input: ServerBenchRunInput): Promise<BenchResult> {
   const item = input.item;
   const timeoutMs = input.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-  const args = buildArgs(input);
+  const args = await buildArgs(input);
   const log = input.log;
   const label = `mtp item ${item.idx}`;
 
@@ -660,8 +680,12 @@ export async function runServerBench(input: ServerBenchRunInput): Promise<BenchR
   let timedOut = false;
   const proc: ChildProcess = spawn(input.llamaServerPath, args, { windowsHide: true });
   input.onSpawn?.(proc);
-  proc.stdout?.on("data", (d) => (stdout += d.toString()));
-  proc.stderr?.on("data", (d) => (stderr += d.toString()));
+  proc.stdout?.on("data", (d) => {
+    stdout = appendBoundedOutput(stdout, d.toString(), MAX_CAPTURED_PROCESS_OUTPUT_CHARS);
+  });
+  proc.stderr?.on("data", (d) => {
+    stderr = appendBoundedOutput(stderr, d.toString(), MAX_CAPTURED_PROCESS_OUTPUT_CHARS);
+  });
   proc.on("error", (err) => {
     log?.warn(`llama-server spawn error: ${err.message}`);
     stderr += `\nspawn error: ${err.message}`;
@@ -979,7 +1003,7 @@ export async function runServerBench(input: ServerBenchRunInput): Promise<BenchR
     // timedOut: true after the fact.
     clearTimeout(timer);
     const exitResult = await stopServer(proc, closed);
-    // See bench.ts's collapseTensorLoadSpam -- --verbosity 4 (buildArgs
+    // See bench.ts's collapseTensorLoadSpam -- --verbosity 5 (buildArgs
     // above) prints the same one-line-per-tensor load/repack spam
     // llama-bench's -v does, and this stderr becomes a failed item's
     // stored `error` verbatim just the same.
