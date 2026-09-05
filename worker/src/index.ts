@@ -19,7 +19,7 @@ import { gzipSync } from "node:zlib";
 import { hostname as osHostname } from "node:os";
 import { pipeline } from "node:stream/promises";
 import { Readable, Transform } from "node:stream";
-import { runBench, matchOffloadLine, extractCudaDiagnosticLines, classifyFailure, collapseTensorLoadSpam, type BenchResult, type OffloadResult, type OffloadInfo, type ModelBufferSizes } from "./bench.js";
+import { runBench, matchOffloadLine, extractCudaDiagnosticLines, classifyFailure, collapseTensorLoadSpam, parseModelBufferSizes, type BenchResult, type OffloadResult, type OffloadInfo, type ModelBufferSizes } from "./bench.js";
 import { runServerBench } from "./serverBench.js";
 import { spawn } from "node:child_process";
 // N1/N2/N5 -- the {engine:"server", spec:"off"} execution paths.
@@ -1397,8 +1397,10 @@ async function finalizeSweepItemResult(
   // buffer *assignment* -- the ggml scheduler's plan, printed before any
   // buffer is actually allocated -- never confirmed residency (see
   // shared/vramEstimate.ts's top comment). A claimed-full offload can still
-  // mean the model never really left system RAM (Windows CUDA sysmem
-  // fallback), regardless of what llama.cpp's own plan-stage line says.
+  // mean the model never really left system RAM -- Windows can silently
+  // back an oversubscribed GPU allocation with host RAM instead of erroring,
+  // confirmed on both NVIDIA/CUDA and AMD/Vulkan -- regardless of what
+  // llama.cpp's own plan-stage line says.
   // Checked two ways, in order of trust:
   //   1. bench.modelBufferSizes -- llama.cpp's own POST-allocation report of
   //      which backend buffer it actually created for the weights (see
@@ -1440,9 +1442,10 @@ async function finalizeSweepItemResult(
   // the scheduler's pre-allocation plan; the assignments/buffer split are
   // where the loader really put the weights, so the two can diverge without
   // any error (a driver too old for the CUDA runtime means zero devices and
-  // an exact 0/49; Windows' NVIDIA driver silently backing an overcommitted
-  // CUDA allocation with system RAM produces a full "offloaded 33/33" claim
-  // with ~0 bytes on the GPU buffer). Computed for every item, not just
+  // an exact 0/49; Windows silently backing an overcommitted GPU allocation
+  // with system RAM -- confirmed on both NVIDIA/CUDA and AMD/Vulkan -- produces
+  // a full "offloaded 33/33" claim with ~0 bytes on the GPU buffer). Computed
+  // for every item, not just
   // suspicious ones, so logs/UI/CSV can always show claimed-vs-actual side by
   // side. Null when nothing was claimed or no report was captured.
   const mainResident = computeResidentLayers(offload.main, bench.modelBufferSizes?.main ?? null);
@@ -1475,7 +1478,7 @@ async function finalizeSweepItemResult(
           `claimed offload ${offload.main.gpu_layers_loaded}/${offload.main.total_model_layers} layers to GPU, ` +
           `but llama.cpp's own allocator put only ~${Math.round(gpuMib)}MiB of model weights on the GPU buffer ` +
           `(~${Math.round(cpuMib)}MiB landed on CPU instead, ~${estimatedMib}MiB expected on GPU)${exactLayers} -- likely ` +
-          `silently running from system RAM (Windows CUDA sysmem fallback), not actual GPU offload`;
+          `silently running from system RAM (a Windows GPU-memory oversubscription fallback, not CUDA-specific), not actual GPU offload`;
         offloadDiscrepancy = {
           estimatedMib,
           observedMib: Math.round(gpuMib),
@@ -1488,7 +1491,7 @@ async function finalizeSweepItemResult(
       vramDiscrepancyWarning =
         `claimed offload ${offload.main.gpu_layers_loaded}/${offload.main.total_model_layers} layers to GPU ` +
         `(~${estimatedMib}MiB expected) but observed VRAM peaked at only ${stats.vram_peak_mib}MiB -- likely ` +
-        `silently running from system RAM (Windows CUDA sysmem fallback), not actual GPU offload`;
+        `silently running from system RAM (a Windows GPU-memory oversubscription fallback, not CUDA-specific), not actual GPU offload`;
       const sampled = estimateResidentGpuLayers({
         modelSizeBytes,
         totalModelLayers: offload.main.total_model_layers,
@@ -2996,14 +2999,21 @@ async function executeDownloadModelJob(
 // fallback, for a model not yet carrying a tensor_layer_bytes breakdown)
 // predicts for THIS model/ngl/context/KV-type combination, before llama.cpp
 // ever loads it. Reuses computeDualPoolFit verbatim rather than a new
-// formula: only its weightsMib/kvMib figures are used here (freeMib is
-// irrelevant to a "how much is needed" log line, so vram/ram readings are
-// passed as unknown and unifiedPool is a light guess from the backend alone --
-// neither affects the needed-bytes math, only the `fits` verdict this caller
-// ignores). Returns null when the model's own header metadata can't support
-// even the flat fallback (n_layer or KV head geometry unresolved) -- the
-// caller then logs the candidate context with no estimate rather than a
-// fabricated one.
+// formula, and returns its PoolFit.neededMib figures as-is (weights + KV +
+// the fixed per-pool overhead) so this "needed" number is the SAME one
+// computeDualPoolFit's own fits check used -- a caller comparing "needed" to
+// "free" must see the identical figure the pass/fail verdict was computed
+// from, not a trimmed-down one. Earlier this summed only weightsMib+kvMib,
+// which silently dropped VRAM/RAM_ESTIMATE_FIXED_OVERHEAD_MIB and made a
+// fully-offloaded rung's RAM figure a literal 0 MiB -- misleading, since the
+// host process never actually uses zero RAM regardless of placement (freeMib
+// is still irrelevant to a "how much is needed" log line, so vram/ram
+// readings are passed as unknown and unifiedPool is a light guess from the
+// backend alone -- neither affects the needed-bytes math, only the `fits`
+// verdict this caller ignores). Returns null when the model's own header
+// metadata can't support even the flat fallback (n_layer or KV head geometry
+// unresolved) -- the caller then logs the candidate context with no estimate
+// rather than a fabricated one.
 function estimateProbeMemoryNeed(
   payload: TestProbeJobPayload,
   candidateCtx: number,
@@ -3036,8 +3046,8 @@ function estimateProbeMemoryNeed(
     tensorBreakdown: meta.tensor_layer_bytes ?? null,
   });
   return {
-    vramMib: Math.round(fit.gpu.weightsMib + fit.gpu.kvMib),
-    ramMib: Math.round(fit.cpu.weightsMib + fit.cpu.kvMib),
+    vramMib: Math.round(fit.gpu.neededMib),
+    ramMib: Math.round(fit.cpu.neededMib),
   };
 }
 
@@ -3047,6 +3057,66 @@ function estimateProbeMemoryNeed(
 function describeEstimatedMemoryNeed(estimate: { vramMib: number; ramMib: number } | null): string | null {
   if (!estimate) return null;
   return `estimated need: ${estimate.vramMib}MiB VRAM, ${estimate.ramMib}MiB RAM`;
+}
+
+// Turns a rung's raw vramDiscrepancy flag (runtimeBench.ts's probeSucceeded)
+// into a warn/retry/fail outcome via vram-policy.ts's
+// resolveVramDiscrepancyAction -- the SAME function and the SAME
+// vramDiscrepancyPolicy setting the sweep path already applies
+// (finalizeSweepItemResult above), so an operator's one policy choice governs
+// both paths identically. Unlike the sweep path this has no llama.cpp
+// post-allocation buffer-size report to lean on (that parsing is
+// llama-bench-log-specific), so any vramDiscrepancy here is treated as
+// sufficient on its own to reach the policy's harder actions -- see
+// probeSucceeded's own doc comment for why that's the right call given a
+// probe's job is specifically to answer "is this placement really usable".
+// `reload` re-runs the exact same rung for retry_once_then_fail's single
+// re-attempt; its result becomes the returned attempt regardless of what it
+// finds (mirrors runSweepItemViaServer's own "only the final attempt is ever
+// recorded" contract).
+async function resolveProbeVramDiscrepancy(
+  label: string,
+  rung: { ctx: number; ngl: number },
+  estimatedVramMib: number | null,
+  initialAttempt: ProbeAttemptOutcome,
+  reload: () => Promise<ProbeAttemptOutcome>
+): Promise<ProbeAttemptOutcome> {
+  if (!initialAttempt.vramDiscrepancy) return initialAttempt;
+  const describe = (a: ProbeAttemptOutcome) =>
+    `candidate ${rung.ctx}/${rung.ngl} looks like a silent VRAM fallback: claimed ${rung.ngl} layers on GPU ` +
+    `(~${estimatedVramMib ?? "?"}MiB expected) but observed VRAM peaked at only ` +
+    `${a.vramPeakMib != null ? Math.round(a.vramPeakMib) : "?"}MiB -- likely silently running from system RAM ` +
+    `instead of erroring, not actual GPU offload`;
+  const decision = resolveVramDiscrepancyAction(vramDiscrepancyPolicy, true, false, vramFallbackConfirmedPersistent);
+  if (decision.action === "record_done_with_warning") {
+    return { ...initialAttempt, error: [initialAttempt.error, describe(initialAttempt)].filter(Boolean).join(" -- ") };
+  }
+  if (decision.action === "fail_item") {
+    return {
+      ...initialAttempt,
+      ok: false,
+      error: [initialAttempt.error, `${describe(initialAttempt)} (vram_discrepancy_policy=${vramDiscrepancyPolicy})`]
+        .filter(Boolean)
+        .join(" -- "),
+    };
+  }
+  log.warn(
+    `${label}: ${describe(initialAttempt)} -- re-running once (vram_discrepancy_policy=retry_once_then_fail). ` +
+      `Nothing recorded from this attempt.`
+  );
+  const retried = await reload();
+  if (!retried.vramDiscrepancy) return retried;
+  vramFallbackConfirmedPersistent = true;
+  log.warn(
+    `${label}: VRAM fallback reproduced across a retry -- later rungs in this run will fail immediately instead of each paying their own retry`
+  );
+  return {
+    ...retried,
+    ok: false,
+    error: [retried.error, `${describe(retried)} (reproduced on retry, vram_discrepancy_policy=retry_once_then_fail)`]
+      .filter(Boolean)
+      .join(" -- "),
+  };
 }
 
 // BENCHMARKING_PLAN_V8.md N2 -- the usable-config probe. Engine pinned to
@@ -3067,12 +3137,20 @@ async function executeRunProbeJob(payload: TestProbeJobPayload): Promise<void> {
   if (!resolvedBuild.server_path) {
     throw new Error("a probe needs llama-server, and this build has no llama-server binary");
   }
+  // Narrowed to a local const: TS doesn't carry the guard above's narrowing
+  // of resolvedBuild.server_path through the loadThisRung closure below.
+  const serverPath = resolvedBuild.server_path;
 
   const label = `probe ${payload.run_id}`;
   setRunLogFile(runLogFilePath(payload.run_id));
   const attempts: ProbeAttemptOutcome[] = [];
   const mode = payload.mode ?? "max_context";
   const granularity = payload.granularity ?? "basic";
+  // Fresh per-run, same reasoning as the sweep job's own reset above: a
+  // fallback confirmed persistent in an EARLIER run (sweep or probe -- this
+  // flag is shared across job types on this worker) must not pre-fail this
+  // run's rungs without their own retry.
+  vramFallbackConfirmedPersistent = false;
 
   // N2 batch dedup -- an earlier sibling scenario in the same batch may
   // already have measured some of the (ctx, ngl) points this ladder is
@@ -3211,12 +3289,16 @@ async function executeRunProbeJob(payload: TestProbeJobPayload): Promise<void> {
           spill: dedupMatch.spill,
           vramPeakMib: dedupMatch.vram_peak_mib,
           ramPeakMib: dedupMatch.ram_peak_mib,
+          vramSharedPeakMib: dedupMatch.vram_shared_peak_mib,
           genTps: dedupMatch.gen_tps,
           vramNeededMib: dedupMatch.vram_needed_mib,
           vramFreeMib: dedupMatch.vram_free_mib,
           ramNeededMib: dedupMatch.ram_needed_mib,
           ramFreeMib: dedupMatch.ram_free_mib,
           reusedFromRunId: dedupMatch.source_run_id,
+          vramDiscrepancy: dedupMatch.vram_discrepancy,
+          gpuLayersResidentEst: dedupMatch.gpu_layers_resident_est,
+          gpuLayersResidentExact: dedupMatch.gpu_layers_resident_exact,
         };
         attempts.push(reusedAttempt);
         sendProbeAttemptTick(payload.run_id, attempts.length - 1, toProbeAttemptReport(reusedAttempt));
@@ -3238,15 +3320,17 @@ async function executeRunProbeJob(payload: TestProbeJobPayload): Promise<void> {
         status: "benchmarking",
         detail: `probe load ${attempts.length + 1}: ctx ${rung.ctx.toLocaleString()} / ${rung.ngl} layers`,
       });
-      const attempt = await runOneProbeLoad({
-        payload,
-        modelPath,
-        serverPath: resolvedBuild.server_path,
-        candidateCtx: rung.ctx,
-        ngl: rung.ngl,
-        estimate,
-        label,
-      });
+      const loadThisRung = () =>
+        runOneProbeLoad({
+          payload,
+          modelPath,
+          serverPath,
+          candidateCtx: rung.ctx,
+          ngl: rung.ngl,
+          estimate,
+          label,
+        });
+      let attempt = await loadThisRung();
       // A stop mid-load kills the child the same way an OOM would, so this
       // attempt's ok/oom fields describe the kill, not the config -- discard
       // it rather than recording a fake failure for a candidate that was
@@ -3254,6 +3338,15 @@ async function executeRunProbeJob(payload: TestProbeJobPayload): Promise<void> {
       if (stopRequested) {
         stoppedMidLadder = true;
         log.info(`${label}: candidate ${rung.ctx}/${rung.ngl} discarded -- stopped mid-load`);
+        break;
+      }
+      attempt = await resolveProbeVramDiscrepancy(label, rung, estimate?.vramMib ?? null, attempt, loadThisRung);
+      // The discrepancy resolution above may itself have re-run the rung
+      // (retry_once_then_fail) -- a stop requested during THAT load needs the
+      // same discard-not-record treatment as the first load's own check.
+      if (stopRequested) {
+        stoppedMidLadder = true;
+        log.info(`${label}: candidate ${rung.ctx}/${rung.ngl} discarded -- stopped mid-retry`);
         break;
       }
       attempts.push(attempt);
@@ -3375,8 +3468,12 @@ function toProbeAttemptReport(attempt: ProbeAttemptOutcome): ProbeAttemptReport 
     ram_needed_mib: attempt.ramNeededMib,
     ram_free_mib: attempt.ramFreeMib,
     ram_peak_mib: attempt.ramPeakMib,
+    vram_shared_peak_mib: attempt.vramSharedPeakMib,
     error: attempt.error,
     reused_from_run_id: attempt.reusedFromRunId,
+    vram_discrepancy: attempt.vramDiscrepancy,
+    gpu_layers_resident_est: attempt.gpuLayersResidentEst,
+    gpu_layers_resident_exact: attempt.gpuLayersResidentExact,
   };
 }
 
@@ -3473,11 +3570,29 @@ async function runOneProbeLoad(input: ProbeLoadInput): Promise<ProbeAttemptOutco
       vramPeakMib: stats.vram_peak_mib,
       gpuTotalMib: payload.gpu_total_mib ?? null,
       genTps,
+      ngl,
+      estimatedVramMib: estimate?.vramMib ?? null,
     });
     const headroomFrac =
       stats.vram_peak_mib != null && payload.gpu_total_mib != null && payload.gpu_total_mib > 0
         ? Math.max(0, 1 - stats.vram_peak_mib / payload.gpu_total_mib)
         : null;
+    // Claimed-vs-landed, same check the sweep path already runs
+    // (finalizeSweepItemResult's mainResident) -- reused verbatim rather than
+    // a second formula, now against the probe's own captured server output.
+    // The requested ngl/totalModelLayers are used directly as the "claim"
+    // here rather than re-parsing llama.cpp's own "offloaded X/Y" line: the
+    // probe already pins -ngl to exactly `ngl` on the command line, so
+    // there's nothing for that line to tell us that we don't already know.
+    const totalModelLayers =
+      payload.model.metadata.n_layer != null && payload.model.metadata.n_layer > 0
+        ? payload.model.metadata.n_layer + 1
+        : null;
+    const modelBufferSizes = parseModelBufferSizes(server?.stderr() ?? "")?.main ?? null;
+    const resident = computeResidentLayers(
+      ngl > 0 && totalModelLayers != null ? { gpu_layers_loaded: ngl, total_model_layers: totalModelLayers } : null,
+      modelBufferSizes
+    );
     return {
       candidateCtx,
       ok: verdict.ok,
@@ -3485,10 +3600,14 @@ async function runOneProbeLoad(input: ProbeLoadInput): Promise<ProbeAttemptOutco
       spill: verdict.spill,
       vramPeakMib: stats.vram_peak_mib,
       ramPeakMib: stats.ram_peak_mib,
+      vramSharedPeakMib: stats.vram_process_shared_peak_mib,
       genTps,
       headroomFrac,
       ...memoryFields,
       error: verdict.reason ?? undefined,
+      vramDiscrepancy: verdict.vramDiscrepancy,
+      gpuLayersResidentEst: resident.layers,
+      gpuLayersResidentExact: resident.exact,
     };
   } catch (err) {
     const stats = sampler.stop();

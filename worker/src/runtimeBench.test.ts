@@ -277,22 +277,74 @@ describe("N5 knee ladder execution", () => {
 // is about one load rather than about the search.
 describe("N2 probe success rule", () => {
   it("treats loading-but-crawling as failure -- loading is not the same as usable", () => {
-    const crawling = probeSucceeded({ oom: false, vramPeakMib: 7000, gpuTotalMib: 8192, genTps: 0.4 });
+    const crawling = probeSucceeded({
+      oom: false,
+      vramPeakMib: 7000,
+      gpuTotalMib: 8192,
+      genTps: 0.4,
+      ngl: 0,
+      estimatedVramMib: null,
+    });
     expect(crawling.ok).toBe(false);
     expect(crawling.reason).toContain(`${PROBE_MIN_GEN_TPS} tok/s floor`);
   });
 
   it("treats a spill past the adapter total as failure", () => {
-    const spilled = probeSucceeded({ oom: false, vramPeakMib: 9000, gpuTotalMib: 8192, genTps: 30 });
+    const spilled = probeSucceeded({
+      oom: false,
+      vramPeakMib: 9000,
+      gpuTotalMib: 8192,
+      genTps: 30,
+      ngl: 0,
+      estimatedVramMib: null,
+    });
     expect(spilled).toMatchObject({ ok: false, spill: true });
   });
 
   it("passes a clean load above the floor", () => {
-    expect(probeSucceeded({ oom: false, vramPeakMib: 7000, gpuTotalMib: 8192, genTps: 30 })).toMatchObject({
+    expect(
+      probeSucceeded({ oom: false, vramPeakMib: 7000, gpuTotalMib: 8192, genTps: 30, ngl: 0, estimatedVramMib: null })
+    ).toMatchObject({
       ok: true,
       spill: false,
+      vramDiscrepancy: false,
       reason: null,
     });
+  });
+
+  // The real case this exists for: a full-VRAM-oversubscribed load whose
+  // generation speed still clears the (deliberately low) tok/s floor because
+  // the OS quietly backed the overcommit with system RAM instead of erroring
+  // -- confirmed live on an AMD RX 6600 XT (8GB, Vulkan backend) loading a
+  // 35B MoE model at full offload: gen tok/s stayed above the floor and VRAM
+  // peak never exceeded the card's total, so neither the genTps nor the spill
+  // check caught it, yet the estimate (needing far more than the card has)
+  // was right and the load was really running from host RAM. `ok` itself does
+  // NOT flip here -- see this function's own doc comment for why that
+  // decision belongs to the caller's vramDiscrepancyPolicy, not this rule.
+  it("flags a VRAM discrepancy when observed peak is far below the estimate for a real offload", () => {
+    const result = probeSucceeded({
+      oom: false,
+      vramPeakMib: 6544,
+      gpuTotalMib: 8192,
+      genTps: 6.8,
+      ngl: 41,
+      estimatedVramMib: 27435,
+    });
+    expect(result.vramDiscrepancy).toBe(true);
+    expect(result.ok).toBe(true);
+  });
+
+  it("does not flag a discrepancy when ngl is 0 (nothing was requested on GPU)", () => {
+    const result = probeSucceeded({
+      oom: false,
+      vramPeakMib: 1791,
+      gpuTotalMib: 8192,
+      genTps: 8.7,
+      ngl: 0,
+      estimatedVramMib: 22315,
+    });
+    expect(result.vramDiscrepancy).toBe(false);
   });
 });
 
