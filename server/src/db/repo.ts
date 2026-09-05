@@ -3260,6 +3260,7 @@ export const repo = {
       const parsedProbeMaxLoads = rawProbeMaxLoads === undefined ? NaN : Number(rawProbeMaxLoads);
       return {
         communitySharingAllowed: read("community_sharing_allowed") === "1",
+        communityUserChoiceAllowed: read("community_user_choice_allowed") !== "0",
         accountDeletionAllowed: read("account_deletion_allowed") !== "0",
         workerVramDiscrepancyPolicy: isVramDiscrepancyPolicy(rawPolicy)
           ? rawPolicy
@@ -3281,6 +3282,16 @@ export const repo = {
       getDb()
         .prepare(
           `INSERT INTO meta (key, value) VALUES ('community_sharing_allowed', ?)
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value`
+        )
+        .run(allowed ? "1" : "0");
+      return repo.appSettingsRepo.get();
+    },
+
+    setCommunityUserChoiceAllowed(allowed: boolean): AppSettings {
+      getDb()
+        .prepare(
+          `INSERT INTO meta (key, value) VALUES ('community_user_choice_allowed', ?)
            ON CONFLICT(key) DO UPDATE SET value = excluded.value`
         )
         .run(allowed ? "1" : "0");
@@ -3411,9 +3422,9 @@ export const repo = {
           `INSERT INTO probe_attempts
              (id, run_id, worker_id, model_id, seq, candidate_ctx, ngl,
               ok, oom, spill, vram_needed_mib, vram_free_mib, vram_peak_mib,
-              ram_needed_mib, ram_free_mib, ram_peak_mib, gen_tps, error, created_at,
-              reused_from_run_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+              ram_needed_mib, ram_free_mib, ram_peak_mib, vram_shared_peak_mib, gen_tps, error, created_at,
+              reused_from_run_id, vram_discrepancy, gpu_layers_resident_est, gpu_layers_resident_exact)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         );
         input.attempts.forEach((a, seq) => {
           insert.run(
@@ -3433,10 +3444,14 @@ export const repo = {
             a.ram_needed_mib ?? null,
             a.ram_free_mib ?? null,
             a.ram_peak_mib ?? null,
+            a.vram_shared_peak_mib ?? null,
             a.gen_tps ?? null,
             a.error ?? null,
             now,
-            a.reused_from_run_id ?? null
+            a.reused_from_run_id ?? null,
+            a.vram_discrepancy === undefined ? null : a.vram_discrepancy ? 1 : 0,
+            a.gpu_layers_resident_est ?? null,
+            a.gpu_layers_resident_exact === undefined ? null : a.gpu_layers_resident_exact ? 1 : 0
           );
         });
       });
@@ -3471,9 +3486,9 @@ export const repo = {
           `INSERT INTO probe_attempts
              (id, run_id, worker_id, model_id, seq, candidate_ctx, ngl,
               ok, oom, spill, vram_needed_mib, vram_free_mib, vram_peak_mib,
-              ram_needed_mib, ram_free_mib, ram_peak_mib, gen_tps, error, created_at,
-              reused_from_run_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              ram_needed_mib, ram_free_mib, ram_peak_mib, vram_shared_peak_mib, gen_tps, error, created_at,
+              reused_from_run_id, vram_discrepancy, gpu_layers_resident_est, gpu_layers_resident_exact)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(run_id, seq) DO UPDATE SET
              candidate_ctx = excluded.candidate_ctx,
              ngl = excluded.ngl,
@@ -3486,10 +3501,14 @@ export const repo = {
              ram_needed_mib = excluded.ram_needed_mib,
              ram_free_mib = excluded.ram_free_mib,
              ram_peak_mib = excluded.ram_peak_mib,
+             vram_shared_peak_mib = excluded.vram_shared_peak_mib,
              gen_tps = excluded.gen_tps,
              error = excluded.error,
              created_at = excluded.created_at,
-             reused_from_run_id = excluded.reused_from_run_id`
+             reused_from_run_id = excluded.reused_from_run_id,
+             vram_discrepancy = excluded.vram_discrepancy,
+             gpu_layers_resident_est = excluded.gpu_layers_resident_est,
+             gpu_layers_resident_exact = excluded.gpu_layers_resident_exact`
         )
         .run(
           uuid(),
@@ -3508,10 +3527,14 @@ export const repo = {
           a.ram_needed_mib ?? null,
           a.ram_free_mib ?? null,
           a.ram_peak_mib ?? null,
+          a.vram_shared_peak_mib ?? null,
           a.gen_tps ?? null,
           a.error ?? null,
           Date.now(),
-          a.reused_from_run_id ?? null
+          a.reused_from_run_id ?? null,
+          a.vram_discrepancy === undefined ? null : a.vram_discrepancy ? 1 : 0,
+          a.gpu_layers_resident_est ?? null,
+          a.gpu_layers_resident_exact === undefined ? null : a.gpu_layers_resident_exact ? 1 : 0
         );
     },
   },
@@ -3721,10 +3744,14 @@ export interface ProbeAttemptRow {
   ram_needed_mib: number | null;
   ram_free_mib: number | null;
   ram_peak_mib: number | null;
+  vram_shared_peak_mib: number | null;
   gen_tps: number | null;
   error: string | null;
   created_at: number;
   reused_from_run_id: string | null;
+  vram_discrepancy: number | null;
+  gpu_layers_resident_est: number | null;
+  gpu_layers_resident_exact: number | null;
 }
 
 // N4 storage shapes.

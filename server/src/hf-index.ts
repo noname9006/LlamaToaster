@@ -357,12 +357,13 @@ export function upsertHfGgufEntry(entry: HfGgufIndexEntry): void {
     .run(entry.sha256, entry.repo_id, entry.filename, entry.revision, entry.file_size, entry.last_seen);
 }
 
-// Look up one or more SHA-256 hashes in the index. Returns entries for
-// hashes that were found; missing hashes are simply absent from the result.
+// Look up one or more SHA-256 hashes in the index. Returns at most one entry
+// per hash that was found; missing hashes are simply absent from the result.
 // Deliberately NOT filtered by deleted_at -- a soft-deleted row must still be
-// returned so the caller (routes/models.ts) can tell "matched, but since
-// removed from HF" apart from "never matched at all", and surface that to the
-// client instead of the match silently vanishing.
+// returned (when it's the best available match) so the caller (routes/
+// models.ts) can tell "matched, but since removed from HF" apart from "never
+// matched at all", and surface that to the client instead of the match
+// silently vanishing.
 export function lookupHfGgufHashes(hashes: string[]): HfGgufIndexEntry[] {
   if (hashes.length === 0) return [];
   const placeholders = hashes.map(() => "?").join(",");
@@ -371,7 +372,47 @@ export function lookupHfGgufHashes(hashes: string[]): HfGgufIndexEntry[] {
                FROM hf_gguf_index
                WHERE sha256 IN (${placeholders})`)
     .all(...hashes) as HfIndexRow[];
-  return rows.map(mapHfIndexRow);
+  return dedupeBestPerHash(rows).map(mapHfIndexRow);
+}
+
+// Content-addressed matching means the same sha256 can legitimately have
+// multiple rows -- e.g. two different repos hosting byte-identical GGUF
+// files (a genuine mirror, or a spam/reupload account that copied a popular
+// quant under its own name). Without this, lookupHfGgufHashes returned every
+// row for a hash and callers (worker/src/model-scanner.ts's lookupHashes)
+// picked whichever one happened to come back last from this unordered SQL
+// scan -- a coin flip that could just as easily land on a since-deleted spam
+// mirror as the real, still-live source (live-confirmed 2026-09-05: a
+// "pleasen/model" mirror repo, already 404 on HF, was winning over the real
+// "unsloth/..." repo for an identical file).
+//
+// Picks, per sha256: a live (deleted_at IS NULL) row over a soft-deleted one
+// -- unless every row for that hash is deleted, in which case a deleted
+// match is still strictly better than none (see this function's doc comment
+// on why deleted rows must still surface). Among same-liveness rows, the one
+// with the most recent last_seen wins -- a repo HF's index sweeps keep
+// re-confirming is far more likely to still be the real, live source than
+// one that hasn't been touched in a while (an abandoned/deleted mirror stops
+// getting last_seen bumps the moment it drops out of HF's own listings).
+// Final tiebreak on repo_id makes the result fully deterministic even when
+// two rows share both deleted_at and last_seen exactly.
+function dedupeBestPerHash(rows: HfIndexRow[]): HfIndexRow[] {
+  const bestBySha = new Map<string, HfIndexRow>();
+  for (const row of rows) {
+    const current = bestBySha.get(row.sha256);
+    if (!current || isBetterMatch(row, current)) {
+      bestBySha.set(row.sha256, row);
+    }
+  }
+  return [...bestBySha.values()];
+}
+
+function isBetterMatch(candidate: HfIndexRow, current: HfIndexRow): boolean {
+  const candidateLive = candidate.deleted_at == null;
+  const currentLive = current.deleted_at == null;
+  if (candidateLive !== currentLive) return candidateLive;
+  if (candidate.last_seen !== current.last_seen) return candidate.last_seen > current.last_seen;
+  return candidate.repo_id < current.repo_id;
 }
 
 // Count total entries in the index (for admin/health display). Includes

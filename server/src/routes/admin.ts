@@ -70,16 +70,21 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
 
   app.get("/api/admin/users", async () => ({ users: repo.adminRepo.listUsers() }));
 
-  // The supervise dashboard's own two platform-wide toggles (see shared/
-  // types.ts's AppSettings doc comment) -- community benchmark sharing and
-  // self-service account deletion. Same {}-partial-body shape for both so
-  // the admin SPA can flip either without re-sending the other's value.
+  // The supervise dashboard's own platform-wide toggles (see shared/
+  // types.ts's AppSettings doc comment) -- community benchmark sharing (and
+  // whether users get their own say over it), self-service account
+  // deletion, and the worker VRAM/probe knobs below. Same {}-partial-body
+  // shape for all of them so the admin SPA can flip any one without
+  // re-sending the others' values.
   app.get("/api/admin/settings", async (): Promise<AppSettings> => repo.appSettingsRepo.get());
 
   app.post<{ Body: Partial<AppSettings> }>("/api/admin/settings", async (req, reply) => {
     const body = req.body ?? {};
     if (body.communitySharingAllowed !== undefined && typeof body.communitySharingAllowed !== "boolean") {
       return reply.code(400).send({ error: "communitySharingAllowed must be a boolean" });
+    }
+    if (body.communityUserChoiceAllowed !== undefined && typeof body.communityUserChoiceAllowed !== "boolean") {
+      return reply.code(400).send({ error: "communityUserChoiceAllowed must be a boolean" });
     }
     if (body.accountDeletionAllowed !== undefined && typeof body.accountDeletionAllowed !== "boolean") {
       return reply.code(400).send({ error: "accountDeletionAllowed must be a boolean" });
@@ -92,6 +97,9 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
     }
     if (body.communitySharingAllowed !== undefined) {
       repo.appSettingsRepo.setCommunitySharingAllowed(body.communitySharingAllowed);
+    }
+    if (body.communityUserChoiceAllowed !== undefined) {
+      repo.appSettingsRepo.setCommunityUserChoiceAllowed(body.communityUserChoiceAllowed);
     }
     if (body.accountDeletionAllowed !== undefined) {
       repo.appSettingsRepo.setAccountDeletionAllowed(body.accountDeletionAllowed);

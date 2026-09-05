@@ -34,6 +34,7 @@ export default function App() {
           authEnabled: false,
           appSettings: {
             communitySharingAllowed: false,
+            communityUserChoiceAllowed: true,
             accountDeletionAllowed: true,
             workerVramDiscrepancyPolicy: "warn",
             probeMaxLoads: 24,

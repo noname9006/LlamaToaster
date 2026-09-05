@@ -176,7 +176,11 @@ export function Settings() {
         </div>
       </section>
 
-      {appSettings?.communitySharingAllowed && (
+      {/* Both operator gates must be on: communitySharingAllowed is the whole
+          feature's master switch, communityUserChoiceAllowed is whether users
+          get a self-service say over their own (default-on) consent flag at
+          all -- see admin/src/App.tsx's own toggle descriptions. */}
+      {appSettings?.communitySharingAllowed && appSettings?.communityUserChoiceAllowed && (
         <section className="mt-8">
           <h2 className="text-sm font-semibold text-fg">Community benchmark data</h2>
           <p className="mt-1 text-sm text-muted">

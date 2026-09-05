@@ -11,6 +11,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import type { IngestResultInput } from "../../shared/types.js";
 import { CURVE_METHOD_VERSION, SERVER_METHOD_VERSION, type CaveatFlag } from "../../shared/types.js";
 import type { SweepItem } from "../../shared/sweep.js";
+import { isVramDiscrepancy } from "../../shared/vramEstimate.js";
 import {
   collapseTensorLoadSpam,
   parseModelBufferSizes,
@@ -637,6 +638,13 @@ export interface ProbeAttemptOutcome {
   /** The probe's own RSS peak (MemorySampler.stop()'s ram_peak_mib) -- the
    * real measured RAM usage, alongside vramPeakMib. */
   ramPeakMib?: number | null;
+  /** The probe's own peak system-RAM-backed GPU allocation (MemorySampler's
+   * vram_process_shared_peak_mib -- vram.ts's GpuMemoryReading.processShared:
+   * Windows WDDM "Shared Usage" or Linux amdgpu GTT). The DIRECT measured
+   * answer to "how much silently spilled into system RAM instead of erroring"
+   * -- vramDiscrepancy above only ever INFERS that from a needed-vs-peak gap.
+   * Null wherever no such counter/file exists at all (not a measured 0). */
+  vramSharedPeakMib?: number | null;
   genTps: number | null;
   /** Fraction of the adapter total still free at this candidate. */
   headroomFrac?: number | null;
@@ -665,6 +673,31 @@ export interface ProbeAttemptOutcome {
    * this exact (candidateCtx, ngl) point (see worker/src/index.ts's
    * findDedupMatch). Names the sibling run it came from. */
   reusedFromRunId?: string | null;
+  /** True when this rung's observed VRAM peak came in far below what
+   * computeDualPoolFit predicted the requested ngl needs -- the same
+   * silent-sysmem-fallback signature shared/vramEstimate.ts's top comment
+   * documents (confirmed on both NVIDIA/CUDA and AMD/Vulkan): llama.cpp's
+   * "offloaded X/Y" claim only reflects buffer assignment, never residency,
+   * and the OS can back an oversubscribed allocation with system RAM instead
+   * of erroring. Set by probeSucceeded below; worker/src/index.ts's ladder
+   * loop turns it into a warn/retry/fail outcome per vramDiscrepancyPolicy,
+   * same policy the sweep path already applies. */
+  vramDiscrepancy?: boolean;
+  /** How many of `ngl`'s claimed layers actually landed in a GPU buffer,
+   * per worker/src/index.ts's computeResidentLayers -- the same claimed-vs-
+   * landed check the sweep path already surfaces as ResultRow's
+   * gpu_layers_resident_est, now available for a probe rung too. EXACT when
+   * this build printed its per-layer "assigned to device" lines under -v,
+   * a byte-ratio estimate from the post-allocation buffer-size report
+   * otherwise (see gpuLayersResidentExact), null when neither was available
+   * (ngl<=0, an older build, or the load failed before tensor loading
+   * finished). */
+  gpuLayersResidentEst?: number | null;
+  /** True when gpuLayersResidentEst came from llama.cpp's own per-layer
+   * "assigned to device" lines (an exact count), false when it's the
+   * coarser buffer-byte-ratio estimate. Meaningless when
+   * gpuLayersResidentEst is null. */
+  gpuLayersResidentExact?: boolean;
 }
 
 /** Gen tok/s floor -- excludes swap-thrash "success". */
@@ -678,28 +711,53 @@ export const PROBE_GEN_TOKENS = 256;
 // context is. Only the per-rung success rule below stayed behind, because it
 // is about one load's verdict rather than about the search.
 
-// A probe's own success rule, kept next to the ladder that consumes it:
-// no OOM, no spill (vram_peak within total), and gen tok/s above the floor.
+// A probe's own success rule, kept next to the ladder that consumes it: no
+// OOM, no spill (vram_peak within total), gen tok/s above the floor, and no
+// VRAM discrepancy severe enough to fail under the operator's policy.
+//
+// vramDiscrepancy is reported as a raw fact regardless of policy -- it does
+// NOT by itself flip `ok` here. worker/src/index.ts's ladder loop is what
+// turns it into warn/retry/fail (via vram-policy.ts's
+// resolveVramDiscrepancyAction, the SAME function/policy the sweep path
+// already uses), the same separation of "detect" from "decide" that path
+// keeps. Unlike the sweep path, there's no llama.cpp post-allocation
+// buffer-size report available here (that parsing is llama-bench-log-specific,
+// see bench.ts's parseModelBufferSizes) -- the vram_peak-vs-estimate signal is
+// the only one a probe has, so the ladder loop treats it as sufficient on its
+// own to trigger the policy's harder actions, not gated behind the sweep
+// path's stricter "exactly 0 bytes resident" bar.
 export function probeSucceeded(input: {
   oom: boolean;
   vramPeakMib: number | null;
   gpuTotalMib: number | null;
   genTps: number | null;
-}): { ok: boolean; spill: boolean; reason: string | null } {
-  if (input.oom) return { ok: false, spill: false, reason: "out of memory at this context" };
+  // The rung's requested layer count and computeDualPoolFit's own predicted
+  // GPU need for it (estimateProbeMemoryNeed's vramMib) -- both null-safe:
+  // ngl<=0 or a missing estimate simply never flags a discrepancy (nothing to
+  // compare against).
+  ngl: number;
+  estimatedVramMib: number | null;
+}): { ok: boolean; spill: boolean; vramDiscrepancy: boolean; reason: string | null } {
+  if (input.oom) return { ok: false, spill: false, vramDiscrepancy: false, reason: "out of memory at this context" };
   const spill =
     input.vramPeakMib != null && input.gpuTotalMib != null && input.vramPeakMib > input.gpuTotalMib;
   if (spill) {
-    return { ok: false, spill: true, reason: "the allocation spilled past this adapter's VRAM total" };
+    return { ok: false, spill: true, vramDiscrepancy: false, reason: "the allocation spilled past this adapter's VRAM total" };
   }
+  const vramDiscrepancy =
+    input.ngl > 0 &&
+    input.estimatedVramMib != null &&
+    input.vramPeakMib != null &&
+    isVramDiscrepancy(input.estimatedVramMib, input.vramPeakMib);
   if (input.genTps == null || input.genTps < PROBE_MIN_GEN_TPS) {
     return {
       ok: false,
       spill: false,
+      vramDiscrepancy,
       reason: `generation ran at ${input.genTps == null ? "an unmeasurable rate" : `${input.genTps.toFixed(2)} tok/s`}, below the ${PROBE_MIN_GEN_TPS} tok/s floor -- loading is not the same as usable`,
     };
   }
-  return { ok: true, spill: false, reason: null };
+  return { ok: true, spill: false, vramDiscrepancy, reason: null };
 }
 
 // Shared BenchResult shaping so both runtime paths report through
