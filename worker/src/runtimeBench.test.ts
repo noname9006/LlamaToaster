@@ -353,7 +353,8 @@ describe("N2 probe success rule", () => {
       vramProcessPeakMib: 3736,
       sharedPeakMib: 7647,
       perLayerMib: 17205 / 41,
-      priorSameCtx: [{ ngl: 10, sharedPeakMib: 1279, dedicatedPeakMib: 3610 }],
+      ctx: 1024,
+      prior: [{ ngl: 10, ctx: 1024, sharedPeakMib: 1279, dedicatedPeakMib: 3610 }],
     });
     expect(result.vramDiscrepancy).toBe(true);
     expect(result.hostBacked).toMatchObject({ hostBacked: true, method: "slope" });
@@ -379,8 +380,9 @@ describe("N2 probe success rule", () => {
       vramProcessPeakMib: 2393,
       sharedPeakMib: 810,
       perLayerMib: 17205 / 41,
-      // Same context, fewer layers -- the reference the slope needs.
-      priorSameCtx: [{ ngl: 2, sharedPeakMib: 806, dedicatedPeakMib: 1200 }],
+      // Same context, fewer layers -- the reference the layer slope needs.
+      ctx: 131072,
+      prior: [{ ngl: 2, ctx: 131072, sharedPeakMib: 806, dedicatedPeakMib: 1200 }],
     });
     expect(result.vramDiscrepancy).toBe(false);
     expect(result.ok).toBe(true);

@@ -183,6 +183,16 @@ export const HOST_BACKED_SLOPE_RATIO = 0.5;
 export const HOST_BACKED_MIN_SLOPE_SPAN = 2;
 
 /**
+ * Floor on the predicted KV growth between two contexts before their
+ * difference is trusted as a slope. Below this the driver's allocation
+ * granularity (~224MiB measured) dominates, exactly as it does for adjacent
+ * layers. Doubling the context near the floor moves the cache by tens of MiB;
+ * doubling it near the ceiling moves it by gigabytes, so this only ever skips
+ * the bottom of the ladder.
+ */
+export const HOST_BACKED_MIN_KV_GROWTH_MIB = 512;
+
+/**
  * Bootstrap threshold for the FIRST rung of a phase, which by definition has
  * no lower rung to take a slope against: what fraction of a placement's own
  * predicted GPU footprint may be system-RAM-backed before it is called
@@ -318,6 +328,13 @@ export function isVramDiscrepancy(estimatedMib: number, observedPeakMib: number)
 /** One measured rung, as this detector needs to see it. */
 export interface HostBackedRungSample {
   ngl: number;
+  /** Needed to compare rungs along the CONTEXT axis. */
+  ctx?: number;
+  /** computeDualPoolFit's predicted GPU footprint for this rung. Only the
+   * context-axis slope uses it, as the DIFFERENCE between two rungs at the
+   * same ngl -- where the weights term cancels and what is left is the
+   * estimator's own predicted KV growth. Systematic bias cancels with it. */
+  estimatedGpuMib?: number | null;
   /** MEASURED per-process system-RAM-backed GPU allocation (Windows WDDM
    * "Shared Usage" / Linux amdgpu GTT). Null wherever no such counter exists
    * -- which is what makes this whole check unavailable rather than passing. */
@@ -367,12 +384,12 @@ export function isPrefillCliff(ppTps: number | null, bestCleanPpTps: number | nu
 
 export interface HostBackedFallbackInput {
   rung: HostBackedRungSample;
-  /** Rungs already measured in this run AT THE SAME CONTEXT. Same context is
-   * the whole requirement: a different context legitimately moves the KV
-   * cache, which would show up in `shared` and be indistinguishable from
-   * spilled weights. The layer phase pins context while it searches, so its
-   * rungs are all mutually comparable by construction. */
-  priorSameCtx: HostBackedRungSample[];
+  /** Every rung already measured in this run. The detector picks its own
+   * comparison from them: a same-context rung for the layer slope, or a
+   * same-layers rung for the context slope. Mixing the two axes at once has
+   * no valid unit -- weights and KV both move -- so one axis must be held
+   * fixed, which is exactly what each phase already does. */
+  prior: HostBackedRungSample[];
   /** One layer's worth of weights: the model file's own size divided by its
    * layer count. Deliberately a fact from disk rather than an estimate --
    * it is the unit the slope is measured in, so it must not inherit the
@@ -428,46 +445,80 @@ export function detectHostBackedFallback(input: HostBackedFallbackInput): HostBa
   const { rung, perLayerMib } = input;
   if (rung.sharedPeakMib == null || rung.ngl <= 0) return UNAVAILABLE_HOST_BACKED;
 
-  // --- Primary: the SLOPE ---------------------------------------------------
+  // --- Primary: the SLOPE, on whichever axis this rung actually moved ------
   //
-  // Overhead does not move with ngl; spilled weights move with it one-for-one.
-  // So the discriminating quantity is how much system RAM appears PER LAYER
-  // ADDED, measured against the nearest comparable rung below this one, and
-  // expressed as a fraction of what one layer of this model weighs.
+  // Overhead does not move with placement; memory the driver pushed to the
+  // host does, one-for-one with whatever was added. So the discriminating
+  // quantity is always "how much system RAM appeared per unit of demand
+  // added", expressed as a fraction of that unit -- only the unit differs
+  // between the two axes:
   //
-  // The reference is the CLOSEST lower-ngl rung rather than the lowest, so
-  // this is a local gradient rather than a whole-range average -- a reference
-  // that is itself already spilling then understates the slope, which loses
-  // detections but never invents them. Under-detection is the safe direction:
-  // it leaves the ladder searching, where a false positive would fail a
-  // placement that genuinely works.
+  //   layer axis    unit = one layer's weights (the model file's own size
+  //                 divided by its layer count -- a fact from disk)
+  //   context axis  unit = the KV growth the estimator itself predicts
+  //                 between the two contexts at this same layer count, where
+  //                 the weights term cancels out of the subtraction
   //
-  // ngl 0 is never a reference: going from no GPU layers to some allocates the
-  // compute buffers, a one-off step that would read as a steep slope.
-  // Closest usable reference, but never closer than HOST_BACKED_MIN_SLOPE_SPAN
-  // -- an adjacent rung's delta is dominated by the driver's allocation
-  // granularity rather than by placement. Closest-of-the-eligible keeps the
-  // gradient local; a wider span would average across the onset.
-  const reference = input.priorSameCtx
+  // A reference must hold the OTHER axis fixed, which every phase already
+  // does: the layer phase pins context while it searches, the context phase
+  // pins layers. Before this, only the layer axis was covered, so every rung
+  // of a context phase fell through to the bootstrap -- observed live, a
+  // six-load context walk judged entirely without a slope.
+  const nglRef = input.prior
     .filter(
-      (p) => p.sharedPeakMib != null && p.ngl > 0 && p.ngl <= rung.ngl - HOST_BACKED_MIN_SLOPE_SPAN
+      (p) =>
+        p.sharedPeakMib != null &&
+        p.ngl > 0 &&
+        p.ngl <= rung.ngl - HOST_BACKED_MIN_SLOPE_SPAN &&
+        (p.ctx == null || rung.ctx == null || p.ctx === rung.ctx)
     )
     .sort((a, b) => b.ngl - a.ngl)[0];
-  if (reference && perLayerMib != null && perLayerMib > 0) {
-    const deltaNgl = rung.ngl - reference.ngl;
-    const deltaShared = rung.sharedPeakMib - reference.sharedPeakMib!;
+  if (nglRef && perLayerMib != null && perLayerMib > 0) {
+    const deltaNgl = rung.ngl - nglRef.ngl;
+    const deltaShared = rung.sharedPeakMib - nglRef.sharedPeakMib!;
     const slopeRatio = deltaShared / deltaNgl / perLayerMib;
     return {
       hostBacked: slopeRatio > HOST_BACKED_SLOPE_RATIO,
       method: "slope",
       slopeRatio,
-      // Only the growth ABOVE the reference is attributable from this pair --
-      // whatever the reference itself was already spilling is invisible here.
       spilledLayers: deltaShared > 0 ? Math.round(deltaShared / perLayerMib) : 0,
     };
   }
 
-  // --- Bootstrap: the first rung of a phase has no slope --------------------
+  // Context axis. The reference is the largest smaller context already
+  // measured at this same placement, and the predicted growth between them
+  // has to be worth measuring -- a doubling near the floor moves the KV cache
+  // by less than the driver's own allocation granularity, which would make
+  // the ratio noise. One layer's weights is the same yardstick the span rule
+  // uses, and it scales with the model rather than the machine.
+  const ctxRef =
+    rung.ctx != null && rung.estimatedGpuMib != null
+      ? input.prior
+          .filter(
+            (p) =>
+              p.sharedPeakMib != null &&
+              p.ngl === rung.ngl &&
+              p.ctx != null &&
+              p.ctx < rung.ctx! &&
+              p.estimatedGpuMib != null
+          )
+          .sort((a, b) => b.ctx! - a.ctx!)[0]
+      : undefined;
+  if (ctxRef) {
+    const expectedGrowthMib = rung.estimatedGpuMib! - ctxRef.estimatedGpuMib!;
+    if (expectedGrowthMib >= Math.max(perLayerMib ?? 0, HOST_BACKED_MIN_KV_GROWTH_MIB)) {
+      const slopeRatio = (rung.sharedPeakMib - ctxRef.sharedPeakMib!) / expectedGrowthMib;
+      return {
+        hostBacked: slopeRatio > HOST_BACKED_SLOPE_RATIO,
+        method: "slope",
+        slopeRatio,
+        // Layers are the wrong unit for a context spill; what grew is cache.
+        spilledLayers: null,
+      };
+    }
+  }
+
+  // --- Bootstrap: no comparable rung on either axis -------------------------
   //
   // Judged against its OWN predicted footprint, so the scale is the model's
   // rather than the machine's. This matters more than it looks: whatever
@@ -481,9 +532,9 @@ export function detectHostBackedFallback(input: HostBackedFallbackInput): HostBa
   // constant-free, but far too permissive to anchor on: simulated against the
   // measured sweep it passed a rung already spilling four layers, and the
   // ladder then converged there instead of descending to the real boundary.
-  if (input.estimatedGpuMib == null || input.estimatedGpuMib <= 0) return UNAVAILABLE_HOST_BACKED;
+  if (input.rung.estimatedGpuMib == null || input.rung.estimatedGpuMib <= 0) return UNAVAILABLE_HOST_BACKED;
   return {
-    hostBacked: rung.sharedPeakMib / input.estimatedGpuMib > HOST_BACKED_BOOTSTRAP_FRAC,
+    hostBacked: rung.sharedPeakMib / input.rung.estimatedGpuMib > HOST_BACKED_BOOTSTRAP_FRAC,
     method: "ratio",
     slopeRatio: null,
     spilledLayers: null,
