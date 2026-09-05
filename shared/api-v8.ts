@@ -65,6 +65,18 @@ export interface ProbeAttemptDto {
    * (not a measured 0), including every worker predating this reading. */
   vram_shared_peak_mib: number | null;
   gen_tps: number | null;
+  /** See ProbeAttemptReport.pp_tps -- prefill has its own placement cliff,
+   * several layers below the weights one, so neither of these is derivable
+   * from gen_tps. Null from a worker predating them. */
+  pp_tps: number | null;
+  ttft_ms: number | null;
+  /** SQLite boolean (1/0/null), same convention as vram_discrepancy above. */
+  prefill_cliff: number | null;
+  /** Which evidence decided vram_discrepancy, and the measured slope in
+   * layers of system RAM per layer added. Null on the inference path (no
+   * shared-memory counter) and from workers predating the check. */
+  host_backed_method: "slope" | "ratio" | null;
+  host_backed_slope: number | null;
   error: string | null;
   created_at: number;
   /** Set when this rung was never actually loaded, but reused verbatim from
