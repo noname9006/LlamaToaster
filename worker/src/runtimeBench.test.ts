@@ -5,6 +5,7 @@ import {
   executeCurvePoint,
   executeKneeLadder,
   probeSucceeded,
+  toProbeAttemptReport,
   spawnRuntimeServer,
   streamedCompletion,
   LlamaServerOutputError,
@@ -738,5 +739,70 @@ describe("streamedCompletion / llama-server SSE error frames", () => {
     expect(sample.tokensPredicted).toBe(2);
     expect(sample.promptN).toBe(4);
     expect(sample.promptMs).toBe(12);
+  });
+});
+
+// The bug this exists to prevent, verbatim: pp/ttft/prefill_cliff/slope were
+// computed by probeSucceeded, stored on the outcome, printed in the worker's
+// own log -- and never mapped onto the wire shape, so the UI showed a column
+// of em-dashes for all of them. Nothing in the type system catches it: every
+// field on the report is optional, so an omitted one is still a valid object.
+describe("toProbeAttemptReport", () => {
+  const outcome = {
+    candidateCtx: 4096,
+    ngl: 13,
+    ok: true,
+    oom: false,
+    spill: false,
+    vramPeakMib: 6761,
+    vramProcessPeakMib: 4380,
+    ramPeakMib: 16657,
+    ramTotalPeakMib: 21000,
+    vramSharedPeakMib: 1821,
+    vramNeededMib: 5958,
+    vramFreeMib: 5778,
+    ramNeededMib: 12341,
+    ramFreeMib: 24479,
+    genTps: 10.3,
+    ppTps: 18.9,
+    ttftMs: 9389,
+    prefillCliff: true,
+    hostBackedMethod: "slope" as const,
+    hostBackedSlopeRatio: 0.92,
+    vramDiscrepancy: false,
+    gpuLayersResidentEst: 13,
+    gpuLayersResidentExact: true,
+  };
+
+  it("carries every measurement onto the wire shape", () => {
+    const report = toProbeAttemptReport(outcome) as unknown as Record<string, unknown>;
+    // Each measured field, and where it has to land.
+    const expected: Record<string, unknown> = {
+      vram_peak_mib: 6761,
+      vram_process_peak_mib: 4380,
+      ram_peak_mib: 16657,
+      ram_total_peak_mib: 21000,
+      vram_shared_peak_mib: 1821,
+      gen_tps: 10.3,
+      pp_tps: 18.9,
+      ttft_ms: 9389,
+      prefill_cliff: true,
+      host_backed_method: "slope",
+      host_backed_slope: 0.92,
+      gpu_layers_resident_est: 13,
+      gpu_layers_resident_exact: true,
+    };
+    for (const [key, value] of Object.entries(expected)) {
+      expect({ [key]: report[key] }).toEqual({ [key]: value });
+    }
+  });
+
+  it("passes nulls through as nulls rather than dropping the keys", () => {
+    const report = toProbeAttemptReport({
+      ...outcome, ppTps: null, ttftMs: null, hostBackedSlopeRatio: null,
+    }) as unknown as Record<string, unknown>;
+    expect("pp_tps" in report).toBe(true);
+    expect(report.pp_tps).toBeNull();
+    expect(report.host_backed_slope).toBeNull();
   });
 });

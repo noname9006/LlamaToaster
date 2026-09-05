@@ -134,6 +134,12 @@ function validateOneProbeAttempt(raw: unknown, label: string): ProbeAttemptRepor
     ram_needed_mib: optionalNonNegative(a.ram_needed_mib, `${label}.ram_needed_mib`),
     ram_free_mib: optionalNonNegative(a.ram_free_mib, `${label}.ram_free_mib`),
     ram_peak_mib: optionalNonNegative(a.ram_peak_mib, `${label}.ram_peak_mib`),
+    // These two were sent by the worker, given DB columns, inserted by the
+    // repo, declared on the DTO and rendered by the client -- and dropped
+    // right here, because this validator never read them. Every probe rung
+    // since they were introduced has stored NULL for both.
+    vram_process_peak_mib: optionalNonNegative(a.vram_process_peak_mib, `${label}.vram_process_peak_mib`),
+    ram_total_peak_mib: optionalNonNegative(a.ram_total_peak_mib, `${label}.ram_total_peak_mib`),
     vram_shared_peak_mib: optionalNonNegative(a.vram_shared_peak_mib, `${label}.vram_shared_peak_mib`),
     gen_tps: optionalNonNegative(a.gen_tps, `${label}.gen_tps`),
     pp_tps: optionalNonNegative(a.pp_tps, `${label}.pp_tps`),
