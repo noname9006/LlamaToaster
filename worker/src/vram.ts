@@ -52,6 +52,20 @@ export interface GpuMemoryReading {
   // reports the whole adapter as "the process's usage" is exactly the
   // mislabeling the accuracy/source fields exist to prevent).
   process?: GpuMemoryValue;
+  // The same process's SYSTEM-RAM-backed GPU allocation -- Windows' WDDM
+  // "GPU Process Memory \ Shared Usage" counter (a distinct PDH category from
+  // Dedicated Usage above, confirmed live on this machine's Radeon RX 6600 XT
+  // -- see the comment on readWindowsUsedMib), or Linux amdgpu's GTT domain
+  // via /proc/<pid>/fdinfo's drm-memory-gtt entries -- the same DRM
+  // accounting `process` above reads for the VRAM domain. This is the
+  // measured answer to "how much did the OS silently spill into system RAM
+  // instead of erroring" -- shared/vramEstimate.ts's isVramDiscrepancy only
+  // ever INFERRED that from a needed-vs-peak gap; a `processShared` reading
+  // sees it directly. Absent (not a measured 0) wherever no such counter/file
+  // exists at all: CUDA-on-Linux has no OS-level silent-paging mechanism to
+  // read here (an oversubscribed cudaMalloc there fails outright rather than
+  // falling back), and Metal has no discrete/shared split to begin with.
+  processShared?: GpuMemoryValue;
 }
 
 function unavailable(): GpuMemoryValue {
@@ -128,18 +142,24 @@ async function readGenericGpuMemory(pid: number | undefined): Promise<GpuMemoryR
   const plat = osPlatform();
   let sample: VramSample = NULL_SAMPLE;
   let processReading: GpuMemoryValue | undefined;
+  let processSharedReading: GpuMemoryValue | undefined;
   if (plat === "win32") {
     const w = await readWindowsVram(pid);
     sample = w.sample;
     if (w.processMib != null) processReading = reading(w.processMib, "exact", "process_gpu_usage");
+    if (w.processSharedMib != null) processSharedReading = reading(w.processSharedMib, "exact", "process_gpu_usage");
   } else if (plat === "linux") {
     sample = await readLinuxVram();
-    if (pid != null) processReading = (await readLinuxProcessVram(pid)) ?? undefined;
+    if (pid != null) {
+      processReading = (await readLinuxProcessVram(pid)) ?? undefined;
+      processSharedReading = (await readAmdgpuFdinfoGtt(pid)) ?? undefined;
+    }
   }
   return {
     total: reading(sample.totalMib, "high", "driver_reported_memory"),
     used: reading(sample.usedMib, "high", "driver_reported_memory"),
     ...(processReading ? { process: processReading } : {}),
+    ...(processSharedReading ? { processShared: processSharedReading } : {}),
   };
 }
 
@@ -155,9 +175,13 @@ let cachedWindowsTotalMib: number | null | undefined;
 
 async function readWindowsVram(
   pid: number | undefined
-): Promise<{ sample: VramSample; processMib: number | null }> {
+): Promise<{ sample: VramSample; processMib: number | null; processSharedMib: number | null }> {
   const [totalMib, usedAndProcess] = await Promise.all([readWindowsTotalMib(), readWindowsUsedMib(pid)]);
-  return { sample: { totalMib, usedMib: usedAndProcess.usedMib }, processMib: usedAndProcess.processMib };
+  return {
+    sample: { totalMib, usedMib: usedAndProcess.usedMib },
+    processMib: usedAndProcess.processMib,
+    processSharedMib: usedAndProcess.processSharedMib,
+  };
 }
 
 async function readWindowsTotalMib(): Promise<number | null> {
@@ -181,41 +205,85 @@ function parseMiB(raw: string | undefined): number | null {
   return Number.isFinite(bytes) && bytes > 0 ? Math.round(bytes / BYTES_PER_MIB) : null;
 }
 
-// One powershell.exe spawn for BOTH readings (each Get-Counter call pays the
-// same ~1-1.5s PDH cold-start cost, so two separate spawns would double it):
+// One powershell.exe spawn for ALL THREE readings (each Get-Counter call pays
+// the same ~1-1.5s PDH cold-start cost, so separate spawns would multiply it):
 //   1. the whole-adapter "GPU Adapter Memory" Dedicated Usage sum (used),
 //   2. the per-process "GPU Process Memory" Dedicated Usage for the spawned
 //      child's pid -- the same VidMm data Task Manager's per-process "GPU
-//      memory" column reads. The counter instances are named
-//      `pid_<pid>_luid_0x..._phys_<n>` (one per memory segment), so the
-//      wildcard matches and Measure-Object sums them. Caveats: the instance
-//      only exists while the process actually holds GPU allocations (a
-//      freshly-spawned llama-bench may not have one yet -- fine, the sampler
-//      just falls back to the whole-adapter reading that tick), and
-//      "Dedicated Usage" is VidMm's *committed* accounting (what the driver
-//      charged the process), not hardware residency -- same semantics as
-//      nvidia-smi's per-process used_memory.
-async function readWindowsUsedMib(pid: number | undefined): Promise<{ usedMib: number | null; processMib: number | null }> {
+//      memory" column reads,
+//   3. that SAME process's "GPU Process Memory" Shared Usage -- a separate
+//      PDH counter (confirmed live on this machine's Radeon RX 6600 XT: only
+//      Shared Usage/Dedicated Usage/Total Committed are published under
+//      "GPU Process Memory", see readWindowsTotalMib's own comment) tracking
+//      system RAM WDDM is backing as GPU-accessible memory for this process
+//      -- exactly the bytes an oversubscribed allocation silently spills
+//      into instead of erroring (this file's own top comment; NVIDIA's
+//      Control Panel names the mechanism "CUDA - Sysmem Fallback Policy",
+//      but the WDDM counter itself is vendor-agnostic, so it applies
+//      identically to an AMD/Vulkan or an NVIDIA/CUDA process's pid).
+// The counter instances are named `pid_<pid>_luid_0x..._phys_<n>` (one per
+// memory segment), so the wildcard matches and Measure-Object sums them.
+// Caveats: an instance only exists while the process actually holds that
+// kind of GPU allocation (a freshly-spawned llama-bench may not have one yet
+// -- fine, the sampler just doesn't grow that stream this tick), and
+// "Dedicated Usage" is VidMm's *committed* accounting (what the driver
+// charged the process), not hardware residency -- same semantics as
+// nvidia-smi's per-process used_memory.
+async function readWindowsUsedMib(
+  pid: number | undefined
+): Promise<{ usedMib: number | null; processMib: number | null; processSharedMib: number | null }> {
   try {
     const lines = [
       `$u = (Get-Counter '\\GPU Adapter Memory(*)\\Dedicated Usage' -ErrorAction SilentlyContinue).CounterSamples | Measure-Object -Property CookedValue -Sum | Select-Object -ExpandProperty Sum`,
       pid != null
         ? `$p = (Get-Counter '\\GPU Process Memory(pid_${pid}*)\\Dedicated Usage' -ErrorAction SilentlyContinue).CounterSamples | Measure-Object -Property CookedValue -Sum | Select-Object -ExpandProperty Sum`
         : null,
+      pid != null
+        ? `$s = (Get-Counter '\\GPU Process Memory(pid_${pid}*)\\Shared Usage' -ErrorAction SilentlyContinue).CounterSamples | Measure-Object -Property CookedValue -Sum | Select-Object -ExpandProperty Sum`
+        : null,
       `Write-Output $u`,
       pid != null ? `Write-Output $p` : null,
+      pid != null ? `Write-Output $s` : null,
     ].filter(Boolean);
     const { stdout } = await execFileAsync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", lines.join("; ")], {
       timeout: EXEC_TIMEOUT_MS,
       windowsHide: true,
     });
-    // Two lines, one per Write-Output -- the second is blank when the pid
-    // has no GPU Process Memory instance yet (or pid-less runs).
-    const [usedRaw, processRaw] = stdout.trim().split("\n");
-    return { usedMib: parseMiB(usedRaw), processMib: pid != null ? parseMiB(processRaw) : null };
+    // Three lines, one per Write-Output when a pid was given (one otherwise)
+    // -- a line is blank when its counter instance doesn't exist yet.
+    const [usedRaw, processRaw, sharedRaw] = stdout.trim().split("\n");
+    return {
+      usedMib: parseMiB(usedRaw),
+      processMib: pid != null ? parseMiB(processRaw) : null,
+      processSharedMib: pid != null ? parseMiB(sharedRaw) : null,
+    };
   } catch {
     // No counter provider, no GPU, or the call timed out -- best-effort.
-    return { usedMib: null, processMib: null };
+    return { usedMib: null, processMib: null, processSharedMib: null };
+  }
+}
+
+// Windows-only, per-process Shared Usage in isolation -- for a caller
+// (readCudaGpuMemory) that already has its own total/used/process readings
+// from a vendor-specific source (nvidia-smi) and just needs this ONE
+// vendor-agnostic WDDM figure added on top, without re-querying "GPU Adapter
+// Memory" Dedicated Usage it has no use for. See readWindowsUsedMib's own
+// comment for what this counter means and why it's the right one to read.
+async function readWindowsProcessSharedMib(pid: number): Promise<number | null> {
+  try {
+    const { stdout } = await execFileAsync(
+      "powershell.exe",
+      [
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        `(Get-Counter '\\GPU Process Memory(pid_${pid}*)\\Shared Usage' -ErrorAction SilentlyContinue).CounterSamples | Measure-Object -Property CookedValue -Sum | Select-Object -ExpandProperty Sum`,
+      ],
+      { timeout: EXEC_TIMEOUT_MS, windowsHide: true }
+    );
+    return parseMiB(stdout);
+  } catch {
+    return null;
   }
 }
 
@@ -280,14 +348,16 @@ async function readLinuxProcessVram(pid: number): Promise<GpuMemoryValue | null>
 const DRM_CARD_DIR = "/sys/class/drm";
 const CARD_DIR_RE = /^card\d+$/;
 
-// Per-process VRAM via amdgpu's fdinfo accounting: every fd open on a DRM
-// render node gets a `drm-memory-vram: <bytes>` line in /proc/<pid>/fdinfo,
+// Per-process GPU memory via amdgpu's fdinfo accounting, generalized over
+// which DRM domain to sum: every fd open on a DRM render node gets one
+// `drm-memory-<domain>: <bytes>` line per domain in /proc/<pid>/fdinfo,
 // summed across fds -- same data amdgpu_top's per-process mode reads. Works
 // on a stock kernel/amdgpu driver with no ROCm install at all (matching the
 // sysfs fallback above for the whole-adapter side). Returns null when the
-// process has no GPU fds or none of the entries are readable -- a process
-// that never touched the GPU reports nothing, not 0.
-async function readAmdgpuFdinfoVram(pid: number): Promise<GpuMemoryValue | null> {
+// process has no GPU fds, none of the entries are readable, or this domain
+// never appears (a process that never touched the GPU, or never touched THIS
+// domain, reports nothing, not 0).
+async function readAmdgpuFdinfoDomain(pid: number, domainKey: string): Promise<GpuMemoryValue | null> {
   try {
     const fdinfoDir = `/proc/${pid}/fdinfo`;
     const entries = await readdir(fdinfoDir);
@@ -301,7 +371,7 @@ async function readAmdgpuFdinfoVram(pid: number): Promise<GpuMemoryValue | null>
         continue;
       }
       for (const line of content.split("\n")) {
-        if (!line.startsWith("drm-memory-vram:")) continue;
+        if (!line.startsWith(domainKey)) continue;
         const bytes = Number(line.slice(line.indexOf(":") + 1).trim());
         if (Number.isFinite(bytes)) totalBytes += bytes;
       }
@@ -310,6 +380,22 @@ async function readAmdgpuFdinfoVram(pid: number): Promise<GpuMemoryValue | null>
   } catch {
     return null;
   }
+}
+
+async function readAmdgpuFdinfoVram(pid: number): Promise<GpuMemoryValue | null> {
+  return readAmdgpuFdinfoDomain(pid, "drm-memory-vram:");
+}
+
+// GTT (Graphics Translation Table) -- amdgpu's own domain for system-RAM
+// pages the GPU can address directly, the Linux/AMD analogue of Windows'
+// WDDM "Shared Usage": a buffer the scheduler couldn't place in VRAM lands
+// here instead of failing, over the same DRM fdinfo interface readAmdgpuFdinfoVram
+// already reads for the VRAM domain (see GpuMemoryReading.processShared's own
+// doc comment for the fuller picture). Not run live this session -- no Linux
+// AMD hardware available -- verify against a real box before fully trusting,
+// same posture as every other not-yet-run-live path in this file.
+async function readAmdgpuFdinfoGtt(pid: number): Promise<GpuMemoryValue | null> {
+  return readAmdgpuFdinfoDomain(pid, "drm-memory-gtt:");
 }
 
 async function readAmdgpuSysfsVram(): Promise<VramSample | null> {
@@ -359,17 +445,33 @@ async function readCudaGpuMemory(pid: number | undefined): Promise<GpuMemoryRead
   const totalReading = reading(wholeAdapter?.totalMib ?? null, "exact", "driver_reported_memory");
   const usedReading = reading(wholeAdapter?.usedMib ?? null, "high", "driver_reported_memory");
   let processReading: GpuMemoryValue | undefined;
+  let processSharedReading: GpuMemoryValue | undefined;
   if (pid != null) {
     const processUsedMib = await readNvidiaSmiProcessUsed(pid);
     // null = this process hasn't shown up in nvidia-smi's own compute-apps
     // list yet (its polling lags a fresh spawn) -- no process reading this
     // tick, not a measured 0.
     if (processUsedMib != null) processReading = reading(processUsedMib, "exact", "process_gpu_usage");
+    // NVML/nvidia-smi has no counterpart to WDDM's "Shared Usage" -- the
+    // sysmem-fallback bytes an oversubscribed CUDA allocation silently
+    // spills to (NVIDIA Control Panel's own "CUDA - Sysmem Fallback Policy")
+    // are invisible to nvidia-smi entirely. Windows' own WDDM performance
+    // counter is vendor-agnostic though (any driver model, any API) -- an
+    // NVIDIA process's pid publishes the identical "GPU Process Memory"
+    // category a Vulkan/AMD process's does, so reading it here catches
+    // exactly what nvidia-smi can't, on Windows only (Linux CUDA has no
+    // equivalent silent-paging mechanism to read -- see
+    // GpuMemoryReading.processShared's own doc comment).
+    if (osPlatform() === "win32") {
+      const sharedMib = await readWindowsProcessSharedMib(pid);
+      if (sharedMib != null) processSharedReading = reading(sharedMib, "exact", "process_gpu_usage");
+    }
   }
   return {
     total: totalReading,
     used: usedReading,
     ...(processReading ? { process: processReading } : {}),
+    ...(processSharedReading ? { processShared: processSharedReading } : {}),
   };
 }
 
@@ -442,13 +544,18 @@ export async function readNvidiaDriverInfo(): Promise<NvidiaDriverInfo | null> {
 async function readRocmGpuMemory(pid: number | undefined): Promise<GpuMemoryReading> {
   const sample = (await readRocmSmiVram()) ?? (await readAmdgpuSysfsVram());
   let processReading: GpuMemoryValue | undefined;
+  let processSharedReading: GpuMemoryValue | undefined;
   if (pid != null) {
     processReading = (await readRocmSmiProcessVram(pid)) ?? (await readAmdgpuFdinfoVram(pid)) ?? undefined;
+    // rocm-smi --showpids has no GTT column -- fdinfo is the only source for
+    // this domain regardless of whether rocm-smi itself is installed.
+    processSharedReading = (await readAmdgpuFdinfoGtt(pid)) ?? undefined;
   }
   return {
     total: reading(sample?.totalMib ?? null, "exact", "driver_reported_memory"),
     used: reading(sample?.usedMib ?? null, "high", "driver_reported_memory"),
     ...(processReading ? { process: processReading } : {}),
+    ...(processSharedReading ? { processShared: processSharedReading } : {}),
   };
 }
 
