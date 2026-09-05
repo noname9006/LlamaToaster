@@ -248,14 +248,32 @@ export default function App() {
             <div>
               <div className="text-sm font-medium text-fg">Allow community benchmark sharing</div>
               <div className="text-xs text-muted">
-                When off, every user's "Contribute to the community benchmark database" toggle in Settings
-                stays greyed out, and the AI assistant's community tools refuse to run.
+                Master switch for the whole feature. When off, the "Community benchmark data" section
+                disappears from every user's Settings page entirely, and the AI assistant's community
+                tools refuse to run.
               </div>
             </div>
             <Toggle
               checked={settings?.communitySharingAllowed ?? false}
               onChange={() => void handleToggleSetting("communitySharingAllowed")}
               disabled={settings === null}
+            />
+          </div>
+          <div className="flex items-center justify-between rounded-lg border border-border px-3 py-2.5">
+            <div>
+              <div className="text-sm font-medium text-fg">Allow users to decide whether to contribute</div>
+              <div className="text-xs text-muted">
+                Each user's own consent flag already defaults to shared. When on, users get a "Contribute
+                to the community benchmark database" toggle in Settings so they can individually opt out
+                (or back in). When off, that toggle is hidden and each user's already-stored preference
+                simply keeps being honored, with no self-service way to change it. Only takes effect while
+                "Allow community benchmark sharing" above is also on.
+              </div>
+            </div>
+            <Toggle
+              checked={settings?.communityUserChoiceAllowed ?? false}
+              onChange={() => void handleToggleSetting("communityUserChoiceAllowed")}
+              disabled={settings === null || !settings?.communitySharingAllowed}
             />
           </div>
           <div className="flex items-center justify-between rounded-lg border border-border px-3 py-2.5">

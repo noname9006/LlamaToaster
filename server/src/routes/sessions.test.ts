@@ -261,6 +261,47 @@ describe("POST /api/auth/share-benchmarks", () => {
     expect(res.status).toBe(200);
     repo.appSettingsRepo.setCommunitySharingAllowed(false); // restore the default for later tests
   });
+
+  it("403s turning it ON while communitySharingAllowed is on but communityUserChoiceAllowed is off -- turning it OFF is still always allowed", async () => {
+    repo.appSettingsRepo.setCommunitySharingAllowed(true);
+    repo.appSettingsRepo.setCommunityUserChoiceAllowed(false);
+    const user = repo.userRepo.upsertByIdentity("github", { providerUserId: "share-route-5", login: "share-route-user-5", avatarUrl: null });
+    const { token } = repo.sessionRepo.create(user.id, { label: "share-no-user-choice" });
+
+    const onRes = await fetch(`${baseUrl}/api/auth/share-benchmarks`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...authed(token) },
+      body: JSON.stringify({ enabled: true }),
+    });
+    expect(onRes.status).toBe(403);
+    expect(repo.userRepo.getUser(user.id)!.shareBenchmarks).toBe(true); // default-on, unchanged by the rejected call
+
+    const offRes = await fetch(`${baseUrl}/api/auth/share-benchmarks`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...authed(token) },
+      body: JSON.stringify({ enabled: false }),
+    });
+    expect(offRes.status).toBe(200);
+
+    // Restore the defaults for later tests.
+    repo.appSettingsRepo.setCommunitySharingAllowed(false);
+    repo.appSettingsRepo.setCommunityUserChoiceAllowed(true);
+  });
+
+  it("allows turning it ON once both communitySharingAllowed and communityUserChoiceAllowed are set", async () => {
+    repo.appSettingsRepo.setCommunitySharingAllowed(true);
+    repo.appSettingsRepo.setCommunityUserChoiceAllowed(true);
+    const user = repo.userRepo.upsertByIdentity("github", { providerUserId: "share-route-6", login: "share-route-user-6", avatarUrl: null });
+    const { token } = repo.sessionRepo.create(user.id, { label: "share-both-allowed" });
+
+    const res = await fetch(`${baseUrl}/api/auth/share-benchmarks`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...authed(token) },
+      body: JSON.stringify({ enabled: true }),
+    });
+    expect(res.status).toBe(200);
+    repo.appSettingsRepo.setCommunitySharingAllowed(false); // restore the default for later tests
+  });
 });
 
 // Security checklist's own "Account deletion ships in v1" item.
