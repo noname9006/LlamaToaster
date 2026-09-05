@@ -449,6 +449,13 @@ interface PhaseSpec {
    * that phase has to move ctx before it can search ngl again.
    */
   pinOther?: number;
+  /**
+   * Marks the "the context axis found nothing at this placement, back the
+   * layers off and try again" phase. The mode after it needs to know the
+   * rescue actually ran, since it re-walks context at whatever placement the
+   * rescue settled on.
+   */
+  isRescue?: boolean;
 }
 
 /**
@@ -499,6 +506,13 @@ interface PhaseSpec {
  *                      layers.
  *  * `custom`       -- no phases; handled directly in nextLadderRung.
  */
+interface PhaseState {
+  /** The phase just before this one produced no successes at all. */
+  lastPhaseAllFailed: boolean;
+  /** A rescue phase has already run in this mode. */
+  rescueRan: boolean;
+}
+
 function phaseSpecFor(
   mode: ProbeMode,
   phaseIndex: number,
@@ -507,7 +521,8 @@ function phaseSpecFor(
   nglMax: number,
   maxCtx: number,
   calculateNgl: (pinnedCtx: number) => number,
-  calculateCtx: (pinnedNgl: number) => number
+  calculateCtx: (pinnedNgl: number) => number,
+  state: PhaseState
 ): PhaseSpec | null {
   const clampNgl = (v: number): number => clamp(Math.round(v), 0, nglMax);
   const clampCtx = (v: number): number => clamp(Math.round(v), PROBE_LADDER_MIN_CTX, maxCtx);
@@ -534,9 +549,58 @@ function phaseSpecFor(
    * even one more layer affords this context, which is the common case after
    * a `fine` refine and used to cost five or six guaranteed failures.
    */
+  /**
+   * "The context axis found nothing at this placement" -- back the layers off
+   * and search again at the cheapest context.
+   *
+   * Without this, a mode whose pinned layer count is unusable at EVERY context
+   * simply reports total failure: confirmed live, a balanced probe seeded at
+   * 41 layers walked 32768 -> 1024 and failed all six loads, never once trying
+   * fewer layers, on a machine that runs the same model happily at 10. That is
+   * the opposite of what "trades context against layers" promises, and it got
+   * much more likely once silent host-backed placements started failing
+   * honestly instead of passing with a warning.
+   *
+   * Shrink-only and pinned at the floor context: the point is to find ANY
+   * workable placement cheaply, after which the mode re-walks context from
+   * there. Jumps straight to the safe-ngl estimate rather than bisecting
+   * toward it, same reasoning as max_gpu's own layer phase.
+   */
+  const rescueLayersPhase = (nglNow: number): PhaseSpec | null => {
+    if (nglNow <= 0) return null;
+    const ceiling = clampNgl(nglNow - 1);
+    const safe = clampNgl(calculateNgl(PROBE_LADDER_MIN_CTX));
+    return {
+      axis: "ngl",
+      pinOther: PROBE_LADDER_MIN_CTX,
+      seed: Math.min(ceiling, safe),
+      growTarget: ceiling,
+      shrinkTarget: 0,
+      searchStyle: "direct",
+      isRescue: true,
+    };
+  };
+
   const growLayersPhase = (ctxNow: number, nglNow: number): PhaseSpec | null => {
-    const grow = bestNglAtContext(nglMax, ctxNow, calculateCtx, nglNow);
-    if (grow <= nglNow) return null;
+    if (nglNow >= nglMax) return null;
+    const estimateSaysGrow = bestNglAtContext(nglMax, ctxNow, calculateCtx, nglNow);
+    // When the estimate says not even one more layer affords this context,
+    // that used to end the mode. It must not, because the condition is
+    // self-inflicted: phase 0 walks context up until a real load FAILS, so a
+    // machine that outperforms the estimate lands on a ctxNow above
+    // calculateCtx(nglNow) by construction -- and then no ngl at all
+    // "affords" it, every time, and the layer axis is never measured. On a
+    // GPU whose driver silently backs overcommitted allocations with system
+    // RAM, the estimate is not what decides placement anyway (measured: the
+    // driver stopped taking weights with 1.9GiB of VRAM still free), so
+    // treating it as a veto over whether to MEASURE is exactly backwards.
+    //
+    // So the estimate now only chooses the target to jump to, never whether
+    // to run at all: its own safe-ngl answer when it has one, and otherwise
+    // a single step up, which costs one load and brackets immediately if it
+    // fails. "direct" jumps straight to the target rather than climbing, so
+    // a hopeless target costs one load, not a staircase of them.
+    const grow = estimateSaysGrow > nglNow ? estimateSaysGrow : Math.min(nglMax, nglNow + 1);
     return { axis: "ngl", seed: nglNow, growTarget: grow, shrinkTarget: nglNow, searchStyle: "direct" };
   };
 
@@ -596,12 +660,19 @@ function phaseSpecFor(
       // pinnedNgl here is ALREADY bestNglForMaxContext's answer -- set once,
       // upstream in nextLadderRung, before any phase runs.
       if (phaseIndex === 0) return ctxPhase(calculateCtx(pinnedNgl));
-      if (phaseIndex === 1) return growLayersPhase(pinnedCtx, pinnedNgl);
+      if (phaseIndex === 1) {
+        return state.lastPhaseAllFailed ? rescueLayersPhase(pinnedNgl) : growLayersPhase(pinnedCtx, pinnedNgl);
+      }
+      // Only after a rescue: re-walk context at the placement it settled on.
+      if (phaseIndex === 2 && state.rescueRan) return ctxPhase(calculateCtx(pinnedNgl));
       return null;
 
     case "balanced":
       if (phaseIndex === 0) return ctxPhase(pinnedCtx);
-      if (phaseIndex === 1) return growLayersPhase(pinnedCtx, pinnedNgl);
+      if (phaseIndex === 1) {
+        return state.lastPhaseAllFailed ? rescueLayersPhase(pinnedNgl) : growLayersPhase(pinnedCtx, pinnedNgl);
+      }
+      if (phaseIndex === 2 && state.rescueRan) return ctxPhase(calculateCtx(pinnedNgl));
       return null;
 
     case "keep_context":
@@ -636,6 +707,15 @@ export interface LadderRung {
 
 export interface LadderAttempt extends LadderRung {
   ok: boolean;
+  /**
+   * This rung failed because its weights were measurably host-backed, rather
+   * than because it did not fit. The distinction matters to the search: a
+   * smaller context cannot fix a placement whose LAYERS are in system RAM, so
+   * a context phase that hits this stops immediately instead of walking the
+   * whole ladder down proving it. Observed live: six loads spent walking
+   * 32768 -> 1024 at 41 layers, every one failing for the same reason.
+   */
+  hostBacked?: boolean;
 }
 
 export interface LadderInput {
@@ -696,10 +776,22 @@ export function nextLadderRung(input: LadderInput): LadderRung | null {
   // way to know which rung belonged to which phase is to re-run the same
   // deterministic decisions and consume history in lockstep.
   let cursor = 0;
+  const state: PhaseState = { lastPhaseAllFailed: false, rescueRan: false };
 
   for (let phaseIdx = 0; ; phaseIdx++) {
-    const spec = phaseSpecFor(input.mode, phaseIdx, pinnedCtx, pinnedNgl, nglMax, maxCtx, input.calculateNgl, input.calculateCtx);
+    const spec = phaseSpecFor(
+      input.mode,
+      phaseIdx,
+      pinnedCtx,
+      pinnedNgl,
+      nglMax,
+      maxCtx,
+      input.calculateNgl,
+      input.calculateCtx,
+      state
+    );
     if (!spec) break;
+    if (spec.isRescue) state.rescueRan = true;
     // A phase that re-pins the other axis (max_gpu's back-off) must do so
     // BEFORE its first rung is built, and the new pin has to persist into
     // the phases after it -- phase 3 re-walks the ctx ladder at exactly the
@@ -726,10 +818,13 @@ export function nextLadderRung(input: LadderInput): LadderRung | null {
       // spending a real model load re-proving it.
       const prior = input.history.slice(0, cursor).find((h) => h.ctx === rung.ctx && h.ngl === rung.ngl);
       let ok: boolean;
+      let hostBacked = false;
       if (prior) {
         ok = prior.ok;
+        hostBacked = prior.hostBacked === true;
       } else if (cursor < input.history.length) {
         ok = input.history[cursor].ok;
+        hostBacked = input.history[cursor].hostBacked === true;
         cursor++;
       } else {
         if (cursor >= maxLoads) return null; // out of budget entirely
@@ -742,6 +837,12 @@ export function nextLadderRung(input: LadderInput): LadderRung | null {
         else pinnedNgl = candidate;
       }
 
+      // A context phase cannot fix a host-backed PLACEMENT: the layers are in
+      // system RAM regardless of how small the context gets. Stop the walk on
+      // the first such failure and let the next phase move the other axis --
+      // this is the difference between one wasted load and six.
+      if (spec.axis === "ctx" && !ok && hostBacked) break;
+
       candidate =
         spec.searchStyle === "slider_refine"
           ? nextSliderRefineCandidate({ history: outcomes, stops: stops!, granularity: input.granularity, min, max })
@@ -750,8 +851,15 @@ export function nextLadderRung(input: LadderInput): LadderRung | null {
           : nextAnchoredCandidate({ history: outcomes, growTarget: spec.growTarget, shrinkTarget: spec.shrinkTarget, min, max, tolerance });
     }
 
-    // Nothing on this axis fit at all -- a later phase cannot rescue that.
-    if (outcomes.length > 0 && !outcomes.some((o) => o.ok)) return null;
+    // Nothing on this axis fit at all. On the NGL axis that is terminal --
+    // the search already went as low as 0 layers. On the CTX axis it is not:
+    // a later phase moving the other axis genuinely can rescue it, and
+    // treating it as terminal is what made a balanced probe give up after six
+    // failures without ever trying fewer layers. The mode decides, via
+    // PhaseState.lastPhaseAllFailed; if it offers no rescue, the loop ends at
+    // the next phaseSpecFor returning null anyway.
+    state.lastPhaseAllFailed = outcomes.length > 0 && !outcomes.some((o) => o.ok);
+    if (state.lastPhaseAllFailed && spec.axis === "ngl") return null;
   }
   return null;
 }

@@ -335,6 +335,84 @@ describe("N2 probe success rule", () => {
     expect(result.ok).toBe(true);
   });
 
+  // The measured signal, from the calibration sweep's own numbers: at ngl 26
+  // this machine reported 7647MiB of llama-server's GPU memory backed by
+  // system RAM while only 3736MiB was really in VRAM. Note the whole-adapter
+  // peak (5872MiB, which is what the old check compared against) put this
+  // rung at 0.507 of its estimate -- just over the 0.5 ratio, so it PASSED,
+  // and the probe went on to report it as the machine's best configuration.
+  // It generated 3.54 tok/s; ngl 10 on the same box generated 12.05.
+  it("flags a measured host-backed fallback that the whole-adapter ratio check passed", () => {
+    const result = probeSucceeded({
+      oom: false,
+      vramPeakMib: 5872,
+      gpuTotalMib: 8176,
+      genTps: 3.54,
+      ngl: 26,
+      estimatedVramMib: 11577,
+      vramProcessPeakMib: 3736,
+      sharedPeakMib: 7647,
+      perLayerMib: 17205 / 41,
+      priorSameCtx: [{ ngl: 10, sharedPeakMib: 1279, dedicatedPeakMib: 3610 }],
+    });
+    expect(result.vramDiscrepancy).toBe(true);
+    expect(result.hostBacked).toMatchObject({ hostBacked: true, method: "slope" });
+    expect(result.hostBacked.spilledLayers).toBeGreaterThan(10);
+    // Detection only -- the warn/retry/fail decision stays with the policy.
+    expect(result.ok).toBe(true);
+  });
+
+  // The false positive the measured signal exists to prevent: 4 layers at a
+  // 131072-token context. Dedicated VRAM came in below the estimate (2393 vs
+  // ~3082MiB), so an inference from the estimate alone would convict it --
+  // but only 810MiB was system-RAM-backed, which is the same flat overhead
+  // band every clean rung showed. It ran at 11.38 tok/s, among the fastest
+  // configurations measured on this machine.
+  it("does NOT flag a merely-pessimistic estimate when nothing is measurably in system RAM", () => {
+    const result = probeSucceeded({
+      oom: false,
+      vramPeakMib: 4793,
+      gpuTotalMib: 8176,
+      genTps: 11.38,
+      ngl: 4,
+      estimatedVramMib: 3082,
+      vramProcessPeakMib: 2393,
+      sharedPeakMib: 810,
+      perLayerMib: 17205 / 41,
+      // Same context, fewer layers -- the reference the slope needs.
+      priorSameCtx: [{ ngl: 2, sharedPeakMib: 806, dedicatedPeakMib: 1200 }],
+    });
+    expect(result.vramDiscrepancy).toBe(false);
+    expect(result.ok).toBe(true);
+  });
+
+  // Same rung, same numbers, on a platform with no shared-memory counter
+  // (CUDA-on-Linux, Metal): the inference is all there is, so it still runs.
+  it("falls back to the estimate inference when no shared-memory counter exists", () => {
+    const result = probeSucceeded({
+      oom: false,
+      vramPeakMib: 5872,
+      gpuTotalMib: 8176,
+      genTps: 3.54,
+      ngl: 26,
+      estimatedVramMib: 11577,
+      vramProcessPeakMib: 3736,
+      sharedPeakMib: null,
+      perLayerMib: 17205 / 41,
+    });
+    expect(result.vramDiscrepancy).toBe(true);
+    expect(result.hostBacked.method).toBeNull();
+  });
+
+  // The per-process half of the fix, in isolation: 3736/11577 = 0.32 (flagged)
+  // vs the whole-adapter 5872/11577 = 0.507 (not flagged). The difference is
+  // the ~2100MiB the desktop was holding on the same GPU.
+  it("measures the ratio against this process's VRAM, not every process on the adapter", () => {
+    const shared = { oom: false, gpuTotalMib: 8176, genTps: 3.54, ngl: 26, estimatedVramMib: 11577, sharedPeakMib: null };
+    expect(probeSucceeded({ ...shared, vramPeakMib: 5872, vramProcessPeakMib: 3736 }).vramDiscrepancy).toBe(true);
+    expect(probeSucceeded({ ...shared, vramPeakMib: 5872, vramProcessPeakMib: null }).vramDiscrepancy).toBe(false);
+  });
+
   it("does not flag a discrepancy when ngl is 0 (nothing was requested on GPU)", () => {
     const result = probeSucceeded({
       oom: false,

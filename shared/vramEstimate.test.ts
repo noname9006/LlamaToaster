@@ -4,6 +4,10 @@ import {
   estimateResidentGpuLayersFromBufferSizes,
   estimateSafeNgl,
   estimateVramNeededMib,
+  detectHostBackedFallback,
+  HOST_BACKED_BOOTSTRAP_FRAC,
+  isPrefillCliff,
+  HOST_BACKED_SLOPE_RATIO,
   isVramDiscrepancy,
   placeWeightBytes,
   VRAM_ESTIMATE_FIXED_OVERHEAD_MIB,
@@ -343,5 +347,219 @@ describe("estimateSafeNgl with a real tensorBreakdown", () => {
     const safe = estimateSafeNgl(2000, 4, (1100 + VRAM_ESTIMATE_FIXED_OVERHEAD_MIB * BYTES_PER_MIB) / BYTES_PER_MIB, breakdown);
     const { gpuBytes } = placeWeightBytes(breakdown, 3, safe);
     expect(gpuBytes).toBeLessThanOrEqual(1100);
+  });
+});
+
+// Every number below is a REAL measurement from a 19-load calibration sweep on
+// an AMD Radeon RX 6600 XT (8176MiB) running llama.cpp b10819 (Vulkan) with
+// Qwen3.6-35B-A3B-UD-IQ4_NL -- 17205MiB across 41 layers, so ~420MiB/layer
+// straight from the file. dedicated/shared are what Windows' per-process WDDM
+// counters reported during generation:
+//
+//   ngl    0    2    4    6    8   10   12   14   18    26    41
+//   ded  277 1136 2014 2822 3442 3610 3434 3584 3543  3736  4069
+//   shr   28  427  427  427  639 1279 2270 2928 4594  7647 13258
+//   tps 8.92 10.5 11.3 11.6 11.9 12.1 10.9 10.4 9.25  3.54  6.87
+describe("detectHostBackedFallback", () => {
+  const PER_LAYER_MIB = 17205 / 41;
+  const SWEEP: Record<number, { ded: number; shr: number }> = {
+    0: { ded: 277, shr: 28 }, 2: { ded: 1136, shr: 427 }, 4: { ded: 2014, shr: 427 },
+    6: { ded: 2822, shr: 427 }, 8: { ded: 3442, shr: 639 }, 10: { ded: 3610, shr: 1279 },
+    12: { ded: 3434, shr: 2270 }, 14: { ded: 3584, shr: 2928 }, 18: { ded: 3543, shr: 4594 },
+    26: { ded: 3736, shr: 7647 }, 41: { ded: 4069, shr: 13258 },
+  };
+  const sample = (ngl: number) => ({ ngl, sharedPeakMib: SWEEP[ngl].shr, dedicatedPeakMib: SWEEP[ngl].ded });
+  const between = (lower: number, upper: number) =>
+    detectHostBackedFallback({ rung: sample(upper), priorSameCtx: [sample(lower)], perLayerMib: PER_LAYER_MIB });
+
+  // The whole basis of the method: overhead does not move with ngl, spilled
+  // weights move with it one-for-one. Measured, the two regimes do not
+  // overlap -- clean intervals 0.00-0.25, spilling ones 0.76-1.18.
+  it.each([[2, 4], [4, 6], [6, 8]])("reads a clean interval %i->%i as a flat slope", (lo, hi) => {
+    const v = between(lo, hi);
+    expect(v.method).toBe("slope");
+    expect(v.slopeRatio!).toBeLessThan(HOST_BACKED_SLOPE_RATIO);
+    expect(v.hostBacked).toBe(false);
+  });
+
+  it.each([[8, 10], [10, 12], [12, 14], [14, 18], [18, 26], [26, 41]])(
+    "reads a spilling interval %i->%i as ~one layer per layer",
+    (lo, hi) => {
+      const v = between(lo, hi);
+      expect(v.slopeRatio!).toBeGreaterThan(HOST_BACKED_SLOPE_RATIO);
+      expect(v.hostBacked).toBe(true);
+    }
+  );
+
+  // ngl 0 -> 2 measures 0.47: the GPU compute buffers appearing the moment any
+  // layer lands on the device. A one-off step, not a slope -- which is why a
+  // zero-layer rung is never allowed to be the reference.
+  it("never uses a zero-layer rung as the reference", () => {
+    const v = detectHostBackedFallback({
+      rung: sample(2), priorSameCtx: [sample(0)], perLayerMib: PER_LAYER_MIB, estimatedGpuMib: 1514,
+    });
+    expect(v.method).toBe("ratio");
+  });
+
+  it("attributes the growth above the reference, in layers", () => {
+    // 26 vs 14: 4719MiB more system RAM for 12 more layers -> ~11 layers' worth.
+    expect(between(14, 26).spilledLayers).toBe(11);
+  });
+
+  it("prefers the CLOSEST lower rung, so the slope stays local", () => {
+    const v = detectHostBackedFallback({
+      rung: sample(12),
+      priorSameCtx: [sample(2), sample(10), sample(4)],
+      perLayerMib: PER_LAYER_MIB,
+    });
+    // Against ngl 10 (the closest), not ngl 2: (2270-1279)/2/420 = 1.18.
+    expect(v.slopeRatio!).toBeCloseTo(1.18, 1);
+  });
+
+  // A reference that is itself already spilling flattens the apparent slope.
+  // That loses detections; it never invents them -- the safe direction, since
+  // the ladder keeps searching rather than failing a placement that works.
+  it("under-detects rather than over-detects when the reference is itself dirty", () => {
+    expect(between(12, 14).hostBacked).toBe(true);
+  });
+
+  // Adjacent rungs are refused as references: at 1-layer resolution the two
+  // regimes overlap outright (clean reaching +1.05, spilling dipping to +0.38)
+  // because the driver's ~224MiB allocation granule is half a layer here.
+  // These are real adjacent pairs from the 1-layer sweep -- both would be
+  // misclassified if a span of 1 were allowed.
+  it.each([
+    ["a clean pair that reads as a steep slope", 6, 452, 7, 894],
+    ["a spilling pair that reads as flat", 12, 1925, 13, 2083],
+  ])("refuses an adjacent reference: %s", (_label, lowNgl, lowShr, hiNgl, hiShr) => {
+    const v = detectHostBackedFallback({
+      rung: { ngl: hiNgl, sharedPeakMib: hiShr, dedicatedPeakMib: 3900 },
+      priorSameCtx: [{ ngl: lowNgl, sharedPeakMib: lowShr, dedicatedPeakMib: 3800 }],
+      perLayerMib: PER_LAYER_MIB,
+    });
+    expect(v.method).not.toBe("slope");
+  });
+
+  it("reaches past an adjacent rung to a wide-enough one", () => {
+    // ngl 11 against ngl 9 (span 2) rather than ngl 10 (span 1):
+    // (1565-786)/2/420 = 0.93 -> correctly spilling. Against ngl 10 alone the
+    // single-layer delta would read 1.51, right verdict for the wrong reason;
+    // the pair below it (12 vs 11) would read 0.86 and 13 vs 12 only 0.38.
+    const v = detectHostBackedFallback({
+      rung: { ngl: 11, sharedPeakMib: 1565, dedicatedPeakMib: 3790 },
+      priorSameCtx: [
+        { ngl: 9, sharedPeakMib: 786, dedicatedPeakMib: 3865 },
+        { ngl: 10, sharedPeakMib: 931, dedicatedPeakMib: 4015 },
+      ],
+      perLayerMib: PER_LAYER_MIB,
+    });
+    expect(v.method).toBe("slope");
+    expect(v.slopeRatio!).toBeCloseTo(0.93, 2);
+    expect(v.hostBacked).toBe(true);
+  });
+
+  describe("single-rung bootstrap", () => {
+    // computeDualPoolFit's own figures for this model at ctx 1024.
+    const EST = (ngl: number) => Math.round(706 + 404 * ngl);
+    const alone = (ngl: number) =>
+      detectHostBackedFallback({
+        rung: sample(ngl), priorSameCtx: [], perLayerMib: PER_LAYER_MIB, estimatedGpuMib: EST(ngl),
+      });
+
+    it.each([12, 14, 18, 26, 41])("convicts ngl %i with no reference to slope against", (ngl) => {
+      expect(alone(ngl)).toMatchObject({ hostBacked: true, method: "ratio" });
+    });
+
+    it.each([2, 4, 6, 8, 10])("stays silent at ngl %i with no reference", (ngl) => {
+      expect(alone(ngl).hostBacked).toBe(false);
+    });
+
+    // max_gpu opens at every layer, so this is the rung the bootstrap must
+    // catch for the search to start bracketing in the right place at all.
+    it("convicts max_gpu's opening rung", () => {
+      expect(alone(41)).toMatchObject({ hostBacked: true, method: "ratio" });
+    });
+
+    // The anchoring failure this threshold exists to prevent: the estimate's
+    // safe-ngl landing point on this machine is ~13, already spilling four
+    // layers. Passing it would anchor every later slope on a dirty reference.
+    it("convicts the estimate's own landing point, which is already spilling", () => {
+      expect(
+        detectHostBackedFallback({
+          rung: { ngl: 13, sharedPeakMib: 2599, dedicatedPeakMib: 3509 },
+          priorSameCtx: [], perLayerMib: PER_LAYER_MIB, estimatedGpuMib: EST(13),
+        }).hostBacked
+      ).toBe(true);
+    });
+
+    // ...while a large context, whose KV legitimately lands partly in system
+    // RAM, stays clean -- which is why the denominator is the full predicted
+    // footprint and not the weights alone.
+    it("leaves a 131072-token context at 4 layers alone", () => {
+      expect(
+        detectHostBackedFallback({
+          rung: { ngl: 4, sharedPeakMib: 810, dedicatedPeakMib: 2393 },
+          priorSameCtx: [], perLayerMib: PER_LAYER_MIB, estimatedGpuMib: 3276,
+        }).hostBacked
+      ).toBe(false);
+    });
+
+    it("is unavailable with no estimate to judge against", () => {
+      expect(
+        detectHostBackedFallback({ rung: sample(41), priorSameCtx: [], perLayerMib: PER_LAYER_MIB }).method
+      ).toBeNull();
+    });
+  });
+
+  it("is unavailable -- never 'clean' -- with no shared-memory counter", () => {
+    expect(
+      detectHostBackedFallback({
+        rung: { ngl: 26, sharedPeakMib: null, dedicatedPeakMib: 3736 },
+        priorSameCtx: [sample(10)],
+        perLayerMib: PER_LAYER_MIB,
+      })
+    ).toEqual({ hostBacked: false, method: null, slopeRatio: null, spilledLayers: null });
+  });
+
+  it("falls back to the bootstrap when the per-layer size is unknown", () => {
+    const v = detectHostBackedFallback({
+      rung: sample(26), priorSameCtx: [sample(10)], perLayerMib: null, estimatedGpuMib: 11213,
+    });
+    expect(v.method).toBe("ratio");
+    expect(v.hostBacked).toBe(true);
+  });
+
+  it("never judges a rung that asked for nothing on the GPU", () => {
+    expect(detectHostBackedFallback({ rung: sample(0), priorSameCtx: [], perLayerMib: PER_LAYER_MIB }).method).toBeNull();
+  });
+});
+
+// Prefill's own cliff, from the same 1-layer sweep. It sits THREE layers below
+// the weights knee and is a far larger signal -- a 3.9x step, against the
+// weights slope's 0.31-vs-0.62.
+describe("isPrefillCliff", () => {
+  const BEST_CLEAN = 69.2; // ngl 6, the best prompt rate measured
+
+  it("fires on the measured collapse at ngl 7", () => {
+    expect(isPrefillCliff(17.7, BEST_CLEAN)).toBe(true);
+  });
+
+  it("keeps firing where generation looks its best", () => {
+    // ngl 10 is the FASTEST rung by gen tok/s (13.10) and still has prefill
+    // ruined at 18.9 t/s -- the case that makes this worth reporting
+    // separately rather than folding into one verdict.
+    expect(isPrefillCliff(18.9, BEST_CLEAN)).toBe(true);
+  });
+
+  it.each([58.8, 63.1, 65.6, 67.1, 69.2])("leaves a healthy rate (%s t/s) alone", (pp) => {
+    expect(isPrefillCliff(pp, BEST_CLEAN)).toBe(false);
+  });
+
+  it("cannot fire before a clean reference exists", () => {
+    expect(isPrefillCliff(17.7, null)).toBe(false);
+  });
+
+  it("says nothing when this rung has no prompt timing", () => {
+    expect(isPrefillCliff(null, BEST_CLEAN)).toBe(false);
   });
 });

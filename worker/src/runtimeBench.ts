@@ -11,7 +11,12 @@ import { spawn, type ChildProcess } from "node:child_process";
 import type { IngestResultInput } from "../../shared/types.js";
 import { CURVE_METHOD_VERSION, SERVER_METHOD_VERSION, type CaveatFlag } from "../../shared/types.js";
 import type { SweepItem } from "../../shared/sweep.js";
-import { isVramDiscrepancy } from "../../shared/vramEstimate.js";
+import {
+  detectHostBackedFallback,
+  isVramDiscrepancy,
+  type HostBackedFallbackVerdict,
+  type HostBackedRungSample,
+} from "../../shared/vramEstimate.js";
 import {
   appendBoundedOutput,
   collapseTensorLoadSpam,
@@ -705,6 +710,30 @@ export interface ProbeAttemptOutcome {
    * loop turns it into a warn/retry/fail outcome per vramDiscrepancyPolicy,
    * same policy the sweep path already applies. */
   vramDiscrepancy?: boolean;
+  /** detectHostBackedFallback's own figures, when this platform HAS a
+   * system-RAM-backed-GPU-memory counter: which evidence decided ("slope"
+   * against a comparable lower-ngl rung, or the single-rung "ratio"
+   * bootstrap), the measured layers-of-system-RAM per layer added, and how
+   * many of this rung's layers that accounts for. Null/absent when the check
+   * couldn't run -- which is also how a caller tells a MEASURED
+   * vramDiscrepancy (hostBackedMethod is set) from an INFERRED one
+   * (it is null and isVramDiscrepancy fired). */
+  hostBackedMethod?: "slope" | "ratio" | null;
+  hostBackedSlopeRatio?: number | null;
+  hostBackedSpilledLayers?: number | null;
+  /** Prompt-processing rate for this rung, from llama-server's own
+   * timings.prompt_n / prompt_ms. Reported per rung because prefill has its
+   * OWN placement cliff, several layers below the weights one -- see
+   * PREFILL_CLIFF_RATIO. */
+  ppTps?: number | null;
+  /** Time to first streamed token, measured client-side from request send.
+   * The user-visible face of the prefill cliff: it jumped 2.6s -> 10.1s across
+   * a single layer on the reference machine. */
+  ttftMs?: number | null;
+  /** Set when ppTps collapsed against the best clean rung in this run
+   * (isPrefillCliff). Never flips `ok`: the placement works, it is just a bad
+   * trade for a prompt-heavy workload. */
+  prefillCliff?: boolean;
   /** How many of `ngl`'s claimed layers actually landed in a GPU buffer,
    * per worker/src/index.ts's computeResidentLayers -- the same claimed-vs-
    * landed check the sweep path already surfaces as ResultRow's
@@ -744,10 +773,27 @@ export const PROBE_GEN_TOKENS = 256;
 // already uses), the same separation of "detect" from "decide" that path
 // keeps. Unlike the sweep path, there's no llama.cpp post-allocation
 // buffer-size report available here (that parsing is llama-bench-log-specific,
-// see bench.ts's parseModelBufferSizes) -- the vram_peak-vs-estimate signal is
-// the only one a probe has, so the ladder loop treats it as sufficient on its
-// own to trigger the policy's harder actions, not gated behind the sweep
-// path's stricter "exactly 0 bytes resident" bar.
+// see bench.ts's parseModelBufferSizes), so the ladder loop treats a
+// discrepancy as sufficient on its own to trigger the policy's harder
+// actions, not gated behind the sweep path's stricter "exactly 0 bytes
+// resident" bar.
+//
+// Two signals feed that one flag, in strict preference order:
+//
+//  1. detectHostBackedFallback -- the OS's own per-process counter for
+//     system-RAM-backed GPU memory. A MEASUREMENT of where the weights went.
+//     Whenever it is available, it decides, and #2 is not consulted: an
+//     inference is strictly worse evidence than a reading of the same fact.
+//  2. isVramDiscrepancy -- the pre-existing needed-vs-observed inference, for
+//     platforms with no such counter (CUDA-on-Linux, Metal). Now fed the
+//     PER-PROCESS VRAM peak rather than the whole-adapter one, which was
+//     crediting a single model's offload with every other process's VRAM and
+//     biasing the check toward "no fallback" by however much the desktop
+//     happened to be using.
+//
+// The practical effect of #1 is that a merely-pessimistic ESTIMATE can no
+// longer fail a rung: with no measured system-RAM backing, there is nothing
+// to corroborate the shortfall and the rung stands.
 export function probeSucceeded(input: {
   oom: boolean;
   vramPeakMib: number | null;
@@ -759,27 +805,90 @@ export function probeSucceeded(input: {
   // compare against).
   ngl: number;
   estimatedVramMib: number | null;
-}): { ok: boolean; spill: boolean; vramDiscrepancy: boolean; reason: string | null } {
-  if (input.oom) return { ok: false, spill: false, vramDiscrepancy: false, reason: "out of memory at this context" };
+  // MEASURED, per-process, both from MemorySampler: this load's own dedicated
+  // VRAM peak and its own system-RAM-backed GPU allocation peak. The former
+  // is what the ratio check below is supposed to compare against -- vramPeakMib
+  // is WHOLE-ADAPTER (every process on the GPU combined, see its own doc
+  // comment), so measuring one model's weights against it silently credits
+  // the rung with the desktop's VRAM and biases the check toward "no
+  // fallback". Null when the platform/backend never attributed a reading to
+  // this pid (see ProbeAttemptOutcome.vramProcessPeakMib).
+  vramProcessPeakMib?: number | null;
+  sharedPeakMib?: number | null;
+  // The model file's own size divided by its layer count -- see
+  // HostBackedFallbackInput.perLayerMib for why this is a fact from disk
+  // rather than an estimate.
+  perLayerMib?: number | null;
+  // Rungs already measured in this run at THIS SAME context, which is what
+  // lets the host-backed check use a slope instead of a level. Empty (or
+  // absent) simply falls back to its single-rung bootstrap.
+  priorSameCtx?: HostBackedRungSample[];
+}): {
+  ok: boolean;
+  spill: boolean;
+  vramDiscrepancy: boolean;
+  hostBacked: HostBackedFallbackVerdict;
+  reason: string | null;
+} {
+  const noFallback: HostBackedFallbackVerdict = {
+    hostBacked: false,
+    method: null,
+    slopeRatio: null,
+    spilledLayers: null,
+  };
+  if (input.oom) {
+    return { ok: false, spill: false, vramDiscrepancy: false, hostBacked: noFallback, reason: "out of memory at this context" };
+  }
+  // Still the whole-adapter reading, and deliberately so: "spilled past the
+  // adapter's VRAM total" is a statement about the DEVICE, not about this
+  // process's share of it.
   const spill =
     input.vramPeakMib != null && input.gpuTotalMib != null && input.vramPeakMib > input.gpuTotalMib;
   if (spill) {
-    return { ok: false, spill: true, vramDiscrepancy: false, reason: "the allocation spilled past this adapter's VRAM total" };
+    return {
+      ok: false,
+      spill: true,
+      vramDiscrepancy: false,
+      hostBacked: noFallback,
+      reason: "the allocation spilled past this adapter's VRAM total",
+    };
   }
+  // The direct measurement first: when the OS can tell us how much system RAM
+  // is backing this process's GPU memory, an inference from the estimate is
+  // strictly worse evidence and is not consulted at all.
+  const hostBacked =
+    input.ngl > 0
+      ? detectHostBackedFallback({
+          rung: {
+            ngl: input.ngl,
+            sharedPeakMib: input.sharedPeakMib ?? null,
+            dedicatedPeakMib: input.vramProcessPeakMib ?? null,
+          },
+          priorSameCtx: input.priorSameCtx ?? [],
+          perLayerMib: input.perLayerMib ?? null,
+          estimatedGpuMib: input.estimatedVramMib,
+        })
+      : noFallback;
+  // Per-process where available -- whole-adapter only as a last resort, since
+  // that reading includes every other process on the GPU.
+  const observedMib = input.vramProcessPeakMib ?? input.vramPeakMib;
   const vramDiscrepancy =
-    input.ngl > 0 &&
-    input.estimatedVramMib != null &&
-    input.vramPeakMib != null &&
-    isVramDiscrepancy(input.estimatedVramMib, input.vramPeakMib);
+    hostBacked.hostBacked ||
+    (hostBacked.method == null &&
+      input.ngl > 0 &&
+      input.estimatedVramMib != null &&
+      observedMib != null &&
+      isVramDiscrepancy(input.estimatedVramMib, observedMib));
   if (input.genTps == null || input.genTps < PROBE_MIN_GEN_TPS) {
     return {
       ok: false,
       spill: false,
       vramDiscrepancy,
+      hostBacked,
       reason: `generation ran at ${input.genTps == null ? "an unmeasurable rate" : `${input.genTps.toFixed(2)} tok/s`}, below the ${PROBE_MIN_GEN_TPS} tok/s floor -- loading is not the same as usable`,
     };
   }
-  return { ok: true, spill: false, vramDiscrepancy, reason: null };
+  return { ok: true, spill: false, vramDiscrepancy, hostBacked, reason: null };
 }
 
 // Shared BenchResult shaping so both runtime paths report through

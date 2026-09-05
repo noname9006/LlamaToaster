@@ -750,3 +750,118 @@ describe("bestLadderResult", () => {
     expect(best).toEqual({ ctx: 16_384, ngl: 27, ok: true });
   });
 });
+
+// Regression: max_context used to stop after resolving context, never testing
+// a single GPU layer. Reproduced with this machine's real estimator shape,
+// where affordable context decreases monotonically in ngl -- so
+// bestNglForMaxContext pins ngl 0, the context walk reaches the trained
+// ceiling, and bestNglAtContext(thatCeiling) then answers 0 for every layer
+// count. The mode measured exactly one placement and reported it.
+describe("max_context grows layers even when the estimate says nothing fits", () => {
+  const NGL_MAX = 41;
+  const MAXCTX = 262144;
+  // Monotonically decreasing, and 0 above ngl 12 -- i.e. the estimate insists
+  // no offload can hold a large context.
+  const calculateCtx = (ngl: number) => (ngl >= 12 ? 1024 : Math.max(1024, 72192 - ngl * 5400));
+
+  function walk(): { ctx: number; ngl: number; ok: boolean }[] {
+    const history: { ctx: number; ngl: number; ok: boolean }[] = [];
+    for (let i = 0; i < 24; i++) {
+      const rung = nextLadderRung({
+        mode: "max_context",
+        granularity: "basic",
+        candidateCtx: 4096,
+        candidateNgl: 20,
+        nglMax: NGL_MAX,
+        maxCtx: MAXCTX,
+        history,
+        calculateNgl: () => 6,
+        calculateCtx,
+      });
+      if (!rung) break;
+      // Context succeeds everywhere; layers fail above 10, which is the shape
+      // the reference machine actually has.
+      history.push({ ...rung, ok: rung.ngl <= 10 });
+    }
+    return history;
+  }
+
+  it("measures more than one layer count", () => {
+    const tried = new Set(walk().map((h) => h.ngl));
+    expect(tried.size).toBeGreaterThan(1);
+  });
+
+  it("finds a real offload rather than reporting ngl 0", () => {
+    const history = walk();
+    const best = history.filter((h) => h.ok).reduce((a, b) => (b.ctx > a.ctx || (b.ctx === a.ctx && b.ngl > a.ngl) ? b : a));
+    expect(best.ngl).toBeGreaterThan(0);
+    expect(best.ctx).toBe(MAXCTX);
+  });
+
+  it("still ends when there is nowhere left to grow", () => {
+    const history: { ctx: number; ngl: number; ok: boolean }[] = [];
+    for (let i = 0; i < 40; i++) {
+      const rung = nextLadderRung({
+        mode: "max_context", granularity: "basic", candidateCtx: 4096, candidateNgl: 20,
+        nglMax: NGL_MAX, maxCtx: MAXCTX, history, calculateNgl: () => 6, calculateCtx,
+      });
+      if (!rung) break;
+      history.push({ ...rung, ok: rung.ngl <= 10 });
+    }
+    expect(history.length).toBeLessThanOrEqual(24);
+  });
+});
+
+// Regression, reproduced from a real production run (probe dbe15026, worker
+// log 2026-09-05T17:27): balanced seeded at the user's own 41 layers, on a
+// machine where 41 layers is a silent host-backed placement at EVERY context.
+// The context phase walked 32768 -> 1024, failed all six loads, and the ladder
+// reported total failure -- never once trying fewer layers, on a box that runs
+// the same model at 10 layers.
+describe("balanced rescues itself when its pinned placement never fits", () => {
+  const NGL_MAX = 41;
+  const MAXCTX = 262144;
+  const calculateCtx = (ngl: number) => (ngl >= 12 ? 1024 : Math.max(1024, 72192 - ngl * 5400));
+
+  function walk(opts: { hostBacked: boolean }): { ctx: number; ngl: number; ok: boolean; hostBacked?: boolean }[] {
+    const history: { ctx: number; ngl: number; ok: boolean; hostBacked?: boolean }[] = [];
+    for (let i = 0; i < 24; i++) {
+      const rung = nextLadderRung({
+        mode: "balanced", granularity: "basic", candidateCtx: 32768, candidateNgl: NGL_MAX,
+        nglMax: NGL_MAX, maxCtx: MAXCTX, history, calculateNgl: () => 6, calculateCtx,
+      });
+      if (!rung) break;
+      const ok = rung.ngl <= 10;
+      history.push({ ...rung, ok, hostBacked: opts.hostBacked ? !ok : undefined });
+    }
+    return history;
+  }
+
+  it("finds a working placement instead of giving up", () => {
+    const history = walk({ hostBacked: true });
+    expect(history.some((h) => h.ok)).toBe(true);
+    const best = history.filter((h) => h.ok).reduce((a, b) => (b.ctx > a.ctx || (b.ctx === a.ctx && b.ngl > a.ngl) ? b : a));
+    expect(best.ngl).toBe(10);
+    expect(best.ctx).toBe(MAXCTX);
+  });
+
+  it("stops walking context down once a failure is known to be host-backed", () => {
+    // The layers are in system RAM; a smaller context cannot change that, so
+    // the context phase must not spend the whole ladder proving it.
+    const atSeedNgl = walk({ hostBacked: true }).filter((h) => h.ngl === NGL_MAX);
+    expect(atSeedNgl).toHaveLength(1);
+  });
+
+  it("still walks the context ladder when the failure reason is unknown", () => {
+    // A worker that reports no reason (older build, or a genuine capacity
+    // failure) keeps the original behaviour -- context really might be the
+    // problem, so it is still worth walking down.
+    const atSeedNgl = walk({ hostBacked: false }).filter((h) => h.ngl === NGL_MAX);
+    expect(atSeedNgl.length).toBeGreaterThan(1);
+  });
+
+  it("recovers even without the reason, just more expensively", () => {
+    const history = walk({ hostBacked: false });
+    expect(history.some((h) => h.ok)).toBe(true);
+  });
+});

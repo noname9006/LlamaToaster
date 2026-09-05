@@ -345,6 +345,15 @@ const COLUMN_MIGRATIONS: ColumnSpec[] = [
   // reading.
   { table: "probe_attempts", column: "vram_process_peak_mib", ddlType: "REAL" },
   { table: "probe_attempts", column: "ram_total_peak_mib", ddlType: "REAL" },
+  // Prefill has its own placement cliff, several layers below the weights
+  // one, so pp/ttft are per-rung facts rather than derivable from gen_tps.
+  { table: "probe_attempts", column: "pp_tps", ddlType: "REAL" },
+  { table: "probe_attempts", column: "ttft_ms", ddlType: "REAL" },
+  { table: "probe_attempts", column: "prefill_cliff", ddlType: "INTEGER" },
+  // detectHostBackedFallback's own evidence: which test decided, and the
+  // measured layers-of-system-RAM per layer added.
+  { table: "probe_attempts", column: "host_backed_method", ddlType: "TEXT" },
+  { table: "probe_attempts", column: "host_backed_slope", ddlType: "REAL" },
 ];
 
 function applyColumnMigrations(database: Database.Database): void {

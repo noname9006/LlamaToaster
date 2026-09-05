@@ -1697,6 +1697,22 @@ export interface ProbeAttemptReport {
   // (not a measured 0), including every worker predating this reading.
   vram_shared_peak_mib?: number | null;
   gen_tps?: number | null;
+  // Prompt-processing rate and time-to-first-token for this rung. Prefill has
+  // a SEPARATE, earlier placement cliff than generation (measured: pp fell
+  // 69.2 -> 17.7 t/s and ttft rose 2583 -> 10056 ms across one layer, while
+  // gen tok/s kept improving for three more), so neither is derivable from
+  // gen_tps and both are recorded per rung.
+  pp_tps?: number | null;
+  ttft_ms?: number | null;
+  // Set when pp_tps collapsed against the best non-host-backed rung in the
+  // same run (shared/vramEstimate.ts's isPrefillCliff). Reported, never
+  // failed: the placement works, it is just a poor trade for prompt-heavy use.
+  prefill_cliff?: boolean;
+  // Which evidence decided vram_discrepancy -- "slope" against a comparable
+  // lower-ngl rung, "ratio" for the single-rung bootstrap -- and the measured
+  // slope itself, in layers of system RAM per layer added.
+  host_backed_method?: "slope" | "ratio" | null;
+  host_backed_slope?: number | null;
   // What computeDualPoolFit PREDICTED this rung would need, and what the
   // machine actually had free just before the load -- the predicted-vs-real
   // pair that until now only ever reached a log line.

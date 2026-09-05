@@ -3424,8 +3424,9 @@ export const repo = {
               ok, oom, spill, vram_needed_mib, vram_free_mib, vram_peak_mib,
               ram_needed_mib, ram_free_mib, ram_peak_mib, vram_process_peak_mib, ram_total_peak_mib,
               vram_shared_peak_mib, gen_tps, error, created_at,
-              reused_from_run_id, vram_discrepancy, gpu_layers_resident_est, gpu_layers_resident_exact)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+              reused_from_run_id, vram_discrepancy, gpu_layers_resident_est, gpu_layers_resident_exact,
+              pp_tps, ttft_ms, prefill_cliff, host_backed_method, host_backed_slope)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         );
         input.attempts.forEach((a, seq) => {
           insert.run(
@@ -3454,7 +3455,12 @@ export const repo = {
             a.reused_from_run_id ?? null,
             a.vram_discrepancy === undefined ? null : a.vram_discrepancy ? 1 : 0,
             a.gpu_layers_resident_est ?? null,
-            a.gpu_layers_resident_exact === undefined ? null : a.gpu_layers_resident_exact ? 1 : 0
+            a.gpu_layers_resident_exact === undefined ? null : a.gpu_layers_resident_exact ? 1 : 0,
+            a.pp_tps ?? null,
+            a.ttft_ms ?? null,
+            a.prefill_cliff === undefined ? null : a.prefill_cliff ? 1 : 0,
+            a.host_backed_method ?? null,
+            a.host_backed_slope ?? null
           );
         });
       });
@@ -3491,8 +3497,9 @@ export const repo = {
               ok, oom, spill, vram_needed_mib, vram_free_mib, vram_peak_mib,
               ram_needed_mib, ram_free_mib, ram_peak_mib, vram_process_peak_mib, ram_total_peak_mib,
               vram_shared_peak_mib, gen_tps, error, created_at,
-              reused_from_run_id, vram_discrepancy, gpu_layers_resident_est, gpu_layers_resident_exact)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              reused_from_run_id, vram_discrepancy, gpu_layers_resident_est, gpu_layers_resident_exact,
+              pp_tps, ttft_ms, prefill_cliff, host_backed_method, host_backed_slope)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(run_id, seq) DO UPDATE SET
              candidate_ctx = excluded.candidate_ctx,
              ngl = excluded.ngl,
@@ -3514,7 +3521,12 @@ export const repo = {
              reused_from_run_id = excluded.reused_from_run_id,
              vram_discrepancy = excluded.vram_discrepancy,
              gpu_layers_resident_est = excluded.gpu_layers_resident_est,
-             gpu_layers_resident_exact = excluded.gpu_layers_resident_exact`
+             gpu_layers_resident_exact = excluded.gpu_layers_resident_exact,
+             pp_tps = excluded.pp_tps,
+             ttft_ms = excluded.ttft_ms,
+             prefill_cliff = excluded.prefill_cliff,
+             host_backed_method = excluded.host_backed_method,
+             host_backed_slope = excluded.host_backed_slope`
         )
         .run(
           uuid(),
@@ -3542,7 +3554,12 @@ export const repo = {
           a.reused_from_run_id ?? null,
           a.vram_discrepancy === undefined ? null : a.vram_discrepancy ? 1 : 0,
           a.gpu_layers_resident_est ?? null,
-          a.gpu_layers_resident_exact === undefined ? null : a.gpu_layers_resident_exact ? 1 : 0
+          a.gpu_layers_resident_exact === undefined ? null : a.gpu_layers_resident_exact ? 1 : 0,
+          a.pp_tps ?? null,
+          a.ttft_ms ?? null,
+          a.prefill_cliff === undefined ? null : a.prefill_cliff ? 1 : 0,
+          a.host_backed_method ?? null,
+          a.host_backed_slope ?? null
         );
     },
   },
@@ -3762,6 +3779,11 @@ export interface ProbeAttemptRow {
   vram_discrepancy: number | null;
   gpu_layers_resident_est: number | null;
   gpu_layers_resident_exact: number | null;
+  pp_tps: number | null;
+  ttft_ms: number | null;
+  prefill_cliff: number | null;
+  host_backed_method: string | null;
+  host_backed_slope: number | null;
 }
 
 // N4 storage shapes.

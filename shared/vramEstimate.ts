@@ -106,6 +106,105 @@ export const VRAM_ESTIMATE_FIXED_OVERHEAD_MIB = 512;
 // real per-layer footprint isn't uniform.
 export const VRAM_DISCREPANCY_RATIO = 0.5;
 
+// --- Measured host-backed fallback (see detectHostBackedFallback below) -----
+//
+// Every constant here was calibrated against a real 19-load sweep on an AMD
+// Radeon RX 6600 XT (8176MiB) running the Vulkan build b10819 with
+// Qwen3.6-35B-A3B-UD-IQ4_NL (17205MiB, 41 layers). The two raw datasets --
+// an ngl sweep at fixed context and a batch/context sweep at fixed ngl -- are
+// what these numbers are fitted to, and any change to them should be made
+// against a comparable measurement rather than by intuition:
+//
+//   ngl   dedicated   shared      gen tok/s     (ctx 1024, b2048/ub512)
+//     0         277       28           8.92
+//     4        2014      427          11.31
+//     6        2822      427          11.62
+//     8        3442      639          11.90
+//    10        3610     1279          12.05   <- fastest config measured
+//    12        3434     2270          10.93
+//    26        3736     7647           3.54
+//    41        4069    13258           6.87
+//
+// Two facts drive the design. First, `shared` is FLAT (427-810MiB) across
+// every configuration where the placement is genuinely resident -- it does
+// not scale with ngl, and it moves the WRONG way with batch size (the two
+// smallest batches measured the highest shared usage) -- so it is buffer
+// overhead, not spill. Second, once the driver starts backing weights with
+// system RAM, `shared` grows by one layer's worth per added layer (382MiB
+// measured, against a 420MiB file-derived per-layer size), and it matches
+// the missing dedicated bytes to within 1%: at ngl 26 the shortfall against
+// the estimate was 7565MiB and shared measured 7647MiB.
+//
+// Hence: subtract an overhead allowance, and call whatever is left over
+// spill once it exceeds a whole layer.
+
+/**
+ * How much of a layer's worth of system RAM has to appear per ADDED layer
+ * before the placement is called host-backed. Dimensionless on purpose: it is
+ * a fraction of whatever one layer of THIS model costs, so it carries across
+ * models, GPUs, drivers and quantizations without recalibration.
+ *
+ * The measured separation on the calibration sweep is wide and unambiguous --
+ * clean intervals ran 0.00-0.47 layers per layer added, spilling ones
+ * 0.76-1.18, with nothing in between:
+ *
+ *   ngl 2->4    0.00      ngl  8->10   0.76
+ *   ngl 4->6    0.00      ngl 10->12   1.18
+ *   ngl 6->8    0.25      ngl 12->14   0.78
+ *   ngl 0->2    0.47      ngl 14->18   0.99
+ *                         ngl 18->26   0.91
+ *                         ngl 26->41   0.89
+ *
+ * The one clean interval that comes close (0->2) is the GPU compute buffers
+ * appearing the moment ANY layer lands on the device -- a one-off step, not a
+ * slope, which is why a rung at ngl 0 is never used as a reference.
+ */
+export const HOST_BACKED_SLOPE_RATIO = 0.5;
+
+/**
+ * Minimum layer span the slope may be measured over.
+ *
+ * The driver hands out memory in granules, not in exact layer-sized pieces --
+ * measured at ~224MiB on the reference machine, which is 0.53 of that model's
+ * 420MiB layer. A single-layer delta is therefore mostly quantization noise,
+ * and a full 1-layer-resolution sweep (42 settings, 7 runs each) shows the two
+ * regimes overlapping outright at that resolution:
+ *
+ *   span 1   clean up to +1.05   spilling down to +0.38   -> NO threshold works
+ *   span 2   clean up to +0.31   spilling down to +0.62   -> clean separation
+ *   span 3   clean up to +0.35   spilling down to +0.71
+ *
+ * The tell is the alternation in the clean region -- +0.54, -0.53, +1.05,
+ * -0.53 -- one granule appearing and disappearing between adjacent rungs.
+ * Two layers halves that noise to +/-0.27, which is what opens the gap the
+ * threshold sits in. A reference closer than this is skipped in favour of a
+ * further one; if none exists, the bootstrap decides instead.
+ */
+export const HOST_BACKED_MIN_SLOPE_SPAN = 2;
+
+/**
+ * Bootstrap threshold for the FIRST rung of a phase, which by definition has
+ * no lower rung to take a slope against: what fraction of a placement's own
+ * predicted GPU footprint may be system-RAM-backed before it is called
+ * host-backed.
+ *
+ * Also dimensionless, and relative to the model's own size rather than to any
+ * machine -- a 2GiB model and a 200GiB one are judged on the same scale. The
+ * measured separation is narrower than the slope's, which is exactly why this
+ * is only the fallback:
+ *
+ *   clean    14% (ngl 6)  16% (ngl 8)  19% (ngl 4)  25% (ngl 4 @131072 ctx)
+ *            27% (ngl 10) 28% (ngl 4 @ b512)
+ *   spilling 41% (ngl 12) 44% (ngl 13) 46% (ngl 14) 58% (ngl 18) 68% (ngl 26)
+ *            75% (ngl 41)
+ *
+ * Denominated in the ESTIMATOR's footprint rather than the file's per-layer
+ * size on purpose: the clean band has to hold at large contexts too, where KV
+ * cache legitimately adds system-RAM-backed bytes (the 131072-token rung above
+ * would read 48% against weights alone, and be convicted).
+ */
+export const HOST_BACKED_BOOTSTRAP_FRAC = 0.35;
+
 const BYTES_PER_MIB = 1024 * 1024;
 
 export interface VramNeedEstimateInput {
@@ -214,6 +313,181 @@ export function estimateSafeNgl(
 // to compare against).
 export function isVramDiscrepancy(estimatedMib: number, observedPeakMib: number): boolean {
   return observedPeakMib < estimatedMib * VRAM_DISCREPANCY_RATIO;
+}
+
+/** One measured rung, as this detector needs to see it. */
+export interface HostBackedRungSample {
+  ngl: number;
+  /** MEASURED per-process system-RAM-backed GPU allocation (Windows WDDM
+   * "Shared Usage" / Linux amdgpu GTT). Null wherever no such counter exists
+   * -- which is what makes this whole check unavailable rather than passing. */
+  sharedPeakMib: number | null;
+  /** MEASURED per-process dedicated VRAM peak -- this process only, never the
+   * whole adapter. */
+  dedicatedPeakMib: number | null;
+}
+
+/**
+ * Fraction of the best clean prompt-processing rate below which prefill is
+ * considered to have fallen off a cliff.
+ *
+ * A SECOND, EARLIER boundary than the weights one, and a different mechanism:
+ * the batch compute buffer moves to host memory before any weight does, and
+ * prompt evaluation -- which is dominated by that buffer -- collapses when it
+ * happens, while token generation (bandwidth-bound per token, not
+ * buffer-bound) carries on improving for several more layers.
+ *
+ * Measured on the reference machine, one layer apart:
+ *
+ *   ngl 6   pp 69.2 t/s   TTFT  2583 ms   tg 12.23
+ *   ngl 7   pp 17.7 t/s   TTFT 10056 ms   tg 12.28   <- 3.9x collapse
+ *   ngl 10  pp 18.9 t/s   TTFT  9389 ms   tg 13.10   <- fastest tg, prefill still ruined
+ *
+ * pp never recovers (17-24 t/s all the way to full offload). For a 130-token
+ * prompt with 80 generated that makes ngl 6 finish 1.5x sooner end to end than
+ * the layer count with the best tok/s -- which is why this is reported rather
+ * than folded into the pass/fail rule: which one is "best" depends on whether
+ * the workload is prefill- or decode-heavy, and only the caller knows that.
+ *
+ * 0.5 discriminates a 3.9x step, so its exact value is not load-bearing;
+ * anything from 0.3 to 0.8 identifies the same rung on this data.
+ */
+export const PREFILL_CLIFF_RATIO = 0.5;
+
+/**
+ * True when this rung's prompt-processing rate has collapsed relative to the
+ * best rate seen at a genuinely-resident placement. `bestCleanPpTps` must come
+ * from rungs the host-backed check left alone -- comparing against a rung that
+ * was already over the cliff would hide it.
+ */
+export function isPrefillCliff(ppTps: number | null, bestCleanPpTps: number | null): boolean {
+  if (ppTps == null || bestCleanPpTps == null || bestCleanPpTps <= 0) return false;
+  return ppTps < bestCleanPpTps * PREFILL_CLIFF_RATIO;
+}
+
+export interface HostBackedFallbackInput {
+  rung: HostBackedRungSample;
+  /** Rungs already measured in this run AT THE SAME CONTEXT. Same context is
+   * the whole requirement: a different context legitimately moves the KV
+   * cache, which would show up in `shared` and be indistinguishable from
+   * spilled weights. The layer phase pins context while it searches, so its
+   * rungs are all mutually comparable by construction. */
+  priorSameCtx: HostBackedRungSample[];
+  /** One layer's worth of weights: the model file's own size divided by its
+   * layer count. Deliberately a fact from disk rather than an estimate --
+   * it is the unit the slope is measured in, so it must not inherit the
+   * estimator's bias. Null when the layer count is unknown. */
+  perLayerMib: number | null;
+  /** computeDualPoolFit's predicted GPU footprint for this rung -- weights
+   * plus GPU-side KV plus overhead. Only the BOOTSTRAP uses it, as the
+   * denominator that makes its threshold model-relative; the slope path never
+   * touches the estimator at all. */
+  estimatedGpuMib?: number | null;
+}
+
+export interface HostBackedFallbackVerdict {
+  hostBacked: boolean;
+  /** Which evidence decided it -- "slope" when a comparable lower-ngl rung
+   * existed, "ratio" for the single-rung bootstrap, null when neither could
+   * run. Also how a caller tells a MEASURED verdict from an absent one. */
+  method: "slope" | "ratio" | null;
+  /** Layers' worth of system RAM appearing per layer added, against the
+   * reference rung. Null unless method is "slope". */
+  slopeRatio: number | null;
+  /** Roughly how many of this rung's claimed layers are host-backed relative
+   * to the reference, for display. Null unless method is "slope". */
+  spilledLayers: number | null;
+}
+
+const UNAVAILABLE_HOST_BACKED: HostBackedFallbackVerdict = {
+  hostBacked: false,
+  method: null,
+  slopeRatio: null,
+  spilledLayers: null,
+};
+
+/**
+ * MEASURED silent-fallback detection: does system RAM demonstrably hold this
+ * placement's weights?
+ *
+ * isVramDiscrepancy above can only ever INFER a fallback, by noticing that
+ * an observed VRAM peak came in far below what was predicted -- which cannot
+ * distinguish "the driver silently paged the model to host RAM" from "our
+ * estimate was too pessimistic", and fails the rung either way. This one
+ * reads the OS's own per-process counter for system-RAM-backed GPU memory,
+ * so a rung is only ever failed when the missing bytes have actually been
+ * found somewhere else. An estimate that is merely wrong produces no shared
+ * usage and is no longer capable of failing anything.
+ *
+ * Returns hostBacked:false (with null figures) whenever the check cannot run
+ * -- no counter on this platform/backend, no estimate, or a rung with
+ * nothing claimed on the GPU. Callers fall back to isVramDiscrepancy there;
+ * "couldn't measure" must never read as "measured clean".
+ */
+export function detectHostBackedFallback(input: HostBackedFallbackInput): HostBackedFallbackVerdict {
+  const { rung, perLayerMib } = input;
+  if (rung.sharedPeakMib == null || rung.ngl <= 0) return UNAVAILABLE_HOST_BACKED;
+
+  // --- Primary: the SLOPE ---------------------------------------------------
+  //
+  // Overhead does not move with ngl; spilled weights move with it one-for-one.
+  // So the discriminating quantity is how much system RAM appears PER LAYER
+  // ADDED, measured against the nearest comparable rung below this one, and
+  // expressed as a fraction of what one layer of this model weighs.
+  //
+  // The reference is the CLOSEST lower-ngl rung rather than the lowest, so
+  // this is a local gradient rather than a whole-range average -- a reference
+  // that is itself already spilling then understates the slope, which loses
+  // detections but never invents them. Under-detection is the safe direction:
+  // it leaves the ladder searching, where a false positive would fail a
+  // placement that genuinely works.
+  //
+  // ngl 0 is never a reference: going from no GPU layers to some allocates the
+  // compute buffers, a one-off step that would read as a steep slope.
+  // Closest usable reference, but never closer than HOST_BACKED_MIN_SLOPE_SPAN
+  // -- an adjacent rung's delta is dominated by the driver's allocation
+  // granularity rather than by placement. Closest-of-the-eligible keeps the
+  // gradient local; a wider span would average across the onset.
+  const reference = input.priorSameCtx
+    .filter(
+      (p) => p.sharedPeakMib != null && p.ngl > 0 && p.ngl <= rung.ngl - HOST_BACKED_MIN_SLOPE_SPAN
+    )
+    .sort((a, b) => b.ngl - a.ngl)[0];
+  if (reference && perLayerMib != null && perLayerMib > 0) {
+    const deltaNgl = rung.ngl - reference.ngl;
+    const deltaShared = rung.sharedPeakMib - reference.sharedPeakMib!;
+    const slopeRatio = deltaShared / deltaNgl / perLayerMib;
+    return {
+      hostBacked: slopeRatio > HOST_BACKED_SLOPE_RATIO,
+      method: "slope",
+      slopeRatio,
+      // Only the growth ABOVE the reference is attributable from this pair --
+      // whatever the reference itself was already spilling is invisible here.
+      spilledLayers: deltaShared > 0 ? Math.round(deltaShared / perLayerMib) : 0,
+    };
+  }
+
+  // --- Bootstrap: the first rung of a phase has no slope --------------------
+  //
+  // Judged against its OWN predicted footprint, so the scale is the model's
+  // rather than the machine's. This matters more than it looks: whatever
+  // verdict the first rung gets becomes the reference every later slope is
+  // measured from, and a spilling rung accepted here anchors the whole search
+  // in the wrong place -- the slope only ever sees growth ABOVE its reference,
+  // so it cannot notice that the reference was already dirty.
+  //
+  // An earlier version compared shared against dedicated (host-backed when
+  // more of the process's GPU memory was system RAM than VRAM). Scale-free and
+  // constant-free, but far too permissive to anchor on: simulated against the
+  // measured sweep it passed a rung already spilling four layers, and the
+  // ladder then converged there instead of descending to the real boundary.
+  if (input.estimatedGpuMib == null || input.estimatedGpuMib <= 0) return UNAVAILABLE_HOST_BACKED;
+  return {
+    hostBacked: rung.sharedPeakMib / input.estimatedGpuMib > HOST_BACKED_BOOTSTRAP_FRAC,
+    method: "ratio",
+    slopeRatio: null,
+    spilledLayers: null,
+  };
 }
 
 export interface ResidentGpuLayersInput {
