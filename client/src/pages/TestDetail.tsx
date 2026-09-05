@@ -1383,7 +1383,9 @@ export function TestDetail() {
                             pre-allocation plan; the estimate is where the
                             weights really landed, so when the two disagree
                             (yellow highlight) the claim was only partially
-                            (or not at all -- Windows CUDA sysmem fallback)
+                            (or not at all -- the driver silently serving the
+                            model from system RAM instead of erroring, seen on
+                            both NVIDIA/CUDA and AMD/Vulkan)
                             fulfilled. The cell shows the estimate instead of
                             endorsing the claim; the full story goes in the
                             tooltip. */}
@@ -1397,7 +1399,7 @@ export function TestDetail() {
                                 `but its own post-allocation buffer report shows only ~${anyResult.gpu_layers_resident_est}/${anyResult.total_model_layers} ` +
                                 `actually GPU-resident -- the rest of the weights landed in CPU/system memory. ` +
                                 `A large gap means the driver may be silently serving the model from system RAM ` +
-                                `(Windows CUDA sysmem fallback); these speeds can then be CPU-class despite the claim.`
+                                `instead of erroring (seen on both NVIDIA/CUDA and AMD/Vulkan); these speeds can then be CPU-class despite the claim.`
                               }
                             >
                               ~{anyResult.gpu_layers_resident_est}/{anyResult.total_model_layers} ⚠

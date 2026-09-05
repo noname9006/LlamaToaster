@@ -44,6 +44,12 @@ export interface ProbeAttemptDto {
   ram_needed_mib: number | null;
   ram_free_mib: number | null;
   ram_peak_mib: number | null;
+  /** This process's peak system-RAM-backed GPU allocation (Windows WDDM
+   * "Shared Usage" or Linux amdgpu GTT) -- the direct measured figure for
+   * "how much silently spilled into system RAM", alongside vram_peak_mib's
+   * dedicated-only reading. Null wherever no such counter/file exists at all
+   * (not a measured 0), including every worker predating this reading. */
+  vram_shared_peak_mib: number | null;
   gen_tps: number | null;
   error: string | null;
   created_at: number;
@@ -52,6 +58,22 @@ export interface ProbeAttemptDto {
    * this exact (candidate_ctx, ngl) point -- see GET .../probe-dedup. Names
    * the sibling run it came from; null for every genuinely measured rung. */
   reused_from_run_id: string | null;
+  /** SQLite integer (0/1), null from a worker/row predating the check. True
+   * means observed vram_peak_mib came in far below vram_needed_mib for the
+   * claimed ngl -- the silent sysmem-fallback signature (see
+   * shared/vramEstimate.ts's top comment; confirmed on both NVIDIA/CUDA and
+   * AMD/Vulkan), not just this estimate over-budgeting. */
+  vram_discrepancy: number | null;
+  /** How many of `ngl`'s claimed layers actually landed in a GPU buffer, per
+   * llama.cpp's own post-allocation buffer-size report -- null when ngl<=0,
+   * a worker predating this check, or the load failed before tensor loading
+   * finished. */
+  gpu_layers_resident_est: number | null;
+  /** SQLite integer (0/1). True means gpu_layers_resident_est is an EXACT
+   * count from llama.cpp's own per-layer "assigned to device" lines; false
+   * means it's the coarser buffer-byte-ratio estimate. Meaningless when
+   * gpu_layers_resident_est is null. */
+  gpu_layers_resident_exact: number | null;
 }
 
 // N2 batch dedup -- one already-measured (ctx, ngl) point from an earlier
@@ -71,6 +93,17 @@ export interface ProbeDedupPoint {
   ram_needed_mib: number | null;
   ram_free_mib: number | null;
   ram_peak_mib: number | null;
+  /** See ProbeAttemptDto.vram_shared_peak_mib. */
+  vram_shared_peak_mib: number | null;
+  /** See ProbeAttemptDto.vram_discrepancy; coerced to false for a sibling row
+   * predating the check, same as ok/oom/spill's own boolean coercion above. */
+  vram_discrepancy: boolean;
+  /** See ProbeAttemptDto.gpu_layers_resident_est. */
+  gpu_layers_resident_est: number | null;
+  /** See ProbeAttemptDto.gpu_layers_resident_exact; coerced to false for a
+   * sibling row predating the check or where gpu_layers_resident_est is
+   * null. */
+  gpu_layers_resident_exact: boolean;
   /** Which sibling run actually measured this point. */
   source_run_id: string;
 }

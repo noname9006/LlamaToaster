@@ -321,6 +321,22 @@ const COLUMN_MIGRATIONS: ColumnSpec[] = [
   // "genuinely measured" (dedup didn't exist yet, so nothing could have been
   // reused).
   { table: "probe_attempts", column: "reused_from_run_id", ddlType: "TEXT REFERENCES runs(id) ON DELETE SET NULL" },
+  // True when this rung's observed VRAM peak came in far below what was
+  // predicted for the requested ngl -- the silent sysmem-fallback signature
+  // (see shared/vramEstimate.ts's top comment; confirmed on both NVIDIA/CUDA
+  // and AMD/Vulkan). NULL on every rung reported before this migration or by
+  // a worker predating the check, which correctly reads as "not checked"
+  // rather than a false "no discrepancy found".
+  { table: "probe_attempts", column: "vram_discrepancy", ddlType: "INTEGER" },
+  // Claimed-vs-landed layer count -- see schema.sql's own comment on these
+  // columns. NULL/NULL on every rung reported before this migration or by a
+  // worker predating the check.
+  { table: "probe_attempts", column: "gpu_layers_resident_est", ddlType: "INTEGER" },
+  { table: "probe_attempts", column: "gpu_layers_resident_exact", ddlType: "INTEGER" },
+  // Peak system-RAM-backed GPU allocation -- see schema.sql's own comment on
+  // this column. NULL on every rung reported before this migration or by a
+  // worker predating the reading.
+  { table: "probe_attempts", column: "vram_shared_peak_mib", ddlType: "REAL" },
 ];
 
 function applyColumnMigrations(database: Database.Database): void {

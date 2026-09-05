@@ -441,7 +441,23 @@ CREATE TABLE IF NOT EXISTS probe_attempts (
   ok INTEGER NOT NULL, oom INTEGER NOT NULL, spill INTEGER NOT NULL,
   vram_needed_mib REAL, vram_free_mib REAL, vram_peak_mib REAL,
   ram_needed_mib REAL,  ram_free_mib REAL,   ram_peak_mib REAL,
+  -- This process's peak system-RAM-backed GPU allocation (Windows WDDM
+  -- "Shared Usage" or Linux amdgpu GTT) -- the direct measured figure for
+  -- "how much silently spilled into system RAM", alongside vram_peak_mib's
+  -- dedicated-only reading. NULL wherever no such counter/file exists at all
+  -- (not a measured 0), including every worker predating this reading.
+  vram_shared_peak_mib REAL,
   gen_tps REAL, error TEXT,
+  -- True when observed VRAM peak came in far below what was predicted for
+  -- the requested ngl -- the silent sysmem-fallback signature (see
+  -- shared/vramEstimate.ts's top comment; confirmed on both NVIDIA/CUDA and
+  -- AMD/Vulkan). NULL from a worker predating the check.
+  vram_discrepancy INTEGER,
+  -- Claimed-vs-landed: how many of `ngl`'s layers llama.cpp's own
+  -- post-allocation buffer report actually put on the GPU, and whether that
+  -- count is exact (per-layer lines under -v) or a coarser byte-ratio
+  -- estimate. NULL/NULL from a worker predating this check.
+  gpu_layers_resident_est INTEGER, gpu_layers_resident_exact INTEGER,
   created_at INTEGER NOT NULL,
   -- N2 batch dedup -- set when this rung was never actually loaded, but
   -- reused verbatim from an earlier sibling run under the same batch root

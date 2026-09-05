@@ -25,6 +25,31 @@ function needVsFree(needed: number | null, free: number | null): string | null {
   return `${Math.round((needed / free) * 100)}% of free`;
 }
 
+// Claimed-vs-landed: `ngl` is what the ladder asked for and llama.cpp claimed
+// to offload; gpu_layers_resident_est is what its own post-allocation buffer
+// report says actually landed on the GPU (see shared/types.ts's
+// ProbeAttemptReport.gpu_layers_resident_est doc comment). Null when the
+// worker predates the check, or nothing was computable for this rung (ngl<=0,
+// or the load failed before tensor loading finished).
+function residentCell(a: Pick<ProbeAttemptDto, "ngl" | "gpu_layers_resident_est" | "gpu_layers_resident_exact">): {
+  text: string;
+  warn: boolean;
+  title?: string;
+} {
+  if (a.gpu_layers_resident_est == null) return { text: "—", warn: false };
+  const prefix = a.gpu_layers_resident_exact === 1 ? "" : "~";
+  const mismatched = a.ngl != null && a.gpu_layers_resident_est !== a.ngl;
+  return {
+    text: `${prefix}${a.gpu_layers_resident_est}`,
+    warn: mismatched,
+    title: mismatched
+      ? `Claimed ${a.ngl} layers on GPU, but llama.cpp's own post-allocation buffer report shows ` +
+        `${a.gpu_layers_resident_exact === 1 ? "exactly" : "an estimated"} ${a.gpu_layers_resident_est} ` +
+        "actually landed there -- the rest fell back to CPU/system memory."
+      : undefined,
+  };
+}
+
 export interface ProbeAttemptsProps {
   testId: string;
   /** Re-fetched whenever the run's own status changes. */
@@ -73,9 +98,11 @@ export function ProbeAttempts({ testId, refreshKey }: ProbeAttemptsProps) {
               <th className="px-2 py-1.5">#</th>
               <th className="px-2 py-1.5">context</th>
               <th className="px-2 py-1.5 text-right">offload</th>
+              <th className="px-2 py-1.5 text-right">resident</th>
               <th className="px-2 py-1.5 text-right">VRAM needed</th>
               <th className="px-2 py-1.5 text-right">VRAM free</th>
               <th className="px-2 py-1.5 text-right">VRAM peak</th>
+              <th className="px-2 py-1.5 text-right">shared</th>
               <th className="px-2 py-1.5 text-right">RAM needed</th>
               <th className="px-2 py-1.5 text-right">RAM free</th>
               <th className="px-2 py-1.5 text-right">gen tok/s</th>
@@ -86,16 +113,36 @@ export function ProbeAttempts({ testId, refreshKey }: ProbeAttemptsProps) {
             {attempts.map((a) => {
               const vramRatio = needVsFree(a.vram_needed_mib, a.vram_free_mib);
               const ramRatio = needVsFree(a.ram_needed_mib, a.ram_free_mib);
+              const resident = residentCell(a);
               return (
                 <tr key={a.id} className="border-b border-border/40">
                   <td className="px-2 py-1.5 font-mono text-muted">{a.seq + 1}</td>
                   <td className="px-2 py-1.5 font-mono text-fg">{a.candidate_ctx.toLocaleString()}</td>
                   <td className="px-2 py-1.5 text-right font-mono text-muted">{a.ngl ?? "—"}</td>
+                  <td
+                    className={`px-2 py-1.5 text-right font-mono ${resident.warn ? "font-bold text-warning" : "text-muted"}`}
+                    title={resident.title}
+                  >
+                    {resident.text}
+                    {resident.warn ? " ⚠" : ""}
+                  </td>
                   <td className="px-2 py-1.5 text-right font-mono text-muted" title={vramRatio ?? undefined}>
                     {mib(a.vram_needed_mib)}
                   </td>
                   <td className="px-2 py-1.5 text-right font-mono text-muted">{mib(a.vram_free_mib)}</td>
                   <td className="px-2 py-1.5 text-right font-mono text-muted">{mib(a.vram_peak_mib)}</td>
+                  <td
+                    className={`px-2 py-1.5 text-right font-mono ${a.vram_shared_peak_mib ? "font-bold text-warning" : "text-muted"}`}
+                    title={
+                      a.vram_shared_peak_mib != null
+                        ? `${mib(a.vram_shared_peak_mib)} of this load's memory was system RAM the OS backed as GPU-accessible ` +
+                          "memory (Windows WDDM \"Shared Usage\" / Linux amdgpu GTT), not real dedicated VRAM -- a direct " +
+                          "measurement, not an inference from the needed-vs-peak gap."
+                        : "No shared/system-RAM-backed GPU memory counter is available on this worker for this backend."
+                    }
+                  >
+                    {mib(a.vram_shared_peak_mib)}
+                  </td>
                   <td className="px-2 py-1.5 text-right font-mono text-muted" title={ramRatio ?? undefined}>
                     {mib(a.ram_needed_mib)}
                   </td>
@@ -117,6 +164,18 @@ export function ProbeAttempts({ testId, refreshKey }: ProbeAttemptsProps) {
                           {a.oom ? "out of memory" : a.spill ? "spilled past VRAM" : "failed"}
                         </span>
                       )}
+                      {a.ok && a.vram_discrepancy === 1 && (
+                        <span
+                          title={
+                            a.error ??
+                            `Observed VRAM peak came in far below what ${mib(a.vram_needed_mib)} of claimed offload should need -- ` +
+                              "likely silently running from system RAM instead of erroring (seen on both NVIDIA/CUDA and AMD/Vulkan), not actual GPU offload."
+                          }
+                          className="rounded-full bg-warning-bg px-2 py-0.5 text-[10px] font-bold text-warning"
+                        >
+                          ⚠ possible VRAM fallback
+                        </span>
+                      )}
                       {a.reused_from_run_id && (
                         <Link
                           to={`/tests/${a.reused_from_run_id}`}
@@ -133,7 +192,7 @@ export function ProbeAttempts({ testId, refreshKey }: ProbeAttemptsProps) {
             })}
             {attempts.length === 0 && (
               <tr>
-                <td colSpan={10} className="px-2 py-3 text-muted">
+                <td colSpan={12} className="px-2 py-3 text-muted">
                   This probe recorded no loads. A probe run that never reached the machine leaves no rungs.
                 </td>
               </tr>
@@ -143,11 +202,22 @@ export function ProbeAttempts({ testId, refreshKey }: ProbeAttemptsProps) {
       </div>
 
       <p className="mt-3 text-[11px] leading-relaxed text-muted">
+        <b className="text-fg">Offload</b> is what was claimed; <b className="text-fg">resident</b> is how many of
+        those layers llama.cpp's own post-allocation buffer report says actually landed on the GPU (a{" "}
+        <span className="text-muted">~</span> prefix means it's a coarser estimate, not an exact per-layer count) —
+        a mismatch is flagged the same way a VRAM-fallback row is.{" "}
         <b className="text-fg">Needed</b> is what the estimate predicted for that context and placement;{" "}
         <b className="text-fg">free</b> is what the machine actually had available just before the load;{" "}
-        <b className="text-fg">peak</b> is what the load really used. A needed figure far above peak means the
-        estimate is over-budgeting for this model — the probe still measured reality, so its verdict stands
-        regardless.
+        <b className="text-fg">peak</b> is what the load really used. A needed figure far above peak usually means
+        the estimate is over-budgeting for this model — but when peak also stays far below free, it can instead mean
+        the load silently ran (partly) from system RAM instead of true GPU memory, without llama.cpp reporting any
+        error. A row flagged{" "}
+        <b className="text-warning">⚠ possible VRAM fallback</b> was caught by that check; how it's handled — warn,
+        retry once, or fail — is the worker's VRAM-discrepancy policy.{" "}
+        <b className="text-fg">Shared</b> is that same spillover, but measured directly rather than inferred: the
+        worker's own OS-level reading of how much of this process's memory was system RAM the driver backed as
+        GPU-accessible memory instead of real dedicated VRAM. It's blank when no such counter exists for this
+        worker's backend, which is different from a confirmed zero.
       </p>
     </div>
   );
