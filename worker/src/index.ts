@@ -1306,19 +1306,23 @@ function formatSpecDecodeLine(results: IngestResultInput[]): string | null {
 // logDiagnosticOutput below still mirrors it into the log file, just at
 // debug level (see LOG_LEVEL) so it's there on demand for troubleshooting
 // without being what a normal `pm2 logs`/daily-log read has to scroll past.
-// Filtered defensively regardless of level: llama-server's MTP path runs at
-// -lv 4 (see serverBench.ts's buildArgs) rather than the max level 5
-// ("debug", which prints a per-token/per-draft-candidate trace -- confirmed
-// live to be unnecessary noise for anything this app reads), but level 4
-// ("trace") is still verbose enough that a request/response body --
-// including this app's own synthetic filler-token prompts and the model's
-// generated text -- could plausibly appear verbatim in a line at that
-// verbosity. Genuine llama.cpp diagnostic lines are short, structured,
-// human-authored strings; a dumped prompt/response array or generated-text
-// blob is not, so any line past a generous length threshold is elided
-// rather than printed in full -- this trades away logging an unusually long
-// *legitimate* diagnostic line (none observed live against either binary)
-// for never printing raw prompt/reply content into the log.
+// Filtered defensively regardless of level: both llama-server paths (the MTP
+// path in serverBench.ts's buildArgs, and the {engine:"server"} path in
+// loadDriver.ts's buildServerArgs) now run at the max level 5 ("debug")
+// rather than 4 ("trace"), specifically to also get the per-layer "assigned
+// to device" lines bench.ts's LAYER_DEVICE_LINE_RE reads for an exact
+// resident-GPU-layer count -- a byte-ratio guess at level 4. The tradeoff
+// is level 5's own per-token/per-draft-candidate trace, which bench.ts's
+// appendBoundedOutput now caps at the live-capture stage so it can't grow
+// the per-item raw JSON dump unbounded. That extra verbosity is also why a
+// request/response body -- including this app's own synthetic filler-token
+// prompts and the model's generated text -- could plausibly appear verbatim
+// in a line at this level. Genuine llama.cpp diagnostic lines are short,
+// structured, human-authored strings; a dumped prompt/response array or
+// generated-text blob is not, so any line past a generous length threshold
+// is elided rather than printed in full -- this trades away logging an
+// unusually long *legitimate* diagnostic line (none observed live against
+// either binary) for never printing raw prompt/reply content into the log.
 const MAX_LOGGED_LINE_CHARS = 300;
 
 function filterDiagnosticOutput(stderr: string): string {
@@ -1758,10 +1762,12 @@ async function finalizeSweepItemResult(
 // buffer" figure for one model. Two tiers, best available first:
 //   1. EXACT -- counted from llama.cpp's own per-layer "assigned to device"
 //      DEBUG lines (bench.ts's parseModelBufferSizes now carries it as
-//      gpu_layers_exact). Every current build emits these under llama-bench's
-//      -v (which this runner already passes); this is where the MX150-class
-//      "claimed 49/49, driver never saw a CUDA device" case resolves to an
-//      exact 0 instead of a guess.
+//      gpu_layers_exact). llama-bench always emits these under its own -v;
+//      both llama-server paths (serverBench.ts's MTP path and loadDriver.ts's
+//      probe/{engine:"server"} path) now run at --verbosity 5 specifically to
+//      get them too (see those files' buildArgs). This is where the
+//      MX150-class "claimed 49/49, driver never saw a CUDA device" case
+//      resolves to an exact 0 instead of a guess.
 //   2. Byte-ratio estimate -- proportional split of the post-allocation
 //      "model buffer size" lines (shared/vramEstimate.ts's
 //      estimateResidentGpuLayersFromBufferSizes), for builds too old to print
@@ -1770,7 +1776,16 @@ async function finalizeSweepItemResult(
 // (ngl=0 / cpu backend), or no buffer report captured.
 function computeResidentLayers(
   info: OffloadInfo | null | undefined,
-  buffers: ModelBufferSizes | null
+  buffers: ModelBufferSizes | null,
+  // The N2 probe's own "resident" column (ProbeAttempts.tsx) dropped the
+  // byte-ratio tier entirely -- a coarse guess sitting next to real measured
+  // columns (VRAM peak, shared) read as a fact, and every probe load now runs
+  // at verbosity 5 anyway (see above), so tier 2 firing there would mean the
+  // exact tier failed to parse rather than an old build being probed. true
+  // makes that failure surface as "--" instead of a silently-approximate
+  // number. The sweep path's own callers leave this false: an older/unusual
+  // llama-bench build with no -v support is still worth an estimate there.
+  exactOnly = false
 ): ResidentLayers {
   if (!info || info.gpu_layers_loaded <= 0 || !buffers) return { layers: null, exact: false };
   if (buffers.gpu_layers_exact != null) {
@@ -1778,6 +1793,7 @@ function computeResidentLayers(
     // than it claimed to offload in the first place.
     return { layers: Math.min(buffers.gpu_layers_exact, info.gpu_layers_loaded), exact: true };
   }
+  if (exactOnly) return { layers: null, exact: false };
   return {
     layers: estimateResidentGpuLayersFromBufferSizes(info.gpu_layers_loaded, buffers.gpuMib, buffers.cpuMib),
     exact: false,
@@ -3591,7 +3607,8 @@ async function runOneProbeLoad(input: ProbeLoadInput): Promise<ProbeAttemptOutco
     const modelBufferSizes = parseModelBufferSizes(server?.stderr() ?? "")?.main ?? null;
     const resident = computeResidentLayers(
       ngl > 0 && totalModelLayers != null ? { gpu_layers_loaded: ngl, total_model_layers: totalModelLayers } : null,
-      modelBufferSizes
+      modelBufferSizes,
+      /* exactOnly */ true
     );
     return {
       candidateCtx,

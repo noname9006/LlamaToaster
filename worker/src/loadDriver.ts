@@ -53,6 +53,12 @@ export interface ServerArgsInput {
   mainGpu?: number;
   /** §0.7 probe result -- when false the flag is left off and its row flags instead. */
   supportsNoContextShift?: boolean;
+  /** §0.7 probe result for --fit -- see buildServerArgs's own comment on why
+   * this is forced off rather than left at llama-server's default. Unlike
+   * supportsNoContextShift, no row-level caveat exists for "unsupported": a
+   * build that doesn't have --fit at all has no auto-adjustment behavior to
+   * begin with, so there's nothing left to flag. */
+  supportsFit?: boolean;
   contextSizeOverride?: number;
 }
 
@@ -91,11 +97,30 @@ export function buildServerArgs(input: ServerArgsInput): string[] {
     "--parallel",
     String(Math.max(1, input.slots)),
     "--metrics",
+    // 5 ("debug"), not 4 ("trace") -- see serverBench.ts's buildArgs for why:
+    // only level 5 also prints llama.cpp's own per-layer "assigned to device"
+    // ground truth (bench.ts's LAYER_DEVICE_LINE_RE), which is what lets
+    // worker/src/index.ts's probe path report an exact resident-layer count
+    // instead of a byte-ratio estimate. bench.ts's appendBoundedOutput caps
+    // the live capture so level 5's extra per-token trace can't grow it
+    // unbounded.
     "--verbosity",
-    "4",
+    "5",
   ];
   if (input.mainGpu != null) args.push("-sm", "none", "-mg", String(input.mainGpu));
   if (item.n_cpu_moe > 0) args.push("--n-cpu-moe", String(item.n_cpu_moe));
+  // --fit (default "on" on builds that have it) auto-adjusts whichever of
+  // -ngl/-c/-ts/-ot were left UNSET to fit free device memory -- it's
+  // documented to leave an explicitly-passed value alone. -ngl and -c are
+  // always explicit above, but -ot (tensor placement, what --n-cpu-moe is a
+  // friendlier alias for) is only ever set when n_cpu_moe>0: at 0, tensor
+  // placement is genuinely unset, so a MoE model that doesn't fully fit at
+  // the requested -ngl could have --fit silently push some experts to CPU
+  // anyway -- exactly the "0 means nothing forced off GPU" guarantee every
+  // reading in this app assumes. Forcing it off removes that gap regardless
+  // of whether --n-cpu-moe itself would otherwise have shielded -ot from the
+  // fitter -- not verified against real source, made moot instead.
+  if (input.supportsFit) args.push("--fit", "off");
   // Probed, never assumed (§0.7): an unsupported flag disables its behavior
   // rather than failing the item, and the row carries a context_shift flag if
   // the logs then show a shift happened anyway.

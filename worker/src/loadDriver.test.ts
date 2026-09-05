@@ -68,6 +68,19 @@ describe("server arguments for the spec-off engine pair", () => {
     });
     expect(with_).toContain("--no-context-shift");
   });
+
+  it("only passes --fit off when the binary probe says --fit exists (§0.7)", () => {
+    const without = buildServerArgs({ modelPath: "m.gguf", port: 8080, item, slots: 1 });
+    expect(without).not.toContain("--fit");
+    const with_ = buildServerArgs({
+      modelPath: "m.gguf",
+      port: 8080,
+      item,
+      slots: 1,
+      supportsFit: true,
+    });
+    expect(with_[with_.indexOf("--fit") + 1]).toBe("off");
+  });
 });
 
 describe("stream summaries (raw samples, never a server aggregate)", () => {

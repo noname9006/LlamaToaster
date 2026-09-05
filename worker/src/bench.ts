@@ -233,9 +233,10 @@ export function classifyFailure(input: FailureClassificationInput): "failed_oom"
 // gpu_layers_loaded, Y = total_model_layers -- Y is the GGUF's real
 // transformer layer count + 1 (the output layer), not the same number as
 // models.metadata.n_layer, so this is the only correct source for either
-// value. Requires -v (llama-bench, see supportsVerboseFlag above) or -lv 4
-// (llama-server, see serverBench.ts's buildArgs) -- absent at default
-// verbosity on both binaries, confirmed live. `g` flag so parseOffloadLayers
+// value. Requires -v (llama-bench, see supportsVerboseFlag above) or -lv 4+
+// (llama-server -- both server buildArgs functions now pass 5, but this
+// summary line was already present at 4, confirmed live against b10405) --
+// absent at default verbosity on both binaries. `g` flag so parseOffloadLayers
 // below can collect every occurrence, not just the first -- an MTP item
 // loads TWO models (base + --model-draft companion) via llama-server, each
 // printing its own line.
@@ -506,8 +507,9 @@ export function extractCudaDiagnosticLines(stderr: string): string[] {
 }
 
 // llama-bench's -v/--verbose (see supportsVerboseFlag above) and
-// llama-server's --verbosity 4 (see worker/src/serverBench.ts's buildArgs)
-// both print one line per tensor while a model loads, and (for a
+// llama-server's --verbosity 5 (see worker/src/serverBench.ts's buildArgs and
+// worker/src/loadDriver.ts's buildServerArgs) both print one line per tensor
+// while a model loads, and (for a
 // CPU_REPACK-eligible quant) a second one per tensor while it repacks --
 // confirmed live against a 541-tensor/402-repackable-tensor model that this
 // alone is >900 near-identical lines. Harmless noise on a successful run
@@ -562,6 +564,36 @@ export function collapseTensorLoadSpam(text: string): string {
   }
   return out.join("\n");
 }
+
+// llama-server's --verbosity 5 ("debug", needed for LAYER_DEVICE_LINE_RE's
+// exact per-layer residency -- see loadDriver.ts/serverBench.ts's buildArgs)
+// prints a per-token/per-draft-candidate trace for the whole life of the
+// process, not just during load -- unlike the tensor-load spam
+// collapseTensorLoadSpam handles above, this arrives interleaved with
+// genuinely useful output for as long as generation runs, so it can't be
+// collapsed by a fixed line-pattern after the fact the same way. Bounds the
+// LIVE accumulator instead of the final string, so a long-running item can
+// never grow the captured buffer past ~2x maxChars before this catches it.
+// Keeps the first half (load-time diagnostics -- device detection, per-layer
+// assignments, buffer sizes -- all done well before this cap could matter)
+// and the last half (freshest output, what a mid-run crash needs), eliding
+// the middle. This is a size safeguard, not a verified spam filter: the exact
+// level-5 line format hasn't been confirmed against a real build the way
+// collapseTensorLoadSpam's patterns were, so it makes no attempt to identify
+// *which* lines are noise.
+export function appendBoundedOutput(current: string, chunk: string, maxChars: number): string {
+  const next = current + chunk;
+  if (next.length <= maxChars) return next;
+  const half = Math.floor(maxChars / 2);
+  const elidedChars = next.length - (half * 2);
+  return `${next.slice(0, half)}\n...[${elidedChars} chars elided to bound captured output]...\n${next.slice(next.length - half)}`;
+}
+
+// Default cap for appendBoundedOutput above -- comfortably larger than any
+// observed legitimate load-time diagnostic output (a 900-tensor model's
+// create_tensor spam alone was ~60KB uncollapsed), small enough to bound a
+// pathological per-token trace over a long generation run.
+export const MAX_CAPTURED_PROCESS_OUTPUT_CHARS = 2_000_000;
 
 export async function runBench(input: BenchRunInput): Promise<BenchResult> {
   const args = await buildArgs(input);

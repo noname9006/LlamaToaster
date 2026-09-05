@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseModelBufferSizes, extractCudaDiagnosticLines, MAX_CUDA_DIAGNOSTIC_LINES, buildArgs, classifyFailure, type BenchRunInput } from "./bench.js";
+import { parseModelBufferSizes, extractCudaDiagnosticLines, MAX_CUDA_DIAGNOSTIC_LINES, buildArgs, classifyFailure, appendBoundedOutput, type BenchRunInput } from "./bench.js";
 import type { SweepItem } from "../../shared/sweep.js";
 
 const BASE_ITEM: SweepItem = {
@@ -315,5 +315,28 @@ describe("extractCudaDiagnosticLines", () => {
       "cuMemCreate returned CUDA_ERROR_OUT_OF_MEMORY",
     ].join("\n");
     expect(extractCudaDiagnosticLines(stderr)).toEqual(stderr.split("\n"));
+  });
+});
+
+describe("appendBoundedOutput", () => {
+  it("passes chunks through unchanged while under the cap", () => {
+    expect(appendBoundedOutput("abc", "def", 100)).toBe("abcdef");
+    expect(appendBoundedOutput("", "hello", 100)).toBe("hello");
+  });
+
+  it("elides the middle once the cap is exceeded, keeping head and tail", () => {
+    const result = appendBoundedOutput("HEAD".repeat(10), "TAIL".repeat(10), 20);
+    expect(result.startsWith("HEAD")).toBe(true);
+    expect(result.endsWith("TAIL")).toBe(true);
+    expect(result).toContain("chars elided to bound captured output");
+    expect(result.length).toBeGreaterThan(20); // the elision marker itself adds some
+  });
+
+  it("never lets the live buffer grow past ~2x the cap regardless of chunk size", () => {
+    let acc = "";
+    for (let i = 0; i < 50; i++) {
+      acc = appendBoundedOutput(acc, "x".repeat(1000), 5000);
+    }
+    expect(acc.length).toBeLessThan(5000 * 2 + 200); // +200 slack for the elision marker text
   });
 });
