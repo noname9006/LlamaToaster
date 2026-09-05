@@ -13,7 +13,9 @@ import { CURVE_METHOD_VERSION, SERVER_METHOD_VERSION, type CaveatFlag } from "..
 import type { SweepItem } from "../../shared/sweep.js";
 import { isVramDiscrepancy } from "../../shared/vramEstimate.js";
 import {
+  appendBoundedOutput,
   collapseTensorLoadSpam,
+  MAX_CAPTURED_PROCESS_OUTPUT_CHARS,
   parseModelBufferSizes,
   parseOffloadLayers,
   type BenchLogger,
@@ -92,6 +94,9 @@ export async function spawnRuntimeServer(input: SpawnRuntimeServerInput): Promis
   // behavior rather than failing the item; the row then carries a
   // context_shift caveat if the logs show a shift happened anyway.
   const supportsNoContextShift = await supportsFlag(input.llamaServerPath, "--no-context-shift").catch(() => false);
+  // Same §0.7 probe pattern for --fit -- see buildServerArgs's own comment
+  // for why this is forced off rather than left at llama-server's default.
+  const supportsFit = await supportsFlag(input.llamaServerPath, "--fit").catch(() => false);
   const args = buildServerArgs({
     modelPath: input.modelPath,
     port: input.port,
@@ -99,6 +104,7 @@ export async function spawnRuntimeServer(input: SpawnRuntimeServerInput): Promis
     slots: input.slots,
     mainGpu: input.mainGpu,
     supportsNoContextShift,
+    supportsFit,
     contextSizeOverride: input.contextSizeOverride,
   });
   input.log?.info(`llama-server ${args.join(" ")}`);
@@ -107,10 +113,10 @@ export async function spawnRuntimeServer(input: SpawnRuntimeServerInput): Promis
 
   let stderr = "";
   proc.stderr?.on("data", (chunk: Buffer) => {
-    stderr += chunk.toString();
+    stderr = appendBoundedOutput(stderr, chunk.toString(), MAX_CAPTURED_PROCESS_OUTPUT_CHARS);
   });
   proc.stdout?.on("data", (chunk: Buffer) => {
-    stderr += chunk.toString();
+    stderr = appendBoundedOutput(stderr, chunk.toString(), MAX_CAPTURED_PROCESS_OUTPUT_CHARS);
   });
 
   const closed = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
