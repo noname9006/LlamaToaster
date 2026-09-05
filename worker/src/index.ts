@@ -3137,11 +3137,20 @@ async function resolveProbeVramDiscrepancy(
       );
     }
     if (a.hostBackedMethod === "ratio") {
+      // No comparable rung on either axis yet, so this one is judged against
+      // its own predicted footprint. Says exactly that -- an earlier version
+      // of this sentence described a different rule (shared exceeding
+      // dedicated) and kept claiming "more in host memory than on the device"
+      // for rungs where that was plainly untrue.
+      const pct =
+        a.vramSharedPeakMib != null && estimatedVramMib
+          ? ` (${Math.round((a.vramSharedPeakMib / estimatedVramMib) * 100)}% of the ${estimatedVramMib}MiB this placement should occupy)`
+          : "";
       return (
         `candidate ${rung.ctx}/${rung.ngl} is running from system RAM, not GPU: ${shared}MiB of this load's GPU ` +
-        `memory is system-RAM-backed against only ${inVram}MiB really in VRAM -- more of this placement is ` +
-        `in host memory than on the device. llama.cpp claimed ${rung.ngl} layers on GPU ` +
-        `(~${estimatedVramMib ?? "?"}MiB expected)`
+        `memory is system-RAM-backed${pct}, with ${inVram}MiB actually in VRAM. No lower-offload load at this ` +
+        `context had been measured yet, so this rung was judged against its own predicted footprint rather than ` +
+        `a slope`
       );
     }
     const observed = a.vramProcessPeakMib ?? a.vramPeakMib;
@@ -3398,12 +3407,16 @@ async function executeRunProbeJob(payload: TestProbeJobPayload): Promise<void> {
           // produced a shared-memory reading. A reused batch-sibling point
           // qualifies too -- it is a real measurement, just one this run
           // did not pay a load for.
-          priorSameCtx: attempts
-            .filter((a) => a.candidateCtx === rung.ctx && a.vramSharedPeakMib != null && a.ngl != null)
+          // Every measured rung, both axes -- the detector picks whichever
+          // comparison holds the other axis fixed.
+          prior: attempts
+            .filter((a) => a.vramSharedPeakMib != null && a.ngl != null)
             .map((a) => ({
               ngl: a.ngl!,
+              ctx: a.candidateCtx,
               sharedPeakMib: a.vramSharedPeakMib ?? null,
               dedicatedPeakMib: a.vramProcessPeakMib ?? null,
+              estimatedGpuMib: a.vramNeededMib ?? null,
             })),
           // Best prefill rate from a rung that was NOT host-backed. Taking it
           // from any rung would let a rung already over the cliff set the
@@ -3585,7 +3598,7 @@ interface ProbeLoadInput {
    * host-backed check compare slopes instead of levels. Same-context is the
    * requirement, since a different context moves the KV cache and that shows
    * up in the same counter. */
-  priorSameCtx?: HostBackedRungSample[];
+  prior?: HostBackedRungSample[];
   /** Best prompt-processing rate this run has measured at a rung the
    * host-backed check left alone -- the reference the prefill cliff is judged
    * against. Null until one exists. */
@@ -3687,7 +3700,8 @@ async function runOneProbeLoad(input: ProbeLoadInput): Promise<ProbeAttemptOutco
       vramProcessPeakMib: stats.vram_process_peak_mib,
       sharedPeakMib: stats.vram_process_shared_peak_mib,
       perLayerMib: probePerLayerMib(payload),
-      priorSameCtx: input.priorSameCtx ?? [],
+      ctx: candidateCtx,
+      prior: input.prior ?? [],
     });
     const headroomFrac =
       stats.vram_peak_mib != null && payload.gpu_total_mib != null && payload.gpu_total_mib > 0

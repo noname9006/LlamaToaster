@@ -367,9 +367,11 @@ describe("detectHostBackedFallback", () => {
     12: { ded: 3434, shr: 2270 }, 14: { ded: 3584, shr: 2928 }, 18: { ded: 3543, shr: 4594 },
     26: { ded: 3736, shr: 7647 }, 41: { ded: 4069, shr: 13258 },
   };
-  const sample = (ngl: number) => ({ ngl, sharedPeakMib: SWEEP[ngl].shr, dedicatedPeakMib: SWEEP[ngl].ded });
+  // Every sample carries the same context: these are LAYER-axis comparisons,
+  // which is exactly the axis the layer phase moves while context stays pinned.
+  const sample = (ngl: number) => ({ ngl, ctx: 1024, sharedPeakMib: SWEEP[ngl].shr, dedicatedPeakMib: SWEEP[ngl].ded });
   const between = (lower: number, upper: number) =>
-    detectHostBackedFallback({ rung: sample(upper), priorSameCtx: [sample(lower)], perLayerMib: PER_LAYER_MIB });
+    detectHostBackedFallback({ rung: sample(upper), prior: [sample(lower)], perLayerMib: PER_LAYER_MIB });
 
   // The whole basis of the method: overhead does not move with ngl, spilled
   // weights move with it one-for-one. Measured, the two regimes do not
@@ -395,7 +397,7 @@ describe("detectHostBackedFallback", () => {
   // zero-layer rung is never allowed to be the reference.
   it("never uses a zero-layer rung as the reference", () => {
     const v = detectHostBackedFallback({
-      rung: sample(2), priorSameCtx: [sample(0)], perLayerMib: PER_LAYER_MIB, estimatedGpuMib: 1514,
+      rung: { ...sample(2), estimatedGpuMib: 1514 }, prior: [sample(0)], perLayerMib: PER_LAYER_MIB,
     });
     expect(v.method).toBe("ratio");
   });
@@ -408,7 +410,7 @@ describe("detectHostBackedFallback", () => {
   it("prefers the CLOSEST lower rung, so the slope stays local", () => {
     const v = detectHostBackedFallback({
       rung: sample(12),
-      priorSameCtx: [sample(2), sample(10), sample(4)],
+      prior: [sample(2), sample(10), sample(4)],
       perLayerMib: PER_LAYER_MIB,
     });
     // Against ngl 10 (the closest), not ngl 2: (2270-1279)/2/420 = 1.18.
@@ -433,7 +435,7 @@ describe("detectHostBackedFallback", () => {
   ])("refuses an adjacent reference: %s", (_label, lowNgl, lowShr, hiNgl, hiShr) => {
     const v = detectHostBackedFallback({
       rung: { ngl: hiNgl, sharedPeakMib: hiShr, dedicatedPeakMib: 3900 },
-      priorSameCtx: [{ ngl: lowNgl, sharedPeakMib: lowShr, dedicatedPeakMib: 3800 }],
+      prior: [{ ngl: lowNgl, sharedPeakMib: lowShr, dedicatedPeakMib: 3800 }],
       perLayerMib: PER_LAYER_MIB,
     });
     expect(v.method).not.toBe("slope");
@@ -446,7 +448,7 @@ describe("detectHostBackedFallback", () => {
     // the pair below it (12 vs 11) would read 0.86 and 13 vs 12 only 0.38.
     const v = detectHostBackedFallback({
       rung: { ngl: 11, sharedPeakMib: 1565, dedicatedPeakMib: 3790 },
-      priorSameCtx: [
+      prior: [
         { ngl: 9, sharedPeakMib: 786, dedicatedPeakMib: 3865 },
         { ngl: 10, sharedPeakMib: 931, dedicatedPeakMib: 4015 },
       ],
@@ -462,7 +464,7 @@ describe("detectHostBackedFallback", () => {
     const EST = (ngl: number) => Math.round(706 + 404 * ngl);
     const alone = (ngl: number) =>
       detectHostBackedFallback({
-        rung: sample(ngl), priorSameCtx: [], perLayerMib: PER_LAYER_MIB, estimatedGpuMib: EST(ngl),
+        rung: { ...sample(ngl), estimatedGpuMib: EST(ngl) }, prior: [], perLayerMib: PER_LAYER_MIB,
       });
 
     it.each([12, 14, 18, 26, 41])("convicts ngl %i with no reference to slope against", (ngl) => {
@@ -485,8 +487,8 @@ describe("detectHostBackedFallback", () => {
     it("convicts the estimate's own landing point, which is already spilling", () => {
       expect(
         detectHostBackedFallback({
-          rung: { ngl: 13, sharedPeakMib: 2599, dedicatedPeakMib: 3509 },
-          priorSameCtx: [], perLayerMib: PER_LAYER_MIB, estimatedGpuMib: EST(13),
+          rung: { ngl: 13, ctx: 1024, sharedPeakMib: 2599, dedicatedPeakMib: 3509, estimatedGpuMib: EST(13) },
+          prior: [], perLayerMib: PER_LAYER_MIB,
         }).hostBacked
       ).toBe(true);
     });
@@ -497,15 +499,15 @@ describe("detectHostBackedFallback", () => {
     it("leaves a 131072-token context at 4 layers alone", () => {
       expect(
         detectHostBackedFallback({
-          rung: { ngl: 4, sharedPeakMib: 810, dedicatedPeakMib: 2393 },
-          priorSameCtx: [], perLayerMib: PER_LAYER_MIB, estimatedGpuMib: 3276,
+          rung: { ngl: 4, ctx: 1024, sharedPeakMib: 810, dedicatedPeakMib: 2393, estimatedGpuMib: 3276 },
+          prior: [], perLayerMib: PER_LAYER_MIB,
         }).hostBacked
       ).toBe(false);
     });
 
     it("is unavailable with no estimate to judge against", () => {
       expect(
-        detectHostBackedFallback({ rung: sample(41), priorSameCtx: [], perLayerMib: PER_LAYER_MIB }).method
+        detectHostBackedFallback({ rung: sample(41), prior: [], perLayerMib: PER_LAYER_MIB }).method
       ).toBeNull();
     });
   });
@@ -513,8 +515,8 @@ describe("detectHostBackedFallback", () => {
   it("is unavailable -- never 'clean' -- with no shared-memory counter", () => {
     expect(
       detectHostBackedFallback({
-        rung: { ngl: 26, sharedPeakMib: null, dedicatedPeakMib: 3736 },
-        priorSameCtx: [sample(10)],
+        rung: { ngl: 26, ctx: 1024, sharedPeakMib: null, dedicatedPeakMib: 3736 },
+        prior: [sample(10)],
         perLayerMib: PER_LAYER_MIB,
       })
     ).toEqual({ hostBacked: false, method: null, slopeRatio: null, spilledLayers: null });
@@ -522,14 +524,14 @@ describe("detectHostBackedFallback", () => {
 
   it("falls back to the bootstrap when the per-layer size is unknown", () => {
     const v = detectHostBackedFallback({
-      rung: sample(26), priorSameCtx: [sample(10)], perLayerMib: null, estimatedGpuMib: 11213,
+      rung: { ...sample(26), estimatedGpuMib: 11213 }, prior: [sample(10)], perLayerMib: null,
     });
     expect(v.method).toBe("ratio");
     expect(v.hostBacked).toBe(true);
   });
 
   it("never judges a rung that asked for nothing on the GPU", () => {
-    expect(detectHostBackedFallback({ rung: sample(0), priorSameCtx: [], perLayerMib: PER_LAYER_MIB }).method).toBeNull();
+    expect(detectHostBackedFallback({ rung: sample(0), prior: [], perLayerMib: PER_LAYER_MIB }).method).toBeNull();
   });
 });
 
@@ -560,5 +562,65 @@ describe("isPrefillCliff", () => {
 
   it("says nothing when this rung has no prompt timing", () => {
     expect(isPrefillCliff(null, BEST_CLEAN)).toBe(false);
+  });
+});
+
+// The context axis, which had no slope at all until a real max_gpu run showed
+// its whole six-load context phase being judged by the bootstrap (probe
+// 79e4088d, 2026-09-05T18:11). Layers are pinned, context moves, so the unit
+// is the KV growth the estimator itself predicts between the two contexts --
+// the weights term is identical at both ends and cancels out of the
+// subtraction, taking its bias with it.
+describe("detectHostBackedFallback on the context axis", () => {
+  const PER_LAYER_MIB = 17205 / 41;
+  // From the run's own log lines, at 10 layers.
+  const EST: Record<number, number> = { 1024: 4747, 8192: 4887, 65536: 6007, 131072: 7287, 262144: 9847 };
+  const rung = (ctx: number, sharedPeakMib: number) => ({
+    ngl: 10, ctx, sharedPeakMib, dedicatedPeakMib: 4000, estimatedGpuMib: EST[ctx],
+  });
+  const check = (lo: [number, number], hi: [number, number]) =>
+    detectHostBackedFallback({
+      rung: rung(hi[0], hi[1]),
+      prior: [rung(lo[0], lo[1])],
+      perLayerMib: PER_LAYER_MIB,
+    });
+
+  it("uses a same-layers rung at a smaller context as the reference", () => {
+    expect(check([1024, 931], [262144, 2000]).method).toBe("slope");
+  });
+
+  it("leaves a context whose KV genuinely landed in VRAM alone", () => {
+    // 5100MiB of predicted KV growth, only ~1GiB of it system-RAM-backed.
+    expect(check([1024, 931], [262144, 1950]).hostBacked).toBe(false);
+  });
+
+  it("flags a context whose KV went to system RAM instead", () => {
+    // Nearly all of the predicted growth turns up in the shared counter.
+    const v = check([1024, 931], [262144, 5600]);
+    expect(v.hostBacked).toBe(true);
+    expect(v.slopeRatio!).toBeGreaterThan(0.5);
+  });
+
+  it("does not report a LAYER count for a context spill", () => {
+    // What grew is cache, not weights -- saying "3 layers' worth" would be a
+    // category error.
+    expect(check([1024, 931], [262144, 5600]).spilledLayers).toBeNull();
+  });
+
+  it("refuses a context step whose predicted KV growth is too small to measure", () => {
+    // 1024 -> 8192 at 10 layers moves the estimate by 140MiB, well under the
+    // driver's own allocation granularity. Falls through to the bootstrap.
+    expect(check([1024, 931], [8192, 1100]).method).toBe("ratio");
+  });
+
+  it("prefers the layer axis when both references exist", () => {
+    // A layer slope is the stronger comparison -- its unit is a fact from the
+    // model file rather than an estimator difference.
+    const v = detectHostBackedFallback({
+      rung: rung(262144, 5600),
+      prior: [rung(1024, 931), { ngl: 6, ctx: 262144, sharedPeakMib: 452, dedicatedPeakMib: 2853 }],
+      perLayerMib: PER_LAYER_MIB,
+    });
+    expect(v.spilledLayers).not.toBeNull();
   });
 });

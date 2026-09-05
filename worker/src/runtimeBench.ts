@@ -805,6 +805,10 @@ export function probeSucceeded(input: {
   // compare against).
   ngl: number;
   estimatedVramMib: number | null;
+  /** This rung's context. Needed to pick a comparable reference: a layer
+   * slope compares rungs at the same context, a context slope compares rungs
+   * at the same layer count. */
+  ctx?: number;
   // MEASURED, per-process, both from MemorySampler: this load's own dedicated
   // VRAM peak and its own system-RAM-backed GPU allocation peak. The former
   // is what the ratio check below is supposed to compare against -- vramPeakMib
@@ -819,10 +823,11 @@ export function probeSucceeded(input: {
   // HostBackedFallbackInput.perLayerMib for why this is a fact from disk
   // rather than an estimate.
   perLayerMib?: number | null;
-  // Rungs already measured in this run at THIS SAME context, which is what
-  // lets the host-backed check use a slope instead of a level. Empty (or
-  // absent) simply falls back to its single-rung bootstrap.
-  priorSameCtx?: HostBackedRungSample[];
+  // Every rung already measured in this run. The host-backed check picks its
+  // own comparison from them -- a same-context rung for the layer slope, a
+  // same-layers rung for the context slope. Empty (or absent) falls back to
+  // the single-rung bootstrap.
+  prior?: HostBackedRungSample[];
 }): {
   ok: boolean;
   spill: boolean;
@@ -861,12 +866,13 @@ export function probeSucceeded(input: {
       ? detectHostBackedFallback({
           rung: {
             ngl: input.ngl,
+            ctx: input.ctx,
             sharedPeakMib: input.sharedPeakMib ?? null,
             dedicatedPeakMib: input.vramProcessPeakMib ?? null,
+            estimatedGpuMib: input.estimatedVramMib,
           },
-          priorSameCtx: input.priorSameCtx ?? [],
+          prior: input.prior ?? [],
           perLayerMib: input.perLayerMib ?? null,
-          estimatedGpuMib: input.estimatedVramMib,
         })
       : noFallback;
   // Per-process where available -- whole-adapter only as a last resort, since
