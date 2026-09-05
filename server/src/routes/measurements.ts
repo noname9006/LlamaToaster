@@ -136,6 +136,16 @@ function validateOneProbeAttempt(raw: unknown, label: string): ProbeAttemptRepor
     ram_peak_mib: optionalNonNegative(a.ram_peak_mib, `${label}.ram_peak_mib`),
     vram_shared_peak_mib: optionalNonNegative(a.vram_shared_peak_mib, `${label}.vram_shared_peak_mib`),
     gen_tps: optionalNonNegative(a.gen_tps, `${label}.gen_tps`),
+    pp_tps: optionalNonNegative(a.pp_tps, `${label}.pp_tps`),
+    ttft_ms: optionalNonNegative(a.ttft_ms, `${label}.ttft_ms`),
+    prefill_cliff: optionalBoolean(a.prefill_cliff, `${label}.prefill_cliff`),
+    // Free-form only in the type system; anything else is dropped rather than
+    // rejected, same fail-soft posture as every other optional worker field.
+    host_backed_method:
+      a.host_backed_method === "slope" || a.host_backed_method === "ratio" ? a.host_backed_method : null,
+    host_backed_slope: typeof a.host_backed_slope === "number" && Number.isFinite(a.host_backed_slope)
+      ? a.host_backed_slope
+      : null,
     error: typeof a.error === "string" ? a.error : undefined,
     // N2 batch dedup -- the worker only ever echoes back a source_run_id the
     // server itself handed it via GET .../probe-dedup, so a plain type check

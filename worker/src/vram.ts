@@ -223,6 +223,11 @@ function parseMiB(raw: string | undefined): number | null {
 //      identically to an AMD/Vulkan or an NVIDIA/CUDA process's pid).
 // The counter instances are named `pid_<pid>_luid_0x..._phys_<n>` (one per
 // memory segment), so the wildcard matches and Measure-Object sums them.
+// The wildcard is anchored on the trailing underscore (`pid_<pid>_*`, not
+// `pid_<pid>*`) because a bare prefix also matches any LONGER pid sharing
+// those leading digits -- `pid_4*` sums pid 4452's segments into pid 4's
+// total. Confirmed live on this machine, where pid 4 (System) and pid 4452
+// both held GPU allocations at the same time.
 // Caveats: an instance only exists while the process actually holds that
 // kind of GPU allocation (a freshly-spawned llama-bench may not have one yet
 // -- fine, the sampler just doesn't grow that stream this tick), and
@@ -236,10 +241,10 @@ async function readWindowsUsedMib(
     const lines = [
       `$u = (Get-Counter '\\GPU Adapter Memory(*)\\Dedicated Usage' -ErrorAction SilentlyContinue).CounterSamples | Measure-Object -Property CookedValue -Sum | Select-Object -ExpandProperty Sum`,
       pid != null
-        ? `$p = (Get-Counter '\\GPU Process Memory(pid_${pid}*)\\Dedicated Usage' -ErrorAction SilentlyContinue).CounterSamples | Measure-Object -Property CookedValue -Sum | Select-Object -ExpandProperty Sum`
+        ? `$p = (Get-Counter '\\GPU Process Memory(pid_${pid}_*)\\Dedicated Usage' -ErrorAction SilentlyContinue).CounterSamples | Measure-Object -Property CookedValue -Sum | Select-Object -ExpandProperty Sum`
         : null,
       pid != null
-        ? `$s = (Get-Counter '\\GPU Process Memory(pid_${pid}*)\\Shared Usage' -ErrorAction SilentlyContinue).CounterSamples | Measure-Object -Property CookedValue -Sum | Select-Object -ExpandProperty Sum`
+        ? `$s = (Get-Counter '\\GPU Process Memory(pid_${pid}_*)\\Shared Usage' -ErrorAction SilentlyContinue).CounterSamples | Measure-Object -Property CookedValue -Sum | Select-Object -ExpandProperty Sum`
         : null,
       `Write-Output $u`,
       pid != null ? `Write-Output $p` : null,
@@ -277,7 +282,7 @@ async function readWindowsProcessSharedMib(pid: number): Promise<number | null> 
         "-NoProfile",
         "-NonInteractive",
         "-Command",
-        `(Get-Counter '\\GPU Process Memory(pid_${pid}*)\\Shared Usage' -ErrorAction SilentlyContinue).CounterSamples | Measure-Object -Property CookedValue -Sum | Select-Object -ExpandProperty Sum`,
+        `(Get-Counter '\\GPU Process Memory(pid_${pid}_*)\\Shared Usage' -ErrorAction SilentlyContinue).CounterSamples | Measure-Object -Property CookedValue -Sum | Select-Object -ExpandProperty Sum`,
       ],
       { timeout: EXEC_TIMEOUT_MS, windowsHide: true }
     );

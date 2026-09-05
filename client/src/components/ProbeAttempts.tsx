@@ -89,8 +89,48 @@ export function ProbeAttempts({ testId, refreshKey }: ProbeAttemptsProps) {
   if (error) return <p className="text-sm text-danger">Could not load this probe's loads: {error}</p>;
   if (!attempts) return <p className="text-sm text-muted">Loading probe loads…</p>;
 
+  // Derived from the rows already on screen -- no extra endpoint, and it can
+  // only ever appear on a machine where a rung actually MEASURED the paging.
+  // On a platform with no shared-memory counter (CUDA-on-Linux, Metal) every
+  // vram_shared_peak_mib is null and this stays silent, which is correct:
+  // there, an oversubscribed allocation fails outright instead of paging.
+  const spilled = attempts.filter((a) => a.host_backed_method != null && a.vram_discrepancy === 1 && a.ngl != null);
+  const lastClean = attempts
+    .filter((a) => a.vram_shared_peak_mib != null && a.vram_discrepancy !== 1 && a.ngl != null)
+    .reduce<ProbeAttemptDto | null>((best, a) => (best == null || a.ngl! > best.ngl! ? a : best), null);
+  const worstSpill = spilled.reduce<ProbeAttemptDto | null>(
+    (w, a) => (w == null || (a.vram_shared_peak_mib ?? 0) > (w.vram_shared_peak_mib ?? 0) ? a : w),
+    null
+  );
+  const cliff = attempts
+    .filter((a) => a.prefill_cliff === 1 && a.ngl != null)
+    .reduce<ProbeAttemptDto | null>((best, a) => (best == null || a.ngl! < best.ngl! ? a : best), null);
+
   return (
     <div className="rounded-xl border border-border bg-surface p-4">
+      {worstSpill && (
+        <div className="mb-3 rounded-lg border border-warning/40 bg-warning-bg px-3 py-2 text-xs text-warning">
+          <span className="font-bold">This GPU pages model weights to system RAM.</span>{" "}
+          {lastClean?.ngl != null ? (
+            <>
+              Past <span className="font-mono font-bold">{lastClean.ngl}</span> layers, llama.cpp reports the layers on
+              the GPU but the driver serves them from system RAM.{" "}
+            </>
+          ) : (
+            <>llama.cpp reports layers on the GPU that the driver is serving from system RAM. </>
+          )}
+          Measured up to <span className="font-mono font-bold">{mib(worstSpill.vram_shared_peak_mib)}</span> in host
+          memory on this probe. Layer counts above that boundary are not real GPU offload on this machine, so a
+          maximum-offload result will not reflect its true GPU speed.
+          {cliff?.ngl != null && (
+            <>
+              {" "}
+              Prompt processing degrades earlier still, from{" "}
+              <span className="font-mono font-bold">{cliff.ngl}</span> layers.
+            </>
+          )}
+        </div>
+      )}
       <div className="flex flex-wrap items-baseline justify-between gap-2">
         <span className="text-[11px] font-semibold uppercase tracking-wide text-muted">
           Context tests — every load this probe performed
@@ -114,6 +154,15 @@ export function ProbeAttempts({ testId, refreshKey }: ProbeAttemptsProps) {
               <th className="px-2 py-1.5 text-right" rowSpan={2}>RAM free</th>
               <th className="px-2 py-1.5 text-center" colSpan={2}>RAM Peak</th>
               <th className="px-2 py-1.5 text-right" rowSpan={2}>gen tok/s</th>
+              <th className="px-2 py-1.5 text-right" rowSpan={2} title="Prompt-processing rate. Prefill has its own placement cliff, several layers BELOW the one where weights start spilling -- a rung can have the best gen tok/s while being several times worse to first token.">
+                pp tok/s
+              </th>
+              <th className="px-2 py-1.5 text-right" rowSpan={2} title="Time to first token, measured from request send to the first streamed chunk.">
+                TTFT
+              </th>
+              <th className="px-2 py-1.5 text-right" rowSpan={2} title="Layers' worth of system-RAM-backed GPU memory appearing per layer added, against a lower-offload load at the same context. Buffer overhead does not scale with layer count; spilled weights do, one for one -- so a value near 1 means the added layers are not on the GPU.">
+                slope
+              </th>
               <th className="px-2 py-1.5" rowSpan={2}>result</th>
             </tr>
             <tr className="border-b border-border text-left text-[10px] uppercase tracking-wide text-muted">
@@ -172,6 +221,30 @@ export function ProbeAttempts({ testId, refreshKey }: ProbeAttemptsProps) {
                   <td className="px-2 py-1.5 text-right font-mono text-muted">{mib(a.ram_peak_mib)}</td>
                   <td className="px-2 py-1.5 text-right font-mono text-muted">
                     {a.gen_tps != null ? a.gen_tps.toFixed(1) : "—"}
+                  </td>
+                  <td
+                    className={`px-2 py-1.5 text-right font-mono ${a.prefill_cliff === 1 ? "font-bold text-warning" : "text-muted"}`}
+                    title={
+                      a.prefill_cliff === 1
+                        ? "Prompt processing has collapsed at this placement -- the batch compute buffer is being served from system RAM. Generation can still look fine here; time to first token will not."
+                        : undefined
+                    }
+                  >
+                    {a.pp_tps != null ? a.pp_tps.toFixed(1) : "—"}
+                    {a.prefill_cliff === 1 ? " ⚠" : ""}
+                  </td>
+                  <td className="px-2 py-1.5 text-right font-mono text-muted">
+                    {a.ttft_ms != null ? `${(a.ttft_ms / 1000).toFixed(2)}s` : "—"}
+                  </td>
+                  <td
+                    className={`px-2 py-1.5 text-right font-mono ${a.host_backed_slope != null && a.host_backed_slope > 0.5 ? "font-bold text-warning" : "text-muted"}`}
+                    title={
+                      a.host_backed_method === "ratio"
+                        ? "No comparable lower-offload load at this context, so this rung was judged against its own predicted footprint instead of a slope."
+                        : undefined
+                    }
+                  >
+                    {a.host_backed_slope != null ? a.host_backed_slope.toFixed(2) : a.host_backed_method === "ratio" ? "n/a" : "—"}
                   </td>
                   <td className="px-2 py-1.5 text-muted">
                     <div className="flex flex-wrap items-center gap-1.5">
