@@ -439,6 +439,61 @@ describe("POST /api/runs/:id/probe-result (N2)", () => {
     expect(rungs.map((r) => r.vram_shared_peak_mib)).toEqual([12000, null]);
   });
 
+  // Guard against the failure mode that produced two separate live bugs: a
+  // field is added to the worker outcome, the report type, the DB schema, the
+  // repo insert, the DTO and the client -- and dropped by whichever single
+  // link in that chain nobody updated. Both times the symptom was identical
+  // and silent: a column of em-dashes in the UI, with the worker's own log
+  // printing the value it had just measured.
+  it("stores every measurement a rung reports, dropping none silently", async () => {
+    makeRun("probe-roundtrip", { kind: "probe", worker: workerId, config: { probe: probeSpec } });
+    const rung = {
+      candidate_ctx: 4096,
+      ngl: 13,
+      ok: true,
+      oom: false,
+      spill: false,
+      vram_needed_mib: 5958,
+      vram_free_mib: 5778,
+      vram_peak_mib: 6761,
+      vram_process_peak_mib: 4380,
+      ram_needed_mib: 12341,
+      ram_free_mib: 24479,
+      ram_peak_mib: 16657,
+      ram_total_peak_mib: 21000,
+      vram_shared_peak_mib: 1821,
+      gen_tps: 10.3,
+      pp_tps: 18.9,
+      ttft_ms: 9389,
+      prefill_cliff: true,
+      host_backed_method: "slope",
+      host_backed_slope: 0.92,
+      vram_discrepancy: false,
+      gpu_layers_resident_est: 13,
+      gpu_layers_resident_exact: true,
+    };
+    const res = await post(
+      "/api/runs/probe-roundtrip/probe-result",
+      { status: "verified", verified_ctx_tokens: 4096, attempts: [rung] },
+      workerToken
+    );
+    expect(res.status).toBe(200);
+
+    const [row] = repo.probeAttemptsRepo.listForTest("probe-roundtrip") as unknown as Record<string, unknown>[];
+    const dropped = Object.entries(rung)
+      .filter(([key]) => key !== "ok" && key !== "oom" && key !== "spill")
+      .filter(([key]) => row[key] === null || row[key] === undefined)
+      .map(([key]) => key);
+    expect(dropped).toEqual([]);
+    // Spot-check the two that were actually being lost, and one boolean, so a
+    // future "stored something, but the wrong thing" cannot pass either.
+    expect(row.vram_process_peak_mib).toBe(4380);
+    expect(row.ram_total_peak_mib).toBe(21000);
+    expect(row.pp_tps).toBe(18.9);
+    expect(row.host_backed_slope).toBe(0.92);
+    expect(row.prefill_cliff).toBe(1);
+  });
+
   it("rejects a non-boolean vram_discrepancy", async () => {
     makeRun("probe-vram-discrepancy-bad", { kind: "probe", worker: workerId, config: { probe: probeSpec } });
     const res = await post(

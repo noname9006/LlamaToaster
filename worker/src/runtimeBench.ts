@@ -8,7 +8,7 @@
 // is unit-tested there; this file is the process and HTTP plumbing over it.
 
 import { spawn, type ChildProcess } from "node:child_process";
-import type { IngestResultInput } from "../../shared/types.js";
+import type { IngestResultInput, ProbeAttemptReport } from "../../shared/types.js";
 import { CURVE_METHOD_VERSION, SERVER_METHOD_VERSION, type CaveatFlag } from "../../shared/types.js";
 import type { SweepItem } from "../../shared/sweep.js";
 import {
@@ -926,3 +926,38 @@ export function toBenchResult(input: {
 
 export const RUNTIME_DEFAULT_TIMEOUT_MS = DEFAULT_TIMEOUT_MS;
 export { contextSizeForSlots };
+
+// The outcome -> wire shape for one probe rung, used by BOTH the live per-rung
+// tick and the final result post. Lives here rather than in index.ts purely so
+// it can be unit-tested: a field that exists on the outcome but is missing
+// from this mapping is computed, logged, and then silently thrown away, which
+// is exactly how pp/ttft/slope reached production as a column of em-dashes.
+export function toProbeAttemptReport(attempt: ProbeAttemptOutcome): ProbeAttemptReport {
+  return {
+    candidate_ctx: attempt.candidateCtx,
+    ok: attempt.ok,
+    oom: attempt.oom,
+    spill: attempt.spill,
+    ngl: attempt.ngl,
+    vram_peak_mib: attempt.vramPeakMib,
+    gen_tps: attempt.genTps,
+    vram_needed_mib: attempt.vramNeededMib,
+    vram_free_mib: attempt.vramFreeMib,
+    ram_needed_mib: attempt.ramNeededMib,
+    ram_free_mib: attempt.ramFreeMib,
+    ram_peak_mib: attempt.ramPeakMib,
+    vram_process_peak_mib: attempt.vramProcessPeakMib,
+    ram_total_peak_mib: attempt.ramTotalPeakMib,
+    vram_shared_peak_mib: attempt.vramSharedPeakMib,
+    pp_tps: attempt.ppTps,
+    ttft_ms: attempt.ttftMs,
+    prefill_cliff: attempt.prefillCliff,
+    host_backed_method: attempt.hostBackedMethod,
+    host_backed_slope: attempt.hostBackedSlopeRatio,
+    error: attempt.error,
+    reused_from_run_id: attempt.reusedFromRunId,
+    vram_discrepancy: attempt.vramDiscrepancy,
+    gpu_layers_resident_est: attempt.gpuLayersResidentEst,
+    gpu_layers_resident_exact: attempt.gpuLayersResidentExact,
+  };
+}
