@@ -37,6 +37,17 @@ export function useWorkerStatuses() {
         if (cancelled) return;
         setWorkers(list);
         setLoaded(true);
+      } catch {
+        // Transient (server restart, brief network drop, a 401 during a
+        // session refresh) -- the finally below reschedules regardless, so the
+        // loop self-heals on the next tick and the page keeps showing its last
+        // good data rather than blanking.
+        //
+        // Swallowed rather than allowed to propagate: poll() is invoked
+        // un-awaited (`void poll()` below, and again from its own setTimeout),
+        // so an escaping rejection has nowhere to go and surfaces as an
+        // "Uncaught (in promise)" on EVERY failed poll -- once per interval,
+        // for as long as the server is unreachable.
       } finally {
         if (!cancelled) timerRef.current = window.setTimeout(poll, POLL_MS);
       }
