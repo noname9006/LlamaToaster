@@ -10,7 +10,6 @@ import {
   streamedCompletion,
   LlamaServerOutputError,
   RuntimeServerStartupError,
-  PROBE_MIN_GEN_TPS,
   type StreamedRequestInput,
 } from "./runtimeBench.js";
 import type { StreamSample } from "./loadDriver.js";
@@ -277,8 +276,12 @@ describe("N5 knee ladder execution", () => {
 // shared/probeLadder.test.ts); what stays here is the per-rung verdict, which
 // is about one load rather than about the search.
 describe("N2 probe success rule", () => {
-  it("treats loading-but-crawling as failure -- loading is not the same as usable", () => {
-    const crawling = probeSucceeded({
+  // The 1 tok/s floor is gone. It rejected a placement on a rate measured over
+  // PROBE_EXERCISED_TOKENS -- a number that describes ~320 tokens of context
+  // and not the configuration in the row -- while the thing it was proxying
+  // for (weights served from system RAM) is now measured directly.
+  it("no longer fails a slow load: a rate is reported, not judged", () => {
+    const slow = probeSucceeded({
       oom: false,
       vramPeakMib: 7000,
       gpuTotalMib: 8192,
@@ -286,8 +289,20 @@ describe("N2 probe success rule", () => {
       ngl: 0,
       estimatedVramMib: null,
     });
-    expect(crawling.ok).toBe(false);
-    expect(crawling.reason).toContain(`${PROBE_MIN_GEN_TPS} tok/s floor`);
+    expect(slow.ok).toBe(true);
+  });
+
+  it("still fails a load that generated nothing measurable", () => {
+    const dead = probeSucceeded({
+      oom: false,
+      vramPeakMib: 7000,
+      gpuTotalMib: 8192,
+      genTps: null,
+      ngl: 0,
+      estimatedVramMib: null,
+    });
+    expect(dead.ok).toBe(false);
+    expect(dead.reason).toContain("no measurable generation");
   });
 
   it("treats a spill past the adapter total as failure", () => {

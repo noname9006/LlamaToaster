@@ -192,6 +192,12 @@ export const HOST_BACKED_MIN_SLOPE_SPAN = 2;
  */
 export const HOST_BACKED_MIN_KV_GROWTH_MIB = 512;
 
+/** Above this share of a context's newly allocated memory sitting in system
+ * RAM, the rung carries a KV-spill caveat. A reporting threshold only -- it
+ * never fails anything. Measured: a genuinely comfortable context ran 0.50,
+ * one whose cache was entirely host-backed ran 0.98. */
+export const KV_HOST_BACKED_REPORT_FRAC = 0.6;
+
 /**
  * Bootstrap threshold for the FIRST rung of a phase, which by definition has
  * no lower rung to take a slope against: what fraction of a placement's own
@@ -403,7 +409,25 @@ export interface HostBackedFallbackInput {
 }
 
 export interface HostBackedFallbackVerdict {
+  /** Weights are demonstrably in system RAM. This is the one that fails a
+   * rung: it has an immediate, measured cost -- every token re-reads those
+   * weights across the bus. NEVER set by the context axis; see
+   * kvHostBackedFrac. */
   hostBacked: boolean;
+  /** Which axis the slope was taken on. */
+  axis: "ngl" | "ctx" | null;
+  /** CONTEXT axis only: what fraction of the memory this larger context
+   * actually allocated ended up in system RAM rather than VRAM.
+   *
+   * Deliberately not a failure. A host-backed KV cache costs nothing until
+   * the context is used, and the probe never uses it -- every rung runs a
+   * 64-token prompt and 256 generated tokens whatever `-c` says, so a
+   * 262144-token cache is allocated and never read. Measured: context 2048 ->
+   * 262144 pushed 98% of the new allocation to host memory and changed
+   * generation speed by 5%. Failing on that would be failing on predicted
+   * harm; reporting it lets a caller see that the verified context is an
+   * ALLOCATION ceiling whose speed was measured at ~320 tokens. */
+  kvHostBackedFrac: number | null;
   /** Which evidence decided it -- "slope" when a comparable lower-ngl rung
    * existed, "ratio" for the single-rung bootstrap, null when neither could
    * run. Also how a caller tells a MEASURED verdict from an absent one. */
@@ -418,6 +442,8 @@ export interface HostBackedFallbackVerdict {
 
 const UNAVAILABLE_HOST_BACKED: HostBackedFallbackVerdict = {
   hostBacked: false,
+  axis: null,
+  kvHostBackedFrac: null,
   method: null,
   slopeRatio: null,
   spilledLayers: null,
@@ -479,6 +505,8 @@ export function detectHostBackedFallback(input: HostBackedFallbackInput): HostBa
     const slopeRatio = deltaShared / deltaNgl / perLayerMib;
     return {
       hostBacked: slopeRatio > HOST_BACKED_SLOPE_RATIO,
+      axis: "ngl",
+      kvHostBackedFrac: null,
       method: "slope",
       slopeRatio,
       spilledLayers: deltaShared > 0 ? Math.round(deltaShared / perLayerMib) : 0,
@@ -504,14 +532,24 @@ export function detectHostBackedFallback(input: HostBackedFallbackInput): HostBa
           )
           .sort((a, b) => b.ctx! - a.ctx!)[0]
       : undefined;
-  if (ctxRef) {
-    const expectedGrowthMib = rung.estimatedGpuMib! - ctxRef.estimatedGpuMib!;
-    if (expectedGrowthMib >= Math.max(perLayerMib ?? 0, HOST_BACKED_MIN_KV_GROWTH_MIB)) {
-      const slopeRatio = (rung.sharedPeakMib - ctxRef.sharedPeakMib!) / expectedGrowthMib;
+  if (ctxRef && rung.dedicatedPeakMib != null && ctxRef.dedicatedPeakMib != null) {
+    // Denominator is what this context actually ALLOCATED, not what the
+    // estimator predicted it would. The prediction is the wrong yardstick
+    // here and measurably so: at ngl 13 it called for 6604MiB of extra KV
+    // between contexts 2048 and 262144, while only 2641MiB was allocated
+    // anywhere -- so dividing real spill by it deflated a 98% spill to 0.39
+    // and made the row look benign. Both terms of this ratio are now measured.
+    const deltaShared = rung.sharedPeakMib - ctxRef.sharedPeakMib!;
+    const deltaTotal = deltaShared + (rung.dedicatedPeakMib - ctxRef.dedicatedPeakMib);
+    if (deltaTotal >= HOST_BACKED_MIN_KV_GROWTH_MIB) {
+      const frac = deltaShared / deltaTotal;
       return {
-        hostBacked: slopeRatio > HOST_BACKED_SLOPE_RATIO,
+        // A KV spill never fails the rung -- see kvHostBackedFrac's comment.
+        hostBacked: false,
+        axis: "ctx",
+        kvHostBackedFrac: frac,
         method: "slope",
-        slopeRatio,
+        slopeRatio: frac,
         // Layers are the wrong unit for a context spill; what grew is cache.
         spilledLayers: null,
       };
@@ -535,6 +573,8 @@ export function detectHostBackedFallback(input: HostBackedFallbackInput): HostBa
   if (input.rung.estimatedGpuMib == null || input.rung.estimatedGpuMib <= 0) return UNAVAILABLE_HOST_BACKED;
   return {
     hostBacked: rung.sharedPeakMib / input.rung.estimatedGpuMib > HOST_BACKED_BOOTSTRAP_FRAC,
+    axis: null,
+    kvHostBackedFrac: null,
     method: "ratio",
     slopeRatio: null,
     spilledLayers: null,

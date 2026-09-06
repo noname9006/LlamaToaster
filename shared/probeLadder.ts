@@ -106,6 +106,22 @@ export const PROBE_LADDER_MIN_CTX = 1024;
  */
 export const PROBE_MAX_LOADS = 24;
 
+/**
+ * What one rung actually exercises, regardless of the context it allocates.
+ *
+ * Every load runs this prompt and generates this many tokens whether `-c` is
+ * 1024 or 262144, so the speeds a rung reports describe roughly
+ * PROBE_EXERCISED_TOKENS of context and NOT the context in its row. A
+ * 262144-token KV cache is allocated and never read. Lives here, shared, so
+ * the worker that sets these values and the UI that has to caption them
+ * cannot drift apart -- the caption is the only thing standing between a
+ * reader and "this machine does 10.4 tok/s at 262k tokens", which is not what
+ * was measured.
+ */
+export const PROBE_PROMPT_TOKENS = 64;
+export const PROBE_GEN_TOKENS = 256;
+export const PROBE_EXERCISED_TOKENS = PROBE_PROMPT_TOKENS + PROBE_GEN_TOKENS;
+
 /** ngl converges once a bracket is this narrow -- every integer is already
  * individually selectable, so there is no coarser "basic" grid to round to
  * the way context has. */
@@ -280,6 +296,62 @@ export function nextSliderCandidate(input: SliderStepInput): number | null {
   return history.some((h) => h.value === candidate) ? null : candidate;
 }
 
+/**
+ * Binary search over the SAME power-of-two stop list nextSliderCandidate
+ * walks, for a phase whose goal is the ceiling rather than a boundary near
+ * some estimate.
+ *
+ * The walk costs one load per notch, in whichever direction it is going. That
+ * is the right shape when the seed is a good guess and the answer is nearby,
+ * and the wrong shape when the mode already knows which end it wants: seeded
+ * at the trained-context ceiling, a machine with room to spare converges in a
+ * SINGLE load, and one without it brackets in log2(stops) instead of walking
+ * every doubling down.
+ *
+ * Measured motivation: a max_gpu probe spent 8 of its 13 loads walking
+ * 1024 -> 262144 one notch at a time, every rung passing, on a model whose KV
+ * cache is a rounding error next to its weights. Those loads belong to the
+ * layer axis, which on the same machine spanned 13.1 -> 6.9 tok/s.
+ *
+ * Every value tested is still a real slider stop, so `fine` refinement inside
+ * the converged bracket works exactly as it does after a walk.
+ */
+export function nextStopBisectCandidate(input: SliderStepInput): number | null {
+  const { history, stops } = input;
+  if (history.length === 0 || stops.length === 0) return null;
+  const tried = new Set(history.map((h) => h.value));
+  const idxOf = (value: number) => {
+    const exact = stops.indexOf(value);
+    return exact >= 0 ? exact : nearestStopIndex(stops, value);
+  };
+  const goodIdx = history.filter((h) => h.ok).map((h) => idxOf(h.value));
+  const badIdx = history.filter((h) => !h.ok).map((h) => idxOf(h.value));
+  const bestGood = goodIdx.length > 0 ? Math.max(...goodIdx) : null;
+  // Only a failure ABOVE the best success bounds the search -- a stray failure
+  // below one already proven to work is noise, same rule the ngl axis uses.
+  const badsAbove = badIdx.filter((b) => bestGood === null || b > bestGood);
+  const worstBad = badsAbove.length > 0 ? Math.min(...badsAbove) : null;
+
+  // Bracketed: adjacent stops means there is nothing coarser left to try.
+  if (bestGood !== null && worstBad !== null) {
+    if (worstBad - bestGood <= 1) return null;
+    const mid = Math.floor((bestGood + worstBad) / 2);
+    return tried.has(stops[mid]) ? null : stops[mid];
+  }
+  // Nothing has failed yet: the only thing left worth testing is higher, and
+  // a seed at the ceiling means there is nothing higher at all.
+  if (bestGood !== null) {
+    if (bestGood >= stops.length - 1) return null;
+    const mid = Math.ceil((bestGood + stops.length - 1) / 2);
+    return tried.has(stops[mid]) ? null : stops[mid];
+  }
+  // Everything has failed so far: bisect down toward the floor.
+  const worstTried = Math.min(...badIdx);
+  if (worstTried <= 0) return null;
+  const mid = Math.floor(worstTried / 2);
+  return tried.has(stops[mid]) ? null : stops[mid];
+}
+
 function nearestStopIndex(stops: readonly number[], target: number): number {
   let best = 0;
   let bestDist = Math.abs(target - stops[0]);
@@ -301,6 +373,11 @@ export interface SliderRefineInput {
   granularity: ProbeGranularity;
   min: number;
   max: number;
+  /** Seeded at the ceiling and bisecting, rather than walking a notch at a
+   * time from an estimate -- for a mode that wants the largest context that
+   * loads rather than the boundary nearest a guess. See
+   * nextStopBisectCandidate. */
+  ceilingFirst?: boolean;
 }
 
 /**
@@ -330,7 +407,12 @@ export function nextSliderRefineCandidate(input: SliderRefineInput): number | nu
   const stopSet = new Set(stops);
   const stillWalking = history.every((h) => stopSet.has(h.value));
   if (stillWalking) {
-    const sliderNext = nextSliderCandidate({ history, stops });
+    // Same stop grid either way; only how it is traversed differs. `fine`
+    // refinement below is unaffected, since both leave a converged bracket of
+    // two adjacent real stops behind them.
+    const sliderNext = input.ceilingFirst
+      ? nextStopBisectCandidate({ history, stops })
+      : nextSliderCandidate({ history, stops });
     if (sliderNext !== null) return sliderNext;
   }
   if (granularity !== "fine") return null;
@@ -442,6 +524,26 @@ interface PhaseSpec {
    */
   searchStyle: "bisect" | "direct" | "slider_refine";
   /**
+   * Traverse the ctx stop grid by BISECTION FROM THE CEILING rather than by
+   * walking up a notch at a time (nextStopBisectCandidate vs
+   * nextSliderCandidate). Same grid, same converged bracket, same `fine`
+   * refinement afterwards -- only the order of visits changes.
+   *
+   * For a mode whose goal IS the ceiling, the walk is pure overhead whenever
+   * context is cheap: measured live on an 8GiB card with a weights-bound MoE,
+   * max_gpu spent 8 of its 13 loads climbing 1024 -> 262144 without a single
+   * failure, on an axis where throughput then varied by 4% (most of it noise)
+   * while the layer axis it had already left behind spanned 2x. Seeding at
+   * the ceiling makes that case cost ONE load, and a genuinely context-bound
+   * machine cost log2(stops) instead of a full climb.
+   *
+   * Deliberately NOT applied to modes that seed from the user's own context
+   * (balanced, fixed_offload): there the seed is the answer being checked,
+   * not a bound being searched for, and jumping to the ceiling would spend
+   * loads far away from what the user asked about.
+   */
+  ceilingFirst?: boolean;
+  /**
    * Re-pin the OTHER axis at this value for the duration of this phase,
    * instead of inheriting whatever the previous phase resolved it to. Only
    * max_gpu's back-off phases use it: giving layers back is only meaningful
@@ -538,6 +640,13 @@ function phaseSpecFor(
     shrinkTarget: PROBE_LADDER_MIN_CTX,
     searchStyle: "slider_refine",
   });
+  // Same phase, entered from the top: the seed IS the ceiling, and failures
+  // bisect down the stop grid instead of the walk stepping up to it.
+  const ctxCeilingPhase = (): PhaseSpec => ({
+    ...ctxPhase(maxCtx),
+    seed: maxCtx,
+    ceilingFirst: true,
+  });
   /**
    * "Now add layers at the context we just resolved" -- max_context's and
    * balanced's phase 1. The seed is always a rung phase 0 already loaded
@@ -618,7 +727,11 @@ function phaseSpecFor(
           searchStyle: "direct",
         };
       }
-      if (phaseIndex === 1) return ctxPhase(calculateCtx(pinnedNgl));
+      // The estimate no longer picks the seed here: this mode wants the
+      // largest context its resolved placement will hold, so the ceiling is
+      // the hypothesis worth testing first. A machine where it fits pays one
+      // load; one where it does not brackets down the same stop grid.
+      if (phaseIndex === 1) return ctxCeilingPhase();
       // Back-off. The layer phase pinned ctx at the floor while it searched,
       // so "the most layers that fit" can be a placement with room for
       // nothing else -- and phase 1 converging AT that same floor is exactly
@@ -653,6 +766,12 @@ function phaseSpecFor(
       // usable context in the first place, and re-seeding on it walks the
       // ladder back down through failures to get here anyway. The proven
       // rung costs no load (history reuse), so this walks up from it.
+      // NOT ceiling-first, unlike phase 1: this phase only exists because the
+      // context axis already collapsed to the floor at the previous
+      // placement, so "context is tight here" is established rather than
+      // unknown. Phase 2 has just proved backoffCtx loads, and walking up
+      // from a proven rung costs one load where bisecting down from the
+      // ceiling costs log2(stops) re-proving what the back-off implied.
       if (phaseIndex === 3) return ctxPhase(pinnedCtx);
       return null;
 
@@ -845,7 +964,14 @@ export function nextLadderRung(input: LadderInput): LadderRung | null {
 
       candidate =
         spec.searchStyle === "slider_refine"
-          ? nextSliderRefineCandidate({ history: outcomes, stops: stops!, granularity: input.granularity, min, max })
+          ? nextSliderRefineCandidate({
+              history: outcomes,
+              stops: stops!,
+              granularity: input.granularity,
+              min,
+              max,
+              ceilingFirst: spec.ceilingFirst,
+            })
           : spec.searchStyle === "direct"
           ? nextDirectCandidate({ history: outcomes, growTarget: spec.growTarget, shrinkTarget: spec.shrinkTarget, min, max, tolerance })
           : nextAnchoredCandidate({ history: outcomes, growTarget: spec.growTarget, shrinkTarget: spec.shrinkTarget, min, max, tolerance });

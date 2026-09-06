@@ -14,6 +14,7 @@ import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { api } from "../api/client";
 import type { ProbeAttemptDto } from "../types";
+import { PROBE_EXERCISED_TOKENS } from "../../../shared/probeLadder";
 
 function mib(value: number | null): string {
   return value == null ? "—" : `${Math.round(value).toLocaleString()} MiB`;
@@ -102,6 +103,9 @@ export function ProbeAttempts({ testId, refreshKey }: ProbeAttemptsProps) {
     (w, a) => (w == null || (a.vram_shared_peak_mib ?? 0) > (w.vram_shared_peak_mib ?? 0) ? a : w),
     null
   );
+  const kvSpill = attempts
+    .filter((a) => a.kv_host_backed_frac != null && a.kv_host_backed_frac > 0.6)
+    .reduce<ProbeAttemptDto | null>((best, a) => (best == null || a.candidate_ctx > best.candidate_ctx ? a : best), null);
   const cliff = attempts
     .filter((a) => a.prefill_cliff === 1 && a.ngl != null)
     .reduce<ProbeAttemptDto | null>((best, a) => (best == null || a.ngl! < best.ngl! ? a : best), null);
@@ -131,6 +135,17 @@ export function ProbeAttempts({ testId, refreshKey }: ProbeAttemptsProps) {
           )}
         </div>
       )}
+      {kvSpill && (
+        <div className="mb-3 rounded-lg border border-border bg-bg px-3 py-2 text-xs text-muted">
+          <span className="font-bold text-fg">A verified context is an allocation ceiling, not a speed.</span> At{" "}
+          <span className="font-mono">{kvSpill.candidate_ctx.toLocaleString()}</span> tokens,{" "}
+          <span className="font-mono font-bold">{Math.round((kvSpill.kv_host_backed_frac ?? 0) * 100)}%</span> of the
+          memory that context allocated went to system RAM rather than VRAM. Each load here runs a 64-token prompt and
+          generates 256 tokens whatever the context is set to, so a cache that large is allocated and never read — the
+          speeds above were measured at roughly 320 tokens of context, and will not hold once the context is actually
+          filled.
+        </div>
+      )}
       <div className="flex flex-wrap items-baseline justify-between gap-2">
         <span className="text-[11px] font-semibold uppercase tracking-wide text-muted">
           Context tests — every load this probe performed
@@ -153,12 +168,12 @@ export function ProbeAttempts({ testId, refreshKey }: ProbeAttemptsProps) {
               <th className="px-2 py-1.5 text-right" rowSpan={2}>shared</th>
               <th className="px-2 py-1.5 text-right" rowSpan={2}>RAM free</th>
               <th className="px-2 py-1.5 text-center" colSpan={2}>RAM Peak</th>
-              <th className="px-2 py-1.5 text-right" rowSpan={2}>gen tok/s</th>
-              <th className="px-2 py-1.5 text-right" rowSpan={2} title="Prompt-processing rate. Prefill has its own placement cliff, several layers BELOW the one where weights start spilling -- a rung can have the best gen tok/s while being several times worse to first token.">
-                pp tok/s
-              </th>
-              <th className="px-2 py-1.5 text-right" rowSpan={2} title="Time to first token, measured from request send to the first streamed chunk.">
-                TTFT
+              <th
+                className="px-2 py-1.5 text-center"
+                colSpan={3}
+                title={`Every load runs the same ${PROBE_EXERCISED_TOKENS}-token workload whatever context it allocates, so these describe roughly ${PROBE_EXERCISED_TOKENS} tokens of context -- NOT the context in the row. A large context here is allocated and never read.`}
+              >
+                speed at ~{PROBE_EXERCISED_TOKENS} tok
               </th>
               <th className="px-2 py-1.5 text-right" rowSpan={2} title="Layers' worth of system-RAM-backed GPU memory appearing per layer added, against a lower-offload load at the same context. Buffer overhead does not scale with layer count; spilled weights do, one for one -- so a value near 1 means the added layers are not on the GPU.">
                 slope
@@ -177,6 +192,16 @@ export function ProbeAttempts({ testId, refreshKey }: ProbeAttemptsProps) {
               </th>
               <th className="px-2 py-1.5 text-right" title="This load's own process only">
                 per process
+              </th>
+              <th className="px-2 py-1.5 text-right">gen tok/s</th>
+              <th
+                className="px-2 py-1.5 text-right"
+                title="Prompt-processing rate. Prefill has its own placement cliff, several layers BELOW the one where weights start spilling -- a rung can have the best gen tok/s while being several times worse to first token."
+              >
+                pp tok/s
+              </th>
+              <th className="px-2 py-1.5 text-right" title="Time to first token, from request send to the first streamed chunk.">
+                TTFT
               </th>
             </tr>
           </thead>
@@ -239,12 +264,15 @@ export function ProbeAttempts({ testId, refreshKey }: ProbeAttemptsProps) {
                   <td
                     className={`px-2 py-1.5 text-right font-mono ${a.host_backed_slope != null && a.host_backed_slope > 0.5 ? "font-bold text-warning" : "text-muted"}`}
                     title={
-                      a.host_backed_method === "ratio"
-                        ? "No comparable lower-offload load at this context, so this rung was judged against its own predicted footprint instead of a slope."
-                        : undefined
+                      a.kv_host_backed_frac != null
+                        ? `Context axis: ${Math.round(a.kv_host_backed_frac * 100)}% of the memory this context allocated went to system RAM instead of VRAM. Not a failure -- the probe never reads a cache this size, so it costs nothing here and everything in real use at this context.`
+                        : a.host_backed_method === "ratio"
+                          ? "No comparable lower-offload load at this context, so this rung was judged against its own predicted footprint instead of a slope."
+                          : undefined
                     }
                   >
                     {a.host_backed_slope != null ? a.host_backed_slope.toFixed(2) : a.host_backed_method === "ratio" ? "n/a" : "—"}
+                    {a.kv_host_backed_frac != null && a.kv_host_backed_frac > 0.6 ? " kv" : ""}
                   </td>
                   <td className="px-2 py-1.5 text-muted">
                     <div className="flex flex-wrap items-center gap-1.5">
@@ -301,7 +329,7 @@ export function ProbeAttempts({ testId, refreshKey }: ProbeAttemptsProps) {
         <b className="text-fg">Offload</b> is what was claimed; <b className="text-fg">resident</b> is the exact
         count llama.cpp's own per-layer "assigned to device" report says actually landed on the GPU — a mismatch
         against offload is flagged the same way a VRAM-fallback row is. It reads "—" rather than a guess when that
-        report wasn't captured (the load failed before tensor loading finished, or an older build). Every other
+        report wasn't captured (nothing was claimed on the GPU, the load failed before tensor loading finished, or an older build). Every other
         number in this row — <b className="text-fg">free</b>, <b className="text-fg">peak</b>,{" "}
         <b className="text-fg">shared</b> — is a direct measurement, not a prediction: free is what the machine
         actually had available just before the load. <b className="text-fg">Peak</b> is split into{" "}
@@ -311,14 +339,24 @@ export function ProbeAttempts({ testId, refreshKey }: ProbeAttemptsProps) {
         it). They're genuinely different numbers, not two views of the same one: something else running on the same
         GPU or machine at the same time shows up in total but not per process, while per process can read "—" more
         often than total does — the tool/counter that attributes usage to this specific process can lag a fresh
-        spawn, or never catch up at all on a very short load. A row flagged{" "}
-        <b className="text-warning">⚠ possible VRAM fallback</b> means VRAM peak (total) came in far below what the
-        ladder's own pre-load estimate expected this offload to need — a sign the load silently ran (partly) from
-        system RAM instead of true GPU memory, without llama.cpp reporting any error; how it's handled — warn, retry
-        once, or fail — is the worker's VRAM-discrepancy policy. <b className="text-fg">Shared</b> is that same
-        spillover, but measured directly rather than inferred: the worker's own OS-level reading of how much of this
-        process's memory was system RAM the driver backed as GPU-accessible memory instead of real dedicated VRAM.
+        spawn, or never catch up at all on a very short load. <b className="text-fg">Shared</b> is the OS's own
+        reading of how much of this process's memory was system RAM the driver backed as GPU-accessible memory
+        instead of real dedicated VRAM — the direct measurement of a silent spillover, not an inference about one.
         It's blank when no such counter exists for this worker's backend, which is different from a confirmed zero.
+      </p>
+      <p className="mt-2 text-[11px] leading-relaxed text-muted">
+        <b className="text-fg">Slope</b> is what decides a{" "}
+        <b className="text-warning">⚠ possible VRAM fallback</b>: how much shared memory appears per unit of demand
+        added, against an earlier load that held the other axis fixed. On the layer axis the unit is one layer's
+        weights, so a value near 1 means the added layers went to system RAM rather than the GPU — buffer overhead
+        doesn't scale with layer count, spilled weights do. A row reading <b className="text-fg">n/a</b> had no
+        comparable earlier load yet and was judged against its own predicted footprint instead. How a fallback is
+        handled — warn, retry once, or fail — is the worker's VRAM-discrepancy policy. A slope suffixed{" "}
+        <b className="text-fg">kv</b> is the context axis, where what spilled is cache rather than weights; that is
+        reported but never failed, because these loads never read a cache that large.{" "}
+        <b className="text-fg">Speeds</b> come from the same fixed {PROBE_EXERCISED_TOKENS}-token workload on every
+        row, so they say whether a configuration runs — not how fast it is at the context beside them. There is no
+        minimum rate: a slow load is reported with its rate, and only one that generates nothing at all fails.
       </p>
     </div>
   );

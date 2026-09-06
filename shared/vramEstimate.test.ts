@@ -519,7 +519,7 @@ describe("detectHostBackedFallback", () => {
         prior: [sample(10)],
         perLayerMib: PER_LAYER_MIB,
       })
-    ).toEqual({ hostBacked: false, method: null, slopeRatio: null, spilledLayers: null });
+    ).toEqual({ hostBacked: false, axis: null, kvHostBackedFrac: null, method: null, slopeRatio: null, spilledLayers: null });
   });
 
   it("falls back to the bootstrap when the per-layer size is unknown", () => {
@@ -575,52 +575,60 @@ describe("detectHostBackedFallback on the context axis", () => {
   const PER_LAYER_MIB = 17205 / 41;
   // From the run's own log lines, at 10 layers.
   const EST: Record<number, number> = { 1024: 4747, 8192: 4887, 65536: 6007, 131072: 7287, 262144: 9847 };
-  const rung = (ctx: number, sharedPeakMib: number) => ({
-    ngl: 10, ctx, sharedPeakMib, dedicatedPeakMib: 4000, estimatedGpuMib: EST[ctx],
+  const rung = (ctx: number, sharedPeakMib: number, dedicatedPeakMib: number) => ({
+    ngl: 10, ctx, sharedPeakMib, dedicatedPeakMib, estimatedGpuMib: EST[ctx] ?? 6000,
   });
-  const check = (lo: [number, number], hi: [number, number]) =>
+  const check = (lo: [number, number, number], hi: [number, number, number]) =>
     detectHostBackedFallback({
-      rung: rung(hi[0], hi[1]),
-      prior: [rung(lo[0], lo[1])],
+      rung: rung(hi[0], hi[1], hi[2]),
+      prior: [rung(lo[0], lo[1], lo[2])],
       perLayerMib: PER_LAYER_MIB,
     });
 
   it("uses a same-layers rung at a smaller context as the reference", () => {
-    expect(check([1024, 931], [262144, 2000]).method).toBe("slope");
+    expect(check([1024, 931, 4000], [262144, 2000, 4400]).axis).toBe("ctx");
   });
 
-  it("leaves a context whose KV genuinely landed in VRAM alone", () => {
-    // 5100MiB of predicted KV growth, only ~1GiB of it system-RAM-backed.
-    expect(check([1024, 931], [262144, 1950]).hostBacked).toBe(false);
+  // The real run this was rebuilt for: context 2048 -> 262144 at 13 layers put
+  // 2597MiB of 2641MiB of newly allocated memory into system RAM, and the
+  // estimator-denominated version reported that as 0.39 because it predicted
+  // 6604MiB of KV that was never allocated anywhere.
+  it("measures the spill against what was ALLOCATED, not what was predicted", () => {
+    const v = check([2048, 1699, 4458], [262144, 4296, 4502]);
+    expect(v.kvHostBackedFrac!).toBeCloseTo(0.98, 2);
   });
 
-  it("flags a context whose KV went to system RAM instead", () => {
-    // Nearly all of the predicted growth turns up in the shared counter.
-    const v = check([1024, 931], [262144, 5600]);
-    expect(v.hostBacked).toBe(true);
-    expect(v.slopeRatio!).toBeGreaterThan(0.5);
+  it("reports a comfortable context as a partial spill, not a clean one", () => {
+    // ngl 4 at 131072 from the 294-run sweep: dedicated +379, shared +383.
+    const v = check([1024, 427, 2014], [131072, 810, 2393]);
+    expect(v.kvHostBackedFrac!).toBeCloseTo(0.5, 1);
+  });
+
+  it("never fails a rung for a KV spill, however large", () => {
+    // The whole point: a cache the probe never reads costs nothing here. It is
+    // a caveat about what "verified 262144 tokens" means, not a capacity fault.
+    expect(check([2048, 1699, 4458], [262144, 9000, 4502]).hostBacked).toBe(false);
   });
 
   it("does not report a LAYER count for a context spill", () => {
-    // What grew is cache, not weights -- saying "3 layers' worth" would be a
-    // category error.
-    expect(check([1024, 931], [262144, 5600]).spilledLayers).toBeNull();
+    expect(check([2048, 1699, 4458], [262144, 4296, 4502]).spilledLayers).toBeNull();
   });
 
-  it("refuses a context step whose predicted KV growth is too small to measure", () => {
-    // 1024 -> 8192 at 10 layers moves the estimate by 140MiB, well under the
-    // driver's own allocation granularity. Falls through to the bootstrap.
-    expect(check([1024, 931], [8192, 1100]).method).toBe("ratio");
+  it("refuses a context step that allocated too little to measure", () => {
+    // 1024 -> 8192 at 13 layers grew the allocation by ~25MiB, far under the
+    // driver's own granularity. Falls through to the bootstrap.
+    expect(check([1024, 1693, 4452], [8192, 1725, 4495]).method).toBe("ratio");
   });
 
   it("prefers the layer axis when both references exist", () => {
     // A layer slope is the stronger comparison -- its unit is a fact from the
-    // model file rather than an estimator difference.
+    // model file rather than a difference of two measurements.
     const v = detectHostBackedFallback({
-      rung: rung(262144, 5600),
-      prior: [rung(1024, 931), { ngl: 6, ctx: 262144, sharedPeakMib: 452, dedicatedPeakMib: 2853 }],
+      rung: rung(262144, 5600, 4502),
+      prior: [rung(1024, 931, 4000), { ngl: 6, ctx: 262144, sharedPeakMib: 452, dedicatedPeakMib: 2853 }],
       perLayerMib: PER_LAYER_MIB,
     });
+    expect(v.axis).toBe("ngl");
     expect(v.spilledLayers).not.toBeNull();
   });
 });

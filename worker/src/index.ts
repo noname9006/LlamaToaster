@@ -33,6 +33,7 @@ import {
   toProbeAttemptReport,
   toBenchResult,
   PROBE_GEN_TOKENS,
+  PROBE_PROMPT_TOKENS,
   RuntimeServerStartupError,
   LlamaServerOutputError,
   type ProbeAttemptOutcome,
@@ -3365,7 +3366,18 @@ async function executeRunProbeJob(payload: TestProbeJobPayload): Promise<void> {
           vramPeakMib: dedupMatch.vram_peak_mib,
           ramPeakMib: dedupMatch.ram_peak_mib,
           vramSharedPeakMib: dedupMatch.vram_shared_peak_mib,
+          // A reused rung is a real measurement, just one this run did not pay
+          // a load for -- so it carries the sibling's figures verbatim rather
+          // than rendering as "not measured".
+          vramProcessPeakMib: dedupMatch.vram_process_peak_mib,
+          ramTotalPeakMib: dedupMatch.ram_total_peak_mib,
           genTps: dedupMatch.gen_tps,
+          ppTps: dedupMatch.pp_tps,
+          ttftMs: dedupMatch.ttft_ms,
+          prefillCliff: dedupMatch.prefill_cliff,
+          hostBackedMethod: dedupMatch.host_backed_method,
+          hostBackedSlopeRatio: dedupMatch.host_backed_slope,
+          kvHostBackedFrac: dedupMatch.kv_host_backed_frac,
           vramNeededMib: dedupMatch.vram_needed_mib,
           vramFreeMib: dedupMatch.vram_free_mib,
           ramNeededMib: dedupMatch.ram_needed_mib,
@@ -3636,7 +3648,7 @@ async function runOneProbeLoad(input: ProbeLoadInput): Promise<ProbeAttemptOutco
     const { sample, grammarConstrained } = await completeWithRetries({
       completion: streamedCompletion,
       port: server.port,
-      tokenCount: 64,
+      tokenCount: PROBE_PROMPT_TOKENS,
       offset: 0,
       nonce: 0,
       blocks: await fetchFillerBlocks(server.port),
@@ -3722,6 +3734,7 @@ async function runOneProbeLoad(input: ProbeLoadInput): Promise<ProbeAttemptOutco
       hostBackedMethod: verdict.hostBacked.method,
       hostBackedSlopeRatio: verdict.hostBacked.slopeRatio,
       hostBackedSpilledLayers: verdict.hostBacked.spilledLayers,
+      kvHostBackedFrac: verdict.hostBacked.kvHostBackedFrac,
       gpuLayersResidentEst: resident.layers,
       gpuLayersResidentExact: resident.exact,
     };

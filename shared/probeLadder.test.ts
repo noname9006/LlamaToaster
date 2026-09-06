@@ -457,24 +457,48 @@ describe("the ladder as a whole", () => {
     for (const rung of rungs.slice(1)) expect(stops.has(rung.ctx)).toBe(true);
   });
 
-  it("max_gpu/basic: the context phase seeds at the slider stop nearest the pre-flight estimate", () => {
+  it("max_gpu/basic: the context phase opens at the CEILING, not at the pre-flight estimate", () => {
     const generous = (r: { ctx: number; ngl: number }): boolean => r.ctx * (r.ngl + 4) <= 10_000_000;
     const rungs = runLadder({ mode: "max_gpu", granularity: "basic", candidateCtx: 32_768, candidateNgl: 27 }, generous);
     // Layer phase converges in 1 load (nglMax fits outright, per the
     // "skips the layer phase entirely" test above) -- rungs[1] is the ctx
-    // phase's own seed. calculateCtx(NGL_MAX) = round(17307 * 1.25) = 21634;
-    // ctxLadderStops(TRAINED) is powers of two here, and 16384 is nearer to
-    // 21634 than 32768 is (5250 vs 11134).
-    expect(rungs[1]).toMatchObject({ ctx: 16_384, ngl: NGL_MAX });
+    // phase's own seed. This mode is looking for the largest context its
+    // resolved placement holds, so the ceiling is the hypothesis worth
+    // testing first; the estimate (21634 -> nearest stop 16384) no longer
+    // chooses where to start, it would only have been a rung on the way up.
+    expect(rungs[1]).toMatchObject({ ctx: TRAINED, ngl: NGL_MAX });
+  });
+
+  it("max_gpu/basic: a context that fits outright costs ONE load, not a climb", () => {
+    // The case measured live: a weights-bound model on an 8GiB card, where
+    // every context from 1024 to the trained ceiling loads. The old walk
+    // spent 8 loads proving that one stop at a time.
+    const everythingFits = (): boolean => true;
+    const rungs = runLadder({ mode: "max_gpu", granularity: "basic", candidateCtx: 1024, candidateNgl: 27 }, everythingFits);
+    const ctxRungs = rungs.slice(1);
+    expect(ctxRungs).toHaveLength(1);
+    expect(ctxRungs[0]).toMatchObject({ ctx: TRAINED });
+  });
+
+  it("max_gpu/basic: a context-bound machine still brackets, in log2 of the grid", () => {
+    // Only the bottom two stops load. A downward walk from the ceiling would
+    // cost one load per stop; bisection costs the depth of the grid.
+    const tight = (r: { ctx: number; ngl: number }): boolean => r.ctx <= 2048;
+    const rungs = runLadder({ mode: "max_gpu", granularity: "basic", candidateCtx: 1024, candidateNgl: 27 }, tight);
+    const ctxRungs = rungs.slice(1);
+    const best = ctxRungs.filter((r) => r.ok).reduce((a, b) => (b.ctx > a.ctx ? b : a));
+    expect(best.ctx).toBe(2048);
+    expect(ctxRungs.length).toBeLessThanOrEqual(Math.ceil(Math.log2(ctxLadderStops(TRAINED).length)) + 2);
   });
 
   it("max_gpu/fine: the context phase starts with the SAME slider walk as basic, then extends past it with refinement", () => {
     const generous = (r: { ctx: number; ngl: number }): boolean => r.ctx * (r.ngl + 4) <= 10_000_000;
     const basicRungs = runLadder({ mode: "max_gpu", granularity: "basic", candidateCtx: 32_768, candidateNgl: 27 }, generous);
     const fineRungs = runLadder({ mode: "max_gpu", granularity: "fine", candidateCtx: 32_768, candidateNgl: 27 }, generous);
-    // Same seed -- fine is the SAME walk, not a different engine (the old
-    // engine seeded fine's ctx phase at the 1024 floor instead).
-    expect(fineRungs[1]).toMatchObject({ ctx: 16_384, ngl: NGL_MAX });
+    // Same seed -- fine is the SAME traversal of the SAME grid, not a
+    // different engine (the old engine seeded fine's ctx phase at the 1024
+    // floor instead), and both now open at the ceiling.
+    expect(fineRungs[1]).toMatchObject({ ctx: TRAINED, ngl: NGL_MAX });
     // Fine does strictly more work once it has a bracket to refine.
     expect(fineRungs.length).toBeGreaterThan(basicRungs.length);
     // At least one fine-phase ctx value is off the power-of-two grid --

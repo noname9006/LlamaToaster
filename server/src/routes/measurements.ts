@@ -152,6 +152,7 @@ function validateOneProbeAttempt(raw: unknown, label: string): ProbeAttemptRepor
     host_backed_slope: typeof a.host_backed_slope === "number" && Number.isFinite(a.host_backed_slope)
       ? a.host_backed_slope
       : null,
+    kv_host_backed_frac: optionalNonNegative(a.kv_host_backed_frac, `${label}.kv_host_backed_frac`),
     error: typeof a.error === "string" ? a.error : undefined,
     // N2 batch dedup -- the worker only ever echoes back a source_run_id the
     // server itself handed it via GET .../probe-dedup, so a plain type check
@@ -398,6 +399,17 @@ export async function measurementRoutes(app: FastifyInstance): Promise<void> {
         ram_free_mib: row.ram_free_mib,
         ram_peak_mib: row.ram_peak_mib,
         vram_shared_peak_mib: row.vram_shared_peak_mib,
+        // Carried so the reusing run's row shows what the sibling measured,
+        // rather than a line of em-dashes reading as "never measured".
+        vram_process_peak_mib: row.vram_process_peak_mib,
+        ram_total_peak_mib: row.ram_total_peak_mib,
+        pp_tps: row.pp_tps,
+        ttft_ms: row.ttft_ms,
+        prefill_cliff: row.prefill_cliff === 1,
+        host_backed_method:
+          row.host_backed_method === "slope" || row.host_backed_method === "ratio" ? row.host_backed_method : null,
+        host_backed_slope: row.host_backed_slope,
+        kv_host_backed_frac: row.kv_host_backed_frac,
         vram_discrepancy: row.vram_discrepancy === 1,
         gpu_layers_resident_est: row.gpu_layers_resident_est,
         gpu_layers_resident_exact: row.gpu_layers_resident_exact === 1,

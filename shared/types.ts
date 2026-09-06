@@ -1713,6 +1713,11 @@ export interface ProbeAttemptReport {
   // slope itself, in layers of system RAM per layer added.
   host_backed_method?: "slope" | "ratio" | null;
   host_backed_slope?: number | null;
+  // CONTEXT axis only: the share of this context's newly allocated memory the
+  // OS put in system RAM. Reported, never failed -- the probe exercises ~320
+  // tokens whatever the context is set to, so a host-backed cache is free at
+  // test time and expensive in real use at that context.
+  kv_host_backed_frac?: number | null;
   // What computeDualPoolFit PREDICTED this rung would need, and what the
   // machine actually had free just before the load -- the predicted-vs-real
   // pair that until now only ever reached a log line.
