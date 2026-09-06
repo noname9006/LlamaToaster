@@ -173,6 +173,12 @@ export function Dashboard() {
         setWorkers(w);
         setStats(s);
         setLoaded(true);
+      } catch {
+        // Same rationale as useWorkerStatus.ts's poll: the finally below
+        // reschedules either way, so a failed tick just leaves the last good
+        // data on screen. Without this catch the un-awaited poll() leaks an
+        // "Uncaught (in promise)" every 5s while any ONE of the three calls
+        // above is failing -- Promise.all rejects if any single one does.
       } finally {
         if (!cancelled) timerRef.current = window.setTimeout(poll, 5000);
       }
