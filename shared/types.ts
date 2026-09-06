@@ -1714,7 +1714,7 @@ export interface ProbeAttemptReport {
   host_backed_method?: "slope" | "ratio" | null;
   host_backed_slope?: number | null;
   // CONTEXT axis only: the share of this context's newly allocated memory the
-  // OS put in system RAM. Reported, never failed -- the probe exercises ~320
+  // OS put in system RAM. Reported, never failed -- the probe exercises ~512
   // tokens whatever the context is set to, so a host-backed cache is free at
   // test time and expensive in real use at that context.
   kv_host_backed_frac?: number | null;

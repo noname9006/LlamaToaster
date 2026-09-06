@@ -706,9 +706,12 @@ export interface ProbeAttemptOutcome {
    * documents (confirmed on both NVIDIA/CUDA and AMD/Vulkan): llama.cpp's
    * "offloaded X/Y" claim only reflects buffer assignment, never residency,
    * and the OS can back an oversubscribed allocation with system RAM instead
-   * of erroring. Set by probeSucceeded below; worker/src/index.ts's ladder
-   * loop turns it into a warn/retry/fail outcome per vramDiscrepancyPolicy,
-   * same policy the sweep path already applies. */
+   * of erroring. Set by probeSucceeded below; worker/src/index.ts's
+   * describeProbeVramDiscrepancy always turns it into a warning attached to
+   * the (still-passing) attempt -- unlike the sweep path's hardFallback
+   * check, this never escalates to a failed/retried rung under
+   * vramDiscrepancyPolicy, since it can fire on a partial spill that still
+   * ran fine. */
   vramDiscrepancy?: boolean;
   /** detectHostBackedFallback's own figures, when this platform HAS a
    * system-RAM-backed-GPU-memory counter: which evidence decided ("slope"
@@ -723,7 +726,7 @@ export interface ProbeAttemptOutcome {
   hostBackedSpilledLayers?: number | null;
   /** CONTEXT axis only: the share of this context's newly allocated memory
    * that the OS put in system RAM. A caveat, never a failure -- the probe
-   * exercises ~320 tokens regardless of `-c`, so a host-backed cache costs
+   * exercises ~512 tokens regardless of `-c`, so a host-backed cache costs
    * nothing here and everything in real use at that context. */
   kvHostBackedFrac?: number | null;
   /** Prompt-processing rate for this rung, from llama-server's own
@@ -761,8 +764,9 @@ export interface ProbeAttemptOutcome {
  *
  * A 1 tok/s floor used to reject "loading is not the same as usable", but it
  * was answering a question the probe can no longer be trusted to ask: every
- * rung generates PROBE_GEN_TOKENS at a 64-token prompt whatever `-c` says, so
- * the rate it measures describes a ~320-token context and nothing else. Using
+ * rung generates PROBE_GEN_TOKENS at a PROBE_PROMPT_TOKENS-token prompt
+ * whatever `-c` says, so the rate it measures describes a ~512-token context
+ * and nothing else. Using
  * a threshold on that to reject a placement means rejecting on a number that
  * was never about the configuration being judged.
  *
@@ -782,20 +786,19 @@ export { PROBE_GEN_TOKENS, PROBE_PROMPT_TOKENS } from "../../shared/probeLadder.
 // is about one load's verdict rather than about the search.
 
 // A probe's own success rule, kept next to the ladder that consumes it: no
-// OOM, no spill (vram_peak within total), gen tok/s above the floor, and no
-// VRAM discrepancy severe enough to fail under the operator's policy.
+// OOM, no spill (vram_peak within total), and gen tok/s above the floor.
 //
-// vramDiscrepancy is reported as a raw fact regardless of policy -- it does
-// NOT by itself flip `ok` here. worker/src/index.ts's ladder loop is what
-// turns it into warn/retry/fail (via vram-policy.ts's
-// resolveVramDiscrepancyAction, the SAME function/policy the sweep path
-// already uses), the same separation of "detect" from "decide" that path
-// keeps. Unlike the sweep path, there's no llama.cpp post-allocation
-// buffer-size report available here (that parsing is llama-bench-log-specific,
-// see bench.ts's parseModelBufferSizes), so the ladder loop treats a
-// discrepancy as sufficient on its own to trigger the policy's harder
-// actions, not gated behind the sweep path's stricter "exactly 0 bytes
-// resident" bar.
+// vramDiscrepancy is reported as a raw fact and does NOT by itself flip `ok`
+// here -- nor does worker/src/index.ts's ladder loop ever escalate it into a
+// failure the way finalizeSweepItemResult's hardFallback check can for a
+// sweep item. That path only escalates on an unambiguous llama.cpp
+// post-allocation buffer report of EXACTLY 0 layers resident; no such report
+// exists here (that parsing is llama-bench-log-specific, see bench.ts's
+// parseModelBufferSizes), so all a probe rung has is a signal that can fire
+// on a placement that PARTIALLY spilled while still completing and
+// generating tokens fine -- describeProbeVramDiscrepancy (worker/src/index.ts)
+// always turns it into a warning attached to the passing attempt instead,
+// never a policy-driven retry/fail.
 //
 // Two signals feed that one flag, in strict preference order:
 //
@@ -860,7 +863,9 @@ export function probeSucceeded(input: {
     kvHostBackedFrac: null,
     method: null,
     slopeRatio: null,
+    residentSlopeRatio: null,
     spilledLayers: null,
+    abstained: false,
   };
   if (input.oom) {
     return { ok: false, spill: false, vramDiscrepancy: false, hostBacked: noFallback, reason: "out of memory at this context" };
@@ -899,9 +904,12 @@ export function probeSucceeded(input: {
   // Per-process where available -- whole-adapter only as a last resort, since
   // that reading includes every other process on the GPU.
   const observedMib = input.vramProcessPeakMib ?? input.vramPeakMib;
+  // An abstained verdict counts as no verdict here: the measured check could
+  // not decide, so the weaker estimate-based inference gets its say exactly as
+  // it does when no counter existed at all.
   const vramDiscrepancy =
     hostBacked.hostBacked ||
-    (hostBacked.method == null &&
+    ((hostBacked.method == null || hostBacked.abstained) &&
       input.ngl > 0 &&
       input.estimatedVramMib != null &&
       observedMib != null &&

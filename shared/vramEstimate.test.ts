@@ -7,6 +7,7 @@ import {
   detectHostBackedFallback,
   isPrefillCliff,
   HOST_BACKED_SLOPE_RATIO,
+  HOST_BACKED_RESIDENT_SLOPE_RATIO,
   isVramDiscrepancy,
   placeWeightBytes,
   VRAM_ESTIMATE_FIXED_OVERHEAD_MIB,
@@ -519,7 +520,10 @@ describe("detectHostBackedFallback", () => {
         prior: [sample(10)],
         perLayerMib: PER_LAYER_MIB,
       })
-    ).toEqual({ hostBacked: false, axis: null, kvHostBackedFrac: null, method: null, slopeRatio: null, spilledLayers: null });
+    ).toEqual({
+      hostBacked: false, axis: null, kvHostBackedFrac: null, method: null,
+      slopeRatio: null, residentSlopeRatio: null, spilledLayers: null, abstained: false,
+    });
   });
 
   it("falls back to the bootstrap when the per-layer size is unknown", () => {
@@ -532,6 +536,101 @@ describe("detectHostBackedFallback", () => {
 
   it("never judges a rung that asked for nothing on the GPU", () => {
     expect(detectHostBackedFallback({ rung: sample(0), prior: [], perLayerMib: PER_LAYER_MIB }).method).toBeNull();
+  });
+
+  // The dedicated counter answers the complementary question -- did the added
+  // layers land ON the device -- and on the calibration sweep it separates the
+  // same two regimes with a wider gap than `shared` does (0.20-0.74 against
+  // 0.47-0.76). Required to agree before anything is convicted.
+  describe("the dedicated-VRAM second opinion", () => {
+    it.each([[2, 4, 1.05], [4, 6, 0.96], [6, 8, 0.74]])(
+      "reads clean interval %i->%i as layers actually landing (%f/layer)",
+      (lo, hi, expected) => {
+        const v = between(lo, hi);
+        expect(v.residentSlopeRatio!).toBeCloseTo(expected, 2);
+        expect(v.residentSlopeRatio!).toBeGreaterThan(HOST_BACKED_RESIDENT_SLOPE_RATIO);
+        expect(v.hostBacked).toBe(false);
+      }
+    );
+
+    it.each([[8, 10, 0.2], [10, 12, -0.21], [12, 14, 0.18], [14, 18, -0.02], [18, 26, 0.06], [26, 41, 0.05]])(
+      "reads spilling interval %i->%i as layers not landing (%f/layer)",
+      (lo, hi, expected) => {
+        const v = between(lo, hi);
+        expect(v.residentSlopeRatio!).toBeCloseTo(expected, 2);
+        expect(v.residentSlopeRatio!).toBeLessThan(HOST_BACKED_RESIDENT_SLOPE_RATIO);
+        expect(v.hostBacked).toBe(true);
+      }
+    );
+
+    // Constructed, not measured: the two counters agree on all nine real
+    // intervals, so the abstention rule has to be pinned deliberately. Shared
+    // grows by a full layer while dedicated ALSO grows by a full layer -- the
+    // signature of a fixed cost that moved with something other than weights,
+    // which is what convicted a genuinely-resident rung on the reference run.
+    it("abstains when the two counters disagree", () => {
+      const v = detectHostBackedFallback({
+        rung: { ngl: 6, ctx: 1024, sharedPeakMib: 427 + 2 * PER_LAYER_MIB, dedicatedPeakMib: 2822 },
+        prior: [{ ngl: 4, ctx: 1024, sharedPeakMib: 427, dedicatedPeakMib: 2014 }],
+        perLayerMib: PER_LAYER_MIB,
+      });
+      expect(v.slopeRatio!).toBeGreaterThan(HOST_BACKED_SLOPE_RATIO);
+      expect(v.residentSlopeRatio!).toBeGreaterThan(HOST_BACKED_RESIDENT_SLOPE_RATIO);
+      expect(v.hostBacked).toBe(false);
+      // ...and says so explicitly, so the caller falls through to its weaker
+      // evidence rather than reading this as a measured clean.
+      expect(v.abstained).toBe(true);
+    });
+
+    // A missing per-process reading is a gap, not a zero -- the shared slope
+    // has to keep deciding on its own exactly as it did before.
+    it("lets the shared slope stand alone when no dedicated reading exists", () => {
+      const v = detectHostBackedFallback({
+        rung: { ngl: 26, ctx: 1024, sharedPeakMib: 7647, dedicatedPeakMib: null },
+        prior: [{ ngl: 10, ctx: 1024, sharedPeakMib: 1279, dedicatedPeakMib: null }],
+        perLayerMib: PER_LAYER_MIB,
+      });
+      expect(v.residentSlopeRatio).toBeNull();
+      expect(v.hostBacked).toBe(true);
+    });
+  });
+
+  // The false conviction this whole pass exists to remove. Measured on the
+  // 6 Sep 2026 reference run, max_context's own rungs at a 262144-token
+  // context: ngl 0 reported 571MiB shared with NOTHING claimed on the GPU, so
+  // the bootstrap charged that fixed cost against one layer's footprint.
+  describe("bootstrap residency veto", () => {
+    // 1 layer of weights + 1/40th of a 262144-token f16 cache + fixed overhead.
+    const EST_NGL1_262K = 1446;
+
+    it("acquits a rung whose weights demonstrably landed on the GPU", () => {
+      const v = detectHostBackedFallback({
+        rung: { ngl: 1, ctx: 262144, sharedPeakMib: 953, dedicatedPeakMib: 1221, estimatedGpuMib: EST_NGL1_262K },
+        prior: [], perLayerMib: PER_LAYER_MIB,
+      });
+      expect(v.method).toBe("ratio");
+      expect(v.hostBacked).toBe(false);
+    });
+
+    // Same rung, same shared reading, without the dedicated counter: the
+    // bootstrap has nothing to veto with and convicts, as it did before.
+    it("still convicts that rung when no dedicated reading exists", () => {
+      expect(
+        detectHostBackedFallback({
+          rung: { ngl: 1, ctx: 262144, sharedPeakMib: 953, dedicatedPeakMib: null, estimatedGpuMib: EST_NGL1_262K },
+          prior: [], perLayerMib: PER_LAYER_MIB,
+        }).hostBacked
+      ).toBe(true);
+    });
+
+    it.each([12, 14, 18, 26, 41])("does not acquit genuinely spilling ngl %i", (ngl) => {
+      const est = Math.round(706 + 404 * ngl);
+      expect(
+        detectHostBackedFallback({
+          rung: { ...sample(ngl), estimatedGpuMib: est }, prior: [], perLayerMib: PER_LAYER_MIB,
+        }).hostBacked
+      ).toBe(true);
+    });
   });
 });
 

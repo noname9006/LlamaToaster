@@ -118,7 +118,7 @@ export const PROBE_MAX_LOADS = 24;
  * reader and "this machine does 10.4 tok/s at 262k tokens", which is not what
  * was measured.
  */
-export const PROBE_PROMPT_TOKENS = 64;
+export const PROBE_PROMPT_TOKENS = 256;
 export const PROBE_GEN_TOKENS = 256;
 export const PROBE_EXERCISED_TOKENS = PROBE_PROMPT_TOKENS + PROBE_GEN_TOKENS;
 

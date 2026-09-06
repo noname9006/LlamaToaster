@@ -3096,27 +3096,28 @@ function describeEstimatedMemoryNeed(estimate: { vramMib: number; ramMib: number
 }
 
 // Turns a rung's raw vramDiscrepancy flag (runtimeBench.ts's probeSucceeded)
-// into a warn/retry/fail outcome via vram-policy.ts's
-// resolveVramDiscrepancyAction -- the SAME function and the SAME
-// vramDiscrepancyPolicy setting the sweep path already applies
-// (finalizeSweepItemResult above), so an operator's one policy choice governs
-// both paths identically. Unlike the sweep path this has no llama.cpp
-// post-allocation buffer-size report to lean on (that parsing is
-// llama-bench-log-specific), so any vramDiscrepancy here is treated as
-// sufficient on its own to reach the policy's harder actions -- see
-// probeSucceeded's own doc comment for why that's the right call given a
-// probe's job is specifically to answer "is this placement really usable".
-// `reload` re-runs the exact same rung for retry_once_then_fail's single
-// re-attempt; its result becomes the returned attempt regardless of what it
-// finds (mirrors runSweepItemViaServer's own "only the final attempt is ever
-// recorded" contract).
-async function resolveProbeVramDiscrepancy(
-  label: string,
+// into a descriptive warning appended to the attempt's error text --
+// vramDiscrepancyPolicy's fail/retry_once_then_fail escalation is
+// deliberately NOT applied here, unlike the sweep path's identical-looking
+// hardFallback check in finalizeSweepItemResult above. That path only ever
+// escalates on an unambiguous llama.cpp post-allocation buffer report of
+// EXACTLY 0 layers resident -- proof the whole placement never touched the
+// GPU. A probe rung has no such report to lean on; all it has is
+// detectHostBackedFallback's shared-GPU-memory reading (Windows WDDM "Shared
+// Usage" / Linux amdgpu GTT) or the older needed-vs-observed inference, both
+// of which can and routinely do fire on a placement that PARTIALLY spilled --
+// some layers host-backed, the rest genuinely on the GPU -- while the load
+// itself completed cleanly and generated tokens fine. Escalating that to a
+// failed/red rung previously hid a placement that had, in fact, worked; the
+// rung's own measured numbers (shared/dedicated MiB, tok/s) are already on
+// screen for the reader to judge, the same way ProbeAttempts.tsx pairs a
+// green "passed" with a separate yellow "possible VRAM fallback" badge rather
+// than failing the row outright.
+function describeProbeVramDiscrepancy(
   rung: { ctx: number; ngl: number },
   estimatedVramMib: number | null,
-  initialAttempt: ProbeAttemptOutcome,
-  reload: () => Promise<ProbeAttemptOutcome>
-): Promise<ProbeAttemptOutcome> {
+  initialAttempt: ProbeAttemptOutcome
+): ProbeAttemptOutcome {
   if (!initialAttempt.vramDiscrepancy) return initialAttempt;
   // Two wordings, because the two signals are not the same kind of claim.
   // When the OS gave us a system-RAM-backed-GPU-memory reading, this is a
@@ -3163,36 +3164,7 @@ async function resolveProbeVramDiscrepancy(
       `instead of erroring, not actual GPU offload`
     );
   };
-  const decision = resolveVramDiscrepancyAction(vramDiscrepancyPolicy, true, false, vramFallbackConfirmedPersistent);
-  if (decision.action === "record_done_with_warning") {
-    return { ...initialAttempt, error: [initialAttempt.error, describe(initialAttempt)].filter(Boolean).join(" -- ") };
-  }
-  if (decision.action === "fail_item") {
-    return {
-      ...initialAttempt,
-      ok: false,
-      error: [initialAttempt.error, `${describe(initialAttempt)} (vram_discrepancy_policy=${vramDiscrepancyPolicy})`]
-        .filter(Boolean)
-        .join(" -- "),
-    };
-  }
-  log.warn(
-    `${label}: ${describe(initialAttempt)} -- re-running once (vram_discrepancy_policy=retry_once_then_fail). ` +
-      `Nothing recorded from this attempt.`
-  );
-  const retried = await reload();
-  if (!retried.vramDiscrepancy) return retried;
-  vramFallbackConfirmedPersistent = true;
-  log.warn(
-    `${label}: VRAM fallback reproduced across a retry -- later rungs in this run will fail immediately instead of each paying their own retry`
-  );
-  return {
-    ...retried,
-    ok: false,
-    error: [retried.error, `${describe(retried)} (reproduced on retry, vram_discrepancy_policy=retry_once_then_fail)`]
-      .filter(Boolean)
-      .join(" -- "),
-  };
+  return { ...initialAttempt, error: [initialAttempt.error, describe(initialAttempt)].filter(Boolean).join(" -- ") };
 }
 
 // BENCHMARKING_PLAN_V8.md N2 -- the usable-config probe. Engine pinned to
@@ -3450,15 +3422,7 @@ async function executeRunProbeJob(payload: TestProbeJobPayload): Promise<void> {
         log.info(`${label}: candidate ${rung.ctx}/${rung.ngl} discarded -- stopped mid-load`);
         break;
       }
-      attempt = await resolveProbeVramDiscrepancy(label, rung, estimate?.vramMib ?? null, attempt, loadThisRung);
-      // The discrepancy resolution above may itself have re-run the rung
-      // (retry_once_then_fail) -- a stop requested during THAT load needs the
-      // same discard-not-record treatment as the first load's own check.
-      if (stopRequested) {
-        stoppedMidLadder = true;
-        log.info(`${label}: candidate ${rung.ctx}/${rung.ngl} discarded -- stopped mid-retry`);
-        break;
-      }
+      attempt = describeProbeVramDiscrepancy(rung, estimate?.vramMib ?? null, attempt);
       attempts.push(attempt);
       sendProbeAttemptTick(payload.run_id, attempts.length - 1, toProbeAttemptReport(attempt));
       // Actual observed peak alongside the "estimated need" line logged
