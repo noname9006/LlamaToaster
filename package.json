@@ -20,6 +20,8 @@
     "worker": "tsx worker/src/index.ts",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:node": "vitest run --project node",
+    "test:client": "vitest run --project client",
     "typecheck": "tsc --noEmit",
     "build": "npm run build --prefix client",
     "build:admin": "npm run build --prefix admin",
@@ -43,6 +45,7 @@
   "devDependencies": {
     "@types/adm-zip": "^0.5.8",
     "@types/better-sqlite3": "^9.6.0",
+    "jsdom": "^29.1.1",
     "typescript": "^7.0.2",
     "vitest": "^4.1.11"
   }
