@@ -9,7 +9,7 @@
 // aria-checked; the floor reveal and the KV-preset section are disclosures
 // with aria-expanded; the target clamp announces via aria-live="polite".
 
-import { useId, useMemo, useState } from "react";
+import { useId, useMemo, useState, type ReactNode } from "react";
 import { Link } from "react-router-dom";
 import { StatusCircle, type CircleTone } from "./StatusPill";
 import {
@@ -210,18 +210,6 @@ function haircut(freeMib: number | null, frac: number): number | null {
   return freeMib == null ? null : freeMib * (1 - frac);
 }
 
-// N2's six search goals, as the user meets them. Each card is a real probe
-// mode (shared/probeLadder.ts) rather than a static suggestion: the estimate
-// only decides where each one STARTS, and pressing Test measures the rest.
-const MODE_LABEL: Record<ProbeMode, string> = {
-  max_gpu: "Max GPU speed",
-  max_context: "Max context",
-  keep_context: "Fixed context",
-  balanced: "Balanced",
-  fixed_offload: "Fixed offload",
-  custom: "Custom",
-};
-
 /**
  * What clicking a card puts on the sliders: its verified rung when it has
  * one, its starting point otherwise. See the call site for why the context
@@ -238,15 +226,6 @@ function appliedConfig(
     ctx: snapToSafeCtx(result.verifiedCtxTokens, trainedCtx ?? result.verifiedCtxTokens),
   };
 }
-
-const MODE_BLURB: Record<ProbeMode, string> = {
-  max_gpu: "Every layer on the GPU, then as much context as still fits.",
-  max_context: "The largest context this machine can hold.",
-  keep_context: "Your context is fixed; the layer split moves to make it fit.",
-  balanced: "Starts where you are: more context first, then more layers if any still fit.",
-  fixed_offload: "Your layer split is fixed; context moves to make it fit.",
-  custom: "One load at exactly the settings above — no search.",
-};
 
 const GRANULARITY_LABEL: Record<ProbeGranularity, string> = {
   basic: "Basic",
@@ -736,10 +715,14 @@ export function GoalQuestionnaire({
   );
 }
 
+// The three ProbeModes the Targets card can dispatch as -- every pin
+// combination except "nothing pinned" (that's the Wizard card instead).
+const TARGETS_FAMILY_MODES: ProbeMode[] = ["keep_context", "fixed_offload", "custom"];
+
 // The Step-2 fit matrix: an offload slider paired with the context slider
 // above it, live dual-pool (VRAM+RAM) indicators, an inaccuracy warning, and
-// the Tested-configurations row -- one card per N2 search mode, each able to
-// fire a real probe at its own starting point.
+// the Tested-configurations row -- Wizard and Targets, each able to fire a
+// real probe at its own starting point.
 function PlacementMatrix({
   placement,
   dualFit,
@@ -758,14 +741,37 @@ function PlacementMatrix({
   onApplyConfig: (ngl: number, ctx: number) => void;
 }) {
   const [granularity, setGranularity] = useState<ProbeGranularity>("basic");
-  // Which cards are selected for the next "Run test" click -- purely local,
-  // ephemeral UI state (unlike the triggers themselves, losing a selection
-  // that hasn't been run yet on a remount/reload is fine). Selecting a card
-  // IS clicking it (there's no separate checkbox); "Select all" is a
-  // shortcut onto this same set, not a separate launch path -- Run test
-  // still has to be clicked to actually fire them.
-  const [selectedModes, setSelectedModes] = useState<Set<ProbeMode>>(new Set());
+  // Two scenarios, not six modes: Wizard is nothing pinned (max_gpu's own
+  // layer-then-context search); Targets pins context, offload, or both onto
+  // whichever underlying ProbeMode answers that combination. Selecting a
+  // card IS clicking it; both cards can be queued together, exactly as
+  // several of the old six could be -- purely local, ephemeral UI state,
+  // same as the set it replaces.
+  const [wizardSelected, setWizardSelected] = useState(false);
+  const [targetsSelected, setTargetsSelected] = useState(false);
+  // Which of the three pin combinations Targets dispatches as -- a single
+  // three-way choice (Context / Offload / Both) rather than two independent
+  // toggles, since "nothing pinned" isn't a legal Targets state (that
+  // combination is the Wizard card instead). Defaulting to context-only
+  // matches the old keep_context card's default reading.
+  const [targetsPin, setTargetsPin] = useState<"ctx" | "ngl" | "both">("ctx");
   const [running, setRunning] = useState(false);
+
+  const targetsMode: ProbeMode =
+    targetsPin === "both" ? "custom" : targetsPin === "ngl" ? "fixed_offload" : "keep_context";
+  const selectedScenarioCount = (wizardSelected ? 1 : 0) + (targetsSelected ? 1 : 0);
+  const targetsFamilyBusy = TARGETS_FAMILY_MODES.some(
+    (m) => placement.verifyResults[m]?.status === "pending" || placement.heldModes.has(m)
+  );
+
+  function setPin(which: "ctx" | "ngl" | "both"): void {
+    // A probe already running under one pin combination keeps running under
+    // that combination's own mode key when the pin changes -- see
+    // targetsFamilyBusy below -- so reassigning the pin mid-run would let a
+    // second probe fire while the first is still loading the model.
+    if (targetsFamilyBusy) return;
+    setTargetsPin(which);
+  }
 
   // Suppresses the "might not fit" warning once a real test has already run
   // at exactly this (ngl, ctx) -- a completed result (verified or failed)
@@ -815,14 +821,19 @@ function PlacementMatrix({
     };
   }, [placement, affordability, trainedCtx, ctx]);
 
-  // The Run test button's handler -- fires every checked, not-already-
-  // pending mode via placement.onRunModes (Benchmark.tsx's runModes), which
-  // threads a shared batch root through all of them so they collapse into
-  // one Runs-list row instead of each 409ing or becoming its own root. Left
-  // checked afterward (not cleared) so re-clicking Run test is a no-op for
-  // modes already running -- onRunModes itself skips anything still pending.
+  // The Run test button's handler -- fires whichever of the two scenario
+  // cards are checked via placement.onRunModes (Benchmark.tsx's runModes),
+  // which threads a shared batch root through both of them so they collapse
+  // into one Runs-list row instead of each 409ing or becoming its own root.
+  // Left checked afterward (not cleared) so re-clicking Run test is a no-op
+  // for a scenario already running -- onRunModes itself skips anything
+  // still pending. targetsMode is resolved at click time, not selection
+  // time, so flipping a pin after checking Targets but before running picks
+  // up the new combination.
   async function handleRunTest(): Promise<void> {
-    const modes = [...selectedModes];
+    const modes: ProbeMode[] = [];
+    if (wizardSelected) modes.push("max_gpu");
+    if (targetsSelected) modes.push(targetsMode);
     if (modes.length === 0) return;
     setRunning(true);
     try {
@@ -948,26 +959,24 @@ function PlacementMatrix({
             </div>
             <button
               type="button"
-              title="Selects every card below (except Custom, which starts from the same point as several others) -- click again to clear the selection. Run test still has to be clicked to actually fire them"
-              onClick={() =>
-                setSelectedModes((prev) => {
-                  const selectable = (Object.keys(MODE_LABEL) as ProbeMode[]).filter((m) => m !== "custom");
-                  const allSelected = selectable.every((m) => prev.has(m));
-                  return allSelected ? new Set() : new Set(selectable);
-                })
-              }
+              title="Selects both cards -- click again to clear the selection. Run test still has to be clicked to actually fire them"
+              onClick={() => {
+                const bothOn = wizardSelected && targetsSelected;
+                setWizardSelected(!bothOn);
+                setTargetsSelected(!bothOn);
+              }}
               className="rounded-lg border border-accent px-2.5 py-1 text-[11px] font-semibold text-accent hover:bg-accent/10"
             >
               Select all
             </button>
             <button
               type="button"
-              title="Runs every checked card -- several fired together collapse into one row on the Runs list, and more can be checked and run again later while these are still going"
-              disabled={selectedModes.size === 0 || running}
+              title="Runs every checked card -- fired together they collapse into one row on the Runs list, and more can be checked and run again later while these are still going"
+              disabled={selectedScenarioCount === 0 || running}
               onClick={() => void handleRunTest()}
               className="rounded-lg bg-accent px-2.5 py-1 text-[11px] font-bold text-accent-fg disabled:opacity-40"
             >
-              {running ? "Running…" : `Run test${selectedModes.size > 0 ? ` (${selectedModes.size})` : ""}`}
+              {running ? "Running…" : `Run test${selectedScenarioCount > 0 ? ` (${selectedScenarioCount})` : ""}`}
             </button>
           </div>
         </div>
@@ -982,42 +991,82 @@ function PlacementMatrix({
         )}
 
         <div className="mt-2 flex flex-wrap gap-2">
-          {(Object.keys(MODE_LABEL) as ProbeMode[]).map((mode) => {
-            const start = modeStarts[mode];
-            const result = placement.verifyResults[mode] ?? null;
-            const busy = result?.status === "pending";
-            const held = placement.heldModes.has(mode);
+          {(() => {
+            const wizardStart = modeStarts.max_gpu;
+            const wizardResult = placement.verifyResults.max_gpu ?? null;
+            const wizardBusy = wizardResult?.status === "pending";
+            const wizardHeld = placement.heldModes.has("max_gpu");
+            const targetsStart = modeStarts[targetsMode];
+            const targetsResult = placement.verifyResults[targetsMode] ?? null;
+            // Targets' identity moves with its pins, but a probe already
+            // fired under a PREVIOUS pin combination keeps running under
+            // that combination's own mode key -- flipping a pin mid-run
+            // does not cancel it. Without targetsFamilyBusy (computed above,
+            // over all three pin combinations) the pin toggles would go live
+            // again the instant the display remaps to a clean mode key,
+            // letting a second probe fire while the first is still loading
+            // the model under a different key.
+            const targetsBusy = targetsResult?.status === "pending" || targetsFamilyBusy;
+            const targetsHeld = placement.heldModes.has(targetsMode);
+            // A tested card applies what the probe PROVED, not where it
+            // started -- the ladder routinely lands somewhere else on both
+            // axes, and the start values are the one thing already known not
+            // to be the answer. The context snaps DOWN to a slider stop (a
+            // `fine` probe verifies values between two stops, which the
+            // slider cannot express); down, never up, so applying never
+            // claims a context that wasn't loaded.
+            const applyFrom = (result: PlacementVerifyResult | null, start: { ngl: number; ctx: number }) => {
+              const applied = appliedConfig(result, start, trainedCtx);
+              onApplyConfig(applied.ngl, applied.ctx);
+            };
             return (
-              <ModeCard
-                key={mode}
-                mode={mode}
-                start={start}
-                selected={selectedModes.has(mode)}
-                busy={busy}
-                held={held}
-                result={result}
-                onActivate={() => {
-                  if (busy || held) return;
-                  setSelectedModes((prev) => {
-                    const next = new Set(prev);
-                    if (next.has(mode)) next.delete(mode);
-                    else next.add(mode);
-                    return next;
-                  });
-                  // A tested card applies what the probe PROVED, not where it
-                  // started -- the ladder routinely lands somewhere else on
-                  // both axes, and the start values are the one thing already
-                  // known not to be the answer. The context snaps DOWN to a
-                  // slider stop (a `fine` probe verifies values between two
-                  // stops, which the slider cannot express); down, never up,
-                  // so applying never claims a context that wasn't loaded.
-                  const applied = appliedConfig(result, start, trainedCtx);
-                  onApplyConfig(applied.ngl, applied.ctx);
-                }}
-                onReset={() => placement.onReset(mode)}
-              />
+              <>
+                <ModeCard
+                  mode="max_gpu"
+                  label="Wizard"
+                  blurb="Nothing pinned: finds the paging boundary at the cheapest context, then pushes context to the trained ceiling at that placement."
+                  start={wizardStart}
+                  selected={wizardSelected}
+                  busy={wizardBusy}
+                  held={wizardHeld}
+                  result={wizardResult}
+                  onActivate={() => {
+                    if (wizardBusy || wizardHeld) return;
+                    setWizardSelected((v) => !v);
+                    applyFrom(wizardResult, wizardStart);
+                  }}
+                  onReset={() => placement.onReset("max_gpu")}
+                />
+                <ModeCard
+                  mode={targetsMode}
+                  label="Targets"
+                  blurb={
+                    targetsMode === "custom"
+                      ? "Both pinned: one load at exactly the sliders above — no search."
+                      : targetsMode === "fixed_offload"
+                        ? "Offload pinned: searches context at that layer split."
+                        : "Context pinned: searches the layer split at that context."
+                  }
+                  extra={
+                    <div onClick={(e) => e.stopPropagation()}>
+                      <TargetsPinGroup value={targetsPin} disabled={targetsFamilyBusy} onChange={setPin} />
+                    </div>
+                  }
+                  start={targetsStart}
+                  selected={targetsSelected}
+                  busy={targetsBusy}
+                  held={targetsHeld}
+                  result={targetsResult}
+                  onActivate={() => {
+                    if (targetsBusy || targetsHeld) return;
+                    setTargetsSelected((v) => !v);
+                    applyFrom(targetsResult, targetsStart);
+                  }}
+                  onReset={() => placement.onReset(targetsMode)}
+                />
+              </>
             );
-          })}
+          })()}
         </div>
 
         <p className="mt-2 text-[11px] leading-relaxed text-muted">
@@ -1045,11 +1094,11 @@ function formatTestedAt(ms: number): string {
   return `${mm}/${dd} ${hh}:${min}`;
 }
 
-// Fixed height sized for the fullest state (blurb + a result line + a
-// measured-needs line + a run-link/tested-at line + the button row) so all 6
-// cards line up regardless of which of those lines the current one actually
-// has.
-const MODE_CARD_HEIGHT = "h-[180px]";
+// One fixed size for every scenario card, sized for the fullest one
+// (Targets, with its pin-group row) so Wizard and Targets always line up
+// regardless of which content lines the current one actually has.
+const MODE_CARD_HEIGHT = "h-[204px]";
+const MODE_CARD_WIDTH = "w-[240px]";
 
 // Maps a card's own status vocabulary onto StatusPill's CircleTone -- the
 // same yellow-blink-while-running/yellow-static-while-queued dot used for a
@@ -1078,6 +1127,9 @@ function modeCardCircleTone(result: PlacementVerifyResult | null): CircleTone {
 
 function ModeCard({
   mode,
+  label,
+  blurb,
+  extra,
   start,
   selected,
   busy,
@@ -1086,7 +1138,15 @@ function ModeCard({
   onActivate,
   onReset,
 }: {
+  /** Which underlying search this card's result/reset/start actually refer
+   * to -- Wizard's is fixed at "max_gpu"; Targets' moves with its pins. */
   mode: ProbeMode;
+  label: string;
+  blurb: string;
+  /** Targets' pin-choice group, rendered between the title row and the
+   * blurb. Its own onClick already stops propagation so choosing a pin
+   * doesn't also (de)select the card. */
+  extra?: ReactNode;
   start: { ngl: number; ctx: number };
   selected: boolean;
   busy: boolean;
@@ -1103,13 +1163,14 @@ function ModeCard({
   const failedCapacity = result?.status === "failed" || result?.status === "failed_oom";
   const failedUnsupported = result?.status === "failed_unsupported";
   const inert = busy || held;
-  const startLabel = `from ${mode === "max_context" ? "searched" : `${start.ngl} layers`} · ${start.ctx.toLocaleString()} tokens`;
+  const startLabel = `from ${start.ngl} layers · ${start.ctx.toLocaleString()} tokens`;
   return (
     <div
       role="button"
       tabIndex={0}
       aria-pressed={selected}
       aria-disabled={inert}
+      aria-label={`${label} — runs as ${mode}`}
       title={startLabel}
       onClick={onActivate}
       onKeyDown={(e) => {
@@ -1118,20 +1179,20 @@ function ModeCard({
           onActivate();
         }
       }}
-      className={`flex ${MODE_CARD_HEIGHT} w-[188px] shrink-0 flex-col gap-1 rounded-lg border p-2.5 transition-colors ${
+      className={`flex ${MODE_CARD_HEIGHT} ${MODE_CARD_WIDTH} shrink-0 flex-col gap-1 rounded-lg border p-2.5 transition-colors ${
         inert ? "cursor-not-allowed" : "cursor-pointer"
       } ${selected ? "border-accent bg-accent/10" : "border-border bg-surface hover:border-accent/40"}`}
     >
       <div className="flex items-start justify-between gap-1">
         <span className="flex min-w-0 items-center gap-1.5 text-[11.5px] font-semibold text-fg">
           <StatusCircle tone={held ? "warn" : modeCardCircleTone(result)} />
-          <span className="truncate">{MODE_LABEL[mode]}</span>
+          <span className="truncate">{label}</span>
         </span>
         {result && !running && (
           <button
             type="button"
             title="Clear this card's result"
-            aria-label={`Reset ${MODE_LABEL[mode]}`}
+            aria-label={`Reset ${label}`}
             onClick={(e) => {
               e.stopPropagation();
               onReset();
@@ -1142,7 +1203,8 @@ function ModeCard({
           </button>
         )}
       </div>
-      <span className="text-[10.5px] leading-relaxed text-muted">{MODE_BLURB[mode]}</span>
+      {extra}
+      <span className="text-[10.5px] leading-relaxed text-muted">{blurb}</span>
       <div className="flex-1">
         {held && (
           <span className="block font-mono text-[10.5px] text-muted">waiting on the first test's result…</span>
@@ -1184,6 +1246,55 @@ function ModeCard({
           </span>
         )}
       </div>
+    </div>
+  );
+}
+
+const TARGETS_PIN_CHOICES: { value: "ctx" | "ngl" | "both"; label: string }[] = [
+  { value: "ctx", label: "Context" },
+  { value: "ngl", label: "Offload" },
+  { value: "both", label: "Both" },
+];
+
+// Targets' pin choice: exactly one of Context / Offload / Both is ever
+// selected -- there's no state where nothing is pinned (that combination is
+// the Wizard card, not a Targets one). Disabled while ANY pin combination's
+// probe is still running/held (targetsFamilyBusy), so a mid-run pin change
+// can't leave one probe running invisibly under its old key while a second
+// fires under the new one.
+function TargetsPinGroup({
+  value,
+  disabled,
+  onChange,
+}: {
+  value: "ctx" | "ngl" | "both";
+  disabled: boolean;
+  onChange: (value: "ctx" | "ngl" | "both") => void;
+}) {
+  return (
+    <div
+      className={`inline-flex overflow-hidden rounded-lg border border-border ${disabled ? "opacity-40" : ""}`}
+      role="radiogroup"
+      aria-label="Targets pin"
+    >
+      {TARGETS_PIN_CHOICES.map((choice) => (
+        <button
+          key={choice.value}
+          type="button"
+          role="radio"
+          aria-checked={value === choice.value}
+          disabled={disabled}
+          title={disabled ? "A Targets run under a different pin combination is still in progress" : undefined}
+          onClick={() => onChange(choice.value)}
+          className={
+            value === choice.value
+              ? `bg-accent px-2 py-0.5 text-[10px] font-semibold text-accent-fg ${disabled ? "cursor-not-allowed" : ""}`
+              : `bg-surface px-2 py-0.5 text-[10px] text-muted ${disabled ? "cursor-not-allowed" : "hover:text-fg"}`
+          }
+        >
+          {choice.label}
+        </button>
+      ))}
     </div>
   );
 }
