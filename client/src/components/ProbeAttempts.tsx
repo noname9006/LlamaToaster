@@ -14,7 +14,7 @@ import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { api } from "../api/client";
 import type { ProbeAttemptDto } from "../types";
-import { PROBE_EXERCISED_TOKENS } from "../../../shared/probeLadder";
+import { PROBE_EXERCISED_TOKENS, PROBE_GEN_TOKENS, PROBE_PROMPT_TOKENS } from "../../../shared/probeLadder";
 
 function mib(value: number | null): string {
   return value == null ? "—" : `${Math.round(value).toLocaleString()} MiB`;
@@ -140,10 +140,10 @@ export function ProbeAttempts({ testId, refreshKey }: ProbeAttemptsProps) {
           <span className="font-bold text-fg">A verified context is an allocation ceiling, not a speed.</span> At{" "}
           <span className="font-mono">{kvSpill.candidate_ctx.toLocaleString()}</span> tokens,{" "}
           <span className="font-mono font-bold">{Math.round((kvSpill.kv_host_backed_frac ?? 0) * 100)}%</span> of the
-          memory that context allocated went to system RAM rather than VRAM. Each load here runs a 64-token prompt and
-          generates 256 tokens whatever the context is set to, so a cache that large is allocated and never read — the
-          speeds above were measured at roughly 320 tokens of context, and will not hold once the context is actually
-          filled.
+          memory that context allocated went to system RAM rather than VRAM. Each load here runs a{" "}
+          {PROBE_PROMPT_TOKENS}-token prompt and generates {PROBE_GEN_TOKENS} tokens whatever the context is set to,
+          so a cache that large is allocated and never read — the speeds above were measured at roughly{" "}
+          {PROBE_EXERCISED_TOKENS} tokens of context, and will not hold once the context is actually filled.
         </div>
       )}
       <div className="flex flex-wrap items-baseline justify-between gap-2">

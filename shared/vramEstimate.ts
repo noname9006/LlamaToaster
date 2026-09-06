@@ -162,6 +162,65 @@ export const VRAM_DISCREPANCY_RATIO = 0.5;
 export const HOST_BACKED_SLOPE_RATIO = 0.5;
 
 /**
+ * The same slope, read on the OTHER counter: how much DEDICATED VRAM appears
+ * per added layer, again as a fraction of one layer's weights. Below this,
+ * the layers did not land on the device.
+ *
+ * `shared` answers "did bytes appear in host memory"; this answers "did the
+ * bytes appear on the GPU". They are not redundant, because the driver's
+ * allocation granularity contaminates them independently, and on the same
+ * calibration sweep this one separates the regimes WIDER:
+ *
+ *   interval    dedicated/layer    shared/layer
+ *    2 ->  4         1.05              0.00        clean
+ *    4 ->  6         0.96              0.00        clean
+ *    6 ->  8         0.74              0.25        clean
+ *    8 -> 10         0.20              0.76        spilling
+ *   10 -> 12        -0.21              1.18        spilling
+ *   12 -> 14         0.18              0.78        spilling
+ *   14 -> 18        -0.02              0.99        spilling
+ *   18 -> 26         0.06              0.91        spilling
+ *   26 -> 41         0.05              0.89        spilling
+ *
+ * Clean 0.74-1.05, spilling -0.21-0.20: a gap of 0.54 against the shared
+ * counter's 0.29, with 0.5 sitting near its middle either way.
+ *
+ * Used as a REQUIRED SECOND OPINION rather than as a replacement. The two
+ * agree on all nine measured intervals, so requiring both costs nothing on
+ * the calibration data; where they disagree the rung is left alone, because
+ * a false conviction fails a configuration that works and moves the reported
+ * boundary, while a false acquittal leaves a slow placement passing where
+ * its own numbers are on screen for the reader.
+ */
+export const HOST_BACKED_RESIDENT_SLOPE_RATIO = 0.5;
+
+/**
+ * Bootstrap acquittal: when a single rung's dedicated VRAM peak reaches this
+ * fraction of its own predicted GPU footprint, its weights demonstrably
+ * landed on the device and no shared-counter reading may convict it.
+ *
+ * The bootstrap needs this because its numerator (`shared`) includes bytes
+ * that are not weights at all. Measured on the reference machine, ngl 0 at a
+ * 262,144-token context reported 571MiB shared with NOTHING claimed on the
+ * GPU -- so at ngl 1 the bootstrap charged that fixed cost against a single
+ * layer's footprint, read 0.95, and convicted a rung whose dedicated VRAM had
+ * just grown by 401MiB for a 420MiB layer and whose generation rate went UP,
+ * 9.1 -> 10.3 tok/s. A layer served from host memory does not make the model
+ * faster.
+ *
+ * Dedicated as a fraction of predicted, same calibration sweep at ctx 1024:
+ *
+ *   clean      ngl  8  0.89     ngl 10  0.77
+ *   spilling   ngl 12  0.62     ngl 14  0.56     ngl 18  0.44
+ *              ngl 26  0.33     ngl 41  0.23
+ *
+ * 0.70 sits in the 0.62-0.77 gap. Narrower than the slope's, which is why
+ * this only ever ACQUITS: it can stop a conviction the shared counter would
+ * have made, and can never make one of its own.
+ */
+export const HOST_BACKED_RESIDENT_ACQUIT_FRAC = 0.7;
+
+/**
  * Minimum layer span the slope may be measured over.
  *
  * The driver hands out memory in granules, not in exact layer-sized pieces --
@@ -421,12 +480,12 @@ export interface HostBackedFallbackVerdict {
    *
    * Deliberately not a failure. A host-backed KV cache costs nothing until
    * the context is used, and the probe never uses it -- every rung runs a
-   * 64-token prompt and 256 generated tokens whatever `-c` says, so a
+   * 256-token prompt and 256 generated tokens whatever `-c` says, so a
    * 262144-token cache is allocated and never read. Measured: context 2048 ->
    * 262144 pushed 98% of the new allocation to host memory and changed
    * generation speed by 5%. Failing on that would be failing on predicted
    * harm; reporting it lets a caller see that the verified context is an
-   * ALLOCATION ceiling whose speed was measured at ~320 tokens. */
+   * ALLOCATION ceiling whose speed was measured at ~512 tokens. */
   kvHostBackedFrac: number | null;
   /** Which evidence decided it -- "slope" when a comparable lower-ngl rung
    * existed, "ratio" for the single-rung bootstrap, null when neither could
@@ -435,9 +494,22 @@ export interface HostBackedFallbackVerdict {
   /** Layers' worth of system RAM appearing per layer added, against the
    * reference rung. Null unless method is "slope". */
   slopeRatio: number | null;
+  /** The corroborating counter: layers' worth of DEDICATED VRAM appearing per
+   * layer added, against the same reference. A conviction on the layer axis
+   * requires this to agree (see HOST_BACKED_RESIDENT_SLOPE_RATIO). Null on
+   * the context axis, on the bootstrap, and whenever either rung's
+   * per-process dedicated peak was never attributed -- which is a real gap,
+   * not a zero, and is why disagreement abstains rather than convicting. */
+  residentSlopeRatio: number | null;
   /** Roughly how many of this rung's claimed layers are host-backed relative
    * to the reference, for display. Null unless method is "slope". */
   spilledLayers: number | null;
+  /** The two counters were both readable and DISAGREED, so no verdict was
+   * reached -- distinct from a measured `hostBacked: false`. Callers must
+   * treat this exactly as they treat `method: null`: fall through to whatever
+   * weaker evidence they have, because "could not decide" must never read as
+   * "measured clean". */
+  abstained: boolean;
 }
 
 const UNAVAILABLE_HOST_BACKED: HostBackedFallbackVerdict = {
@@ -446,7 +518,9 @@ const UNAVAILABLE_HOST_BACKED: HostBackedFallbackVerdict = {
   kvHostBackedFrac: null,
   method: null,
   slopeRatio: null,
+  residentSlopeRatio: null,
   spilledLayers: null,
+  abstained: false,
 };
 
 /**
@@ -503,13 +577,33 @@ export function detectHostBackedFallback(input: HostBackedFallbackInput): HostBa
     const deltaNgl = rung.ngl - nglRef.ngl;
     const deltaShared = rung.sharedPeakMib - nglRef.sharedPeakMib!;
     const slopeRatio = deltaShared / deltaNgl / perLayerMib;
+    // The second opinion, on the dedicated counter: did the added layers show
+    // up on the GPU? Available only when BOTH rungs had a per-process
+    // dedicated peak attributed to them -- that counter can lag a fresh spawn
+    // or never catch up on a short load, and a missing reading is not a zero.
+    const residentSlopeRatio =
+      rung.dedicatedPeakMib != null && nglRef.dedicatedPeakMib != null
+        ? (rung.dedicatedPeakMib - nglRef.dedicatedPeakMib) / deltaNgl / perLayerMib
+        : null;
+    // Both counters must agree before a rung is failed. They do on all nine
+    // intervals of the calibration sweep, so this costs nothing there; what it
+    // buys is that neither counter's own granularity noise can convict alone.
+    // With no dedicated reading the shared slope stands by itself, unchanged
+    // from before -- "couldn't measure" must not become "measured clean".
+    const sharedSaysSpill = slopeRatio > HOST_BACKED_SLOPE_RATIO;
+    const residentSaysSpill = residentSlopeRatio == null || residentSlopeRatio < HOST_BACKED_RESIDENT_SLOPE_RATIO;
     return {
-      hostBacked: slopeRatio > HOST_BACKED_SLOPE_RATIO,
+      hostBacked: sharedSaysSpill && residentSaysSpill,
       axis: "ngl",
       kvHostBackedFrac: null,
       method: "slope",
       slopeRatio,
+      residentSlopeRatio,
       spilledLayers: deltaShared > 0 ? Math.round(deltaShared / perLayerMib) : 0,
+      // Both readable and pointing opposite ways: report the figures, claim
+      // no verdict. On all nine calibration intervals they agree, so this is
+      // never reached there.
+      abstained: residentSlopeRatio != null && sharedSaysSpill !== residentSaysSpill,
     };
   }
 
@@ -550,8 +644,12 @@ export function detectHostBackedFallback(input: HostBackedFallbackInput): HostBa
         kvHostBackedFrac: frac,
         method: "slope",
         slopeRatio: frac,
+        // Layers did not move on this axis, so there is no per-layer residency
+        // slope to report -- the weights term cancelled out of the subtraction.
+        residentSlopeRatio: null,
         // Layers are the wrong unit for a context spill; what grew is cache.
         spilledLayers: null,
+        abstained: false,
       };
     }
   }
@@ -571,13 +669,36 @@ export function detectHostBackedFallback(input: HostBackedFallbackInput): HostBa
   // measured sweep it passed a rung already spilling four layers, and the
   // ladder then converged there instead of descending to the real boundary.
   if (input.rung.estimatedGpuMib == null || input.rung.estimatedGpuMib <= 0) return UNAVAILABLE_HOST_BACKED;
+  // Residency veto. The bootstrap's numerator is the whole shared reading,
+  // including bytes that were never weights -- staging buffers, and a KV cache
+  // the allocator may place host-side by choice. When the dedicated counter
+  // shows the predicted footprint largely DID land on the device, that reading
+  // cannot be weights sitting in host memory, whatever its size. Measured: a
+  // rung whose dedicated VRAM held 84% of its predicted footprint, and whose
+  // generation rate rose when the layer was added, was being convicted at 0.95.
+  const resident =
+    rung.dedicatedPeakMib != null ? rung.dedicatedPeakMib / input.rung.estimatedGpuMib : null;
+  if (resident != null && resident >= HOST_BACKED_RESIDENT_ACQUIT_FRAC) {
+    return {
+      hostBacked: false,
+      axis: null,
+      kvHostBackedFrac: null,
+      method: "ratio",
+      slopeRatio: null,
+      residentSlopeRatio: null,
+      spilledLayers: null,
+      abstained: false,
+    };
+  }
   return {
     hostBacked: rung.sharedPeakMib / input.rung.estimatedGpuMib > HOST_BACKED_BOOTSTRAP_FRAC,
     axis: null,
     kvHostBackedFrac: null,
     method: "ratio",
     slopeRatio: null,
+    residentSlopeRatio: null,
     spilledLayers: null,
+    abstained: false,
   };
 }
 

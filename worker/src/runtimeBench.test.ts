@@ -277,7 +277,7 @@ describe("N5 knee ladder execution", () => {
 // is about one load rather than about the search.
 describe("N2 probe success rule", () => {
   // The 1 tok/s floor is gone. It rejected a placement on a rate measured over
-  // PROBE_EXERCISED_TOKENS -- a number that describes ~320 tokens of context
+  // PROBE_EXERCISED_TOKENS -- a number that describes ~512 tokens of context
   // and not the configuration in the row -- while the thing it was proxying
   // for (weights served from system RAM) is now measured directly.
   it("no longer fails a slow load: a rate is reported, not judged", () => {
