@@ -721,6 +721,11 @@ export interface ProbeAttemptOutcome {
   hostBackedMethod?: "slope" | "ratio" | null;
   hostBackedSlopeRatio?: number | null;
   hostBackedSpilledLayers?: number | null;
+  /** CONTEXT axis only: the share of this context's newly allocated memory
+   * that the OS put in system RAM. A caveat, never a failure -- the probe
+   * exercises ~320 tokens regardless of `-c`, so a host-backed cache costs
+   * nothing here and everything in real use at that context. */
+  kvHostBackedFrac?: number | null;
   /** Prompt-processing rate for this rung, from llama-server's own
    * timings.prompt_n / prompt_ms. Reported per rung because prefill has its
    * OWN placement cliff, several layers below the weights one -- see
@@ -751,9 +756,23 @@ export interface ProbeAttemptOutcome {
   gpuLayersResidentExact?: boolean;
 }
 
-/** Gen tok/s floor -- excludes swap-thrash "success". */
-export const PROBE_MIN_GEN_TPS = 1;
-export const PROBE_GEN_TOKENS = 256;
+/**
+ * There is deliberately no MINIMUM generation rate any more.
+ *
+ * A 1 tok/s floor used to reject "loading is not the same as usable", but it
+ * was answering a question the probe can no longer be trusted to ask: every
+ * rung generates PROBE_GEN_TOKENS at a 64-token prompt whatever `-c` says, so
+ * the rate it measures describes a ~320-token context and nothing else. Using
+ * a threshold on that to reject a placement means rejecting on a number that
+ * was never about the configuration being judged.
+ *
+ * What actually distinguishes a usable placement from a thrashing one is
+ * measured directly now -- detectHostBackedFallback sees the weights sitting
+ * in system RAM rather than inferring it from the symptom. A rung that
+ * generates nothing at all still fails below; a rung that generates slowly is
+ * reported with its rate and left to the caller.
+ */
+export { PROBE_GEN_TOKENS, PROBE_PROMPT_TOKENS } from "../../shared/probeLadder.js";
 
 // The ladder that used to live here -- one context axis, x0.75 on failure and
 // x1.33 on a roomy success, three loads max -- has been replaced by
@@ -837,6 +856,8 @@ export function probeSucceeded(input: {
 } {
   const noFallback: HostBackedFallbackVerdict = {
     hostBacked: false,
+    axis: null,
+    kvHostBackedFrac: null,
     method: null,
     slopeRatio: null,
     spilledLayers: null,
@@ -885,13 +906,15 @@ export function probeSucceeded(input: {
       input.estimatedVramMib != null &&
       observedMib != null &&
       isVramDiscrepancy(input.estimatedVramMib, observedMib));
-  if (input.genTps == null || input.genTps < PROBE_MIN_GEN_TPS) {
+  // "Generated nothing measurable" is still a failure -- that is not a slow
+  // configuration, it is one that did not work. Any positive rate passes.
+  if (input.genTps == null) {
     return {
       ok: false,
       spill: false,
       vramDiscrepancy,
       hostBacked,
-      reason: `generation ran at ${input.genTps == null ? "an unmeasurable rate" : `${input.genTps.toFixed(2)} tok/s`}, below the ${PROBE_MIN_GEN_TPS} tok/s floor -- loading is not the same as usable`,
+      reason: "the model loaded but produced no measurable generation",
     };
   }
   return { ok: true, spill: false, vramDiscrepancy, hostBacked, reason: null };
@@ -949,6 +972,7 @@ export function toProbeAttemptReport(attempt: ProbeAttemptOutcome): ProbeAttempt
     vram_process_peak_mib: attempt.vramProcessPeakMib,
     ram_total_peak_mib: attempt.ramTotalPeakMib,
     vram_shared_peak_mib: attempt.vramSharedPeakMib,
+    kv_host_backed_frac: attempt.kvHostBackedFrac,
     pp_tps: attempt.ppTps,
     ttft_ms: attempt.ttftMs,
     prefill_cliff: attempt.prefillCliff,

@@ -77,6 +77,8 @@ export interface ProbeAttemptDto {
    * shared-memory counter) and from workers predating the check. */
   host_backed_method: "slope" | "ratio" | null;
   host_backed_slope: number | null;
+  /** See ProbeAttemptReport.kv_host_backed_frac -- a caveat, not a failure. */
+  kv_host_backed_frac: number | null;
   error: string | null;
   created_at: number;
   /** Set when this rung was never actually loaded, but reused verbatim from
@@ -121,6 +123,18 @@ export interface ProbeDedupPoint {
   ram_peak_mib: number | null;
   /** See ProbeAttemptDto.vram_shared_peak_mib. */
   vram_shared_peak_mib: number | null;
+  /** Everything below is carried so a REUSED rung shows the same figures as
+   * the sibling that actually measured it. Without them a reused row rendered
+   * as a line of em-dashes next to fully-populated neighbours, which reads as
+   * "not measured" rather than "measured once, elsewhere". */
+  vram_process_peak_mib: number | null;
+  ram_total_peak_mib: number | null;
+  pp_tps: number | null;
+  ttft_ms: number | null;
+  prefill_cliff: boolean;
+  host_backed_method: "slope" | "ratio" | null;
+  host_backed_slope: number | null;
+  kv_host_backed_frac: number | null;
   /** See ProbeAttemptDto.vram_discrepancy; coerced to false for a sibling row
    * predating the check, same as ok/oom/spill's own boolean coercion above. */
   vram_discrepancy: boolean;

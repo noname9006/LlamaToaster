@@ -849,6 +849,62 @@ describe("POST /api/runs/:id/probe-attempt (N2 live progress)", () => {
 // N2 batch dedup -- lets a later scenario in the same batch skip a point an
 // earlier sibling already measured.
 describe("GET /api/runs/:id/probe-dedup", () => {
+  // A reused rung is a real measurement, just one the reusing run did not pay
+  // a load for. It used to arrive carrying only ok/oom/spill and a handful of
+  // memory figures, so its row rendered as a line of em-dashes beside fully
+  // populated neighbours -- which reads as "never measured" rather than
+  // "measured once, by a sibling".
+  it("carries speeds and slope to a reusing run, not just the pass/fail", async () => {
+    makeRun("dedup-full-root", { kind: "probe", worker: workerId, config: { probe: probeSpec }, status: "done" });
+    await post(
+      "/api/runs/dedup-full-root/probe-attempt",
+      {
+        seq: 0,
+        candidate_ctx: 4096,
+        ngl: 13,
+        ok: true,
+        oom: false,
+        spill: false,
+        gen_tps: 11.1,
+        pp_tps: 8.7,
+        ttft_ms: 7390,
+        prefill_cliff: true,
+        host_backed_method: "slope",
+        host_backed_slope: 0.16,
+        kv_host_backed_frac: 0.98,
+        vram_process_peak_mib: 4452,
+        ram_total_peak_mib: 24774,
+        vram_shared_peak_mib: 1693,
+      },
+      workerToken
+    );
+    makeRun("dedup-full-sibling", {
+      kind: "probe",
+      worker: workerId,
+      config: { probe: probeSpec },
+      root_run_id: "dedup-full-root",
+    });
+
+    const res = await fetch(`${baseUrl}/api/runs/dedup-full-sibling/probe-dedup`, {
+      headers: { authorization: `Bearer ${workerToken}` },
+    });
+    expect(res.status).toBe(200);
+    const { points } = (await res.json()) as { points: Record<string, unknown>[] };
+    expect(points).toHaveLength(1);
+    expect(points[0]).toMatchObject({
+      gen_tps: 11.1,
+      pp_tps: 8.7,
+      ttft_ms: 7390,
+      prefill_cliff: true,
+      host_backed_method: "slope",
+      host_backed_slope: 0.16,
+      kv_host_backed_frac: 0.98,
+      vram_process_peak_mib: 4452,
+      ram_total_peak_mib: 24774,
+    });
+  });
+
+
   it("surfaces an earlier sibling's rungs to a same-root, same-build, same-kv probe", async () => {
     makeRun("dedup-root", { kind: "probe", worker: workerId, config: { probe: probeSpec }, status: "done" });
     await post(

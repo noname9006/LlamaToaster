@@ -354,6 +354,7 @@ const COLUMN_MIGRATIONS: ColumnSpec[] = [
   // measured layers-of-system-RAM per layer added.
   { table: "probe_attempts", column: "host_backed_method", ddlType: "TEXT" },
   { table: "probe_attempts", column: "host_backed_slope", ddlType: "REAL" },
+  { table: "probe_attempts", column: "kv_host_backed_frac", ddlType: "REAL" },
 ];
 
 function applyColumnMigrations(database: Database.Database): void {
