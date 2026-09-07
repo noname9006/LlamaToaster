@@ -82,6 +82,11 @@ const TEST_ITEM_STATUS_TONE: Record<TestItemStatus, PillTone> = {
   // Still danger-toned (it IS a failure), distinguished from plain "failed"
   // only by its label/tooltip.
   failed_unsupported: "danger",
+  // The worker's own idle-timeout watchdog killed this item -- not a crash,
+  // not evidence the config doesn't work, just "took longer than the
+  // configured budget without making progress." Warning-toned rather than
+  // danger so it doesn't read as an error the way a real failure does.
+  failed_timeout: "warning",
   cancelled: "muted",
   // §0.7 -- never measured (an unsupported flag disabled its axis), which is
   // a different outcome from "failed" and reads as its own muted tone.
@@ -98,6 +103,7 @@ const TEST_ITEM_STATUS_LABEL: Record<TestItemStatus, string> = {
   failed: "failed",
   failed_oom: "failed (oom)",
   failed_unsupported: "unsupported model",
+  failed_timeout: "timed out",
   cancelled: "cancelled",
   skipped: "skipped",
 };
@@ -122,6 +128,8 @@ export function shortItemErrorLabel(status: TestItemStatus): string {
       return "stopped with an error";
     case "failed_oom":
       return "stopped — out of memory";
+    case "failed_timeout":
+      return "stopped — timed out";
     case "failed_unsupported":
       return "this model can't be tested";
     case "cancelled":
@@ -159,7 +167,7 @@ export function describeItemPhase(item: TestItem): string {
   }
 }
 
-type DotState = "grey" | "blink" | "solid" | "red" | "cancelled" | "skipped";
+type DotState = "grey" | "blink" | "solid" | "red" | "warn" | "cancelled" | "skipped";
 
 const TEST_ITEM_DOT_STATE: Record<TestItemStatus, DotState> = {
   queued: "grey",
@@ -171,6 +179,8 @@ const TEST_ITEM_DOT_STATE: Record<TestItemStatus, DotState> = {
   failed: "red",
   failed_oom: "red",
   failed_unsupported: "red",
+  // Informational, not an error -- see TEST_ITEM_STATUS_TONE's own comment.
+  failed_timeout: "warn",
   cancelled: "cancelled",
   skipped: "skipped",
 };
@@ -260,6 +270,8 @@ function comboIsRunning(status: TestItemStatus): boolean {
 export function comboTone(status: TestItemStatus): CircleTone {
   if (comboIsRunning(status)) return "running";
   if (status === "failed" || status === "failed_oom" || status === "failed_unsupported") return "red";
+  // Informational, not an error -- see TEST_ITEM_STATUS_TONE's own comment.
+  if (status === "failed_timeout") return "warn";
   if (status === "done") return "solid";
   if (status === "cancelled") return "cancelled";
   return "grey";

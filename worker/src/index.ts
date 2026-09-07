@@ -1750,7 +1750,16 @@ async function finalizeSweepItemResult(
     ...formatMemoryLines(stats, baseline).map((line) => `  ${line}`),
     `  error (code ${bench.code}, signal ${bench.signal ?? "none"}): ${errorMessage}`,
   ];
-  log.error(failureLines.join("\n"));
+  // A watchdog timeout isn't a crash or a bad config -- it's the worker's own
+  // idle budget running out, quite possibly on an item that was still making
+  // fine progress (see bench.ts's classifyFailure). Logged at warn, not
+  // error, so it doesn't read as something having gone wrong the way a real
+  // failure does.
+  if (status === "failed_timeout") {
+    log.warn(failureLines.join("\n"));
+  } else {
+    log.error(failureLines.join("\n"));
+  }
   await safeItemTerminal(runId, item.idx, {
     status,
     error: errorMessage,

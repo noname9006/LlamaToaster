@@ -920,7 +920,7 @@ export const repo = {
         `SELECT runs.*, m.filename AS model_filename,
                 (SELECT COUNT(*) FROM run_items WHERE run_items.run_id = runs.id) AS items_total,
                 (SELECT COUNT(*) FROM run_items WHERE run_items.run_id = runs.id AND status = 'done') AS items_done,
-                (SELECT COUNT(*) FROM run_items WHERE run_items.run_id = runs.id AND status IN ('failed','failed_oom')) AS items_failed,
+                (SELECT COUNT(*) FROM run_items WHERE run_items.run_id = runs.id AND status IN ('failed','failed_oom','failed_timeout')) AS items_failed,
                 (SELECT COUNT(*) FROM run_items WHERE run_items.run_id = runs.id AND status = 'cancelled') AS items_cancelled
          FROM runs
          LEFT JOIN models m ON m.id = runs.model_id
@@ -937,7 +937,7 @@ export const repo = {
         `SELECT runs.*, m.filename AS model_filename,
                 (SELECT COUNT(*) FROM run_items WHERE run_items.run_id = runs.id) AS items_total,
                 (SELECT COUNT(*) FROM run_items WHERE run_items.run_id = runs.id AND status = 'done') AS items_done,
-                (SELECT COUNT(*) FROM run_items WHERE run_items.run_id = runs.id AND status IN ('failed','failed_oom')) AS items_failed,
+                (SELECT COUNT(*) FROM run_items WHERE run_items.run_id = runs.id AND status IN ('failed','failed_oom','failed_timeout')) AS items_failed,
                 (SELECT COUNT(*) FROM run_items WHERE run_items.run_id = runs.id AND status = 'cancelled') AS items_cancelled
          FROM runs
          LEFT JOIN models m ON m.id = runs.model_id
@@ -1249,7 +1249,7 @@ export const repo = {
         `SELECT runs.*, m.filename AS model_filename,
                 (SELECT COUNT(*) FROM run_items WHERE run_items.run_id = runs.id) AS items_total,
                 (SELECT COUNT(*) FROM run_items WHERE run_items.run_id = runs.id AND status = 'done') AS items_done,
-                (SELECT COUNT(*) FROM run_items WHERE run_items.run_id = runs.id AND status IN ('failed','failed_oom')) AS items_failed,
+                (SELECT COUNT(*) FROM run_items WHERE run_items.run_id = runs.id AND status IN ('failed','failed_oom','failed_timeout')) AS items_failed,
                 (SELECT COUNT(*) FROM run_items WHERE run_items.run_id = runs.id AND status = 'cancelled') AS items_cancelled
          FROM runs
          LEFT JOIN models m ON m.id = runs.model_id
@@ -1670,7 +1670,7 @@ export const repo = {
     const row = getDb()
       .prepare(
         `SELECT COUNT(*) as n FROM run_items
-         WHERE run_id = ? AND status NOT IN ('done','failed','failed_oom','failed_unsupported','cancelled','skipped')`
+         WHERE run_id = ? AND status NOT IN ('done','failed','failed_oom','failed_unsupported','failed_timeout','cancelled','skipped')`
       )
       .get(runId) as { n: number };
     return row.n;
@@ -1699,11 +1699,12 @@ export const repo = {
            SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END) as done,
            SUM(CASE WHEN status = 'skipped' THEN 1 ELSE 0 END) as skipped,
            SUM(CASE WHEN status = 'failed_oom' THEN 1 ELSE 0 END) as oom,
+           SUM(CASE WHEN status = 'failed_timeout' THEN 1 ELSE 0 END) as timeout,
            SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END) as cancelled,
            COUNT(*) as total
          FROM run_items WHERE run_id = ?`
       )
-      .get(runId) as { done: number; skipped: number; oom: number; cancelled: number; total: number };
+      .get(runId) as { done: number; skipped: number; oom: number; timeout: number; cancelled: number; total: number };
 
     let status: TestStatus;
     let error: string | null = null;
@@ -1736,7 +1737,10 @@ export const repo = {
       const failedCount = counts.total - counts.done - counts.skipped;
       if (failedCount > 0) {
         error = `${failedCount} of ${counts.total} test${counts.total === 1 ? "" : "s"} failed`;
-        if (counts.oom > 0) error += ` (${counts.oom} OOM)`;
+        const reasons = [counts.oom > 0 ? `${counts.oom} OOM` : null, counts.timeout > 0 ? `${counts.timeout} timed out` : null].filter(
+          Boolean
+        );
+        if (reasons.length > 0) error += ` (${reasons.join(", ")})`;
         if (counts.skipped > 0) error += `, ${counts.skipped} skipped`;
       }
     }
@@ -1763,7 +1767,7 @@ export const repo = {
       database
         .prepare(
           `UPDATE run_items SET status = 'failed', error = ?, completed_at = ?
-           WHERE run_id = ? AND status NOT IN ('done','failed','failed_oom','failed_unsupported','cancelled','skipped')`
+           WHERE run_id = ? AND status NOT IN ('done','failed','failed_oom','failed_unsupported','failed_timeout','cancelled','skipped')`
         )
         .run(error, now, runId);
       this.finalizeTest(runId, now);
@@ -1791,7 +1795,7 @@ export const repo = {
       database
         .prepare(
           `UPDATE run_items SET status = 'cancelled', error = ?, completed_at = ?
-           WHERE run_id = ? AND status NOT IN ('done','failed','failed_oom','failed_unsupported','cancelled','skipped')`
+           WHERE run_id = ? AND status NOT IN ('done','failed','failed_oom','failed_unsupported','failed_timeout','cancelled','skipped')`
         )
         .run(note, now, runId);
       this.finalizeTest(runId, now, note);
@@ -1821,7 +1825,7 @@ export const repo = {
       database
         .prepare(
           `UPDATE run_items SET status = 'failed', error = ?, completed_at = ?
-           WHERE run_id = ? AND status NOT IN ('done','failed','failed_oom','failed_unsupported','cancelled','skipped')`
+           WHERE run_id = ? AND status NOT IN ('done','failed','failed_oom','failed_unsupported','failed_timeout','cancelled','skipped')`
         )
         .run(note, now, runId);
       this.finalizeTest(runId, now);
@@ -3001,10 +3005,10 @@ export const repo = {
       }
 
       // Terminal outcomes only -- the same finished set countUnfinishedItems
-      // defines ('done','failed','failed_oom','failed_unsupported','cancelled');
+      // defines ('done','failed','failed_oom','failed_unsupported','failed_timeout','cancelled');
       // still-'queued' or in-flight items haven't been performed yet.
       const tests = scalar(
-        `SELECT COUNT(*) AS n FROM run_items WHERE status IN ('done','failed','failed_oom','failed_unsupported','cancelled')`
+        `SELECT COUNT(*) AS n FROM run_items WHERE status IN ('done','failed','failed_oom','failed_unsupported','failed_timeout','cancelled')`
       );
 
       return { users, machines, modelsTested, quants: quants.size, tests, runs };
@@ -3022,7 +3026,7 @@ export const repo = {
                   m.filename AS model_filename,
                   (SELECT COUNT(*) FROM run_items WHERE run_items.run_id = runs.id) AS items_total,
                   (SELECT COUNT(*) FROM run_items WHERE run_items.run_id = runs.id AND status = 'done') AS items_done,
-                  (SELECT COUNT(*) FROM run_items WHERE run_items.run_id = runs.id AND status IN ('failed','failed_oom')) AS items_failed
+                  (SELECT COUNT(*) FROM run_items WHERE run_items.run_id = runs.id AND status IN ('failed','failed_oom','failed_timeout')) AS items_failed
            FROM runs
            LEFT JOIN users u ON u.id = runs.user_id
            LEFT JOIN workers w ON w.id = runs.worker_id

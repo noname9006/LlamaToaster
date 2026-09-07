@@ -143,7 +143,11 @@ export interface PlacementVerifyResult {
   // "failed_unsupported" -- llama-server rejected the model's own output the
   // same way at every placement tried (see runtimeBench.ts's
   // LlamaServerOutputError); no placement this card could pick would fix it.
-  status: "pending" | "verified" | "failed" | "failed_oom" | "failed_unsupported" | "cancelled" | "error";
+  // "failed_timeout" -- the worker's own idle-timeout watchdog killed the
+  // probe (see worker/src/bench.ts's classifyFailure); says nothing about
+  // whether this placement actually fits, so ModeCard below keeps it out of
+  // the failedCapacity "didn't fit" bucket.
+  status: "pending" | "verified" | "failed" | "failed_oom" | "failed_unsupported" | "failed_timeout" | "cancelled" | "error";
   detail?: string;
   verifiedCtxTokens?: number | null;
   mode?: ProbeMode;
@@ -1118,6 +1122,10 @@ function modeCardCircleTone(result: PlacementVerifyResult | null): CircleTone {
     case "failed":
     case "error":
       return "red";
+    // Informational, not an error -- see PlacementVerifyResult.status's own
+    // comment.
+    case "failed_timeout":
+      return "warn";
     case "cancelled":
       return "cancelled";
     default:
@@ -1162,6 +1170,11 @@ function ModeCard({
   const running = result?.status === "pending";
   const failedCapacity = result?.status === "failed" || result?.status === "failed_oom";
   const failedUnsupported = result?.status === "failed_unsupported";
+  // Distinct from failedCapacity -- a timeout says nothing about whether
+  // this placement actually fits, just that the worker's idle budget ran out
+  // (see PlacementVerifyResult.status's own comment), so it gets its own
+  // informational label instead of the "✗ didn't fit" one.
+  const failedTimeout = result?.status === "failed_timeout";
   const inert = busy || held;
   const startLabel = `from ${start.ngl} layers · ${start.ctx.toLocaleString()} tokens`;
   return (
@@ -1227,6 +1240,9 @@ function ModeCard({
             below (same as any other terminal card) is where the detail is. */}
         {failedUnsupported && (
           <span className="block font-mono text-[11px] font-semibold text-danger">✗ can't be tested</span>
+        )}
+        {failedTimeout && (
+          <span className="block font-mono text-[11px] font-semibold text-warning">⏱ timed out</span>
         )}
         {result?.status === "cancelled" && (
           <span className="block font-mono text-[11px] font-semibold text-muted">■ stopped before finishing</span>
