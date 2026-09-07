@@ -278,6 +278,7 @@ const TERMINAL_ITEM_STATUSES = new Set([
   "failed",
   "failed_oom",
   "failed_unsupported",
+  "failed_timeout",
   "cancelled",
   "skipped",
 ]);
@@ -303,7 +304,9 @@ function matchesStatusFilter(status: TestItem["status"], filter: StatusFilter): 
     case "done":
       return status === "done";
     case "failed":
-      return status === "failed" || status === "failed_oom" || status === "failed_unsupported";
+      return (
+        status === "failed" || status === "failed_oom" || status === "failed_unsupported" || status === "failed_timeout"
+      );
     case "cancelled":
       return status === "cancelled";
     default:

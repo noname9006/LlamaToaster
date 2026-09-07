@@ -178,7 +178,7 @@ CREATE TABLE IF NOT EXISTS run_items (
   mtp TEXT DEFAULT 'off',    -- 'on'/'off' -- see worker/src/serverBench.ts
   n_gpu_layers_draft INTEGER DEFAULT 0,  -- -ngld for the MTP/draft companion model, 0 where not applicable
   n_cpu_moe INTEGER DEFAULT 0,    -- --n-cpu-moe, 0 where not applicable -- see shared/sweep.ts's SweepItem.n_cpu_moe
-  status TEXT,              -- queued|loading|processing|generating|benchmarking|done|failed|failed_oom
+  status TEXT,              -- queued|loading|processing|generating|benchmarking|done|failed|failed_oom|failed_timeout
   detail TEXT,               -- best-effort human text, e.g. a stderr progress line
   ram_mib INTEGER,           -- live/current, updated by best-effort ticks
   vram_mib INTEGER,

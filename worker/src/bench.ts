@@ -9,6 +9,18 @@ export interface BenchLogger {
   warn: (...parts: unknown[]) => void;
 }
 
+// Injectable in tests (see runtimeBench.ts's identically-shaped SpawnFn,
+// used the same way there) so the idle-watchdog timing below can be
+// exercised against a trivial, script-based child process instead of
+// needing a real llama-bench binary on disk. Declared locally rather than
+// imported from runtimeBench.ts to avoid a circular import (that module
+// already imports from this one).
+export type SpawnFn = (path: string, args: string[]) => ChildProcess;
+
+function defaultSpawn(path: string, args: string[]): ChildProcess {
+  return spawn(path, args, { windowsHide: true });
+}
+
 export interface BenchRunInput {
   modelPath: string;
   // One sweep combination -- see shared/sweep.ts's expandSweep. A whole
@@ -29,6 +41,7 @@ export interface BenchRunInput {
   // every run before this field existed.
   mainGpu?: number;
   timeoutMs?: number;
+  spawnFn?: SpawnFn;
   onSpawn?: (proc: ChildProcess) => void;
   // Fired per stderr line as it streams in -- lets the caller drive live
   // phase/detail reporting without this module knowing anything about
@@ -37,7 +50,26 @@ export interface BenchRunInput {
   log?: BenchLogger;
 }
 
+// Idle-activity budget, not a total-runtime cap -- see runBench's timer
+// below for why. Same 30-minute number as before this distinction existed,
+// just reinterpreted: previously the whole spawn-to-exit lifetime had to fit
+// inside it (so a sweep item with enough repeats, or slow enough ones, was
+// always eventually killed regardless of whether it was still making
+// progress -- confirmed live: a batch of otherwise-healthy 10-repeat items
+// died on their final repeat, every time, right at this many ms after
+// spawn). Now it's the longest gap allowed between two progress markers.
 const DEFAULT_TIMEOUT_MS = 30 * 60 * 1000;
+
+// Common prefix of every progress line llama-bench's --progress flag prints
+// (see buildArgs/supportsProgressFlag above and index.ts's PP_RUN_RE/
+// TG_RUN_RE/WARMUP_RE/STARTING_RE, which parse the same lines for their own,
+// more specific purposes): "benchmark 1/1: starting", "benchmark 1/1: warmup
+// prompt run", "benchmark 1/1: prompt run 3/10", "benchmark 1/1: generation
+// run 3/10". Matching just this shared prefix is enough to know the process
+// is still alive and progressing -- the idle timer below doesn't need to
+// know which specific phase/repeat it's on, only that llama-bench itself
+// last said something recently.
+const PROGRESS_LINE_RE = /^benchmark\s+\d+\/\d+:/i;
 
 // Whether a given llama-bench build understands --progress (added upstream
 // well after some older installed builds were released -- see
@@ -215,8 +247,16 @@ export interface FailureClassificationInput {
   timedOut: boolean;
 }
 
-export function classifyFailure(input: FailureClassificationInput): "failed_oom" | "failed" {
-  if (!input.timedOut && (input.signal === "SIGKILL" || input.signal === "SIGABRT")) {
+export function classifyFailure(input: FailureClassificationInput): "failed_oom" | "failed_timeout" | "failed" {
+  // Checked first and unconditionally: this worker's own idle-watchdog kill
+  // (BenchResult.timedOut, see runBench above) is an unambiguous, known
+  // reason to die -- distinct from both an OS OOM-killer's SIGKILL and any
+  // OOM-flavored stderr text a slow-but-otherwise-healthy process happened
+  // to have printed before going quiet.
+  if (input.timedOut) {
+    return "failed_timeout";
+  }
+  if (input.signal === "SIGKILL" || input.signal === "SIGABRT") {
     return "failed_oom";
   }
   if (OOM_STDERR_PATTERN.test(input.stderr)) {
@@ -601,7 +641,7 @@ export async function runBench(input: BenchRunInput): Promise<BenchResult> {
   const log = input.log;
   return new Promise((resolve) => {
     log?.info(
-      `spawning llama-bench: ${input.llamaBenchPath} (backend=${input.backend}, timeoutMs=${timeoutMs})`
+      `spawning llama-bench: ${input.llamaBenchPath} (backend=${input.backend}, idleTimeoutMs=${timeoutMs})`
     );
     log?.debug(`llama-bench args: ${args.join(" ")}`);
     const startedAt = Date.now();
@@ -610,34 +650,53 @@ export async function runBench(input: BenchRunInput): Promise<BenchResult> {
     // Windows, with proper argument escaping. Re-implementing that by hand
     // here previously meant cmd.exe re-parsed the full command line itself,
     // letting shell metacharacters in any sweep value break out of argv.
-    const proc: ChildProcess = spawn(input.llamaBenchPath, args, {
-      windowsHide: true,
-    });
+    const proc: ChildProcess = (input.spawnFn ?? defaultSpawn)(input.llamaBenchPath, args);
     input.onSpawn?.(proc);
     let stdout = "";
     let stderr = "";
     let stderrLineBuf = "";
     let timedOut = false;
-    const timer = setTimeout(() => {
-      timedOut = true;
-      const elapsedMs = Date.now() - startedAt;
-      log?.warn(
-        `llama-bench (pid ${proc.pid}) timed out after ${timeoutMs}ms (elapsed ${elapsedMs}ms), sending SIGKILL`
-      );
-      stderr += `\ntimed out after ${timeoutMs}ms, killing process`;
-      proc.kill("SIGKILL");
-    }, timeoutMs);
+    // Idle watchdog, not a total-runtime cap: rearmed on every progress
+    // marker (see PROGRESS_LINE_RE) rather than left running from spawn to
+    // exit, so a sweep item whose repeats legitimately take longer than this
+    // budget to all sum to is never killed for merely being slow -- only for
+    // going quiet. A build too old to support --progress (see
+    // supportsProgressFlag) never prints a matching line at all, so no
+    // marker ever rearms this for those builds -- the timer just runs out at
+    // timeoutMs after spawn like it always did, the best available fallback
+    // without progress markers to key off.
+    let timer: NodeJS.Timeout;
+    const armTimer = () => {
+      timer = setTimeout(() => {
+        timedOut = true;
+        const elapsedMs = Date.now() - startedAt;
+        log?.warn(
+          `llama-bench (pid ${proc.pid}) had no progress for ${timeoutMs}ms (elapsed ${elapsedMs}ms total), sending SIGKILL`
+        );
+        stderr += `\nno progress for ${timeoutMs}ms, killing process`;
+        proc.kill("SIGKILL");
+      }, timeoutMs);
+    };
+    armTimer();
     proc.stdout?.on("data", (d) => (stdout += d.toString()));
     proc.stderr?.on("data", (d) => {
       const text: string = d.toString();
       stderr += text;
-      if (!input.onStderrLine) return;
+      // Always split into lines now (not just when a caller wants them) --
+      // the idle-timer rearm below needs every line checked against
+      // PROGRESS_LINE_RE regardless of whether onStderrLine is wired up.
       stderrLineBuf += text;
       let nl = stderrLineBuf.indexOf("\n");
       while (nl !== -1) {
         const line = stderrLineBuf.slice(0, nl);
         stderrLineBuf = stderrLineBuf.slice(nl + 1);
-        if (line.trim()) input.onStderrLine(line);
+        if (line.trim()) {
+          if (PROGRESS_LINE_RE.test(line)) {
+            clearTimeout(timer);
+            armTimer();
+          }
+          input.onStderrLine?.(line);
+        }
         nl = stderrLineBuf.indexOf("\n");
       }
     });
@@ -650,7 +709,7 @@ export async function runBench(input: BenchRunInput): Promise<BenchResult> {
       const elapsedMs = Date.now() - startedAt;
       log?.info(
         `llama-bench (pid ${proc.pid}) exited with code ${code}${signal ? ` signal ${signal}` : ""} ` +
-          `after ${elapsedMs}ms${timedOut ? " (killed on timeout)" : ""}, stdout=${stdout.length}B stderr=${stderr.length}B`
+          `after ${elapsedMs}ms${timedOut ? " (killed on idle timeout)" : ""}, stdout=${stdout.length}B stderr=${stderr.length}B`
       );
       let results: IngestResultInput[] = [];
       let gpu_info: string | undefined;

@@ -1,5 +1,15 @@
+import { spawn } from "node:child_process";
 import { describe, expect, it } from "vitest";
-import { parseModelBufferSizes, extractCudaDiagnosticLines, MAX_CUDA_DIAGNOSTIC_LINES, buildArgs, classifyFailure, appendBoundedOutput, type BenchRunInput } from "./bench.js";
+import {
+  parseModelBufferSizes,
+  extractCudaDiagnosticLines,
+  MAX_CUDA_DIAGNOSTIC_LINES,
+  buildArgs,
+  classifyFailure,
+  appendBoundedOutput,
+  runBench,
+  type BenchRunInput,
+} from "./bench.js";
 import type { SweepItem } from "../../shared/sweep.js";
 
 const BASE_ITEM: SweepItem = {
@@ -56,8 +66,14 @@ describe("classifyFailure", () => {
     expect(classifyFailure({ stderr: "", signal: "SIGABRT", timedOut: false })).toBe("failed_oom");
   });
 
-  it("does NOT treat our own bench_timeout_ms kill as OOM, even though it also arrives as SIGKILL", () => {
-    expect(classifyFailure({ stderr: "", signal: "SIGKILL", timedOut: true })).toBe("failed");
+  it("does NOT treat our own bench_timeout_ms kill as OOM, even though it also arrives as SIGKILL -- it's its own status instead", () => {
+    expect(classifyFailure({ stderr: "", signal: "SIGKILL", timedOut: true })).toBe("failed_timeout");
+  });
+
+  it("treats timedOut as authoritative even over OOM-flavored stderr text", () => {
+    expect(
+      classifyFailure({ stderr: "CUDA error: out of memory\ncudaMalloc failed", signal: "SIGKILL", timedOut: true })
+    ).toBe("failed_timeout");
   });
 
   it("recognizes common allocator error phrases in stderr as OOM", () => {
@@ -78,6 +94,70 @@ describe("classifyFailure", () => {
       classifyFailure({ stderr: "Segmentation fault (core dumped)", signal: null, timedOut: false })
     ).toBe("failed");
     expect(classifyFailure({ stderr: "", signal: null, timedOut: false })).toBe("failed");
+  });
+});
+
+// Real diagnosed incident (see the run log this fix was built from): a
+// sweep item whose 10 repeats each legitimately take a bit longer than
+// timeoutMs/10 got SIGKILLed on its own final repeat, every time, because
+// the old timer ran once from spawn and never noticed the process was still
+// making steady progress. These exercise the fix against a real (if trivial)
+// child process via BenchRunInput.spawnFn, rather than just asserting on
+// classifyFailure's output in isolation -- runBench's own setTimeout/rearm
+// wiring is what actually needs to behave correctly here.
+describe("runBench idle-timeout watchdog", () => {
+  // Ignores argv entirely (buildArgs' real llama-bench flags are irrelevant
+  // to a fake process) and writes '[]' to stdout at the end so
+  // parseLlamaBench doesn't throw -- these tests only care about
+  // BenchResult.timedOut/code, not the (empty) results array.
+  function scriptSpawnFn(script: string) {
+    return () => spawn(process.execPath, ["-e", script], { stdio: ["ignore", "pipe", "pipe"] });
+  }
+
+  it("does not kill a run whose total time exceeds the idle budget as long as it keeps progressing", async () => {
+    // Three repeats at 120ms apart -- each gap comfortably under the 300ms
+    // idle timeout below, but the 360ms+ total would have tripped the OLD
+    // flat from-spawn timer at the same 300ms value.
+    const script = `
+      const delay = (ms) => new Promise((r) => setTimeout(r, ms));
+      (async () => {
+        process.stderr.write("benchmark 1/1: starting\\n");
+        for (let i = 1; i <= 3; i++) {
+          await delay(120);
+          process.stderr.write(\`benchmark 1/1: prompt run \${i}/3\\n\`);
+        }
+        process.stdout.write("[]");
+      })();
+    `;
+    const result = await runBench({
+      modelPath: "/models/fake.gguf",
+      item: BASE_ITEM,
+      repeats: 3,
+      llamaBenchPath: "unused-with-spawnFn",
+      backend: "cuda",
+      timeoutMs: 300,
+      spawnFn: scriptSpawnFn(script),
+    });
+    expect(result.timedOut).toBe(false);
+    expect(result.code).toBe(0);
+  });
+
+  it("still kills a run that genuinely goes quiet for the idle budget", async () => {
+    const script = `
+      process.stderr.write("benchmark 1/1: starting\\n");
+      setTimeout(() => { process.stdout.write("[]"); }, 5000);
+    `;
+    const result = await runBench({
+      modelPath: "/models/fake.gguf",
+      item: BASE_ITEM,
+      repeats: 1,
+      llamaBenchPath: "unused-with-spawnFn",
+      backend: "cuda",
+      timeoutMs: 150,
+      spawnFn: scriptSpawnFn(script),
+    });
+    expect(result.timedOut).toBe(true);
+    expect(result.signal).toBe("SIGKILL");
   });
 });
 

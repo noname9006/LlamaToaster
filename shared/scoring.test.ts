@@ -266,6 +266,15 @@ describe("§0.3 eligibility gates and rejection accounting", () => {
     expect(skipped.scoredCount).toBe(1);
   });
 
+  it("a timed-out item disqualifies its tuple just like any other failure reason", () => {
+    const timedOut = scoreProfiles({
+      rows: config({ idx: 0, pp: 100, tg: 10 }),
+      repeats: 5,
+      itemStatusByIdx: { 0: "failed_timeout" },
+    });
+    expect(timedOut.scoredCount).toBe(0);
+  });
+
   it("excludes swa rows from the TG reference-depth comparison, tallying caveat_flagged when nothing is left", () => {
     const rows = [
       row({ idx: 0, test_type: "pp", avg_tps: 100, n_depth: 16384 }),
