@@ -902,6 +902,13 @@ export type TestItemStatus =
   // all" apart from an ordinary too-slow/OOM outcome that a different
   // placement might still pass.
   | "failed_unsupported"
+  // The worker's own idle-timeout watchdog killed the process (see
+  // worker/src/bench.ts's runBench/classifyFailure) -- not a crash, not an
+  // OOM, and not evidence the config doesn't work, just "this took longer
+  // than the configured budget without making progress." Distinct from
+  // failed/failed_oom so the UI can present it as informational (the item
+  // may well have been about to finish) rather than as an error.
+  | "failed_timeout"
   | "cancelled"
   // §0.7 -- an unsupported flag disables its axis (items become skipped with
   // a reason) rather than failing every item. Never measured; scoring's
@@ -913,6 +920,7 @@ const TERMINAL_TEST_ITEM_STATUSES = [
   "failed",
   "failed_oom",
   "failed_unsupported",
+  "failed_timeout",
   "cancelled",
   "skipped",
 ] as const;

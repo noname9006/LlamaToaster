@@ -695,12 +695,28 @@ export async function runServerBench(input: ServerBenchRunInput): Promise<BenchR
     proc.on("close", (code, signal) => resolvePromise({ code, signal }));
   });
 
-  const timer = setTimeout(() => {
-    timedOut = true;
-    log?.warn(`llama-server (pid ${proc.pid}) timed out after ${timeoutMs}ms, sending SIGKILL`);
-    stderr += `\ntimed out after ${timeoutMs}ms, killing process`;
-    proc.kill("SIGKILL");
-  }, timeoutMs);
+  // Idle watchdog, not a total-runtime cap -- same reasoning and rearm
+  // pattern as bench.ts's runBench (see that module's own comment):
+  // killing this process after timeoutMs regardless of how many repeats
+  // (input.repeats) were left, or how long each legitimately takes, has the
+  // exact same failure mode confirmed live on the llama-bench-CLI path (a
+  // healthy multi-repeat item dying on its own last repeat just for being
+  // slow). Initially armed here to cover model load + the /health wait
+  // before the first repeat; rearmed once per repeat after that (see the
+  // `for (rep...)` loop below) instead of left running from spawn to exit.
+  // Definite-assignment: armTimer() below assigns it synchronously before
+  // any of this function's other code (including the try block, well past
+  // an await) can run.
+  let timer!: NodeJS.Timeout;
+  const armTimer = () => {
+    timer = setTimeout(() => {
+      timedOut = true;
+      log?.warn(`llama-server (pid ${proc.pid}) had no progress for ${timeoutMs}ms, sending SIGKILL`);
+      stderr += `\nno progress for ${timeoutMs}ms, killing process`;
+      proc.kill("SIGKILL");
+    }, timeoutMs);
+  };
+  armTimer();
 
   try {
     input.onProgress?.("loading", "starting llama-server");
@@ -784,6 +800,10 @@ export async function runServerBench(input: ServerBenchRunInput): Promise<BenchR
     let waitPhase: "processing" | "generating" = item.n_prompt > 0 ? "processing" : "generating";
     const bothPhasesPresent = item.n_prompt > 0 && item.n_gen > 0;
     for (let rep = 1; rep <= input.repeats; rep++) {
+      // Reached the top of another repeat -- real progress, so the idle
+      // watchdog above gets a fresh timeoutMs to let this one finish.
+      clearTimeout(timer);
+      armTimer();
       input.onProgress?.(waitPhase, `run ${rep}/${input.repeats}`, waitPhase === "processing" ? lastPpLive : lastTgLive);
       let outcome: CompletionOutcome | undefined;
       const candidates = buildOffsetCandidates(preferredOffset, MAX_COMPLETION_ATTEMPTS);

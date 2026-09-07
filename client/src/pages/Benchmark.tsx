@@ -161,7 +161,11 @@ interface PlacementVerifyState {
   // same way at every placement tried (see runtimeBench.ts's
   // LlamaServerOutputError); not a capacity/config problem this card's own
   // placement could ever fix.
-  status: "pending" | "verified" | "failed" | "failed_oom" | "failed_unsupported" | "cancelled" | "error";
+  // "failed_timeout" -- the worker's own idle-timeout watchdog killed the
+  // probe (see worker/src/bench.ts's classifyFailure); says nothing about
+  // whether this placement actually fits, so it's kept out of the
+  // failed/failed_oom "estimate was wrong" bucket below.
+  status: "pending" | "verified" | "failed" | "failed_oom" | "failed_unsupported" | "failed_timeout" | "cancelled" | "error";
   detail?: string;
   verifiedCtxTokens?: number | null;
   /** Which Tested-configurations card fired this probe. */
@@ -1121,11 +1125,13 @@ export function Benchmark() {
               ? "failed_oom"
               : item?.status === "failed_unsupported"
                 ? "failed_unsupported"
-                : item?.status === "done"
-                  ? "verified"
-                  : item?.status === "cancelled"
-                    ? "cancelled"
-                    : "failed";
+                : item?.status === "failed_timeout"
+                  ? "failed_timeout"
+                  : item?.status === "done"
+                    ? "verified"
+                    : item?.status === "cancelled"
+                      ? "cancelled"
+                      : "failed";
           setVerifyStates((prev) => {
             const cur = prev[mode];
             // item.error (the terminal reason, e.g. a friendly
