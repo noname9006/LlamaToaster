@@ -369,8 +369,9 @@ Every run also gets its own structured log file under `logs/runs/<run_id>.log`
 tests/runs), one line per test and per repeat as it happens, and an
 end-of-run summary (tests/runs completed vs. failed vs. cancelled, and
 whether the run finished on its own or was stopped early). Downloadable from
-the Run page next to the CSV export whenever a run has at least one failed
-test (`GET /api/runs/:id/log`, proxied from this worker's own local log file).
+the Test Detail page next to the CSV export whenever a run has at least one
+failed test (`GET /api/tests/:id/log`, proxied from this worker's own local
+log file).
 
 Then, once `config.json` exists:
 
@@ -389,32 +390,36 @@ on the VPS itself, is covered in [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md)
 ## Using it
 
 1. **Dashboard** (`/`) — your own machines (status, backend, live job
-   progress) and recent runs. Nothing here is ever cross-tenant, even for a
+   progress) and recent tests. Nothing here is ever cross-tenant, even for a
    superadmin — the cross-tenant view lives entirely on the separate admin
    origin, if configured.
 2. **Models** (`/models`) — register a model (local path or Hugging Face repo/file),
    or use the "Search & download (Hugging Face)" panel: search by model name, expand a
    repo to see its quant files, pick a machine, download straight to its `model_dir`.
-3. **New Run** (`/new-run`) — pick a model + machine, set the sweep with graphical
-   controls (chip inputs for numeric fields, toggles for cache types/flash attention,
-   a repeats stepper), or open "Advanced: raw JSON" to edit/paste the equivalent JSON
-   directly, then trigger.
-4. **Runs** (`/runs`) — list; polls every 5s while anything is `running`.
-5. **Run Detail** (`/runs/:id`) — results table + Chart.js bar chart + raw JSON download.
-6. **Compare** (`/compare`) — pick 2+ runs for side-by-side bars.
-7. **Workers** (`/workers`) — one card per machine: online/offline/**Inaccessible**
+3. **Benchmark** (`/benchmark`) — the guided path: pick a model + machine, state what
+   you're optimizing for (a goal questionnaire — speed floor, workload shape, KV
+   preset), and the page derives a tuning → refine → sweep chain of tests linked
+   together and scored as one unit, instead of you hand-building a grid.
+4. **Custom Test** (`/custom-test`) — the hand-built path: set the sweep yourself with
+   graphical controls (chip inputs for numeric fields, toggles for cache types/flash
+   attention, a repeats stepper), or open "Advanced: raw JSON" to edit/paste the
+   equivalent JSON directly, then trigger a single standalone test.
+5. **Tests** (`/tests`) — list; polls every 5s while anything is `running`.
+6. **Test Detail** (`/tests/:id`) — results table + Chart.js bar chart + raw JSON download.
+7. **Compare** (`/compare`) — pick 2+ tests for side-by-side bars.
+8. **Workers** (`/workers`) — one card per machine: online/offline/**Inaccessible**
    status, platform/backend, detected CPU/GPU/RAM (best-effort, informational), and
    two separate lists — **Downloaded** (installed builds, active one marked, with
    Activate/Delete) and **Available to install** (from GitHub, checked every few
    minutes). Every action is a manual click — nothing downloads, switches, or
    deletes on its own.
-8. **Device** (`/device`) — approve a machine enrolment code (see "Running a worker"
+9. **Device** (`/device`) — approve a machine enrolment code (see "Running a worker"
    above); bookmarkable, for enrolling a headless box you set up over SSH.
-9. **Settings** (`/settings`, only with `AUTH_ENABLED`) — connected sign-in providers,
-   active sessions (revoke individually or "sign out everywhere else"), and the
-   community-benchmarks sharing toggle.
-10. Export: `GET /api/results/export?format=json|csv|md[&runs=id1,id2]`.
-11. **AI Assistant** — collapsible panel on the right of every page (collapsed by
+10. **Settings** (`/settings`, only with `AUTH_ENABLED`) — connected sign-in providers,
+    active sessions (revoke individually or "sign out everywhere else"), and the
+    community-benchmarks sharing toggle.
+11. Export: `GET /api/results/export?format=json|csv|md[&tests=id1,id2]`.
+12. **AI Assistant** — collapsible panel on the right of every page (collapsed by
     default). Chats with whatever OpenAI-compatible provider you configure via
     `AI_API_KEY`/`AI_BASE_URL`/`AI_MODEL`, with your hardware, registered
     models, and recent benchmark results automatically included as context, plus
@@ -456,8 +461,8 @@ driven by the SPA, not called directly).
 
 | Method | Path | Purpose |
 |---|---|---|
-| POST | `/api/runs/trigger` | Queue a sweep against one of your own machines |
-| GET | `/api/runs` | list your own runs |
+| POST | `/api/tests/trigger` | Queue a sweep against one of your own machines |
+| GET | `/api/tests` | list your own tests |
 | GET | `/api/models` | list models |
 | GET | `/api/workers` | list your own machines |
 | GET | `/api/results/export` | json \| csv \| md |
