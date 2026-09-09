@@ -5,15 +5,30 @@
 # setup-worker.sh) the home for the "llama" and "models" subfolders.
 #
 # Usage from a totally fresh machine (only bash + Node.js 22+ needed; git is
-# used if present, otherwise falls back to a plain tarball download). --url
-# is required. Omit --dir and it'll ask -- shows `df -h` (models are often
-# tens of GB each) and asks for a base folder and a name:
+# used if present, otherwise falls back to a plain tarball download):
 #
-#   curl -fsSL https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.sh | bash -s -- --url https://llamatoaster.com
+#   curl -fsSL https://llamatoaster.com/install.sh | bash
 #
-# Pass --dir to skip the prompts (e.g. for unattended/scripted use):
+# That short URL is a 302 redirect to THIS file's raw.githubusercontent.com
+# address (server/src/routes/install.ts) -- the bytes that run still come
+# from the public repo, where they can be read and diffed, the domain just
+# supplies the short name. The raw URL keeps working directly if you prefer
+# to see exactly where it points, or the origin is unreachable:
 #
-#   curl -fsSL https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.sh | bash -s -- --url https://llamatoaster.com --dir ~/LlamaToaster
+#   curl -fsSL https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.sh | bash
+#
+# It'll ask where to install. To pass any option (including --dir, to skip
+# the prompts for unattended/scripted use), forward arguments through bash:
+#
+#   curl -fsSL https://llamatoaster.com/install.sh | bash -s -- --dir ~/LlamaToaster
+#
+# --url defaults to the public instance (https://llamatoaster.com).
+# Self-hosted deployments pass their own, e.g. --url https://toaster.example.com.
+#
+# When setup finishes, a "toaster" command is installed for this user so
+# every later start/update/restart is just `toaster` from any folder -- see
+# setup-worker.sh's install_toaster_shim for exactly what that writes and how
+# to remove it (`toaster uninstall`).
 #
 # Safe to re-run: if --dir already has a LlamaToaster install, it is updated
 # IN PLACE -- via git fetch + reset --hard when it is a git checkout, or a
@@ -38,7 +53,9 @@ DIR=""
 BRANCH="main"
 WORKER_NAME="Local"
 BACKEND=""
-URL=""
+# Defaults to the public instance so `curl ... | bash` -- which passes no
+# arguments at all -- works as-is. Self-hosters pass their own origin.
+URL="https://llamatoaster.com"
 FORCE=0
 RECONNECT=0
 ALLOW_INSECURE_URL=0
@@ -57,12 +74,27 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-# Not required for --reconnect: it only clears the session fields in an
-# EXISTING config.json, which already has its own url saved.
+# $URL has a default (see above) so the zero-argument pipe form works, but
+# an explicitly-passed empty string would still reach setup-worker.sh and
+# fail there with a much less obvious message.
 if [ -z "$URL" ] && [ "$RECONNECT" -ne 1 ]; then
-  echo "--url is required, e.g. --url https://llamatoaster.com" >&2
+  echo "--url was passed but empty. Omit it to use https://llamatoaster.com, or give a real origin." >&2
   exit 1
 fi
+
+# Said out loud before anything happens. This script is normally reached by
+# piping a URL straight into a shell, which by nature hides what it does
+# until it's already doing it -- printing the plan first costs nothing and is
+# the difference between "some script ran" and an informed install.
+echo ""
+echo "LlamaToaster worker setup"
+echo "  1. download this repo (no sudo, nothing installed system-wide)"
+echo "  2. install npm dependencies (Node.js must already be present)"
+echo "  3. ask where to keep code, llama.cpp builds and models"
+echo "  4. install a 'toaster' command for your user (undo: toaster uninstall)"
+echo "  5. start the worker -- it prints a code to approve this machine at $URL/device"
+echo "The worker opens no inbound ports; it polls $URL for work."
+echo ""
 
 # Same Git Bash/MSYS/Cygwin footgun setup-worker.sh guards against -- paths
 # written on Windows under those shells get silently misinterpreted by the

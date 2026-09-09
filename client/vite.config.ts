@@ -19,6 +19,13 @@ export default defineConfig({
       // silently swallows /auth/github, /auth/github/callback, and
       // /auth/logout in dev instead of ever reaching the real backend.
       "/auth": apiProxyTarget,
+      // The short worker-install entry points (server/src/routes/install.ts).
+      // Same reason as /auth above: without this, vite's SPA fallback answers
+      // them with index.html in dev, so the copy-paste command shown on the
+      // "Add a machine" page would silently do nothing when tried against a
+      // dev origin.
+      "/install.ps1": apiProxyTarget,
+      "/install.sh": apiProxyTarget,
     },
   },
   build: {
