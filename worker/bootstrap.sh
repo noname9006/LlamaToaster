@@ -139,11 +139,36 @@ if [ -z "$DIR" ]; then
   echo "Using $DIR"
 fi
 
+# Trims a git checkout down to worker/ + shared/ -- everything directly in
+# the repo root (package.json, README, ...) is kept automatically by git's
+# cone mode. A worker never runs the server or its admin/client UIs, and
+# never needs docs, deploy configs or CI files, so there's no reason an
+# install folder should show any of it. Uses git's own sparse-checkout
+# rather than a one-off delete so it keeps applying after every future
+# `git fetch`/`reset --hard` -- from `toaster update`, a re-run of this
+# script, or a plain `git pull` -- not just the moment this runs.
+# Best-effort: a git too old for cone-mode sparse-checkout (pre-2.25) just
+# keeps the full checkout, which is harmless since this is purely cosmetic.
+prune_checkout() {
+  local dir="$1"
+  if git -C "$dir" sparse-checkout init --cone >/dev/null 2>&1; then
+    git -C "$dir" sparse-checkout set worker shared >/dev/null 2>&1 || true
+  fi
+}
+
+# Same pruning, for the no-git tarball path where sparse-checkout doesn't
+# apply -- just remove the folders a worker doesn't need after extraction.
+prune_extracted_tarball() {
+  local dir="$1"
+  rm -rf "$dir/admin" "$dir/client" "$dir/server" "$dir/docs" "$dir/deploy" "$dir/scripts" "$dir/assets" "$dir/bin" "$dir/.github"
+}
+
 if [ ! -f "$DIR/package.json" ]; then
   echo "$DIR has no LlamaToaster checkout yet -- downloading it (branch: $BRANCH)..."
   mkdir -p "$DIR"
   if command -v git >/dev/null 2>&1; then
     git clone --depth 1 --branch "$BRANCH" "$REPO_URL" "$DIR"
+    prune_checkout "$DIR"
   else
     echo "git not found -- downloading a tarball of the repo instead."
     TMP_TAR="$(mktemp -t llamatoaster-XXXXXX).tar.gz"
@@ -152,6 +177,7 @@ if [ ! -f "$DIR/package.json" ]; then
     # LlamaToaster-main/) wrapping everything -- strip it on extract.
     tar -xzf "$TMP_TAR" -C "$DIR" --strip-components=1
     rm -f "$TMP_TAR"
+    prune_extracted_tarball "$DIR"
   fi
   echo "Downloaded to $DIR"
 elif [ -d "$DIR/.git" ] && command -v git >/dev/null 2>&1; then
@@ -163,6 +189,11 @@ elif [ -d "$DIR/.git" ] && command -v git >/dev/null 2>&1; then
   # so none of it can be touched here.
   echo "$DIR is already a git checkout -- updating to latest $BRANCH..."
   cd "$DIR"
+  # Converts a pre-existing full checkout (installed before pruning existed)
+  # to sparse right here, so the very next `git fetch`/`reset --hard` below
+  # -- and every one after, including from `toaster update` -- keeps the
+  # working tree trimmed instead of only ever pruning brand-new installs.
+  prune_checkout "$DIR"
   if ! git fetch origin "$BRANCH"; then
     echo "git fetch failed -- check network access and the branch name ($BRANCH)." >&2
     exit 1
@@ -198,6 +229,7 @@ else
   TMP_EXTRACT="$(mktemp -d)"
   curl -fsSL "https://github.com/$REPO_OWNER_SLASH/archive/refs/heads/$BRANCH.tar.gz" -o "$TMP_TAR"
   tar -xzf "$TMP_TAR" -C "$TMP_EXTRACT" --strip-components=1
+  prune_extracted_tarball "$TMP_EXTRACT"
   if ! cp -R "$TMP_EXTRACT"/. "$DIR"/; then
     echo "Failed copying new files over $DIR -- check permissions and retry." >&2
     exit 1

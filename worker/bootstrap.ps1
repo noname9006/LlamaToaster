@@ -169,6 +169,34 @@ function Invoke-GitCommand {
     return $exitCode
 }
 
+# Trims a git checkout down to worker/ + shared/ -- everything directly in
+# the repo root (package.json, README, ...) is kept automatically by git's
+# cone mode. A worker never runs the server or its admin/client UIs, and
+# never needs docs, deploy configs or CI files, so there's no reason an
+# install folder should show any of it. Uses git's own sparse-checkout
+# rather than a one-off delete so it keeps applying after every future
+# `git fetch`/`reset --hard` -- from `toaster update`, a re-run of this
+# script, or a plain `git pull` -- not just the moment this runs.
+# Best-effort: a git too old for cone-mode sparse-checkout (pre-2.25) just
+# keeps the full checkout, which is harmless since this is purely cosmetic.
+function Set-SparseCheckout {
+    param([string]$RepoDir)
+    $initExit = Invoke-GitCommand @('-C', $RepoDir, 'sparse-checkout', 'init', '--cone')
+    if ($initExit -eq 0) {
+        Invoke-GitCommand @('-C', $RepoDir, 'sparse-checkout', 'set', 'worker', 'shared') | Out-Null
+    }
+}
+
+# Same pruning, for the no-git zip path where sparse-checkout doesn't apply --
+# just remove the folders a worker doesn't need after extraction.
+function Remove-NonEssentialFolders {
+    param([string]$RootDir)
+    foreach ($name in @('admin', 'client', 'server', 'docs', 'deploy', 'scripts', 'assets', 'bin', '.github')) {
+        $p = Join-Path $RootDir $name
+        if (Test-Path $p) { Remove-Item $p -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+
 # Fetches the repo (git clone if available, else a zip download) into a
 # scratch folder, then merges it into $TargetDir with Copy-Item -Force.
 # Cloning to scratch first -- rather than straight into $TargetDir -- means
@@ -189,6 +217,7 @@ function Sync-LlamaToasterCode {
             Write-Error "git clone failed (exit $cloneExit) -- see the git output above for the actual reason."
             exit 1
         }
+        Set-SparseCheckout -RepoDir $scratch
     } else {
         Write-Host "git not found -- downloading a zip of the repo instead."
         $zipPath = Join-Path $env:TEMP "llamatoaster-$RefBranch-$([guid]::NewGuid()).zip"
@@ -198,6 +227,7 @@ function Sync-LlamaToasterCode {
         # GitHub's archive zip has one top-level folder (e.g. LlamaToaster-main/)
         # wrapping everything -- copy its contents, not the wrapper, into scratch.
         $extractedRoot = Get-ChildItem $extractDir | Select-Object -First 1
+        Remove-NonEssentialFolders -RootDir $extractedRoot.FullName
         Get-ChildItem $extractedRoot.FullName | Move-Item -Destination $scratch -Force
         Remove-Item $zipPath -Force
         Remove-Item $extractDir -Recurse -Force
@@ -213,6 +243,11 @@ $dirHasContent = (Test-Path $Dir) -and ((Get-ChildItem -Path $Dir -Force -ErrorA
 
 if (Test-Path $GitDir) {
     Write-Host "$Dir is already a git checkout -- updating to latest $Branch..."
+    # Converts a pre-existing full checkout (installed before pruning
+    # existed) to sparse right here, so the fetch/reset below -- and every
+    # one after, including from `toaster update` -- keeps the working tree
+    # trimmed instead of only ever pruning brand-new installs.
+    Set-SparseCheckout -RepoDir $Dir
     Push-Location $Dir
     $fetchExit = Invoke-GitCommand @('fetch', 'origin', $Branch)
     $resetExit = 0
