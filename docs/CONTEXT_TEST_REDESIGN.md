@@ -7,9 +7,12 @@ Companion reading: `docs/PROBE_CONTEXT_SCENARIOS.md` (what the ladder does per
 architecture), `shared/probeLadder.ts` (the search), `shared/vramEstimate.ts`
 (the cost model and the spill verdict).
 
-**Status.** The verdict changes in §7 are implemented. Everything else —
-the two-scenario structure, the reuse widening, persisting the new verdict
-fields — is specification, not code.
+**Status.** The verdict changes in §7 are implemented, and so is the
+Wizard/Targets scenario structure (the client collapsed the six per-mode
+cards into two — Wizard dispatches `max_gpu`, Targets picks among
+`keep_context`/`fixed_offload`/`custom` via a Context/Offload/Both pin). The
+reuse widening and persisting the new verdict fields remain specification,
+not code.
 
 | part | state |
 |---|---|
@@ -17,7 +20,7 @@ fields — is specification, not code.
 | Bootstrap residency veto | implemented |
 | Pressure gate | **proposed and withdrawn** — see §7 |
 | Span-1 slope references | **proposed and withdrawn** — see §7 |
-| Wizard / Targets structure | spec only |
+| Wizard / Targets structure | implemented |
 | Reuse across probes (not just batch siblings) | spec only |
 | `residentSlopeRatio` / `abstained` persisted and displayed | spec only |
 

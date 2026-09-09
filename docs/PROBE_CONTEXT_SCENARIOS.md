@@ -26,7 +26,12 @@ Companion reading: `shared/probeLadder.ts` (the search), `shared/vramEstimate.ts
 - **The anchor.** The phase seeds at the stop nearest `maxAffordableContext`
   for the currently-pinned layer count — a pure calculation, no load spent. A
   good anchor is worth two or three loads; a bad one costs the loads it takes
-  the walk to climb out of.
+  the walk to climb out of. **Exception: `max_gpu`'s context phase seeds at
+  the trained-context ceiling instead** and bisects downward on failure
+  (`nextStopBisectCandidate`) rather than walking up a notch at a time from an
+  estimate — its goal is the ceiling itself, not a boundary near a guess, so a
+  machine with room to spare converges in a single load instead of walking
+  every doubling up to it.
 - **The walk.** One notch up on success, one notch down on failure, converging
   the moment it reverses. Each step **doubles** the KV cache, so the cost of a
   step is not constant — the last step is as expensive as everything before it

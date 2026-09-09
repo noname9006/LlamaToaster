@@ -78,7 +78,7 @@ generating and persisting the session credentials.
    the dropdown — this replaces manually building llama.cpp on the server.
 7. Register a small model (search-and-download panel on **Models**, or place
    a `.gguf` in the worker's `model_dir` by hand) and trigger a small run
-   against that worker from **New Run** before doing a full sweep.
+   against that worker from **Custom Test** before doing a full sweep.
 
 ## Security / Networking
 
