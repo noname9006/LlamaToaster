@@ -6,10 +6,10 @@ are meant to be driven by the SPA, not called directly).
 
 | Method | Path | Purpose |
 |---|---|---|
-| POST | `/api/runs/trigger` | Queue a sweep against one of your own machines |
-| GET | `/api/runs` | list your own runs |
-| GET | `/api/runs/:id` | run detail + results |
-| POST | `/api/runs/:id/pause` \| `/resume` \| `/stop` | control a running sweep |
+| POST | `/api/tests/trigger` | Queue a sweep against one of your own machines |
+| GET | `/api/tests` | list your own tests |
+| GET | `/api/tests/:id` | test detail + results |
+| POST | `/api/tests/:id/pause` \| `/resume` \| `/stop` | control a running sweep |
 | GET | `/api/models` | list models |
 | POST | `/api/models` | register a model |
 | GET | `/api/workers` | list your own machines |
