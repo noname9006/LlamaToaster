@@ -5,20 +5,36 @@
 #
 # Usage from a totally fresh machine (only PowerShell needed -- Node.js is
 # installed automatically via winget if missing; git is used if present,
-# otherwise falls back to a plain zip download). -Url is required.
-# Omit -Dir and it'll ask -- lists your local drives with free space (models
-# are often tens of GB each) and asks which one, then a folder name:
+# otherwise falls back to a plain zip download):
 #
-#   iex "& { $(irm https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.ps1) } -Url https://llamatoaster.com"
+#   irm https://llamatoaster.com/install.ps1 | iex
 #
-# Pass -Dir to skip the prompts (e.g. for unattended/scripted use):
+# That short URL is a 302 redirect to THIS file's raw.githubusercontent.com
+# address (server/src/routes/install.ts) -- the bytes that run still come
+# from the public repo, where they can be read and diffed, the domain just
+# supplies the short name. The raw URL keeps working directly if you prefer
+# to see exactly where it points, or the origin is unreachable:
 #
-#   iex "& { $(irm https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.ps1) } -Url https://llamatoaster.com -Dir F:\LlamaToaster"
+#   irm https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.ps1 | iex
+#
+# It'll ask which drive/folder to use. To pass any option (including -Dir,
+# to skip the prompts for unattended/scripted use), a plain pipe into iex
+# can't carry arguments -- use the script-block form instead:
+#
+#   iex "& { $(irm https://llamatoaster.com/install.ps1) } -Dir F:\LlamaToaster"
 #
 # Or download it first and run locally:
 #
-#   irm https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.ps1 -OutFile bootstrap.ps1
-#   .\bootstrap.ps1 -Url https://llamatoaster.com
+#   irm https://llamatoaster.com/install.ps1 -OutFile bootstrap.ps1
+#   .\bootstrap.ps1
+#
+# -Url defaults to the public instance (https://llamatoaster.com). Self-hosted
+# deployments pass their own, e.g. -Url https://toaster.example.com.
+#
+# When setup finishes, a "toaster" command is registered for this user so
+# every later start/update/restart is just `toaster` from any folder -- see
+# setup-worker.ps1's Install-ToasterShim for exactly what that writes and how
+# to remove it (`toaster uninstall`).
 #
 # Safe to re-run: if $Dir is already a git checkout, it's updated in place
 # (git fetch + reset --hard to latest $Branch) instead of re-cloning;
@@ -40,7 +56,10 @@ param(
     [string]$Branch = "main",
     [string]$WorkerName = "Local",
     [string]$Backend,
-    [string]$Url,
+    # Defaults to the public instance so `irm .../install.ps1 | iex` -- which
+    # cannot pass arguments at all -- works with no arguments. Self-hosters
+    # pass their own origin explicitly.
+    [string]$Url = "https://llamatoaster.com",
     [switch]$Reconnect,
     [switch]$Force,
     [switch]$AllowInsecureUrl
@@ -48,12 +67,27 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-# Not required for -Reconnect: it only clears the session fields in an
-# EXISTING config.json, which already has its own url saved.
+# $Url has a default (see param block) so the zero-argument pipe form works,
+# but an explicitly-passed empty string would still slip through to
+# setup-worker.ps1 and fail there with a much less obvious message.
 if (-not $Url -and -not $Reconnect) {
-    Write-Error "-Url is required, e.g. -Url https://llamatoaster.com"
+    Write-Error "-Url was passed but empty. Omit it to use https://llamatoaster.com, or give a real origin."
     exit 1
 }
+
+# Said out loud before anything happens. This script is normally reached by
+# piping a URL straight into a shell, which by nature hides what it does
+# until it's already doing it -- printing the plan first costs nothing and is
+# the difference between "some script ran" and an informed install.
+Write-Host ""
+Write-Host "LlamaToaster worker setup" -ForegroundColor Cyan
+Write-Host "  1. download this repo (no admin rights needed, nothing installed system-wide)"
+Write-Host "  2. install Node.js via winget if it's missing, then npm dependencies"
+Write-Host "  3. ask which drive/folder to use for code, llama.cpp builds and models"
+Write-Host "  4. register a 'toaster' command for your user (undo: toaster uninstall)"
+Write-Host "  5. start the worker -- it prints a code to approve this machine at $Url/device"
+Write-Host "The worker opens no inbound ports; it polls $Url for work." -ForegroundColor DarkGray
+Write-Host ""
 
 $RepoUrl = "https://github.com/noname9006/LlamaToaster.git"
 $RepoOwnerSlash = "noname9006/LlamaToaster"
