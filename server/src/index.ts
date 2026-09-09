@@ -21,6 +21,7 @@ import { sessionRoutes } from "./routes/sessions.js";
 import { deviceRoutes, deviceApprovalRoutes } from "./routes/device.js";
 import { adminRoutes } from "./routes/admin.js";
 import { statsRoutes } from "./routes/stats.js";
+import { installRoutes } from "./routes/install.js";
 import { getDb } from "./db/migrate.js";
 import { runMaintenanceSweep, REAP_INTERVAL_MS } from "./reaper.js";
 import { authMiddleware } from "./auth-middleware.js";
@@ -137,6 +138,9 @@ app.register(workersRoutes);
 app.register(aiRoutes);
 app.register(queueRoutes);
 app.register(statsRoutes);
+// The short /install.ps1 + /install.sh entry points a fresh worker machine
+// is told to run -- redirects to the bootstrap scripts in the public repo.
+app.register(installRoutes);
 // Registered unconditionally (not gated on AUTH_ENABLED) -- GET
 // /api/auth/status is the SPA's own boot check and needs to answer even when
 // auth is off (MULTIUSER_PLAN.md §2.3's independent-deploy split), and the

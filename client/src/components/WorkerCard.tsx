@@ -15,10 +15,11 @@ export const SETUP_OS_LABELS: Array<{ key: SetupOS; label: string; badgeClass: s
   { key: "linux", label: "LINUX", badgeClass: "text-[#f0b86e] bg-[#f0b86e]/15" },
 ];
 
-// Every Windows command below is PowerShell syntax (iex "& {...}", .\x.ps1
-// invocation) -- pasting it into cmd.exe just errors. Deliberately quiet
-// (not the warning-colored treatment used elsewhere on this page) since it's
-// a heads-up, not something wrong.
+// The Windows INSTALL command is PowerShell syntax (irm ... | iex) -- pasting
+// it into cmd.exe just errors. (The "toaster" commands after it are a .cmd
+// shim and run in either shell, but the notice sits above the whole block.)
+// Deliberately quiet -- not the warning-colored treatment used elsewhere on
+// this page -- since it's a heads-up, not something wrong.
 export function PowerShellNotice() {
   return (
     <Tooltip text="Written for PowerShell -- paste into a PowerShell window, not Command Prompt (cmd.exe).">
@@ -61,49 +62,68 @@ export interface SetupScenario {
   title: string;
   desc: string;
   cmd: Record<SetupOS, string>;
+  // Only the fresh-install scenario sets this: the GitHub URL of the exact
+  // script the command runs. Piping a URL into a shell is a trust decision,
+  // and the whole point of serving /install.ps1 as a redirect (see
+  // server/src/routes/install.ts) is that the bytes stay readable in the
+  // public repo -- a link that says so is worth more than the near-zero
+  // number of people who will click it.
+  sourceUrl?: Record<SetupOS, string>;
 }
 
-// url is this server's own public origin (pass window.location.origin --
-// the page showing this command IS served from PUBLIC_URL, see
-// deploy/orchestrator.env.example) -- baked into the fresh-install command
-// so it's copy-paste-runnable as-is instead of erroring with "-Url is
-// required" (bootstrap.ps1/bootstrap.sh both require it on first setup).
-// Already-cloned/restart need no URL: by then config.json has it saved.
+const RAW_BOOTSTRAP = "https://github.com/noname9006/LlamaToaster/blob/main/worker";
+
+// url is this server's own public origin (pass window.location.origin -- the
+// page showing this command IS served from PUBLIC_URL, see deploy/
+// orchestrator.env.example), so the short install URL points back at
+// whichever deployment the reader is actually looking at, self-hosted
+// included. That origin is ALSO what the worker will be told to poll: the
+// bootstrap scripts default -Url/--url to https://llamatoaster.com, so a
+// self-hosted install needs it passed explicitly -- which the plain pipe
+// form can't do, hence the script-block/`bash -s --` form for that case.
 //
-// Exported for client/src/pages/Device.tsx's own install-command display
-// (MULTIUSER_PLAN.md §3.1) -- single source of truth so an existing worker's
-// restart/reinstall reference panel here and the "Add machine" onboarding
-// screen there never drift apart. Kept in sync with worker/bootstrap.ps1,
-// worker/bootstrap.sh, worker/setup-worker.ps1, worker/setup-worker.sh, and
-// README.md's "Running the worker (GPU box)" section.
+// Everything after the first install is the "toaster" command that setup
+// registers on the machine (setup-worker.ps1's Install-ToasterShim /
+// setup-worker.sh's install_toaster_shim) -- no folder to find, no script
+// name to remember.
+//
+// Exported for client/src/components/AddMachinePanel.tsx's own
+// install-command display (MULTIUSER_PLAN.md §3.1) -- single source of truth
+// so an existing worker's restart/reinstall reference panel and the "Add
+// machine" onboarding screen never drift apart. Kept in sync with
+// worker/bootstrap.ps1, worker/bootstrap.sh, worker/setup-worker.ps1,
+// worker/setup-worker.sh, server/src/routes/install.ts, and README.md's
+// "Running the worker (GPU box)" section.
 export function buildSetupScenarios(url: string): SetupScenario[] {
   return [
     {
       title: "Fresh install",
-      desc: "Brand-new machine, nothing downloaded yet (no repo, no config, no llama.cpp) -- one command fetches the repo, installs dependencies, and starts the worker. It'll ask which drive/volume to use (showing free space -- models are often tens of GB each) and a folder name, then create it. Re-running the same command later updates an existing install in place -- config.json, models and all other local data are preserved.",
+      desc: "Brand-new machine, nothing downloaded yet (no repo, no config, no llama.cpp) -- one command fetches the repo, installs dependencies, registers a 'toaster' command for your user, and starts the worker. It'll ask which drive/volume to use (showing free space -- models are often tens of GB each) and a folder name, then create it.",
       cmd: {
-        windows: `iex "& { $(irm https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.ps1) } -Url ${url}"`,
-        macos: `curl -fsSL https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.sh | bash -s -- --url ${url}`,
-        linux: `curl -fsSL https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.sh | bash -s -- --url ${url}`,
+        windows: `irm ${url}/install.ps1 | iex`,
+        macos: `curl -fsSL ${url}/install.sh | bash`,
+        linux: `curl -fsSL ${url}/install.sh | bash`,
+      },
+      sourceUrl: {
+        windows: `${RAW_BOOTSTRAP}/bootstrap.ps1`,
+        macos: `${RAW_BOOTSTRAP}/bootstrap.sh`,
+        linux: `${RAW_BOOTSTRAP}/bootstrap.sh`,
       },
     },
     {
-      title: "Already installed",
-      desc: "Already have the repo checked out -- same command for first setup (still asks where, unless you pass a folder) and every restart after. Run from the repo root.",
-      cmd: {
-        windows: ".\\worker\\setup-worker.ps1",
-        macos: "bash worker/setup-worker.sh",
-        linux: "bash worker/setup-worker.sh",
-      },
+      title: "Start or restart",
+      desc: "Once it's installed, this is the only command you need -- run it from any folder. Stop a running worker with Ctrl+C (or by closing its window) and run it again to start over. 'toaster help' lists the rest.",
+      cmd: { windows: "toaster", macos: "toaster", linux: "toaster" },
     },
     {
-      title: "Restart",
-      desc: "Once it's already set up and running, stop it (Ctrl+C, or close the window) and run this to start it again -- reuses the saved config.json as-is, no prompts.",
-      cmd: {
-        windows: "worker\\start.bat",
-        macos: "npm run worker",
-        linux: "npm run worker",
-      },
+      title: "Update",
+      desc: "Pull the latest code and dependencies into the existing install, then start -- config.json, models, llama.cpp builds and every other local file are left exactly as they are.",
+      cmd: { windows: "toaster update", macos: "toaster update", linux: "toaster update" },
+    },
+    {
+      title: "Reconnect",
+      desc: "Only if this machine's session was revoked from Settings (or its token expired) -- clears the saved session and asks for a fresh code, keeping the same machine identity and all its history. Normal restarts never need this.",
+      cmd: { windows: "toaster reconnect", macos: "toaster reconnect", linux: "toaster reconnect" },
     },
   ];
 }
@@ -504,6 +524,18 @@ export function WorkerCard({ worker, onRefresh }: { worker: Worker; onRefresh: (
                       <code className="flex-1 whitespace-pre-wrap break-all font-mono text-xs text-fg">
                         {scenario.cmd[effectiveOS]}
                       </code>
+                      {/* Only on the install command, which pipes a URL
+                          straight into a shell -- see SetupScenario.sourceUrl. */}
+                      {scenario.sourceUrl && (
+                        <a
+                          href={scenario.sourceUrl[effectiveOS]}
+                          target="_blank"
+                          rel="noreferrer noopener"
+                          className="flex-none self-start rounded-md border border-border px-2 py-1 text-[11px] font-medium text-muted hover:border-accent/40 hover:text-accent"
+                        >
+                          View source
+                        </a>
+                      )}
                       <CopyCommandButton text={scenario.cmd[effectiveOS]} />
                     </div>
                   </div>

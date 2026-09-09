@@ -44,9 +44,11 @@ export function AddMachinePanel({
   return (
     <div className="max-w-2xl">
       <p className="text-sm text-muted">
-        Run whichever of these matches the GPU box you want to connect. Setting it up for the
-        first time (or reconnecting a machine whose session was revoked) prints a one-time code —
-        enter that code below once it appears. A plain restart doesn't need this page at all.
+        Run the first command on the GPU box you want to connect — it installs everything and
+        registers a <code className="font-mono text-fg">toaster</code> command you'll use from
+        then on. Setting a machine up for the first time (or reconnecting one whose session was
+        revoked) prints a one-time code — enter that code below once it appears. A plain restart
+        doesn't need this page at all.
       </p>
 
       <div className="mt-6 flex items-center gap-1.5">
@@ -64,10 +66,10 @@ export function AddMachinePanel({
         ))}
         {os === "windows" && <PowerShellNotice />}
       </div>
-      {/* First-run command has this page's own origin baked in as -Url/
-          --url (see WorkerCard.tsx's buildSetupScenarios) -- copy-paste
-          runs as-is instead of erroring "-Url is required". Already-
-          installed/restart need no URL: config.json has it saved by then. */}
+      {/* The install URL is this page's own origin (see WorkerCard.tsx's
+          buildSetupScenarios), so it points at whichever deployment the
+          reader is looking at. Everything after the first install is the
+          "toaster" command that setup registers on the machine. */}
       <div className="mt-2 flex flex-col gap-3">
         {setupScenarios.map((scenario, i) => (
           <div key={scenario.title} className="overflow-hidden rounded-lg border border-border">
@@ -84,6 +86,18 @@ export function AddMachinePanel({
               <code className="flex-1 whitespace-pre-wrap break-all font-mono text-xs text-fg">
                 {scenario.cmd[os]}
               </code>
+              {/* Only on the install command, which pipes a URL straight into
+                  a shell -- see SetupScenario.sourceUrl. */}
+              {scenario.sourceUrl && (
+                <a
+                  href={scenario.sourceUrl[os]}
+                  target="_blank"
+                  rel="noreferrer noopener"
+                  className="flex-none self-start rounded-md border border-border px-2 py-1 text-[11px] font-medium text-muted hover:border-accent/40 hover:text-accent"
+                >
+                  View source
+                </a>
+              )}
               <CopyCommandButton text={scenario.cmd[os]} />
             </div>
           </div>
