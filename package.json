@@ -45,7 +45,7 @@
   "devDependencies": {
     "@types/adm-zip": "^0.5.8",
     "@types/better-sqlite3": "^9.6.0",
-    "jsdom": "^29.1.1",
+    "jsdom": "^30.0.1",
     "typescript": "^7.0.2",
     "vitest": "^4.1.11"
   }
