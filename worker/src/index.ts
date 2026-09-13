@@ -30,6 +30,7 @@ import {
   executeCurvePoint,
   executeKneeLadder,
   probeSucceeded,
+  failedForHostBackedLayers,
   toProbeAttemptReport,
   toBenchResult,
   PROBE_GEN_TOKENS,
@@ -3105,23 +3106,17 @@ function describeEstimatedMemoryNeed(estimate: { vramMib: number; ramMib: number
 }
 
 // Turns a rung's raw vramDiscrepancy flag (runtimeBench.ts's probeSucceeded)
-// into a descriptive warning appended to the attempt's error text --
-// vramDiscrepancyPolicy's fail/retry_once_then_fail escalation is
-// deliberately NOT applied here, unlike the sweep path's identical-looking
-// hardFallback check in finalizeSweepItemResult above. That path only ever
-// escalates on an unambiguous llama.cpp post-allocation buffer report of
-// EXACTLY 0 layers resident -- proof the whole placement never touched the
-// GPU. A probe rung has no such report to lean on; all it has is
-// detectHostBackedFallback's shared-GPU-memory reading (Windows WDDM "Shared
-// Usage" / Linux amdgpu GTT) or the older needed-vs-observed inference, both
-// of which can and routinely do fire on a placement that PARTIALLY spilled --
-// some layers host-backed, the rest genuinely on the GPU -- while the load
-// itself completed cleanly and generated tokens fine. Escalating that to a
-// failed/red rung previously hid a placement that had, in fact, worked; the
-// rung's own measured numbers (shared/dedicated MiB, tok/s) are already on
-// screen for the reader to judge, the same way ProbeAttempts.tsx pairs a
-// green "passed" with a separate yellow "possible VRAM fallback" badge rather
-// than failing the row outright.
+// into a descriptive explanation appended to the attempt's error text. Whether
+// the rung passed or failed is already decided by then: probeSucceeded fails a
+// measured layer-axis conviction that is corroborated or taken at a small
+// context, and leaves everything weaker -- the inference, an abstained verdict,
+// an uncorroborated conviction at a large context, any context-axis KV spill --
+// as a warning on a passing rung (see its own comment and
+// HOST_BACKED_FAIL_MAX_UNCORROBORATED_CTX for why).
+// vramDiscrepancyPolicy's fail/retry_once_then_fail escalation is still
+// deliberately NOT applied here, unlike the sweep path's hardFallback check in
+// finalizeSweepItemResult above -- a retry re-measures the same deterministic
+// placement, and the policy was what used to escalate the INFERENCE too.
 function describeProbeVramDiscrepancy(
   rung: { ctx: number; ngl: number },
   estimatedVramMib: number | null,
@@ -3541,7 +3536,9 @@ function toLadderAttempt(attempt: ProbeAttemptOutcome): LadderAttempt {
     // WHY it failed, not just that it did: a host-backed placement cannot be
     // rescued by a smaller context, so the ladder stops walking that axis
     // immediately instead of re-proving it at every stop down to the floor.
-    hostBacked: !attempt.ok && attempt.vramDiscrepancy === true,
+    // Not just `!ok && vramDiscrepancy` -- a rung that generated nothing can
+    // carry an INFERRED discrepancy too, and that is no proof the layers moved.
+    hostBacked: failedForHostBackedLayers(attempt),
   };
 }
 

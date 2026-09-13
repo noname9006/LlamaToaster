@@ -38,6 +38,7 @@ import {
   type StreamSample,
 } from "./loadDriver.js";
 import { supportsFlag } from "./binary-probe.js";
+import { PROBE_LADDER_MIN_CTX } from "../../shared/probeLadder.js";
 
 const READY_POLL_INTERVAL_MS = 500;
 const READY_TIMEOUT_MS = 120_000;
@@ -706,12 +707,13 @@ export interface ProbeAttemptOutcome {
    * documents (confirmed on both NVIDIA/CUDA and AMD/Vulkan): llama.cpp's
    * "offloaded X/Y" claim only reflects buffer assignment, never residency,
    * and the OS can back an oversubscribed allocation with system RAM instead
-   * of erroring. Set by probeSucceeded below; worker/src/index.ts's
-   * describeProbeVramDiscrepancy always turns it into a warning attached to
-   * the (still-passing) attempt -- unlike the sweep path's hardFallback
-   * check, this never escalates to a failed/retried rung under
-   * vramDiscrepancyPolicy, since it can fire on a partial spill that still
-   * ran fine. */
+   * of erroring. Set by probeSucceeded below, which also FAILS the rung when
+   * the flag came from a measured layer-axis conviction strong enough to fail
+   * on (see HOST_BACKED_FAIL_MAX_UNCORROBORATED_CTX and
+   * failedForHostBackedLayers); an inferred, abstained or weaker flag stays a
+   * warning on a passing attempt. worker/src/index.ts's describeProbeVramDiscrepancy
+   * attaches the explanation either way. vramDiscrepancyPolicy's retry/fail
+   * escalation still never applies here -- that is the sweep path's. */
   vramDiscrepancy?: boolean;
   /** detectHostBackedFallback's own figures, when this platform HAS a
    * system-RAM-backed-GPU-memory counter: which evidence decided ("slope"
@@ -785,22 +787,54 @@ export { PROBE_GEN_TOKENS, PROBE_PROMPT_TOKENS } from "../../shared/probeLadder.
 // context is. Only the per-rung success rule below stayed behind, because it
 // is about one load's verdict rather than about the search.
 
+/**
+ * The largest context at which a host-backed conviction may fail a rung
+ * WITHOUT the dedicated-VRAM counter corroborating it.
+ *
+ * A corroborated conviction -- a layer slope where the dedicated counter also
+ * says the added layers did not land -- fails at any context. Everything else
+ * rests on the shared counter alone, whose reading at a large context is not
+ * only weights: KV cache the driver placed in host memory is in it, and so is
+ * host-side overhead that grows with context whatever is on the GPU (571MiB
+ * measured at 262144 tokens with ngl 0, against 28MiB at 1024). The bootstrap
+ * divides that whole reading by the rung's footprint, and every spilling rung
+ * it was calibrated on was measured at the floor context; above it, the one
+ * clean large-context rung it would have convicted (ngl 1 at 262144, whose
+ * generation rate went UP when the layer was added) was only saved by the
+ * dedicated-counter veto.
+ *
+ * That veto is missing exactly where it matters most: on Windows CUDA the
+ * per-process dedicated reading comes from nvidia-smi, which reports "[N/A]"
+ * per process under WDDM, so every conviction there is uncorroborated. The
+ * floor and one doubling above it cover both layer searches max_gpu runs (its
+ * layer phase at the floor, its back-off at the next stop), where context adds
+ * nothing the shared counter could mistake for weights. Above that an
+ * uncorroborated conviction stays a warning, exactly as before.
+ */
+export const HOST_BACKED_FAIL_MAX_UNCORROBORATED_CTX = PROBE_LADDER_MIN_CTX * 2;
+
 // A probe's own success rule, kept next to the ladder that consumes it: no
-// OOM, no spill (vram_peak within total), and gen tok/s above the floor.
+// OOM, no spill (vram_peak within total), some generation, and no weights
+// MEASURABLY served from system RAM.
 //
-// vramDiscrepancy is reported as a raw fact and does NOT by itself flip `ok`
-// here -- nor does worker/src/index.ts's ladder loop ever escalate it into a
-// failure the way finalizeSweepItemResult's hardFallback check can for a
-// sweep item. That path only escalates on an unambiguous llama.cpp
-// post-allocation buffer report of EXACTLY 0 layers resident; no such report
-// exists here (that parsing is llama-bench-log-specific, see bench.ts's
-// parseModelBufferSizes), so all a probe rung has is a signal that can fire
-// on a placement that PARTIALLY spilled while still completing and
-// generating tokens fine -- describeProbeVramDiscrepancy (worker/src/index.ts)
-// always turns it into a warning attached to the passing attempt instead,
-// never a policy-driven retry/fail.
+// That last rule is what stops a silently oversubscribed placement from
+// passing. On a driver that backs an overcommitted allocation with system RAM
+// instead of erroring (Windows WDDM's CUDA sysmem fallback, amdgpu GTT) none
+// of the other three can ever fire: nothing OOMs, dedicated VRAM never passes
+// the adapter total because the overflow lands in SHARED memory, and the load
+// still generates, just slowly. Observed live: max_gpu on a 10GiB RTX 3080
+// "verified" every layer of a model several GiB larger than the card.
 //
-// Two signals feed that one flag, in strict preference order:
+// Only a CONVICTION fails, never the weaker evidence: detectHostBackedFallback
+// returning hostBacked:true. An abstained verdict, the estimate-only inference
+// below, and any context-axis KV spill all stay a warning on a passing rung.
+// The inference in particular cannot tell a real fallback from a pessimistic
+// estimate, and failing on it is what 926ab8c backed out.
+//
+// And not every conviction either -- see HOST_BACKED_FAIL_MAX_UNCORROBORATED_CTX
+// for which ones are strong enough to fail on.
+//
+// Two signals feed the vramDiscrepancy flag, in strict preference order:
 //
 //  1. detectHostBackedFallback -- the OS's own per-process counter for
 //     system-RAM-backed GPU memory. A MEASUREMENT of where the weights went.
@@ -813,9 +847,9 @@ export { PROBE_GEN_TOKENS, PROBE_PROMPT_TOKENS } from "../../shared/probeLadder.
 //     biasing the check toward "no fallback" by however much the desktop
 //     happened to be using.
 //
-// The practical effect of #1 is that a merely-pessimistic ESTIMATE can no
-// longer fail a rung: with no measured system-RAM backing, there is nothing
-// to corroborate the shortfall and the rung stands.
+// The practical effect of #1 is that a merely-pessimistic ESTIMATE can never
+// fail a rung: with no measured system-RAM backing, there is nothing to
+// corroborate the shortfall and the rung stands.
 export function probeSucceeded(input: {
   oom: boolean;
   vramPeakMib: number | null;
@@ -925,7 +959,47 @@ export function probeSucceeded(input: {
       reason: "the model loaded but produced no measurable generation",
     };
   }
+  // Checked after the generation rule on purpose, so a rung failing here always
+  // generated something -- failedForHostBackedLayers leans on exactly that to
+  // recover the reason from stored fields alone.
+  const corroborated = hostBacked.method === "slope" && hostBacked.residentSlopeRatio != null;
+  const contextNegligible = input.ctx != null && input.ctx <= HOST_BACKED_FAIL_MAX_UNCORROBORATED_CTX;
+  if (hostBacked.hostBacked && (corroborated || contextNegligible)) {
+    return {
+      ok: false,
+      spill: false,
+      vramDiscrepancy,
+      hostBacked,
+      reason: "the model's layers are being served from system RAM, not VRAM",
+    };
+  }
   return { ok: true, spill: false, vramDiscrepancy, hostBacked, reason: null };
+}
+
+/**
+ * Did this rung fail BECAUSE its layers were measurably host-backed, as
+ * opposed to not fitting at all?
+ *
+ * The ladder needs the distinction (LadderAttempt.hostBacked): a smaller
+ * context cannot rescue a placement whose weights are in system RAM, so a
+ * context phase stops walking on the first one. Derived from the outcome's
+ * stored fields rather than a dedicated flag so a rung reused from a batch
+ * sibling (which only carries what probe_attempts stores) answers the same
+ * way as one measured here. probeSucceeded's rule order is what makes it
+ * exact: the only failure that can leave a rung with generation, no OOM, no
+ * adapter spill and a MEASURED discrepancy is the host-backed one.
+ */
+export function failedForHostBackedLayers(
+  attempt: Pick<ProbeAttemptOutcome, "ok" | "oom" | "spill" | "genTps" | "vramDiscrepancy" | "hostBackedMethod">
+): boolean {
+  return (
+    !attempt.ok &&
+    !attempt.oom &&
+    !attempt.spill &&
+    attempt.genTps != null &&
+    attempt.vramDiscrepancy === true &&
+    attempt.hostBackedMethod != null
+  );
 }
 
 // Shared BenchResult shaping so both runtime paths report through

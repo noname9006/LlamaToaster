@@ -60,6 +60,16 @@ function residentCell(a: Pick<ProbeAttemptDto, "ngl" | "gpu_layers_resident_est"
   };
 }
 
+// Mirrors worker/src/runtimeBench.ts's failedForHostBackedLayers on the stored
+// row: the only failure that leaves a rung with generation, no OOM, no adapter
+// spill and a MEASURED discrepancy is the one where its layers were found in
+// system RAM.
+function failedForHostBackedLayers(
+  a: Pick<ProbeAttemptDto, "ok" | "oom" | "spill" | "gen_tps" | "vram_discrepancy" | "host_backed_method">
+): boolean {
+  return a.ok !== 1 && a.oom !== 1 && a.spill !== 1 && a.gen_tps != null && a.vram_discrepancy === 1 && a.host_backed_method != null;
+}
+
 export interface ProbeAttemptsProps {
   testId: string;
   /** Re-fetched whenever the run's own status changes. */
@@ -285,7 +295,13 @@ export function ProbeAttempts({ testId, refreshKey }: ProbeAttemptsProps) {
                           title={a.error ?? undefined}
                           className="rounded-full bg-warning-bg px-2 py-0.5 text-[10px] font-bold text-warning"
                         >
-                          {a.oom ? "out of memory" : a.spill ? "spilled past VRAM" : "failed"}
+                          {a.oom
+                            ? "out of memory"
+                            : a.spill
+                              ? "spilled past VRAM"
+                              : failedForHostBackedLayers(a)
+                                ? "layers in system RAM"
+                                : "failed"}
                         </span>
                       )}
                       {a.ok && a.vram_discrepancy === 1 && (
@@ -350,8 +366,12 @@ export function ProbeAttempts({ testId, refreshKey }: ProbeAttemptsProps) {
         added, against an earlier load that held the other axis fixed. On the layer axis the unit is one layer's
         weights, so a value near 1 means the added layers went to system RAM rather than the GPU — buffer overhead
         doesn't scale with layer count, spilled weights do. A row reading <b className="text-fg">n/a</b> had no
-        comparable earlier load yet and was judged against its own predicted footprint instead. How a fallback is
-        handled — warn, retry once, or fail — is the worker's VRAM-discrepancy policy. A slope suffixed{" "}
+        comparable earlier load yet and was judged against its own predicted footprint instead. A load whose layers
+        are measurably in system RAM <b className="text-fg">fails</b> as <b className="text-warning">layers in system RAM</b>,
+        so the search backs off to a layer count that really fits — when both memory counters agree, or at a small
+        context where nothing but weights can account for the shared memory. Otherwise (the evidence is only an
+        inference from the estimate, the counters disagree, or a large context could explain the reading) the load
+        passes with the warning instead. A slope suffixed{" "}
         <b className="text-fg">kv</b> is the context axis, where what spilled is cache rather than weights; that is
         reported but never failed, because these loads never read a cache that large.{" "}
         <b className="text-fg">Speeds</b> come from the same fixed {PROBE_EXERCISED_TOKENS}-token workload on every
