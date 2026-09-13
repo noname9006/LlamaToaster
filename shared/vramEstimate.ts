@@ -668,6 +668,24 @@ export function detectHostBackedFallback(input: HostBackedFallbackInput): HostBa
   // constant-free, but far too permissive to anchor on: simulated against the
   // measured sweep it passed a rung already spilling four layers, and the
   // ladder then converged there instead of descending to the real boundary.
+  //
+  // Not for a rung whose placement was already measured at a smaller context,
+  // though. The weights were judged there; all that differs here is cache,
+  // and the bootstrap cannot tell the two apart -- its numerator is the whole
+  // shared reading. The context slope above is the instrument for this rung,
+  // and when it could not run (no dedicated reading, or too little growth to
+  // measure) the honest answer is "unavailable", not a weights verdict charged
+  // with KV. Otherwise a max_gpu context phase opening at the ceiling with no
+  // per-process VRAM reading reads a big host-backed cache as spilled layers:
+  // a false "running from system RAM" on the row, and -- at a context small
+  // enough for the worker to fail on an uncorroborated conviction -- a failed
+  // rung that stops the context walk.
+  if (
+    rung.ctx != null &&
+    input.prior.some((p) => p.sharedPeakMib != null && p.ngl === rung.ngl && p.ctx != null && p.ctx < rung.ctx!)
+  ) {
+    return UNAVAILABLE_HOST_BACKED;
+  }
   if (input.rung.estimatedGpuMib == null || input.rung.estimatedGpuMib <= 0) return UNAVAILABLE_HOST_BACKED;
   // Residency veto. The bootstrap's numerator is the whole shared reading,
   // including bytes that were never weights -- staging buffers, and a KV cache

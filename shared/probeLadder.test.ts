@@ -836,6 +836,51 @@ describe("max_context grows layers even when the estimate says nothing fits", ()
   });
 });
 
+// Regression, probe 4b588fa2 (2026-09-13): max_gpu on a 10GiB RTX 3080 with a
+// 31-layer 26B-A4B MoE that does not fit. The driver backed the overflow with
+// system RAM instead of erroring, the worker let every such rung pass with a
+// warning, and the probe "verified" all 31 layers at the full context. Once a
+// measured layer spill fails the rung, the same search backs off to the
+// largest layer count whose weights actually stay in VRAM.
+describe("max_gpu backs off from layers served from system RAM", () => {
+  const LAYERS = 31;
+  const RESIDENT = 22;
+
+  function walk(spillFails: boolean): LadderAttempt[] {
+    const history: LadderAttempt[] = [];
+    for (let i = 0; i < PROBE_MAX_LOADS; i++) {
+      const rung = nextLadderRung({
+        mode: "max_gpu", granularity: "basic", candidateCtx: 1024, candidateNgl: LAYERS,
+        nglMax: LAYERS, maxCtx: TRAINED, history, calculateNgl: () => 19, calculateCtx: () => TRAINED,
+      });
+      if (!rung) break;
+      // Nothing ever OOMs on this driver; the only failure is the spill itself.
+      const spilled = spillFails && rung.ngl > RESIDENT;
+      history.push({ ...rung, ok: !spilled, hostBacked: spilled });
+    }
+    return history;
+  }
+
+  it("settles on the largest layer count that stays in VRAM, then still reaches the full context", () => {
+    expect(bestLadderResult(walk(true))).toMatchObject({ ngl: RESIDENT, ctx: TRAINED });
+  });
+
+  it("never reports a placement that spilled", () => {
+    expect(walk(true).filter((h) => h.ok && h.ngl > RESIDENT)).toHaveLength(0);
+  });
+
+  it("opens at every layer, then jumps straight to the estimate on the spill", () => {
+    expect(walk(true).slice(0, 2)).toMatchObject([
+      { ctx: 1024, ngl: LAYERS, ok: false },
+      { ctx: 1024, ngl: 19, ok: true },
+    ]);
+  });
+
+  it("reproduces the bug when a spill is allowed to pass", () => {
+    expect(bestLadderResult(walk(false))).toMatchObject({ ngl: LAYERS, ctx: TRAINED });
+  });
+});
+
 // Regression, reproduced from a real production run (probe dbe15026, worker
 // log 2026-09-05T17:27): balanced seeded at the user's own 41 layers, on a
 // machine where 41 layers is a silent host-backed placement at EVERY context.

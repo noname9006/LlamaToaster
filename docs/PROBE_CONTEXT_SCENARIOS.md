@@ -226,8 +226,22 @@ worth being explicit that they do not fight:
 - That comparison is only valid between rungs at the **same context**, which is
   why the reference is restricted to same-context rungs. The layer phase pins
   context while it searches, so its rungs are mutually comparable by
-  construction; a context phase (ngl fixed, ctx varying) has no valid slope
-  reference and falls through to the single-rung bootstrap.
+  construction. A context phase (ngl fixed, ctx varying) takes the context
+  slope instead, against a same-layers rung at a smaller context, and reports
+  the share of the newly allocated memory that went to system RAM.
+- The two axes have different consequences. A layer-axis conviction **fails**
+  the rung, so the search backs off to a layer count that really fits — when
+  the dedicated-VRAM counter corroborates it, or at a context of at most 2,048
+  tokens. Above that, an uncorroborated conviction stays a warning: the shared
+  reading also holds host-placed cache and host overhead that grows with
+  context (571 MiB at 262,144 tokens with nothing on the GPU), and on Windows
+  CUDA the corroborating counter is never available, because nvidia-smi
+  reports per-process memory as `[N/A]` under WDDM. A
+  context-axis spill is only a caveat and never fails: the probe's fixed
+  ~512-token workload never reads a cache that large. When a rung's placement
+  was already measured at a smaller context but the context slope could not
+  run, the detector reports "unavailable" rather than falling to the bootstrap,
+  which would charge the cache against the weights.
 - The bootstrap judges shared usage against the rung's own *predicted
   footprint*, which includes GPU-side KV. That is deliberate: measured on the
   reference machine, 4 layers at a 131,072-token context reported 810 MiB
