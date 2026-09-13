@@ -73,7 +73,7 @@ describe("parseWorkerState", () => {
             size_bytes: 1,
             sha256: sha.toUpperCase(),
             state: "verified",
-            hf_match: { repo_id: "org/repo", filename: "m.gguf", revision: "main", deleted: false },
+            hf_match: { repo_id: "org/repo", filename: "m.gguf", revision: "main", deleted: false, superseded: false },
           },
         ],
       })
@@ -85,6 +85,29 @@ describe("parseWorkerState", () => {
       filename: "m.gguf",
       revision: "main",
       deleted: false,
+      superseded: false,
+    });
+  });
+
+  it("preserves hf_match.superseded through the sanitizer", () => {
+    const state = parseWorkerState(
+      validBody({
+        model_files: [
+          {
+            path: "m.gguf",
+            size_bytes: 1,
+            state: "verified",
+            hf_match: { repo_id: "org/repo", filename: "m.gguf", revision: "main", deleted: true, superseded: true },
+          },
+        ],
+      })
+    );
+    expect(state.model_files[0]?.hf_match).toEqual({
+      repo_id: "org/repo",
+      filename: "m.gguf",
+      revision: "main",
+      deleted: true,
+      superseded: true,
     });
   });
 

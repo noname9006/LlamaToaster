@@ -210,6 +210,10 @@ export async function searchHfGgufModels(
   if (options.sort) params.set("sort", options.sort);
   if (options.direction) params.set("direction", String(options.direction));
   if (options.cursor) params.set("cursor", options.cursor);
+  // HF's search API omits lastModified by default (it only shows up when
+  // sorting by it) -- confirmed live. Asking for it via `expand` replaces the
+  // default field set entirely, so every field read below has to be listed.
+  for (const field of ["downloads", "likes", "createdAt", "lastModified"]) params.append("expand", field);
   const url = `https://huggingface.co/api/models?${params.toString()}`;
   const res = await hfFetch(url, undefined, { bucket: "api", timeoutMs, reason });
   if (!res.ok) {

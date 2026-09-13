@@ -219,6 +219,7 @@ function parseModelFiles(value: unknown): ModelDirFile[] {
           filename: sanitizeString(m.filename, `model_files[${i}].hf_match.filename`, 512),
           revision: sanitizeString(m.revision ?? "main", `model_files[${i}].hf_match.revision`),
           deleted: m.deleted === true,
+          superseded: m.superseded === true,
         };
       }
 

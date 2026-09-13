@@ -76,6 +76,17 @@ describe("LocalModelCache", () => {
     await cache.close();
   });
 
+  it("adds the hf_replaced_by_sha256 column for a cache that predates it", async () => {
+    const cache = new LocalModelCache("/test/model/dir");
+    await cache.init();
+
+    expect(mockDb.exec).toHaveBeenCalledWith(
+      `ALTER TABLE local_model_cache ADD COLUMN hf_replaced_by_sha256 TEXT`
+    );
+
+    await cache.close();
+  });
+
   it("should invalidate previous GGUF reads when upgrading to the KV-geometry schema", async () => {
     // PRAGMA table_info returns an empty list (mockStatement.all defaults to
     // []), which means no column exists yet -- so every migration branch in
@@ -172,6 +183,7 @@ describe("LocalModelCache", () => {
       entry.hf_model_id,
       null, // hf_checked_at
       null, // hf_deleted_at
+      null, // hf_replaced_by_sha256
       null, // n_layer
       null, // mtp_layers
       null, // quant
@@ -226,6 +238,7 @@ describe("LocalModelCache", () => {
       "user/repo/model.gguf",
       expect.any(Number), // hf_checked_at
       null, // hf_deleted_at
+      null, // hf_replaced_by_sha256
       "verified",
       expect.any(Number), // last_verified
       "model.gguf"
@@ -244,6 +257,40 @@ describe("LocalModelCache", () => {
       "user/repo/model.gguf",
       expect.any(Number),
       1700000000000,
+      null, // hf_replaced_by_sha256
+      "verified",
+      expect.any(Number),
+      "model.gguf"
+    );
+
+    await cache.close();
+  });
+
+  it("should update HF match with a replacedBySha256 value, and unconditionally overwrite a prior one", async () => {
+    const cache = new LocalModelCache("/test/model/dir");
+    await cache.init();
+
+    await cache.updateHfMatch("model.gguf", "user/repo/model.gguf", 1700000000000, "sha-new");
+
+    expect(mockStatement.run).toHaveBeenCalledWith(
+      "user/repo/model.gguf",
+      expect.any(Number),
+      1700000000000,
+      "sha-new",
+      "verified",
+      expect.any(Number),
+      "model.gguf"
+    );
+
+    // A fresh live match (no deletedAt, no replacedBySha256 passed) must
+    // actively clear both to null, not silently leave whatever a previous
+    // call set -- every updateHfMatch call is a fresh verification.
+    await cache.updateHfMatch("model.gguf", "user/repo/model.gguf");
+    expect(mockStatement.run).toHaveBeenLastCalledWith(
+      "user/repo/model.gguf",
+      expect.any(Number),
+      null,
+      null,
       "verified",
       expect.any(Number),
       "model.gguf"

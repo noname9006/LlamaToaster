@@ -1174,7 +1174,14 @@ export interface ModelDirFile {
   // re-verification, see worker/src/model-scanner.ts) that this match's HF
   // source has since been removed -- absent/false for a live match or a
   // worker running old code.
-  hf_match?: { repo_id: string; filename: string; revision: string; deleted?: boolean } | null;
+  // superseded is true when this exact file was replaced by different
+  // content at the same repo/filename (an HF re-upload), as opposed to the
+  // path being removed entirely -- always implies deleted: true (see
+  // server/src/hf-index.ts's markSupersededEntries), but the client shows a
+  // distinct "newer version available" badge (and keeps the HF link, which
+  // now shows the new content) instead of "no longer available". Absent for
+  // a live match, a genuinely-deleted match, or a worker running old code.
+  hf_match?: { repo_id: string; filename: string; revision: string; deleted?: boolean; superseded?: boolean } | null;
   // Per-file GGUF header metadata (see worker/src/gguf.ts's readGgufInfo) --
   // read once at download/reconciliation time and carried on the heartbeat so
   // the server can populate a model's catalog metadata for files that were
@@ -1375,6 +1382,9 @@ export interface HfRepoSearchResult {
   // that field was missing from the response -- powers the "Newest" sort in
   // the client's HF search UI.
   created_at: string | null;
+  // Repo's last-modified date (ISO string) -- shown as "updated ..." in the
+  // client's HF search results, like HF's own listing. null if missing.
+  last_modified: string | null;
 }
 
 export interface HfFileEntry {
@@ -2168,6 +2178,16 @@ export interface HfGgufIndexEntry {
   // match that's since been removed can still be reported as such (rather
   // than silently vanishing) -- see hf-index.ts's module doc comment.
   deleted_at: number | null;
+  // Set alongside deleted_at when this row was superseded by a re-upload at
+  // the same repo/filename (different sha256), rather than the path being
+  // removed entirely -- see hf-index.ts's markSupersededEntries. The sha256
+  // that was live at the moment of that scan; a single-hop pointer, not
+  // chased forward through multiple later re-uploads. Optional (not just
+  // nullable) so upsertHfGgufEntry's existing call sites -- which never read
+  // this field, since the row self-manages it -- don't need updating, and so
+  // an older server's hash-lookup response (missing the key entirely) is
+  // distinguishable from one that explicitly checked and found no supersede.
+  replaced_by_sha256?: string | null;
 }
 
 // Worker-local persistent cache of model file hashes and their HF

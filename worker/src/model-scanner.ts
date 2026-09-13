@@ -287,8 +287,13 @@ export async function lookupHashes(
   apiBaseUrl: string,
   authToken: string,
   hashes: string[]
-): Promise<Map<string, { repo_id: string; filename: string; revision: string; deleted_at: number | null }>> {
-  const results = new Map<string, { repo_id: string; filename: string; revision: string; deleted_at: number | null }>();
+): Promise<
+  Map<string, { repo_id: string; filename: string; revision: string; deleted_at: number | null; replaced_by_sha256: string | null }>
+> {
+  const results = new Map<
+    string,
+    { repo_id: string; filename: string; revision: string; deleted_at: number | null; replaced_by_sha256: string | null }
+  >();
 
   if (hashes.length === 0) return results;
 
@@ -318,7 +323,18 @@ export async function lookupHashes(
 
       anySuccess = true;
       const data = (await res.json()) as {
-        results: Array<{ sha256: string; repo_id: string; filename: string; revision: string; deleted_at: number | null }>;
+        // replaced_by_sha256 is optional here (not just nullable) because an
+        // older server's response won't include the key at all -- see
+        // lookupHashes' doc comment / the version-skew note in the plan this
+        // came from. Normalized to a real null below, never left undefined.
+        results: Array<{
+          sha256: string;
+          repo_id: string;
+          filename: string;
+          revision: string;
+          deleted_at: number | null;
+          replaced_by_sha256?: string | null;
+        }>;
       };
       for (const entry of data.results) {
         results.set(entry.sha256, {
@@ -326,6 +342,7 @@ export async function lookupHashes(
           filename: entry.filename,
           revision: entry.revision,
           deleted_at: entry.deleted_at,
+          replaced_by_sha256: entry.replaced_by_sha256 ?? null,
         });
       }
     } catch (err) {
@@ -375,7 +392,10 @@ export async function resolveHfMetadata(
 
   if (hashesToLookup.length === 0) return;
 
-  let matches: Map<string, { repo_id: string; filename: string; revision: string; deleted_at: number | null }>;
+  let matches: Map<
+    string,
+    { repo_id: string; filename: string; revision: string; deleted_at: number | null; replaced_by_sha256: string | null }
+  >;
   try {
     matches = await lookupHashes(apiBaseUrl, authToken, hashesToLookup);
   } catch (err) {
@@ -394,7 +414,7 @@ export async function resolveHfMetadata(
       }
       const match = matches.get(entry.sha256!);
       if (match) {
-        await cache.updateHfMatch(entry.path, `${match.repo_id}/${match.filename}`, match.deleted_at);
+        await cache.updateHfMatch(entry.path, `${match.repo_id}/${match.filename}`, match.deleted_at, match.replaced_by_sha256);
       } else {
         await cache.updateState(entry.path, "unknown");
       }
@@ -613,6 +633,12 @@ function buildHfMatch(entry: LocalCacheEntry): ModelDirFile["hf_match"] {
     filename: parts.slice(2).join("/"),
     revision: "main",
     deleted: Boolean(entry.hf_deleted_at),
+    // Single-hop pointer (the sha live at the time of the scan that set
+    // this) -- not chased forward through later re-uploads. Only its
+    // presence matters here, never its value, so that's fine: it always
+    // implies deleted:true, but distinguishes "replaced by a newer version
+    // at this same path" from "genuinely gone" for the client badge.
+    superseded: entry.hf_replaced_by_sha256 != null,
   };
 }
 

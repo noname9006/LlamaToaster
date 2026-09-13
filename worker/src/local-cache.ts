@@ -18,6 +18,12 @@ export interface LocalCacheEntry {
   // (hf-index.ts's deleted_at). Cleared back to undefined once a
   // re-verification finds the match live again.
   hf_deleted_at?: number;
+  // Set when the server reported this match as superseded -- the same
+  // repo/filename now hosts different content (an HF re-upload), rather
+  // than having been removed entirely (hf-index.ts's replaced_by_sha256).
+  // Cleared back to undefined the same way hf_deleted_at is, on any fresh
+  // re-verification that doesn't report a supersede.
+  hf_replaced_by_sha256?: string;
   // Per-file GGUF header metadata, read once by model-scanner.ts's
   // backfillGgufMetadata (and stamped at download time) -- the same fields
   // a download reports to the server's catalog, so a file dropped into
@@ -176,6 +182,9 @@ export class LocalModelCache {
     if (!cols.some((c) => c.name === "hf_deleted_at")) {
       this.db.exec(`ALTER TABLE local_model_cache ADD COLUMN hf_deleted_at INTEGER`);
     }
+    if (!cols.some((c) => c.name === "hf_replaced_by_sha256")) {
+      this.db.exec(`ALTER TABLE local_model_cache ADD COLUMN hf_replaced_by_sha256 TEXT`);
+    }
     // GGUF header metadata (see LocalCacheEntry's doc comments) -- added
     // together so a single PRAGMA check covers all five.
     if (!cols.some((c) => c.name === "n_layer")) {
@@ -268,7 +277,7 @@ export class LocalModelCache {
   // and the mapRow read below -- one source of truth so a future column
   // addition can't silently drift between the reader and the writer.
   private static readonly SELECT_COLS =
-    "path, size, mtime, sha256, hf_model_id, hf_checked_at, hf_deleted_at, " +
+    "path, size, mtime, sha256, hf_model_id, hf_checked_at, hf_deleted_at, hf_replaced_by_sha256, " +
     "n_layer, mtp_layers, quant, param_count, gguf_checked_at, last_verified, state, " +
     "trained_ctx, n_head_kv, head_dim_k, head_dim_v, n_embd, n_head, sliding_window, " +
     "sliding_window_pattern, shared_kv_layers, tensor_layer_bytes";
@@ -308,8 +317,8 @@ export class LocalModelCache {
 
     this.db
       .prepare(
-        `INSERT INTO local_model_cache (path, size, mtime, sha256, hf_model_id, hf_checked_at, hf_deleted_at, n_layer, mtp_layers, quant, param_count, gguf_checked_at, last_verified, state, trained_ctx, n_head_kv, head_dim_k, head_dim_v, n_embd, n_head, sliding_window, sliding_window_pattern, shared_kv_layers, tensor_layer_bytes)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO local_model_cache (path, size, mtime, sha256, hf_model_id, hf_checked_at, hf_deleted_at, hf_replaced_by_sha256, n_layer, mtp_layers, quant, param_count, gguf_checked_at, last_verified, state, trained_ctx, n_head_kv, head_dim_k, head_dim_v, n_embd, n_head, sliding_window, sliding_window_pattern, shared_kv_layers, tensor_layer_bytes)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(path) DO UPDATE SET
            size = excluded.size,
            mtime = excluded.mtime,
@@ -317,6 +326,7 @@ export class LocalModelCache {
            hf_model_id = excluded.hf_model_id,
            hf_checked_at = excluded.hf_checked_at,
            hf_deleted_at = excluded.hf_deleted_at,
+           hf_replaced_by_sha256 = excluded.hf_replaced_by_sha256,
            n_layer = excluded.n_layer,
            mtp_layers = excluded.mtp_layers,
            quant = excluded.quant,
@@ -343,6 +353,7 @@ export class LocalModelCache {
         entry.hf_model_id ?? null,
         entry.hf_checked_at ?? null,
         entry.hf_deleted_at ?? null,
+        entry.hf_replaced_by_sha256 ?? null,
         entry.n_layer ?? null,
         entry.mtp_layers ?? null,
         entry.quant ?? null,
@@ -380,17 +391,27 @@ export class LocalModelCache {
   }
 
   // deletedAt: the server's hf_gguf_index.deleted_at for this match (null if
-  // live). Always stamps hf_checked_at with now -- this call IS a fresh
-  // verification, whether it's the first match or a periodic re-check of an
-  // already-matched entry (see model-scanner.ts's resolveHfMetadata).
-  async updateHfMatch(path: string, hf_model_id: string, deletedAt: number | null = null): Promise<void> {
+  // live). replacedBySha256: the server's hf_gguf_index.replaced_by_sha256
+  // (non-null only when deletedAt is also set, for a superseded-not-gone
+  // match). Both are bound unconditionally on every call, exactly like
+  // deletedAt already was -- this call IS a fresh verification, whether it's
+  // the first match or a periodic re-check of an already-matched entry (see
+  // model-scanner.ts's resolveHfMetadata), so a live result must actively
+  // clear a previously-set flag, not just leave it because this call didn't
+  // mention it.
+  async updateHfMatch(
+    path: string,
+    hf_model_id: string,
+    deletedAt: number | null = null,
+    replacedBySha256: string | null = null
+  ): Promise<void> {
     if (!this.db) throw new Error("Database not initialized");
 
     this.db
       .prepare(
-        `UPDATE local_model_cache SET hf_model_id = ?, hf_checked_at = ?, hf_deleted_at = ?, state = ?, last_verified = ? WHERE path = ?`
+        `UPDATE local_model_cache SET hf_model_id = ?, hf_checked_at = ?, hf_deleted_at = ?, hf_replaced_by_sha256 = ?, state = ?, last_verified = ? WHERE path = ?`
       )
-      .run(hf_model_id, Date.now(), deletedAt, "verified", Date.now(), path);
+      .run(hf_model_id, Date.now(), deletedAt, replacedBySha256, "verified", Date.now(), path);
   }
 
   async delete(path: string): Promise<void> {
@@ -430,6 +451,7 @@ export class LocalModelCache {
     hf_model_id: string | null;
     hf_checked_at: number | null;
     hf_deleted_at: number | null;
+    hf_replaced_by_sha256: string | null;
     n_layer: number | null;
     mtp_layers: number | null;
     quant: string | null;
@@ -456,6 +478,7 @@ export class LocalModelCache {
       hf_model_id: row.hf_model_id ?? undefined,
       hf_checked_at: row.hf_checked_at ?? undefined,
       hf_deleted_at: row.hf_deleted_at ?? undefined,
+      hf_replaced_by_sha256: row.hf_replaced_by_sha256 ?? undefined,
       n_layer: row.n_layer ?? undefined,
       mtp_layers: row.mtp_layers ?? undefined,
       quant: row.quant ?? undefined,

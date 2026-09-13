@@ -100,41 +100,18 @@ function persistManualAddOpen(open: boolean): void {
   }
 }
 
-// Which worker the user has told THIS BROWSER is running on the same
-// physical machine -- there's no way for a web page to detect that on its
-// own (the browser and the worker process are unrelated to each other), so
-// it's a one-time manual pairing per browser/device rather than anything
-// derived from server data. Stored in localStorage (not sessionStorage) so
-// it survives across visits on the same machine -- a laptop's browser
-// should only need to be told once which worker is "this laptop".
-const THIS_MACHINE_WORKER_KEY = "llamatoaster:this-machine-worker-id";
-
-function loadThisMachineWorkerId(): string | null {
-  try {
-    return localStorage.getItem(THIS_MACHINE_WORKER_KEY);
-  } catch {
-    return null;
-  }
-}
-
-function persistThisMachineWorkerId(workerId: string | null): void {
-  try {
-    if (workerId) localStorage.setItem(THIS_MACHINE_WORKER_KEY, workerId);
-    else localStorage.removeItem(THIS_MACHINE_WORKER_KEY);
-  } catch {
-    /* localStorage unavailable -- pairing just won't survive a refresh */
-  }
-}
-
-// Every worker's models section starts collapsed -- which ones the user has
-// expanded is purely a per-browser display preference, remembered the same
-// way THIS_MACHINE_WORKER_KEY is (localStorage, not sessionStorage) so it
-// survives across visits on the same machine.
+// Which worker sections, and which model groups within them, the user has
+// expanded -- everything starts collapsed, and what's open is purely a
+// per-browser display preference, kept in localStorage (not sessionStorage)
+// so it survives across visits on the same machine.
 const OPEN_WORKER_SECTIONS_KEY = "llamatoaster:models-open-worker-ids";
+// Entries are openGroupKey() values -- the same model can sit under several
+// workers' sections at once, each expanded independently.
+const OPEN_MODEL_GROUPS_KEY = "llamatoaster:models-open-group-keys";
 
-function loadOpenWorkerIds(): string[] {
+function loadStringList(key: string): string[] {
   try {
-    const raw = localStorage.getItem(OPEN_WORKER_SECTIONS_KEY);
+    const raw = localStorage.getItem(key);
     if (!raw) return [];
     const parsed: unknown = JSON.parse(raw);
     return Array.isArray(parsed) ? parsed.filter((v): v is string => typeof v === "string") : [];
@@ -143,12 +120,16 @@ function loadOpenWorkerIds(): string[] {
   }
 }
 
-function persistOpenWorkerIds(ids: string[]): void {
+function persistStringList(key: string, ids: string[]): void {
   try {
-    localStorage.setItem(OPEN_WORKER_SECTIONS_KEY, JSON.stringify(ids));
+    localStorage.setItem(key, JSON.stringify(ids));
   } catch {
     /* localStorage unavailable -- open/collapsed state just won't survive a refresh */
   }
+}
+
+function openGroupKey(group: ModelGroup, workerId: string): string {
+  return `${group.key}::${workerId}`;
 }
 
 // `downloading`/`progress`/`speeds` below used to be keyed by bare filename
@@ -198,6 +179,72 @@ const HF_SORT_SERVER_FIELD: Partial<Record<HfSortField, "downloads" | "likes" | 
   newest: "createdAt",
   updated: "lastModified",
 };
+
+// Filter/sort choices for both the "My models" list and the HF search
+// controls, remembered per browser like the open/collapsed state above.
+// Separate from HF_SEARCH_STORAGE_KEY's session-scoped blob below: that one
+// also carries fetched results (which go stale), these are pure preferences.
+// A live session blob still wins for the HF controls, since its cached pages
+// were fetched under exactly those settings.
+const DISPLAY_PREFS_KEY = "llamatoaster:models-display-prefs";
+
+interface DisplayPrefs {
+  authorFilter: string;
+  familyFilter: string;
+  paramsLoIndex: number;
+  paramsHiIndex: number;
+  sortField: SortField;
+  sortDir: SortDir;
+  hfParamsLoIndex: number;
+  hfParamsHiIndex: number;
+  hfSortField: HfSortField;
+  hfSortDir: SortDir;
+}
+
+// Field-by-field so a value stored by an older build (renamed sort option,
+// PARAMS_STOPS changed length) falls back to its default instead of feeding
+// the UI something it can't render.
+function loadDisplayPrefs(): DisplayPrefs {
+  let stored: Record<string, unknown> = {};
+  try {
+    const parsed: unknown = JSON.parse(localStorage.getItem(DISPLAY_PREFS_KEY) ?? "{}");
+    if (parsed && typeof parsed === "object") stored = parsed as Record<string, unknown>;
+  } catch {
+    /* unavailable or corrupt -- defaults below */
+  }
+  const lastStop = PARAMS_STOPS.length - 1;
+  const str = (v: unknown) => (typeof v === "string" ? v : "");
+  const idx = (v: unknown, def: number) => (typeof v === "number" && Number.isInteger(v) && v >= 0 && v <= lastStop ? v : def);
+  const oneOf = <T extends string>(v: unknown, allowed: readonly T[], def: T): T => (allowed.includes(v as T) ? (v as T) : def);
+  const range = (loV: unknown, hiV: unknown): [number, number] => {
+    const lo = idx(loV, 0);
+    const hi = idx(hiV, lastStop);
+    return lo <= hi ? [lo, hi] : [0, lastStop];
+  };
+  const dirs: SortDir[] = ["asc", "desc"];
+  const [paramsLoIndex, paramsHiIndex] = range(stored.paramsLoIndex, stored.paramsHiIndex);
+  const [hfParamsLoIndex, hfParamsHiIndex] = range(stored.hfParamsLoIndex, stored.hfParamsHiIndex);
+  return {
+    authorFilter: str(stored.authorFilter),
+    familyFilter: str(stored.familyFilter),
+    paramsLoIndex,
+    paramsHiIndex,
+    sortField: oneOf(stored.sortField, SORT_OPTIONS.map((o) => o.value), "created"),
+    sortDir: oneOf(stored.sortDir, dirs, "desc"),
+    hfParamsLoIndex,
+    hfParamsHiIndex,
+    hfSortField: oneOf(stored.hfSortField, HF_SORT_OPTIONS.map((o) => o.value), "relevance"),
+    hfSortDir: oneOf(stored.hfSortDir, dirs, "desc"),
+  };
+}
+
+function persistDisplayPrefs(prefs: DisplayPrefs): void {
+  try {
+    localStorage.setItem(DISPLAY_PREFS_KEY, JSON.stringify(prefs));
+  } catch {
+    /* localStorage unavailable -- preferences just won't survive a refresh */
+  }
+}
 
 interface HfPage {
   results: HfRepoSearchResult[];
@@ -342,8 +389,10 @@ export function Models() {
   const [form, setForm] = useState(emptyForm);
   const [addMsg, setAddMsg] = useState("");
   const [manualAddOpen, setManualAddOpen] = useState(loadManualAddOpen);
-  const [thisMachineWorkerId, setThisMachineWorkerId] = useState<string | null>(loadThisMachineWorkerId);
-  const [openWorkerIds, setOpenWorkerIds] = useState<string[]>(loadOpenWorkerIds);
+  const [openWorkerIds, setOpenWorkerIds] = useState<string[]>(() => loadStringList(OPEN_WORKER_SECTIONS_KEY));
+  const [openGroupKeys, setOpenGroupKeys] = useState<string[]>(() => loadStringList(OPEN_MODEL_GROUPS_KEY));
+  // Read once per mount -- the filter/sort useStates below all seed from it.
+  const [initialPrefs] = useState(loadDisplayPrefs);
 
   const [hfQuery, setHfQuery] = useState(() => loadPersistedHfSearch()?.query ?? "");
   // hfPages holds every raw HF search page fetched so far (each with its own
@@ -408,12 +457,16 @@ export function Models() {
   const seenRef = useRef<Record<string, boolean>>({});
   const missesRef = useRef<Record<string, number>>({});
 
-  const [hfParamsLoIndex, setHfParamsLoIndex] = useState(() => loadPersistedHfSearch()?.paramsLoIndex ?? 0);
-  const [hfParamsHiIndex, setHfParamsHiIndex] = useState(
-    () => loadPersistedHfSearch()?.paramsHiIndex ?? PARAMS_STOPS.length - 1
+  const [hfParamsLoIndex, setHfParamsLoIndex] = useState(
+    () => loadPersistedHfSearch()?.paramsLoIndex ?? initialPrefs.hfParamsLoIndex
   );
-  const [hfSortField, setHfSortField] = useState<HfSortField>(() => loadPersistedHfSearch()?.sortField ?? "relevance");
-  const [hfSortDir, setHfSortDir] = useState<SortDir>(() => loadPersistedHfSearch()?.sortDir ?? "desc");
+  const [hfParamsHiIndex, setHfParamsHiIndex] = useState(
+    () => loadPersistedHfSearch()?.paramsHiIndex ?? initialPrefs.hfParamsHiIndex
+  );
+  const [hfSortField, setHfSortField] = useState<HfSortField>(
+    () => loadPersistedHfSearch()?.sortField ?? initialPrefs.hfSortField
+  );
+  const [hfSortDir, setHfSortDir] = useState<SortDir>(() => loadPersistedHfSearch()?.sortDir ?? initialPrefs.hfSortDir);
 
   // Keyed by "<model_id>:<worker_name>" since a delete now only ever targets
   // one worker's copy, and the same model can appear (with independent
@@ -433,12 +486,12 @@ export function Models() {
   const [locations, setLocations] = useState<Record<string, string[]>>({});
   const [, setUnreachableLocationWorkers] = useState<string[]>([]);
 
-  const [authorFilter, setAuthorFilter] = useState("");
-  const [familyFilter, setFamilyFilter] = useState("");
-  const [paramsLoIndex, setParamsLoIndex] = useState(0);
-  const [paramsHiIndex, setParamsHiIndex] = useState(PARAMS_STOPS.length - 1);
-  const [sortField, setSortField] = useState<SortField>("created");
-  const [sortDir, setSortDir] = useState<SortDir>("desc");
+  const [authorFilter, setAuthorFilter] = useState(initialPrefs.authorFilter);
+  const [familyFilter, setFamilyFilter] = useState(initialPrefs.familyFilter);
+  const [paramsLoIndex, setParamsLoIndex] = useState(initialPrefs.paramsLoIndex);
+  const [paramsHiIndex, setParamsHiIndex] = useState(initialPrefs.paramsHiIndex);
+  const [sortField, setSortField] = useState<SortField>(initialPrefs.sortField);
+  const [sortDir, setSortDir] = useState<SortDir>(initialPrefs.sortDir);
   const [refreshingModels, setRefreshingModels] = useState(false);
   const [refreshModelsMsg, setRefreshModelsMsg] = useState("");
 
@@ -696,8 +749,36 @@ export function Models() {
   }, [downloading]);
 
   useEffect(() => {
-    persistOpenWorkerIds(openWorkerIds);
+    persistStringList(OPEN_WORKER_SECTIONS_KEY, openWorkerIds);
   }, [openWorkerIds]);
+
+  useEffect(() => {
+    persistStringList(OPEN_MODEL_GROUPS_KEY, openGroupKeys);
+  }, [openGroupKeys]);
+
+  useEffect(() => {
+    persistDisplayPrefs({
+      authorFilter,
+      familyFilter,
+      paramsLoIndex,
+      paramsHiIndex,
+      sortField,
+      sortDir,
+      hfParamsLoIndex,
+      hfParamsHiIndex,
+      hfSortField,
+      hfSortDir,
+    });
+  }, [authorFilter, familyFilter, paramsLoIndex, paramsHiIndex, sortField, sortDir, hfParamsLoIndex, hfParamsHiIndex, hfSortField, hfSortDir]);
+
+  // A remembered author/family filter can outlive the last model it matched
+  // (that file was deleted since) -- the <select> would then show "All"
+  // while still filtering everything out. Only judged once there's data.
+  useEffect(() => {
+    if (presentModels.length === 0) return;
+    if (authorFilter && !authorOptions.includes(authorFilter)) setAuthorFilter("");
+    if (familyFilter && !familyOptions.includes(familyFilter)) setFamilyFilter("");
+  }, [presentModels, authorOptions, familyOptions, authorFilter, familyFilter]);
 
   useEffect(() => {
     persistHfSearch({
@@ -1209,13 +1290,20 @@ export function Models() {
     const quant = resolveQuant(m) ?? "?";
     // The worker's live hash-verified match takes priority over the model's
     // own stored hf_repo/hf_file (which can point at a since-renamed/moved
-    // file the hash lookup would catch).
-    const hfLinkRepo = hfMatch && !hfMatch.deleted ? hfMatch.repo_id : !hfMatch ? m.hf_repo : undefined;
-    const hfLinkFile = hfMatch && !hfMatch.deleted ? hfMatch.filename : !hfMatch ? m.hf_file : undefined;
-    // A confirmed-gone HF source overrides whatever the worker's own local
-    // state says -- "the exact file HF served this hash from is gone" is the
-    // more important thing to surface than "still verified locally".
-    const { Icon: StateIcon, className: stateClassName, label: stateLabel } = hfMatch?.deleted
+    // file the hash lookup would catch). A superseded match is always also
+    // `deleted`, but keeps a real link -- the repo/filename didn't go away,
+    // they just now show different (newer) content than what's on disk here.
+    const hasLiveLink = hfMatch && (!hfMatch.deleted || hfMatch.superseded);
+    const hfLinkRepo = hasLiveLink ? hfMatch.repo_id : !hfMatch ? m.hf_repo : undefined;
+    const hfLinkFile = hasLiveLink ? hfMatch.filename : !hfMatch ? m.hf_file : undefined;
+    // A confirmed-gone (or superseded) HF source overrides whatever the
+    // worker's own local state says -- "the exact file HF served this hash
+    // from is gone / replaced" is more important to surface than "still
+    // verified locally". Superseded checked first since it's always also
+    // `deleted` -- checking `deleted` first would shadow it.
+    const { Icon: StateIcon, className: stateClassName, label: stateLabel } = hfMatch?.superseded
+      ? { Icon: IconRefreshCw, className: "text-accent", label: "a newer version is available on Hugging Face" }
+      : hfMatch?.deleted
       ? { Icon: IconAlertTriangle, className: "text-warning", label: "no longer available on Hugging Face" }
       : badgeState(modelState);
     const title = `${m.filename} · ${formatBytes(m.size_bytes)} · ${stateLabel} · added ${formatShortRelativeTime(m.created_at)}`;
@@ -1277,6 +1365,10 @@ export function Models() {
     );
   }
 
+  function toggleGroupOpen(key: string) {
+    setOpenGroupKeys((keys) => (keys.includes(key) ? keys.filter((k) => k !== key) : [...keys, key]));
+  }
+
   function renderModelGroup(group: ModelGroup, worker: Worker) {
     // A companion MTP draft file that shares its hf_repo with more than one
     // quant in this group is attached to each of those quants' own
@@ -1303,16 +1395,49 @@ export function Models() {
     const groupParamsB = modelParamsB(repModel);
     const isEstimatedGroupParams = groupParamsB !== null && typeof repModel.metadata.param_count !== "number";
     const tiers = groupQuantsByTier(group.quants);
+    const openKey = openGroupKey(group, worker.id);
+    const isOpen = openGroupKeys.includes(openKey);
+    // "author / repo-name" the way HF shows it, the name linking to the model
+    // card -- taken from the representative quant's own repo rather than
+    // group.label, which strips a "-GGUF" suffix for grouping purposes. A
+    // manually-registered local model has no repo, so it keeps group.label.
+    const slash = repModel.hf_repo?.indexOf("/") ?? -1;
+    const repoAuthor = repModel.hf_repo && slash > 0 ? repModel.hf_repo.slice(0, slash) : null;
+    const repoName = repModel.hf_repo && slash > 0 ? repModel.hf_repo.slice(slash + 1) : group.label;
 
     return (
       // border-t (not just the individual rows' own hairline) is what
       // actually separates one group from the next -- without it here, a
       // group header sat flush against the previous group's last row with
       // nothing visually marking the boundary between them.
-      <div key={`${group.key}:${worker.id}`} className="border-t-2 border-border/80 first:border-t-0">
-        <div className="flex flex-wrap items-center gap-2 px-4 pt-3 pb-2">
-          <span className="text-[13.5px] font-semibold text-fg">{group.label}</span>
-          <span className="text-xs text-muted">· {group.author} · {group.family}</span>
+      <div key={openKey} className="border-t-2 border-border/80 first:border-t-0">
+        {/* Collapsed by default: one line with just the quant codes. Clicking
+            anywhere on the line that isn't its own link/button toggles the
+            full tier view below. */}
+        <div
+          onClick={(e) => {
+            if ((e.target as HTMLElement).closest("a, button")) return;
+            toggleGroupOpen(openKey);
+          }}
+          className={`flex cursor-pointer flex-wrap items-center gap-2 px-4 hover:bg-surface-raised/40 ${isOpen ? "pt-3 pb-2" : "py-2.5"}`}
+        >
+          <span className="text-[13.5px]">
+            {repoAuthor && <span className="text-muted">{repoAuthor} / </span>}
+            {repModel.hf_repo ? (
+              <a
+                href={hfRepoUrl(repModel.hf_repo)}
+                target="_blank"
+                rel="noreferrer"
+                className="font-semibold text-fg hover:text-accent hover:underline"
+                title="Open the model card on Hugging Face"
+              >
+                {repoName}
+              </a>
+            ) : (
+              <span className="font-semibold text-fg">{repoName}</span>
+            )}
+          </span>
+          <span className="text-xs text-muted">· {group.family}</span>
           {groupParamsB !== null && (
             <span className="inline-flex items-center rounded border border-border bg-surface-raised px-1.5 py-0.5 font-mono text-xs font-bold text-fg">
               {formatParamsB(groupParamsB)}
@@ -1330,32 +1455,52 @@ export function Models() {
               <IconRefreshCw width={12} height={12} className={paramLookupBusyId === repModel.id ? "animate-spin" : undefined} />
             </button>
           )}
-          <span className="flex-1" />
-          {repModel.hf_repo && (
-            <a
-              href={hfRepoUrl(repModel.hf_repo)}
-              target="_blank"
-              rel="noreferrer"
-              className="inline-flex items-center gap-1 rounded-md border border-transparent px-2 py-1 text-xs text-accent hover:border-accent/30 hover:bg-accent/10"
-            >
-              View on HF ↗
-            </a>
+          {!isOpen && (
+            <span className="flex flex-wrap items-center gap-1">
+              {group.quants.map((q) => (
+                <span
+                  key={q.base.id}
+                  className="rounded border border-border bg-surface px-1.5 py-0.5 font-mono text-[11px] font-semibold text-fg"
+                >
+                  {resolveQuant(q.base) ?? "?"}
+                </span>
+              ))}
+              {uniqueDrafts.length > 0 && (
+                <span className="rounded border border-dashed border-border px-1.5 py-0.5 font-mono text-[11px] text-muted">
+                  MTP
+                </span>
+              )}
+            </span>
           )}
+          <span className="flex-1" />
           <span className="font-mono text-[10.5px] text-muted/70">
             {totalFiles} file{totalFiles === 1 ? "" : "s"} · {formatBytes(totalBytes)}
           </span>
+          <button
+            type="button"
+            onClick={() => toggleGroupOpen(openKey)}
+            aria-expanded={isOpen}
+            aria-label={`${isOpen ? "Collapse" : "Expand"} ${repoName}`}
+            className="flex h-5 w-5 items-center justify-center rounded text-muted hover:text-accent"
+          >
+            <IconChevronDown width={14} height={14} className={`transition-transform ${isOpen ? "rotate-180" : ""}`} />
+          </button>
         </div>
         {paramLookupErr[repModel.id] && <div className="px-4 pb-1.5 text-xs text-danger">{paramLookupErr[repModel.id]}</div>}
-        {tiers.map((tier) =>
-          renderTierRow(
-            tier.label,
-            `${tier.quants.length} quant${tier.quants.length === 1 ? "" : "s"}`,
-            tier.quants.map((q) => q.base),
-            worker
-          )
+        {isOpen && (
+          <>
+            {tiers.map((tier) =>
+              renderTierRow(
+                tier.label,
+                `${tier.quants.length} quant${tier.quants.length === 1 ? "" : "s"}`,
+                tier.quants.map((q) => q.base),
+                worker
+              )
+            )}
+            {uniqueDrafts.length > 0 &&
+              renderTierRow("MTP", `${uniqueDrafts.length} file${uniqueDrafts.length === 1 ? "" : "s"}`, uniqueDrafts, worker)}
+          </>
         )}
-        {uniqueDrafts.length > 0 &&
-          renderTierRow("MTP", `${uniqueDrafts.length} file${uniqueDrafts.length === 1 ? "" : "s"}`, uniqueDrafts, worker)}
       </div>
     );
   }
@@ -1490,28 +1635,6 @@ export function Models() {
               </button>
             </div>
 
-            {workers.length > 1 && (
-              <label className="mt-3 flex flex-wrap items-center gap-2 text-sm">
-                <span className="text-muted">This machine is</span>
-                <select
-                  value={thisMachineWorkerId && workers.some((w) => w.id === thisMachineWorkerId) ? thisMachineWorkerId : ""}
-                  onChange={(e) => {
-                    const id = e.target.value || null;
-                    setThisMachineWorkerId(id);
-                    persistThisMachineWorkerId(id);
-                  }}
-                  className="rounded-lg border border-border bg-surface px-3 py-1.5 text-fg outline-none focus:border-accent"
-                >
-                  <option value="">not set -- guess for me</option>
-                  {workers.map((w) => (
-                    <option key={w.id} value={w.id}>
-                      {w.displayName}
-                    </option>
-                  ))}
-                </select>
-              </label>
-            )}
-
             <div className="mt-3 flex flex-col gap-3">
               {modelsByWorker.map(({ worker, subset, groups, orphans }) => (
                 <details
@@ -1529,7 +1652,6 @@ export function Models() {
                   <summary className="flex cursor-pointer items-center justify-between px-4 py-2.5 text-sm font-semibold text-fg">
                     <span className="flex items-center gap-2">
                       {worker.displayName}
-                      {worker.id === thisMachineWorkerId && <StatusPill label="this machine" tone="accent" />}
                       <span className="text-xs font-normal text-muted">
                         ({subset.length} file{subset.length === 1 ? "" : "s"}
                         {subset.length > 0 ? ` · ${formatBytes(subset.reduce((n, m) => n + m.size_bytes, 0))}` : ""})
@@ -1896,21 +2018,29 @@ export function Models() {
                   onClick={() => toggleRepo(r.id)}
                   className="flex w-full items-center justify-between gap-3 bg-surface px-4 py-2.5 text-left text-sm hover:bg-white/5"
                 >
-                  <span className="text-fg">
-                    {r.id}{" "}
+                  <span className="min-w-0">
+                    {r.id.includes("/") && <span className="text-muted">{r.id.slice(0, r.id.indexOf("/"))} / </span>}
                     <a
                       href={hfRepoUrl(r.id)}
                       target="_blank"
                       rel="noreferrer"
                       onClick={(e) => e.stopPropagation()}
-                      className="text-xs text-accent hover:underline"
+                      className="font-semibold text-fg hover:text-accent hover:underline"
+                      title="Open the model card on Hugging Face"
                     >
-                      view on HF ↗
+                      {r.id.slice(r.id.indexOf("/") + 1)}
                     </a>
                   </span>
-                  <span className="flex items-center gap-3 text-xs text-muted">
-                    {r.downloads.toLocaleString()} downloads · {r.likes.toLocaleString()} likes
-                    {formatRelativeTime(r.created_at) && <span>· added {formatRelativeTime(r.created_at)}</span>}
+                  <span className="flex shrink-0 items-center gap-3 text-xs text-muted">
+                    {/* last_modified is absent on results restored from a session blob saved before it existed */}
+                    {[
+                      formatRelativeTime(r.last_modified) && `updated ${formatRelativeTime(r.last_modified)}`,
+                      `${r.downloads.toLocaleString()} downloads`,
+                      `${r.likes.toLocaleString()} likes`,
+                      formatRelativeTime(r.created_at) && `added ${formatRelativeTime(r.created_at)}`,
+                    ]
+                      .filter(Boolean)
+                      .join(" · ")}
                     <IconChevronDown
                       width={16}
                       height={16}
