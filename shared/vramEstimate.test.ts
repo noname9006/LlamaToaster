@@ -715,8 +715,36 @@ describe("detectHostBackedFallback on the context axis", () => {
 
   it("refuses a context step that allocated too little to measure", () => {
     // 1024 -> 8192 at 13 layers grew the allocation by ~25MiB, far under the
-    // driver's own granularity. Falls through to the bootstrap.
-    expect(check([1024, 1693, 4452], [8192, 1725, 4495]).method).toBe("ratio");
+    // driver's own granularity. Unavailable rather than a bootstrap verdict:
+    // the placement was already judged at 1024.
+    const v = check([1024, 1693, 4452], [8192, 1725, 4495]);
+    expect(v.method).toBeNull();
+    expect(v.hostBacked).toBe(false);
+  });
+
+  // The bootstrap's numerator is the whole shared reading, cache included. With
+  // no per-process VRAM reading the context slope cannot run, and before this
+  // guard the bootstrap charged a 9GiB host-backed cache against the weights
+  // and convicted -- which now fails the rung and stops the context walk.
+  it("does not let the bootstrap convict a context step at an already-measured placement", () => {
+    const v = detectHostBackedFallback({
+      rung: { ngl: 10, ctx: 262144, sharedPeakMib: 9000, dedicatedPeakMib: null, estimatedGpuMib: EST[262144] },
+      prior: [{ ngl: 10, ctx: 1024, sharedPeakMib: 931, dedicatedPeakMib: null, estimatedGpuMib: EST[1024] }],
+      perLayerMib: PER_LAYER_MIB,
+    });
+    expect(v.method).toBeNull();
+    expect(v.hostBacked).toBe(false);
+  });
+
+  // Walking context DOWN leaves only larger contexts behind, so the placement
+  // has not been judged at a smaller one and the bootstrap still decides.
+  it("still bootstraps a context walk that is stepping down", () => {
+    const v = detectHostBackedFallback({
+      rung: { ngl: 41, ctx: 16384, sharedPeakMib: 13000, dedicatedPeakMib: null, estimatedGpuMib: 17500 },
+      prior: [{ ngl: 41, ctx: 32768, sharedPeakMib: 13258, dedicatedPeakMib: null, estimatedGpuMib: 18000 }],
+      perLayerMib: PER_LAYER_MIB,
+    });
+    expect(v).toMatchObject({ method: "ratio", hostBacked: true });
   });
 
   it("prefers the layer axis when both references exist", () => {
