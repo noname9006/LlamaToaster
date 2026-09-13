@@ -231,6 +231,11 @@ const COLUMN_MIGRATIONS: ColumnSpec[] = [
   // module doc comment. Nullable: NULL means live, non-null means confirmed
   // gone from Hugging Face as of that timestamp.
   { table: "hf_gguf_index", column: "deleted_at", ddlType: "INTEGER" },
+  // Set alongside deleted_at when a row was soft-deleted because HF
+  // re-uploaded different content at the same repo/filename, rather than
+  // the path being removed entirely -- see hf-index.ts's
+  // markSupersededEntries. NULL for a live row or a genuinely-gone one.
+  { table: "hf_gguf_index", column: "replaced_by_sha256", ddlType: "TEXT" },
   // PRE-EXISTING GAP, caught by the fresh-vs-upgraded parity check in
   // v8-migrate.test.ts: raw_json_path is in schema.sql's CREATE TABLE for
   // `results` but never had an ALTER, so a database created before that
