@@ -336,25 +336,49 @@ interface HfIndexRow {
   file_size: number;
   last_seen: number;
   deleted_at: number | null;
+  replaced_by_sha256: string | null;
 }
 
 // Upsert a single entry into the hf_gguf_index table.
 // Composite PK (sha256, repo_id, filename) so mirrored content keeps distinct rows.
-// deleted_at is always cleared on upsert -- content that reappears (a false
-// 404, or a genuinely republished repo/file) automatically heals out of any
-// prior soft-delete.
+// deleted_at (and replaced_by_sha256, see markSupersededEntries) are always
+// cleared on upsert -- content that reappears (a false 404, a genuinely
+// republished repo/file, or a revert to a prior exact version) automatically
+// heals out of any prior soft-delete/supersede. Neither field is read from
+// `entry` -- both are fully self-managed by this function (clears) and
+// markSupersededEntries (sets, on *other* rows for the same repo/filename).
 export function upsertHfGgufEntry(entry: HfGgufIndexEntry): void {
   getDb()
     .prepare(
-      `INSERT INTO hf_gguf_index (sha256, repo_id, filename, revision, file_size, last_seen, deleted_at)
-       VALUES (?, ?, ?, ?, ?, ?, NULL)
+      `INSERT INTO hf_gguf_index (sha256, repo_id, filename, revision, file_size, last_seen, deleted_at, replaced_by_sha256)
+       VALUES (?, ?, ?, ?, ?, ?, NULL, NULL)
        ON CONFLICT(sha256, repo_id, filename) DO UPDATE SET
           revision = excluded.revision,
           file_size = excluded.file_size,
           last_seen = excluded.last_seen,
-          deleted_at = NULL`
+          deleted_at = NULL,
+          replaced_by_sha256 = NULL`
     )
     .run(entry.sha256, entry.repo_id, entry.filename, entry.revision, entry.file_size, entry.last_seen);
+}
+
+// Soft-delete other live rows for the same (repo_id, filename) whose sha256
+// differs from the one just indexed -- i.e. this path was re-uploaded with
+// different content, not removed. Distinct from pruneRepoEntries (which
+// only catches a filename disappearing from the tree entirely): this
+// catches the filename staying present but its content changing.
+// deleted_at IS NULL guard makes this idempotent across repeated scans (a
+// row already-superseded keeps its original replaced_by_sha256 pointer --
+// see HfGgufIndexEntry.replaced_by_sha256's doc comment on this being a
+// single-hop pointer, not chased forward through later re-uploads) and
+// matches the same guard markRepoDeleted/pruneRepoEntries already use.
+export function markSupersededEntries(repoId: string, filename: string, currentSha256: string, now: number): number {
+  return getDb()
+    .prepare(
+      `UPDATE hf_gguf_index SET deleted_at = ?, replaced_by_sha256 = ?
+       WHERE repo_id = ? AND filename = ? AND sha256 != ? AND deleted_at IS NULL`
+    )
+    .run(now, currentSha256, repoId, filename, currentSha256).changes;
 }
 
 // Look up one or more SHA-256 hashes in the index. Returns at most one entry
@@ -368,7 +392,7 @@ export function lookupHfGgufHashes(hashes: string[]): HfGgufIndexEntry[] {
   if (hashes.length === 0) return [];
   const placeholders = hashes.map(() => "?").join(",");
   const rows = getDb()
-    .prepare(`SELECT sha256, repo_id, filename, revision, file_size, last_seen, deleted_at
+    .prepare(`SELECT sha256, repo_id, filename, revision, file_size, last_seen, deleted_at, replaced_by_sha256
                FROM hf_gguf_index
                WHERE sha256 IN (${placeholders})`)
     .all(...hashes) as HfIndexRow[];
@@ -504,6 +528,7 @@ function mapHfIndexRow(r: HfIndexRow): HfGgufIndexEntry {
     file_size: r.file_size,
     last_seen: r.last_seen,
     deleted_at: r.deleted_at,
+    replaced_by_sha256: r.replaced_by_sha256,
   };
 }
 
@@ -634,6 +659,12 @@ export async function scanHfRepo(
       last_seen: now,
       deleted_at: null,
     });
+    // This path may have hosted different content before (a re-upload) --
+    // soft-delete whichever other live row(s) for this exact repo/filename
+    // no longer match what's actually there now. See markSupersededEntries'
+    // doc comment for why this is distinct from the filename-level pruning
+    // below.
+    markSupersededEntries(repoId, f.path, f.sha256, now);
     indexed++;
   }
 

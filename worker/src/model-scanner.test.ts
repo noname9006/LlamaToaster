@@ -308,7 +308,7 @@ describe("model-scanner", () => {
 
       await resolveHfMetadata(mockCache, "http://localhost", "token");
 
-      expect(mockCache.updateHfMatch).toHaveBeenCalledWith("model1.gguf", "repo1/model1.gguf", null);
+      expect(mockCache.updateHfMatch).toHaveBeenCalledWith("model1.gguf", "repo1/model1.gguf", null, null);
       // model2 matched and freshly checked -> not touched; model3 has hash but no match -> unknown
       expect(mockCache.updateState).toHaveBeenCalledWith("model3.gguf", "unknown");
       expect(mockCache.updateHfMatch).not.toHaveBeenCalledWith("model2.gguf", expect.anything(), expect.anything());
@@ -337,7 +337,7 @@ describe("model-scanner", () => {
 
       await resolveHfMetadata(mockCache, "http://localhost", "token");
 
-      expect(mockCache.updateHfMatch).toHaveBeenCalledWith("model1.gguf", "repo1/model1.gguf", null);
+      expect(mockCache.updateHfMatch).toHaveBeenCalledWith("model1.gguf", "repo1/model1.gguf", null, null);
     });
 
     it("should re-verify an already-matched entry once its check has gone stale", async () => {
@@ -368,7 +368,68 @@ describe("model-scanner", () => {
 
       // Re-checked despite already having a match, because hf_checked_at is stale --
       // and the server's deleted_at is carried through to updateHfMatch.
-      expect(mockCache.updateHfMatch).toHaveBeenCalledWith("model1.gguf", "old/repo/model1.gguf", deletedAt);
+      expect(mockCache.updateHfMatch).toHaveBeenCalledWith("model1.gguf", "old/repo/model1.gguf", deletedAt, null);
+    });
+
+    it("carries the server's replaced_by_sha256 through to updateHfMatch for a superseded match", async () => {
+      const staleCheckedAt = Date.now() - 25 * 60 * 60 * 1000; // >24h ago
+      const mockCache = {
+        getAll: vi.fn().mockResolvedValue([
+          {
+            path: "model1.gguf",
+            sha256: "hash1",
+            hf_model_id: "org/repo/model1.gguf",
+            hf_checked_at: staleCheckedAt,
+            state: "verified",
+          },
+        ]),
+        updateHfMatch: vi.fn().mockResolvedValue(undefined),
+        updateState: vi.fn().mockResolvedValue(undefined),
+      } as unknown as LocalModelCache;
+
+      const deletedAt = 1700000000000;
+      global.fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        json: vi.fn().mockResolvedValue({
+          results: [
+            {
+              sha256: "hash1",
+              repo_id: "org",
+              filename: "repo/model1.gguf",
+              revision: "main",
+              deleted_at: deletedAt,
+              replaced_by_sha256: "hash1-new",
+            },
+          ],
+        }),
+      });
+
+      await resolveHfMetadata(mockCache, "http://localhost", "token");
+
+      expect(mockCache.updateHfMatch).toHaveBeenCalledWith("model1.gguf", "org/repo/model1.gguf", deletedAt, "hash1-new");
+    });
+
+    it("normalizes a missing replaced_by_sha256 key (old-server response) to null instead of undefined", async () => {
+      const mockCache = {
+        getAll: vi.fn().mockResolvedValue([
+          { path: "model1.gguf", sha256: "hash1", hf_model_id: undefined, state: "detected" },
+        ]),
+        updateHfMatch: vi.fn().mockResolvedValue(undefined),
+        updateState: vi.fn().mockResolvedValue(undefined),
+      } as unknown as LocalModelCache;
+
+      // No replaced_by_sha256 key at all -- simulates an older server that
+      // predates this field, not one that checked and found nothing.
+      global.fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        json: vi.fn().mockResolvedValue({
+          results: [{ sha256: "hash1", repo_id: "repo1", filename: "model1.gguf", revision: "main", deleted_at: null }],
+        }),
+      });
+
+      await resolveHfMetadata(mockCache, "http://localhost", "token");
+
+      expect(mockCache.updateHfMatch).toHaveBeenCalledWith("model1.gguf", "repo1/model1.gguf", null, null);
     });
   });
 
@@ -429,6 +490,36 @@ describe("model-scanner", () => {
         filename: "Qwen3.5-9B-Abliterated-HSAQ-v2.Q2_K.gguf",
         revision: "main",
         deleted: false,
+        superseded: false,
+      });
+    });
+
+    it("reports superseded:true (and deleted:true) for an entry whose HF source was replaced by a re-upload", async () => {
+      const mockCache = {
+        getAll: vi.fn().mockResolvedValue([
+          {
+            path: "model.gguf",
+            size: 1000,
+            mtime: 1000,
+            sha256: "abc123",
+            hf_model_id: "org/repo/model.Q4_K_M.gguf",
+            hf_deleted_at: 1234,
+            hf_replaced_by_sha256: "def456",
+            state: "verified",
+          },
+        ]),
+      } as unknown as LocalModelCache;
+
+      mockFs.existsSync.mockReturnValue(false);
+
+      const [file] = await getModelFilesWithState(mockCache, "/models");
+
+      expect(file.hf_match).toEqual({
+        repo_id: "org/repo",
+        filename: "model.Q4_K_M.gguf",
+        revision: "main",
+        deleted: true,
+        superseded: true,
       });
     });
   });

@@ -133,6 +133,133 @@ describe("upsertHfGgufEntry", () => {
     hfIndex.upsertHfGgufEntry({ ...entry, last_seen: now + 1000 });
     expect(hfIndex.lookupHfGgufHashes(["sha-revived"])[0].deleted_at).toBeNull();
   });
+
+  it("also clears a prior replaced_by_sha256 when the exact same content reverts back", () => {
+    // Root-cause coverage for the audit finding: deleted_at healing alone
+    // isn't enough -- replaced_by_sha256 must heal the same way, or a
+    // reverted file would keep reporting superseded:true forever.
+    // Unique sha256 values -- this file shares one real (unmocked) DB across
+    // every test, so reusing a placeholder like "sha-a" would collide with
+    // another describe block's row of the same hash in a different repo, and
+    // lookupHfGgufHashes' mirror-dedup would silently pick the wrong one.
+    const repoId = "test/revert-repo";
+    const now = Date.now();
+    const entryA = {
+      sha256: "sha-revert-a",
+      repo_id: repoId,
+      filename: "model.gguf",
+      revision: "main",
+      file_size: 1,
+      last_seen: now,
+      deleted_at: null,
+    };
+    hfIndex.upsertHfGgufEntry(entryA);
+    // Re-upload: sha-revert-b becomes live, supersedes sha-revert-a.
+    hfIndex.upsertHfGgufEntry({ ...entryA, sha256: "sha-revert-b", last_seen: now + 1 });
+    hfIndex.markSupersededEntries(repoId, "model.gguf", "sha-revert-b", now + 1);
+    expect(hfIndex.lookupHfGgufHashes(["sha-revert-a"])[0].replaced_by_sha256).toBe("sha-revert-b");
+
+    // Revert: content goes back to exactly what sha-revert-a was.
+    hfIndex.upsertHfGgufEntry({ ...entryA, last_seen: now + 2 });
+    const [healed] = hfIndex.lookupHfGgufHashes(["sha-revert-a"]);
+    expect(healed.deleted_at).toBeNull();
+    expect(healed.replaced_by_sha256).toBeNull();
+  });
+});
+
+describe("markSupersededEntries", () => {
+  it("soft-deletes the old hash's row and records what replaced it, without touching other filenames", () => {
+    const repoId = "test/reupload-repo";
+    const now = Date.now();
+    hfIndex.upsertHfGgufEntry({
+      sha256: "sha-old",
+      repo_id: repoId,
+      filename: "model.Q4_K_M.gguf",
+      revision: "main",
+      file_size: 1,
+      last_seen: now,
+      deleted_at: null,
+    });
+    // A different file in the same repo, untouched by the re-upload.
+    hfIndex.upsertHfGgufEntry({
+      sha256: "sha-other",
+      repo_id: repoId,
+      filename: "model.Q8_0.gguf",
+      revision: "main",
+      file_size: 1,
+      last_seen: now,
+      deleted_at: null,
+    });
+
+    // HF re-uploads model.Q4_K_M.gguf with different content (sha-new).
+    hfIndex.upsertHfGgufEntry({
+      sha256: "sha-new",
+      repo_id: repoId,
+      filename: "model.Q4_K_M.gguf",
+      revision: "main",
+      file_size: 2,
+      last_seen: now + 1,
+      deleted_at: null,
+    });
+    const changed = hfIndex.markSupersededEntries(repoId, "model.Q4_K_M.gguf", "sha-new", now + 1);
+    expect(changed).toBe(1);
+
+    const [oldRow] = hfIndex.lookupHfGgufHashes(["sha-old"]);
+    expect(oldRow.deleted_at).toBe(now + 1);
+    expect(oldRow.replaced_by_sha256).toBe("sha-new");
+
+    const [newRow] = hfIndex.lookupHfGgufHashes(["sha-new"]);
+    expect(newRow.deleted_at).toBeNull();
+    expect(newRow.replaced_by_sha256).toBeNull();
+
+    // The other filename in the same repo must be untouched.
+    const [otherRow] = hfIndex.lookupHfGgufHashes(["sha-other"]);
+    expect(otherRow.deleted_at).toBeNull();
+    expect(otherRow.replaced_by_sha256).toBeNull();
+  });
+
+  it("is idempotent -- a row already superseded keeps its original replaced_by_sha256 pointer", () => {
+    const repoId = "test/chained-reupload-repo";
+    const now = Date.now();
+    hfIndex.upsertHfGgufEntry({
+      sha256: "sha-v1",
+      repo_id: repoId,
+      filename: "model.gguf",
+      revision: "main",
+      file_size: 1,
+      last_seen: now,
+      deleted_at: null,
+    });
+    hfIndex.upsertHfGgufEntry({
+      sha256: "sha-v2",
+      repo_id: repoId,
+      filename: "model.gguf",
+      revision: "main",
+      file_size: 1,
+      last_seen: now + 1,
+      deleted_at: null,
+    });
+    hfIndex.markSupersededEntries(repoId, "model.gguf", "sha-v2", now + 1);
+    expect(hfIndex.lookupHfGgufHashes(["sha-v1"])[0].replaced_by_sha256).toBe("sha-v2");
+
+    // A second re-upload: v1 is already deleted_at-set, so this call must
+    // NOT touch it again (the guard is deleted_at IS NULL) -- only v2 (still
+    // live at this point) gets newly superseded.
+    hfIndex.upsertHfGgufEntry({
+      sha256: "sha-v3",
+      repo_id: repoId,
+      filename: "model.gguf",
+      revision: "main",
+      file_size: 1,
+      last_seen: now + 2,
+      deleted_at: null,
+    });
+    const changed = hfIndex.markSupersededEntries(repoId, "model.gguf", "sha-v3", now + 2);
+    expect(changed).toBe(1);
+
+    expect(hfIndex.lookupHfGgufHashes(["sha-v1"])[0].replaced_by_sha256).toBe("sha-v2"); // unchanged
+    expect(hfIndex.lookupHfGgufHashes(["sha-v2"])[0].replaced_by_sha256).toBe("sha-v3"); // newly set
+  });
 });
 
 describe("lookupHfGgufHashes", () => {
