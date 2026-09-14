@@ -478,7 +478,8 @@ describe("N2 probe success rule", () => {
     // The measured false conviction: ngl 1 at 262144 read 953MiB shared -- mostly
     // context-scaled host overhead -- against a 1446MiB footprint, and its
     // generation rate rose when the layer was added. With no dedicated reading
-    // (Windows CUDA, where nvidia-smi says [N/A] per process) nothing vetoes it.
+    // (any platform where no per-process VRAM counter was attributed) nothing
+    // vetoes it.
     it("keeps an uncorroborated bootstrap conviction at a large context as a warning", () => {
       const result = probeSucceeded({
         ...base, ngl: 1, ctx: 262144, estimatedVramMib: 1446, vramProcessPeakMib: null, sharedPeakMib: 953, prior: [],
@@ -525,6 +526,37 @@ describe("N2 probe success rule", () => {
       });
       expect(result.hostBacked.residentSlopeRatio).not.toBeNull();
       expect(result.ok).toBe(false);
+    });
+
+    // Measured on Windows CUDA (GeForce MX150, llama.cpp b10952, -c 65536): ngl
+    // 36 -> 42 added 283MiB on CUDA0, of which dedicated took 2MiB and shared
+    // 280MiB, and generation fell 22.5 -> 13.8 tok/s. With WDDM's per-process
+    // Dedicated Usage read for CUDA the conviction is corroborated and fails;
+    // without it (nvidia-smi's [N/A] alone) the same rung only warned.
+    describe("Windows CUDA spill at a large context", () => {
+      const cuda = {
+        oom: false, vramPeakMib: 1949, gpuTotalMib: 2048, genTps: 13.8, perLayerMib: 1007 / 49,
+        ngl: 42, ctx: 65536, estimatedVramMib: 2310, sharedPeakMib: 414,
+      };
+
+      it("fails once the dedicated counter corroborates it", () => {
+        const result = probeSucceeded({
+          ...cuda, vramProcessPeakMib: 1949,
+          prior: [{ ngl: 36, ctx: 65536, sharedPeakMib: 134, dedicatedPeakMib: 1947 }],
+        });
+        expect(result.hostBacked).toMatchObject({ hostBacked: true, method: "slope", abstained: false });
+        expect(result.hostBacked.residentSlopeRatio!).toBeLessThan(0.1);
+        expect(result.ok).toBe(false);
+      });
+
+      it("only warns when no dedicated reading was attributed", () => {
+        const result = probeSucceeded({
+          ...cuda, vramProcessPeakMib: null,
+          prior: [{ ngl: 36, ctx: 65536, sharedPeakMib: 134, dedicatedPeakMib: null }],
+        });
+        expect(result.hostBacked).toMatchObject({ hostBacked: true, method: "slope", residentSlopeRatio: null });
+        expect(result.ok).toBe(true);
+      });
     });
 
     it("keeps an uncorroborated conviction as a warning when the context is unknown", () => {

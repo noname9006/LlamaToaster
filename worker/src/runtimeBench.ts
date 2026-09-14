@@ -803,9 +803,10 @@ export { PROBE_GEN_TOKENS, PROBE_PROMPT_TOKENS } from "../../shared/probeLadder.
  * generation rate went UP when the layer was added) was only saved by the
  * dedicated-counter veto.
  *
- * That veto is missing exactly where it matters most: on Windows CUDA the
- * per-process dedicated reading comes from nvidia-smi, which reports "[N/A]"
- * per process under WDDM, so every conviction there is uncorroborated. The
+ * That veto is missing wherever no per-process dedicated reading exists.
+ * Windows CUDA used to be one such place -- nvidia-smi reports "[N/A]" per
+ * process under WDDM -- until vram.ts's readCudaGpuMemory started falling back
+ * to WDDM's own per-process Dedicated Usage counter there. The
  * floor and one doubling above it cover both layer searches max_gpu runs (its
  * layer phase at the floor, its back-off at the next stop), where context adds
  * nothing the shared counter could mistake for weights. Above that an
