@@ -49,11 +49,19 @@ export interface SampleStats {
   // Whole-adapter system-RAM-backed GPU memory -- every process on the card
   // combined (vram.ts's GpuMemoryReading.usedShared). The shared-memory
   // counterpart of vram_total_used_*. Null wherever no such counter is read
-  // (only Windows CUDA today), never a false "0 spilled".
+  // (Windows WDDM and Linux amdgpu GTT only), never a false "0 spilled".
   vram_total_shared_peak_mib: number | null;
   vram_total_shared_avg_mib: number | null;
   vram_total_shared_accuracy: GpuMemoryAccuracyLevel;
   vram_total_shared_source: GpuMemoryMeasurementSource | null;
+  // Everything the process claimed on the GPU: its dedicated plus its shared
+  // reading, summed within the SAME tick and peaked over the load -- never two
+  // peaks added, which could come from different moments and overstate. A
+  // tick with a dedicated reading and no shared one counts shared as 0: a
+  // shared counter instance only exists once the process holds such memory,
+  // and platforms with no shared counter at all have no silent paging to
+  // miss. Null when no per-process dedicated reading was ever taken.
+  vram_process_claimed_peak_mib: number | null;
   vram_peak_accuracy: GpuMemoryAccuracyLevel;
   vram_peak_source: GpuMemoryMeasurementSource | null;
   vram_avg_accuracy: GpuMemoryAccuracyLevel;
@@ -203,6 +211,9 @@ export class MemorySampler {
   private vramTotalSharedMeasured = false;
   private vramTotalSharedWorstAccuracy: GpuMemoryAccuracyLevel = "exact";
   private vramTotalSharedWorstSource: GpuMemoryMeasurementSource | null = null;
+  // The process's per-tick dedicated+shared sum, peaked.
+  private vramClaimedPeakBytes = 0;
+  private vramClaimedMeasured = false;
   // M6 -- clock/temp samples, on the same tick as VRAM.
   private sensors = new SensorSampleBuffer();
 
@@ -248,6 +259,8 @@ export class MemorySampler {
     this.vramTotalSharedMeasured = false;
     this.vramTotalSharedWorstAccuracy = "exact";
     this.vramTotalSharedWorstSource = null;
+    this.vramClaimedPeakBytes = 0;
+    this.vramClaimedMeasured = false;
     this.sensors.reset();
     this.sample();
     this.timer = setInterval(() => this.sample(), intervalMs);
@@ -328,6 +341,7 @@ export class MemorySampler {
           : null,
       vram_total_shared_accuracy: this.vramTotalSharedMeasured ? this.vramTotalSharedWorstAccuracy : "unavailable",
       vram_total_shared_source: this.vramTotalSharedMeasured ? this.vramTotalSharedWorstSource : null,
+      vram_process_claimed_peak_mib: this.vramClaimedMeasured ? Math.round(this.vramClaimedPeakBytes / BYTES_PER_MIB) : null,
       vram_peak_accuracy: accuracy,
       vram_peak_source: source,
       vram_avg_accuracy: accuracy,
@@ -453,6 +467,12 @@ export class MemorySampler {
             this.vramProcessSharedWorstAccuracy = processShared.accuracy;
             this.vramProcessSharedWorstSource = processShared.source;
           }
+        }
+        // Same-tick sum -- see SampleStats.vram_process_claimed_peak_mib.
+        if (processUsed?.mib != null) {
+          const bytes = (processUsed.mib + (processShared?.mib ?? 0)) * BYTES_PER_MIB;
+          this.vramClaimedMeasured = true;
+          if (bytes > this.vramClaimedPeakBytes) this.vramClaimedPeakBytes = bytes;
         }
       } catch {
         /* VRAM visibility varies by OS/vendor/driver; best-effort */

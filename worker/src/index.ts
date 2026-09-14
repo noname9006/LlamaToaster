@@ -3344,6 +3344,8 @@ async function executeRunProbeJob(payload: TestProbeJobPayload): Promise<void> {
           vramPeakMib: dedupMatch.vram_peak_mib,
           ramPeakMib: dedupMatch.ram_peak_mib,
           vramSharedPeakMib: dedupMatch.vram_shared_peak_mib,
+          vramSharedTotalPeakMib: dedupMatch.vram_shared_total_peak_mib,
+          vramClaimedPeakMib: dedupMatch.vram_claimed_peak_mib,
           // A reused rung is a real measurement, just one this run did not pay
           // a load for -- so it carries the sibling's figures verbatim rather
           // than rendering as "not measured".
@@ -3541,6 +3543,12 @@ function toLadderAttempt(attempt: ProbeAttemptOutcome): LadderAttempt {
     // Not just `!ok && vramDiscrepancy` -- a rung that generated nothing can
     // carry an INFERRED discrepancy too, and that is no proof the layers moved.
     hostBacked: failedForHostBackedLayers(attempt),
+    // Whether this rung's CACHE placement was actually judged, which only the
+    // context slope can do (it needs a per-process dedicated reading and a
+    // same-placement rung at a smaller context). A pass without it means "it
+    // loaded" and nothing about where the cache went, so the frontier marks
+    // anything resting on it unverified rather than presenting it as measured.
+    ctxVerdictMeasured: attempt.kvHostBackedFrac != null,
   };
 }
 
@@ -3695,6 +3703,8 @@ async function runOneProbeLoad(input: ProbeLoadInput): Promise<ProbeAttemptOutco
       vramProcessPeakMib: stats.vram_process_peak_mib,
       ramTotalPeakMib: stats.ram_total_peak_mib,
       vramSharedPeakMib: stats.vram_process_shared_peak_mib,
+      vramSharedTotalPeakMib: stats.vram_total_shared_peak_mib,
+      vramClaimedPeakMib: stats.vram_process_claimed_peak_mib,
       genTps,
       ppTps,
       ttftMs,
@@ -3733,6 +3743,8 @@ async function runOneProbeLoad(input: ProbeLoadInput): Promise<ProbeAttemptOutco
         vramProcessPeakMib: stats.vram_process_peak_mib,
         ramTotalPeakMib: stats.ram_total_peak_mib,
         vramSharedPeakMib: stats.vram_process_shared_peak_mib,
+        vramSharedTotalPeakMib: stats.vram_total_shared_peak_mib,
+        vramClaimedPeakMib: stats.vram_process_claimed_peak_mib,
         genTps: null,
         ...memoryFields,
         error: message,
@@ -3764,6 +3776,8 @@ async function runOneProbeLoad(input: ProbeLoadInput): Promise<ProbeAttemptOutco
       vramProcessPeakMib: stats.vram_process_peak_mib,
       ramTotalPeakMib: stats.ram_total_peak_mib,
       vramSharedPeakMib: stats.vram_process_shared_peak_mib,
+      vramSharedTotalPeakMib: stats.vram_total_shared_peak_mib,
+      vramClaimedPeakMib: stats.vram_process_claimed_peak_mib,
       genTps: null,
       ...memoryFields,
       error: message,

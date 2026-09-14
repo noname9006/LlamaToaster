@@ -149,13 +149,16 @@ async function readGenericGpuMemory(pid: number | undefined): Promise<GpuMemoryR
   let sample: VramSample = NULL_SAMPLE;
   let processReading: GpuMemoryValue | undefined;
   let processSharedReading: GpuMemoryValue | undefined;
+  let usedSharedMib: number | null = null;
   if (plat === "win32") {
     const w = await readWindowsVram(pid);
     sample = w.sample;
+    usedSharedMib = w.usedSharedMib;
     if (w.processMib != null) processReading = reading(w.processMib, "exact", "process_gpu_usage");
     if (w.processSharedMib != null) processSharedReading = reading(w.processSharedMib, "exact", "process_gpu_usage");
   } else if (plat === "linux") {
     sample = await readLinuxVram();
+    usedSharedMib = await readAmdgpuSysfsGttUsedMib();
     if (pid != null) {
       processReading = (await readLinuxProcessVram(pid)) ?? undefined;
       processSharedReading = (await readAmdgpuFdinfoGtt(pid)) ?? undefined;
@@ -166,6 +169,7 @@ async function readGenericGpuMemory(pid: number | undefined): Promise<GpuMemoryR
     used: reading(sample.usedMib, "high", "driver_reported_memory"),
     ...(processReading ? { process: processReading } : {}),
     ...(processSharedReading ? { processShared: processSharedReading } : {}),
+    ...(usedSharedMib != null ? { usedShared: reading(usedSharedMib, "high", "driver_reported_memory") } : {}),
   };
 }
 
@@ -181,10 +185,16 @@ let cachedWindowsTotalMib: number | null | undefined;
 
 async function readWindowsVram(
   pid: number | undefined
-): Promise<{ sample: VramSample; processMib: number | null; processSharedMib: number | null }> {
+): Promise<{
+  sample: VramSample;
+  usedSharedMib: number | null;
+  processMib: number | null;
+  processSharedMib: number | null;
+}> {
   const [totalMib, usedAndProcess] = await Promise.all([readWindowsTotalMib(), readWindowsUsedMib(pid)]);
   return {
     sample: { totalMib, usedMib: usedAndProcess.usedMib },
+    usedSharedMib: usedAndProcess.usedSharedMib,
     processMib: usedAndProcess.processMib,
     processSharedMib: usedAndProcess.processSharedMib,
   };
@@ -211,8 +221,27 @@ function parseMiB(raw: string | undefined): number | null {
   return Number.isFinite(bytes) && bytes > 0 ? Math.round(bytes / BYTES_PER_MIB) : null;
 }
 
-// One powershell.exe spawn for ALL THREE readings (each Get-Counter call pays
+// Each value is written as `<label>=<bytes>` and read back by label, never by
+// line position: a counter with no instance yet makes its variable $null, and
+// `Write-Output $null` emits NOTHING -- so a positional read silently shifts
+// every later value into the wrong slot (a process's Shared Usage read back as
+// its Dedicated Usage whenever the dedicated instance hadn't appeared yet).
+// String concatenation turns $null into an empty value instead, and uses the
+// invariant culture, so the number never picks up a locale decimal comma.
+export function parseLabeledCounterOutput(stdout: string): Record<string, string> {
+  const values: Record<string, string> = {};
+  for (const line of stdout.split(/\r?\n/)) {
+    const eq = line.indexOf("=");
+    if (eq > 0) values[line.slice(0, eq).trim()] = line.slice(eq + 1);
+  }
+  return values;
+}
+
+// One powershell.exe spawn for ALL FOUR readings (each Get-Counter call pays
 // the same ~1-1.5s PDH cold-start cost, so separate spawns would multiply it):
+//   0. the whole-adapter "GPU Adapter Memory" Shared Usage sum (usedShared) --
+//      every process's system-RAM-backed GPU memory, summed across adapters
+//      exactly like the Dedicated Usage reading below,
 //   1. the whole-adapter "GPU Adapter Memory" Dedicated Usage sum (used),
 //   2. the per-process "GPU Process Memory" Dedicated Usage for the spawned
 //      child's pid -- the same VidMm data Task Manager's per-process "GPU
@@ -242,35 +271,42 @@ function parseMiB(raw: string | undefined): number | null {
 // nvidia-smi's per-process used_memory.
 async function readWindowsUsedMib(
   pid: number | undefined
-): Promise<{ usedMib: number | null; processMib: number | null; processSharedMib: number | null }> {
+): Promise<{
+  usedMib: number | null;
+  usedSharedMib: number | null;
+  processMib: number | null;
+  processSharedMib: number | null;
+}> {
   try {
     const lines = [
       `$u = (Get-Counter '\\GPU Adapter Memory(*)\\Dedicated Usage' -ErrorAction SilentlyContinue).CounterSamples | Measure-Object -Property CookedValue -Sum | Select-Object -ExpandProperty Sum`,
+      `$t = (Get-Counter '\\GPU Adapter Memory(*)\\Shared Usage' -ErrorAction SilentlyContinue).CounterSamples | Measure-Object -Property CookedValue -Sum | Select-Object -ExpandProperty Sum`,
       pid != null
         ? `$p = (Get-Counter '\\GPU Process Memory(pid_${pid}_*)\\Dedicated Usage' -ErrorAction SilentlyContinue).CounterSamples | Measure-Object -Property CookedValue -Sum | Select-Object -ExpandProperty Sum`
         : null,
       pid != null
         ? `$s = (Get-Counter '\\GPU Process Memory(pid_${pid}_*)\\Shared Usage' -ErrorAction SilentlyContinue).CounterSamples | Measure-Object -Property CookedValue -Sum | Select-Object -ExpandProperty Sum`
         : null,
-      `Write-Output $u`,
-      pid != null ? `Write-Output $p` : null,
-      pid != null ? `Write-Output $s` : null,
+      `Write-Output ("u=" + $u)`,
+      `Write-Output ("t=" + $t)`,
+      pid != null ? `Write-Output ("p=" + $p)` : null,
+      pid != null ? `Write-Output ("s=" + $s)` : null,
     ].filter(Boolean);
     const { stdout } = await execFileAsync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", lines.join("; ")], {
       timeout: EXEC_TIMEOUT_MS,
       windowsHide: true,
     });
-    // Three lines, one per Write-Output when a pid was given (one otherwise)
-    // -- a line is blank when its counter instance doesn't exist yet.
-    const [usedRaw, processRaw, sharedRaw] = stdout.trim().split("\n");
+    // A value is empty when its counter instance doesn't exist yet.
+    const values = parseLabeledCounterOutput(stdout);
     return {
-      usedMib: parseMiB(usedRaw),
-      processMib: pid != null ? parseMiB(processRaw) : null,
-      processSharedMib: pid != null ? parseMiB(sharedRaw) : null,
+      usedMib: parseMiB(values.u),
+      usedSharedMib: parseMiB(values.t),
+      processMib: pid != null ? parseMiB(values.p) : null,
+      processSharedMib: pid != null ? parseMiB(values.s) : null,
     };
   } catch {
     // No counter provider, no GPU, or the call timed out -- best-effort.
-    return { usedMib: null, processMib: null, processSharedMib: null };
+    return { usedMib: null, usedSharedMib: null, processMib: null, processSharedMib: null };
   }
 }
 
@@ -470,6 +506,28 @@ async function readAmdgpuFdinfoGtt(pid: number): Promise<GpuMemoryValue | null> 
   return readAmdgpuFdinfoDomain(pid, "drm-memory-gtt:");
 }
 
+// Whole-adapter GTT in use -- amdgpu's sysfs counterpart of the per-process
+// drm-memory-gtt fdinfo entries above, and of Windows' adapter-wide Shared
+// Usage. Same not-run-live posture as readAmdgpuSysfsVram below. Null when no
+// amdgpu card exposes the attribute (an NVIDIA or Intel box).
+async function readAmdgpuSysfsGttUsedMib(): Promise<number | null> {
+  try {
+    const entries = await readdir(DRM_CARD_DIR);
+    for (const entry of entries) {
+      if (!CARD_DIR_RE.test(entry)) continue;
+      try {
+        const bytes = Number((await readFile(`${DRM_CARD_DIR}/${entry}/device/mem_info_gtt_used`, "utf8")).trim());
+        if (Number.isFinite(bytes)) return Math.round(bytes / BYTES_PER_MIB);
+      } catch {
+        continue;
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 async function readAmdgpuSysfsVram(): Promise<VramSample | null> {
   try {
     const entries = await readdir(DRM_CARD_DIR);
@@ -628,11 +686,13 @@ async function readRocmGpuMemory(pid: number | undefined): Promise<GpuMemoryRead
     // this domain regardless of whether rocm-smi itself is installed.
     processSharedReading = (await readAmdgpuFdinfoGtt(pid)) ?? undefined;
   }
+  const usedSharedMib = await readAmdgpuSysfsGttUsedMib();
   return {
     total: reading(sample?.totalMib ?? null, "exact", "driver_reported_memory"),
     used: reading(sample?.usedMib ?? null, "high", "driver_reported_memory"),
     ...(processReading ? { process: processReading } : {}),
     ...(processSharedReading ? { processShared: processSharedReading } : {}),
+    ...(usedSharedMib != null ? { usedShared: reading(usedSharedMib, "high", "driver_reported_memory") } : {}),
   };
 }
 
