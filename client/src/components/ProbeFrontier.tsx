@@ -36,10 +36,10 @@ function tokens(value: number): string {
 }
 
 // The stored rows, in the vocabulary the ladder itself reasons in. A row's
-// kv_host_backed_frac is the tell for whether the CACHE placement was actually
-// judged: the context-axis check writes it, and writes nothing when it could
-// not run (no per-process VRAM reading, or no same-placement rung at a smaller
-// context to compare against).
+// gpu_in_system_ram_mib is the tell for whether its placement was measured at
+// all: the worker writes it whenever llama.cpp's buffer report and a
+// per-process VRAM reading both existed for that load. Rows from an older
+// worker never carry it, so their passes read as unmeasured.
 export function toLadderAttempts(rows: ProbeAttemptDto[]): LadderAttempt[] {
   return rows
     .filter((r) => r.ngl != null)
@@ -48,7 +48,7 @@ export function toLadderAttempts(rows: ProbeAttemptDto[]): LadderAttempt[] {
       ngl: r.ngl!,
       ok: r.ok === 1,
       hostBacked: failedForHostBackedLayers(r),
-      ctxVerdictMeasured: r.kv_host_backed_frac != null,
+      placementJudged: r.gpu_in_system_ram_mib != null,
     }));
 }
 
@@ -138,7 +138,7 @@ export function ProbeFrontier({ testId, refreshKey }: { testId: string; refreshK
               label: (item: { dataIndex: number; parsed: { y: number | null } }) => {
                 const stop = frontier[item.dataIndex];
                 if (!stop || stop.ngl == null) return "nothing fits at this context";
-                return `${stop.ngl} layers · ${stop.source}${stop.unverified ? " · cache placement unverified" : ""}`;
+                return `${stop.ngl} layers · ${stop.source}${stop.unverified ? " · placement not measured" : ""}`;
               },
             },
           },
@@ -213,7 +213,7 @@ export function ProbeFrontier({ testId, refreshKey }: { testId: string; refreshK
                     {stop.unverified && (
                       <span
                         className="ml-1.5 text-warning"
-                        title="This context loaded, but whether its cache stayed in VRAM was never measured on this worker -- treat it as an allocation ceiling only."
+                        title="This context loaded, but whether its memory stayed in VRAM was never measured on this worker -- treat it as an allocation ceiling only."
                       >
                         ⚠
                       </span>
@@ -225,8 +225,15 @@ export function ProbeFrontier({ testId, refreshKey }: { testId: string; refreshK
                   <td className="py-1 pr-3 tabular-nums text-muted">
                     {row?.vram_process_peak_mib != null ? `${Math.round(row.vram_process_peak_mib).toLocaleString()} MiB` : "—"}
                   </td>
-                  <td className="py-1 pr-3 tabular-nums text-muted">
-                    {row?.vram_shared_peak_mib != null ? `${Math.round(row.vram_shared_peak_mib).toLocaleString()} MiB` : "—"}
+                  <td
+                    className="py-1 pr-3 tabular-nums text-muted"
+                    title="What llama.cpp put on the GPU that this process's dedicated VRAM did not hold."
+                  >
+                    {row?.gpu_in_system_ram_mib == null
+                      ? "—"
+                      : row.gpu_in_system_ram_mib > (row.gpu_spill_jitter_mib ?? 0)
+                        ? `${Math.round(row.gpu_in_system_ram_mib).toLocaleString()} MiB`
+                        : "none"}
                   </td>
                   <td className="py-1 pr-3 tabular-nums text-muted">
                     {row?.gen_tps != null ? row.gen_tps.toFixed(1) : "—"}
@@ -240,8 +247,8 @@ export function ProbeFrontier({ testId, refreshKey }: { testId: string; refreshK
 
       {anyUnverified && (
         <p className="mt-2 text-[11px] leading-relaxed text-warning">
-          ⚠ Some stops rest on a load whose cache placement was never measured on this worker — the model loaded, but
-          the cache may be sitting in system RAM. Those contexts are allocation ceilings, not speeds.
+          ⚠ Some stops rest on a load whose memory placement was never measured on this worker — the model loaded, but
+          part of it may be sitting in system RAM. Those contexts are allocation ceilings, not speeds.
         </p>
       )}
     </div>

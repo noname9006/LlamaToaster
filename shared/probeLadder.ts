@@ -849,19 +849,15 @@ export interface LadderAttempt extends LadderRung {
    */
   hostBacked?: boolean;
   /**
-   * The CONTEXT-axis spill check actually produced a reading for this rung
-   * (detectHostBackedFallback returned a kvHostBackedFrac). A pass without one
-   * is not evidence that the cache landed in VRAM -- the check needs a
-   * per-process dedicated reading and a same-placement rung at a smaller
-   * context, and returns "unavailable" otherwise. The frontier search will not
-   * let such a pass IMPLY anything about stops it never measured; see
-   * resolveFrontier.
-   *
-   * Absent on rungs at the floor context, where there is nothing below to
-   * compare against and the cache is a rounding error anyway, and on every
-   * worker predating the field.
+   * Whether this rung's GPU memory placement was measured: llama.cpp's own
+   * buffer report held against a per-process dedicated VRAM reading
+   * (shared/gpuSpill.ts). A pass without it means "it loaded" and nothing about
+   * where the memory went -- a platform with no per-process VRAM reading, a
+   * build that printed no buffer sizes, or a row from an older worker. Neither
+   * the frontier nor bestLadderResult lets an unmeasured pass stand in for a
+   * measured one; see both.
    */
-  ctxVerdictMeasured?: boolean;
+  placementJudged?: boolean;
 }
 
 export interface LadderInput {
@@ -1032,12 +1028,31 @@ export function nextLadderRung(input: LadderInput): LadderRung | null {
 
 /**
  * The rung a probe should report as its verdict: the largest context that
- * passed, preferring the placement that achieved it.
+ * passed, preferring the placement that achieved it -- and, when any pass had
+ * its placement measured, only among measured passes.
+ *
+ * Without that preference "it loaded" became "verified": a frontier probe on a
+ * 10GiB RTX 3080 reported 262,144 tokens at 15 layers from a rung whose own
+ * estimate needed 10,225MiB, because nothing had measured where that memory
+ * went. Every rung measures its own placement where the platform allows it
+ * (shared/gpuSpill.ts), so on a platform that cannot, no pass is measured and
+ * the verdict is the largest pass exactly as before -- only labelled.
  */
 export function bestLadderResult(history: LadderAttempt[]): LadderAttempt | null {
+  return bestLadderEvidence(history)?.attempt ?? null;
+}
+
+/** bestLadderResult's pick, plus whether its placement was measured -- so a
+ * caller can label an unmeasured verdict instead of presenting it as verified. */
+export function bestLadderEvidence(
+  history: readonly LadderAttempt[]
+): { attempt: LadderAttempt; judged: boolean } | null {
   const passing = history.filter((h) => h.ok);
   if (passing.length === 0) return null;
-  return passing.reduce((best, h) => (h.ctx > best.ctx || (h.ctx === best.ctx && h.ngl > best.ngl) ? h : best));
+  const measured = passing.filter(placementMeasured);
+  const pool = measured.length > 0 ? measured : passing;
+  const attempt = pool.reduce((best, h) => (h.ctx > best.ctx || (h.ctx === best.ctx && h.ngl > best.ngl) ? h : best));
+  return { attempt, judged: placementMeasured(attempt) };
 }
 
 // --- The probe's ctx ladder + the client's OWN separate slider grid --------
@@ -1101,16 +1116,15 @@ export interface FrontierStop {
    * "unmeasured" -- still open when the budget ran out. */
   source: "measured" | "implied" | "unmeasured";
   /** The pass this rests on never had its CACHE placement judged (see
-   * LadderAttempt.ctxVerdictMeasured), so "it loaded" is all that is known --
+   * LadderAttempt.placementJudged), so "it loaded" is all that is known --
    * the cache may be sitting in system RAM. Display must say so. */
   unverified: boolean;
 }
 
-/** A rung at the floor context carries no cache worth judging, so it needs no
- * context-axis verdict to be trusted. Above the floor, a pass is only
- * trustworthy evidence when that check actually ran. */
-function ctxEvidenceTrusted(attempt: LadderAttempt, floorCtx: number): boolean {
-  return attempt.ctx <= floorCtx || attempt.ctxVerdictMeasured === true;
+/** A pass is only evidence that its memory stayed in VRAM when that was
+ * actually measured (LadderAttempt.placementJudged). */
+function placementMeasured(attempt: LadderAttempt): boolean {
+  return attempt.placementJudged === true;
 }
 
 /**
@@ -1128,7 +1142,6 @@ export function resolveFrontier(input: {
   nglMax: number;
 }): FrontierStop[] {
   const nglMax = Math.max(0, Math.floor(input.nglMax));
-  const floorCtx = input.stops.length > 0 ? input.stops[0] : PROBE_LADDER_MIN_CTX;
 
   return input.stops.map((ctx) => {
     // A pass carries DOWN the context axis, a failure carries UP it -- and a
@@ -1176,7 +1189,10 @@ export function resolveFrontier(input: {
       source,
       // Only a PASS can be untrustworthy this way: a failure is a failure
       // whatever the cache did.
-      unverified: resolved && pass != null && !nothingFits && !ctxEvidenceTrusted(pass, floorCtx),
+      // A measured pass at a larger context vouches for the same layer count
+      // here too, so any measured pass at this layer count will do.
+      unverified:
+        resolved && pass != null && !nothingFits && !passes.some((p) => p.ngl === ngl && placementMeasured(p)),
     };
   });
 }
@@ -1199,14 +1215,8 @@ export function resolveFrontier(input: {
  *     interval whose ends already match needs no load at all, because
  *     resolveFrontier has already settled everything inside it.
  *
- * Plus one rule that is about EVIDENCE rather than search order: a rung above
- * the floor is only judged for cache spill when a rung at the same layer count
- * and a smaller context exists to compare it against (shared/vramEstimate.ts's
- * context slope). So before testing a layer count anywhere above the floor,
- * test it at the floor -- one cheap load that both supplies that reference and
- * sharpens the floor's own boundary. Without it the detector returns
- * "unavailable" and a fully host-backed cache passes, which is the failure
- * this whole mode would otherwise inherit.
+ * Every rung measures its own spill (shared/gpuSpill.ts), so no load is spent
+ * buying a smaller-context reference for another rung to be compared against.
  */
 export function nextFrontierRung(input: {
   history: readonly LadderAttempt[];
@@ -1218,7 +1228,6 @@ export function nextFrontierRung(input: {
   const nglMax = Math.max(0, Math.floor(input.nglMax));
   const stops = ctxLadderStops(Math.max(PROBE_LADDER_MIN_CTX, Math.floor(input.maxCtx)));
   const frontier = resolveFrontier({ history: input.history, stops, nglMax });
-  const floorCtx = stops[0];
   const tried = new Set(input.history.map((h) => `${h.ctx}:${h.ngl}`));
 
   // Nothing loads even at the cheapest context: no stop above it can, and the
@@ -1238,13 +1247,6 @@ export function nextFrontierRung(input: {
     });
     if (candidate == null) continue;
 
-    // Reference-first: give the cache check something to measure against.
-    // Not for ngl 0 -- with nothing claimed on the GPU there is no placement to
-    // judge and detectHostBackedFallback bails out before it looks at any
-    // reference, so that load would buy nothing.
-    if (candidate > 0 && ctx > floorCtx && !input.history.some((h) => h.ngl === candidate && h.ctx < ctx)) {
-      if (!tried.has(`${floorCtx}:${candidate}`)) return { ctx: floorCtx, ngl: candidate };
-    }
     if (!tried.has(`${ctx}:${candidate}`)) return { ctx, ngl: candidate };
   }
   return null;

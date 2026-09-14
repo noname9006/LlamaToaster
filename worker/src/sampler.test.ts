@@ -221,3 +221,59 @@ describe("MemorySampler shared and claimed VRAM", () => {
     expect(stats.vram_process_claimed_peak_mib).toBeNull();
   });
 });
+
+// The dedicated readings shared/gpuSpill.ts holds llama.cpp's buffer report
+// against: only those taken once every buffer exists.
+describe("MemorySampler readings after the model loaded", () => {
+  beforeEach(() => {
+    mockMem.mockReset().mockResolvedValue({ active: 1024 * 1024 * 1024 });
+    mockProcesses.mockReset().mockResolvedValue({ list: [{ pid: TEST_PID, memRss: 2048 }] });
+    mockReadGpuSensors.mockReset().mockResolvedValue({ clockMhz: null, tempC: null, source: null });
+    mockReadGpuMemory.mockReset();
+  });
+
+  const reading = (dedicated: number): GpuMemoryReading => ({
+    total: wholeAdapter(8176),
+    used: wholeAdapter(dedicated + 1500),
+    process: process(dedicated),
+  });
+
+  function newSampler() {
+    const sampler = new MemorySampler();
+    (sampler as unknown as { pid: number; backend: string }).pid = TEST_PID;
+    (sampler as unknown as { pid: number; backend: string }).backend = "vulkan";
+    return sampler;
+  }
+
+  it("ignores readings taken while the model was still loading", async () => {
+    mockReadGpuMemory
+      .mockResolvedValueOnce(reading(1200))
+      .mockResolvedValueOnce(reading(2810))
+      .mockResolvedValueOnce(reading(2806));
+    const sampler = newSampler();
+    await sampler.sampleVramNow();
+    sampler.markLoaded();
+    await sampler.sampleVramNow();
+    await sampler.sampleVramNow();
+    expect(sampler.stats.vram_process_loaded_peak_mib).toBe(2810);
+    expect(sampler.stats.vram_process_loaded_jitter_mib).toBe(4);
+  });
+
+  it("reports nothing until a reading lands after markLoaded", async () => {
+    mockReadGpuMemory.mockResolvedValueOnce(reading(2810));
+    const sampler = newSampler();
+    await sampler.sampleVramNow();
+    sampler.markLoaded();
+    expect(sampler.stats.vram_process_loaded_peak_mib).toBeNull();
+    expect(sampler.stats.vram_process_loaded_jitter_mib).toBeNull();
+  });
+
+  it("gives a single loaded reading no movement", async () => {
+    mockReadGpuMemory.mockResolvedValueOnce(reading(4623));
+    const sampler = newSampler();
+    sampler.markLoaded();
+    await sampler.sampleVramNow();
+    expect(sampler.stats.vram_process_loaded_peak_mib).toBe(4623);
+    expect(sampler.stats.vram_process_loaded_jitter_mib).toBe(0);
+  });
+});

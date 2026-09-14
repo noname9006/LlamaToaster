@@ -219,50 +219,36 @@ layer's extreme-GQA value — an *underestimate* of every local layer.
 
 ---
 
-## 4. Interaction with the host-backed fallback check
+## 4. Interaction with the spill check
 
-The context axis and `detectHostBackedFallback` touch the same memory, so it is
-worth being explicit that they do not fight:
+The context axis and the spill check (`shared/gpuSpill.ts`) touch the same
+memory, so it is worth being explicit about how they meet:
 
-- A large context genuinely can push KV cache into system RAM, and it shows up
-  in the same `shared` counter that spilled weights do.
-- The detector's primary signal is a **slope**, not a level: how much
-  system-RAM-backed memory appears *per layer added*, in units of one layer of
-  this model. Overhead — including KV overhead from a big context — doesn't
-  scale with layer count; spilled weights do. So growing the context cannot
-  produce a spilling verdict, because the context isn't what's varying.
-- That comparison is only valid between rungs at the **same context**, which is
-  why the reference is restricted to same-context rungs. The layer phase pins
-  context while it searches, so its rungs are mutually comparable by
-  construction. A context phase (ngl fixed, ctx varying) takes the context
-  slope instead, against a same-layers rung at a smaller context, and reports
-  the share of the newly allocated memory that went to system RAM.
-- The two axes have different consequences. A layer-axis conviction **fails**
-  the rung, so the search backs off to a layer count that really fits — when
-  the dedicated-VRAM counter corroborates it, or at a context of at most 2,048
-  tokens. Above that, an uncorroborated conviction stays a warning: the shared
-  reading also holds host-placed cache and host overhead that grows with
-  context (571 MiB at 262,144 tokens with nothing on the GPU). A context-axis
-  spill judges the cache, not the weights: when more than 60% of what a larger
-  context added went to system RAM, that rung fails and the context search
-  bisects down to a context whose cache stays on the GPU. It used to be a
-  caveat only, since the probe's fixed ~512-token workload never reads a cache
-  that large — but that let an 8 GiB card "verify" 262,144 tokens with the
-  whole cache in system RAM. Both checks need the per-process dedicated-VRAM
-  reading. On Windows CUDA nvidia-smi reports it as `[N/A]` under WDDM, so the
-  worker reads Windows' own WDDM "GPU Process Memory" counter there instead
-  (`pickCudaProcessDedicatedMib`); where no source answers at all, the layer
-  check falls back to an uncorroborated warning and the context check cannot
-  run. When a rung's placement
-  was already measured at a smaller context but the context slope could not
-  run, the detector reports "unavailable" rather than falling to the bootstrap,
-  which would charge the cache against the weights.
-- The bootstrap judges shared usage against the rung's own *predicted
-  footprint*, which includes GPU-side KV. That is deliberate: measured on the
-  reference machine, 4 layers at a 131,072-token context reported 810 MiB
-  shared, which is 48% of that placement's weights but only 25% of its full
-  footprint. Denominated in weights alone it would be convicted; denominated in
-  the footprint it is correctly left alone.
+- A larger context allocates a larger KV cache and compute buffer on the GPU,
+  and on a driver that backs overflow with system RAM (Windows WDDM, amdgpu
+  GTT) part of that can land there without any error.
+- Every load is judged on its own, with no reference load and no estimate:
+  llama.cpp logs exactly how much it put on the GPU, and the OS reports how much
+  of the process sits in dedicated VRAM. Whatever VRAM does not hold is in
+  system RAM, and the load fails. The only tolerance is the VRAM counter's own
+  movement during that load.
+- What spilled decides what the search does next. When more is in system RAM
+  than the context's entire KV cache and compute buffer, the weights are
+  affected and no smaller context can fix it, so the context walk stops and the
+  next phase moves layers. So does any spill at the smallest context the probe
+  tries, where nothing smaller exists. Otherwise a smaller context can bring it
+  back, and the walk bisects down.
+- The driver does not wait for VRAM to run out. Measured on an 8 GiB RX 6600 XT
+  (Qwen3.6-35B-A3B, Vulkan, b10956): 828 MiB of 8 layers' buffers sat in system
+  RAM with half the card free, and at 262,144 tokens about 240 MiB of the
+  1,069 MiB compute buffer did at every layer count, including zero. On that
+  machine a 262,144-token context therefore fails at any placement.
+- Where there is no per-process VRAM reading (Metal), or the build printed no
+  buffer sizes, the load cannot be measured and passes on the old
+  estimate-based inference, which only ever warns.
+- Not yet confirmed on Windows CUDA, where the CUDA context may sit in
+  dedicated VRAM outside llama.cpp's buffers and hide a spill smaller than
+  itself.
 
 ---
 

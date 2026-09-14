@@ -234,87 +234,74 @@ starts from measurement instead of fantasy.
 ## 7. What decides a rung passed
 
 The load either allocated or it did not, and if it allocated, the driver either
-put it on the GPU or silently backed it with system RAM. Two counters, read as
-a pair, and not one speed measurement among them.
+put it on the GPU or silently backed part of it with system RAM. Not one speed
+measurement is involved.
 
-**Host-backed slope — primary evidence.** How much system-RAM-backed GPU memory
-appears per layer added, against a rung at least two layers below at the same
-context, in units of one layer's weights from the file. Overhead does not scale
-with layer count; spilled weights do. The two-layer span
-(`HOST_BACKED_MIN_SLOPE_SPAN`) is not conservatism — at one layer the driver's
-~224 MiB allocation granule appears and disappears between adjacent rungs, and
-a measured 42-setting sweep shows the clean and spilling regimes overlapping
-outright at that resolution.
+**The measured rule.** Every load carries two independent accounts of the same
+memory. llama.cpp logs exactly how much it put in each GPU buffer — weights, KV
+cache, recurrent state, compute, output. The OS reports how much of the process
+sits in dedicated VRAM (Windows WDDM "Dedicated Usage", amdgpu fdinfo,
+nvidia-smi). Whatever VRAM does not hold is being served from system RAM, and
+the rung fails (`shared/gpuSpill.ts`). There is no reference rung, no estimate
+and no tuned limit: the only tolerance is how far the dedicated counter moved
+across the readings taken once the model had loaded.
 
-**Resident slope — required second opinion.** The same interval read on the
-dedicated-VRAM counter: did the added layers show up *on the device*? On the
-calibration sweep it separates the two regimes wider than the host counter
-does, and the two agree on all nine measured intervals:
+Measured 14 Sep 2026 on the reference machine below, llama.cpp b10956:
 
-| interval | dedicated/layer | shared/layer | truth |
+| load | GPU buffers (MiB) | in VRAM | in system RAM |
 |---|---|---|---|
-| 2 → 4 | 1.05 | 0.00 | clean |
-| 4 → 6 | 0.96 | 0.00 | clean |
-| 6 → 8 | 0.74 | 0.25 | clean |
-| 8 → 10 | 0.20 | 0.76 | spilling |
-| 10 → 12 | −0.21 | 1.18 | spilling |
-| 12 → 14 | 0.18 | 0.78 | spilling |
-| 14 → 18 | −0.02 | 0.99 | spilling |
-| 18 → 26 | 0.06 | 0.91 | spilling |
-| 26 → 41 | 0.05 | 0.89 | spilling |
+| 1,024 tok, 0 layers | 275 | 280 | −5 (clean) |
+| 1,024 tok, 4 layers | 2,002 | 2,017 | −16 (clean) |
+| 1,024 tok, 8 layers | 3,635 | 2,806 | 828 |
+| 1,024 tok, 15 layers | 6,462 | 4,623 | 1,839 |
+| 262,144 tok, 0 layers | 1,069 | 822 | 247 |
+| 262,144 tok, 4 layers | 3,320 | 3,085 | 234 |
 
-Clean 0.74–1.05 against spilling −0.21–0.20: a gap of 0.54, where the shared
-counter's is 0.29. Both must agree before a rung is failed. Where they disagree
-the rung is left **undecided** (`abstained`) rather than convicted, and the
-caller falls through to its weaker evidence exactly as it does when no counter
-existed at all — because a false conviction fails a configuration that works
-and moves the reported boundary.
+A clean load holds every buffer plus a sliver of driver overhead. The rest of
+the process's overhead — 430–480 MiB there — lives in *shared* memory, which is
+why the shared counter on its own could never tell overhead from spill.
 
-**KV spill — the context axis's own rule.** The two counters above judge
-*weights*. A rung that grew the context instead is judged on what that growth
-allocated: the share of the newly allocated memory that landed in system RAM
-(`KV_HOST_BACKED_FAIL_FRAC`, 0.6). Above it the rung fails and the walk bisects
-down. It needs no corroboration gate — the weights are identical at both ends
-of the comparison and cancel out — but it does need a per-process dedicated
-reading and a same-placement rung at a smaller context. Where it cannot run it
-reports nothing, and a pass there means only "it allocated". Measured: context
-2,048 → 262,144 pushed 98% of the new allocation to host memory.
+**What spilled.** A spill larger than the context's entire KV cache and compute
+buffer means the weights are affected, so the rung is recorded as a layer
+failure and no smaller context is tried at that placement. So is any spill at
+the smallest context the probe tries, where there is nothing smaller to try. A
+smaller spill anywhere else is a cache failure, and the context walk bisects
+down.
 
-**Residency veto — bootstrap only.** When no valid reference exists, a single
-rung is judged against its own predicted footprint — and that numerator counts
-bytes that were never weights. On the reference run ngl 0 reported 571 MiB
-host-backed with *nothing* claimed on the GPU, so ngl 1 was charged that fixed
-cost against one layer and convicted at 0.95, while its dedicated VRAM had just
-grown by 401 MiB for a 420 MiB layer and its generation rate had gone up,
-9.1 → 10.3 tok/s. When the dedicated counter shows the predicted footprint
-largely did land (`HOST_BACKED_RESIDENT_ACQUIT_FRAC`, 0.70), no host-counter
-reading may convict.
+**The same load does not spill the same amount twice.** 8 layers at 1,024
+tokens put 828 MiB in system RAM in one run and 189 MiB in a later one on the
+same machine, while the counter itself moved by 2 MiB within the load. The
+driver's choice of what to demote depends on what else holds the card at the
+time. Detection held both times, but a rung close to the boundary can pass in
+one probe and fail in the next.
 
-### Two rules that were proposed and withdrawn
+**What it replaced.** An earlier detector judged spill by *slopes* — system RAM
+appearing per layer or per context step against a reference rung, with a
+bootstrap ratio when no reference existed, and later a 768 MiB cache allowance.
+The accounting showed it was systematically late: 15 layers had passed on the
+reference machine, llama.cpp's own report put 1.7 GiB of those buffers in
+system RAM at 1,024 tokens, and the real boundary sat between 4 and 8 layers. A
+slope only ever sees growth *above* its reference, and the reference was
+already spilling.
 
-A **pressure gate** — refusing to convict unless the GPU was actually full — is
-wrong on this hardware. The calibration sweep records ngl 26 spilling 7,647 MiB
-to host memory at 3.5 tok/s with the GPU **46% full**, and `growLayersPhase`'s
-own notes record the driver refusing weights with 1.9 GiB of VRAM free. The
-driver does not wait to run out, so "it ran out" cannot be a precondition.
+### Two things the accounting settled
 
-Admitting a **one-layer slope reference** guarded by a minimum delta does not
-work either: the granularity noise is large and positive, not small, so a
-genuinely clean pair can read +1.05 layers. Any threshold admitting the real
-cases admits that one too. The span stays at two, and the fix for rungs that
-fall through to the bootstrap belongs in the **search order**, which can
-guarantee a valid reference exists.
+The driver does not wait for VRAM to run out. 8 layers had 828 MiB in system
+RAM with the card half full, so "was the GPU full" cannot be a precondition.
 
-### Known gaps in the current implementation
+Part of a large compute buffer lands in system RAM with the GPU nearly empty:
+about 240 MiB of 1,069 MiB at 262,144 tokens, at 0 and 4 layers alike. It is a
+real spill and fails the rung, so on that machine 262,144 tokens is not a
+verified context at any placement.
 
-- The acquit threshold's margin is thin: spilling ngl 12 reads 0.62, clean
-  ngl 10 reads 0.77, the threshold sits at 0.70. It only ever acquits, which
-  bounds the damage.
-- No real measurement exercises the abstention branch — the two counters agree
-  on all nine measured intervals, so its test is constructed.
-- `residentSlopeRatio` and `abstained` are computed but not persisted, so a
-  rung that abstains renders as *slope 0.61 · passed* with nothing explaining
-  why. Needs a migration and a UI line.
+### Known gaps
+
+- Windows CUDA is unconfirmed. The CUDA context may land in dedicated VRAM
+  outside llama.cpp's buffers, pulling clean readings further below zero and
+  hiding a spill smaller than itself.
+- A load that cannot be measured — no per-process VRAM reading (Metal), or a
+  build that printed no buffer sizes — passes on the estimate-based inference,
+  which only warns.
 
 ---
 
@@ -358,11 +345,10 @@ cheap the whole curve costs the two ends, which is what max_gpu already spent.
 | Ceiling stop next | Together with the floor it brackets the curve; agreement proves it flat for free. |
 | Then the widest remaining step | Each remaining load goes where the curve actually bends. A span whose ends already agree needs none. |
 
-**Reference-first.** Before testing a layer count anywhere above the floor, it
-is tested AT the floor. The KV rule in §7 needs a same-placement rung at a
-smaller context, and without one a host-backed cache passes silently. That
-doubles the loads per candidate and is the price of a verdict that means
-something; ngl 0 is exempt, since nothing is claimed on the GPU to judge.
+**No reference loads.** Every rung measures its own placement (§7), so no load
+is spent buying a smaller-context twin for another rung to be compared against.
+An earlier version tested every candidate at the floor first, doubling the
+loads per candidate, because the slope-based rule it served needed one.
 
 **What the estimate is allowed to do.** Pick the seed, inside the bracket the
 neighbours imply — nothing more. `estimateSafeNgl` does not vary with context
@@ -371,7 +357,7 @@ just failed; bounding it is what keeps the walk from wandering.
 
 **Honesty of the output.** Every stop carries how it was decided — `measured`,
 `implied`, or `unmeasured` when the budget ran out — and a stop resting on a
-pass whose cache placement was never judged is flagged `unverified` rather than
+pass whose memory placement was never measured is flagged `unverified` rather than
 presented as a boundary. Rates shown beside a stop are empty-cache figures
 (§1), and are labelled as such in the UI.
 
@@ -383,6 +369,6 @@ presented as a boundary. Rates shown beside a stop are empty-cache figures
 262,144 trained context) on a Radeon RX 6600 XT, 8 GiB, Vulkan, llama.cpp
 b10819. Per-layer weight ~422 MiB, derived from the run's own reported slopes.
 
-The 11-point calibration sweep quoted in §7 is the earlier one recorded at the
-top of `shared/vramEstimate.ts` and reproduced as a fixture in
-`shared/vramEstimate.test.ts`.
+The spill measurements quoted in §7 were taken on the same card and model with
+llama.cpp b10956 on 14 Sep 2026; all twelve are fixtures in
+`shared/gpuSpill.test.ts`.

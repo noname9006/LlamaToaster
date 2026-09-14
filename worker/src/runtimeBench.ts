@@ -11,13 +11,8 @@ import { spawn, type ChildProcess } from "node:child_process";
 import type { IngestResultInput, ProbeAttemptReport } from "../../shared/types.js";
 import { CURVE_METHOD_VERSION, SERVER_METHOD_VERSION, type CaveatFlag } from "../../shared/types.js";
 import type { SweepItem } from "../../shared/sweep.js";
-import {
-  detectHostBackedFallback,
-  isVramDiscrepancy,
-  KV_HOST_BACKED_FAIL_FRAC,
-  type HostBackedFallbackVerdict,
-  type HostBackedRungSample,
-} from "../../shared/vramEstimate.js";
+import { isVramDiscrepancy } from "../../shared/vramEstimate.js";
+import { measureGpuSpill, UNMEASURED_GPU_SPILL, type GpuBufferReport, type GpuSpillVerdict } from "../../shared/gpuSpill.js";
 import {
   appendBoundedOutput,
   collapseTensorLoadSpam,
@@ -711,35 +706,28 @@ export interface ProbeAttemptOutcome {
    * this exact (candidateCtx, ngl) point (see worker/src/index.ts's
    * findDedupMatch). Names the sibling run it came from. */
   reusedFromRunId?: string | null;
-  /** True when this rung's observed VRAM peak came in far below what
-   * computeDualPoolFit predicted the requested ngl needs -- the same
-   * silent-sysmem-fallback signature shared/vramEstimate.ts's top comment
-   * documents (confirmed on both NVIDIA/CUDA and AMD/Vulkan): llama.cpp's
-   * "offloaded X/Y" claim only reflects buffer assignment, never residency,
-   * and the OS can back an oversubscribed allocation with system RAM instead
-   * of erroring. Set by probeSucceeded below, which also FAILS the rung when
-   * the flag came from a measured layer-axis conviction strong enough to fail
-   * on (see HOST_BACKED_FAIL_MAX_UNCORROBORATED_CTX and
-   * failedForHostBackedLayers); an inferred, abstained or weaker flag stays a
-   * warning on a passing attempt. worker/src/index.ts's describeProbeVramDiscrepancy
-   * attaches the explanation either way. vramDiscrepancyPolicy's retry/fail
-   * escalation still never applies here -- that is the sweep path's. */
+  /** True when this rung's GPU memory was not all in VRAM: MEASURED when
+   * probeSucceeded could hold llama.cpp's buffer report against a per-process
+   * dedicated reading (gpuInSystemRamMib is set, and the rung failed), else
+   * INFERRED from an observed VRAM peak far below computeDualPoolFit's
+   * prediction, which only ever warns. worker/src/index.ts's
+   * describeProbeVramDiscrepancy explains the inferred case.
+   * vramDiscrepancyPolicy's retry/fail escalation never applies here -- that is
+   * the sweep path's. */
   vramDiscrepancy?: boolean;
-  /** detectHostBackedFallback's own figures, when this platform HAS a
-   * system-RAM-backed-GPU-memory counter: which evidence decided ("slope"
-   * against a comparable lower-ngl rung, or the single-rung "ratio"
-   * bootstrap), the measured layers-of-system-RAM per layer added, and how
-   * many of this rung's layers that accounts for. Null/absent when the check
-   * couldn't run -- which is also how a caller tells a MEASURED
-   * vramDiscrepancy (hostBackedMethod is set) from an INFERRED one
-   * (it is null and isVramDiscrepancy fired). */
-  hostBackedMethod?: "slope" | "ratio" | null;
-  hostBackedSlopeRatio?: number | null;
-  hostBackedSpilledLayers?: number | null;
-  /** CONTEXT axis only: the share of this context's newly allocated memory
-   * that the OS put in system RAM. Above KV_HOST_BACKED_FAIL_FRAC the rung
-   * fails (see probeSucceeded); below it, this is reported only. */
-  kvHostBackedFrac?: number | null;
+  /** The measured spill (shared/gpuSpill.ts): every buffer llama.cpp reported
+   * putting on the GPU, how much of it this process's dedicated VRAM did not
+   * hold once loaded (negative when VRAM holds more -- the normal clean
+   * reading), and how far those dedicated readings moved. All null when the
+   * spill could not be measured. */
+  gpuBuffersMib?: number | null;
+  gpuInSystemRamMib?: number | null;
+  gpuSpillJitterMib?: number | null;
+  /** Which spill failed this rung: its LAYERS (more in system RAM than the
+   * context's whole KV cache and compute buffer, so no smaller context fixes
+   * it) or its context's buffers. Null on a pass and on every other kind of
+   * failure. */
+  hostBackedFailCause?: "layers" | "cache" | null;
   /** Prompt-processing rate for this rung, from llama-server's own
    * timings.prompt_n / prompt_ms. Reported per rung because prefill has its
    * OWN placement cliff, several layers below the weights one -- see
@@ -782,8 +770,9 @@ export interface ProbeAttemptOutcome {
  * was never about the configuration being judged.
  *
  * What actually distinguishes a usable placement from a thrashing one is
- * measured directly now -- detectHostBackedFallback sees the weights sitting
- * in system RAM rather than inferring it from the symptom. A rung that
+ * measured directly now -- probeSucceeded holds llama.cpp's own GPU buffer
+ * report against the process's dedicated VRAM rather than inferring a
+ * fallback from the symptom. A rung that
  * generates nothing at all still fails below; a rung that generates slowly is
  * reported with its rate and left to the caller.
  */
@@ -796,132 +785,74 @@ export { PROBE_GEN_TOKENS, PROBE_PROMPT_TOKENS } from "../../shared/probeLadder.
 // context is. Only the per-rung success rule below stayed behind, because it
 // is about one load's verdict rather than about the search.
 
-/**
- * The largest context at which a host-backed conviction may fail a rung
- * WITHOUT the dedicated-VRAM counter corroborating it.
- *
- * A corroborated conviction -- a layer slope where the dedicated counter also
- * says the added layers did not land -- fails at any context. Everything else
- * rests on the shared counter alone, whose reading at a large context is not
- * only weights: KV cache the driver placed in host memory is in it, and so is
- * host-side overhead that grows with context whatever is on the GPU (571MiB
- * measured at 262144 tokens with ngl 0, against 28MiB at 1024). The bootstrap
- * divides that whole reading by the rung's footprint, and every spilling rung
- * it was calibrated on was measured at the floor context; above it, the one
- * clean large-context rung it would have convicted (ngl 1 at 262144, whose
- * generation rate went UP when the layer was added) was only saved by the
- * dedicated-counter veto.
- *
- * That veto is missing wherever no per-process dedicated reading exists.
- * Windows CUDA used to be one such place -- nvidia-smi reports "[N/A]" per
- * process under WDDM -- until vram.ts's readCudaGpuMemory started falling back
- * to WDDM's own per-process Dedicated Usage counter there. The
- * floor and one doubling above it cover both layer searches max_gpu runs (its
- * layer phase at the floor, its back-off at the next stop), where context adds
- * nothing the shared counter could mistake for weights. Above that an
- * uncorroborated conviction stays a warning, exactly as before.
- */
-export const HOST_BACKED_FAIL_MAX_UNCORROBORATED_CTX = PROBE_LADDER_MIN_CTX * 2;
-
 // A probe's own success rule, kept next to the ladder that consumes it: no
-// OOM, no spill (vram_peak within total), some generation, and neither the
-// weights nor most of a context's cache MEASURABLY served from system RAM.
+// OOM, no spill past the adapter total, some generation, and nothing llama.cpp
+// put on the GPU being served from system RAM instead.
 //
-// That last rule is what stops a silently oversubscribed placement from
-// passing. On a driver that backs an overcommitted allocation with system RAM
-// instead of erroring (Windows WDDM's CUDA sysmem fallback, amdgpu GTT) none
-// of the other three can ever fire: nothing OOMs, dedicated VRAM never passes
-// the adapter total because the overflow lands in SHARED memory, and the load
-// still generates, just slowly. Observed live: max_gpu on a 10GiB RTX 3080
-// "verified" every layer of a model several GiB larger than the card.
+// That last rule is the one a silently oversubscribed placement meets. On a
+// driver that backs an overcommitted allocation with system RAM instead of
+// erroring (Windows WDDM on any vendor, amdgpu GTT) none of the other three can
+// fire: nothing OOMs, dedicated VRAM never passes the adapter total because the
+// overflow lands in shared memory, and the load still generates. Observed live:
+// max_gpu on a 10GiB RTX 3080 "verified" every layer of a model several GiB
+// larger than the card. It is measured by holding llama.cpp's own buffer report
+// against this process's dedicated VRAM -- no reference load, no estimate, no
+// tuned limit; see shared/gpuSpill.ts.
 //
-// Only a CONVICTION fails, never the weaker evidence: detectHostBackedFallback
-// returning hostBacked:true. An abstained verdict and the estimate-only
-// inference below stay a warning on a passing rung. The inference in
-// particular cannot tell a real fallback from a pessimistic estimate, and
-// failing on it is what 926ab8c backed out.
-//
-// The context axis has its own rule: a larger context fails when most of what
-// it ADDED landed in system RAM (KV_HOST_BACKED_FAIL_FRAC). That reading is
-// measured against a smaller context at the same layer count, so it needs no
-// corroboration gate -- the weights are the same at both ends and cancel out.
-//
-// And not every conviction either -- see HOST_BACKED_FAIL_MAX_UNCORROBORATED_CTX
-// for which ones are strong enough to fail on.
-//
-// Two signals feed the vramDiscrepancy flag, in strict preference order:
-//
-//  1. detectHostBackedFallback -- the OS's own per-process counter for
-//     system-RAM-backed GPU memory. A MEASUREMENT of where the weights went.
-//     Whenever it is available, it decides, and #2 is not consulted: an
-//     inference is strictly worse evidence than a reading of the same fact.
-//  2. isVramDiscrepancy -- the pre-existing needed-vs-observed inference, for
-//     platforms with no such counter (CUDA-on-Linux, Metal). Now fed the
-//     PER-PROCESS VRAM peak rather than the whole-adapter one, which was
-//     crediting a single model's offload with every other process's VRAM and
-//     biasing the check toward "no fallback" by however much the desktop
-//     happened to be using.
-//
-// The practical effect of #1 is that a merely-pessimistic ESTIMATE can never
-// fail a rung: with no measured system-RAM backing, there is nothing to
-// corroborate the shortfall and the rung stands.
+// Where that cannot be measured (no per-process VRAM reading, as on Metal, or a
+// build that printed no buffer sizes) the older needed-vs-observed inference
+// still runs, and only ever warns: it cannot tell a real fallback from an
+// estimate that was merely pessimistic, and failing on it is what 926ab8c
+// backed out.
 export function probeSucceeded(input: {
   oom: boolean;
+  // WHOLE-ADAPTER VRAM peak, every process combined -- read only by the
+  // adapter-total rule below, which is a statement about the device.
   vramPeakMib: number | null;
   gpuTotalMib: number | null;
   genTps: number | null;
-  // The rung's requested layer count and computeDualPoolFit's own predicted
-  // GPU need for it (estimateProbeMemoryNeed's vramMib) -- both null-safe:
-  // ngl<=0 or a missing estimate simply never flags a discrepancy (nothing to
-  // compare against).
+  // The rung's requested layer count and computeDualPoolFit's predicted GPU
+  // need for it: the inference's inputs, consulted only when the spill could
+  // not be measured. ngl<=0 or a missing estimate never infers anything.
   ngl: number;
   estimatedVramMib: number | null;
-  /** This rung's context. Needed to pick a comparable reference: a layer
-   * slope compares rungs at the same context, a context slope compares rungs
-   * at the same layer count. */
-  ctx?: number;
-  // MEASURED, per-process, both from MemorySampler: this load's own dedicated
-  // VRAM peak and its own system-RAM-backed GPU allocation peak. The former
-  // is what the ratio check below is supposed to compare against -- vramPeakMib
-  // is WHOLE-ADAPTER (every process on the GPU combined, see its own doc
-  // comment), so measuring one model's weights against it silently credits
-  // the rung with the desktop's VRAM and biases the check toward "no
-  // fallback". Null when the platform/backend never attributed a reading to
-  // this pid (see ProbeAttemptOutcome.vramProcessPeakMib).
+  // This process's own dedicated VRAM peak over the whole load, for that same
+  // inference. Null when the platform never attributed a reading to this pid.
   vramProcessPeakMib?: number | null;
-  sharedPeakMib?: number | null;
-  // The model file's own size divided by its layer count -- see
-  // HostBackedFallbackInput.perLayerMib for why this is a fact from disk
-  // rather than an estimate.
-  perLayerMib?: number | null;
-  // Every rung already measured in this run. The host-backed check picks its
-  // own comparison from them -- a same-context rung for the layer slope, a
-  // same-layers rung for the context slope. Empty (or absent) falls back to
-  // the single-rung bootstrap.
-  prior?: HostBackedRungSample[];
+  // The measured rule's two sides: llama.cpp's report of what it put on the
+  // GPU (bench.ts's parseGpuBufferReport), and this process's dedicated VRAM
+  // once the model had loaded, with how far those readings moved
+  // (MemorySampler's vram_process_loaded_*).
+  gpuBuffers?: GpuBufferReport | null;
+  loadedDedicatedMib?: number | null;
+  loadedDedicatedJitterMib?: number | null;
+  // This rung already runs at the smallest context the probe ever tries, so no
+  // smaller context can fix a spill (see GpuSpillInput.atSmallestContext).
+  atSmallestContext?: boolean;
 }): {
   ok: boolean;
   spill: boolean;
   vramDiscrepancy: boolean;
-  hostBacked: HostBackedFallbackVerdict;
+  gpuSpill: GpuSpillVerdict;
+  /** Which spill failed the rung, if one did -- see ProbeAttemptOutcome.hostBackedFailCause. */
+  failCause: "layers" | "cache" | null;
   reason: string | null;
 } {
-  const noFallback: HostBackedFallbackVerdict = {
-    hostBacked: false,
-    axis: null,
-    kvHostBackedFrac: null,
-    method: null,
-    slopeRatio: null,
-    residentSlopeRatio: null,
-    spilledLayers: null,
-    abstained: false,
-  };
   if (input.oom) {
-    return { ok: false, spill: false, vramDiscrepancy: false, hostBacked: noFallback, reason: "out of memory at this context" };
+    return {
+      ok: false,
+      spill: false,
+      vramDiscrepancy: false,
+      gpuSpill: UNMEASURED_GPU_SPILL,
+      failCause: null,
+      reason: "out of memory at this context",
+    };
   }
   // Still the whole-adapter reading, and deliberately so: "spilled past the
   // adapter's VRAM total" is a statement about the DEVICE, not about this
-  // process's share of it.
+  // process's share of it. It never fires under Windows WDDM, whose whole
+  // behaviour is to back oversubscription with shared memory rather than push
+  // dedicated past the adapter total -- which is why the measured rule exists.
   const spill =
     input.vramPeakMib != null && input.gpuTotalMib != null && input.vramPeakMib > input.gpuTotalMib;
   if (spill) {
@@ -929,40 +860,27 @@ export function probeSucceeded(input: {
       ok: false,
       spill: true,
       vramDiscrepancy: false,
-      hostBacked: noFallback,
+      gpuSpill: UNMEASURED_GPU_SPILL,
+      failCause: null,
       reason: "the allocation spilled past this adapter's VRAM total",
     };
   }
-  // The direct measurement first: when the OS can tell us how much system RAM
-  // is backing this process's GPU memory, an inference from the estimate is
-  // strictly worse evidence and is not consulted at all.
-  const hostBacked =
-    input.ngl > 0
-      ? detectHostBackedFallback({
-          rung: {
-            ngl: input.ngl,
-            ctx: input.ctx,
-            sharedPeakMib: input.sharedPeakMib ?? null,
-            dedicatedPeakMib: input.vramProcessPeakMib ?? null,
-            estimatedGpuMib: input.estimatedVramMib,
-          },
-          prior: input.prior ?? [],
-          perLayerMib: input.perLayerMib ?? null,
-        })
-      : noFallback;
-  // Per-process where available -- whole-adapter only as a last resort, since
-  // that reading includes every other process on the GPU.
+  const gpuSpill = measureGpuSpill({
+    buffers: input.gpuBuffers ?? null,
+    dedicatedMib: input.loadedDedicatedMib ?? null,
+    dedicatedJitterMib: input.loadedDedicatedJitterMib ?? null,
+    atSmallestContext: input.atSmallestContext,
+  });
+  // A measurement decides whenever one exists; the inference is strictly worse
+  // evidence of the same fact. Per-process where available -- the whole-adapter
+  // reading credits the rung with every other process's VRAM.
   const observedMib = input.vramProcessPeakMib ?? input.vramPeakMib;
-  // An abstained verdict counts as no verdict here: the measured check could
-  // not decide, so the weaker estimate-based inference gets its say exactly as
-  // it does when no counter existed at all.
-  const vramDiscrepancy =
-    hostBacked.hostBacked ||
-    ((hostBacked.method == null || hostBacked.abstained) &&
-      input.ngl > 0 &&
+  const vramDiscrepancy = gpuSpill.measured
+    ? gpuSpill.spilled
+    : input.ngl > 0 &&
       input.estimatedVramMib != null &&
       observedMib != null &&
-      isVramDiscrepancy(input.estimatedVramMib, observedMib));
+      isVramDiscrepancy(input.estimatedVramMib, observedMib);
   // "Generated nothing measurable" is still a failure -- that is not a slow
   // configuration, it is one that did not work. Any positive rate passes.
   if (input.genTps == null) {
@@ -970,70 +888,48 @@ export function probeSucceeded(input: {
       ok: false,
       spill: false,
       vramDiscrepancy,
-      hostBacked,
+      gpuSpill,
+      failCause: null,
       reason: "the model loaded but produced no measurable generation",
     };
   }
-  // Checked after the generation rule on purpose, so a rung failing here always
-  // generated something -- failedForHostBackedLayers leans on exactly that to
-  // recover the reason from stored fields alone.
-  const corroborated = hostBacked.method === "slope" && hostBacked.residentSlopeRatio != null;
-  const contextNegligible = input.ctx != null && input.ctx <= HOST_BACKED_FAIL_MAX_UNCORROBORATED_CTX;
-  if (hostBacked.hostBacked && (corroborated || contextNegligible)) {
+  if (gpuSpill.spilled && gpuSpill.inSystemRamMib != null && input.gpuBuffers) {
+    const contextMib = Math.round(input.gpuBuffers.contextMib);
+    const beyondContext = gpuSpill.inSystemRamMib - (gpuSpill.jitterMib ?? 0) > input.gpuBuffers.contextMib;
+    const consequence =
+      gpuSpill.cause === "cache"
+        ? `no more than this context's KV cache and compute buffer (${contextMib}MiB), so a smaller context can ` +
+          `bring it back into VRAM`
+        : beyondContext
+          ? `more than this context's entire KV cache and compute buffer (${contextMib}MiB), so the model's layers ` +
+            `are in system RAM and no smaller context fixes it`
+          : `and this is already the smallest context the probe tries, so only fewer layers can bring it back into VRAM`;
     return {
       ok: false,
       spill: false,
       vramDiscrepancy,
-      hostBacked,
-      reason: "the model's layers are being served from system RAM, not VRAM",
-    };
-  }
-  // The context-axis counterpart: this rung's weights were already judged at a
-  // smaller context, and most of what the larger context added went to system
-  // RAM. Not a host-backed failure for the ladder -- a smaller context CAN fix
-  // this, so the context walk keeps bisecting down.
-  if (
-    hostBacked.axis === "ctx" &&
-    hostBacked.kvHostBackedFrac != null &&
-    hostBacked.kvHostBackedFrac > KV_HOST_BACKED_FAIL_FRAC
-  ) {
-    return {
-      ok: false,
-      spill: false,
-      vramDiscrepancy,
-      hostBacked,
+      gpuSpill,
+      failCause: gpuSpill.cause,
       reason:
-        `this context's KV cache is being served from system RAM, not VRAM: ` +
-        `${Math.round(hostBacked.kvHostBackedFrac * 100)}% of the memory it added went to system RAM`,
+        `${Math.round(gpuSpill.inSystemRamMib)}MiB of the ${Math.round(input.gpuBuffers.deviceMib)}MiB llama.cpp ` +
+        `put on the GPU is being served from system RAM, not VRAM -- ${consequence}`,
     };
   }
-  return { ok: true, spill: false, vramDiscrepancy, hostBacked, reason: null };
+  return { ok: true, spill: false, vramDiscrepancy, gpuSpill, failCause: null, reason: null };
 }
 
 /**
- * Did this rung fail BECAUSE its layers were measurably host-backed, as
- * opposed to not fitting at all?
+ * Did this rung fail BECAUSE its layers were in system RAM, as opposed to its
+ * context's buffers, or not fitting at all?
  *
  * The ladder needs the distinction (LadderAttempt.hostBacked): a smaller
  * context cannot rescue a placement whose weights are in system RAM, so a
- * context phase stops walking on the first one. Derived from the outcome's
- * stored fields rather than a dedicated flag so a rung reused from a batch
- * sibling (which only carries what probe_attempts stores) answers the same
- * way as one measured here. probeSucceeded's rule order is what makes it
- * exact: the only failure that can leave a rung with generation, no OOM, no
- * adapter spill and a MEASURED discrepancy is the host-backed one.
+ * context phase stops walking on the first one -- while a context-sized spill
+ * is exactly what a smaller context fixes. Read from the cause probeSucceeded
+ * recorded, which a rung reused from a batch sibling carries too.
  */
-export function failedForHostBackedLayers(
-  attempt: Pick<ProbeAttemptOutcome, "ok" | "oom" | "spill" | "genTps" | "vramDiscrepancy" | "hostBackedMethod">
-): boolean {
-  return (
-    !attempt.ok &&
-    !attempt.oom &&
-    !attempt.spill &&
-    attempt.genTps != null &&
-    attempt.vramDiscrepancy === true &&
-    attempt.hostBackedMethod != null
-  );
+export function failedForHostBackedLayers(attempt: Pick<ProbeAttemptOutcome, "ok" | "hostBackedFailCause">): boolean {
+  return !attempt.ok && attempt.hostBackedFailCause === "layers";
 }
 
 // Shared BenchResult shaping so both runtime paths report through
@@ -1090,12 +986,13 @@ export function toProbeAttemptReport(attempt: ProbeAttemptOutcome): ProbeAttempt
     vram_shared_peak_mib: attempt.vramSharedPeakMib,
     vram_shared_total_peak_mib: attempt.vramSharedTotalPeakMib,
     vram_claimed_peak_mib: attempt.vramClaimedPeakMib,
-    kv_host_backed_frac: attempt.kvHostBackedFrac,
+    gpu_buffers_mib: attempt.gpuBuffersMib,
+    gpu_in_system_ram_mib: attempt.gpuInSystemRamMib,
+    gpu_spill_jitter_mib: attempt.gpuSpillJitterMib,
+    host_backed_fail: attempt.hostBackedFailCause,
     pp_tps: attempt.ppTps,
     ttft_ms: attempt.ttftMs,
     prefill_cliff: attempt.prefillCliff,
-    host_backed_method: attempt.hostBackedMethod,
-    host_backed_slope: attempt.hostBackedSlopeRatio,
     error: attempt.error,
     reused_from_run_id: attempt.reusedFromRunId,
     vram_discrepancy: attempt.vramDiscrepancy,

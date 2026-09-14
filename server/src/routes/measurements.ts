@@ -155,6 +155,15 @@ function validateOneProbeAttempt(raw: unknown, label: string): ProbeAttemptRepor
       ? a.host_backed_slope
       : null,
     kv_host_backed_frac: optionalNonNegative(a.kv_host_backed_frac, `${label}.kv_host_backed_frac`),
+    gpu_buffers_mib: optionalNonNegative(a.gpu_buffers_mib, `${label}.gpu_buffers_mib`),
+    // Signed on purpose: a clean load reads below zero (VRAM holds more than
+    // llama.cpp's buffers), so this cannot share the non-negative validator.
+    gpu_in_system_ram_mib:
+      typeof a.gpu_in_system_ram_mib === "number" && Number.isFinite(a.gpu_in_system_ram_mib)
+        ? a.gpu_in_system_ram_mib
+        : null,
+    gpu_spill_jitter_mib: optionalNonNegative(a.gpu_spill_jitter_mib, `${label}.gpu_spill_jitter_mib`),
+    host_backed_fail: a.host_backed_fail === "layers" || a.host_backed_fail === "cache" ? a.host_backed_fail : null,
     error: typeof a.error === "string" ? a.error : undefined,
     // N2 batch dedup -- the worker only ever echoes back a source_run_id the
     // server itself handed it via GET .../probe-dedup, so a plain type check
@@ -414,6 +423,11 @@ export async function measurementRoutes(app: FastifyInstance): Promise<void> {
           row.host_backed_method === "slope" || row.host_backed_method === "ratio" ? row.host_backed_method : null,
         host_backed_slope: row.host_backed_slope,
         kv_host_backed_frac: row.kv_host_backed_frac,
+        gpu_buffers_mib: row.gpu_buffers_mib,
+        gpu_in_system_ram_mib: row.gpu_in_system_ram_mib,
+        gpu_spill_jitter_mib: row.gpu_spill_jitter_mib,
+        host_backed_fail:
+          row.host_backed_fail === "layers" || row.host_backed_fail === "cache" ? row.host_backed_fail : null,
         vram_discrepancy: row.vram_discrepancy === 1,
         gpu_layers_resident_est: row.gpu_layers_resident_est,
         gpu_layers_resident_exact: row.gpu_layers_resident_exact === 1,

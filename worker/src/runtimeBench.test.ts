@@ -277,428 +277,167 @@ describe("N5 knee ladder execution", () => {
 // shared/probeLadder.test.ts); what stays here is the per-rung verdict, which
 // is about one load rather than about the search.
 describe("N2 probe success rule", () => {
+  const base = { oom: false, vramPeakMib: 7000, gpuTotalMib: 8176, genTps: 11, estimatedVramMib: null };
+
   // The 1 tok/s floor is gone. It rejected a placement on a rate measured over
   // PROBE_EXERCISED_TOKENS -- a number that describes ~512 tokens of context
   // and not the configuration in the row -- while the thing it was proxying
-  // for (weights served from system RAM) is now measured directly.
+  // for (GPU memory served from system RAM) is now measured directly.
   it("no longer fails a slow load: a rate is reported, not judged", () => {
-    const slow = probeSucceeded({
-      oom: false,
-      vramPeakMib: 7000,
-      gpuTotalMib: 8192,
-      genTps: 0.4,
-      ngl: 0,
-      estimatedVramMib: null,
-    });
-    expect(slow.ok).toBe(true);
+    expect(probeSucceeded({ ...base, genTps: 0.4, ngl: 0 }).ok).toBe(true);
   });
 
   it("still fails a load that generated nothing measurable", () => {
-    const dead = probeSucceeded({
-      oom: false,
-      vramPeakMib: 7000,
-      gpuTotalMib: 8192,
-      genTps: null,
-      ngl: 0,
-      estimatedVramMib: null,
-    });
+    const dead = probeSucceeded({ ...base, genTps: null, ngl: 0 });
     expect(dead.ok).toBe(false);
     expect(dead.reason).toContain("no measurable generation");
   });
 
   it("treats a spill past the adapter total as failure", () => {
-    const spilled = probeSucceeded({
-      oom: false,
-      vramPeakMib: 9000,
-      gpuTotalMib: 8192,
-      genTps: 30,
-      ngl: 0,
-      estimatedVramMib: null,
-    });
-    expect(spilled).toMatchObject({ ok: false, spill: true });
+    expect(probeSucceeded({ ...base, vramPeakMib: 9000, gpuTotalMib: 8192, ngl: 0 })).toMatchObject({ ok: false, spill: true });
   });
 
-  it("passes a clean load above the floor", () => {
-    expect(
-      probeSucceeded({ oom: false, vramPeakMib: 7000, gpuTotalMib: 8192, genTps: 30, ngl: 0, estimatedVramMib: null })
-    ).toMatchObject({
+  it("passes a clean load", () => {
+    expect(probeSucceeded({ ...base, ngl: 0 })).toMatchObject({
       ok: true,
       spill: false,
       vramDiscrepancy: false,
+      failCause: null,
       reason: null,
     });
   });
 
-  // The real case this exists for: a full-VRAM-oversubscribed load whose
-  // generation speed still clears the (deliberately low) tok/s floor because
-  // the OS quietly backed the overcommit with system RAM instead of erroring
-  // -- confirmed live on an AMD RX 6600 XT (8GB, Vulkan backend) loading a
-  // 35B MoE model at full offload: gen tok/s stayed above the floor and VRAM
-  // peak never exceeded the card's total, so neither the genTps nor the spill
-  // check caught it, yet the estimate (needing far more than the card has)
-  // was right and the load was really running from host RAM. `ok` itself does
-  // NOT flip here: with no shared-memory counter this is only an INFERENCE
-  // from the estimate, which cannot tell a real fallback from a pessimistic
-  // estimate, so it stays a warning.
-  it("flags a VRAM discrepancy when observed peak is far below the estimate for a real offload", () => {
-    const result = probeSucceeded({
-      oom: false,
-      vramPeakMib: 6544,
-      gpuTotalMib: 8192,
-      genTps: 6.8,
-      ngl: 41,
-      estimatedVramMib: 27435,
-    });
-    expect(result.vramDiscrepancy).toBe(true);
-    expect(result.ok).toBe(true);
-  });
+  // Real loads, 2026-09-14: Qwen3.6-35B-A3B-UD-IQ4_NL on a Radeon RX 6600 XT,
+  // Vulkan, b10956 -- llama.cpp's own buffer report against the process's
+  // dedicated VRAM once loaded (see shared/gpuSpill.test.ts for all twelve).
+  describe("measured GPU spill", () => {
+    const eightLayers = { gpuBuffers: { deviceMib: 3634.7, contextMib: 215.51 }, loadedDedicatedMib: 2806.27 };
 
-  // The measured signal, from the calibration sweep's own numbers: at ngl 26
-  // this machine reported 7647MiB of llama-server's GPU memory backed by
-  // system RAM while only 3736MiB was really in VRAM. Note the whole-adapter
-  // peak (5872MiB, which is what the old check compared against) put this
-  // rung at 0.507 of its estimate -- just over the 0.5 ratio, so it PASSED,
-  // and the probe went on to report it as the machine's best configuration.
-  // It generated 3.54 tok/s; ngl 10 on the same box generated 12.05.
-  it("fails a measured host-backed fallback that the whole-adapter ratio check passed", () => {
-    const result = probeSucceeded({
-      oom: false,
-      vramPeakMib: 5872,
-      gpuTotalMib: 8176,
-      genTps: 3.54,
-      ngl: 26,
-      estimatedVramMib: 11577,
-      vramProcessPeakMib: 3736,
-      sharedPeakMib: 7647,
-      perLayerMib: 17205 / 41,
-      ctx: 1024,
-      prior: [{ ngl: 10, ctx: 1024, sharedPeakMib: 1279, dedicatedPeakMib: 3610 }],
-    });
-    expect(result.vramDiscrepancy).toBe(true);
-    expect(result.hostBacked).toMatchObject({ hostBacked: true, method: "slope" });
-    expect(result.hostBacked.spilledLayers).toBeGreaterThan(10);
-    // A measured conviction fails the rung, so the ladder backs off instead of
-    // reporting this as the machine's best placement. It still generated, and
-    // the reason says why it failed rather than claiming it did not fit.
-    expect(result.ok).toBe(false);
-    expect(result.spill).toBe(false);
-    expect(result.reason).toContain("system RAM");
-  });
-
-  // Probe 4b588fa2, 2026-09-13: max_gpu "verified" all 31 layers of a 26B-A4B
-  // MoE on a 10GiB RTX 3080 -- nothing OOMed, dedicated VRAM never passed the
-  // adapter total, and it still generated, so the only rule that can see it is
-  // the measured one. Figures shaped like the calibration sweep's ngl 41 rung.
-  it("fails a full-offload opening rung whose weights are mostly in system RAM", () => {
-    const result = probeSucceeded({
-      oom: false,
-      vramPeakMib: 9800,
-      gpuTotalMib: 10240,
-      genTps: 4.1,
-      ngl: 31,
-      estimatedVramMib: 17000,
-      vramProcessPeakMib: 8900,
-      sharedPeakMib: 7400,
-      perLayerMib: 16000 / 31,
-      ctx: 1024,
-      prior: [],
-    });
-    expect(result.hostBacked).toMatchObject({ hostBacked: true, method: "ratio" });
-    expect(result.ok).toBe(false);
-  });
-
-  // The two counters disagreeing is "could not decide", never a conviction:
-  // failing on it is exactly the false-positive the second opinion exists for.
-  it("does not fail a rung the measured check abstained on", () => {
-    const perLayer = 17205 / 41;
-    const result = probeSucceeded({
-      oom: false,
-      vramPeakMib: 5000,
-      gpuTotalMib: 8176,
-      genTps: 12.2,
-      ngl: 6,
-      estimatedVramMib: 3100,
-      vramProcessPeakMib: 2822,
-      sharedPeakMib: 427 + 2 * perLayer,
-      perLayerMib: perLayer,
-      ctx: 1024,
-      prior: [{ ngl: 4, ctx: 1024, sharedPeakMib: 427, dedicatedPeakMib: 2014 }],
-    });
-    expect(result.hostBacked.abstained).toBe(true);
-    expect(result.ok).toBe(true);
-  });
-
-  // Probe 124c2ab1: 262144 tokens "verified" on an 8GiB RX 6600 XT with the
-  // whole cache in system RAM. A context whose cache is mostly host-backed
-  // fails, so the context search bisects down to one that fits.
-  it("fails a context whose cache went to system RAM", () => {
-    const result = probeSucceeded({
-      oom: false,
-      vramPeakMib: 6000,
-      gpuTotalMib: 8176,
-      genTps: 11.9,
-      ngl: 10,
-      estimatedVramMib: 9847,
-      vramProcessPeakMib: 4502,
-      sharedPeakMib: 9000,
-      perLayerMib: 17205 / 41,
-      ctx: 262144,
-      prior: [{ ngl: 10, ctx: 2048, sharedPeakMib: 1699, dedicatedPeakMib: 4458, estimatedGpuMib: 4800 }],
-    });
-    expect(result.hostBacked.axis).toBe("ctx");
-    expect(result.hostBacked.kvHostBackedFrac!).toBeGreaterThan(0.9);
-    expect(result.ok).toBe(false);
-    expect(result.spill).toBe(false);
-    // Not a layer failure: a smaller context can fix this, so the ladder must
-    // keep walking context rather than stopping as it does for spilled layers.
-    expect(result.vramDiscrepancy).toBe(false);
-    expect(result.reason).toContain("KV cache");
-  });
-
-  // ...while a comfortable context, whose cache only partly landed in system
-  // RAM, still passes. Measured: ngl 4 at 131072 on the calibration machine,
-  // dedicated +379MiB and shared +383MiB over the 1024-token load.
-  it("passes a context whose cache only partly went to system RAM", () => {
-    const result = probeSucceeded({
-      oom: false,
-      vramPeakMib: 4793,
-      gpuTotalMib: 8176,
-      genTps: 11.38,
-      ngl: 4,
-      estimatedVramMib: 3276,
-      vramProcessPeakMib: 2393,
-      sharedPeakMib: 810,
-      perLayerMib: 17205 / 41,
-      ctx: 131072,
-      prior: [{ ngl: 4, ctx: 1024, sharedPeakMib: 427, dedicatedPeakMib: 2014, estimatedGpuMib: 2322 }],
-    });
-    expect(result.hostBacked.axis).toBe("ctx");
-    expect(result.hostBacked.kvHostBackedFrac!).toBeCloseTo(0.5, 1);
-    expect(result.ok).toBe(true);
-  });
-
-  // Rule order: "generated nothing" wins, so a host-backed failure always has
-  // a generation rate -- which is what lets failedForHostBackedLayers read the
-  // reason back off stored fields.
-  it("reports no generation, not a layer spill, when a convicted rung also generated nothing", () => {
-    const result = probeSucceeded({
-      oom: false,
-      vramPeakMib: 9800,
-      gpuTotalMib: 10240,
-      genTps: null,
-      ngl: 31,
-      estimatedVramMib: 17000,
-      vramProcessPeakMib: 8900,
-      sharedPeakMib: 7400,
-      perLayerMib: 16000 / 31,
-      ctx: 1024,
-      prior: [],
-    });
-    expect(result.hostBacked.hostBacked).toBe(true);
-    expect(result.reason).toContain("no measurable generation");
-  });
-
-  // Which convictions are strong enough to fail on -- see
-  // HOST_BACKED_FAIL_MAX_UNCORROBORATED_CTX.
-  describe("conviction strength", () => {
-    const PER_LAYER = 17205 / 41;
-    const base = { oom: false, vramPeakMib: 6000, gpuTotalMib: 8176, genTps: 9.1, perLayerMib: PER_LAYER };
-
-    // The measured false conviction: ngl 1 at 262144 read 953MiB shared -- mostly
-    // context-scaled host overhead -- against a 1446MiB footprint, and its
-    // generation rate rose when the layer was added. With no dedicated reading
-    // (any platform where no per-process VRAM counter was attributed) nothing
-    // vetoes it.
-    it("keeps an uncorroborated bootstrap conviction at a large context as a warning", () => {
+    it("passes a load whose GPU buffers are all in VRAM", () => {
       const result = probeSucceeded({
-        ...base, ngl: 1, ctx: 262144, estimatedVramMib: 1446, vramProcessPeakMib: null, sharedPeakMib: 953, prior: [],
+        ...base, ngl: 4, gpuBuffers: { deviceMib: 2001.57, contextMib: 263.01 }, loadedDedicatedMib: 2017.33,
+        loadedDedicatedJitterMib: 3,
       });
-      expect(result.hostBacked).toMatchObject({ hostBacked: true, method: "ratio" });
-      expect(result.vramDiscrepancy).toBe(true);
-      expect(result.ok).toBe(true);
+      expect(result).toMatchObject({ ok: true, vramDiscrepancy: false, failCause: null });
+      expect(result.gpuSpill).toMatchObject({ measured: true, spilled: false });
     });
 
-    // The same kind of evidence at the floor is what max_gpu's layer phase runs
-    // on, and what the bootstrap's spilling calibration was measured at.
-    it.each([1024, 2048])("fails an uncorroborated bootstrap conviction at context %i", (ctx) => {
+    // 828MiB of the buffers missing from VRAM at 1,024 tokens, with half the
+    // card free -- the driver does not wait for VRAM to run out.
+    it("fails a load with its layers in system RAM, and says no smaller context fixes it", () => {
+      const result = probeSucceeded({ ...base, ngl: 8, ...eightLayers, loadedDedicatedJitterMib: 12 });
+      expect(result).toMatchObject({ ok: false, spill: false, vramDiscrepancy: true, failCause: "layers" });
+      expect(result.reason).toContain("828MiB of the 3635MiB");
+      expect(result.reason).toContain("no smaller context fixes it");
+    });
+
+    // 234MiB of a 1,069MiB compute buffer in system RAM at 262,144 tokens.
+    it("fails a context-sized spill as the cache's, so the search tries a smaller context", () => {
       const result = probeSucceeded({
-        ...base, ngl: 26, ctx, estimatedVramMib: 11210, vramProcessPeakMib: null, sharedPeakMib: 7647, prior: [],
+        ...base, ngl: 4, gpuBuffers: { deviceMib: 3319.56, contextMib: 1581 }, loadedDedicatedMib: 3085.23,
+        loadedDedicatedJitterMib: 0,
       });
-      expect(result.hostBacked).toMatchObject({ hostBacked: true, method: "ratio" });
-      expect(result.ok).toBe(false);
+      expect(result).toMatchObject({ ok: false, failCause: "cache" });
+      expect(result.reason).toContain("a smaller context can bring it back");
     });
 
-    it("fails a shared-only slope conviction at the floor context", () => {
+    it("measures a load with no layers on the GPU too", () => {
       const result = probeSucceeded({
-        ...base, ngl: 26, ctx: 1024, estimatedVramMib: 11210, vramProcessPeakMib: null, sharedPeakMib: 7647,
-        prior: [{ ngl: 10, ctx: 1024, sharedPeakMib: 1279, dedicatedPeakMib: null }],
+        ...base, ngl: 0, gpuBuffers: { deviceMib: 1069, contextMib: 1069 }, loadedDedicatedMib: 822.35,
+        loadedDedicatedJitterMib: 0,
       });
-      expect(result.hostBacked).toMatchObject({ hostBacked: true, method: "slope", residentSlopeRatio: null });
-      expect(result.ok).toBe(false);
+      expect(result).toMatchObject({ ok: false, failCause: "cache" });
     });
 
-    it("keeps a shared-only slope conviction at a large context as a warning", () => {
-      const result = probeSucceeded({
-        ...base, ngl: 26, ctx: 131072, estimatedVramMib: 14000, vramProcessPeakMib: null, sharedPeakMib: 7647,
-        prior: [{ ngl: 10, ctx: 131072, sharedPeakMib: 1279, dedicatedPeakMib: null }],
-      });
-      expect(result.hostBacked).toMatchObject({ hostBacked: true, method: "slope" });
-      expect(result.ok).toBe(true);
-    });
-
-    // Both counters agreeing is a measurement of the weights themselves, so it
-    // needs no help from the context being small.
-    it("fails a corroborated slope conviction at any context", () => {
-      const result = probeSucceeded({
-        ...base, ngl: 26, ctx: 131072, estimatedVramMib: 14000, vramProcessPeakMib: 3736, sharedPeakMib: 7647,
-        prior: [{ ngl: 10, ctx: 131072, sharedPeakMib: 1279, dedicatedPeakMib: 3610 }],
-      });
-      expect(result.hostBacked.residentSlopeRatio).not.toBeNull();
-      expect(result.ok).toBe(false);
-    });
-
-    // Measured on Windows CUDA (GeForce MX150, llama.cpp b10952, -c 65536): ngl
-    // 36 -> 42 added 283MiB on CUDA0, of which dedicated took 2MiB and shared
-    // 280MiB, and generation fell 22.5 -> 13.8 tok/s. With WDDM's per-process
-    // Dedicated Usage read for CUDA the conviction is corroborated and fails;
-    // without it (nvidia-smi's [N/A] alone) the same rung only warned.
-    describe("Windows CUDA spill at a large context", () => {
-      const cuda = {
-        oom: false, vramPeakMib: 1949, gpuTotalMib: 2048, genTps: 13.8, perLayerMib: 1007 / 49,
-        ngl: 42, ctx: 65536, estimatedVramMib: 2310, sharedPeakMib: 414,
+    // A rerun of 8 layers at 1,024 tokens spilled only 189MiB -- less than that
+    // context's own buffers -- but no smaller context exists to try.
+    it("files a spill at the smallest context under the layers, and says why", () => {
+      const rerun = {
+        ...base, ngl: 8, gpuBuffers: { deviceMib: 3634.7, contextMib: 215.51 }, loadedDedicatedMib: 3446,
+        loadedDedicatedJitterMib: 2,
       };
-
-      it("fails once the dedicated counter corroborates it", () => {
-        const result = probeSucceeded({
-          ...cuda, vramProcessPeakMib: 1949,
-          prior: [{ ngl: 36, ctx: 65536, sharedPeakMib: 134, dedicatedPeakMib: 1947 }],
-        });
-        expect(result.hostBacked).toMatchObject({ hostBacked: true, method: "slope", abstained: false });
-        expect(result.hostBacked.residentSlopeRatio!).toBeLessThan(0.1);
-        expect(result.ok).toBe(false);
-      });
-
-      it("only warns when no dedicated reading was attributed", () => {
-        const result = probeSucceeded({
-          ...cuda, vramProcessPeakMib: null,
-          prior: [{ ngl: 36, ctx: 65536, sharedPeakMib: 134, dedicatedPeakMib: null }],
-        });
-        expect(result.hostBacked).toMatchObject({ hostBacked: true, method: "slope", residentSlopeRatio: null });
-        expect(result.ok).toBe(true);
-      });
+      expect(probeSucceeded(rerun).failCause).toBe("cache");
+      const atFloor = probeSucceeded({ ...rerun, atSmallestContext: true });
+      expect(atFloor).toMatchObject({ ok: false, failCause: "layers" });
+      expect(atFloor.reason).toContain("smallest context");
+      expect(atFloor.reason).not.toContain("more than this context's entire");
     });
 
-    it("keeps an uncorroborated conviction as a warning when the context is unknown", () => {
+    it("does not call a difference the counter itself could not resolve a spill", () => {
       const result = probeSucceeded({
-        ...base, ngl: 26, estimatedVramMib: 11210, vramProcessPeakMib: null, sharedPeakMib: 7647, prior: [],
+        ...base, ngl: 4, gpuBuffers: { deviceMib: 2000, contextMib: 263 }, loadedDedicatedMib: 1980,
+        loadedDedicatedJitterMib: 40,
       });
-      expect(result.hostBacked.hostBacked).toBe(true);
       expect(result.ok).toBe(true);
     });
-  });
 
-  // The false positive the measured signal exists to prevent: 4 layers at a
-  // 131072-token context. Dedicated VRAM came in below the estimate (2393 vs
-  // ~3082MiB), so an inference from the estimate alone would convict it --
-  // but only 810MiB was system-RAM-backed, which is the same flat overhead
-  // band every clean rung showed. It ran at 11.38 tok/s, among the fastest
-  // configurations measured on this machine.
-  it("does NOT flag a merely-pessimistic estimate when nothing is measurably in system RAM", () => {
-    const result = probeSucceeded({
-      oom: false,
-      vramPeakMib: 4793,
-      gpuTotalMib: 8176,
-      genTps: 11.38,
-      ngl: 4,
-      estimatedVramMib: 3082,
-      vramProcessPeakMib: 2393,
-      sharedPeakMib: 810,
-      perLayerMib: 17205 / 41,
-      // Same context, fewer layers -- the reference the layer slope needs.
-      ctx: 131072,
-      prior: [{ ngl: 2, ctx: 131072, sharedPeakMib: 806, dedicatedPeakMib: 1200 }],
+    it("does not consult the estimate once the spill was measured", () => {
+      const result = probeSucceeded({
+        ...base, ngl: 26, estimatedVramMib: 27000, vramProcessPeakMib: 2017,
+        gpuBuffers: { deviceMib: 2001.57, contextMib: 263.01 }, loadedDedicatedMib: 2017.33, loadedDedicatedJitterMib: 0,
+      });
+      expect(result).toMatchObject({ ok: true, vramDiscrepancy: false });
     });
-    expect(result.vramDiscrepancy).toBe(false);
-    expect(result.ok).toBe(true);
-  });
 
-  // Same rung, same numbers, on a platform with no shared-memory counter
-  // (CUDA-on-Linux, Metal): the inference is all there is, so it still runs.
-  it("falls back to the estimate inference when no shared-memory counter exists", () => {
-    const result = probeSucceeded({
-      oom: false,
-      vramPeakMib: 5872,
-      gpuTotalMib: 8176,
-      genTps: 3.54,
-      ngl: 26,
-      estimatedVramMib: 11577,
-      vramProcessPeakMib: 3736,
-      sharedPeakMib: null,
-      perLayerMib: 17205 / 41,
+    // Rule order: "generated nothing" wins, so a spill failure always generated.
+    it("reports no generation, not a spill, when a spilled load also generated nothing", () => {
+      const result = probeSucceeded({ ...base, genTps: null, ngl: 8, ...eightLayers, loadedDedicatedJitterMib: 0 });
+      expect(result.gpuSpill.spilled).toBe(true);
+      expect(result).toMatchObject({ ok: false, failCause: null });
+      expect(result.reason).toContain("no measurable generation");
     });
-    expect(result.vramDiscrepancy).toBe(true);
-    expect(result.hostBacked.method).toBeNull();
-    // An inference alone never fails a rung -- only a measurement does.
-    expect(result.ok).toBe(true);
   });
 
-  // The per-process half of the fix, in isolation: 3736/11577 = 0.32 (flagged)
-  // vs the whole-adapter 5872/11577 = 0.507 (not flagged). The difference is
-  // the ~2100MiB the desktop was holding on the same GPU.
-  it("measures the ratio against this process's VRAM, not every process on the adapter", () => {
-    const shared = { oom: false, gpuTotalMib: 8176, genTps: 3.54, ngl: 26, estimatedVramMib: 11577, sharedPeakMib: null };
-    expect(probeSucceeded({ ...shared, vramPeakMib: 5872, vramProcessPeakMib: 3736 }).vramDiscrepancy).toBe(true);
-    expect(probeSucceeded({ ...shared, vramPeakMib: 5872, vramProcessPeakMib: null }).vramDiscrepancy).toBe(false);
-  });
-
-  it("does not flag a discrepancy when ngl is 0 (nothing was requested on GPU)", () => {
-    const result = probeSucceeded({
-      oom: false,
-      vramPeakMib: 1791,
-      gpuTotalMib: 8192,
-      genTps: 8.7,
-      ngl: 0,
-      estimatedVramMib: 22315,
+  describe("where the spill cannot be measured", () => {
+    it.each([
+      ["no buffer report", { gpuBuffers: null, loadedDedicatedMib: 2000 }],
+      ["no per-process VRAM reading", { gpuBuffers: { deviceMib: 3634.7, contextMib: 215.51 }, loadedDedicatedMib: null }],
+      ["nothing placed on a GPU", { gpuBuffers: { deviceMib: 0, contextMib: 0 }, loadedDedicatedMib: 0 }],
+    ])("stays unmeasured with %s, and passes", (_label, spill) => {
+      const result = probeSucceeded({ ...base, ngl: 8, ...spill });
+      expect(result.gpuSpill.measured).toBe(false);
+      expect(result.ok).toBe(true);
     });
-    expect(result.vramDiscrepancy).toBe(false);
+
+    // A 35B MoE at full offload on an 8GiB card, with no measurement available:
+    // the estimate needs far more than the card has, but an estimate cannot tell
+    // a real fallback from a pessimistic one, so this stays a warning.
+    it("flags an inferred discrepancy as a warning only", () => {
+      const result = probeSucceeded({ ...base, vramPeakMib: 6544, gpuTotalMib: 8192, genTps: 6.8, ngl: 41, estimatedVramMib: 27435 });
+      expect(result).toMatchObject({ ok: true, vramDiscrepancy: true });
+      expect(result.gpuSpill.measured).toBe(false);
+    });
+
+    // 3736/11577 = 0.32 (flagged) against the whole-adapter 5872/11577 = 0.507
+    // (not flagged): the difference is the ~2100MiB the desktop held.
+    it("infers against this process's VRAM, not every process on the adapter", () => {
+      const shared = { oom: false, gpuTotalMib: 8176, genTps: 3.54, ngl: 26, estimatedVramMib: 11577 };
+      expect(probeSucceeded({ ...shared, vramPeakMib: 5872, vramProcessPeakMib: 3736 }).vramDiscrepancy).toBe(true);
+      expect(probeSucceeded({ ...shared, vramPeakMib: 5872, vramProcessPeakMib: null }).vramDiscrepancy).toBe(false);
+    });
+
+    it("infers nothing when ngl is 0", () => {
+      expect(probeSucceeded({ ...base, vramPeakMib: 1791, gpuTotalMib: 8192, ngl: 0, estimatedVramMib: 22315 }).vramDiscrepancy).toBe(false);
+    });
   });
 });
 
-// The ladder's "why did it fail" signal, read back off an outcome's stored
-// fields so a rung reused from a batch sibling answers the same way.
+// The ladder's "why did it fail" signal, read back off a stored outcome so a
+// rung reused from a batch sibling answers the same way.
 describe("failedForHostBackedLayers", () => {
-  const convicted = {
-    ok: false, oom: false, spill: false, genTps: 4.1, vramDiscrepancy: true, hostBackedMethod: "slope" as const,
-  };
-
-  it("recognises a rung failed for measured host-backed layers", () => {
-    expect(failedForHostBackedLayers(convicted)).toBe(true);
-    expect(failedForHostBackedLayers({ ...convicted, hostBackedMethod: "ratio" })).toBe(true);
+  it("is true only for a failure probeSucceeded filed under the layers", () => {
+    expect(failedForHostBackedLayers({ ok: false, hostBackedFailCause: "layers" })).toBe(true);
+    expect(failedForHostBackedLayers({ ok: false, hostBackedFailCause: "cache" })).toBe(false);
+    expect(failedForHostBackedLayers({ ok: false, hostBackedFailCause: null })).toBe(false);
+    expect(failedForHostBackedLayers({ ok: true, hostBackedFailCause: "layers" })).toBe(false);
   });
 
-  it("agrees with probeSucceeded on the rung it actually failed", () => {
+  it("agrees with probeSucceeded on the rung it failed", () => {
     const result = probeSucceeded({
-      oom: false, vramPeakMib: 5872, gpuTotalMib: 8176, genTps: 3.54, ngl: 26, estimatedVramMib: 11577,
-      vramProcessPeakMib: 3736, sharedPeakMib: 7647, perLayerMib: 17205 / 41, ctx: 1024,
-      prior: [{ ngl: 10, ctx: 1024, sharedPeakMib: 1279, dedicatedPeakMib: 3610 }],
+      oom: false, vramPeakMib: 4322, gpuTotalMib: 8176, genTps: 11.8, ngl: 8, estimatedVramMib: null,
+      gpuBuffers: { deviceMib: 3634.7, contextMib: 215.51 }, loadedDedicatedMib: 2806.27, loadedDedicatedJitterMib: 0,
     });
-    expect(
-      failedForHostBackedLayers({
-        ok: result.ok, oom: false, spill: result.spill, genTps: 3.54,
-        vramDiscrepancy: result.vramDiscrepancy, hostBackedMethod: result.hostBacked.method,
-      })
-    ).toBe(true);
-  });
-
-  it.each([
-    ["a passing rung with a warning", { ...convicted, ok: true }],
-    ["an OOM", { ...convicted, oom: true, genTps: null }],
-    ["a spill past the adapter total", { ...convicted, spill: true }],
-    ["a rung that generated nothing", { ...convicted, genTps: null }],
-    ["an inferred discrepancy (no shared-memory counter)", { ...convicted, hostBackedMethod: null }],
-    ["a failure with no discrepancy at all", { ...convicted, vramDiscrepancy: false }],
-  ])("does not claim %s", (_label, attempt) => {
-    expect(failedForHostBackedLayers(attempt)).toBe(false);
+    expect(failedForHostBackedLayers({ ok: result.ok, hostBackedFailCause: result.failCause })).toBe(true);
   });
 });
 
@@ -1042,8 +781,10 @@ describe("toProbeAttemptReport", () => {
     ppTps: 18.9,
     ttftMs: 9389,
     prefillCliff: true,
-    hostBackedMethod: "slope" as const,
-    hostBackedSlopeRatio: 0.92,
+    gpuBuffersMib: 6462.03,
+    gpuInSystemRamMib: -15.76,
+    gpuSpillJitterMib: 4,
+    hostBackedFailCause: null,
     vramDiscrepancy: false,
     gpuLayersResidentEst: 13,
     gpuLayersResidentExact: true,
@@ -1064,8 +805,9 @@ describe("toProbeAttemptReport", () => {
       pp_tps: 18.9,
       ttft_ms: 9389,
       prefill_cliff: true,
-      host_backed_method: "slope",
-      host_backed_slope: 0.92,
+      gpu_buffers_mib: 6462.03,
+      gpu_in_system_ram_mib: -15.76,
+      gpu_spill_jitter_mib: 4,
       gpu_layers_resident_est: 13,
       gpu_layers_resident_exact: true,
     };
@@ -1076,10 +818,10 @@ describe("toProbeAttemptReport", () => {
 
   it("passes nulls through as nulls rather than dropping the keys", () => {
     const report = toProbeAttemptReport({
-      ...outcome, ppTps: null, ttftMs: null, hostBackedSlopeRatio: null,
+      ...outcome, ppTps: null, ttftMs: null, gpuInSystemRamMib: null,
     }) as unknown as Record<string, unknown>;
     expect("pp_tps" in report).toBe(true);
     expect(report.pp_tps).toBeNull();
-    expect(report.host_backed_slope).toBeNull();
+    expect(report.gpu_in_system_ram_mib).toBeNull();
   });
 });
