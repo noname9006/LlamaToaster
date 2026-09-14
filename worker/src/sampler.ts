@@ -46,6 +46,14 @@ export interface SampleStats {
   vram_process_shared_avg_mib: number | null;
   vram_process_shared_accuracy: GpuMemoryAccuracyLevel;
   vram_process_shared_source: GpuMemoryMeasurementSource | null;
+  // Whole-adapter system-RAM-backed GPU memory -- every process on the card
+  // combined (vram.ts's GpuMemoryReading.usedShared). The shared-memory
+  // counterpart of vram_total_used_*. Null wherever no such counter is read
+  // (only Windows CUDA today), never a false "0 spilled".
+  vram_total_shared_peak_mib: number | null;
+  vram_total_shared_avg_mib: number | null;
+  vram_total_shared_accuracy: GpuMemoryAccuracyLevel;
+  vram_total_shared_source: GpuMemoryMeasurementSource | null;
   vram_peak_accuracy: GpuMemoryAccuracyLevel;
   vram_peak_source: GpuMemoryMeasurementSource | null;
   vram_avg_accuracy: GpuMemoryAccuracyLevel;
@@ -187,6 +195,14 @@ export class MemorySampler {
   private vramProcessSharedMeasured = false;
   private vramProcessSharedWorstAccuracy: GpuMemoryAccuracyLevel = "exact";
   private vramProcessSharedWorstSource: GpuMemoryMeasurementSource | null = null;
+  // Whole-adapter system-RAM-backed GPU memory (every process combined) --
+  // same tracking shape as vramTotal* above.
+  private vramTotalSharedPeakBytes = 0;
+  private vramTotalSharedSumBytes = 0;
+  private vramTotalSharedSampleCount = 0;
+  private vramTotalSharedMeasured = false;
+  private vramTotalSharedWorstAccuracy: GpuMemoryAccuracyLevel = "exact";
+  private vramTotalSharedWorstSource: GpuMemoryMeasurementSource | null = null;
   // M6 -- clock/temp samples, on the same tick as VRAM.
   private sensors = new SensorSampleBuffer();
 
@@ -226,6 +242,12 @@ export class MemorySampler {
     this.vramProcessSharedMeasured = false;
     this.vramProcessSharedWorstAccuracy = "exact";
     this.vramProcessSharedWorstSource = null;
+    this.vramTotalSharedPeakBytes = 0;
+    this.vramTotalSharedSumBytes = 0;
+    this.vramTotalSharedSampleCount = 0;
+    this.vramTotalSharedMeasured = false;
+    this.vramTotalSharedWorstAccuracy = "exact";
+    this.vramTotalSharedWorstSource = null;
     this.sensors.reset();
     this.sample();
     this.timer = setInterval(() => this.sample(), intervalMs);
@@ -297,6 +319,15 @@ export class MemorySampler {
           : null,
       vram_process_shared_accuracy: processSharedAccuracy,
       vram_process_shared_source: processSharedSource,
+      vram_total_shared_peak_mib: this.vramTotalSharedMeasured
+        ? Math.round(this.vramTotalSharedPeakBytes / BYTES_PER_MIB)
+        : null,
+      vram_total_shared_avg_mib:
+        this.vramTotalSharedMeasured && this.vramTotalSharedSampleCount > 0
+          ? Math.round(this.vramTotalSharedSumBytes / this.vramTotalSharedSampleCount / BYTES_PER_MIB)
+          : null,
+      vram_total_shared_accuracy: this.vramTotalSharedMeasured ? this.vramTotalSharedWorstAccuracy : "unavailable",
+      vram_total_shared_source: this.vramTotalSharedMeasured ? this.vramTotalSharedWorstSource : null,
       vram_peak_accuracy: accuracy,
       vram_peak_source: source,
       vram_avg_accuracy: accuracy,
@@ -352,7 +383,21 @@ export class MemorySampler {
       if (!dueForVram) return;
 
       try {
-        const { used, process: processUsed, processShared } = await readGpuMemory(this.backend, this.pid);
+        const { used, usedShared, process: processUsed, processShared } = await readGpuMemory(this.backend, this.pid);
+        // Whole-adapter shared memory -- absent (not null) wherever the
+        // backend never reads it (see GpuMemoryReading.usedShared), in which
+        // case this stream simply doesn't grow.
+        if (usedShared?.mib != null) {
+          const totalSharedBytes = usedShared.mib * BYTES_PER_MIB;
+          this.vramTotalSharedMeasured = true;
+          if (totalSharedBytes > this.vramTotalSharedPeakBytes) this.vramTotalSharedPeakBytes = totalSharedBytes;
+          this.vramTotalSharedSumBytes += totalSharedBytes;
+          this.vramTotalSharedSampleCount++;
+          if (ACCURACY_RANK[usedShared.accuracy] > ACCURACY_RANK[this.vramTotalSharedWorstAccuracy]) {
+            this.vramTotalSharedWorstAccuracy = usedShared.accuracy;
+            this.vramTotalSharedWorstSource = usedShared.source;
+          }
+        }
         // used.mib === null means "couldn't measure" (missing tool/driver/
         // permission, or the cpu backend's unconditional short-circuit); 0
         // is a legitimate reading and must still count.

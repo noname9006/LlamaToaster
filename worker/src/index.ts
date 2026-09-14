@@ -1255,6 +1255,8 @@ function formatMemoryLines(stats: SampleStats, baseline: FreeMemoryBaseline): st
   if (stats.vram_total_used_peak_mib != null) vramParts.push(`used_peak=${stats.vram_total_used_peak_mib}MiB`);
   if (stats.vram_process_avg_mib != null) vramParts.push(`proc_avg=${stats.vram_process_avg_mib}MiB`);
   if (stats.vram_process_peak_mib != null) vramParts.push(`proc_peak=${stats.vram_process_peak_mib}MiB`);
+  if (stats.vram_total_shared_peak_mib != null) vramParts.push(`shared_used_peak=${stats.vram_total_shared_peak_mib}MiB`);
+  if (stats.vram_process_shared_peak_mib != null) vramParts.push(`proc_shared_peak=${stats.vram_process_shared_peak_mib}MiB`);
   if (vramParts.length === 0) return [ramLine, "vram: unavailable"];
   const accuracy = stats.vram_peak_mib != null ? stats.vram_peak_accuracy : baseline.gpu_memory_total_accuracy;
   const source = stats.vram_peak_source ?? baseline.gpu_memory_total_source;
