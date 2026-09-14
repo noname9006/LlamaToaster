@@ -6,7 +6,7 @@
   <a href="https://llamatoaster.com"><img src="https://img.shields.io/badge/try%20it-llamatoaster.com-f5a623" alt="Try it at llamatoaster.com"></a>
   <a href="https://llamatoaster.com"><img src="https://img.shields.io/website?url=https%3A%2F%2Fllamatoaster.com%2Fhealth&up_message=online&down_message=offline&label=status" alt="Hosted instance status"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
-  <img src="https://img.shields.io/badge/node-%3E%3D22-brightgreen" alt="Node >= 22">
+  <img src="https://img.shields.io/badge/node-%3E%3D22.22.2-brightgreen" alt="Node >= 22.22.2">
 </p>
 
 **Find the llama.cpp settings your own hardware actually runs best, then
@@ -118,7 +118,7 @@ the reasoning behind most of what's described in this document.
 
 ## Prerequisites
 
-- Node.js 22+ (required by `better-sqlite3` v13, and by Vite 8 for the client/admin builds)
+- Node.js 22.22.2+ (22+ is required by `better-sqlite3` v13 and by Vite 8 for the client/admin builds; jsdom 30, used by the client tests, needs 22.22.2)
 - A built `llama-bench` (and `llama.cpp`) on each worker box — or install one from the Workers page after the worker is up, no manual build needed
 - A GitHub OAuth App if you're running with accounts enabled (see below) — not needed for a single-user/no-login deployment
 
