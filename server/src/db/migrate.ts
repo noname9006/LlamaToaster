@@ -355,8 +355,9 @@ const COLUMN_MIGRATIONS: ColumnSpec[] = [
   { table: "probe_attempts", column: "pp_tps", ddlType: "REAL" },
   { table: "probe_attempts", column: "ttft_ms", ddlType: "REAL" },
   { table: "probe_attempts", column: "prefill_cliff", ddlType: "INTEGER" },
-  // detectHostBackedFallback's own evidence: which test decided, and the
-  // measured layers-of-system-RAM per layer added.
+  // The slope-based spill detector's evidence, from workers predating the
+  // measured gpu_* columns below: which test decided, and the measured
+  // layers-of-system-RAM per layer added.
   { table: "probe_attempts", column: "host_backed_method", ddlType: "TEXT" },
   { table: "probe_attempts", column: "host_backed_slope", ddlType: "REAL" },
   { table: "probe_attempts", column: "kv_host_backed_frac", ddlType: "REAL" },
@@ -366,6 +367,14 @@ const COLUMN_MIGRATIONS: ColumnSpec[] = [
   // both. NULL on every rung reported before this migration.
   { table: "probe_attempts", column: "vram_shared_total_peak_mib", ddlType: "REAL" },
   { table: "probe_attempts", column: "vram_claimed_peak_mib", ddlType: "REAL" },
+  // The measured GPU spill -- llama.cpp's own GPU buffers against this
+  // process's dedicated VRAM -- and which spill (layers or cache) failed a
+  // rung. See shared/types.ts's ProbeAttemptReport. NULL on every rung reported
+  // before this migration.
+  { table: "probe_attempts", column: "gpu_buffers_mib", ddlType: "REAL" },
+  { table: "probe_attempts", column: "gpu_in_system_ram_mib", ddlType: "REAL" },
+  { table: "probe_attempts", column: "gpu_spill_jitter_mib", ddlType: "REAL" },
+  { table: "probe_attempts", column: "host_backed_fail", ddlType: "TEXT" },
 ];
 
 function applyColumnMigrations(database: Database.Database): void {

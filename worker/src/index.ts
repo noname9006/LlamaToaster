@@ -19,7 +19,7 @@ import { gzipSync } from "node:zlib";
 import { hostname as osHostname } from "node:os";
 import { pipeline } from "node:stream/promises";
 import { Readable, Transform } from "node:stream";
-import { runBench, matchOffloadLine, extractCudaDiagnosticLines, classifyFailure, collapseTensorLoadSpam, parseModelBufferSizes, type BenchResult, type OffloadResult, type OffloadInfo, type ModelBufferSizes } from "./bench.js";
+import { runBench, matchOffloadLine, extractCudaDiagnosticLines, classifyFailure, collapseTensorLoadSpam, parseModelBufferSizes, parseGpuBufferReport, type BenchResult, type OffloadResult, type OffloadInfo, type ModelBufferSizes } from "./bench.js";
 import { runServerBench } from "./serverBench.js";
 import { spawn } from "node:child_process";
 // N1/N2/N5 -- the {engine:"server", spec:"off"} execution paths.
@@ -40,7 +40,7 @@ import {
   type ProbeAttemptOutcome,
 } from "./runtimeBench.js";
 import {
-  bestLadderResult,
+  bestLadderEvidence,
   nextLadderRung,
   PROBE_LADDER_MIN_CTX,
   PROBE_MAX_LOADS,
@@ -54,7 +54,6 @@ import { readGpuMemory, readNvidiaDriverInfo, type NvidiaDriverInfo } from "./vr
 import {
   estimateResidentGpuLayers,
   isPrefillCliff,
-  type HostBackedRungSample,
   estimateResidentGpuLayersFromBufferSizes,
   estimateVramNeededMib,
   estimateSafeNgl,
@@ -3083,22 +3082,6 @@ function estimateProbeMemoryNeed(
   };
 }
 
-// One layer's worth of weights, straight from the model file's own size and
-// its layer count -- NOT from the estimator. detectHostBackedFallback uses
-// this as its materiality unit ("is more than a whole layer sitting in system
-// RAM?"), and the whole point of that check is to be independent of estimator
-// bias, so deriving the unit from the estimator would defeat it. llama.cpp's
-// "+1" convention (n_layer plus the output pseudo-layer) matches the
-// total_model_layers the rest of the app divides by. Null when the header
-// never resolved a layer count.
-function probePerLayerMib(payload: TestProbeJobPayload): number | null {
-  const nLayer = payload.model.metadata.n_layer;
-  if (nLayer == null || nLayer <= 0) return null;
-  const fileMib = payload.model.size_bytes / (1024 * 1024);
-  if (!Number.isFinite(fileMib) || fileMib <= 0) return null;
-  return fileMib / (nLayer + 1);
-}
-
 // The log line's own wording, unchanged -- kept as a thin formatter over the
 // numbers above so the persisted probe_attempts row and the log a reader
 // compares it against can never be computed two different ways.
@@ -3107,70 +3090,48 @@ function describeEstimatedMemoryNeed(estimate: { vramMib: number; ramMib: number
   return `estimated need: ${estimate.vramMib}MiB VRAM, ${estimate.ramMib}MiB RAM`;
 }
 
-// Turns a rung's raw vramDiscrepancy flag (runtimeBench.ts's probeSucceeded)
-// into a descriptive explanation appended to the attempt's error text. Whether
-// the rung passed or failed is already decided by then: probeSucceeded fails a
-// measured layer-axis conviction that is corroborated or taken at a small
-// context, and leaves everything weaker -- the inference, an abstained verdict,
-// an uncorroborated conviction at a large context, any context-axis KV spill --
-// as a warning on a passing rung (see its own comment and
-// HOST_BACKED_FAIL_MAX_UNCORROBORATED_CTX for why).
+// One rung's measured memory, in the order a reader needs it: what this process
+// held in VRAM and as system-RAM-backed GPU memory, the whole adapter --
+// labelled, because it includes the desktop and every other process on the
+// card -- and llama.cpp's own GPU buffers against what VRAM held once loaded,
+// signed, so a clean load's reading below zero stays visible for calibration.
+// A missing reading prints "?" rather than disappearing.
+function describeProbePeak(attempt: ProbeAttemptOutcome): string {
+  const fmt = (v: number | null | undefined) => (v != null ? `${Math.round(v)}MiB` : "?");
+  const buffers = attempt.gpuBuffersMib;
+  const inRam = attempt.gpuInSystemRamMib;
+  const spill =
+    buffers != null && inRam != null
+      ? `; llama.cpp put ${fmt(buffers)} on the GPU, VRAM held ${fmt(buffers - inRam)} ` +
+        `(${inRam >= 0 ? "+" : ""}${Math.round(inRam)}MiB not in VRAM, readings moved ${fmt(attempt.gpuSpillJitterMib ?? 0)})`
+      : "; spill not measured";
+  return (
+    `peak: ${fmt(attempt.vramProcessPeakMib)} in VRAM + ${fmt(attempt.vramSharedPeakMib)} system-RAM-backed, ` +
+    `this process; ${fmt(attempt.vramPeakMib)} across the whole adapter${spill}`
+  );
+}
+
+// Appends an explanation to a rung whose spill could NOT be measured but whose
+// observed VRAM came in far below the estimate -- runtimeBench.ts's
+// probeSucceeded infers a fallback there, and only warns. A measured spill
+// already carries its own reason, in MiB, and is left alone.
 // vramDiscrepancyPolicy's fail/retry_once_then_fail escalation is still
 // deliberately NOT applied here, unlike the sweep path's hardFallback check in
 // finalizeSweepItemResult above -- a retry re-measures the same deterministic
-// placement, and the policy was what used to escalate the INFERENCE too.
+// placement, and an inference alone never fails a rung.
 function describeProbeVramDiscrepancy(
   rung: { ctx: number; ngl: number },
   estimatedVramMib: number | null,
   initialAttempt: ProbeAttemptOutcome
 ): ProbeAttemptOutcome {
-  if (!initialAttempt.vramDiscrepancy) return initialAttempt;
-  // Two wordings, because the two signals are not the same kind of claim.
-  // When the OS gave us a system-RAM-backed-GPU-memory reading, this is a
-  // MEASUREMENT and says so in bytes and layers; otherwise it is the older
-  // needed-vs-observed inference and keeps its hedged "looks like" phrasing.
-  // See probeSucceeded's own comment for the preference order.
-  const describe = (a: ProbeAttemptOutcome) => {
-    const shared = a.vramSharedPeakMib != null ? Math.round(a.vramSharedPeakMib) : "?";
-    const inVram = a.vramProcessPeakMib != null ? Math.round(a.vramProcessPeakMib) : "?";
-    if (a.hostBackedMethod === "slope") {
-      // The strongest statement available: system RAM grew by ~a layer's worth
-      // for every layer added, which buffer overhead cannot do.
-      const perLayer = a.hostBackedSlopeRatio != null ? a.hostBackedSlopeRatio.toFixed(2) : "?";
-      const layers = a.hostBackedSpilledLayers ? ` -- about ${a.hostBackedSpilledLayers} layers' worth` : "";
-      return (
-        `candidate ${rung.ctx}/${rung.ngl} is running from system RAM, not GPU: adding layers grew this load's ` +
-        `system-RAM-backed GPU memory by ${perLayer} of a layer per layer added${layers}, measured against a ` +
-        `lower-offload load at the same context -- buffer overhead does not scale with layer count, spilled ` +
-        `weights do. ${shared}MiB shared, ${inVram}MiB actually in VRAM`
-      );
-    }
-    if (a.hostBackedMethod === "ratio") {
-      // No comparable rung on either axis yet, so this one is judged against
-      // its own predicted footprint. Says exactly that -- an earlier version
-      // of this sentence described a different rule (shared exceeding
-      // dedicated) and kept claiming "more in host memory than on the device"
-      // for rungs where that was plainly untrue.
-      const pct =
-        a.vramSharedPeakMib != null && estimatedVramMib
-          ? ` (${Math.round((a.vramSharedPeakMib / estimatedVramMib) * 100)}% of the ${estimatedVramMib}MiB this placement should occupy)`
-          : "";
-      return (
-        `candidate ${rung.ctx}/${rung.ngl} is running from system RAM, not GPU: ${shared}MiB of this load's GPU ` +
-        `memory is system-RAM-backed${pct}, with ${inVram}MiB actually in VRAM. No lower-offload load at this ` +
-        `context had been measured yet, so this rung was judged against its own predicted footprint rather than ` +
-        `a slope`
-      );
-    }
-    const observed = a.vramProcessPeakMib ?? a.vramPeakMib;
-    return (
-      `candidate ${rung.ctx}/${rung.ngl} looks like a silent VRAM fallback: claimed ${rung.ngl} layers on GPU ` +
-      `(~${estimatedVramMib ?? "?"}MiB expected) but observed VRAM peaked at only ` +
-      `${observed != null ? Math.round(observed) : "?"}MiB -- likely silently running from system RAM ` +
-      `instead of erroring, not actual GPU offload`
-    );
-  };
-  return { ...initialAttempt, error: [initialAttempt.error, describe(initialAttempt)].filter(Boolean).join(" -- ") };
+  if (!initialAttempt.vramDiscrepancy || initialAttempt.gpuInSystemRamMib != null) return initialAttempt;
+  const observed = initialAttempt.vramProcessPeakMib ?? initialAttempt.vramPeakMib;
+  const note =
+    `candidate ${rung.ctx}/${rung.ngl} looks like a silent VRAM fallback: claimed ${rung.ngl} layers on GPU ` +
+    `(~${estimatedVramMib ?? "?"}MiB expected) but observed VRAM peaked at only ` +
+    `${observed != null ? Math.round(observed) : "?"}MiB -- likely silently running from system RAM ` +
+    `instead of erroring, not actual GPU offload`;
+  return { ...initialAttempt, error: [initialAttempt.error, note].filter(Boolean).join(" -- ") };
 }
 
 // BENCHMARKING_PLAN_V8.md N2 -- the usable-config probe. Engine pinned to
@@ -3355,9 +3316,10 @@ async function executeRunProbeJob(payload: TestProbeJobPayload): Promise<void> {
           ppTps: dedupMatch.pp_tps,
           ttftMs: dedupMatch.ttft_ms,
           prefillCliff: dedupMatch.prefill_cliff,
-          hostBackedMethod: dedupMatch.host_backed_method,
-          hostBackedSlopeRatio: dedupMatch.host_backed_slope,
-          kvHostBackedFrac: dedupMatch.kv_host_backed_frac,
+          gpuBuffersMib: dedupMatch.gpu_buffers_mib,
+          gpuInSystemRamMib: dedupMatch.gpu_in_system_ram_mib,
+          gpuSpillJitterMib: dedupMatch.gpu_spill_jitter_mib,
+          hostBackedFailCause: dedupMatch.host_backed_fail,
           vramNeededMib: dedupMatch.vram_needed_mib,
           vramFreeMib: dedupMatch.vram_free_mib,
           ramNeededMib: dedupMatch.ram_needed_mib,
@@ -3396,21 +3358,6 @@ async function executeRunProbeJob(payload: TestProbeJobPayload): Promise<void> {
           ngl: rung.ngl,
           estimate,
           label,
-          // Only rungs at this same context, and only ones that actually
-          // produced a shared-memory reading. A reused batch-sibling point
-          // qualifies too -- it is a real measurement, just one this run
-          // did not pay a load for.
-          // Every measured rung, both axes -- the detector picks whichever
-          // comparison holds the other axis fixed.
-          prior: attempts
-            .filter((a) => a.vramSharedPeakMib != null && a.ngl != null)
-            .map((a) => ({
-              ngl: a.ngl!,
-              ctx: a.candidateCtx,
-              sharedPeakMib: a.vramSharedPeakMib ?? null,
-              dedicatedPeakMib: a.vramProcessPeakMib ?? null,
-              estimatedGpuMib: a.vramNeededMib ?? null,
-            })),
           // Best prefill rate from a rung that was NOT host-backed. Taking it
           // from any rung would let a rung already over the cliff set the
           // reference and hide every later one.
@@ -3433,10 +3380,12 @@ async function executeRunProbeJob(payload: TestProbeJobPayload): Promise<void> {
       attempt = describeProbeVramDiscrepancy(rung, estimate?.vramMib ?? null, attempt);
       attempts.push(attempt);
       sendProbeAttemptTick(payload.run_id, attempts.length - 1, toProbeAttemptReport(attempt));
-      // Actual observed peak alongside the "estimated need" line logged
-      // before this load started -- lets a log reader compare predicted vs
-      // real without cross-referencing anything else.
-      const actualNote = attempt.vramPeakMib != null ? ` (actual VRAM peak: ${Math.round(attempt.vramPeakMib)}MiB)` : "";
+      // Measured figures alongside the "estimated need" line logged before
+      // this load started, on EVERY rung, pass or fail. The per-process split
+      // used to surface only inside a failure's explanation, so the rung that
+      // became a verdict was the one rung whose real placement no log reader
+      // could see.
+      const actualNote = ` (${describeProbePeak(attempt)})`;
       log.info(
         `${label}: candidate ${rung.ctx}/${rung.ngl} -> ${attempt.ok ? "ok" : "failed"}${actualNote}` +
           (attempt.error ? ` (${attempt.error})` : "")
@@ -3459,7 +3408,17 @@ async function executeRunProbeJob(payload: TestProbeJobPayload): Promise<void> {
       }
     }
 
-    const best = bestLadderResult(attempts.map(toLadderAttempt));
+    const evidence = bestLadderEvidence(attempts.map(toLadderAttempt));
+    const best = evidence?.attempt ?? null;
+    // Labelled, not silently promoted: when this probe never judged the winning
+    // rung's cache placement (no smaller-context reference, or no shared-memory
+    // counter on this platform), "it loaded" must not read as "it fits".
+    if (evidence && !evidence.judged) {
+      log.warn(
+        `${label}: verdict ${evidence.attempt.ctx}/${evidence.attempt.ngl} rests on a load whose cache placement ` +
+          `was never judged -- it loaded, but its cache may be in system RAM`
+      );
+    }
     // Reported EXACTLY as loaded, both axes. This used to snap the context
     // down to a slider stop before storing it, on the theory that a ceiling
     // the rest of the app cannot express is not a usable one -- but a `fine`
@@ -3543,12 +3502,11 @@ function toLadderAttempt(attempt: ProbeAttemptOutcome): LadderAttempt {
     // Not just `!ok && vramDiscrepancy` -- a rung that generated nothing can
     // carry an INFERRED discrepancy too, and that is no proof the layers moved.
     hostBacked: failedForHostBackedLayers(attempt),
-    // Whether this rung's CACHE placement was actually judged, which only the
-    // context slope can do (it needs a per-process dedicated reading and a
-    // same-placement rung at a smaller context). A pass without it means "it
-    // loaded" and nothing about where the cache went, so the frontier marks
-    // anything resting on it unverified rather than presenting it as measured.
-    ctxVerdictMeasured: attempt.kvHostBackedFrac != null,
+    // Whether this rung's memory placement was actually measured. A pass
+    // without it means "it loaded" and nothing about where the memory went, so
+    // neither the frontier nor the reported verdict lets it stand in for one
+    // that was.
+    placementJudged: attempt.gpuInSystemRamMib != null,
   };
 }
 
@@ -3563,11 +3521,6 @@ interface ProbeLoadInput {
   /** What this rung was predicted to need -- carried onto the outcome row. */
   estimate: { vramMib: number; ramMib: number } | null;
   label: string;
-  /** Rungs this run has already measured AT THIS SAME CONTEXT -- what lets the
-   * host-backed check compare slopes instead of levels. Same-context is the
-   * requirement, since a different context moves the KV cache and that shows
-   * up in the same counter. */
-  prior?: HostBackedRungSample[];
   /** Best prompt-processing rate this run has measured at a rung the
    * host-backed check left alone -- the reference the prefill cliff is judged
    * against. Null until one exists. */
@@ -3622,6 +3575,9 @@ async function runOneProbeLoad(input: ProbeLoadInput): Promise<ProbeAttemptOutco
         sampler.start(proc.pid, payload.llama_cpp_backend, TICK_INTERVAL_MS);
       },
     });
+    // Ready means loaded: every buffer llama.cpp allocates for this load exists
+    // from here on, so dedicated readings can be held against its buffer report.
+    sampler.markLoaded();
     // Retries a rejected generation on a rotated prompt, and falls back to a
     // grammar-constrained attempt, rather than letting one parser failure mark
     // the whole ladder fatal (see completeWithRetries).
@@ -3658,7 +3614,14 @@ async function runOneProbeLoad(input: ProbeLoadInput): Promise<ProbeAttemptOutco
         ? (sample.promptN / sample.promptMs) * 1000
         : null;
     const ttftMs = Number.isFinite(sample.ttftMs) ? sample.ttftMs : null;
+    // Two readings taken now, whatever the tick cadence managed during a short
+    // load: the measured spill needs at least one after markLoaded, and a
+    // second shows how far the counter itself moves.
+    await sampler.sampleVramNow();
+    await sampler.sampleVramNow();
     const stats = sampler.stop();
+    const serverOutput = server?.stderr() ?? "";
+    const gpuBuffers = parseGpuBufferReport(serverOutput);
     const verdict = probeSucceeded({
       oom: false,
       vramPeakMib: stats.vram_peak_mib,
@@ -3667,10 +3630,10 @@ async function runOneProbeLoad(input: ProbeLoadInput): Promise<ProbeAttemptOutco
       ngl,
       estimatedVramMib: estimate?.vramMib ?? null,
       vramProcessPeakMib: stats.vram_process_peak_mib,
-      sharedPeakMib: stats.vram_process_shared_peak_mib,
-      perLayerMib: probePerLayerMib(payload),
-      ctx: candidateCtx,
-      prior: input.prior ?? [],
+      gpuBuffers,
+      loadedDedicatedMib: stats.vram_process_loaded_peak_mib,
+      loadedDedicatedJitterMib: stats.vram_process_loaded_jitter_mib,
+      atSmallestContext: candidateCtx <= PROBE_LADDER_MIN_CTX,
     });
     const headroomFrac =
       stats.vram_peak_mib != null && payload.gpu_total_mib != null && payload.gpu_total_mib > 0
@@ -3687,7 +3650,7 @@ async function runOneProbeLoad(input: ProbeLoadInput): Promise<ProbeAttemptOutco
       payload.model.metadata.n_layer != null && payload.model.metadata.n_layer > 0
         ? payload.model.metadata.n_layer + 1
         : null;
-    const modelBufferSizes = parseModelBufferSizes(server?.stderr() ?? "")?.main ?? null;
+    const modelBufferSizes = parseModelBufferSizes(serverOutput)?.main ?? null;
     const resident = computeResidentLayers(
       ngl > 0 && totalModelLayers != null ? { gpu_layers_loaded: ngl, total_model_layers: totalModelLayers } : null,
       modelBufferSizes,
@@ -3713,10 +3676,10 @@ async function runOneProbeLoad(input: ProbeLoadInput): Promise<ProbeAttemptOutco
       ...memoryFields,
       error: verdict.reason ?? undefined,
       vramDiscrepancy: verdict.vramDiscrepancy,
-      hostBackedMethod: verdict.hostBacked.method,
-      hostBackedSlopeRatio: verdict.hostBacked.slopeRatio,
-      hostBackedSpilledLayers: verdict.hostBacked.spilledLayers,
-      kvHostBackedFrac: verdict.hostBacked.kvHostBackedFrac,
+      gpuBuffersMib: verdict.gpuSpill.measured ? (gpuBuffers?.deviceMib ?? null) : null,
+      gpuInSystemRamMib: verdict.gpuSpill.inSystemRamMib,
+      gpuSpillJitterMib: verdict.gpuSpill.jitterMib,
+      hostBackedFailCause: verdict.failCause,
       gpuLayersResidentEst: resident.layers,
       gpuLayersResidentExact: resident.exact,
     };

@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { describe, expect, it } from "vitest";
 import {
   parseModelBufferSizes,
+  parseGpuBufferReport,
   extractCudaDiagnosticLines,
   MAX_CUDA_DIAGNOSTIC_LINES,
   buildArgs,
@@ -338,6 +339,81 @@ describe("parseModelBufferSizes", () => {
       "load_tensors:        CUDA0 model buffer size =   64.00 MiB",
     ].join("\n");
     expect(parseModelBufferSizes(stderr)?.main).toEqual({ gpuMib: 64, cpuMib: 0, gpu_layers_exact: 1 });
+  });
+});
+
+describe("parseGpuBufferReport", () => {
+  // Captured from b10956's llama-server (Vulkan, qwen2.5-1b-instruct-q8_0,
+  // -ngl 99 -c 1024), logger prefix and all.
+  const REAL = [
+    "0.00.697.532 I load_tensors: offloaded 49/49 layers to GPU",
+    "0.00.697.536 I load_tensors:   CPU_Mapped model buffer size =   137.94 MiB",
+    "0.00.697.538 I load_tensors:      Vulkan0 model buffer size =   863.64 MiB",
+    "0.02.210.847 I llama_context: Vulkan_Host  output buffer size =     0.58 MiB",
+    "0.02.218.676 I llama_kv_cache:    Vulkan0 KV buffer size =    24.00 MiB",
+    "0.02.240.524 I sched_reserve:    Vulkan0 compute buffer size =    33.01 MiB",
+    "0.02.240.526 I sched_reserve: Vulkan_Host compute buffer size =     4.51 MiB",
+  ];
+
+  it("sums every GPU buffer and leaves the host-side ones out", () => {
+    const report = parseGpuBufferReport(REAL.join("\n"))!;
+    expect(report.deviceMib).toBeCloseTo(863.64 + 24 + 33.01, 2);
+    expect(report.contextMib).toBeCloseTo(24 + 33.01, 2);
+  });
+
+  // Qwen3.6-35B-A3B at 1,024 tokens and 15 layers, which the calibration run
+  // measured at 6462.03MiB of GPU buffers.
+  it("counts a hybrid model's recurrent state on the GPU, but not as context", () => {
+    const report = parseGpuBufferReport(
+      [
+        "load_tensors:   CPU_Mapped model buffer size = 10973.07 MiB",
+        "load_tensors:      Vulkan0 model buffer size =  6221.58 MiB",
+        "llama_context: Vulkan_Host  output buffer size =     0.95 MiB",
+        "llama_kv_cache:          CPU KV buffer size =    12.00 MiB",
+        "llama_kv_cache:      Vulkan0 KV buffer size =     8.00 MiB",
+        "llama_memory_recurrent:          CPU RS buffer size =    41.88 MiB",
+        "llama_memory_recurrent:      Vulkan0 RS buffer size =    20.94 MiB",
+        "sched_reserve:      Vulkan0 compute buffer size =   211.51 MiB",
+        "sched_reserve: Vulkan_Host compute buffer size =    21.11 MiB",
+      ].join("\n")
+    )!;
+    expect(report.deviceMib).toBeCloseTo(6462.03, 2);
+    expect(report.contextMib).toBeCloseTo(219.51, 2);
+  });
+
+  it("keeps only the latest reservation of a buffer reserved twice", () => {
+    const report = parseGpuBufferReport(
+      [
+        "load_tensors:        CUDA0 model buffer size =  4000.00 MiB",
+        "sched_reserve:        CUDA0 compute buffer size =   100.00 MiB",
+        "sched_reserve:        CUDA0 compute buffer size =   150.00 MiB",
+      ].join("\n")
+    )!;
+    expect(report).toEqual({ deviceMib: 4150, contextMib: 150 });
+  });
+
+  it("sums buffers across several GPUs", () => {
+    const report = parseGpuBufferReport(
+      [
+        "load_tensors:        CUDA0 model buffer size =  2000.00 MiB",
+        "load_tensors:        CUDA1 model buffer size =  1500.00 MiB",
+        "llama_kv_cache:        CUDA0 KV buffer size =   100.00 MiB",
+        "llama_kv_cache:        CUDA1 KV buffer size =    80.00 MiB",
+      ].join("\n")
+    )!;
+    expect(report).toEqual({ deviceMib: 3680, contextMib: 180 });
+  });
+
+  it("reports nothing on a GPU for a CPU-only load, rather than no report", () => {
+    expect(
+      parseGpuBufferReport(
+        ["load_tensors:   CPU_Mapped model buffer size =  5880.00 MiB", "llama_kv_cache:          CPU KV buffer size =   512.00 MiB"].join("\n")
+      )
+    ).toEqual({ deviceMib: 0, contextMib: 0 });
+  });
+
+  it("returns null when the build printed no buffer sizes", () => {
+    expect(parseGpuBufferReport("load_tensors: offloaded 49/49 layers to GPU\n")).toBeNull();
   });
 });
 

@@ -3430,8 +3430,9 @@ export const repo = {
               vram_shared_peak_mib, gen_tps, error, created_at,
               reused_from_run_id, vram_discrepancy, gpu_layers_resident_est, gpu_layers_resident_exact,
               pp_tps, ttft_ms, prefill_cliff, host_backed_method, host_backed_slope, kv_host_backed_frac,
-              vram_shared_total_peak_mib, vram_claimed_peak_mib)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+              vram_shared_total_peak_mib, vram_claimed_peak_mib, gpu_buffers_mib, gpu_in_system_ram_mib,
+              gpu_spill_jitter_mib, host_backed_fail)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         );
         input.attempts.forEach((a, seq) => {
           insert.run(
@@ -3468,7 +3469,11 @@ export const repo = {
             a.host_backed_slope ?? null,
             a.kv_host_backed_frac ?? null,
             a.vram_shared_total_peak_mib ?? null,
-            a.vram_claimed_peak_mib ?? null
+            a.vram_claimed_peak_mib ?? null,
+            a.gpu_buffers_mib ?? null,
+            a.gpu_in_system_ram_mib ?? null,
+            a.gpu_spill_jitter_mib ?? null,
+            a.host_backed_fail ?? null
           );
         });
       });
@@ -3507,8 +3512,9 @@ export const repo = {
               vram_shared_peak_mib, gen_tps, error, created_at,
               reused_from_run_id, vram_discrepancy, gpu_layers_resident_est, gpu_layers_resident_exact,
               pp_tps, ttft_ms, prefill_cliff, host_backed_method, host_backed_slope, kv_host_backed_frac,
-              vram_shared_total_peak_mib, vram_claimed_peak_mib)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              vram_shared_total_peak_mib, vram_claimed_peak_mib, gpu_buffers_mib, gpu_in_system_ram_mib,
+              gpu_spill_jitter_mib, host_backed_fail)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(run_id, seq) DO UPDATE SET
              candidate_ctx = excluded.candidate_ctx,
              ngl = excluded.ngl,
@@ -3538,7 +3544,11 @@ export const repo = {
              host_backed_slope = excluded.host_backed_slope,
              kv_host_backed_frac = excluded.kv_host_backed_frac,
              vram_shared_total_peak_mib = excluded.vram_shared_total_peak_mib,
-             vram_claimed_peak_mib = excluded.vram_claimed_peak_mib`
+             vram_claimed_peak_mib = excluded.vram_claimed_peak_mib,
+             gpu_buffers_mib = excluded.gpu_buffers_mib,
+             gpu_in_system_ram_mib = excluded.gpu_in_system_ram_mib,
+             gpu_spill_jitter_mib = excluded.gpu_spill_jitter_mib,
+             host_backed_fail = excluded.host_backed_fail`
         )
         .run(
           uuid(),
@@ -3574,7 +3584,11 @@ export const repo = {
           a.host_backed_slope ?? null,
           a.kv_host_backed_frac ?? null,
           a.vram_shared_total_peak_mib ?? null,
-          a.vram_claimed_peak_mib ?? null
+          a.vram_claimed_peak_mib ?? null,
+          a.gpu_buffers_mib ?? null,
+          a.gpu_in_system_ram_mib ?? null,
+          a.gpu_spill_jitter_mib ?? null,
+          a.host_backed_fail ?? null
         );
     },
   },
@@ -3802,6 +3816,10 @@ export interface ProbeAttemptRow {
   kv_host_backed_frac: number | null;
   vram_shared_total_peak_mib: number | null;
   vram_claimed_peak_mib: number | null;
+  gpu_buffers_mib: number | null;
+  gpu_in_system_ram_mib: number | null;
+  gpu_spill_jitter_mib: number | null;
+  host_backed_fail: string | null;
 }
 
 // N4 storage shapes.

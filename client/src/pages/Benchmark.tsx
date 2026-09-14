@@ -34,7 +34,7 @@ import { useWorkerStatuses } from "../api/useWorkerStatus";
 import { ModelPicker } from "../components/ModelPicker";
 import { GoalQuestionnaire, KV_PRESET_LABEL } from "../components/GoalQuestionnaire";
 import { TestStatusPill } from "../components/StatusPill";
-import { frontierFrom } from "../components/ProbeFrontier";
+import { frontierFrom, toLadderAttempts } from "../components/ProbeFrontier";
 import { IconArrowRight, IconChevronDown, IconInfo } from "../components/icons";
 import { backendVisibleGpus } from "../types";
 import type { Model, Test, TestItem, ResultRow, TestKind, SweepConfig } from "../types";
@@ -49,7 +49,7 @@ import {
   type GoalsConfig,
 } from "../goals";
 import { expandSweep } from "../../../shared/sweep";
-import type { ProbeGranularity, ProbeMode } from "../../../shared/probeLadder";
+import { bestLadderResult, type ProbeGranularity, type ProbeMode } from "../../../shared/probeLadder";
 import { priceMatrix, ETA_UNAVAILABLE } from "../../../shared/pricing";
 import type { ModelRatesResponse } from "../types";
 
@@ -1162,13 +1162,15 @@ export function Benchmark() {
               const match = limits.limits
                 .filter((l) => l.kv_type === "f16/f16")
                 .sort((a, b) => b.created_at - a.created_at)[0];
-              // The largest passing context wins, ties broken by ngl -- the
-              // same rule bestLadderResult (shared/probeLadder.ts) applies
-              // server-side, so this always names the SAME rung the stored
-              // ceiling actually came from.
-              const winner = attemptsRes.attempts
-                .filter((a) => a.ok)
-                .sort((a, b) => b.candidate_ctx - a.candidate_ctx || (b.ngl ?? 0) - (a.ngl ?? 0))[0];
+              // The rung the stored ceiling came from, picked by the worker's
+              // own bestLadderResult rather than a hand-rolled copy of it --
+              // the copy that used to live here claimed parity, and would
+              // have drifted the moment the rule started preferring rungs
+              // whose cache placement was judged.
+              const best = bestLadderResult(toLadderAttempts(attemptsRes.attempts));
+              const winner = best
+                ? attemptsRes.attempts.find((a) => a.candidate_ctx === best.ctx && a.ngl === best.ngl)
+                : undefined;
               // A frontier probe measured a boundary per context stop, and
               // that -- not the single stored ceiling -- is what its card
               // names and applies. Derived with the same function the run's
