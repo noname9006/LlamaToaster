@@ -428,8 +428,10 @@ describe("N2 probe success rule", () => {
     expect(result.ok).toBe(true);
   });
 
-  // KV spill stays a caveat: the probe never reads a cache this size.
-  it("does not fail a context whose cache went to system RAM", () => {
+  // Probe 124c2ab1: 262144 tokens "verified" on an 8GiB RX 6600 XT with the
+  // whole cache in system RAM. A context whose cache is mostly host-backed
+  // fails, so the context search bisects down to one that fits.
+  it("fails a context whose cache went to system RAM", () => {
     const result = probeSucceeded({
       oom: false,
       vramPeakMib: 6000,
@@ -445,6 +447,33 @@ describe("N2 probe success rule", () => {
     });
     expect(result.hostBacked.axis).toBe("ctx");
     expect(result.hostBacked.kvHostBackedFrac!).toBeGreaterThan(0.9);
+    expect(result.ok).toBe(false);
+    expect(result.spill).toBe(false);
+    // Not a layer failure: a smaller context can fix this, so the ladder must
+    // keep walking context rather than stopping as it does for spilled layers.
+    expect(result.vramDiscrepancy).toBe(false);
+    expect(result.reason).toContain("KV cache");
+  });
+
+  // ...while a comfortable context, whose cache only partly landed in system
+  // RAM, still passes. Measured: ngl 4 at 131072 on the calibration machine,
+  // dedicated +379MiB and shared +383MiB over the 1024-token load.
+  it("passes a context whose cache only partly went to system RAM", () => {
+    const result = probeSucceeded({
+      oom: false,
+      vramPeakMib: 4793,
+      gpuTotalMib: 8176,
+      genTps: 11.38,
+      ngl: 4,
+      estimatedVramMib: 3276,
+      vramProcessPeakMib: 2393,
+      sharedPeakMib: 810,
+      perLayerMib: 17205 / 41,
+      ctx: 131072,
+      prior: [{ ngl: 4, ctx: 1024, sharedPeakMib: 427, dedicatedPeakMib: 2014, estimatedGpuMib: 2322 }],
+    });
+    expect(result.hostBacked.axis).toBe("ctx");
+    expect(result.hostBacked.kvHostBackedFrac!).toBeCloseTo(0.5, 1);
     expect(result.ok).toBe(true);
   });
 
@@ -1003,6 +1032,8 @@ describe("toProbeAttemptReport", () => {
     ramPeakMib: 16657,
     ramTotalPeakMib: 21000,
     vramSharedPeakMib: 1821,
+    vramSharedTotalPeakMib: 2411,
+    vramClaimedPeakMib: 6201,
     vramNeededMib: 5958,
     vramFreeMib: 5778,
     ramNeededMib: 12341,
@@ -1027,6 +1058,8 @@ describe("toProbeAttemptReport", () => {
       ram_peak_mib: 16657,
       ram_total_peak_mib: 21000,
       vram_shared_peak_mib: 1821,
+      vram_shared_total_peak_mib: 2411,
+      vram_claimed_peak_mib: 6201,
       gen_tps: 10.3,
       pp_tps: 18.9,
       ttft_ms: 9389,
