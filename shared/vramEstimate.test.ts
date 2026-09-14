@@ -595,6 +595,58 @@ describe("detectHostBackedFallback", () => {
     });
   });
 
+  // The same two counters on the OTHER vendor/driver model: a GeForce MX150
+  // (2048MiB, driver 582.66, sysmem fallback on) running llama.cpp b10952 CUDA
+  // with qwen2.5-1b-instruct-q8_0 (1007MiB, 49 layers) at -c 65536 -- a context
+  // chosen to overflow the card. dedicated/shared are WDDM's per-process
+  // counters on the CUDA adapter; nvidia-smi said [N/A] per process throughout.
+  //
+  //   ngl        24     30     36     42     49
+  //   ded      1381   1665   1947   1949   1962
+  //   shr       134    134    134    414    710
+  //   tg tok/s 17.9   20.4   22.5   13.8   13.4
+  //
+  // Each layer here also carries ~31MiB of f16 KV, so both slopes exceed 1.0
+  // in weights-only units; the regimes are still unambiguous.
+  describe("Windows CUDA calibration (MX150, WDDM counters)", () => {
+    const CUDA_PER_LAYER_MIB = 1007 / 49;
+    const CUDA_SWEEP: Record<number, { ded: number; shr: number }> = {
+      24: { ded: 1381, shr: 134 }, 30: { ded: 1665, shr: 134 }, 36: { ded: 1947, shr: 134 },
+      42: { ded: 1949, shr: 414 }, 49: { ded: 1962, shr: 710 },
+    };
+    const cudaSample = (ngl: number) => ({
+      ngl, ctx: 65536, sharedPeakMib: CUDA_SWEEP[ngl].shr, dedicatedPeakMib: CUDA_SWEEP[ngl].ded,
+    });
+    const cudaBetween = (lower: number, upper: number) =>
+      detectHostBackedFallback({ rung: cudaSample(upper), prior: [cudaSample(lower)], perLayerMib: CUDA_PER_LAYER_MIB });
+
+    it.each([[24, 30], [30, 36]])("reads %i->%i as clean on both counters", (lo, hi) => {
+      const v = cudaBetween(lo, hi);
+      expect(v.slopeRatio!).toBeLessThan(HOST_BACKED_SLOPE_RATIO);
+      expect(v.residentSlopeRatio!).toBeGreaterThan(HOST_BACKED_RESIDENT_SLOPE_RATIO);
+      expect(v.hostBacked).toBe(false);
+      expect(v.abstained).toBe(false);
+    });
+
+    it.each([[36, 42], [42, 49]])("convicts %i->%i with both counters agreeing", (lo, hi) => {
+      const v = cudaBetween(lo, hi);
+      expect(v.slopeRatio!).toBeGreaterThan(HOST_BACKED_SLOPE_RATIO);
+      expect(v.residentSlopeRatio!).toBeLessThan(HOST_BACKED_RESIDENT_SLOPE_RATIO);
+      expect(v.hostBacked).toBe(true);
+      expect(v.abstained).toBe(false);
+    });
+
+    it("picks the nearest clean rung as the reference for the first spilling one", () => {
+      const v = detectHostBackedFallback({
+        rung: cudaSample(42),
+        prior: [cudaSample(24), cudaSample(30), cudaSample(36)],
+        perLayerMib: CUDA_PER_LAYER_MIB,
+      });
+      expect(v.spilledLayers).toBe(Math.round(280 / CUDA_PER_LAYER_MIB));
+      expect(v.hostBacked).toBe(true);
+    });
+  });
+
   // The false conviction this whole pass exists to remove. Measured on the
   // 6 Sep 2026 reference run, max_context's own rungs at a 262144-token
   // context: ngl 0 reported 571MiB shared with NOTHING claimed on the GPU, so

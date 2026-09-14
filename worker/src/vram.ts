@@ -42,6 +42,12 @@ export interface GpuMemoryReading {
   // Whole-adapter usage -- every process on the GPU combined (the desktop,
   // other apps, this benchmark), never process-isolated.
   used: GpuMemoryValue;
+  // Whole-adapter SYSTEM-RAM-backed GPU memory -- every process's WDDM
+  // "Shared Usage" on this card combined; the shared-memory counterpart of
+  // `used`. Only read on Windows CUDA today, and only alongside a pid (the
+  // sampler's ticks, not the pid-less pre-spawn baseline). Absent, not 0,
+  // wherever it was not read.
+  usedShared?: GpuMemoryValue;
   // This worker's own benchmark child process's usage -- only present on
   // backends/platforms with a per-process reading (nvidia-smi compute-apps,
   // Windows' WDDM "GPU Process Memory" counter, rocm-smi --showpids /
@@ -268,27 +274,88 @@ async function readWindowsUsedMib(
   }
 }
 
-// Windows-only, per-process Shared Usage in isolation -- for a caller
-// (readCudaGpuMemory) that already has its own total/used/process readings
-// from a vendor-specific source (nvidia-smi) and just needs this ONE
-// vendor-agnostic WDDM figure added on top, without re-querying "GPU Adapter
-// Memory" Dedicated Usage it has no use for. See readWindowsUsedMib's own
-// comment for what this counter means and why it's the right one to read.
-async function readWindowsProcessSharedMib(pid: number): Promise<number | null> {
+export interface WindowsCudaGpuMemory {
+  dedicatedMib: number | null;
+  sharedMib: number | null;
+  adapterSharedMib: number | null;
+}
+
+// Windows-only, for readCudaGpuMemory: this process's WDDM "GPU Process
+// Memory" Dedicated Usage AND Shared Usage, plus the whole adapter's "GPU
+// Adapter Memory" Shared Usage, in one powershell.exe spawn. Adapter
+// Dedicated Usage is not re-queried -- nvidia-smi already supplies total/used.
+//
+// Adapter Shared Usage is every process's system-RAM-backed memory on the CUDA
+// card -- nvidia-smi has no such figure. Restricted to adapters that expose a
+// CUDA engine in ANY process's "GPU Engine" instances (System, pid 4, holds
+// one even with no CUDA app running), because summing every adapter would add
+// an Optimus laptop's iGPU: measured 148MiB of desktop Shared Usage on the
+// Intel UHD 620 against 0.25MiB on the idle MX150. No CUDA engine anywhere ->
+// null, never a guess.
+//
+// Dedicated Usage is the per-process VRAM figure nvidia-smi cannot give under
+// WDDM (its compute-apps used_memory is "[N/A]" there on every driver tested).
+// It is placement, not the allocation claim: confirmed live on a GeForce MX150
+// (driver 582.66), where it matched NVML's whole-adapter memory.used within
+// 1 MiB at every step of a 256 MiB-chunk allocation ramp, stopped at the
+// card's ~1955 MiB while Shared Usage absorbed the rest 1:1, and the same held
+// for llama-server b10952 loads (ngl 36 -> 42 at -c 65536: dedicated +2.5 MiB,
+// shared +280 MiB for the same 283 MiB llama.cpp claimed on CUDA0).
+//
+// Every process's counters are split per adapter (`pid_<pid>_luid_<luid>_phys_<n>`),
+// so an Optimus laptop's iGPU allocations would otherwise be summed in. The
+// adapter is identified by this process's own "GPU Engine" instance whose
+// engtype is cuda -- no LUID is cached, since a driver update renumbers them.
+// When no CUDA engine instance exists yet (a fresh spawn) the sums fall back to
+// every adapter, which is what the Shared Usage reading here always did.
+// Same `pid_<pid>_*` trailing-underscore anchoring as readWindowsUsedMib.
+export function windowsCudaMemoryCommand(pid: number): string {
+  return [
+    `$c = (Get-Counter '\\GPU Engine(*engtype_cuda)\\Utilization Percentage','\\GPU Adapter Memory(*)\\Shared Usage','\\GPU Process Memory(pid_${pid}_*)\\Dedicated Usage','\\GPU Process Memory(pid_${pid}_*)\\Shared Usage' -ErrorAction SilentlyContinue).CounterSamples`,
+    `$e = @($c | Where-Object { $_.Path -like '*\\gpu engine(*' })`,
+    `$all = @($e | ForEach-Object { ($_.InstanceName -split '_phys_')[0] -replace '^pid_\\d+_', '' } | Select-Object -Unique)`,
+    `$own = @($e | Where-Object { $_.InstanceName -like 'pid_${pid}_*' } | ForEach-Object { ($_.InstanceName -split '_phys_')[0] -replace '^pid_\\d+_', '' } | Select-Object -Unique)`,
+    `$m = @($c | Where-Object { $_.Path -like '*\\gpu process memory(*' })`,
+    `if ($own.Count -gt 0) { $m = @($m | Where-Object { $n = $_.InstanceName; @($own | Where-Object { $n -like ('*_' + $_ + '_phys_*') }).Count -gt 0 }) }`,
+    `$a = @($c | Where-Object { $_.Path -like '*\\gpu adapter memory(*' } | Where-Object { $n = $_.InstanceName; @($all | Where-Object { $n -like ($_ + '_phys_*') }).Count -gt 0 })`,
+    `Write-Output ('dedicated=' + ($m | Where-Object { $_.Path -like '*\\dedicated usage' } | Measure-Object -Property CookedValue -Sum).Sum)`,
+    `Write-Output ('shared=' + ($m | Where-Object { $_.Path -like '*\\shared usage' } | Measure-Object -Property CookedValue -Sum).Sum)`,
+    `Write-Output ('adapter_shared=' + ($a | Measure-Object -Property CookedValue -Sum).Sum)`,
+  ].join("; ");
+}
+
+// Labeled lines rather than positional ones, so a counter with no instance
+// (an empty sum prints as "dedicated=") can never shift another value into
+// its slot. Unlike parseMiB, a present 0 stays 0: the instance existed and
+// measured nothing, which is a reading -- only an absent instance is null.
+export function parseWindowsCudaMemoryOutput(stdout: string): WindowsCudaGpuMemory {
+  const values = new Map<string, string>();
+  for (const line of stdout.split(/\r?\n/)) {
+    const eq = line.indexOf("=");
+    if (eq > 0) values.set(line.slice(0, eq).trim(), line.slice(eq + 1).trim());
+  }
+  const toMib = (raw: string | undefined): number | null => {
+    if (!raw) return null;
+    const bytes = Number(raw);
+    return Number.isFinite(bytes) && bytes >= 0 ? Math.round(bytes / BYTES_PER_MIB) : null;
+  };
+  return {
+    dedicatedMib: toMib(values.get("dedicated")),
+    sharedMib: toMib(values.get("shared")),
+    adapterSharedMib: toMib(values.get("adapter_shared")),
+  };
+}
+
+async function readWindowsCudaMemory(pid: number): Promise<WindowsCudaGpuMemory> {
   try {
     const { stdout } = await execFileAsync(
       "powershell.exe",
-      [
-        "-NoProfile",
-        "-NonInteractive",
-        "-Command",
-        `(Get-Counter '\\GPU Process Memory(pid_${pid}_*)\\Shared Usage' -ErrorAction SilentlyContinue).CounterSamples | Measure-Object -Property CookedValue -Sum | Select-Object -ExpandProperty Sum`,
-      ],
+      ["-NoProfile", "-NonInteractive", "-Command", windowsCudaMemoryCommand(pid)],
       { timeout: EXEC_TIMEOUT_MS, windowsHide: true }
     );
-    return parseMiB(stdout);
+    return parseWindowsCudaMemoryOutput(stdout);
   } catch {
-    return null;
+    return { dedicatedMib: null, sharedMib: null, adapterSharedMib: null };
   }
 }
 
@@ -436,45 +503,50 @@ async function readAmdgpuSysfsVram(): Promise<VramSample | null> {
 
 // ---------------------------------------------------------------------------
 // CUDA: nvidia-smi --query-compute-apps is NVML's own per-process memory
-// accounting exposed as a stable, long-documented CLI -- the one backend
-// here that can honestly claim "exact"/process_gpu_usage, preferred over
-// the whole-adapter reading per the spec's own "prefer process-specific"
-// requirement. Not run live this session -- no NVIDIA hardware available --
-// verify against a real CUDA worker before fully trusting the PID-matching
-// behavior in practice. `used` stays the whole-adapter reading (reported
-// separately from `process` below -- the two are different numbers, and
-// collapsing them into one hybrid field is what made the old "vram_peak"
-// mean different things on different backends).
+// accounting exposed as a stable, long-documented CLI, preferred over the
+// whole-adapter reading per the spec's own "prefer process-specific"
+// requirement. Under WDDM it has no per-process figure at all ("[N/A]",
+// confirmed live on driver 436.30 and 582.66), so on Windows the process
+// reading falls back to WDDM's own per-process Dedicated Usage -- see
+// windowsCudaProcessMemoryCommand for how that was verified. `used` stays the
+// whole-adapter reading (reported separately from `process` below -- the two
+// are different numbers, and collapsing them into one hybrid field is what
+// made the old "vram_peak" mean different things on different backends).
 async function readCudaGpuMemory(pid: number | undefined): Promise<GpuMemoryReading> {
   const wholeAdapter = await readNvidiaSmiWholeAdapter();
   const totalReading = reading(wholeAdapter?.totalMib ?? null, "exact", "driver_reported_memory");
   const usedReading = reading(wholeAdapter?.usedMib ?? null, "high", "driver_reported_memory");
+  let usedSharedReading: GpuMemoryValue | undefined;
   let processReading: GpuMemoryValue | undefined;
   let processSharedReading: GpuMemoryValue | undefined;
   if (pid != null) {
-    const processUsedMib = await readNvidiaSmiProcessUsed(pid);
-    // null = this process hasn't shown up in nvidia-smi's own compute-apps
-    // list yet (its polling lags a fresh spawn) -- no process reading this
-    // tick, not a measured 0.
-    if (processUsedMib != null) processReading = reading(processUsedMib, "exact", "process_gpu_usage");
     // NVML/nvidia-smi has no counterpart to WDDM's "Shared Usage" -- the
     // sysmem-fallback bytes an oversubscribed CUDA allocation silently
     // spills to (NVIDIA Control Panel's own "CUDA - Sysmem Fallback Policy")
-    // are invisible to nvidia-smi entirely. Windows' own WDDM performance
-    // counter is vendor-agnostic though (any driver model, any API) -- an
-    // NVIDIA process's pid publishes the identical "GPU Process Memory"
-    // category a Vulkan/AMD process's does, so reading it here catches
-    // exactly what nvidia-smi can't, on Windows only (Linux CUDA has no
-    // equivalent silent-paging mechanism to read -- see
-    // GpuMemoryReading.processShared's own doc comment).
-    if (osPlatform() === "win32") {
-      const sharedMib = await readWindowsProcessSharedMib(pid);
-      if (sharedMib != null) processSharedReading = reading(sharedMib, "exact", "process_gpu_usage");
+    // are invisible to nvidia-smi entirely, per process and per adapter alike.
+    // Windows' own WDDM performance counters are vendor-agnostic though, so
+    // they are read on Windows only (Linux CUDA has no equivalent silent-paging
+    // mechanism to read -- see GpuMemoryReading.processShared's own doc comment).
+    const [processUsedMib, wddm] = await Promise.all([
+      readNvidiaSmiProcessUsed(pid),
+      osPlatform() === "win32" ? readWindowsCudaMemory(pid) : Promise.resolve(null),
+    ]);
+    // null = no source attributed this process yet (nvidia-smi's compute-apps
+    // polling or the WDDM instance lags a fresh spawn) -- no process reading
+    // this tick, not a measured 0.
+    const dedicatedMib = processUsedMib ?? wddm?.dedicatedMib ?? null;
+    if (dedicatedMib != null) processReading = reading(dedicatedMib, "exact", "process_gpu_usage");
+    if (wddm?.sharedMib != null) processSharedReading = reading(wddm.sharedMib, "exact", "process_gpu_usage");
+    // Same accuracy/source label as `used`: a driver-reported whole-adapter
+    // figure, every process on the card included.
+    if (wddm?.adapterSharedMib != null) {
+      usedSharedReading = reading(wddm.adapterSharedMib, "high", "driver_reported_memory");
     }
   }
   return {
     total: totalReading,
     used: usedReading,
+    ...(usedSharedReading ? { usedShared: usedSharedReading } : {}),
     ...(processReading ? { process: processReading } : {}),
     ...(processSharedReading ? { processShared: processSharedReading } : {}),
   };

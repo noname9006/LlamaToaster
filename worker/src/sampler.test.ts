@@ -129,4 +129,47 @@ describe("MemorySampler VRAM peak semantics", () => {
     // rather than over-report from background GPU activity.
     expect(stats.vram_process_peak_mib).toBe(2000);
   });
+
+  it("tracks whole-adapter shared memory as its own stream, separate from the process's shared memory", async () => {
+    mockReadGpuMemory.mockResolvedValueOnce({
+      total: wholeAdapter(2048),
+      used: wholeAdapter(1949),
+      usedShared: wholeAdapter(430), // every process's system-RAM-backed GPU memory on the card
+      process: process(1949),
+      processShared: process(414), // this load's own share of it
+    } satisfies GpuMemoryReading);
+
+    const sampler = new MemorySampler();
+    (sampler as unknown as { pid: number; backend: string }).pid = TEST_PID;
+    (sampler as unknown as { pid: number; backend: string }).backend = "cuda";
+    await tick(sampler);
+
+    const stats = sampler.stats;
+    expect(stats.vram_total_shared_peak_mib).toBe(430);
+    expect(stats.vram_total_shared_avg_mib).toBe(430);
+    expect(stats.vram_total_shared_accuracy).toBe("high");
+    expect(stats.vram_process_shared_peak_mib).toBe(414);
+    // Shared memory never leaks into the dedicated whole-adapter stream.
+    expect(stats.vram_total_used_peak_mib).toBe(1949);
+  });
+
+  it("reports whole-adapter shared memory as unavailable, not zero, when the backend never read it", async () => {
+    mockReadGpuMemory.mockResolvedValueOnce({
+      total: wholeAdapter(8176),
+      used: wholeAdapter(3000),
+      process: process(2800),
+      processShared: process(100),
+    } satisfies GpuMemoryReading);
+
+    const sampler = new MemorySampler();
+    (sampler as unknown as { pid: number; backend: string }).pid = TEST_PID;
+    (sampler as unknown as { pid: number; backend: string }).backend = "vulkan";
+    await tick(sampler);
+
+    const stats = sampler.stats;
+    expect(stats.vram_total_shared_peak_mib).toBeNull();
+    expect(stats.vram_total_shared_avg_mib).toBeNull();
+    expect(stats.vram_total_shared_accuracy).toBe("unavailable");
+    expect(stats.vram_total_shared_source).toBeNull();
+  });
 });
