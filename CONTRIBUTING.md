@@ -17,7 +17,7 @@ shared/   TypeScript types shared by server, worker, and client
 
 ## Setup
 
-Requires Node.js 22+.
+Requires Node.js 22.22.2+ (jsdom 30, used by the client tests, needs it).
 
 ```bash
 npm install          # root deps; postinstall also installs client/ and admin/

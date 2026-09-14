@@ -9,7 +9,7 @@
     "url": "git+https://github.com/noname9006/LlamaToaster.git"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=22.22.2"
   },
   "type": "module",
   "bin": {
