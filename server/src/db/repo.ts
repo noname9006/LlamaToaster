@@ -3429,8 +3429,9 @@ export const repo = {
               ram_needed_mib, ram_free_mib, ram_peak_mib, vram_process_peak_mib, ram_total_peak_mib,
               vram_shared_peak_mib, gen_tps, error, created_at,
               reused_from_run_id, vram_discrepancy, gpu_layers_resident_est, gpu_layers_resident_exact,
-              pp_tps, ttft_ms, prefill_cliff, host_backed_method, host_backed_slope, kv_host_backed_frac)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+              pp_tps, ttft_ms, prefill_cliff, host_backed_method, host_backed_slope, kv_host_backed_frac,
+              vram_shared_total_peak_mib, vram_claimed_peak_mib)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         );
         input.attempts.forEach((a, seq) => {
           insert.run(
@@ -3465,7 +3466,9 @@ export const repo = {
             a.prefill_cliff === undefined ? null : a.prefill_cliff ? 1 : 0,
             a.host_backed_method ?? null,
             a.host_backed_slope ?? null,
-            a.kv_host_backed_frac ?? null
+            a.kv_host_backed_frac ?? null,
+            a.vram_shared_total_peak_mib ?? null,
+            a.vram_claimed_peak_mib ?? null
           );
         });
       });
@@ -3503,8 +3506,9 @@ export const repo = {
               ram_needed_mib, ram_free_mib, ram_peak_mib, vram_process_peak_mib, ram_total_peak_mib,
               vram_shared_peak_mib, gen_tps, error, created_at,
               reused_from_run_id, vram_discrepancy, gpu_layers_resident_est, gpu_layers_resident_exact,
-              pp_tps, ttft_ms, prefill_cliff, host_backed_method, host_backed_slope, kv_host_backed_frac)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              pp_tps, ttft_ms, prefill_cliff, host_backed_method, host_backed_slope, kv_host_backed_frac,
+              vram_shared_total_peak_mib, vram_claimed_peak_mib)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(run_id, seq) DO UPDATE SET
              candidate_ctx = excluded.candidate_ctx,
              ngl = excluded.ngl,
@@ -3532,7 +3536,9 @@ export const repo = {
              prefill_cliff = excluded.prefill_cliff,
              host_backed_method = excluded.host_backed_method,
              host_backed_slope = excluded.host_backed_slope,
-             kv_host_backed_frac = excluded.kv_host_backed_frac`
+             kv_host_backed_frac = excluded.kv_host_backed_frac,
+             vram_shared_total_peak_mib = excluded.vram_shared_total_peak_mib,
+             vram_claimed_peak_mib = excluded.vram_claimed_peak_mib`
         )
         .run(
           uuid(),
@@ -3566,7 +3572,9 @@ export const repo = {
           a.prefill_cliff === undefined ? null : a.prefill_cliff ? 1 : 0,
           a.host_backed_method ?? null,
           a.host_backed_slope ?? null,
-          a.kv_host_backed_frac ?? null
+          a.kv_host_backed_frac ?? null,
+          a.vram_shared_total_peak_mib ?? null,
+          a.vram_claimed_peak_mib ?? null
         );
     },
   },
@@ -3792,6 +3800,8 @@ export interface ProbeAttemptRow {
   host_backed_method: string | null;
   host_backed_slope: number | null;
   kv_host_backed_frac: number | null;
+  vram_shared_total_peak_mib: number | null;
+  vram_claimed_peak_mib: number | null;
 }
 
 // N4 storage shapes.

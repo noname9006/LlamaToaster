@@ -360,6 +360,12 @@ const COLUMN_MIGRATIONS: ColumnSpec[] = [
   { table: "probe_attempts", column: "host_backed_method", ddlType: "TEXT" },
   { table: "probe_attempts", column: "host_backed_slope", ddlType: "REAL" },
   { table: "probe_attempts", column: "kv_host_backed_frac", ddlType: "REAL" },
+  // Context tests table: "Shared" split into total/llama like the peak
+  // columns, plus "claimed" -- llama-server's dedicated + shared GPU memory
+  // summed within one reading. See shared/types.ts's ProbeAttemptReport for
+  // both. NULL on every rung reported before this migration.
+  { table: "probe_attempts", column: "vram_shared_total_peak_mib", ddlType: "REAL" },
+  { table: "probe_attempts", column: "vram_claimed_peak_mib", ddlType: "REAL" },
 ];
 
 function applyColumnMigrations(database: Database.Database): void {

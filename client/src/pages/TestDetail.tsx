@@ -3,6 +3,7 @@ import { ProfileCards } from "../components/ProfileCards";
 import { SustainedState } from "../components/SustainedState";
 import { CurvesPanel, KneeChart } from "../components/CurvesPanel";
 import { ProbeAttempts } from "../components/ProbeAttempts";
+import { ProbeFrontier } from "../components/ProbeFrontier";
 import { api as apiClient } from "../api/client";
 import { priceMatrix, ETA_UNAVAILABLE } from "../../../shared/pricing";
 import { useParams, Link } from "react-router-dom";
@@ -25,6 +26,7 @@ import { Tooltip } from "../components/Tooltip";
 import { IconInfo } from "../components/icons";
 import type {
   Test,
+  TestConfig,
   ResultRow,
   TestItem,
   GpuMemoryAccuracyLevel,
@@ -33,6 +35,13 @@ import type {
   Worker,
 } from "../types";
 import { shortId, formatElapsed, formatFlashAttn } from "../utils";
+
+// Which search a probe run actually ran. Only "frontier" produces a curve
+// across context stops; every other mode answers with a single placement, for
+// which the rung table alone is the whole story.
+function probeMode(run: Test): string | undefined {
+  return (run.config as TestConfig)?.probe?.mode;
+}
 
 interface ColDef {
   label: string;
@@ -1121,11 +1130,19 @@ export function TestDetail() {
                         Queued, waiting its turn behind another scenario on this worker…
                       </p>
                     ) : (
-                      <ProbeAttempts testId={m.id} refreshKey={pollTick} />
+                      <div className="flex flex-col gap-3">
+                        {probeMode(m) === "frontier" && <ProbeFrontier testId={m.id} refreshKey={pollTick} />}
+                        <ProbeAttempts testId={m.id} refreshKey={pollTick} />
+                      </div>
                     )}
                   </div>
                 ))
-              : <ProbeAttempts testId={id} refreshKey={pollTick} />}
+              : (
+                  <div className="flex flex-col gap-3">
+                    {run != null && probeMode(run) === "frontier" && <ProbeFrontier testId={id} refreshKey={pollTick} />}
+                    <ProbeAttempts testId={id} refreshKey={pollTick} />
+                  </div>
+                )}
           </div>
         </section>
       )}

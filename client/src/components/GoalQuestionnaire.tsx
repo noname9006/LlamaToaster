@@ -168,6 +168,20 @@ export interface PlacementVerifyResult {
    * actually running -- only meaningful while status is "pending". See
    * ModeCard's own dot rendering. */
   runStatus?: "scheduled" | "running";
+  /**
+   * The frontier mode's real answer: the settled (ctx, layers) points, in
+   * ascending context order. Absent for every other mode, which answer with a
+   * single placement.
+   *
+   * The card cannot be summarised by "the winning rung" when a whole curve was
+   * measured. The stored ceiling is the largest context that passed, and on a
+   * machine where context is expensive that is frequently the rung with NO
+   * layers on the GPU -- a true statement, and a useless headline, and worse as
+   * something to apply to the sliders. With the curve here the card can name
+   * both ends and apply the point that matches the context the user is actually
+   * aiming at.
+   */
+  curve?: { ctx: number; ngl: number }[];
 }
 
 const GOAL_CHOICES: { value: GoalKind; label: string }[] = [
@@ -222,13 +236,36 @@ function haircut(freeMib: number | null, frac: number): number | null {
 function appliedConfig(
   result: PlacementVerifyResult | null,
   start: { ngl: number; ctx: number },
-  trainedCtx: number | null
+  trainedCtx: number | null,
+  targetCtx?: number
 ): { ngl: number; ctx: number } {
-  if (result?.status !== "verified" || result.verifiedCtxTokens == null) return start;
+  if (result?.status !== "verified") return start;
+  // A curve has no single answer to apply, so it answers the question the user
+  // has already asked with the context slider: the measured point at the
+  // largest context they are still willing to accept. Applying the curve's own
+  // top end instead would routinely set 0 layers, since the largest context
+  // that loads is usually the one that put nothing on the GPU.
+  if (result.curve && result.curve.length > 0) {
+    const wanted = targetCtx ?? start.ctx;
+    const atOrBelow = result.curve.filter((p) => p.ctx <= wanted);
+    const point = atOrBelow.length > 0 ? atOrBelow[atOrBelow.length - 1] : result.curve[0];
+    return { ngl: point.ngl, ctx: point.ctx };
+  }
+  if (result.verifiedCtxTokens == null) return start;
   return {
     ngl: result.measuredNgl ?? start.ngl,
     ctx: snapToSafeCtx(result.verifiedCtxTokens, trainedCtx ?? result.verifiedCtxTokens),
   };
+}
+
+// Two ends of a measured curve, e.g. "40 layers @ 16k → 26 @ 256k". The span
+// IS the finding: one number cannot say that context costs layers here.
+function describeCurve(curve: { ctx: number; ngl: number }[]): string {
+  const short = (v: number) => (v >= 1024 && v % 1024 === 0 ? `${v / 1024}k` : v.toLocaleString());
+  const first = curve[0];
+  const last = curve[curve.length - 1];
+  if (curve.length === 1 || first.ngl === last.ngl) return `${first.ngl} layers @ ${short(first.ctx)}–${short(last.ctx)}`;
+  return `${first.ngl} layers @ ${short(first.ctx)} → ${last.ngl} @ ${short(last.ctx)}`;
 }
 
 const GRANULARITY_LABEL: Record<ProbeGranularity, string> = {
@@ -240,6 +277,13 @@ const GRANULARITY_BLURB: Record<ProbeGranularity, string> = {
   basic: "Converges on a value within about 1/16th of the search range.",
   fine: "Converges four times tighter — more precise, more loads.",
 };
+
+// The Wizard's frontier search has no finer grid to converge onto: its answer
+// is one layer boundary per context stop, and layers are already whole
+// numbers. So this control only changes what Targets does, and says so rather
+// than sitting there looking effective.
+const GRANULARITY_INERT_NOTE =
+  "Applies to Targets. The Wizard measures a layer boundary at each context stop, which has no finer setting.";
 
 // The context-target slider stops now live in shared/probeLadder.ts, so the
 // slider and the probe cannot disagree about what a legal context is --
@@ -723,6 +767,13 @@ export function GoalQuestionnaire({
 // combination except "nothing pinned" (that's the Wizard card instead).
 const TARGETS_FAMILY_MODES: ProbeMode[] = ["keep_context", "fixed_offload", "custom"];
 
+// What the Wizard card dispatches as. It used to be "max_gpu", which reports
+// ONE placement: the most layers that fit at the cheapest context, then the
+// largest context at that placement. "frontier" answers the question that
+// single corner cannot -- what context COSTS in layers -- by resolving a layer
+// boundary per context stop, and reports the whole staircase.
+const WIZARD_MODE: ProbeMode = "frontier";
+
 // The Step-2 fit matrix: an offload slider paired with the context slider
 // above it, live dual-pool (VRAM+RAM) indicators, an inaccuracy warning, and
 // the Tested-configurations row -- Wizard and Targets, each able to fire a
@@ -745,8 +796,8 @@ function PlacementMatrix({
   onApplyConfig: (ngl: number, ctx: number) => void;
 }) {
   const [granularity, setGranularity] = useState<ProbeGranularity>("basic");
-  // Two scenarios, not six modes: Wizard is nothing pinned (max_gpu's own
-  // layer-then-context search); Targets pins context, offload, or both onto
+  // Two scenarios, not six modes: Wizard is nothing pinned (the frontier
+  // search, see WIZARD_MODE); Targets pins context, offload, or both onto
   // whichever underlying ProbeMode answers that combination. Selecting a
   // card IS clicking it; both cards can be queued together, exactly as
   // several of the old six could be -- purely local, ephemeral UI state,
@@ -763,6 +814,10 @@ function PlacementMatrix({
 
   const targetsMode: ProbeMode =
     targetsPin === "both" ? "custom" : targetsPin === "ngl" ? "fixed_offload" : "keep_context";
+  // Granularity is a Targets-only setting (see GRANULARITY_INERT_NOTE), so it
+  // goes quiet when the Wizard is the only thing selected. Still live when
+  // nothing is selected: the choice is about the run the user is building.
+  const granularityInert = wizardSelected && !targetsSelected;
   const selectedScenarioCount = (wizardSelected ? 1 : 0) + (targetsSelected ? 1 : 0);
   const targetsFamilyBusy = TARGETS_FAMILY_MODES.some(
     (m) => placement.verifyResults[m]?.status === "pending" || placement.heldModes.has(m)
@@ -813,6 +868,10 @@ function PlacementMatrix({
     const maxCtxStart = affordable.tokens > 0 ? Math.min(affordable.tokens, trainedCtx ?? affordable.tokens) : ctx;
     return {
       max_gpu: { ngl: placement.nglMax, ctx: PROBE_LADDER_MIN_CTX },
+      // Same opening rung as max_gpu -- every layer at the cheapest context --
+      // but it carries on across the context ladder instead of stopping at the
+      // placement that rung settles on.
+      frontier: { ngl: placement.nglMax, ctx: PROBE_LADDER_MIN_CTX },
       // ngl is a placeholder for the payload only: max_context searches for
       // its own starting layer count worker-side (bestNglForMaxContext), so
       // the card renders this one as "searched" rather than as a promise --
@@ -836,7 +895,7 @@ function PlacementMatrix({
   // up the new combination.
   async function handleRunTest(): Promise<void> {
     const modes: ProbeMode[] = [];
-    if (wizardSelected) modes.push("max_gpu");
+    if (wizardSelected) modes.push(WIZARD_MODE);
     if (targetsSelected) modes.push(targetsMode);
     if (modes.length === 0) return;
     setRunning(true);
@@ -942,14 +1001,21 @@ function PlacementMatrix({
             </small>
           </span>
           <div className="flex items-center gap-2">
-            <div className="inline-flex overflow-hidden rounded-lg border border-border" role="radiogroup" aria-label="Test granularity">
+            <div
+              className={`inline-flex overflow-hidden rounded-lg border border-border ${granularityInert ? "opacity-40" : ""}`}
+              role="radiogroup"
+              aria-label="Test granularity"
+              aria-disabled={granularityInert}
+              title={granularityInert ? GRANULARITY_INERT_NOTE : undefined}
+            >
               {PROBE_GRANULARITIES.map((value) => (
                 <button
                   key={value}
                   type="button"
                   role="radio"
                   aria-checked={granularity === value}
-                  title={GRANULARITY_BLURB[value]}
+                  disabled={granularityInert}
+                  title={granularityInert ? GRANULARITY_INERT_NOTE : GRANULARITY_BLURB[value]}
                   onClick={() => setGranularity(value)}
                   className={
                     granularity === value
@@ -996,10 +1062,10 @@ function PlacementMatrix({
 
         <div className="mt-2 flex flex-wrap gap-2">
           {(() => {
-            const wizardStart = modeStarts.max_gpu;
-            const wizardResult = placement.verifyResults.max_gpu ?? null;
+            const wizardStart = modeStarts[WIZARD_MODE];
+            const wizardResult = placement.verifyResults[WIZARD_MODE] ?? null;
             const wizardBusy = wizardResult?.status === "pending";
-            const wizardHeld = placement.heldModes.has("max_gpu");
+            const wizardHeld = placement.heldModes.has(WIZARD_MODE);
             const targetsStart = modeStarts[targetsMode];
             const targetsResult = placement.verifyResults[targetsMode] ?? null;
             // Targets' identity moves with its pins, but a probe already
@@ -1020,15 +1086,17 @@ function PlacementMatrix({
             // slider cannot express); down, never up, so applying never
             // claims a context that wasn't loaded.
             const applyFrom = (result: PlacementVerifyResult | null, start: { ngl: number; ctx: number }) => {
-              const applied = appliedConfig(result, start, trainedCtx);
+              // ctx is the user's own context target -- what a curve result is
+              // read against (see appliedConfig).
+              const applied = appliedConfig(result, start, trainedCtx, ctx);
               onApplyConfig(applied.ngl, applied.ctx);
             };
             return (
               <>
                 <ModeCard
-                  mode="max_gpu"
+                  mode={WIZARD_MODE}
                   label="Wizard"
-                  blurb="Nothing pinned: finds the paging boundary at the cheapest context, then pushes context to the trained ceiling at that placement."
+                  blurb="Nothing pinned: maps how many layers fit at each context, so you can see what context costs rather than one placement."
                   start={wizardStart}
                   selected={wizardSelected}
                   busy={wizardBusy}
@@ -1039,7 +1107,7 @@ function PlacementMatrix({
                     setWizardSelected((v) => !v);
                     applyFrom(wizardResult, wizardStart);
                   }}
-                  onReset={() => placement.onReset("max_gpu")}
+                  onReset={() => placement.onReset(WIZARD_MODE)}
                 />
                 <ModeCard
                   mode={targetsMode}
@@ -1147,7 +1215,7 @@ function ModeCard({
   onReset,
 }: {
   /** Which underlying search this card's result/reset/start actually refer
-   * to -- Wizard's is fixed at "max_gpu"; Targets' moves with its pins. */
+   * to -- Wizard's is fixed at WIZARD_MODE; Targets' moves with its pins. */
   mode: ProbeMode;
   label: string;
   blurb: string;
@@ -1229,8 +1297,16 @@ function ModeCard({
         )}
         {result?.status === "verified" && (
           <span className="block font-mono text-[11px] font-semibold text-success">
-            ✓ {(result.verifiedCtxTokens ?? result.ctx).toLocaleString()} tokens
-            {result.measuredNgl != null ? ` · ${result.measuredNgl} layers` : ""}
+            {result.curve && result.curve.length > 0 ? (
+              <span title="The layer split measured at each context. Clicking this card applies the point at your current context target.">
+                ✓ {describeCurve(result.curve)}
+              </span>
+            ) : (
+              <>
+                ✓ {(result.verifiedCtxTokens ?? result.ctx).toLocaleString()} tokens
+                {result.measuredNgl != null ? ` · ${result.measuredNgl} layers` : ""}
+              </>
+            )}
           </span>
         )}
         {failedCapacity && <span className="block font-mono text-[11px] font-semibold text-danger">✗ didn’t fit</span>}
