@@ -861,6 +861,14 @@ export async function testsRoutes(app: FastifyInstance): Promise<void> {
           "that machine runs an older worker build — update it to probe on this model."
         );
       }
+      // The frontier mode measures one boundary per context stop rather than a
+      // single placement; a worker that never heard of it would run no rungs at
+      // all and report a probe that "converged" on nothing.
+      if (body.kind === "probe" && body.probe?.mode === "frontier" && !capabilities.has("probe-frontier-v1")) {
+        throw new ConflictError(
+          "that machine runs an older worker build — update it to map context against layers on this model."
+        );
+      }
       if (body.kind === "quality" && !capabilities.has("quality-v1")) {
         throw new ConflictError(
           "that machine runs an older worker build — update it to measure quality on this model."
