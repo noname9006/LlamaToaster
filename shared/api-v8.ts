@@ -81,9 +81,18 @@ export interface ProbeAttemptDto {
    * shared-memory counter) and from workers predating the check. */
   host_backed_method: "slope" | "ratio" | null;
   host_backed_slope: number | null;
-  /** See ProbeAttemptReport.kv_host_backed_frac -- fails the rung above
-   * KV_HOST_BACKED_FAIL_FRAC. */
+  /** See ProbeAttemptReport.kv_host_backed_frac -- only from a worker
+   * predating the measured gpu_* fields below. */
   kv_host_backed_frac: number | null;
+  /** The measured spill -- see ProbeAttemptReport.gpu_buffers_mib. Null where
+   * it could not be measured, and on every row from an older worker (whose
+   * verdict the host_backed_* and kv_host_backed_frac fields above record). */
+  gpu_buffers_mib: number | null;
+  gpu_in_system_ram_mib: number | null;
+  gpu_spill_jitter_mib: number | null;
+  /** See ProbeAttemptReport.host_backed_fail. Null from a worker predating it,
+   * where the reason has to be re-derived from the other fields. */
+  host_backed_fail: "layers" | "cache" | null;
   error: string | null;
   created_at: number;
   /** Set when this rung was never actually loaded, but reused verbatim from
@@ -143,6 +152,13 @@ export interface ProbeDedupPoint {
   host_backed_method: "slope" | "ratio" | null;
   host_backed_slope: number | null;
   kv_host_backed_frac: number | null;
+  /** See ProbeAttemptDto.gpu_buffers_mib / host_backed_fail. Without them a
+   * reused rung reads as "never measured" and, when it failed, loses which
+   * spill failed it. */
+  gpu_buffers_mib: number | null;
+  gpu_in_system_ram_mib: number | null;
+  gpu_spill_jitter_mib: number | null;
+  host_backed_fail: "layers" | "cache" | null;
   /** See ProbeAttemptDto.vram_discrepancy; coerced to false for a sibling row
    * predating the check, same as ok/oom/spill's own boolean coercion above. */
   vram_discrepancy: boolean;

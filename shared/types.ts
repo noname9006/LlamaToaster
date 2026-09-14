@@ -1746,9 +1746,22 @@ export interface ProbeAttemptReport {
   host_backed_method?: "slope" | "ratio" | null;
   host_backed_slope?: number | null;
   // CONTEXT axis only: the share of this context's newly allocated memory the
-  // OS put in system RAM. Above shared/vramEstimate.ts's
-  // KV_HOST_BACKED_FAIL_FRAC the rung failed; below it, reported only.
+  // OS put in system RAM. Sent only by workers predating the measured gpu_*
+  // fields below, whose slope-based detector failed a rung above 0.6.
   kv_host_backed_frac?: number | null;
+  // The measured spill (shared/gpuSpill.ts): every buffer llama.cpp reported
+  // putting on the GPU, how much of that this process's dedicated VRAM did NOT
+  // hold once loaded (negative when VRAM holds more, the normal clean reading),
+  // and how far the dedicated readings moved -- the only tolerance the rule
+  // applies. Null where the spill could not be measured; absent from a worker
+  // predating them. host_backed_method/host_backed_slope/kv_host_backed_frac
+  // above are what those older workers sent instead.
+  gpu_buffers_mib?: number | null;
+  gpu_in_system_ram_mib?: number | null;
+  gpu_spill_jitter_mib?: number | null;
+  // Which spill failed this rung: the layers (no smaller context fixes it) or
+  // the context's buffers. Null on a pass or any other failure.
+  host_backed_fail?: "layers" | "cache" | null;
   // What computeDualPoolFit PREDICTED this rung would need, and what the
   // machine actually had free just before the load -- the predicted-vs-real
   // pair that until now only ever reached a log line.

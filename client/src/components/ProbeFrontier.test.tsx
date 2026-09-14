@@ -1,8 +1,8 @@
 // Real render against crafted rungs, with the fetch and the canvas mocked.
 // What matters here is that the table says where each number CAME FROM: a
 // stop nobody loaded must not read like a measurement, a stop the budget never
-// reached must not read like a boundary, and a pass whose cache placement was
-// never judged has to carry its warning.
+// reached must not read like a boundary, and a pass whose memory placement was
+// never measured has to carry its warning.
 
 import { describe, expect, it, vi } from "vitest";
 import { render, screen, within } from "@testing-library/react";
@@ -19,6 +19,7 @@ vi.mock("./Chart", () => ({ Chart: () => <div data-testid="chart" /> }));
 
 import { ProbeFrontier } from "./ProbeFrontier";
 
+// Measured and clean by default: llama.cpp's buffers all in VRAM.
 function row(overrides: Partial<ProbeAttemptDto>): ProbeAttemptDto {
   return {
     id: `a${attempts.length}`, run_id: "r1", worker_id: "w1", model_id: "m1", seq: attempts.length,
@@ -28,6 +29,7 @@ function row(overrides: Partial<ProbeAttemptDto>): ProbeAttemptDto {
     vram_shared_total_peak_mib: null, vram_claimed_peak_mib: null,
     gen_tps: 22.5, pp_tps: 400, ttft_ms: 700, prefill_cliff: 0,
     host_backed_method: null, host_backed_slope: null, kv_host_backed_frac: null,
+    gpu_buffers_mib: 6190, gpu_in_system_ram_mib: -10, gpu_spill_jitter_mib: 0, host_backed_fail: null,
     error: null, created_at: 0, reused_from_run_id: null, vram_discrepancy: 0,
     gpu_layers_resident_est: null, gpu_layers_resident_exact: null,
     ...overrides,
@@ -47,7 +49,7 @@ async function renderCurve(rows: ProbeAttemptDto[]) {
 const FLAT = [
   row({ candidate_ctx: 1024, ngl: 12, ok: 1 }),
   row({ candidate_ctx: 1024, ngl: 13, ok: 0 }),
-  row({ candidate_ctx: 8192, ngl: 12, ok: 1, kv_host_backed_frac: 0.1 }),
+  row({ candidate_ctx: 8192, ngl: 12, ok: 1 }),
 ];
 
 describe("ProbeFrontier", () => {
@@ -69,6 +71,7 @@ describe("ProbeFrontier", () => {
     const { bodyRows } = await renderCurve(FLAT);
     expect(within(bodyRows[0]).getByText("6,200 MiB")).toBeInTheDocument();
     expect(within(bodyRows[0]).getByText("22.5")).toBeInTheDocument();
+    expect(within(bodyRows[0]).getByText("none")).toBeInTheDocument();
     // An implied stop has no rung of its own, so it has no measurements.
     expect(within(bodyRows[1]).queryByText("6,200 MiB")).not.toBeInTheDocument();
   });
@@ -78,14 +81,14 @@ describe("ProbeFrontier", () => {
     expect(screen.getByText(/gen tok\/s \(empty cache\)/)).toBeInTheDocument();
   });
 
-  it("warns when a stop rests on a pass whose cache placement was never judged", async () => {
+  it("warns when a stop rests on a pass whose placement was never measured", async () => {
     const { bodyRows } = await renderCurve([
-      row({ candidate_ctx: 1024, ngl: 12, ok: 1 }),
+      row({ candidate_ctx: 1024, ngl: 12, ok: 1, gpu_in_system_ram_mib: null, gpu_buffers_mib: null }),
       row({ candidate_ctx: 1024, ngl: 13, ok: 0 }),
-      // No kv_host_backed_frac: the check could not run on this worker.
-      row({ candidate_ctx: 8192, ngl: 12, ok: 1, kv_host_backed_frac: null }),
+      // No measurement: an older worker, or a platform with no per-process VRAM reading.
+      row({ candidate_ctx: 8192, ngl: 12, ok: 1, gpu_in_system_ram_mib: null, gpu_buffers_mib: null }),
     ]);
-    expect(within(bodyRows[3]).getByTitle(/cache stayed in VRAM was never measured/)).toBeInTheDocument();
+    expect(within(bodyRows[3]).getByTitle(/was never measured on this worker/)).toBeInTheDocument();
     expect(screen.getByText(/allocation ceilings, not speeds/)).toBeInTheDocument();
   });
 
@@ -93,7 +96,7 @@ describe("ProbeFrontier", () => {
     const { bodyRows } = await renderCurve([
       row({ candidate_ctx: 1024, ngl: 12, ok: 1 }),
       row({ candidate_ctx: 1024, ngl: 13, ok: 0 }),
-      row({ candidate_ctx: 8192, ngl: 12, ok: 0, kv_host_backed_frac: 0.9 }),
+      row({ candidate_ctx: 8192, ngl: 12, ok: 0, host_backed_fail: "cache" }),
     ]);
     const top = bodyRows[3];
     expect(within(top).getByText("not measured")).toBeInTheDocument();
@@ -109,8 +112,8 @@ describe("ProbeFrontier", () => {
     const { bodyRows } = await renderCurve([
       row({ candidate_ctx: 1024, ngl: 12, ok: 1 }),
       row({ candidate_ctx: 1024, ngl: 13, ok: 0 }),
-      row({ candidate_ctx: 4096, ngl: 9, ok: 1, kv_host_backed_frac: 0.2 }),
-      row({ candidate_ctx: 8192, ngl: 12, ok: 0, kv_host_backed_frac: 0.9 }),
+      row({ candidate_ctx: 4096, ngl: 9, ok: 1 }),
+      row({ candidate_ctx: 8192, ngl: 12, ok: 0, host_backed_fail: "cache" }),
     ]);
     const partial = bodyRows[2]; // 4096: 9 loaded, 12 unproven, boundary unknown
     expect(within(partial).getByText("not measured")).toBeInTheDocument();

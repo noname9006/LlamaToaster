@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  bestLadderEvidence,
   bestLadderResult,
   bestNglAtContext,
   bestNglForMaxContext,
@@ -404,7 +405,7 @@ describe("the ladder as a whole", () => {
 
     it("carries a pass DOWN the context axis and a failure UP it", () => {
       const resolved = curve([
-        { ctx: 32_768, ngl: 20, ok: true, ctxVerdictMeasured: true },
+        { ctx: 32_768, ngl: 20, ok: true, placementJudged: true },
         { ctx: 32_768, ngl: 21, ok: false },
       ]);
       // The stop that was measured.
@@ -424,7 +425,7 @@ describe("the ladder as a whole", () => {
       const resolved = curve([
         { ctx: 1024, ngl: 12, ok: true },
         { ctx: 1024, ngl: 13, ok: false },
-        { ctx: TRAINED, ngl: 12, ok: true, ctxVerdictMeasured: true },
+        { ctx: TRAINED, ngl: 12, ok: true, placementJudged: true },
       ]);
       expect(resolved.every((s) => s.resolved)).toBe(true);
       expect(resolved.every((s) => s.ngl === 12)).toBe(true);
@@ -436,9 +437,11 @@ describe("the ladder as a whole", () => {
       expect(resolved.every((s) => s.firstFailingNgl === 30)).toBe(true);
     });
 
-    it("marks a stop resolved by a pass whose cache was never judged", () => {
-      const [floor] = curve([{ ctx: 1024, ngl: 48, ok: true }]);
+    it("marks a stop resolved by a pass whose placement was never measured", () => {
+      const [floor] = curve([{ ctx: 1024, ngl: 48, ok: true, placementJudged: true }]);
       expect(floor).toMatchObject({ resolved: true, unverified: false });
+      // Every stop needs its own measurement now, the floor included.
+      expect(curve([{ ctx: 1024, ngl: 48, ok: true }])[0]).toMatchObject({ resolved: true, unverified: true });
       const top = curve([
         { ctx: 1024, ngl: 12, ok: true },
         { ctx: 1024, ngl: 13, ok: false },
@@ -461,17 +464,6 @@ describe("the ladder as a whole", () => {
       // every stop in between.
       expect(resolveFrontier({ history: rungs.slice(0, firstAbove), stops, nglMax: NGL_MAX })[0].resolved).toBe(true);
       expect(rungs[firstAbove].ctx).toBe(TRAINED);
-    });
-
-    it("never loads a rung above the floor whose layer count has no cheaper reference", () => {
-      const rungs = runLadder({ mode: "frontier", granularity: "basic", candidateCtx: 32_768, candidateNgl: 27 });
-      for (const [i, rung] of rungs.entries()) {
-        // ngl 0 is exempt: nothing is claimed on the GPU, so there is no
-        // placement for the check to judge and no reference worth a load.
-        if (rung.ctx === PROBE_LADDER_MIN_CTX || rung.ngl === 0) continue;
-        const reference = rungs.slice(0, i).some((r) => r.ngl === rung.ngl && r.ctx < rung.ctx);
-        expect({ rung, reference }).toMatchObject({ reference: true });
-      }
     });
 
     it("produces a staircase that only ever steps down", () => {
@@ -934,6 +926,50 @@ describe("bestLadderResult", () => {
       { ctx: 32_768, ngl: 27, ok: false },
     ]);
     expect(best).toEqual({ ctx: 16_384, ngl: 27, ok: true });
+  });
+
+  // The RTX 3080 frontier probe: 262144 tokens at 15 layers was reported from a
+  // load nothing had measured, while 6 layers at the same context had been.
+  it("prefers a pass whose placement was measured over a larger unmeasured one", () => {
+    const best = bestLadderEvidence([
+      { ctx: 1024, ngl: 20, ok: true, placementJudged: true },
+      { ctx: 262_144, ngl: 6, ok: true, placementJudged: true },
+      { ctx: 262_144, ngl: 15, ok: true, placementJudged: false },
+    ]);
+    expect(best).toEqual({ attempt: { ctx: 262_144, ngl: 6, ok: true, placementJudged: true }, judged: true });
+  });
+
+  // Metal, or a build that printed no buffer sizes: nothing can be measured, so
+  // the verdict is the largest pass as it always was -- only labelled.
+  it("keeps the largest pass where nothing could be measured", () => {
+    const best = bestLadderEvidence([
+      { ctx: 1024, ngl: 31, ok: true, placementJudged: false },
+      { ctx: 262_144, ngl: 31, ok: true, placementJudged: false },
+    ]);
+    expect(best).toMatchObject({ attempt: { ctx: 262_144, ngl: 31 }, judged: false });
+  });
+
+  it("does not let a measured failure switch the preference on", () => {
+    const best = bestLadderEvidence([
+      { ctx: 131_072, ngl: 12, ok: true, placementJudged: false },
+      { ctx: 262_144, ngl: 12, ok: false, placementJudged: true },
+    ]);
+    expect(best).toMatchObject({ attempt: { ctx: 131_072, ngl: 12 }, judged: false });
+  });
+
+  // A measured pass at a larger context proves the same layer count at every
+  // smaller one, so a stop resting on an unmeasured twin is still verified.
+  it("verifies a frontier stop through a measured pass at the same layers and a larger context", () => {
+    const resolved = resolveFrontier({
+      history: [
+        { ctx: 1024, ngl: 13, ok: false, placementJudged: true },
+        { ctx: 1024, ngl: 12, ok: true, placementJudged: false },
+        { ctx: 8192, ngl: 12, ok: true, placementJudged: true },
+      ],
+      stops: ctxLadderStops(8192),
+      nglMax: 40,
+    });
+    expect(resolved.every((s) => s.resolved && s.ngl === 12 && !s.unverified)).toBe(true);
   });
 });
 

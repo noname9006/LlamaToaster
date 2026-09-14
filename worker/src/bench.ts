@@ -494,6 +494,49 @@ export function parseModelBufferSizes(stderr: string): ModelBufferSizesByModel |
   };
 }
 
+// llama.cpp's whole allocation report for one load -- not only the weights'
+// "model buffer size" lines above but every buffer created after them. As
+// printed by b10956's llama-server, logger prefix included:
+//
+//   0.00.697.538 I load_tensors:      Vulkan0 model buffer size =   863.64 MiB
+//   0.02.210.847 I llama_context: Vulkan_Host  output buffer size =     0.58 MiB
+//   0.02.218.676 I llama_kv_cache:    Vulkan0 KV buffer size =    24.00 MiB
+//   0.02.240.524 I sched_reserve:    Vulkan0 compute buffer size =    33.01 MiB
+//   0.02.240.526 I sched_reserve: Vulkan_Host compute buffer size =     4.51 MiB
+//
+// plus "RS buffer size" for a hybrid model's recurrent state. Host-side buffers
+// (CPU, CPU_Mapped, CPU_REPACK, and the *_Host pinned staging buffers) are not
+// GPU memory and are left out. Weights are summed; every other kind keeps its
+// LAST reported size per device, because a context can be reserved more than
+// once and each reservation replaces the one before. Single-model loads only --
+// an MTP draft's buffers would be counted in. Null when no buffer line was seen
+// at all. The shape is shared/gpuSpill.ts's GpuBufferReport.
+const GPU_BUFFER_SIZE_LINE_RE = /^.*?:\s*(\S+)\s+(model|KV|RS|compute|output)\s+buffer size\s*=\s*([\d.]+)\s*MiB/;
+const HOST_BUFFER_NAME_RE = /^CPU|_Host$/i;
+
+export function parseGpuBufferReport(stderr: string): { deviceMib: number; contextMib: number } | null {
+  let seen = false;
+  let weightsMib = 0;
+  const latest = new Map<string, { kind: string; mib: number }>();
+  for (const line of stderr.split("\n")) {
+    const m = GPU_BUFFER_SIZE_LINE_RE.exec(line);
+    if (!m) continue;
+    seen = true;
+    const mib = Number(m[3]);
+    if (!Number.isFinite(mib) || HOST_BUFFER_NAME_RE.test(m[1])) continue;
+    if (m[2] === "model") weightsMib += mib;
+    else latest.set(`${m[1]}:${m[2]}`, { kind: m[2], mib });
+  }
+  if (!seen) return null;
+  let deviceMib = weightsMib;
+  let contextMib = 0;
+  for (const { kind, mib } of latest.values()) {
+    deviceMib += mib;
+    if (kind === "KV" || kind === "compute") contextMib += mib;
+  }
+  return { deviceMib, contextMib };
+}
+
 // ---------------------------------------------------------------------------
 // VRAM-discrepancy postmortem extraction. When a claimed-full offload turns
 // out not-resident (index.ts's finalizeSweepItemResult discrepancy check),

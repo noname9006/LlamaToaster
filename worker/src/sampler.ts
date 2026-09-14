@@ -16,10 +16,11 @@ export interface SampleStats {
   // sampled on the same interval.
   ram_total_peak_mib: number;
   ram_total_avg_mib: number;
-  // Best-available VRAM usage stream (legacy meaning, kept for the existing
-  // vram_avg/vram_peak columns, CSV names, and the VRAM-discrepancy
-  // heuristic): per-process when the backend could read it that tick,
-  // whole-adapter otherwise.
+  // WHOLE-ADAPTER VRAM usage (every process on the GPU combined), despite the
+  // name -- the legacy stream behind the vram_avg/vram_peak columns and CSV
+  // names. It is fed from the adapter-wide reading only, so its peak always
+  // equals vram_total_used_peak_mib below; vram_process_peak_mib is the
+  // per-process figure.
   vram_peak_mib: number | null;
   vram_avg_mib: number | null;
   // Whole-adapter VRAM usage (every process on the GPU combined) -- one
@@ -62,6 +63,13 @@ export interface SampleStats {
   // and platforms with no shared counter at all have no silent paging to
   // miss. Null when no per-process dedicated reading was ever taken.
   vram_process_claimed_peak_mib: number | null;
+  // This process's dedicated VRAM over only the readings taken after
+  // markLoaded() -- once every buffer llama.cpp allocates exists -- and how far
+  // those readings moved between each other. The pair shared/gpuSpill.ts holds
+  // llama.cpp's own buffer report against. Null until a reading lands after
+  // markLoaded, which the sweep paths never call.
+  vram_process_loaded_peak_mib: number | null;
+  vram_process_loaded_jitter_mib: number | null;
   vram_peak_accuracy: GpuMemoryAccuracyLevel;
   vram_peak_source: GpuMemoryMeasurementSource | null;
   vram_avg_accuracy: GpuMemoryAccuracyLevel;
@@ -170,10 +178,10 @@ export class MemorySampler {
   private ramTotalPeakBytes = 0;
   private ramTotalSumBytes = 0;
   private ramTotalSampleCount = 0;
-  // Best-available VRAM (process when the backend could read it this tick,
-  // else whole adapter) -- the legacy stream, keeps vram_peak_mib/vram_avg_mib
-  // semantics stable for every existing consumer (CSV names, the
-  // VRAM-discrepancy heuristic in worker/src/index.ts).
+  // Whole-adapter VRAM -- the legacy stream behind vram_peak_mib/vram_avg_mib,
+  // kept stable for every existing consumer (CSV names, the adapter-total
+  // spill rule). It never took the process's own reading; see vram_peak_mib's
+  // comment above.
   private vramPeakBytes = 0;
   private vramCurrentBytes = 0;
   private vramSumBytes = 0;
@@ -214,6 +222,12 @@ export class MemorySampler {
   // The process's per-tick dedicated+shared sum, peaked.
   private vramClaimedPeakBytes = 0;
   private vramClaimedMeasured = false;
+  // The process's dedicated readings after markLoaded() only -- see
+  // SampleStats.vram_process_loaded_peak_mib.
+  private loaded = false;
+  private loadedDedicatedMaxBytes = 0;
+  private loadedDedicatedMinBytes = 0;
+  private loadedDedicatedCount = 0;
   // M6 -- clock/temp samples, on the same tick as VRAM.
   private sensors = new SensorSampleBuffer();
 
@@ -261,6 +275,10 @@ export class MemorySampler {
     this.vramTotalSharedWorstSource = null;
     this.vramClaimedPeakBytes = 0;
     this.vramClaimedMeasured = false;
+    this.loaded = false;
+    this.loadedDedicatedMaxBytes = 0;
+    this.loadedDedicatedMinBytes = 0;
+    this.loadedDedicatedCount = 0;
     this.sensors.reset();
     this.sample();
     this.timer = setInterval(() => this.sample(), intervalMs);
@@ -272,6 +290,19 @@ export class MemorySampler {
       this.timer = null;
     }
     return this.stats;
+  }
+
+  // The model finished loading: every buffer llama.cpp will allocate for this
+  // load now exists, so dedicated readings from here on can be held against
+  // its own buffer report (shared/gpuSpill.ts).
+  markLoaded(): void {
+    this.loaded = true;
+  }
+
+  // One VRAM reading right now, outside the tick cadence -- so a load that
+  // finishes between two due ticks still has readings taken after markLoaded.
+  async sampleVramNow(): Promise<void> {
+    await this.readVram();
   }
 
   // M6's detection window is the TIMED work, not the spawn: server items
@@ -342,6 +373,12 @@ export class MemorySampler {
       vram_total_shared_accuracy: this.vramTotalSharedMeasured ? this.vramTotalSharedWorstAccuracy : "unavailable",
       vram_total_shared_source: this.vramTotalSharedMeasured ? this.vramTotalSharedWorstSource : null,
       vram_process_claimed_peak_mib: this.vramClaimedMeasured ? Math.round(this.vramClaimedPeakBytes / BYTES_PER_MIB) : null,
+      vram_process_loaded_peak_mib:
+        this.loadedDedicatedCount > 0 ? Math.round(this.loadedDedicatedMaxBytes / BYTES_PER_MIB) : null,
+      vram_process_loaded_jitter_mib:
+        this.loadedDedicatedCount > 0
+          ? Math.round((this.loadedDedicatedMaxBytes - this.loadedDedicatedMinBytes) / BYTES_PER_MIB)
+          : null,
       vram_peak_accuracy: accuracy,
       vram_peak_source: source,
       vram_avg_accuracy: accuracy,
@@ -396,87 +433,7 @@ export class MemorySampler {
       this.vramTickCount++;
       if (!dueForVram) return;
 
-      try {
-        const { used, usedShared, process: processUsed, processShared } = await readGpuMemory(this.backend, this.pid);
-        // Whole-adapter shared memory -- absent (not null) wherever the
-        // backend never reads it (see GpuMemoryReading.usedShared), in which
-        // case this stream simply doesn't grow.
-        if (usedShared?.mib != null) {
-          const totalSharedBytes = usedShared.mib * BYTES_PER_MIB;
-          this.vramTotalSharedMeasured = true;
-          if (totalSharedBytes > this.vramTotalSharedPeakBytes) this.vramTotalSharedPeakBytes = totalSharedBytes;
-          this.vramTotalSharedSumBytes += totalSharedBytes;
-          this.vramTotalSharedSampleCount++;
-          if (ACCURACY_RANK[usedShared.accuracy] > ACCURACY_RANK[this.vramTotalSharedWorstAccuracy]) {
-            this.vramTotalSharedWorstAccuracy = usedShared.accuracy;
-            this.vramTotalSharedWorstSource = usedShared.source;
-          }
-        }
-        // used.mib === null means "couldn't measure" (missing tool/driver/
-        // permission, or the cpu backend's unconditional short-circuit); 0
-        // is a legitimate reading and must still count.
-        if (used.mib != null) {
-          const vramBytes = used.mib * BYTES_PER_MIB;
-          // Legacy best-available stream: the process's own reading when the
-          // backend produced one this tick, else the whole adapter.
-          this.vramMeasured = true;
-          this.vramCurrentBytes = vramBytes;
-          if (vramBytes > this.vramPeakBytes) this.vramPeakBytes = vramBytes;
-          this.vramSumBytes += vramBytes;
-          this.vramSampleCount++;
-          if (ACCURACY_RANK[used.accuracy] > ACCURACY_RANK[this.vramWorstAccuracy]) {
-            this.vramWorstAccuracy = used.accuracy;
-            this.vramWorstSource = used.source;
-          }
-          // Whole-adapter stream (always separate from the process stream --
-          // they're different numbers and the report shows both).
-          this.vramTotalMeasured = true;
-          if (vramBytes > this.vramTotalPeakBytes) this.vramTotalPeakBytes = vramBytes;
-          this.vramTotalSumBytes += vramBytes;
-          this.vramTotalSampleCount++;
-          if (ACCURACY_RANK[used.accuracy] > ACCURACY_RANK[this.vramTotalWorstAccuracy]) {
-            this.vramTotalWorstAccuracy = used.accuracy;
-            this.vramTotalWorstSource = used.source;
-          }
-        }
-        // processUsed is absent (not null) when this backend/platform has no
-        // per-process reading at all -- e.g. Metal -- or the driver hadn't
-        // caught up to this process yet that tick. Either way the whole
-        // process stream just doesn't grow this tick.
-        if (processUsed?.mib != null) {
-          const processBytes = processUsed.mib * BYTES_PER_MIB;
-          this.vramProcessMeasured = true;
-          if (processBytes > this.vramProcessPeakBytes) this.vramProcessPeakBytes = processBytes;
-          this.vramProcessSumBytes += processBytes;
-          this.vramProcessSampleCount++;
-          if (ACCURACY_RANK[processUsed.accuracy] > ACCURACY_RANK[this.vramProcessWorstAccuracy]) {
-            this.vramProcessWorstAccuracy = processUsed.accuracy;
-            this.vramProcessWorstSource = processUsed.source;
-          }
-        }
-        // processShared is absent (not null) wherever the platform/backend
-        // has no such counter at all -- see GpuMemoryReading.processShared's
-        // own doc comment for which those are.
-        if (processShared?.mib != null) {
-          const sharedBytes = processShared.mib * BYTES_PER_MIB;
-          this.vramProcessSharedMeasured = true;
-          if (sharedBytes > this.vramProcessSharedPeakBytes) this.vramProcessSharedPeakBytes = sharedBytes;
-          this.vramProcessSharedSumBytes += sharedBytes;
-          this.vramProcessSharedSampleCount++;
-          if (ACCURACY_RANK[processShared.accuracy] > ACCURACY_RANK[this.vramProcessSharedWorstAccuracy]) {
-            this.vramProcessSharedWorstAccuracy = processShared.accuracy;
-            this.vramProcessSharedWorstSource = processShared.source;
-          }
-        }
-        // Same-tick sum -- see SampleStats.vram_process_claimed_peak_mib.
-        if (processUsed?.mib != null) {
-          const bytes = (processUsed.mib + (processShared?.mib ?? 0)) * BYTES_PER_MIB;
-          this.vramClaimedMeasured = true;
-          if (bytes > this.vramClaimedPeakBytes) this.vramClaimedPeakBytes = bytes;
-        }
-      } catch {
-        /* VRAM visibility varies by OS/vendor/driver; best-effort */
-      }
+      await this.readVram();
 
       // M6 -- same cadence, same best-effort posture: a sensorless platform
       // simply contributes nothing and its columns stay NULL.
@@ -487,6 +444,98 @@ export class MemorySampler {
       }
     } catch {
       /* sampler is non-fatal */
+    }
+  }
+
+  private async readVram(): Promise<void> {
+    try {
+      const { used, usedShared, process: processUsed, processShared } = await readGpuMemory(this.backend, this.pid);
+      // Whole-adapter shared memory -- absent (not null) wherever the
+      // backend never reads it (see GpuMemoryReading.usedShared), in which
+      // case this stream simply doesn't grow.
+      if (usedShared?.mib != null) {
+        const totalSharedBytes = usedShared.mib * BYTES_PER_MIB;
+        this.vramTotalSharedMeasured = true;
+        if (totalSharedBytes > this.vramTotalSharedPeakBytes) this.vramTotalSharedPeakBytes = totalSharedBytes;
+        this.vramTotalSharedSumBytes += totalSharedBytes;
+        this.vramTotalSharedSampleCount++;
+        if (ACCURACY_RANK[usedShared.accuracy] > ACCURACY_RANK[this.vramTotalSharedWorstAccuracy]) {
+          this.vramTotalSharedWorstAccuracy = usedShared.accuracy;
+          this.vramTotalSharedWorstSource = usedShared.source;
+        }
+      }
+      // used.mib === null means "couldn't measure" (missing tool/driver/
+      // permission, or the cpu backend's unconditional short-circuit); 0
+      // is a legitimate reading and must still count.
+      if (used.mib != null) {
+        const vramBytes = used.mib * BYTES_PER_MIB;
+        // Legacy stream: the whole adapter, see vram_peak_mib.
+        this.vramMeasured = true;
+        this.vramCurrentBytes = vramBytes;
+        if (vramBytes > this.vramPeakBytes) this.vramPeakBytes = vramBytes;
+        this.vramSumBytes += vramBytes;
+        this.vramSampleCount++;
+        if (ACCURACY_RANK[used.accuracy] > ACCURACY_RANK[this.vramWorstAccuracy]) {
+          this.vramWorstAccuracy = used.accuracy;
+          this.vramWorstSource = used.source;
+        }
+        // Whole-adapter stream (always separate from the process stream --
+        // they're different numbers and the report shows both).
+        this.vramTotalMeasured = true;
+        if (vramBytes > this.vramTotalPeakBytes) this.vramTotalPeakBytes = vramBytes;
+        this.vramTotalSumBytes += vramBytes;
+        this.vramTotalSampleCount++;
+        if (ACCURACY_RANK[used.accuracy] > ACCURACY_RANK[this.vramTotalWorstAccuracy]) {
+          this.vramTotalWorstAccuracy = used.accuracy;
+          this.vramTotalWorstSource = used.source;
+        }
+      }
+      // processUsed is absent (not null) when this backend/platform has no
+      // per-process reading at all -- e.g. Metal -- or the driver hadn't
+      // caught up to this process yet that tick. Either way the whole
+      // process stream just doesn't grow this tick.
+      if (processUsed?.mib != null) {
+        const processBytes = processUsed.mib * BYTES_PER_MIB;
+        this.vramProcessMeasured = true;
+        if (processBytes > this.vramProcessPeakBytes) this.vramProcessPeakBytes = processBytes;
+        this.vramProcessSumBytes += processBytes;
+        this.vramProcessSampleCount++;
+        if (ACCURACY_RANK[processUsed.accuracy] > ACCURACY_RANK[this.vramProcessWorstAccuracy]) {
+          this.vramProcessWorstAccuracy = processUsed.accuracy;
+          this.vramProcessWorstSource = processUsed.source;
+        }
+        if (this.loaded) {
+          if (this.loadedDedicatedCount === 0 || processBytes > this.loadedDedicatedMaxBytes) {
+            this.loadedDedicatedMaxBytes = processBytes;
+          }
+          if (this.loadedDedicatedCount === 0 || processBytes < this.loadedDedicatedMinBytes) {
+            this.loadedDedicatedMinBytes = processBytes;
+          }
+          this.loadedDedicatedCount++;
+        }
+      }
+      // processShared is absent (not null) wherever the platform/backend
+      // has no such counter at all -- see GpuMemoryReading.processShared's
+      // own doc comment for which those are.
+      if (processShared?.mib != null) {
+        const sharedBytes = processShared.mib * BYTES_PER_MIB;
+        this.vramProcessSharedMeasured = true;
+        if (sharedBytes > this.vramProcessSharedPeakBytes) this.vramProcessSharedPeakBytes = sharedBytes;
+        this.vramProcessSharedSumBytes += sharedBytes;
+        this.vramProcessSharedSampleCount++;
+        if (ACCURACY_RANK[processShared.accuracy] > ACCURACY_RANK[this.vramProcessSharedWorstAccuracy]) {
+          this.vramProcessSharedWorstAccuracy = processShared.accuracy;
+          this.vramProcessSharedWorstSource = processShared.source;
+        }
+      }
+      // Same-tick sum -- see SampleStats.vram_process_claimed_peak_mib.
+      if (processUsed?.mib != null) {
+        const bytes = (processUsed.mib + (processShared?.mib ?? 0)) * BYTES_PER_MIB;
+        this.vramClaimedMeasured = true;
+        if (bytes > this.vramClaimedPeakBytes) this.vramClaimedPeakBytes = bytes;
+      }
+    } catch {
+      /* VRAM visibility varies by OS/vendor/driver; best-effort */
     }
   }
 }
