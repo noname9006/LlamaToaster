@@ -173,3 +173,51 @@ describe("MemorySampler VRAM peak semantics", () => {
     expect(stats.vram_total_shared_source).toBeNull();
   });
 });
+
+describe("MemorySampler shared and claimed VRAM", () => {
+  const shared = (mib: number): GpuMemoryReading["processShared"] => ({ mib, accuracy: "exact", source: "process_gpu_usage" });
+
+  beforeEach(() => {
+    mockMem.mockReset().mockResolvedValue({ active: 1024 * 1024 * 1024 });
+    mockProcesses.mockReset().mockResolvedValue({ list: [{ pid: TEST_PID, memRss: 2048 }] });
+    mockReadGpuSensors.mockReset().mockResolvedValue({ clockMhz: null, tempC: null, source: null });
+    mockReadGpuMemory.mockReset();
+  });
+
+  async function sampleTicks(readings: GpuMemoryReading[]) {
+    for (const r of readings) mockReadGpuMemory.mockResolvedValueOnce(r);
+    const sampler = new MemorySampler();
+    (sampler as unknown as { pid: number; backend: string }).pid = TEST_PID;
+    (sampler as unknown as { pid: number; backend: string }).backend = "vulkan";
+    // One due VRAM tick per reading (every third tick is due).
+    for (let i = 0; i < readings.length * 3; i++) await tick(sampler);
+    return sampler.stats;
+  }
+
+  it("peaks the same-tick dedicated+shared sum, never two peaks from different ticks", async () => {
+    const stats = await sampleTicks([
+      // Weights loading: dedicated high, little shared yet -> claimed 6500.
+      { total: wholeAdapter(8176), used: wholeAdapter(7000), process: process(6000), processShared: shared(500), usedShared: wholeAdapter(900) },
+      // The driver moved some to system RAM -> claimed 6200.
+      { total: wholeAdapter(8176), used: wholeAdapter(6100), process: process(5000), processShared: shared(1200), usedShared: wholeAdapter(1500) },
+    ]);
+    expect(stats.vram_process_peak_mib).toBe(6000);
+    expect(stats.vram_process_shared_peak_mib).toBe(1200);
+    // 6000 + 1200 = 7200 never existed at any single moment.
+    expect(stats.vram_process_claimed_peak_mib).toBe(6500);
+    expect(stats.vram_total_shared_peak_mib).toBe(1500);
+  });
+
+  it("counts a shared counter with no instance yet as zero", async () => {
+    const stats = await sampleTicks([{ total: wholeAdapter(8176), used: wholeAdapter(4000), process: process(3500) }]);
+    expect(stats.vram_process_claimed_peak_mib).toBe(3500);
+    expect(stats.vram_total_shared_peak_mib).toBeNull();
+  });
+
+  // Windows CUDA: nvidia-smi reports [N/A] per process, so there is shared but
+  // no dedicated reading -- half a sum is not a claimed figure.
+  it("leaves claimed unmeasured without a per-process dedicated reading", async () => {
+    const stats = await sampleTicks([{ total: wholeAdapter(10240), used: wholeAdapter(9800), processShared: shared(7400) }]);
+    expect(stats.vram_process_claimed_peak_mib).toBeNull();
+  });
+});

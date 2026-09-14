@@ -755,9 +755,9 @@ describe("detectHostBackedFallback on the context axis", () => {
     expect(v.kvHostBackedFrac!).toBeCloseTo(0.5, 1);
   });
 
-  it("never fails a rung for a KV spill, however large", () => {
-    // The whole point: a cache the probe never reads costs nothing here. It is
-    // a caveat about what "verified 262144 tokens" means, not a capacity fault.
+  it("never convicts the weights for a KV spill, however large", () => {
+    // The weights did not move; what spilled is cache. Whether that fails the
+    // rung is the worker's call (KV_HOST_BACKED_FAIL_FRAC), not this verdict's.
     expect(check([2048, 1699, 4458], [262144, 9000, 4502]).hostBacked).toBe(false);
   });
 

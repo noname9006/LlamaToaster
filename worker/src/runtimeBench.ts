@@ -14,6 +14,7 @@ import type { SweepItem } from "../../shared/sweep.js";
 import {
   detectHostBackedFallback,
   isVramDiscrepancy,
+  KV_HOST_BACKED_FAIL_FRAC,
   type HostBackedFallbackVerdict,
   type HostBackedRungSample,
 } from "../../shared/vramEstimate.js";
@@ -673,6 +674,15 @@ export interface ProbeAttemptOutcome {
    * -- vramDiscrepancy above only ever INFERS that from a needed-vs-peak gap.
    * Null wherever no such counter/file exists at all (not a measured 0). */
   vramSharedPeakMib?: number | null;
+  /** MemorySampler's vram_total_shared_peak_mib -- WHOLE-ADAPTER
+   * system-RAM-backed GPU memory (every process combined), the total beside
+   * vramSharedPeakMib's llama-only figure. Null where no such counter exists. */
+  vramSharedTotalPeakMib?: number | null;
+  /** MemorySampler's vram_process_claimed_peak_mib -- llama-server's own
+   * dedicated + shared GPU memory, summed within one reading and peaked:
+   * everything it claimed on the device, however the driver split it between
+   * VRAM and system RAM. Null when no per-process dedicated reading was taken. */
+  vramClaimedPeakMib?: number | null;
   genTps: number | null;
   /** Fraction of the adapter total still free at this candidate. */
   headroomFrac?: number | null;
@@ -727,9 +737,8 @@ export interface ProbeAttemptOutcome {
   hostBackedSlopeRatio?: number | null;
   hostBackedSpilledLayers?: number | null;
   /** CONTEXT axis only: the share of this context's newly allocated memory
-   * that the OS put in system RAM. A caveat, never a failure -- the probe
-   * exercises ~512 tokens regardless of `-c`, so a host-backed cache costs
-   * nothing here and everything in real use at that context. */
+   * that the OS put in system RAM. Above KV_HOST_BACKED_FAIL_FRAC the rung
+   * fails (see probeSucceeded); below it, this is reported only. */
   kvHostBackedFrac?: number | null;
   /** Prompt-processing rate for this rung, from llama-server's own
    * timings.prompt_n / prompt_ms. Reported per rung because prefill has its
@@ -815,8 +824,8 @@ export { PROBE_GEN_TOKENS, PROBE_PROMPT_TOKENS } from "../../shared/probeLadder.
 export const HOST_BACKED_FAIL_MAX_UNCORROBORATED_CTX = PROBE_LADDER_MIN_CTX * 2;
 
 // A probe's own success rule, kept next to the ladder that consumes it: no
-// OOM, no spill (vram_peak within total), some generation, and no weights
-// MEASURABLY served from system RAM.
+// OOM, no spill (vram_peak within total), some generation, and neither the
+// weights nor most of a context's cache MEASURABLY served from system RAM.
 //
 // That last rule is what stops a silently oversubscribed placement from
 // passing. On a driver that backs an overcommitted allocation with system RAM
@@ -827,10 +836,15 @@ export const HOST_BACKED_FAIL_MAX_UNCORROBORATED_CTX = PROBE_LADDER_MIN_CTX * 2;
 // "verified" every layer of a model several GiB larger than the card.
 //
 // Only a CONVICTION fails, never the weaker evidence: detectHostBackedFallback
-// returning hostBacked:true. An abstained verdict, the estimate-only inference
-// below, and any context-axis KV spill all stay a warning on a passing rung.
-// The inference in particular cannot tell a real fallback from a pessimistic
-// estimate, and failing on it is what 926ab8c backed out.
+// returning hostBacked:true. An abstained verdict and the estimate-only
+// inference below stay a warning on a passing rung. The inference in
+// particular cannot tell a real fallback from a pessimistic estimate, and
+// failing on it is what 926ab8c backed out.
+//
+// The context axis has its own rule: a larger context fails when most of what
+// it ADDED landed in system RAM (KV_HOST_BACKED_FAIL_FRAC). That reading is
+// measured against a smaller context at the same layer count, so it needs no
+// corroboration gate -- the weights are the same at both ends and cancel out.
 //
 // And not every conviction either -- see HOST_BACKED_FAIL_MAX_UNCORROBORATED_CTX
 // for which ones are strong enough to fail on.
@@ -974,6 +988,25 @@ export function probeSucceeded(input: {
       reason: "the model's layers are being served from system RAM, not VRAM",
     };
   }
+  // The context-axis counterpart: this rung's weights were already judged at a
+  // smaller context, and most of what the larger context added went to system
+  // RAM. Not a host-backed failure for the ladder -- a smaller context CAN fix
+  // this, so the context walk keeps bisecting down.
+  if (
+    hostBacked.axis === "ctx" &&
+    hostBacked.kvHostBackedFrac != null &&
+    hostBacked.kvHostBackedFrac > KV_HOST_BACKED_FAIL_FRAC
+  ) {
+    return {
+      ok: false,
+      spill: false,
+      vramDiscrepancy,
+      hostBacked,
+      reason:
+        `this context's KV cache is being served from system RAM, not VRAM: ` +
+        `${Math.round(hostBacked.kvHostBackedFrac * 100)}% of the memory it added went to system RAM`,
+    };
+  }
   return { ok: true, spill: false, vramDiscrepancy, hostBacked, reason: null };
 }
 
@@ -1055,6 +1088,8 @@ export function toProbeAttemptReport(attempt: ProbeAttemptOutcome): ProbeAttempt
     vram_process_peak_mib: attempt.vramProcessPeakMib,
     ram_total_peak_mib: attempt.ramTotalPeakMib,
     vram_shared_peak_mib: attempt.vramSharedPeakMib,
+    vram_shared_total_peak_mib: attempt.vramSharedTotalPeakMib,
+    vram_claimed_peak_mib: attempt.vramClaimedPeakMib,
     kv_host_backed_frac: attempt.kvHostBackedFrac,
     pp_tps: attempt.ppTps,
     ttft_ms: attempt.ttftMs,
