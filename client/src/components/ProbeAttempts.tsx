@@ -15,6 +15,7 @@ import { Link } from "react-router-dom";
 import { api } from "../api/client";
 import type { ProbeAttemptDto } from "../types";
 import { PROBE_EXERCISED_TOKENS, PROBE_GEN_TOKENS, PROBE_PROMPT_TOKENS } from "../../../shared/probeLadder";
+import { KV_HOST_BACKED_FAIL_FRAC } from "../../../shared/vramEstimate";
 
 function mib(value: number | null): string {
   return value == null ? "—" : `${Math.round(value).toLocaleString()} MiB`;
@@ -64,10 +65,60 @@ function residentCell(a: Pick<ProbeAttemptDto, "ngl" | "gpu_layers_resident_est"
 // row: the only failure that leaves a rung with generation, no OOM, no adapter
 // spill and a MEASURED discrepancy is the one where its layers were found in
 // system RAM.
-function failedForHostBackedLayers(
+export function failedForHostBackedLayers(
   a: Pick<ProbeAttemptDto, "ok" | "oom" | "spill" | "gen_tps" | "vram_discrepancy" | "host_backed_method">
 ): boolean {
   return a.ok !== 1 && a.oom !== 1 && a.spill !== 1 && a.gen_tps != null && a.vram_discrepancy === 1 && a.host_backed_method != null;
+}
+
+// The context-axis counterpart: the rung generated, did not OOM or pass the
+// adapter total, and most of what its larger context added went to system RAM
+// (worker/src/runtimeBench.ts's probeSucceeded, KV_HOST_BACKED_FAIL_FRAC).
+// Disjoint from the layer one -- a context-axis verdict never sets
+// vram_discrepancy.
+function failedForHostBackedCache(
+  a: Pick<ProbeAttemptDto, "ok" | "oom" | "spill" | "gen_tps" | "kv_host_backed_frac">
+): boolean {
+  return (
+    a.ok !== 1 &&
+    a.oom !== 1 &&
+    a.spill !== 1 &&
+    a.gen_tps != null &&
+    a.kv_host_backed_frac != null &&
+    a.kv_host_backed_frac > KV_HOST_BACKED_FAIL_FRAC
+  );
+}
+
+// Everything llama-server claimed on the GPU, however the driver split it
+// between dedicated VRAM and shared system RAM. Measured as one sum per reading
+// when the worker sent it; a rung stored before that falls back to adding the
+// two separate peaks, marked "~" -- they can come from different moments of the
+// load, so that sum can only read high, never low.
+function claimedCell(
+  a: Pick<ProbeAttemptDto, "vram_claimed_peak_mib" | "vram_process_peak_mib" | "vram_shared_peak_mib">
+): { text: string; title: string; mib: number | null } {
+  if (a.vram_claimed_peak_mib != null) {
+    return {
+      text: mib(a.vram_claimed_peak_mib),
+      title: "llama-server's own dedicated VRAM plus its shared system RAM, summed within one reading -- everything it claimed on the GPU.",
+      mib: a.vram_claimed_peak_mib,
+    };
+  }
+  if (a.vram_process_peak_mib != null) {
+    const sum = a.vram_process_peak_mib + (a.vram_shared_peak_mib ?? 0);
+    return {
+      text: `~${mib(sum)}`,
+      title:
+        "Recorded before claimed VRAM was measured directly: llama's VRAM peak plus its shared peak, which may come from different moments of the load, so this can read high.",
+      mib: sum,
+    };
+  }
+  return {
+    text: "—",
+    title:
+      "No per-process VRAM reading on this worker (an older worker build, or a platform whose driver reports no per-process memory), so what llama-server claimed can't be measured.",
+    mib: null,
+  };
 }
 
 export interface ProbeAttemptsProps {
@@ -113,9 +164,11 @@ export function ProbeAttempts({ testId, refreshKey }: ProbeAttemptsProps) {
     (w, a) => (w == null || (a.vram_shared_peak_mib ?? 0) > (w.vram_shared_peak_mib ?? 0) ? a : w),
     null
   );
-  const kvSpill = attempts
-    .filter((a) => a.kv_host_backed_frac != null && a.kv_host_backed_frac > 0.6)
-    .reduce<ProbeAttemptDto | null>((best, a) => (best == null || a.candidate_ctx > best.candidate_ctx ? a : best), null);
+  // The smallest context whose cache went mostly to system RAM -- the one
+  // nearest the boundary the context search settled against.
+  const kvFailed = attempts
+    .filter(failedForHostBackedCache)
+    .reduce<ProbeAttemptDto | null>((best, a) => (best == null || a.candidate_ctx < best.candidate_ctx ? a : best), null);
   const cliff = attempts
     .filter((a) => a.prefill_cliff === 1 && a.ngl != null)
     .reduce<ProbeAttemptDto | null>((best, a) => (best == null || a.ngl! < best.ngl! ? a : best), null);
@@ -145,15 +198,14 @@ export function ProbeAttempts({ testId, refreshKey }: ProbeAttemptsProps) {
           )}
         </div>
       )}
-      {kvSpill && (
-        <div className="mb-3 rounded-lg border border-border bg-bg px-3 py-2 text-xs text-muted">
-          <span className="font-bold text-fg">A verified context is an allocation ceiling, not a speed.</span> At{" "}
-          <span className="font-mono">{kvSpill.candidate_ctx.toLocaleString()}</span> tokens,{" "}
-          <span className="font-mono font-bold">{Math.round((kvSpill.kv_host_backed_frac ?? 0) * 100)}%</span> of the
-          memory that context allocated went to system RAM rather than VRAM. Each load here runs a{" "}
-          {PROBE_PROMPT_TOKENS}-token prompt and generates {PROBE_GEN_TOKENS} tokens whatever the context is set to,
-          so a cache that large is allocated and never read — the speeds above were measured at roughly{" "}
-          {PROBE_EXERCISED_TOKENS} tokens of context, and will not hold once the context is actually filled.
+      {kvFailed && (
+        <div className="mb-3 rounded-lg border border-warning/40 bg-warning-bg px-3 py-2 text-xs text-warning">
+          <span className="font-bold">Past a point, the context's cache does not fit in VRAM.</span> At{" "}
+          <span className="font-mono font-bold">{kvFailed.candidate_ctx.toLocaleString()}</span> tokens,{" "}
+          <span className="font-mono font-bold">{Math.round((kvFailed.kv_host_backed_frac ?? 0) * 100)}%</span> of the
+          memory that context added went to system RAM, so the load failed and the search tried smaller contexts. Each
+          load here only runs a {PROBE_PROMPT_TOKENS}-token prompt and generates {PROBE_GEN_TOKENS} tokens, so that load
+          can still look fast — a cache in system RAM only slows generation down once the context actually fills.
         </div>
       )}
       <div className="flex flex-wrap items-baseline justify-between gap-2">
@@ -174,8 +226,15 @@ export function ProbeAttempts({ testId, refreshKey }: ProbeAttemptsProps) {
               <th className="px-2 py-1.5 text-right" rowSpan={2}>offload</th>
               <th className="px-2 py-1.5 text-right" rowSpan={2}>resident</th>
               <th className="px-2 py-1.5 text-right" rowSpan={2}>VRAM free</th>
+              <th
+                className="px-2 py-1.5 text-right"
+                rowSpan={2}
+                title="Everything llama-server claimed on the GPU: its own dedicated VRAM plus its own shared system RAM, however the driver split the two."
+              >
+                VRAM claimed
+              </th>
               <th className="px-2 py-1.5 text-center" colSpan={2}>VRAM Peak</th>
-              <th className="px-2 py-1.5 text-right" rowSpan={2}>shared</th>
+              <th className="px-2 py-1.5 text-center" colSpan={2}>Shared</th>
               <th className="px-2 py-1.5 text-right" rowSpan={2}>RAM free</th>
               <th className="px-2 py-1.5 text-center" colSpan={2}>RAM Peak</th>
               <th
@@ -194,14 +253,23 @@ export function ProbeAttempts({ testId, refreshKey }: ProbeAttemptsProps) {
               <th className="px-2 py-1.5 text-right" title="Whole-adapter -- every process on this GPU combined, not just this load">
                 total
               </th>
-              <th className="px-2 py-1.5 text-right" title="This load's own process only">
-                per process
+              <th className="px-2 py-1.5 text-right" title="llama-server's own process only">
+                llama
+              </th>
+              <th
+                className="px-2 py-1.5 text-right"
+                title="Whole-adapter -- every process's system-RAM-backed GPU memory combined, not just this load"
+              >
+                total
+              </th>
+              <th className="px-2 py-1.5 text-right" title="llama-server's own process only">
+                llama
               </th>
               <th className="px-2 py-1.5 text-right" title="Whole-system -- every process on this machine combined, not just this load">
                 total
               </th>
-              <th className="px-2 py-1.5 text-right" title="This load's own process only">
-                per process
+              <th className="px-2 py-1.5 text-right" title="llama-server's own process only">
+                llama
               </th>
               <th className="px-2 py-1.5 text-right">gen tok/s</th>
               <th
@@ -220,6 +288,10 @@ export function ProbeAttempts({ testId, refreshKey }: ProbeAttemptsProps) {
               const vramRatio = usedVsFree(a.vram_peak_mib, a.vram_free_mib);
               const ramRatio = usedVsFree(a.ram_total_peak_mib, a.ram_free_mib);
               const resident = residentCell(a);
+              const claimed = claimedCell(a);
+              // More claimed than was free before the load: the rest had to
+              // land in system RAM, whatever the counters' timing.
+              const claimedOverFree = claimed.mib != null && a.vram_free_mib != null && claimed.mib > a.vram_free_mib;
               return (
                 <tr key={a.id} className="border-b border-border/40">
                   <td className="px-2 py-1.5 font-mono text-muted">{a.seq + 1}</td>
@@ -233,10 +305,26 @@ export function ProbeAttempts({ testId, refreshKey }: ProbeAttemptsProps) {
                     {resident.warn ? " ⚠" : ""}
                   </td>
                   <td className="px-2 py-1.5 text-right font-mono text-muted">{mib(a.vram_free_mib)}</td>
+                  <td
+                    className={`px-2 py-1.5 text-right font-mono ${claimedOverFree ? "font-bold text-warning" : "text-muted"}`}
+                    title={claimed.title}
+                  >
+                    {claimed.text}
+                  </td>
                   <td className="px-2 py-1.5 text-right font-mono text-muted" title={vramRatio ?? undefined}>
                     {mib(a.vram_peak_mib)}
                   </td>
                   <td className="px-2 py-1.5 text-right font-mono text-muted">{mib(a.vram_process_peak_mib)}</td>
+                  <td
+                    className="px-2 py-1.5 text-right font-mono text-muted"
+                    title={
+                      a.vram_shared_total_peak_mib != null
+                        ? "Every process's system-RAM-backed GPU memory combined -- includes anything else running, not just this load."
+                        : "No adapter-wide shared memory reading for this load (an older worker, or no such counter for this backend)."
+                    }
+                  >
+                    {mib(a.vram_shared_total_peak_mib)}
+                  </td>
                   <td
                     className={`px-2 py-1.5 text-right font-mono ${a.vram_shared_peak_mib ? "font-bold text-warning" : "text-muted"}`}
                     title={
@@ -275,14 +363,14 @@ export function ProbeAttempts({ testId, refreshKey }: ProbeAttemptsProps) {
                     className={`px-2 py-1.5 text-right font-mono ${a.host_backed_slope != null && a.host_backed_slope > 0.5 ? "font-bold text-warning" : "text-muted"}`}
                     title={
                       a.kv_host_backed_frac != null
-                        ? `Context axis: ${Math.round(a.kv_host_backed_frac * 100)}% of the memory this context allocated went to system RAM instead of VRAM. Not a failure -- the probe never reads a cache this size, so it costs nothing here and everything in real use at this context.`
+                        ? `Context axis: ${Math.round(a.kv_host_backed_frac * 100)}% of the memory this context added went to system RAM instead of VRAM. Above ${Math.round(KV_HOST_BACKED_FAIL_FRAC * 100)}% the load fails -- a cache in system RAM is slow once the context actually fills.`
                         : a.host_backed_method === "ratio"
                           ? "No comparable lower-offload load at this context, so this rung was judged against its own predicted footprint instead of a slope."
                           : undefined
                     }
                   >
                     {a.host_backed_slope != null ? a.host_backed_slope.toFixed(2) : a.host_backed_method === "ratio" ? "n/a" : "—"}
-                    {a.kv_host_backed_frac != null && a.kv_host_backed_frac > 0.6 ? " kv" : ""}
+                    {a.kv_host_backed_frac != null && a.kv_host_backed_frac > KV_HOST_BACKED_FAIL_FRAC ? " kv" : ""}
                   </td>
                   <td className="px-2 py-1.5 text-muted">
                     <div className="flex flex-wrap items-center gap-1.5">
@@ -301,10 +389,14 @@ export function ProbeAttempts({ testId, refreshKey }: ProbeAttemptsProps) {
                               ? "spilled past VRAM"
                               : failedForHostBackedLayers(a)
                                 ? "layers in system RAM"
-                                : "failed"}
+                                : failedForHostBackedCache(a)
+                                  ? "cache in system RAM"
+                                  : "failed"}
                         </span>
                       )}
-                      {a.ok && a.vram_discrepancy === 1 && (
+                      {/* === 1, not a bare `a.ok &&`: ok is a SQLite 0/1, and React
+                          renders a literal 0 for `0 && ...` on every failed row. */}
+                      {a.ok === 1 && a.vram_discrepancy === 1 && (
                         <span
                           title={
                             a.error ??
@@ -332,7 +424,7 @@ export function ProbeAttempts({ testId, refreshKey }: ProbeAttemptsProps) {
             })}
             {attempts.length === 0 && (
               <tr>
-                <td colSpan={13} className="px-2 py-3 text-muted">
+                <td colSpan={18} className="px-2 py-3 text-muted">
                   This probe recorded no loads. A probe run that never reached the machine leaves no rungs.
                 </td>
               </tr>
@@ -346,19 +438,24 @@ export function ProbeAttempts({ testId, refreshKey }: ProbeAttemptsProps) {
         count llama.cpp's own per-layer "assigned to device" report says actually landed on the GPU — a mismatch
         against offload is flagged the same way a VRAM-fallback row is. It reads "—" rather than a guess when that
         report wasn't captured (nothing was claimed on the GPU, the load failed before tensor loading finished, or an older build). Every other
-        number in this row — <b className="text-fg">free</b>, <b className="text-fg">peak</b>,{" "}
-        <b className="text-fg">shared</b> — is a direct measurement, not a prediction: free is what the machine
-        actually had available just before the load. <b className="text-fg">Peak</b> is split into{" "}
+        number in this row — <b className="text-fg">free</b>, <b className="text-fg">claimed</b>,{" "}
+        <b className="text-fg">peak</b>, <b className="text-fg">shared</b> — is a direct measurement, not a prediction:
+        free is what the machine actually had available just before the load. <b className="text-fg">Claimed</b> is
+        everything llama-server allocated on the GPU — its own dedicated VRAM plus its own shared memory, summed within
+        one reading — however the driver split the two; once claimed exceeds VRAM free, the difference has to live in
+        system RAM. A claimed value marked <b className="text-fg">~</b> comes from a load recorded before claimed was
+        measured directly and adds the two separate peaks instead, so it can only read high.{" "}
+        <b className="text-fg">Peak</b> and <b className="text-fg">Shared</b> are each split into{" "}
         <b className="text-fg">total</b> (every process on the GPU/machine combined, not just this load — the same
-        thing "free" measures, which is why the two are comparable) and{" "}
-        <b className="text-fg">per process</b> (this load's own usage in isolation, when the backend could attribute
-        it). They're genuinely different numbers, not two views of the same one: something else running on the same
-        GPU or machine at the same time shows up in total but not per process, while per process can read "—" more
-        often than total does — the tool/counter that attributes usage to this specific process can lag a fresh
-        spawn, or never catch up at all on a very short load. <b className="text-fg">Shared</b> is the OS's own
-        reading of how much of this process's memory was system RAM the driver backed as GPU-accessible memory
-        instead of real dedicated VRAM — the direct measurement of a silent spillover, not an inference about one.
-        It's blank when no such counter exists for this worker's backend, which is different from a confirmed zero.
+        thing "free" measures, which is why the two are comparable) and <b className="text-fg">llama</b> (llama-server's
+        own usage in isolation, when the backend could attribute it). They're genuinely different numbers, not two
+        views of the same one: something else running on the same GPU or machine at the same time shows up in total but
+        not in llama, while llama can read "—" more often than total does — the tool/counter that attributes usage to
+        this specific process can lag a fresh spawn, or never catch up at all on a very short load.{" "}
+        <b className="text-fg">Shared</b> is the OS's own reading of system RAM the driver backed as GPU-accessible
+        memory instead of real dedicated VRAM — the direct measurement of a silent spillover, not an inference about
+        one. It's blank when no such counter exists for this worker's backend, which is different from a confirmed
+        zero.
       </p>
       <p className="mt-2 text-[11px] leading-relaxed text-muted">
         <b className="text-fg">Slope</b> is what decides a{" "}
@@ -372,8 +469,9 @@ export function ProbeAttempts({ testId, refreshKey }: ProbeAttemptsProps) {
         context where nothing but weights can account for the shared memory. Otherwise (the evidence is only an
         inference from the estimate, the counters disagree, or a large context could explain the reading) the load
         passes with the warning instead. A slope suffixed{" "}
-        <b className="text-fg">kv</b> is the context axis, where what spilled is cache rather than weights; that is
-        reported but never failed, because these loads never read a cache that large.{" "}
+        <b className="text-fg">kv</b> is the context axis, where what spilled is cache rather than weights: when more
+        than {Math.round(KV_HOST_BACKED_FAIL_FRAC * 100)}% of the memory a larger context added went to system RAM, the
+        load fails as <b className="text-warning">cache in system RAM</b> and the search tries a smaller context.{" "}
         <b className="text-fg">Speeds</b> come from the same fixed {PROBE_EXERCISED_TOKENS}-token workload on every
         row, so they say whether a configuration runs — not how fast it is at the context beside them. There is no
         minimum rate: a slow load is reported with its rate, and only one that generates nothing at all fails.

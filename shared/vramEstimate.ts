@@ -252,10 +252,17 @@ export const HOST_BACKED_MIN_SLOPE_SPAN = 2;
 export const HOST_BACKED_MIN_KV_GROWTH_MIB = 512;
 
 /** Above this share of a context's newly allocated memory sitting in system
- * RAM, the rung carries a KV-spill caveat. A reporting threshold only -- it
- * never fails anything. Measured: a genuinely comfortable context ran 0.50,
- * one whose cache was entirely host-backed ran 0.98. */
-export const KV_HOST_BACKED_REPORT_FRAC = 0.6;
+ * RAM, the worker fails the rung (worker/src/runtimeBench.ts's
+ * probeSucceeded) and the context search bisects down to a context whose
+ * cache stays in VRAM. Measured: a genuinely comfortable context ran 0.50,
+ * one whose cache was entirely host-backed ran 0.98.
+ *
+ * This used to be a reporting threshold only, on the grounds that the probe's
+ * ~512-token workload never reads a cache that large, so a host-backed one
+ * costs nothing AT TEST TIME. That made a "verified" context an allocation
+ * ceiling nobody could use at that length: probe 124c2ab1 verified 262144
+ * tokens on an 8GiB RX 6600 XT with the whole cache in system RAM. */
+export const KV_HOST_BACKED_FAIL_FRAC = 0.6;
 
 /**
  * Bootstrap threshold for the FIRST rung of a phase, which by definition has
@@ -478,14 +485,10 @@ export interface HostBackedFallbackVerdict {
   /** CONTEXT axis only: what fraction of the memory this larger context
    * actually allocated ended up in system RAM rather than VRAM.
    *
-   * Deliberately not a failure. A host-backed KV cache costs nothing until
-   * the context is used, and the probe never uses it -- every rung runs a
-   * 256-token prompt and 256 generated tokens whatever `-c` says, so a
-   * 262144-token cache is allocated and never read. Measured: context 2048 ->
-   * 262144 pushed 98% of the new allocation to host memory and changed
-   * generation speed by 5%. Failing on that would be failing on predicted
-   * harm; reporting it lets a caller see that the verified context is an
-   * ALLOCATION ceiling whose speed was measured at ~512 tokens. */
+   * Never sets hostBacked -- the weights did not move -- but the worker fails
+   * the rung above KV_HOST_BACKED_FAIL_FRAC (see that constant for why).
+   * Measured: context 2048 -> 262144 pushed 98% of the new allocation to host
+   * memory. */
   kvHostBackedFrac: number | null;
   /** Which evidence decided it -- "slope" when a comparable lower-ngl rung
    * existed, "ratio" for the single-rung bootstrap, null when neither could
@@ -638,7 +641,7 @@ export function detectHostBackedFallback(input: HostBackedFallbackInput): HostBa
     if (deltaTotal >= HOST_BACKED_MIN_KV_GROWTH_MIB) {
       const frac = deltaShared / deltaTotal;
       return {
-        // A KV spill never fails the rung -- see kvHostBackedFrac's comment.
+        // A KV spill never convicts the WEIGHTS -- see kvHostBackedFrac's comment.
         hostBacked: false,
         axis: "ctx",
         kvHostBackedFrac: frac,

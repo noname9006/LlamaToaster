@@ -133,7 +133,10 @@ export const SENSOR_MEASUREMENT_SOURCES = [
 ] as const;
 export type SensorMeasurementSource = (typeof SENSOR_MEASUREMENT_SOURCES)[number];
 
-export const WORKER_CAPABILITIES = ["benchmark", "probe-v1", "quality-v1", "curve-v1"] as const;
+// "curve-v1" is the throughput-vs-context/concurrency measurement (curve_point
+// and knee jobs). "probe-frontier-v1" is the context test's frontier MODE --
+// a different feature that happens to draw a curve too, hence the longer name.
+export const WORKER_CAPABILITIES = ["benchmark", "probe-v1", "quality-v1", "curve-v1", "probe-frontier-v1"] as const;
 export type WorkerCapability = (typeof WORKER_CAPABILITIES)[number];
 
 // BENCHMARKING_PLAN_V8.md §0.1 -- increments whenever measurement semantics
@@ -1714,6 +1717,17 @@ export interface ProbeAttemptReport {
   // a needed-vs-peak gap. Null wherever no such counter/file exists at all
   // (not a measured 0), including every worker predating this reading.
   vram_shared_peak_mib?: number | null;
+  // Whole-adapter system-RAM-backed GPU memory peak (every process combined),
+  // the total beside vram_shared_peak_mib's llama-only figure -- the same
+  // pairing vram_peak_mib has with vram_process_peak_mib. Absent where no
+  // such counter exists.
+  vram_shared_total_peak_mib?: number | null;
+  // llama-server's own dedicated + shared GPU memory, summed within one
+  // reading and peaked -- everything it claimed on the device, however the
+  // driver split that between VRAM and system RAM. Absent when no per-process
+  // dedicated reading was taken at all -- a platform with no such counter, or
+  // a load too short for one to be attributed.
+  vram_claimed_peak_mib?: number | null;
   gen_tps?: number | null;
   // Prompt-processing rate and time-to-first-token for this rung. Prefill has
   // a SEPARATE, earlier placement cliff than generation (measured: pp fell
@@ -1732,9 +1746,8 @@ export interface ProbeAttemptReport {
   host_backed_method?: "slope" | "ratio" | null;
   host_backed_slope?: number | null;
   // CONTEXT axis only: the share of this context's newly allocated memory the
-  // OS put in system RAM. Reported, never failed -- the probe exercises ~512
-  // tokens whatever the context is set to, so a host-backed cache is free at
-  // test time and expensive in real use at that context.
+  // OS put in system RAM. Above shared/vramEstimate.ts's
+  // KV_HOST_BACKED_FAIL_FRAC the rung failed; below it, reported only.
   kv_host_backed_frac?: number | null;
   // What computeDualPoolFit PREDICTED this rung would need, and what the
   // machine actually had free just before the load -- the predicted-vs-real

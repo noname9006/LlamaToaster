@@ -67,9 +67,69 @@ describe("GoalQuestionnaire's Tested-configurations section", () => {
     }
   });
 
+  // A frontier probe measures a boundary per context stop. Summarising it by
+  // the single stored ceiling names the largest context that loaded, which on
+  // a machine where context is expensive is routinely the rung with NOTHING on
+  // the GPU -- true, useless, and worse as something to apply to the sliders.
+  describe("a Wizard card holding a measured curve", () => {
+    const curveResult = {
+      ngl: 41,
+      ctx: 1024,
+      testId: "t-curve",
+      status: "verified" as const,
+      mode: "frontier" as const,
+      // The ceiling that loaded is 262,144 -- with zero layers on the GPU.
+      verifiedCtxTokens: 262_144,
+      measuredNgl: 0,
+      curve: [
+        { ctx: 1024, ngl: 40 },
+        { ctx: 16_384, ngl: 40 },
+        { ctx: 65_536, ngl: 33 },
+        { ctx: 262_144, ngl: 0 },
+      ],
+    };
+    const withCurve = () => {
+      const placement = basePlacement();
+      placement.verifyResults = { frontier: curveResult };
+      return renderWithPlacement({ placement });
+    };
+
+    it("names both ends of the curve rather than the zero-layer ceiling", () => {
+      withCurve();
+      expect(screen.getByText(/40 layers @ 1k → 0 @ 256k/)).toBeInTheDocument();
+      expect(screen.queryByText(/262,144 tokens · 0 layers/)).not.toBeInTheDocument();
+    });
+
+    it("applies the point at the context the user is aiming at, not the curve's top end", () => {
+      const { placement } = withCurve();
+      fireEvent.click(screen.getByRole("button", { name: /^Wizard/ }));
+      // Whatever the slider's current target is, the applied layer count is a
+      // real point on the curve -- and never the 0-layer top end while a
+      // smaller context is being targeted.
+      const appliedNgl = (placement.onNglChange as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[0];
+      expect(curveResult.curve.map((p) => p.ngl)).toContain(appliedNgl);
+      expect(appliedNgl).toBeGreaterThan(0);
+    });
+  });
+
+  // Granularity changes how finely a Targets search converges. The Wizard's
+  // frontier has no finer setting -- one boundary per context stop, and layers
+  // are whole numbers -- so the control must not look effective when the
+  // Wizard is the only thing selected.
+  it("goes quiet about granularity when only the Wizard is selected", () => {
+    renderWithPlacement();
+    const [basic] = screen.getAllByRole("radio", { name: "Basic" });
+    expect(basic).not.toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: /^Wizard/ }));
+    expect(screen.getAllByRole("radio", { name: "Basic" })[0]).toBeDisabled();
+    // Selecting Targets as well brings it back: it applies to that search.
+    fireEvent.click(screen.getByRole("button", { name: /^Targets/ }));
+    expect(screen.getAllByRole("radio", { name: "Basic" })[0]).not.toBeDisabled();
+  });
+
   it("labels the Wizard card with its real dispatch mode for assistive tech", () => {
     renderWithPlacement();
-    expect(screen.getByRole("button", { name: /Wizard — runs as max_gpu/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Wizard — runs as frontier/ })).toBeInTheDocument();
   });
 
   it("defaults Targets to a context pin, dispatching keep_context", () => {
@@ -128,7 +188,7 @@ describe("GoalQuestionnaire's Tested-configurations section", () => {
     fireEvent.click(screen.getByRole("button", { name: /Run test/ }));
     await waitFor(() => expect(onRunModes).toHaveBeenCalledTimes(1));
     const [modes] = onRunModes.mock.calls[0] as [string[], unknown, unknown];
-    expect(modes).toEqual(["max_gpu", "keep_context"]);
+    expect(modes).toEqual(["frontier", "keep_context"]);
   });
 
   it("re-resolves the pinned mode at click time, not at selection time", async () => {

@@ -12,6 +12,7 @@ import {
   nextSliderRefineCandidate,
   PROBE_LADDER_MIN_CTX,
   PROBE_MAX_LOADS,
+  resolveFrontier,
   snapToSafeCtx,
   type AnchoredOutcome,
   type LadderAttempt,
@@ -391,6 +392,165 @@ describe("the ladder as a whole", () => {
     expect(bestLadderResult(failing)).toBeNull();
   });
 
+  // --- the frontier mode ---------------------------------------------------
+  //
+  // Unlike every other mode, this one's answer is the whole staircase rather
+  // than one rung, so the assertions are about the CURVE: that it is monotone,
+  // that nothing was declared without evidence, and that the cheap implications
+  // really do replace loads.
+  describe("frontier", () => {
+    const stops = ctxLadderStops(TRAINED);
+    const curve = (history: LadderAttempt[]) => resolveFrontier({ history, stops, nglMax: NGL_MAX });
+
+    it("carries a pass DOWN the context axis and a failure UP it", () => {
+      const resolved = curve([
+        { ctx: 32_768, ngl: 20, ok: true, ctxVerdictMeasured: true },
+        { ctx: 32_768, ngl: 21, ok: false },
+      ]);
+      // The stop that was measured.
+      expect(resolved.find((s) => s.ctx === 32_768)).toMatchObject({ ngl: 20, resolved: true, source: "measured" });
+      // Below it: 20 passes (less cache), and nothing here failed, so the
+      // boundary is still open -- more layers may well fit.
+      const below = resolved.find((s) => s.ctx === 1024)!;
+      expect(below.ngl).toBe(20);
+      expect(below.resolved).toBe(false);
+      // Above it: 21 is known to fail, and 20 is not known to pass.
+      const above = resolved.find((s) => s.ctx === TRAINED)!;
+      expect(above.firstFailingNgl).toBe(21);
+      expect(above.ngl).toBeNull();
+    });
+
+    it("settles every stop between two ends that agree, without loading them", () => {
+      const resolved = curve([
+        { ctx: 1024, ngl: 12, ok: true },
+        { ctx: 1024, ngl: 13, ok: false },
+        { ctx: TRAINED, ngl: 12, ok: true, ctxVerdictMeasured: true },
+      ]);
+      expect(resolved.every((s) => s.resolved)).toBe(true);
+      expect(resolved.every((s) => s.ngl === 12)).toBe(true);
+      expect(resolved.filter((s) => s.source === "implied").length).toBe(stops.length - 2);
+    });
+
+    it("treats host-backed weights as failing at every context, not just larger ones", () => {
+      const resolved = curve([{ ctx: 32_768, ngl: 30, ok: false, hostBacked: true }]);
+      expect(resolved.every((s) => s.firstFailingNgl === 30)).toBe(true);
+    });
+
+    it("marks a stop resolved by a pass whose cache was never judged", () => {
+      const [floor] = curve([{ ctx: 1024, ngl: 48, ok: true }]);
+      expect(floor).toMatchObject({ resolved: true, unverified: false });
+      const top = curve([
+        { ctx: 1024, ngl: 12, ok: true },
+        { ctx: 1024, ngl: 13, ok: false },
+        { ctx: TRAINED, ngl: 12, ok: true },
+      ]).at(-1)!;
+      expect(top).toMatchObject({ ngl: 12, resolved: true, unverified: true });
+    });
+
+    it("reports a machine the model does not fit on at all", () => {
+      const resolved = curve([{ ctx: 1024, ngl: 0, ok: false }]);
+      expect(resolved[0]).toMatchObject({ ngl: null, resolved: true });
+    });
+
+    it("measures the floor context first, then the ceiling", () => {
+      const rungs = runLadder({ mode: "frontier", granularity: "basic", candidateCtx: 32_768, candidateNgl: 27 });
+      expect(rungs[0]).toMatchObject({ ctx: PROBE_LADDER_MIN_CTX, ngl: NGL_MAX });
+      const firstAbove = rungs.findIndex((r) => r.ctx > PROBE_LADDER_MIN_CTX);
+      // The floor's own boundary is pinned down before anything above it runs,
+      // and the first stop above it is the ceiling -- the two together bracket
+      // every stop in between.
+      expect(resolveFrontier({ history: rungs.slice(0, firstAbove), stops, nglMax: NGL_MAX })[0].resolved).toBe(true);
+      expect(rungs[firstAbove].ctx).toBe(TRAINED);
+    });
+
+    it("never loads a rung above the floor whose layer count has no cheaper reference", () => {
+      const rungs = runLadder({ mode: "frontier", granularity: "basic", candidateCtx: 32_768, candidateNgl: 27 });
+      for (const [i, rung] of rungs.entries()) {
+        // ngl 0 is exempt: nothing is claimed on the GPU, so there is no
+        // placement for the check to judge and no reference worth a load.
+        if (rung.ctx === PROBE_LADDER_MIN_CTX || rung.ngl === 0) continue;
+        const reference = rungs.slice(0, i).some((r) => r.ngl === rung.ngl && r.ctx < rung.ctx);
+        expect({ rung, reference }).toMatchObject({ reference: true });
+      }
+    });
+
+    it("produces a staircase that only ever steps down", () => {
+      const rungs = runLadder({ mode: "frontier", granularity: "basic", candidateCtx: 32_768, candidateNgl: 27 });
+      const resolved = curve(rungs);
+      const measured = resolved.filter((s) => s.ngl != null).map((s) => s.ngl!);
+      for (let i = 1; i < measured.length; i++) expect(measured[i]).toBeLessThanOrEqual(measured[i - 1]);
+      // ...and it agrees with the machine it was measured on.
+      for (const stop of resolved) {
+        if (stop.ngl == null || !stop.resolved) continue;
+        expect({ ctx: stop.ctx, ngl: stop.ngl, fits: fits({ ctx: stop.ctx, ngl: stop.ngl }) }).toMatchObject({ fits: true });
+      }
+    });
+
+    // The case the whole design turns on: when context is cheap the curve is
+    // one flat line, and proving that must not cost more than max_gpu's own
+    // two corners. Every stop between the ends is settled by implication.
+    it("proves a flat curve from its two ends, without walking the stops between", () => {
+      const cheapContext = (r: { ctx: number; ngl: number }): boolean => r.ctx * (r.ngl + 4) <= 1_000_000_000;
+      const rungs = runLadder({ mode: "frontier", granularity: "basic", candidateCtx: 32_768, candidateNgl: 27 }, cheapContext);
+      // Only the two ends are ever loaded, however wrong the estimate is about
+      // where the boundary sits (this one is far too pessimistic, so the
+      // ceiling's opening guess costs one extra load before the bound is tested).
+      expect(rungs.length).toBeLessThanOrEqual(3);
+      expect(rungs.every((r) => r.ctx === PROBE_LADDER_MIN_CTX || r.ctx === TRAINED)).toBe(true);
+      const resolved = curve(rungs);
+      expect(resolved.every((s) => s.resolved && s.ngl === NGL_MAX)).toBe(true);
+      expect(resolved.filter((s) => s.source === "implied")).toHaveLength(stops.length - 2);
+    });
+
+    // A machine where context genuinely costs layers: the budget goes to the
+    // stops that bend, and every boundary it does report is the real one.
+    it("resolves the stops it can afford, and reports each one correctly", () => {
+      const truth = (ctx: number) => {
+        for (let n = NGL_MAX; n >= 0; n--) if (fits({ ctx, ngl: n })) return n;
+        return null;
+      };
+      const rungs = runLadder({ mode: "frontier", granularity: "basic", candidateCtx: 32_768, candidateNgl: 27 });
+      const resolved = curve(rungs).filter((s) => s.resolved);
+      expect(resolved.length).toBeGreaterThanOrEqual(6);
+      for (const stop of resolved) {
+        expect({ ctx: stop.ctx, ngl: stop.ngl }).toEqual({ ctx: stop.ctx, ngl: truth(stop.ctx) });
+      }
+    });
+
+    // The estimator does not vary with context (estimateSafeNgl ignores it), so
+    // without the neighbour-derived bracket it proposed 20 layers at a context
+    // where 13 had just failed, and the walk wandered for nine loads.
+    it("never proposes a layer count at or above one already known to fail there", () => {
+      const rungs = runLadder({ mode: "frontier", granularity: "basic", candidateCtx: 32_768, candidateNgl: 27 });
+      for (const [i, rung] of rungs.entries()) {
+        const knownFailure = rungs
+          .slice(0, i)
+          .filter((r) => !r.ok && (r.ctx <= rung.ctx || r.hostBacked))
+          .map((r) => r.ngl);
+        for (const failed of knownFailure) expect(rung.ngl).toBeLessThan(failed);
+      }
+    });
+
+    it("stops immediately when not even one layer fits at the cheapest context", () => {
+      const rungs = runLadder({ mode: "frontier", granularity: "basic", candidateCtx: 32_768, candidateNgl: 27 }, () => false);
+      // Every layer, the estimate, then zero -- and zero failing ends it. No
+      // load is ever spent at a larger context, where nothing could fit either.
+      expect(rungs.every((r) => r.ctx === PROBE_LADDER_MIN_CTX)).toBe(true);
+      expect(rungs.length).toBeLessThanOrEqual(3);
+      expect(curve(rungs).every((s) => s.resolved && s.ngl === null)).toBe(true);
+    });
+
+    it("leaves stops it could not reach marked unmeasured rather than guessed", () => {
+      // One measured stop, nothing else: the ends are known, the middle is not.
+      const resolved = curve([
+        { ctx: 1024, ngl: 12, ok: true },
+        { ctx: 1024, ngl: 13, ok: false },
+      ]);
+      expect(resolved[0].source).toBe("measured");
+      expect(resolved.slice(1).every((s) => s.source === "unmeasured" && s.ngl == null)).toBe(true);
+    });
+  });
+
   it.each<[ProbeMode, ProbeGranularity]>([
     ["max_gpu", "basic"],
     ["max_gpu", "fine"],
@@ -402,6 +562,8 @@ describe("the ladder as a whole", () => {
     ["keep_context", "fine"],
     ["fixed_offload", "basic"],
     ["fixed_offload", "fine"],
+    ["frontier", "basic"],
+    ["frontier", "fine"],
   ])("%s/%s terminates within budget, stays in bounds, and never repeats a rung", (mode, granularity) => {
     const rungs = runLadder({ mode, granularity, candidateCtx: 32_768, candidateNgl: 27 });
     expect(rungs.length).toBeGreaterThan(0);

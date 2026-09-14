@@ -141,6 +141,8 @@ function validateOneProbeAttempt(raw: unknown, label: string): ProbeAttemptRepor
     vram_process_peak_mib: optionalNonNegative(a.vram_process_peak_mib, `${label}.vram_process_peak_mib`),
     ram_total_peak_mib: optionalNonNegative(a.ram_total_peak_mib, `${label}.ram_total_peak_mib`),
     vram_shared_peak_mib: optionalNonNegative(a.vram_shared_peak_mib, `${label}.vram_shared_peak_mib`),
+    vram_shared_total_peak_mib: optionalNonNegative(a.vram_shared_total_peak_mib, `${label}.vram_shared_total_peak_mib`),
+    vram_claimed_peak_mib: optionalNonNegative(a.vram_claimed_peak_mib, `${label}.vram_claimed_peak_mib`),
     gen_tps: optionalNonNegative(a.gen_tps, `${label}.gen_tps`),
     pp_tps: optionalNonNegative(a.pp_tps, `${label}.pp_tps`),
     ttft_ms: optionalNonNegative(a.ttft_ms, `${label}.ttft_ms`),
@@ -399,6 +401,8 @@ export async function measurementRoutes(app: FastifyInstance): Promise<void> {
         ram_free_mib: row.ram_free_mib,
         ram_peak_mib: row.ram_peak_mib,
         vram_shared_peak_mib: row.vram_shared_peak_mib,
+        vram_shared_total_peak_mib: row.vram_shared_total_peak_mib,
+        vram_claimed_peak_mib: row.vram_claimed_peak_mib,
         // Carried so the reusing run's row shows what the sibling measured,
         // rather than a line of em-dashes reading as "never measured".
         vram_process_peak_mib: row.vram_process_peak_mib,

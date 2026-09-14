@@ -21,6 +21,8 @@ not code.
 | Pressure gate | **proposed and withdrawn** — see §7 |
 | Span-1 slope references | **proposed and withdrawn** — see §7 |
 | Wizard / Targets structure | implemented |
+| Context-axis KV spill fails a rung | implemented |
+| Frontier mode — the Wizard's search (§9) | implemented |
 | Reuse across probes (not just batch siblings) | spec only |
 | `residentSlopeRatio` / `abstained` persisted and displayed | spec only |
 
@@ -120,12 +122,19 @@ context is 16 layers:
 | 2 | ngl 16 · ctx 1,024 | Opening: jump to the estimator's answer | passed |
 | 3 | ngl 17 · ctx 1,024 | Last point passed: step up by 1 | failed |
 | — | bracket [16, 17] | Width 1 — offload boundary resolved, no load spent | boundary = 16 |
-| 4 | ngl 16 · ctx 262,144 | Offload settled, so context now moves at a placement already judged clean — jump straight to the trained ceiling | passed |
+| 4 | ngl 16 · ctx 262,144 | Offload settled, so context now moves at a placement already judged clean — jump straight to the trained ceiling | **fails** if most of the memory that context added lands in system RAM (§7), and the walk bisects down |
 | 5–6 | ngl 18, 20 · ctx 1,024 | Optional: show what crossing the boundary costs, rather than asserting it | cliff drawn |
 
 Six loads against the 24-load budget, and the context axis moved exactly once.
 The five probes on the 6 Sep 2026 reference run spent 31 loads reaching four
 different answers.
+
+Row 4 used to read *passed*, and that was the bug: probe 124c2ab1 "verified"
+262,144 tokens on this 8 GiB card with the entire cache in system RAM. A
+context whose cache is host-backed now fails, so what this row really shows is
+the **largest context whose cache stayed on the GPU at 16 layers** — which on
+this machine is below the trained ceiling, and is exactly why one corner is not
+an answer. See §9.
 
 ---
 
@@ -138,7 +147,7 @@ only the first is about speed:
 |---|---|
 | Cheapest loads | A 1,024-token cache is a rounding error against the weights, so these loads are the fastest the probe can buy. |
 | Uncontaminated verdict | With the cache term negligible, host-backed memory at these rungs is attributable to weights alone — which is what the offload verdict is about. |
-| Context never moves at an unjudged placement | Spill on the context axis is reported but deliberately never failed, so a placement reached by growing context inherits a pass it was never tested for. Resolving offload first means that inheritance can never happen. |
+| Context never moves at an unjudged placement | Spill on the context axis judges the cache, never the weights, so a placement reached by growing context inherits a layer verdict it was never tested for. Resolving offload first means that inheritance can never happen. |
 
 That third row is why the ordering is fixed rather than a heuristic. On the
 reference run, ngl 17 at 262,144 tokens passed with 4,013 MiB host-backed
@@ -261,6 +270,16 @@ caller falls through to its weaker evidence exactly as it does when no counter
 existed at all — because a false conviction fails a configuration that works
 and moves the reported boundary.
 
+**KV spill — the context axis's own rule.** The two counters above judge
+*weights*. A rung that grew the context instead is judged on what that growth
+allocated: the share of the newly allocated memory that landed in system RAM
+(`KV_HOST_BACKED_FAIL_FRAC`, 0.6). Above it the rung fails and the walk bisects
+down. It needs no corroboration gate — the weights are identical at both ends
+of the comparison and cancel out — but it does need a per-process dedicated
+reading and a same-placement rung at a smaller context. Where it cannot run it
+reports nothing, and a pass there means only "it allocated". Measured: context
+2,048 → 262,144 pushed 98% of the new allocation to host memory.
+
 **Residency veto — bootstrap only.** When no valid reference exists, a single
 rung is judged against its own predicted footprint — and that numerator counts
 bytes that were never weights. On the reference run ngl 0 reported 571 MiB
@@ -310,6 +329,51 @@ any rung the probe runs, and cannot be inferred from the rates beside them.
 Answering it means a workload that fills the cache, which is a separate sweep
 with its own budget and its own honest cost. Until that exists, the probe's
 context result should be read as *this much will allocate*, and nothing further.
+
+---
+
+## 9. The frontier — what the Wizard actually runs
+
+§4 resolves one corner: the most layers at the cheapest context, then the
+largest context at that placement. That is a real answer to a question nobody
+asked. The question users trade against is *what does context cost in layers* —
+and 16 layers at 16k tokens and 12 layers at 128k are both true of one machine.
+
+The `frontier` mode answers that, as one layer boundary per context stop
+(`nextFrontierRung` / `resolveFrontier`). It costs no new budget, no new table
+and no new endpoint: the rungs in `probe_attempts` are the measurement, and the
+curve is derived from them by the same function the search uses.
+
+**What makes it affordable.** At a fixed layer count a larger context needs
+strictly more memory, so a pass carries DOWN the context axis and a failure
+carries UP it. Two stops that resolve to the same layer count therefore settle
+every stop between them with no load at all — on a model whose KV cache is
+cheap the whole curve costs the two ends, which is what max_gpu already spent.
+
+**Order, and why.**
+
+| step | why that order |
+|---|---|
+| Floor stop first | Cheapest loads, and the only verdict uncontaminated by cache (§5). Its answer bounds every other stop from above. |
+| Ceiling stop next | Together with the floor it brackets the curve; agreement proves it flat for free. |
+| Then the widest remaining step | Each remaining load goes where the curve actually bends. A span whose ends already agree needs none. |
+
+**Reference-first.** Before testing a layer count anywhere above the floor, it
+is tested AT the floor. The KV rule in §7 needs a same-placement rung at a
+smaller context, and without one a host-backed cache passes silently. That
+doubles the loads per candidate and is the price of a verdict that means
+something; ngl 0 is exempt, since nothing is claimed on the GPU to judge.
+
+**What the estimate is allowed to do.** Pick the seed, inside the bracket the
+neighbours imply — nothing more. `estimateSafeNgl` does not vary with context
+at all, so an unbounded target proposed 20 layers at a context where 13 had
+just failed; bounding it is what keeps the walk from wandering.
+
+**Honesty of the output.** Every stop carries how it was decided — `measured`,
+`implied`, or `unmeasured` when the budget ran out — and a stop resting on a
+pass whose cache placement was never judged is flagged `unverified` rather than
+presented as a boundary. Rates shown beside a stop are empty-cache figures
+(§1), and are labelled as such in the UI.
 
 ---
 

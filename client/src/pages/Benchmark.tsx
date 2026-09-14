@@ -34,6 +34,7 @@ import { useWorkerStatuses } from "../api/useWorkerStatus";
 import { ModelPicker } from "../components/ModelPicker";
 import { GoalQuestionnaire, KV_PRESET_LABEL } from "../components/GoalQuestionnaire";
 import { TestStatusPill } from "../components/StatusPill";
+import { frontierFrom } from "../components/ProbeFrontier";
 import { IconArrowRight, IconChevronDown, IconInfo } from "../components/icons";
 import { backendVisibleGpus } from "../types";
 import type { Model, Test, TestItem, ResultRow, TestKind, SweepConfig } from "../types";
@@ -194,6 +195,11 @@ interface PlacementVerifyState {
    * the card distinguish "waiting its turn" from "loading right now" (see
    * GoalQuestionnaire.tsx's ModeCard). Undefined once terminal. */
   runStatus?: "scheduled" | "running";
+  /** The frontier mode's settled (ctx, layers) points, ascending -- what the
+   * Wizard card names and applies instead of a single rung. See
+   * PlacementVerifyResult.curve for why a curve cannot be summarised by the
+   * stored ceiling. Absent for every other mode. */
+  curve?: { ctx: number; ngl: number }[];
 }
 
 // M5 -- a preset here carries INTENT (goals + repeats) and nothing machine-
@@ -1163,6 +1169,16 @@ export function Benchmark() {
               const winner = attemptsRes.attempts
                 .filter((a) => a.ok)
                 .sort((a, b) => b.candidate_ctx - a.candidate_ctx || (b.ngl ?? 0) - (a.ngl ?? 0))[0];
+              // A frontier probe measured a boundary per context stop, and
+              // that -- not the single stored ceiling -- is what its card
+              // names and applies. Derived with the same function the run's
+              // own page draws the curve with.
+              const curve =
+                mode === "frontier"
+                  ? frontierFrom(attemptsRes.attempts)
+                      .filter((s) => s.resolved && s.ngl != null)
+                      .map((s) => ({ ctx: s.ctx, ngl: s.ngl as number }))
+                  : undefined;
               if (!unmountedRef.current && (match || winner)) {
                 setVerifyStates((prev) => {
                   const cur = prev[mode];
@@ -1172,6 +1188,7 @@ export function Benchmark() {
                     [mode]: {
                       ...cur,
                       verifiedCtxTokens: match?.verified_ctx_tokens,
+                      curve: curve && curve.length > 0 ? curve : undefined,
                       measuredNgl: winner?.ngl ?? null,
                       measuredVramPeakMib: winner?.vram_peak_mib ?? null,
                       measuredRamPeakMib: winner?.ram_peak_mib ?? null,

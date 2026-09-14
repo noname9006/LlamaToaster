@@ -64,6 +64,10 @@ export interface ProbeAttemptDto {
    * dedicated-only reading. Null wherever no such counter/file exists at all
    * (not a measured 0), including every worker predating this reading. */
   vram_shared_peak_mib: number | null;
+  /** See ProbeAttemptReport.vram_shared_total_peak_mib / vram_claimed_peak_mib.
+   * Null from a worker predating them. */
+  vram_shared_total_peak_mib: number | null;
+  vram_claimed_peak_mib: number | null;
   gen_tps: number | null;
   /** See ProbeAttemptReport.pp_tps -- prefill has its own placement cliff,
    * several layers below the weights one, so neither of these is derivable
@@ -77,7 +81,8 @@ export interface ProbeAttemptDto {
    * shared-memory counter) and from workers predating the check. */
   host_backed_method: "slope" | "ratio" | null;
   host_backed_slope: number | null;
-  /** See ProbeAttemptReport.kv_host_backed_frac -- a caveat, not a failure. */
+  /** See ProbeAttemptReport.kv_host_backed_frac -- fails the rung above
+   * KV_HOST_BACKED_FAIL_FRAC. */
   kv_host_backed_frac: number | null;
   error: string | null;
   created_at: number;
@@ -123,6 +128,9 @@ export interface ProbeDedupPoint {
   ram_peak_mib: number | null;
   /** See ProbeAttemptDto.vram_shared_peak_mib. */
   vram_shared_peak_mib: number | null;
+  /** See ProbeAttemptDto.vram_shared_total_peak_mib / vram_claimed_peak_mib. */
+  vram_shared_total_peak_mib: number | null;
+  vram_claimed_peak_mib: number | null;
   /** Everything below is carried so a REUSED rung shows the same figures as
    * the sibling that actually measured it. Without them a reused row rendered
    * as a line of em-dashes next to fully-populated neighbours, which reads as

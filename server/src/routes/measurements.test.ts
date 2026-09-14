@@ -462,6 +462,8 @@ describe("POST /api/runs/:id/probe-result (N2)", () => {
       ram_peak_mib: 16657,
       ram_total_peak_mib: 21000,
       vram_shared_peak_mib: 1821,
+      vram_shared_total_peak_mib: 2411,
+      vram_claimed_peak_mib: 6201,
       gen_tps: 10.3,
       pp_tps: 18.9,
       ttft_ms: 9389,
@@ -492,6 +494,8 @@ describe("POST /api/runs/:id/probe-result (N2)", () => {
     expect(row.pp_tps).toBe(18.9);
     expect(row.host_backed_slope).toBe(0.92);
     expect(row.prefill_cliff).toBe(1);
+    expect(row.vram_shared_total_peak_mib).toBe(2411);
+    expect(row.vram_claimed_peak_mib).toBe(6201);
   });
 
   it("rejects a non-boolean vram_discrepancy", async () => {

@@ -41,6 +41,14 @@ Companion reading: `shared/probeLadder.ts` (the search), `shared/vramEstimate.ts
   loads.
 - **The verdict.** The largest context that passed, at the placement that
   achieved it.
+- **The Wizard asks for the whole staircase, not one rung.** Its `frontier`
+  mode resolves a layer boundary at each stop rather than a single placement
+  (`docs/CONTEXT_TEST_REDESIGN.md` §9). It walks the same stops with the same
+  budget; what changes is that monotonicity — a pass carries down the context
+  axis, a failure carries up it — settles stops nobody loaded. So the scenarios
+  below describe its shape too: where the ladder converges cheaply, the curve
+  is flat and nearly free; where context is expensive, the curve is a staircase
+  and the budget goes to the stops that bend.
 
 ## 2. What a token of context costs
 
@@ -234,11 +242,18 @@ worth being explicit that they do not fight:
   the dedicated-VRAM counter corroborates it, or at a context of at most 2,048
   tokens. Above that, an uncorroborated conviction stays a warning: the shared
   reading also holds host-placed cache and host overhead that grows with
-  context (571 MiB at 262,144 tokens with nothing on the GPU), and on Windows
-  CUDA the corroborating counter is never available, because nvidia-smi
-  reports per-process memory as `[N/A]` under WDDM. A
-  context-axis spill is only a caveat and never fails: the probe's fixed
-  ~512-token workload never reads a cache that large. When a rung's placement
+  context (571 MiB at 262,144 tokens with nothing on the GPU). A context-axis
+  spill judges the cache, not the weights: when more than 60% of what a larger
+  context added went to system RAM, that rung fails and the context search
+  bisects down to a context whose cache stays on the GPU. It used to be a
+  caveat only, since the probe's fixed ~512-token workload never reads a cache
+  that large — but that let an 8 GiB card "verify" 262,144 tokens with the
+  whole cache in system RAM. Both checks need the per-process dedicated-VRAM
+  reading. On Windows CUDA nvidia-smi reports it as `[N/A]` under WDDM, so the
+  worker reads Windows' own WDDM "GPU Process Memory" counter there instead
+  (`pickCudaProcessDedicatedMib`); where no source answers at all, the layer
+  check falls back to an uncorroborated warning and the context check cannot
+  run. When a rung's placement
   was already measured at a smaller context but the context slope could not
   run, the detector reports "unavailable" rather than falling to the bootstrap,
   which would charge the cache against the weights.
