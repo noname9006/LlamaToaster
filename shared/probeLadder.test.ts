@@ -1,1134 +1,355 @@
 import { describe, expect, it } from "vitest";
 import {
-  bestLadderEvidence,
-  bestLadderResult,
-  bestNglAtContext,
-  bestNglForMaxContext,
+  claimFitsFree,
+  claimFitsFreeByDevice,
   computeCtxStops,
   ctxLadderStops,
-  nextAnchoredCandidate,
-  nextDirectCandidate,
+  isProbeMode,
   nextLadderRung,
-  nextSliderCandidate,
-  nextSliderRefineCandidate,
+  predictFitNgl,
+  probeOutcome,
   PROBE_LADDER_MIN_CTX,
   PROBE_MAX_LOADS,
-  resolveFrontier,
   snapToSafeCtx,
-  type AnchoredOutcome,
   type LadderAttempt,
-  type ProbeGranularity,
+  type LadderInput,
+  type LadderRung,
   type ProbeMode,
 } from "./probeLadder.js";
 
-it("PROBE_MAX_LOADS defaults to 24, not the old 8 -- the new basic-ladder + fine-refine flow needs more budget to converge", () => {
-  expect(PROBE_MAX_LOADS).toBe(24);
-});
-
 const TRAINED = 262_144;
-const NGL_MAX = 48;
-// A KV-cache-shaped constraint: more layers on GPU leaves less room for
-// context. The TRUE boundary at ngl is FIT_LIMIT / (ngl + 4).
-const FIT_LIMIT = 900_000;
-const fits = (r: { ctx: number; ngl: number }): boolean => r.ctx * (r.ngl + 4) <= FIT_LIMIT;
+const LAYERS = 41;
+const FREE = 7378;
 
-// A deliberately IMPERFECT estimate -- real ones can be wrong (see the
-// gemma4 SWA case this ladder was built to be robust against): consistently
-// ~30% optimistic on ngl, ~25% optimistic on ctx, so tests prove the search
-// still converges on the TRUE boundary via the bracket rule, not merely on
-// whatever the estimate said.
-function calculateNgl(): number {
-  return 26; // true safe ngl at ctx=1024 is floor(900000/1024)-4 = 875; layers only go to 48, so "safe" just means "most of them"
-}
-function calculateCtx(pinnedNgl: number): number {
-  const trueMax = Math.floor(FIT_LIMIT / (pinnedNgl + 4));
-  return Math.round(trueMax * 1.25); // optimistic by construction
+// A machine shaped on the RX 6600 XT sweep (docs/research/spill-tax-dataset.json):
+// ~405MiB claimed per layer, 7,378MiB free per --list-devices, and spill that
+// grows steadily with neither layers (5 spills, 6 is clean) nor context (8
+// spills at 1k-8k and not at 16k).
+interface Machine {
+  claim: (r: LadderRung) => number;
+  clean: (r: LadderRung, loadIndex: number) => boolean;
 }
 
-function runLadder(
-  opts: { mode: ProbeMode; granularity: ProbeGranularity; candidateCtx: number; candidateNgl: number; maxCtx?: number; nglMax?: number },
-  fitsFn: (rung: { ctx: number; ngl: number }) => boolean = fits
-): LadderAttempt[] {
+const cleanLayers = (ctx: number): Set<number> =>
+  ctx <= 8192
+    ? new Set([0, 1, 2, 3, 4, 6])
+    : ctx <= 32_768
+      ? new Set([0, 1, 2, 3, 4, 6, 8])
+      : ctx <= 131_072
+        ? new Set([0, 1, 2])
+        : new Set<number>();
+
+const CARD: Machine = {
+  claim: (r) => 280 + 405 * r.ngl + r.ctx * 0.004,
+  clean: (r) => cleanLayers(r.ctx).has(r.ngl),
+};
+
+function measure(machine: Machine, r: LadderRung, history: LadderAttempt[], free: number | null): LadderAttempt {
+  const claim = machine.claim(r);
+  const index = history.filter((h) => h.ctx === r.ctx && h.ngl === r.ngl).length;
+  return {
+    ...r,
+    ok: machine.clean(r, index),
+    placementJudged: true,
+    claimedMib: claim,
+    fitsFree: claimFitsFree({ claimedMib: claim, freeMib: free, loaded: true }),
+  };
+}
+
+function run(
+  mode: ProbeMode,
+  opts: { ctx?: number; ngl?: number; machine?: Machine; free?: number | null; maxLoads?: number; maxCtx?: number } = {}
+): { history: LadderAttempt[]; input: LadderInput } {
+  const machine = opts.machine ?? CARD;
+  const free = opts.free === undefined ? FREE : opts.free;
   const history: LadderAttempt[] = [];
-  for (let guard = 0; guard <= PROBE_MAX_LOADS + 2; guard++) {
-    const next = nextLadderRung({
-      mode: opts.mode,
-      granularity: opts.granularity,
-      candidateCtx: opts.candidateCtx,
-      candidateNgl: opts.candidateNgl,
-      nglMax: opts.nglMax ?? NGL_MAX,
-      maxCtx: opts.maxCtx ?? TRAINED,
-      history,
-      calculateNgl,
-      calculateCtx,
-    });
-    if (next === null) return history;
-    history.push({ ...next, ok: fitsFn(next) });
+  const input: LadderInput = {
+    mode,
+    candidateCtx: opts.ctx ?? 1024,
+    candidateNgl: opts.ngl ?? 10,
+    nglMax: LAYERS,
+    maxCtx: opts.maxCtx ?? TRAINED,
+    maxLoads: opts.maxLoads ?? 200,
+    history,
+    freeVramMib: free,
+    calculateNgl: () => 12,
+  };
+  for (let guard = 0; guard < 300; guard++) {
+    const next = nextLadderRung(input);
+    if (next == null) return { history, input };
+    history.push(measure(machine, next, history, free));
   }
   throw new Error("ladder did not terminate");
 }
 
-describe("nextAnchoredCandidate", () => {
-  const base = { min: 0, max: 100, tolerance: 1 };
+const key = (r: LadderRung) => `${r.ctx}/${r.ngl}`;
 
-  it("does nothing with an empty history -- the seed is the caller's job", () => {
-    expect(nextAnchoredCandidate({ ...base, history: [], growTarget: 80, shrinkTarget: 10 })).toBeNull();
+describe("vocabulary", () => {
+  it("defaults to 40 loads", () => {
+    expect(PROBE_MAX_LOADS).toBe(40);
   });
 
-  it("only failures so far: bisects toward shrinkTarget", () => {
-    const history: AnchoredOutcome[] = [{ value: 48, ok: false }];
-    expect(nextAnchoredCandidate({ ...base, history, growTarget: 48, shrinkTarget: 20 })).toBe(34);
-  });
-
-  it("repeated failures keep bisecting toward shrinkTarget using the latest failure", () => {
-    const history: AnchoredOutcome[] = [
-      { value: 48, ok: false },
-      { value: 34, ok: false },
-    ];
-    expect(nextAnchoredCandidate({ ...base, history, growTarget: 48, shrinkTarget: 20 })).toBe(27);
-  });
-
-  it("only successes so far: bisects toward growTarget", () => {
-    const history: AnchoredOutcome[] = [{ value: 1024, ok: true }];
-    expect(nextAnchoredCandidate({ min: 1024, max: 200_000, tolerance: 64, history, growTarget: 32_768, shrinkTarget: 1024 })).toBe(
-      16_896
-    );
-  });
-
-  it("a seed that IS its own growTarget converges in one success, no second candidate", () => {
-    const history: AnchoredOutcome[] = [{ value: 48, ok: true }];
-    expect(nextAnchoredCandidate({ ...base, history, growTarget: 48, shrinkTarget: 20 })).toBeNull();
-  });
-
-  it("once a bracket exists, bisects the two real values directly", () => {
-    const history: AnchoredOutcome[] = [
-      { value: 48, ok: false },
-      { value: 34, ok: false },
-      { value: 27, ok: true },
-    ];
-    // bracket [27 ok, 34 bad] -> mean 30.5 -> rounds to 31 (matches the plan's worked example)
-    expect(nextAnchoredCandidate({ ...base, history, growTarget: 48, shrinkTarget: 20 })).toBe(31);
-  });
-
-  it("stops once the bracket is within tolerance", () => {
-    const history: AnchoredOutcome[] = [
-      { value: 27, ok: true },
-      { value: 28, ok: false },
-    ];
-    expect(nextAnchoredCandidate({ ...base, history, growTarget: 48, shrinkTarget: 20 })).toBeNull();
-  });
-
-  it("ignores a flaky failure below an already-proven success", () => {
-    const history: AnchoredOutcome[] = [
-      { value: 30, ok: true },
-      { value: 20, ok: false }, // below the proven success -- must not drag the bracket down
-    ];
-    const next = nextAnchoredCandidate({ ...base, history, growTarget: 48, shrinkTarget: 20 });
-    // Still only ONE real success and no qualifying failure above it -> keeps growing toward growTarget.
-    expect(next).toBe(39);
-  });
-
-  it("tests the shrink target itself before giving up, even when already within tolerance", () => {
-    // A failure that's already numerically close to shrinkTarget must not
-    // short-circuit to "nothing fits" without ever trying shrinkTarget --
-    // that would report failure based on proximity to an UNTESTED value.
-    const history: AnchoredOutcome[] = [{ value: 27, ok: false }];
-    expect(nextAnchoredCandidate({ ...base, history, growTarget: 48, shrinkTarget: 26 })).toBe(26);
-  });
-
-  it("once the shrink target itself has been tried and also failed, stops for real", () => {
-    const history: AnchoredOutcome[] = [
-      { value: 27, ok: false },
-      { value: 26, ok: false },
-    ];
-    expect(nextAnchoredCandidate({ ...base, history, growTarget: 48, shrinkTarget: 26 })).toBeNull();
-  });
-
-  it("tests the grow target itself before stopping, symmetric to the shrink case", () => {
-    const history: AnchoredOutcome[] = [{ value: 95, ok: true }];
-    expect(nextAnchoredCandidate({ min: 0, max: 100, tolerance: 5, history, growTarget: 99, shrinkTarget: 0 })).toBe(99);
-  });
-
-  it("clamps a candidate to [min, max] and refuses to repeat an already-tried value", () => {
-    const history: AnchoredOutcome[] = [{ value: 95, ok: true }];
-    // mean(95, 200) would be 147.5, clamped to max=100 -- but 100 wasn't tried yet, so it's offered once.
-    expect(nextAnchoredCandidate({ min: 0, max: 100, tolerance: 1, history, growTarget: 200, shrinkTarget: 0 })).toBe(100);
-    const historyAtCeiling: AnchoredOutcome[] = [
-      { value: 95, ok: true },
-      { value: 100, ok: true },
-    ];
-    // Now every candidate the rule could produce clamps straight back to 100, already tried -> null.
-    expect(
-      nextAnchoredCandidate({ min: 0, max: 100, tolerance: 1, history: historyAtCeiling, growTarget: 200, shrinkTarget: 0 })
-    ).toBeNull();
+  it("no longer accepts the removed modes", () => {
+    for (const gone of ["max_gpu", "max_context", "balanced"]) expect(isProbeMode(gone)).toBe(false);
+    for (const kept of ["frontier", "keep_context", "fixed_offload", "custom"]) expect(isProbeMode(kept)).toBe(true);
   });
 });
 
-describe("nextDirectCandidate", () => {
-  const base = { min: 0, max: 48, tolerance: 1 };
-
-  it("jumps straight to shrinkTarget on the seed's first failure, not a midpoint", () => {
-    const history: AnchoredOutcome[] = [{ value: 48, ok: false }];
-    expect(nextDirectCandidate({ ...base, history, growTarget: 48, shrinkTarget: 26 })).toBe(26);
-  });
-
-  it("once shrinkTarget itself is tried, forms a real bracket with the seed and bisects normally", () => {
-    const history: AnchoredOutcome[] = [
-      { value: 48, ok: false },
-      { value: 26, ok: true },
-    ];
-    // bracket [26 ok, 48 fail] -> mean 37
-    expect(nextDirectCandidate({ ...base, history, growTarget: 48, shrinkTarget: 26 })).toBe(37);
-  });
-
-  it("continues bracket bisection on later steps exactly like nextAnchoredCandidate", () => {
-    const history: AnchoredOutcome[] = [
-      { value: 48, ok: false },
-      { value: 26, ok: true },
-      { value: 37, ok: false },
-    ];
-    // bracket [26 ok, 37 fail] -> mean 31.5 -> 32
-    expect(nextDirectCandidate({ ...base, history, growTarget: 48, shrinkTarget: 26 })).toBe(32);
-  });
-
-  it("retargets toward min once shrinkTarget itself has also failed", () => {
-    const history: AnchoredOutcome[] = [
-      { value: 48, ok: false },
-      { value: 26, ok: false },
-    ];
-    // shrinkTarget (26) already tried and failed -- no more trusted value to
-    // jump to, so bisect toward the hard floor instead: mean(26, 0) = 13.
-    expect(nextDirectCandidate({ ...base, history, growTarget: 48, shrinkTarget: 26 })).toBe(13);
-  });
-
-  it("tests min itself before giving up, symmetric to the shrink-target rule", () => {
-    const history: AnchoredOutcome[] = [
-      { value: 48, ok: false },
-      { value: 26, ok: false },
-      { value: 1, ok: false },
-    ];
-    expect(nextDirectCandidate({ ...base, history, growTarget: 48, shrinkTarget: 26 })).toBe(0);
-  });
-
-  it("reports nothing once even min has failed", () => {
-    const history: AnchoredOutcome[] = [
-      { value: 48, ok: false },
-      { value: 26, ok: false },
-      { value: 1, ok: false },
-      { value: 0, ok: false },
-    ];
-    expect(nextDirectCandidate({ ...base, history, growTarget: 48, shrinkTarget: 26 })).toBeNull();
-  });
-
-  it("mirrors the direct jump on the grow side", () => {
-    const history: AnchoredOutcome[] = [{ value: 10, ok: true }];
-    expect(nextDirectCandidate({ min: 0, max: 100, tolerance: 1, history, growTarget: 80, shrinkTarget: 0 })).toBe(80);
+describe("claimFitsFree", () => {
+  it("strictly below free fits, a load that never allocated does not, missing readings are unknown", () => {
+    expect(claimFitsFree({ claimedMib: 7274, freeMib: 7378, loaded: true })).toBe(true);
+    expect(claimFitsFree({ claimedMib: 7378, freeMib: 7378, loaded: true })).toBe(false);
+    expect(claimFitsFree({ claimedMib: null, freeMib: 7378, loaded: false })).toBe(false);
+    expect(claimFitsFree({ claimedMib: null, freeMib: 7378, loaded: true })).toBeNull();
+    expect(claimFitsFree({ claimedMib: 7000, freeMib: null, loaded: true })).toBeNull();
   });
 });
 
-describe("nextSliderCandidate", () => {
-  const stops = [1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144];
-
-  it("walks up one stop at a time while every stop succeeds", () => {
-    expect(nextSliderCandidate({ history: [{ value: 16384, ok: true }], stops })).toBe(32768);
+describe("claimFitsFreeByDevice", () => {
+  it("needs every used device to fit its own free memory -- an integrated GPU's room cannot hide a full card", () => {
+    const free = { Vulkan0: 7378, Vulkan1: 15000 };
+    expect(claimFitsFreeByDevice({ Vulkan0: 7000, Vulkan1: 200 }, free)).toBe(true);
+    // 7,500 + 200 is far below the 22,378 total, but Vulkan0 alone is over.
+    expect(claimFitsFreeByDevice({ Vulkan0: 7500, Vulkan1: 200 }, free)).toBe(false);
   });
 
-  it("walks down one stop at a time while every stop fails", () => {
-    expect(nextSliderCandidate({ history: [{ value: 16384, ok: false }], stops })).toBe(8192);
+  it("is unknown when a used device was not listed, or nothing was claimed", () => {
+    expect(claimFitsFreeByDevice({ CUDA0: 100 }, { Vulkan0: 7378 })).toBeNull();
+    expect(claimFitsFreeByDevice({ Vulkan0: 0 }, { Vulkan0: 7378 })).toBeNull();
+    expect(claimFitsFreeByDevice(null, { Vulkan0: 7378 })).toBeNull();
+  });
+});
+
+describe("predictFitNgl", () => {
+  const at = (ctx: number, ngl: number): LadderAttempt => ({ ctx, ngl, ok: false, claimedMib: CARD.claim({ ctx, ngl }) });
+
+  it("errs low from one load, and reads the per-layer claim from two", () => {
+    expect(predictFitNgl([at(1024, 12)], 1024, FREE)).toBe(17);
+    expect(predictFitNgl([at(1024, 12)], 1024, FREE)!).toBeLessThanOrEqual(17);
+    expect(predictFitNgl([at(1024, 12), at(1024, 17)], 1024, FREE)).toBe(17);
   });
 
-  it("stops the instant the walk reverses -- the two stops are already adjacent", () => {
-    const history: AnchoredOutcome[] = [
-      { value: 16384, ok: true },
-      { value: 32768, ok: false },
+  it("assumes the fixed part does not grow until a second context is measured, then interpolates", () => {
+    const floor = [at(1024, 12), at(1024, 17)];
+    expect(predictFitNgl(floor, 262_144, FREE)).toBe(17);
+    expect(predictFitNgl([...floor, at(262_144, 17)], 262_144, FREE)).toBe(14);
+    expect(predictFitNgl([...floor, at(262_144, 17)], 65_536, FREE)).toBe(16);
+  });
+});
+
+describe("the Wizard (frontier)", () => {
+  it("opens at the estimate, never at every layer, and settles target 2 at the smallest context in three loads", () => {
+    const { history } = run("frontier");
+    expect(history[0]).toEqual(expect.objectContaining({ ctx: 1024, ngl: 12 }));
+    expect(history.some((h) => h.ngl === LAYERS)).toBe(false);
+    expect(history.slice(0, 3).map(key)).toEqual(["1024/12", "1024/17", "1024/18"]);
+  });
+
+  it("finds where spill starts, then the two layers above it -- 6 past a spilling 5", () => {
+    const { history, input } = run("frontier");
+    const stop = probeOutcome(input).curve![0];
+    expect(stop.fit).toMatchObject({ value: 17, resolved: true });
+    expect(stop.clean).toMatchObject({ value: 6, resolved: true, control: "confirmed" });
+    // 7 is where spill starts above 6; 8 and 9 are the two layers above it.
+    for (const n of [7, 8, 9]) expect(history.some((h) => h.ctx === 1024 && h.ngl === n)).toBe(true);
+  });
+
+  it("finishes each context before the next, with the control after the next context's target 2", () => {
+    const { history } = run("frontier");
+    const order = history.map(key);
+    const fit2k = order.indexOf("2048/17");
+    const control1k = order.lastIndexOf("1024/6");
+    const clean2k = order.indexOf("2048/6");
+    expect(order.indexOf("1024/6")).toBeLessThan(fit2k);
+    expect(fit2k).toBeLessThan(control1k);
+    expect(control1k).toBeLessThan(clean2k);
+    expect(order.findIndex((k) => k.startsWith("2048/"))).toBeGreaterThan(order.indexOf("1024/18"));
+  });
+
+  it("never tries more layers for no spill than the smaller context held clean -- 8 at 16k stays untried", () => {
+    const { history, input } = run("frontier");
+    expect(history.some((h) => h.ctx === 16_384 && h.ngl === 8)).toBe(false);
+    const curve = probeOutcome(input).curve!;
+    expect(curve.find((s) => s.ctx === 16_384)!.clean.value).toBe(6);
+    expect(curve.find((s) => s.ctx === 65_536)!.clean.value).toBe(2);
+    expect(curve.find((s) => s.ctx === TRAINED)!.clean).toMatchObject({ value: null, resolved: true });
+  });
+
+  it("resolves the whole curve for this card in 43 loads, every answer controlled", () => {
+    const { history, input } = run("frontier");
+    expect(history).toHaveLength(43);
+    const outcome = probeOutcome(input);
+    for (const stop of outcome.curve!) {
+      expect(stop.fit?.resolved).toBe(true);
+      expect(stop.clean.resolved).toBe(true);
+      if (stop.clean.value != null) {
+        expect(stop.clean.control).toBe("confirmed");
+        expect(stop.clean.value).toBeLessThanOrEqual(stop.fit!.value!);
+      }
+    }
+    expect(outcome.next).toBeNull();
+  });
+
+  it("lowers an answer whose control spills, and gives the next context the lowered ceiling", () => {
+    // The second load of 6 layers at 1k spills: that reading is not reproducible.
+    const flaky: Machine = {
+      claim: CARD.claim,
+      clean: (r, index) => (r.ctx === 1024 && r.ngl === 6 && index >= 1 ? false : CARD.clean(r, index)),
+    };
+    const { history, input } = run("frontier", { machine: flaky });
+    const curve = probeOutcome(input).curve!;
+    expect(curve[0].clean).toMatchObject({ value: 4, control: "confirmed" });
+    expect(history.some((h) => h.ctx === 2048 && h.ngl > 4 && h.ok)).toBe(false);
+    expect(curve[1].clean.value).toBe(4);
+  });
+
+  it("stops once nothing fits: no load at any larger context", () => {
+    const expensiveKv: Machine = { claim: (r) => 280 + 405 * r.ngl + r.ctx * 0.1, clean: (r) => r.ngl <= 2 };
+    const { history, input } = run("frontier", { machine: expensiveKv });
+    const outcome = probeOutcome(input);
+    const firstNone = outcome.nothingFitsFrom!;
+    expect(firstNone).toBe(131_072);
+    expect(history.some((h) => h.ctx > firstNone)).toBe(false);
+    expect(outcome.curve!.filter((s) => s.ctx > firstNone).every((s) => s.fit?.resolved && s.fit.value == null)).toBe(true);
+  });
+
+  it("at the default 40 loads, leaves only the largest context's no-spill answer unmeasured on this card", () => {
+    const { history, input } = run("frontier", { maxLoads: PROBE_MAX_LOADS });
+    expect(history).toHaveLength(PROBE_MAX_LOADS);
+    const curve = probeOutcome(input).curve!;
+    expect(curve.slice(0, -1).every((s) => s.fit?.resolved && s.clean.resolved)).toBe(true);
+    expect(curve[curve.length - 1].fit).toMatchObject({ value: 14, resolved: true });
+    expect(curve[curve.length - 1].clean.resolved).toBe(false);
+  });
+
+  it("leaves the stops it never reached unmeasured when the budget runs out", () => {
+    const { history, input } = run("frontier", { maxLoads: 16 });
+    expect(history).toHaveLength(16);
+    const curve = probeOutcome(input).curve!;
+    expect(curve[0].clean.resolved).toBe(true);
+    expect(curve[curve.length - 1].clean.source).toBe("unmeasured");
+    expect(curve[curve.length - 1].fit?.source).toBe("unmeasured");
+  });
+
+  it("without a --list-devices reading searches no spill alone, opening at the estimate", () => {
+    const { history, input } = run("frontier", { free: null });
+    expect(history[0]).toEqual(expect.objectContaining({ ctx: 1024, ngl: 12 }));
+    const outcome = probeOutcome(input);
+    expect(outcome.curve![0].fit).toBeNull();
+    expect(outcome.curve![0].clean.value).toBe(6);
+    expect(outcome.fit).toBeNull();
+  });
+});
+
+describe("the stored ceiling", () => {
+  it("prefers the largest context whose answer a control confirmed over a larger unconfirmed one", () => {
+    // Cut the Wizard off at every budget; wherever it stops right after an answer
+    // but before that answer's control, the stored ceiling must skip it.
+    let checked = 0;
+    for (let budget = 10; budget <= 43; budget++) {
+      const outcome = probeOutcome(run("frontier", { maxLoads: budget }).input);
+      const answered = outcome.curve!.filter((s) => s.clean.resolved && s.clean.value != null);
+      const last = answered.at(-1);
+      if (!last || last.clean.control !== "pending" || answered.length < 2) continue;
+      expect(outcome.clean?.control).toBe("confirmed");
+      expect(outcome.clean!.ctx).toBeLessThan(last.ctx);
+      checked++;
+    }
+    expect(checked).toBeGreaterThan(0);
+  });
+});
+
+describe("target 1's window of two layers above where spill starts", () => {
+  function atOneContext(cleanSet: number[]) {
+    const machine: Machine = { claim: CARD.claim, clean: (r) => cleanSet.includes(r.ngl) };
+    return run("keep_context", { machine, ctx: 1024, ngl: 10 });
+  }
+
+  it("repeats from each clean layer the window finds", () => {
+    const { input } = atOneContext([0, 1, 2, 3, 5, 7]);
+    expect(probeOutcome(input).clean?.ngl).toBe(7);
+  });
+
+  it("misses a clean island three layers above where spill starts, by design", () => {
+    const { input } = atOneContext([0, 1, 2, 3, 4, 8]);
+    expect(probeOutcome(input).clean?.ngl).toBe(4);
+  });
+
+  it("answers none when even 0 layers spill", () => {
+    const { input } = atOneContext([]);
+    expect(probeOutcome(input).clean).toBeNull();
+    expect(probeOutcome(input).fit?.ngl).toBe(17);
+  });
+});
+
+describe("Targets", () => {
+  it("keep_context: target 2 from the user's layers, then target 1, then the control last", () => {
+    const { history, input } = run("keep_context", { ctx: 1024, ngl: 10 });
+    const outcome = probeOutcome(input);
+    expect(history[0]).toEqual(expect.objectContaining({ ctx: 1024, ngl: 10 }));
+    expect(outcome.fit).toEqual({ ctx: 1024, ngl: 17 });
+    expect(outcome.clean).toMatchObject({ ctx: 1024, ngl: 6, control: "confirmed" });
+    expect(key(history[history.length - 1])).toBe("1024/6");
+  });
+
+  it("fixed_offload: both targets over the context stops, two stops above where spill starts", () => {
+    // 6 layers: clean up to 32k, spilling above it.
+    const { history, input } = run("fixed_offload", { ctx: 8192, ngl: 6 });
+    const outcome = probeOutcome(input);
+    expect(outcome.fit).toEqual({ ctx: TRAINED, ngl: 6 });
+    expect(outcome.clean).toMatchObject({ ctx: 32_768, ngl: 6, control: "confirmed" });
+    expect(history.every((h) => ctxLadderStops(TRAINED).includes(h.ctx))).toBe(true);
+  });
+
+  it("fixed_offload keeps a real miss above a fit when a flaky miss sits below it", () => {
+    const at = (ctx: number, fits: boolean): LadderAttempt => ({ ctx, ngl: 6, ok: false, fitsFree: fits, claimedMib: 1 });
+    const outcome = probeOutcome({
+      mode: "fixed_offload", candidateCtx: 8192, candidateNgl: 6, nglMax: LAYERS, maxCtx: TRAINED, freeVramMib: FREE,
+      // 2k missed (flaky), 8k fits, 16k misses: target 2 is 8k, not "every stop fits".
+      history: [at(2048, false), at(8192, true), at(16_384, false)],
+    });
+    expect(outcome.fit).toEqual({ ctx: 8192, ngl: 6 });
+  });
+
+  it("keep_context does not read a load that failed for a non-memory reason as a miss", () => {
+    // 18 timed out before ready: it must not become target 2's boundary.
+    const history: LadderAttempt[] = [
+      { ctx: 1024, ngl: 16, ok: false, fitsFree: true, claimedMib: 6800 },
+      { ctx: 1024, ngl: 17, ok: false, fitsFree: true, claimedMib: 7205 },
+      { ctx: 1024, ngl: 18, ok: false, fitsFree: false, inconclusive: true },
     ];
-    expect(nextSliderCandidate({ history, stops })).toBeNull();
+    const outcome = probeOutcome({
+      mode: "keep_context", candidateCtx: 1024, candidateNgl: 16, nglMax: LAYERS, maxCtx: TRAINED, freeVramMib: FREE, history,
+    });
+    expect(outcome.fit).toBeNull();
+    expect(outcome.next).not.toEqual({ ctx: 1024, ngl: 18 });
+    expect(outcome.next?.ngl).toBeGreaterThan(18);
   });
 
-  it("stops at the top of the ladder instead of walking off the end", () => {
-    expect(nextSliderCandidate({ history: [{ value: 262144, ok: true }], stops })).toBeNull();
-  });
-
-  it("stops at the bottom of the ladder instead of walking off the end", () => {
-    expect(nextSliderCandidate({ history: [{ value: 1024, ok: false }], stops })).toBeNull();
+  it("custom: exactly one load, no control", () => {
+    const { history, input } = run("custom", { ctx: 4096, ngl: 6 });
+    expect(history.map(key)).toEqual(["4096/6"]);
+    expect(probeOutcome(input).clean).toMatchObject({ ctx: 4096, ngl: 6, control: "none" });
   });
 });
 
 describe("ctxLadderStops", () => {
-  it("always includes the hard floor and the model's own ceiling", () => {
-    const stops = ctxLadderStops(262_144);
-    expect(stops[0]).toBe(PROBE_LADDER_MIN_CTX);
-    expect(stops[stops.length - 1]).toBe(262_144);
-  });
-
-  it("is ascending with no duplicates", () => {
-    const stops = ctxLadderStops(262_144);
-    for (let i = 1; i < stops.length; i++) expect(stops[i]).toBeGreaterThan(stops[i - 1]);
-  });
-
-  it("is pure power-of-two doublings from the floor, per the user's own spec (1024, 2048, 4096, 8192, ...)", () => {
+  it("is power-of-two doublings from the floor to the model's own ceiling, included exactly", () => {
     expect(ctxLadderStops(262_144)).toEqual([1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144]);
-  });
-
-  it("still includes the exact ceiling even when it isn't a power of two", () => {
     expect(ctxLadderStops(50_000)).toEqual([1024, 2048, 4096, 8192, 16384, 32768, 50_000]);
-  });
-
-  it("collapses to just the floor when maxCtx is at or below it", () => {
-    expect(ctxLadderStops(1024)).toEqual([1024]);
-    expect(ctxLadderStops(500)).toEqual([1024]);
+    expect(ctxLadderStops(500)).toEqual([PROBE_LADDER_MIN_CTX]);
   });
 });
 
-describe("nextSliderRefineCandidate", () => {
-  const stops = [1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144];
-
-  it("basic: behaves exactly like nextSliderCandidate, converging once the walk reverses", () => {
-    const history: AnchoredOutcome[] = [
-      { value: 16384, ok: true },
-      { value: 32768, ok: false },
-    ];
-    expect(nextSliderRefineCandidate({ history, stops, granularity: "basic", min: 1024, max: 262144 })).toBeNull();
-  });
-
-  it("fine: continues past basic's convergence, refining within the bracket the walk found", () => {
-    const history: AnchoredOutcome[] = [
-      { value: 16384, ok: true },
-      { value: 32768, ok: false },
-    ];
-    // bracket width = 32768-16384 = 16384; mean = 24576, the first refine candidate.
-    expect(nextSliderRefineCandidate({ history, stops, granularity: "fine", min: 1024, max: 262144 })).toBe(24576);
-  });
-
-  it("fine: refine tolerance is fixed at 1/16 of the ORIGINAL slider bracket, not recomputed smaller each step", () => {
-    const history: AnchoredOutcome[] = [
-      { value: 16384, ok: true },
-      { value: 32768, ok: false },
-      { value: 24576, ok: true }, // first refine step, narrows the live bracket to [24576, 32768] (width 8192)
-    ];
-    // If tolerance were recomputed from the NEW (narrower) bracket, it would
-    // shrink to 8192/16=512. Fixed at the original 16384/16=1024 instead:
-    // next candidate is mean(24576,32768)=28672, and convergence should
-    // still require the ORIGINAL bracket's own 1024-token tolerance.
-    expect(nextSliderRefineCandidate({ history, stops, granularity: "fine", min: 1024, max: 262144 })).toBe(28672);
-  });
-
-  it("fine: converges once the bracket is within 1/16 of the original slider-stop gap", () => {
-    // Original bracket [16384 ok, 32768 fail], width 16384, tolerance 1024.
-    const history: AnchoredOutcome[] = [
-      { value: 16384, ok: true },
-      { value: 32768, ok: false },
-      { value: 24576, ok: true },
-      { value: 28672, ok: false },
-      { value: 26624, ok: true },
-      { value: 27648, ok: false }, // bracket [26624, 27648], width 1024 <= tolerance 1024
-    ];
-    expect(nextSliderRefineCandidate({ history, stops, granularity: "fine", min: 1024, max: 262144 })).toBeNull();
-  });
-
-  it("fine: nothing to refine when the walk never bracketed at all", () => {
-    const allOk: AnchoredOutcome[] = [{ value: 262144, ok: true }];
-    expect(nextSliderRefineCandidate({ history: allOk, stops, granularity: "fine", min: 1024, max: 262144 })).toBeNull();
-    const allFail: AnchoredOutcome[] = [{ value: 1024, ok: false }];
-    expect(nextSliderRefineCandidate({ history: allFail, stops, granularity: "fine", min: 1024, max: 262144 })).toBeNull();
-  });
-
-  it("fine: once an off-grid refine value has been tested, never falls back to nextSliderCandidate's nearest-stop snap again", () => {
-    // Regression: 49152 sits EXACTLY equidistant between the stops 32768 and
-    // 65536 (16384 either way). Before the fix, nextSliderRefineCandidate
-    // re-ran nextSliderCandidate on the full (mixed) history every call --
-    // its nearest-stop tie-break (favors the lower index) treated 49152 as
-    // "closest to 32768", then walked DOWN one more ladder notch to 16384,
-    // completely abandoning the bisection instead of continuing it.
-    const history: AnchoredOutcome[] = [
-      { value: 32768, ok: true },
-      { value: 65536, ok: false },
-      { value: 49152, ok: false }, // refine step 1: mean(32768, 65536)
-    ];
-    // Correct next step is bracket bisection continuing from the NARROWEST
-    // known bracket [32768 ok, 49152 fail]: mean = 40960. NOT 16384.
-    expect(nextSliderRefineCandidate({ history, stops, granularity: "fine", min: 1024, max: 262144 })).toBe(40960);
-  });
-});
-
-describe("bestNglForMaxContext", () => {
-  it("finds ngl=0 when context strictly decreases as layers are added (the naive VRAM-scarce case)", () => {
-    const calculateCtx = (ngl: number) => 100_000 - ngl * 1000;
-    expect(bestNglForMaxContext(48, calculateCtx)).toBe(0);
-  });
-
-  it("climbs to an interior peak when partial offload frees more room than either extreme", () => {
-    // A clean tent, symmetric, peaking exactly at ngl=20.
-    const calculateCtx = (ngl: number) => 50_000 - Math.abs(ngl - 20) * 100;
-    expect(bestNglForMaxContext(48, calculateCtx)).toBe(20);
-  });
-
-  it("the coarse (step-2) pass alone would miss an odd peak just past it -- the bidirectional refine must find it", () => {
-    // Same tent (coarse alone lands on 20), but the ODD value 21 is secretly
-    // even better -- the coarse pass, stepping only by 2, would never test
-    // 21 at all; refine must search upward from the coarse peak, not just
-    // back down through the values coarse skipped.
-    const tent = (ngl: number) => 50_000 - Math.abs(ngl - 20) * 100;
-    const calculateCtx = (ngl: number) => (ngl === 21 ? 99_999 : tent(ngl));
-    expect(bestNglForMaxContext(48, calculateCtx)).toBe(21);
-  });
-
-  it("checks the exact ceiling when nglMax is odd (the coarse step-2 pass never lands on it directly)", () => {
-    const calculateCtx = (ngl: number) => ngl; // strictly increasing -- true best is nglMax itself
-    expect(bestNglForMaxContext(49, calculateCtx)).toBe(49);
-  });
-
-  it("nglMax=0 trivially returns 0 without evaluating anything impossible", () => {
-    expect(bestNglForMaxContext(0, () => 12_345)).toBe(0);
-  });
-});
-
-describe("the ladder as a whole", () => {
-  it("custom performs exactly one load at the user's exact values, pass or fail", () => {
-    const passing = runLadder({ mode: "custom", granularity: "basic", candidateCtx: 32_768, candidateNgl: 27 }, () => true);
-    expect(passing).toEqual([{ ctx: 32_768, ngl: 27, ok: true }]);
-
-    const failing = runLadder({ mode: "custom", granularity: "basic", candidateCtx: 32_768, candidateNgl: 27 }, () => false);
-    expect(failing).toEqual([{ ctx: 32_768, ngl: 27, ok: false }]);
-    expect(bestLadderResult(failing)).toBeNull();
-  });
-
-  // --- the frontier mode ---------------------------------------------------
-  //
-  // Unlike every other mode, this one's answer is the whole staircase rather
-  // than one rung, so the assertions are about the CURVE: that it is monotone,
-  // that nothing was declared without evidence, and that the cheap implications
-  // really do replace loads.
-  describe("frontier", () => {
-    const stops = ctxLadderStops(TRAINED);
-    const curve = (history: LadderAttempt[]) => resolveFrontier({ history, stops, nglMax: NGL_MAX });
-
-    it("carries a pass DOWN the context axis and a failure UP it", () => {
-      const resolved = curve([
-        { ctx: 32_768, ngl: 20, ok: true, placementJudged: true },
-        { ctx: 32_768, ngl: 21, ok: false },
-      ]);
-      // The stop that was measured.
-      expect(resolved.find((s) => s.ctx === 32_768)).toMatchObject({ ngl: 20, resolved: true, source: "measured" });
-      // Below it: 20 passes (less cache), and nothing here failed, so the
-      // boundary is still open -- more layers may well fit.
-      const below = resolved.find((s) => s.ctx === 1024)!;
-      expect(below.ngl).toBe(20);
-      expect(below.resolved).toBe(false);
-      // Above it: 21 is known to fail, and 20 is not known to pass.
-      const above = resolved.find((s) => s.ctx === TRAINED)!;
-      expect(above.firstFailingNgl).toBe(21);
-      expect(above.ngl).toBeNull();
-    });
-
-    it("settles every stop between two ends that agree, without loading them", () => {
-      const resolved = curve([
-        { ctx: 1024, ngl: 12, ok: true },
-        { ctx: 1024, ngl: 13, ok: false },
-        { ctx: TRAINED, ngl: 12, ok: true, placementJudged: true },
-      ]);
-      expect(resolved.every((s) => s.resolved)).toBe(true);
-      expect(resolved.every((s) => s.ngl === 12)).toBe(true);
-      expect(resolved.filter((s) => s.source === "implied").length).toBe(stops.length - 2);
-    });
-
-    it("treats host-backed weights as failing at every context, not just larger ones", () => {
-      const resolved = curve([{ ctx: 32_768, ngl: 30, ok: false, hostBacked: true }]);
-      expect(resolved.every((s) => s.firstFailingNgl === 30)).toBe(true);
-    });
-
-    it("marks a stop resolved by a pass whose placement was never measured", () => {
-      const [floor] = curve([{ ctx: 1024, ngl: 48, ok: true, placementJudged: true }]);
-      expect(floor).toMatchObject({ resolved: true, unverified: false });
-      // Every stop needs its own measurement now, the floor included.
-      expect(curve([{ ctx: 1024, ngl: 48, ok: true }])[0]).toMatchObject({ resolved: true, unverified: true });
-      const top = curve([
-        { ctx: 1024, ngl: 12, ok: true },
-        { ctx: 1024, ngl: 13, ok: false },
-        { ctx: TRAINED, ngl: 12, ok: true },
-      ]).at(-1)!;
-      expect(top).toMatchObject({ ngl: 12, resolved: true, unverified: true });
-    });
-
-    it("reports a machine the model does not fit on at all", () => {
-      const resolved = curve([{ ctx: 1024, ngl: 0, ok: false }]);
-      expect(resolved[0]).toMatchObject({ ngl: null, resolved: true });
-    });
-
-    it("measures the floor context first, then the ceiling", () => {
-      const rungs = runLadder({ mode: "frontier", granularity: "basic", candidateCtx: 32_768, candidateNgl: 27 });
-      expect(rungs[0]).toMatchObject({ ctx: PROBE_LADDER_MIN_CTX, ngl: NGL_MAX });
-      const firstAbove = rungs.findIndex((r) => r.ctx > PROBE_LADDER_MIN_CTX);
-      // The floor's own boundary is pinned down before anything above it runs,
-      // and the first stop above it is the ceiling -- the two together bracket
-      // every stop in between.
-      expect(resolveFrontier({ history: rungs.slice(0, firstAbove), stops, nglMax: NGL_MAX })[0].resolved).toBe(true);
-      expect(rungs[firstAbove].ctx).toBe(TRAINED);
-    });
-
-    it("produces a staircase that only ever steps down", () => {
-      const rungs = runLadder({ mode: "frontier", granularity: "basic", candidateCtx: 32_768, candidateNgl: 27 });
-      const resolved = curve(rungs);
-      const measured = resolved.filter((s) => s.ngl != null).map((s) => s.ngl!);
-      for (let i = 1; i < measured.length; i++) expect(measured[i]).toBeLessThanOrEqual(measured[i - 1]);
-      // ...and it agrees with the machine it was measured on.
-      for (const stop of resolved) {
-        if (stop.ngl == null || !stop.resolved) continue;
-        expect({ ctx: stop.ctx, ngl: stop.ngl, fits: fits({ ctx: stop.ctx, ngl: stop.ngl }) }).toMatchObject({ fits: true });
-      }
-    });
-
-    // The case the whole design turns on: when context is cheap the curve is
-    // one flat line, and proving that must not cost more than max_gpu's own
-    // two corners. Every stop between the ends is settled by implication.
-    it("proves a flat curve from its two ends, without walking the stops between", () => {
-      const cheapContext = (r: { ctx: number; ngl: number }): boolean => r.ctx * (r.ngl + 4) <= 1_000_000_000;
-      const rungs = runLadder({ mode: "frontier", granularity: "basic", candidateCtx: 32_768, candidateNgl: 27 }, cheapContext);
-      // Only the two ends are ever loaded, however wrong the estimate is about
-      // where the boundary sits (this one is far too pessimistic, so the
-      // ceiling's opening guess costs one extra load before the bound is tested).
-      expect(rungs.length).toBeLessThanOrEqual(3);
-      expect(rungs.every((r) => r.ctx === PROBE_LADDER_MIN_CTX || r.ctx === TRAINED)).toBe(true);
-      const resolved = curve(rungs);
-      expect(resolved.every((s) => s.resolved && s.ngl === NGL_MAX)).toBe(true);
-      expect(resolved.filter((s) => s.source === "implied")).toHaveLength(stops.length - 2);
-    });
-
-    // A machine where context genuinely costs layers: the budget goes to the
-    // stops that bend, and every boundary it does report is the real one.
-    it("resolves the stops it can afford, and reports each one correctly", () => {
-      const truth = (ctx: number) => {
-        for (let n = NGL_MAX; n >= 0; n--) if (fits({ ctx, ngl: n })) return n;
-        return null;
-      };
-      const rungs = runLadder({ mode: "frontier", granularity: "basic", candidateCtx: 32_768, candidateNgl: 27 });
-      const resolved = curve(rungs).filter((s) => s.resolved);
-      expect(resolved.length).toBeGreaterThanOrEqual(6);
-      for (const stop of resolved) {
-        expect({ ctx: stop.ctx, ngl: stop.ngl }).toEqual({ ctx: stop.ctx, ngl: truth(stop.ctx) });
-      }
-    });
-
-    // The estimator does not vary with context (estimateSafeNgl ignores it), so
-    // without the neighbour-derived bracket it proposed 20 layers at a context
-    // where 13 had just failed, and the walk wandered for nine loads.
-    it("never proposes a layer count at or above one already known to fail there", () => {
-      const rungs = runLadder({ mode: "frontier", granularity: "basic", candidateCtx: 32_768, candidateNgl: 27 });
-      for (const [i, rung] of rungs.entries()) {
-        const knownFailure = rungs
-          .slice(0, i)
-          .filter((r) => !r.ok && (r.ctx <= rung.ctx || r.hostBacked))
-          .map((r) => r.ngl);
-        for (const failed of knownFailure) expect(rung.ngl).toBeLessThan(failed);
-      }
-    });
-
-    it("stops immediately when not even one layer fits at the cheapest context", () => {
-      const rungs = runLadder({ mode: "frontier", granularity: "basic", candidateCtx: 32_768, candidateNgl: 27 }, () => false);
-      // Every layer, the estimate, then zero -- and zero failing ends it. No
-      // load is ever spent at a larger context, where nothing could fit either.
-      expect(rungs.every((r) => r.ctx === PROBE_LADDER_MIN_CTX)).toBe(true);
-      expect(rungs.length).toBeLessThanOrEqual(3);
-      expect(curve(rungs).every((s) => s.resolved && s.ngl === null)).toBe(true);
-    });
-
-    it("leaves stops it could not reach marked unmeasured rather than guessed", () => {
-      // One measured stop, nothing else: the ends are known, the middle is not.
-      const resolved = curve([
-        { ctx: 1024, ngl: 12, ok: true },
-        { ctx: 1024, ngl: 13, ok: false },
-      ]);
-      expect(resolved[0].source).toBe("measured");
-      expect(resolved.slice(1).every((s) => s.source === "unmeasured" && s.ngl == null)).toBe(true);
-    });
-  });
-
-  it.each<[ProbeMode, ProbeGranularity]>([
-    ["max_gpu", "basic"],
-    ["max_gpu", "fine"],
-    ["max_context", "basic"],
-    ["max_context", "fine"],
-    ["balanced", "basic"],
-    ["balanced", "fine"],
-    ["keep_context", "basic"],
-    ["keep_context", "fine"],
-    ["fixed_offload", "basic"],
-    ["fixed_offload", "fine"],
-    ["frontier", "basic"],
-    ["frontier", "fine"],
-  ])("%s/%s terminates within budget, stays in bounds, and never repeats a rung", (mode, granularity) => {
-    const rungs = runLadder({ mode, granularity, candidateCtx: 32_768, candidateNgl: 27 });
-    expect(rungs.length).toBeGreaterThan(0);
-    expect(rungs.length).toBeLessThanOrEqual(PROBE_MAX_LOADS);
-    for (const rung of rungs) {
-      expect(rung.ctx).toBeGreaterThanOrEqual(PROBE_LADDER_MIN_CTX);
-      expect(rung.ctx).toBeLessThanOrEqual(TRAINED);
-      expect(rung.ngl).toBeGreaterThanOrEqual(0);
-      expect(rung.ngl).toBeLessThanOrEqual(NGL_MAX);
-    }
-    const seen = rungs.map((r) => `${r.ctx}:${r.ngl}`);
-    expect(new Set(seen).size).toBe(seen.length);
-  });
-
-  it("max_gpu skips the layer phase entirely when every layer already fits at the floor context", () => {
-    // Loosen the constraint so (ngl=48, ctx=1024) itself fits.
-    const generous = (r: { ctx: number; ngl: number }): boolean => r.ctx * (r.ngl + 4) <= 10_000_000;
-    const rungs = runLadder({ mode: "max_gpu", granularity: "basic", candidateCtx: 32_768, candidateNgl: 27 }, generous);
-    // First (and only "layer-phase") rung is the seed itself, at full layers.
-    expect(rungs[0]).toMatchObject({ ngl: NGL_MAX, ok: true });
-    // No other rung ever revisits ngl=48 at a different context via a failed
-    // layer-phase probe -- everything after the first rung is the ctx phase
-    // (ngl stays pinned at NGL_MAX throughout).
-    expect(rungs.slice(1).every((r) => r.ngl === NGL_MAX)).toBe(true);
-  });
-
-  it("max_gpu runs the layer phase first when the floor context doesn't fit at max layers, then grows context", () => {
-    const rungs = runLadder({ mode: "max_gpu", granularity: "basic", candidateCtx: 32_768, candidateNgl: 27 });
-    expect(rungs[0]).toMatchObject({ ngl: NGL_MAX, ctx: PROBE_LADDER_MIN_CTX });
-    const best = bestLadderResult(rungs);
-    expect(best).not.toBeNull();
-    // The true boundary at whatever ngl it settled on.
-    const trueMax = Math.floor(FIT_LIMIT / (best!.ngl + 4));
-    expect(best!.ctx).toBeLessThanOrEqual(trueMax);
-    expect(best!.ctx).toBeGreaterThan(PROBE_LADDER_MIN_CTX);
-  });
-
-  it("max_gpu/basic: a failed full-layer attempt jumps straight to the precalculated ngl, not a midpoint", () => {
-    // Only ngl <= 30 "fits" -- excludes the (48+26)/2 = 37 midpoint the OLD
-    // gradual-bisection engine would have tested next, so landing on 26
-    // (calculateNgl's fixed return) at rungs[1] proves the direct jump.
-    const onlyLowNgl = (r: { ctx: number; ngl: number }): boolean => r.ngl <= 30;
-    const rungs = runLadder({ mode: "max_gpu", granularity: "basic", candidateCtx: 32_768, candidateNgl: 27 }, onlyLowNgl);
-    expect(rungs[0]).toMatchObject({ ngl: NGL_MAX, ok: false });
-    expect(rungs[1]).toMatchObject({ ngl: 26, ok: true });
-  });
-
-  it("max_gpu/basic: the context phase only ever tests real slider stops, never an arbitrary bisected number", () => {
-    const rungs = runLadder({ mode: "max_gpu", granularity: "basic", candidateCtx: 32_768, candidateNgl: 27 });
-    const stops = new Set(ctxLadderStops(TRAINED));
-    // rungs[0] is the layer phase (its ctx field is just the pinned floor,
-    // not a slider probe) -- everything from rungs[1] on is the ctx phase.
-    for (const rung of rungs.slice(1)) expect(stops.has(rung.ctx)).toBe(true);
-  });
-
-  it("max_gpu/basic: the context phase opens at the CEILING, not at the pre-flight estimate", () => {
-    const generous = (r: { ctx: number; ngl: number }): boolean => r.ctx * (r.ngl + 4) <= 10_000_000;
-    const rungs = runLadder({ mode: "max_gpu", granularity: "basic", candidateCtx: 32_768, candidateNgl: 27 }, generous);
-    // Layer phase converges in 1 load (nglMax fits outright, per the
-    // "skips the layer phase entirely" test above) -- rungs[1] is the ctx
-    // phase's own seed. This mode is looking for the largest context its
-    // resolved placement holds, so the ceiling is the hypothesis worth
-    // testing first; the estimate (21634 -> nearest stop 16384) no longer
-    // chooses where to start, it would only have been a rung on the way up.
-    expect(rungs[1]).toMatchObject({ ctx: TRAINED, ngl: NGL_MAX });
-  });
-
-  it("max_gpu/basic: a context that fits outright costs ONE load, not a climb", () => {
-    // The case measured live: a weights-bound model on an 8GiB card, where
-    // every context from 1024 to the trained ceiling loads. The old walk
-    // spent 8 loads proving that one stop at a time.
-    const everythingFits = (): boolean => true;
-    const rungs = runLadder({ mode: "max_gpu", granularity: "basic", candidateCtx: 1024, candidateNgl: 27 }, everythingFits);
-    const ctxRungs = rungs.slice(1);
-    expect(ctxRungs).toHaveLength(1);
-    expect(ctxRungs[0]).toMatchObject({ ctx: TRAINED });
-  });
-
-  it("max_gpu/basic: a context-bound machine still brackets, in log2 of the grid", () => {
-    // Only the bottom two stops load. A downward walk from the ceiling would
-    // cost one load per stop; bisection costs the depth of the grid.
-    const tight = (r: { ctx: number; ngl: number }): boolean => r.ctx <= 2048;
-    const rungs = runLadder({ mode: "max_gpu", granularity: "basic", candidateCtx: 1024, candidateNgl: 27 }, tight);
-    const ctxRungs = rungs.slice(1);
-    const best = ctxRungs.filter((r) => r.ok).reduce((a, b) => (b.ctx > a.ctx ? b : a));
-    expect(best.ctx).toBe(2048);
-    expect(ctxRungs.length).toBeLessThanOrEqual(Math.ceil(Math.log2(ctxLadderStops(TRAINED).length)) + 2);
-  });
-
-  it("max_gpu/fine: the context phase starts with the SAME slider walk as basic, then extends past it with refinement", () => {
-    const generous = (r: { ctx: number; ngl: number }): boolean => r.ctx * (r.ngl + 4) <= 10_000_000;
-    const basicRungs = runLadder({ mode: "max_gpu", granularity: "basic", candidateCtx: 32_768, candidateNgl: 27 }, generous);
-    const fineRungs = runLadder({ mode: "max_gpu", granularity: "fine", candidateCtx: 32_768, candidateNgl: 27 }, generous);
-    // Same seed -- fine is the SAME traversal of the SAME grid, not a
-    // different engine (the old engine seeded fine's ctx phase at the 1024
-    // floor instead), and both now open at the ceiling.
-    expect(fineRungs[1]).toMatchObject({ ctx: TRAINED, ngl: NGL_MAX });
-    // Fine does strictly more work once it has a bracket to refine.
-    expect(fineRungs.length).toBeGreaterThan(basicRungs.length);
-    // At least one fine-phase ctx value is off the power-of-two grid --
-    // proof it actually refined, not just re-walked the same stops.
-    const stops = new Set(ctxLadderStops(TRAINED));
-    expect(fineRungs.slice(1).some((r) => !stops.has(r.ctx))).toBe(true);
-    const fineBest = bestLadderResult(fineRungs)!;
-    const basicBest = bestLadderResult(basicRungs)!;
-    expect(fineBest.ctx).toBeGreaterThanOrEqual(basicBest.ctx);
-  });
-
-  it("keep_context never moves the pinned context, regardless of the estimate's own accuracy", () => {
-    const rungs = runLadder({ mode: "keep_context", granularity: "basic", candidateCtx: 16_384, candidateNgl: 40 });
-    for (const rung of rungs) expect(rung.ctx).toBe(16_384);
-    const best = bestLadderResult(rungs);
-    expect(best).not.toBeNull();
-    expect(fits(best!)).toBe(true);
-  });
-
-  it("fixed_offload never moves the pinned layer count", () => {
-    const rungs = runLadder({ mode: "fixed_offload", granularity: "basic", candidateCtx: 16_384, candidateNgl: 20 });
-    for (const rung of rungs) expect(rung.ngl).toBe(20);
-    const best = bestLadderResult(rungs);
-    expect(best).not.toBeNull();
-    expect(fits(best!)).toBe(true);
-  });
-
-  it("max_context ignores the user's own ngl for its starting pin -- this fixture's calculateCtx is strictly decreasing in ngl, so bestNglForMaxContext anchors at 0, not the user's 27", () => {
-    expect(bestNglForMaxContext(NGL_MAX, calculateCtx)).toBe(0);
-    const rungs = runLadder({ mode: "max_context", granularity: "basic", candidateCtx: 32_768, candidateNgl: 27 });
-    expect(rungs[0].ngl).toBe(0);
-  });
-
-  it("max_context's second phase reuses phase 1's own resolved rung instead of spending a load re-proving it", () => {
-    const rungs = runLadder({ mode: "max_context", granularity: "basic", candidateCtx: 32_768, candidateNgl: 27 });
-    const resolvedNgl = rungs[0].ngl; // whatever bestNglForMaxContext pinned phase 0 to
-    const resolvedCtxAfterPhase1 = bestLadderResult(rungs.filter((r) => r.ngl === resolvedNgl))?.ctx;
-    if (resolvedCtxAfterPhase1 != null) {
-      const repeats = rungs.filter((r) => r.ctx === resolvedCtxAfterPhase1 && r.ngl === resolvedNgl).length;
-      expect(repeats).toBe(1);
-    }
-  });
-
-  it("max_context never gives back context to fit more layers -- ctx only ever grows or holds across the whole trace", () => {
-    const rungs = runLadder({ mode: "max_context", granularity: "basic", candidateCtx: 32_768, candidateNgl: 27 });
-    const best = bestLadderResult(rungs);
-    expect(best).not.toBeNull();
-    // Every ok rung's ctx is <= the best ok ctx found anywhere in the trace --
-    // phase 1 (growing ngl) never trades away context for a passing layer count.
-    for (const r of rungs.filter((r) => r.ok)) expect(r.ctx).toBeLessThanOrEqual(best!.ctx);
-  });
-
-  it("max_context genuinely searches for the ngl that maximizes context, not just ngl=0 or the user's own -- a real interior peak", () => {
-    // A hand-built model where partial offload (ngl=10) affords MORE context
-    // than either extreme: weights compete with KV for VRAM, but this
-    // fixture pretends 10 layers' worth of offloaded weights frees more
-    // system RAM pressure than it costs in VRAM, up to a point. Clean tent,
-    // peaking exactly at ngl=10. runLadder() is locked to the module-level
-    // calculateCtx fixture, so this drives nextLadderRung directly with its
-    // own matching calculateCtx (the estimate) and fits rule (the truth).
-    const peakCtx = (ngl: number) => 40_000 - Math.abs(ngl - 10) * 500;
-    const history: LadderAttempt[] = [];
-    for (let guard = 0; guard <= PROBE_MAX_LOADS + 2; guard++) {
-      const next = nextLadderRung({
-        mode: "max_context",
-        granularity: "basic",
-        candidateCtx: 32_768,
-        candidateNgl: 27,
-        nglMax: 40,
-        maxCtx: TRAINED,
-        history,
-        calculateNgl,
-        calculateCtx: peakCtx,
-      });
-      if (next === null) break;
-      history.push({ ...next, ok: next.ctx <= peakCtx(next.ngl) });
-    }
-    expect(history[0].ngl).toBe(10); // bestNglForMaxContext's answer for this curve
-  });
-
-  it("balanced snaps its seed to the nearest power-of-two stop, not the user's raw ctx", () => {
-    // 8192 is already a stop -- pick a value that ISN'T, to actually prove
-    // the snap (a value that happens to already be a stop can't tell the
-    // difference between "snapped" and "used raw").
-    const rungs = runLadder({ mode: "balanced", granularity: "basic", candidateCtx: 10_000, candidateNgl: 30 });
-    expect(rungs[0]).toMatchObject({ ctx: 8192, ngl: 30 }); // nearest stop to 10,000 is 8192 (1808 away) over 16384 (6384 away)
-  });
-
-  it("fixed_offload snaps its seed to the nearest power-of-two stop too", () => {
-    const rungs = runLadder({ mode: "fixed_offload", granularity: "basic", candidateCtx: 10_000, candidateNgl: 20 });
-    expect(rungs[0]).toMatchObject({ ctx: 8192, ngl: 20 });
-  });
-
-  it("fine granularity converges tighter than basic, at the cost of more or equal loads", () => {
-    const basicRungs = runLadder({ mode: "fixed_offload", granularity: "basic", candidateCtx: 16_384, candidateNgl: 20 });
-    const fineRungs = runLadder({ mode: "fixed_offload", granularity: "fine", candidateCtx: 16_384, candidateNgl: 20 });
-    const basicBest = bestLadderResult(basicRungs)!;
-    const fineBest = bestLadderResult(fineRungs)!;
-    const trueMax = Math.floor(FIT_LIMIT / 24);
-    // Fine must land at least as close to the true boundary as basic.
-    expect(trueMax - fineBest.ctx).toBeLessThanOrEqual(trueMax - basicBest.ctx);
-  });
-
-  it("reports nothing when even the shrink target fails outright", () => {
-    // Nothing fits, ever.
-    const rungs = runLadder({ mode: "max_gpu", granularity: "basic", candidateCtx: 32_768, candidateNgl: 27 }, () => false);
-    expect(bestLadderResult(rungs)).toBeNull();
-    expect(rungs.length).toBeGreaterThan(0);
-    expect(rungs.length).toBeLessThanOrEqual(PROBE_MAX_LOADS);
-  });
-
-  it("stops immediately once history already meets the load budget", () => {
-    const history: LadderAttempt[] = Array.from({ length: PROBE_MAX_LOADS }, (_, i) => ({
-      ctx: 1024 * (i + 1),
-      ngl: 20,
-      ok: true,
-    }));
-    expect(
-      nextLadderRung({
-        mode: "fixed_offload",
-        granularity: "fine",
-        candidateCtx: 16_384,
-        candidateNgl: 20,
-        nglMax: NGL_MAX,
-        maxCtx: TRAINED,
-        history,
-        calculateNgl,
-        calculateCtx,
-      })
-    ).toBeNull();
-  });
-});
-
-describe("bestNglAtContext", () => {
-  it("names the most layers whose estimate still affords the target context", () => {
-    // Estimate halves roughly with every 8 layers: 40000, 32000, ... 0.
-    const estimate = (ngl: number) => Math.max(0, 40_000 - ngl * 1000);
-    expect(bestNglAtContext(48, 30_000, estimate)).toBe(10);
-    expect(bestNglAtContext(48, 40_000, estimate)).toBe(0);
-  });
-
-  it("never returns below the floor, so a grow phase's own seed stays its lower bound", () => {
-    const estimate = (ngl: number) => Math.max(0, 40_000 - ngl * 1000);
-    // Nothing at or above 20 affords 30,000 -- the floor itself comes back,
-    // which callers read as "no room to grow".
-    expect(bestNglAtContext(48, 30_000, estimate, 20)).toBe(20);
-  });
-
-  it("scans rather than climbing, so a non-monotonic estimate can't end it early", () => {
-    // A dip at ngl=5 that a climb-until-worse loop would stop on.
-    const estimate = (ngl: number) => (ngl === 5 ? 0 : 50_000 - ngl * 100);
-    expect(bestNglAtContext(20, 49_000, estimate)).toBe(10);
-  });
-});
-
-describe("grow-layers phases are bounded by the estimate, not by nglMax", () => {
-  it("max_context skips its layer phase entirely when the estimate affords no extra layer", () => {
-    // A fine ladder pushes ctx to the boundary at ngl=0, where the estimate
-    // (1.25x the truth) allows at most ngl=1 -- so the layer phase is one
-    // load, not a descent through every integer down from nglMax.
-    const rungs = runLadder({ mode: "max_context", granularity: "fine", candidateCtx: 32_768, candidateNgl: 27 });
-    const ctxResolved = bestLadderResult(rungs)!.ctx;
-    const layerRungs = rungs.filter((r) => r.ctx === ctxResolved && r.ngl > 0);
-    expect(layerRungs.length).toBeLessThanOrEqual(1);
-  });
-
-  it("a bounded grow phase never probes a layer count above what the estimate affords", () => {
-    const rungs = runLadder({ mode: "balanced", granularity: "fine", candidateCtx: 32_768, candidateNgl: 16 });
-    const ctxResolved = bestLadderResult(rungs)!.ctx;
-    const ceiling = bestNglAtContext(NGL_MAX, ctxResolved, calculateCtx, 16);
-    for (const rung of rungs.filter((r) => r.ctx === ctxResolved)) {
-      expect(rung.ngl).toBeLessThanOrEqual(ceiling);
-    }
-    expect(ceiling).toBeLessThan(NGL_MAX);
-  });
-
-  it("costs strictly fewer loads than growing toward every layer did, for the same verdict", () => {
-    const rungs = runLadder({ mode: "max_context", granularity: "basic", candidateCtx: 32_768, candidateNgl: 27 });
-    // The unbounded version of this search took 7; bounding it takes 5 and
-    // still lands on the same rung.
-    expect(rungs.length).toBe(5);
-    expect(bestLadderResult(rungs)).toEqual({ ctx: 131_072, ngl: 2, ok: true });
-  });
-});
-
-describe("max_gpu backs off when its context collapses to the floor", () => {
-  // Weights dominate: every layer above ~20 leaves room for almost no KV, so
-  // the layer phase wins layers the context phase then can't use.
-  const tight = (r: { ctx: number; ngl: number }): boolean => r.ctx * (r.ngl + 4) <= 100_000;
-
-  it("gives layers back to reach a context above the floor", () => {
-    const rungs = runLadder({ mode: "max_gpu", granularity: "basic", candidateCtx: 32_768, candidateNgl: 27 }, tight);
-    const best = bestLadderResult(rungs)!;
-    expect(best.ctx).toBeGreaterThan(PROBE_LADDER_MIN_CTX);
-    // The floor-context phase found more layers than the verdict keeps --
-    // that is the trade the back-off exists to make.
-    const bestAtFloor = Math.max(...rungs.filter((r) => r.ok && r.ctx === PROBE_LADDER_MIN_CTX).map((r) => r.ngl));
-    expect(best.ngl).toBeLessThan(bestAtFloor);
-  });
-
-  it("never gives back a layer when the context phase already cleared the floor", () => {
-    const rungs = runLadder({ mode: "max_gpu", granularity: "basic", candidateCtx: 32_768, candidateNgl: 27 });
-    const best = bestLadderResult(rungs)!;
-    expect(best.ctx).toBeGreaterThan(PROBE_LADDER_MIN_CTX);
-    // Every rung sits at the layer count the layer phase resolved: no back-off.
-    expect(new Set(rungs.map((r) => r.ngl)).size).toBe(1);
-  });
-
-  it("backs off under fine too -- a refined context below the second stop is still 'at the floor'", () => {
-    // fine refines INSIDE the [1024, 2048] bracket, landing on something like
-    // 1920: larger than the floor exactly, and just as unusable. Gating the
-    // back-off on "> the floor" would have let fine slip past it.
-    const rungs = runLadder({ mode: "max_gpu", granularity: "fine", candidateCtx: 32_768, candidateNgl: 27 }, tight);
-    const best = bestLadderResult(rungs)!;
-    expect(best.ctx).toBeGreaterThanOrEqual(2048);
-    const bestAtFloor = Math.max(...rungs.filter((r) => r.ok && r.ctx < 2048).map((r) => r.ngl));
-    expect(best.ngl).toBeLessThan(bestAtFloor);
-  });
-
-  it("re-walks the context ladder from the rung the back-off proved, not from the estimate", () => {
-    const rungs = runLadder({ mode: "max_gpu", granularity: "basic", candidateCtx: 32_768, candidateNgl: 27 }, tight);
-    const best = bestLadderResult(rungs)!;
-    // Everything tested at the backed-off placement starts at 2048 and steps
-    // UP the ladder; re-seeding on this fixture's (wildly optimistic)
-    // estimate would instead walk back down through 16384/8192/4096.
-    const atBackoff = rungs.filter((r) => r.ngl === best.ngl).map((r) => r.ctx);
-    expect(Math.min(...atBackoff)).toBe(2048);
-    expect(atBackoff.filter((c) => c > 4096)).toHaveLength(0);
-  });
-
-  it("stays within budget and reports the largest context that actually loaded", () => {
-    const rungs = runLadder({ mode: "max_gpu", granularity: "fine", candidateCtx: 32_768, candidateNgl: 27 }, tight);
-    expect(rungs.length).toBeLessThanOrEqual(PROBE_MAX_LOADS);
-    const best = bestLadderResult(rungs)!;
-    expect(Math.max(...rungs.filter((r) => r.ok).map((r) => r.ctx))).toBe(best.ctx);
-  });
-});
-
-describe("the safe-value rule", () => {
-  it("snaps a value between slider stops DOWN, never up", () => {
-    const safe = snapToSafeCtx(43_581, TRAINED);
-    expect(safe).toBeLessThanOrEqual(43_581);
-    expect(ctxLadderStops(TRAINED)).toContain(safe);
-  });
-
-  it("leaves a value that is already a stop untouched", () => {
+describe("snapToSafeCtx", () => {
+  it("snaps a stored off-stop value DOWN to a stop, never up", () => {
+    expect(snapToSafeCtx(43_581, TRAINED)).toBe(32_768);
     expect(snapToSafeCtx(32_768, TRAINED)).toBe(32_768);
+    for (const v of [1024, 5000, 43_581, 200_000, TRAINED]) expect(snapToSafeCtx(v, TRAINED)).toBeLessThanOrEqual(v);
   });
 
-  it("never returns more than was actually verified", () => {
-    for (const verified of [1024, 5000, 32_768, 43_581, 200_000, TRAINED]) {
-      expect(snapToSafeCtx(verified, TRAINED)).toBeLessThanOrEqual(verified);
-    }
-  });
-
-  it("snaps against the probe's own power-of-two grid, not the client slider's fraction grid", () => {
-    // 50,000 isn't a power of two and isn't a "round fraction" of itself
-    // either -- ctxLadderStops and computeCtxStops now deliberately diverge.
-    expect(ctxLadderStops(50_000)).toEqual([1024, 2048, 4096, 8192, 16384, 32768, 50_000]);
+  it("uses the probe's grid, not the client slider's fraction grid", () => {
     expect(computeCtxStops(50_000)).not.toEqual(ctxLadderStops(50_000));
     expect(snapToSafeCtx(40_000, 50_000)).toBe(32_768);
-  });
-});
-
-describe("bestLadderResult", () => {
-  it("picks the largest passing context, breaking ties on placement", () => {
-    const best = bestLadderResult([
-      { ctx: 8192, ngl: 40, ok: true },
-      { ctx: 16_384, ngl: 20, ok: true },
-      { ctx: 16_384, ngl: 27, ok: true },
-      { ctx: 32_768, ngl: 27, ok: false },
-    ]);
-    expect(best).toEqual({ ctx: 16_384, ngl: 27, ok: true });
-  });
-
-  // The RTX 3080 frontier probe: 262144 tokens at 15 layers was reported from a
-  // load nothing had measured, while 6 layers at the same context had been.
-  it("prefers a pass whose placement was measured over a larger unmeasured one", () => {
-    const best = bestLadderEvidence([
-      { ctx: 1024, ngl: 20, ok: true, placementJudged: true },
-      { ctx: 262_144, ngl: 6, ok: true, placementJudged: true },
-      { ctx: 262_144, ngl: 15, ok: true, placementJudged: false },
-    ]);
-    expect(best).toEqual({ attempt: { ctx: 262_144, ngl: 6, ok: true, placementJudged: true }, judged: true });
-  });
-
-  // Metal, or a build that printed no buffer sizes: nothing can be measured, so
-  // the verdict is the largest pass as it always was -- only labelled.
-  it("keeps the largest pass where nothing could be measured", () => {
-    const best = bestLadderEvidence([
-      { ctx: 1024, ngl: 31, ok: true, placementJudged: false },
-      { ctx: 262_144, ngl: 31, ok: true, placementJudged: false },
-    ]);
-    expect(best).toMatchObject({ attempt: { ctx: 262_144, ngl: 31 }, judged: false });
-  });
-
-  it("does not let a measured failure switch the preference on", () => {
-    const best = bestLadderEvidence([
-      { ctx: 131_072, ngl: 12, ok: true, placementJudged: false },
-      { ctx: 262_144, ngl: 12, ok: false, placementJudged: true },
-    ]);
-    expect(best).toMatchObject({ attempt: { ctx: 131_072, ngl: 12 }, judged: false });
-  });
-
-  // A measured pass at a larger context proves the same layer count at every
-  // smaller one, so a stop resting on an unmeasured twin is still verified.
-  it("verifies a frontier stop through a measured pass at the same layers and a larger context", () => {
-    const resolved = resolveFrontier({
-      history: [
-        { ctx: 1024, ngl: 13, ok: false, placementJudged: true },
-        { ctx: 1024, ngl: 12, ok: true, placementJudged: false },
-        { ctx: 8192, ngl: 12, ok: true, placementJudged: true },
-      ],
-      stops: ctxLadderStops(8192),
-      nglMax: 40,
-    });
-    expect(resolved.every((s) => s.resolved && s.ngl === 12 && !s.unverified)).toBe(true);
-  });
-});
-
-// Regression: max_context used to stop after resolving context, never testing
-// a single GPU layer. Reproduced with this machine's real estimator shape,
-// where affordable context decreases monotonically in ngl -- so
-// bestNglForMaxContext pins ngl 0, the context walk reaches the trained
-// ceiling, and bestNglAtContext(thatCeiling) then answers 0 for every layer
-// count. The mode measured exactly one placement and reported it.
-describe("max_context grows layers even when the estimate says nothing fits", () => {
-  const NGL_MAX = 41;
-  const MAXCTX = 262144;
-  // Monotonically decreasing, and 0 above ngl 12 -- i.e. the estimate insists
-  // no offload can hold a large context.
-  const calculateCtx = (ngl: number) => (ngl >= 12 ? 1024 : Math.max(1024, 72192 - ngl * 5400));
-
-  function walk(): { ctx: number; ngl: number; ok: boolean }[] {
-    const history: { ctx: number; ngl: number; ok: boolean }[] = [];
-    for (let i = 0; i < 24; i++) {
-      const rung = nextLadderRung({
-        mode: "max_context",
-        granularity: "basic",
-        candidateCtx: 4096,
-        candidateNgl: 20,
-        nglMax: NGL_MAX,
-        maxCtx: MAXCTX,
-        history,
-        calculateNgl: () => 6,
-        calculateCtx,
-      });
-      if (!rung) break;
-      // Context succeeds everywhere; layers fail above 10, which is the shape
-      // the reference machine actually has.
-      history.push({ ...rung, ok: rung.ngl <= 10 });
-    }
-    return history;
-  }
-
-  it("measures more than one layer count", () => {
-    const tried = new Set(walk().map((h) => h.ngl));
-    expect(tried.size).toBeGreaterThan(1);
-  });
-
-  it("finds a real offload rather than reporting ngl 0", () => {
-    const history = walk();
-    const best = history.filter((h) => h.ok).reduce((a, b) => (b.ctx > a.ctx || (b.ctx === a.ctx && b.ngl > a.ngl) ? b : a));
-    expect(best.ngl).toBeGreaterThan(0);
-    expect(best.ctx).toBe(MAXCTX);
-  });
-
-  it("still ends when there is nowhere left to grow", () => {
-    const history: { ctx: number; ngl: number; ok: boolean }[] = [];
-    for (let i = 0; i < 40; i++) {
-      const rung = nextLadderRung({
-        mode: "max_context", granularity: "basic", candidateCtx: 4096, candidateNgl: 20,
-        nglMax: NGL_MAX, maxCtx: MAXCTX, history, calculateNgl: () => 6, calculateCtx,
-      });
-      if (!rung) break;
-      history.push({ ...rung, ok: rung.ngl <= 10 });
-    }
-    expect(history.length).toBeLessThanOrEqual(24);
-  });
-});
-
-// Regression, probe 4b588fa2 (2026-09-13): max_gpu on a 10GiB RTX 3080 with a
-// 31-layer 26B-A4B MoE that does not fit. The driver backed the overflow with
-// system RAM instead of erroring, the worker let every such rung pass with a
-// warning, and the probe "verified" all 31 layers at the full context. Once a
-// measured layer spill fails the rung, the same search backs off to the
-// largest layer count whose weights actually stay in VRAM.
-describe("max_gpu backs off from layers served from system RAM", () => {
-  const LAYERS = 31;
-  const RESIDENT = 22;
-
-  function walk(spillFails: boolean): LadderAttempt[] {
-    const history: LadderAttempt[] = [];
-    for (let i = 0; i < PROBE_MAX_LOADS; i++) {
-      const rung = nextLadderRung({
-        mode: "max_gpu", granularity: "basic", candidateCtx: 1024, candidateNgl: LAYERS,
-        nglMax: LAYERS, maxCtx: TRAINED, history, calculateNgl: () => 19, calculateCtx: () => TRAINED,
-      });
-      if (!rung) break;
-      // Nothing ever OOMs on this driver; the only failure is the spill itself.
-      const spilled = spillFails && rung.ngl > RESIDENT;
-      history.push({ ...rung, ok: !spilled, hostBacked: spilled });
-    }
-    return history;
-  }
-
-  it("settles on the largest layer count that stays in VRAM, then still reaches the full context", () => {
-    expect(bestLadderResult(walk(true))).toMatchObject({ ngl: RESIDENT, ctx: TRAINED });
-  });
-
-  it("never reports a placement that spilled", () => {
-    expect(walk(true).filter((h) => h.ok && h.ngl > RESIDENT)).toHaveLength(0);
-  });
-
-  it("opens at every layer, then jumps straight to the estimate on the spill", () => {
-    expect(walk(true).slice(0, 2)).toMatchObject([
-      { ctx: 1024, ngl: LAYERS, ok: false },
-      { ctx: 1024, ngl: 19, ok: true },
-    ]);
-  });
-
-  it("reproduces the bug when a spill is allowed to pass", () => {
-    expect(bestLadderResult(walk(false))).toMatchObject({ ngl: LAYERS, ctx: TRAINED });
-  });
-});
-
-// Regression, reproduced from a real production run (probe dbe15026, worker
-// log 2026-09-05T17:27): balanced seeded at the user's own 41 layers, on a
-// machine where 41 layers is a silent host-backed placement at EVERY context.
-// The context phase walked 32768 -> 1024, failed all six loads, and the ladder
-// reported total failure -- never once trying fewer layers, on a box that runs
-// the same model at 10 layers.
-describe("balanced rescues itself when its pinned placement never fits", () => {
-  const NGL_MAX = 41;
-  const MAXCTX = 262144;
-  const calculateCtx = (ngl: number) => (ngl >= 12 ? 1024 : Math.max(1024, 72192 - ngl * 5400));
-
-  function walk(opts: { hostBacked: boolean }): { ctx: number; ngl: number; ok: boolean; hostBacked?: boolean }[] {
-    const history: { ctx: number; ngl: number; ok: boolean; hostBacked?: boolean }[] = [];
-    for (let i = 0; i < 24; i++) {
-      const rung = nextLadderRung({
-        mode: "balanced", granularity: "basic", candidateCtx: 32768, candidateNgl: NGL_MAX,
-        nglMax: NGL_MAX, maxCtx: MAXCTX, history, calculateNgl: () => 6, calculateCtx,
-      });
-      if (!rung) break;
-      const ok = rung.ngl <= 10;
-      history.push({ ...rung, ok, hostBacked: opts.hostBacked ? !ok : undefined });
-    }
-    return history;
-  }
-
-  it("finds a working placement instead of giving up", () => {
-    const history = walk({ hostBacked: true });
-    expect(history.some((h) => h.ok)).toBe(true);
-    const best = history.filter((h) => h.ok).reduce((a, b) => (b.ctx > a.ctx || (b.ctx === a.ctx && b.ngl > a.ngl) ? b : a));
-    expect(best.ngl).toBe(10);
-    expect(best.ctx).toBe(MAXCTX);
-  });
-
-  it("stops walking context down once a failure is known to be host-backed", () => {
-    // The layers are in system RAM; a smaller context cannot change that, so
-    // the context phase must not spend the whole ladder proving it.
-    const atSeedNgl = walk({ hostBacked: true }).filter((h) => h.ngl === NGL_MAX);
-    expect(atSeedNgl).toHaveLength(1);
-  });
-
-  it("still walks the context ladder when the failure reason is unknown", () => {
-    // A worker that reports no reason (older build, or a genuine capacity
-    // failure) keeps the original behaviour -- context really might be the
-    // problem, so it is still worth walking down.
-    const atSeedNgl = walk({ hostBacked: false }).filter((h) => h.ngl === NGL_MAX);
-    expect(atSeedNgl.length).toBeGreaterThan(1);
-  });
-
-  it("recovers even without the reason, just more expensively", () => {
-    const history = walk({ hostBacked: false });
-    expect(history.some((h) => h.ok)).toBe(true);
   });
 });

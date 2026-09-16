@@ -120,7 +120,8 @@ export function ProfileCards({ testId, refreshKey, modelId, workerId }: ProfileC
 
   // N2 -- estimate → VERIFY. The probe rides the ordinary trigger route, so
   // every §0.5 guard applies unchanged; the engine is pinned to llama-server
-  // server-side, and it performs at most three loads, ever.
+  // server-side. It verifies context at this card's own layer count, so it runs
+  // as fixed_offload: layers pinned, both answers searched over context.
   async function verifyWithProbe(config: ScoredConfig): Promise<void> {
     if (!modelId || !workerId) {
       setProbeMsg("This run has no machine attached, so there is nothing to probe against.");
@@ -155,6 +156,7 @@ export function ProfileCards({ testId, refreshKey, modelId, workerId }: ProfileC
             slots: Number(config.axes.concurrency ?? 1),
           },
           kv_pair: [String(config.axes.cache_type_k), String(config.axes.cache_type_v)],
+          mode: "fixed_offload",
         },
         sweep: {
           n_prompt: [Number(config.axes.n_prompt ?? 512)],

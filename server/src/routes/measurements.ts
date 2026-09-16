@@ -44,7 +44,7 @@ export const MAX_PROBE_NGL = 4096;
 // (appSettingsRepo.getProbeMaxLoads()), not this constant, so an operator's
 // override on the supervise dashboard is actually enforced and a
 // misbehaving worker can't report more loads than that live setting allows.
-export const MAX_PROBE_ATTEMPTS = 24;
+export const MAX_PROBE_ATTEMPTS = 40;
 export const DATASET_HASH_RE = /^sha256:[0-9a-f]{64}$/;
 
 // The enrolled-worker-session rule. Deliberately NOT authenticateWorker():
@@ -163,6 +163,17 @@ function validateOneProbeAttempt(raw: unknown, label: string): ProbeAttemptRepor
         ? a.gpu_in_system_ram_mib
         : null,
     gpu_spill_jitter_mib: optionalNonNegative(a.gpu_spill_jitter_mib, `${label}.gpu_spill_jitter_mib`),
+    list_devices_free_mib: optionalNonNegative(a.list_devices_free_mib, `${label}.list_devices_free_mib`),
+    load_kind:
+      a.load_kind === "claim_stop" || a.load_kind === "full" || a.load_kind === "error" ? a.load_kind : undefined,
+    claim_fits_free: typeof a.claim_fits_free === "boolean" ? a.claim_fits_free : null,
+    // Signed, like gpu_in_system_ram_mib: a clean phase reads below zero.
+    spill_ready_mib: typeof a.spill_ready_mib === "number" && Number.isFinite(a.spill_ready_mib) ? a.spill_ready_mib : null,
+    spill_ready_jitter_mib: optionalNonNegative(a.spill_ready_jitter_mib, `${label}.spill_ready_jitter_mib`),
+    spill_work_mib: typeof a.spill_work_mib === "number" && Number.isFinite(a.spill_work_mib) ? a.spill_work_mib : null,
+    spill_work_jitter_mib: optionalNonNegative(a.spill_work_jitter_mib, `${label}.spill_work_jitter_mib`),
+    ladder_ngl_max: optionalFiniteInt(a.ladder_ngl_max, `${label}.ladder_ngl_max`, 0, MAX_PROBE_NGL),
+    ladder_max_ctx: optionalFiniteInt(a.ladder_max_ctx, `${label}.ladder_max_ctx`, 0, 16_777_216),
     host_backed_fail: a.host_backed_fail === "layers" || a.host_backed_fail === "cache" ? a.host_backed_fail : null,
     error: typeof a.error === "string" ? a.error : undefined,
     // N2 batch dedup -- the worker only ever echoes back a source_run_id the
@@ -426,6 +437,16 @@ export async function measurementRoutes(app: FastifyInstance): Promise<void> {
         gpu_buffers_mib: row.gpu_buffers_mib,
         gpu_in_system_ram_mib: row.gpu_in_system_ram_mib,
         gpu_spill_jitter_mib: row.gpu_spill_jitter_mib,
+        list_devices_free_mib: row.list_devices_free_mib,
+        load_kind:
+          row.load_kind === "claim_stop" || row.load_kind === "full" || row.load_kind === "error"
+            ? (row.load_kind as "claim_stop" | "full" | "error")
+            : null,
+        claim_fits_free: row.claim_fits_free == null ? null : row.claim_fits_free === 1,
+        spill_ready_mib: row.spill_ready_mib,
+        spill_ready_jitter_mib: row.spill_ready_jitter_mib,
+        spill_work_mib: row.spill_work_mib,
+        spill_work_jitter_mib: row.spill_work_jitter_mib,
         host_backed_fail:
           row.host_backed_fail === "layers" || row.host_backed_fail === "cache" ? row.host_backed_fail : null,
         vram_discrepancy: row.vram_discrepancy === 1,

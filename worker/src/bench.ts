@@ -514,27 +514,29 @@ export function parseModelBufferSizes(stderr: string): ModelBufferSizesByModel |
 const GPU_BUFFER_SIZE_LINE_RE = /^.*?:\s*(\S+)\s+(model|KV|RS|compute|output)\s+buffer size\s*=\s*([\d.]+)\s*MiB/;
 const HOST_BUFFER_NAME_RE = /^CPU|_Host$/i;
 
-export function parseGpuBufferReport(stderr: string): { deviceMib: number; contextMib: number } | null {
+export function parseGpuBufferReport(
+  stderr: string
+): { deviceMib: number; contextMib: number; byDeviceMib: Record<string, number> } | null {
   let seen = false;
-  let weightsMib = 0;
-  const latest = new Map<string, { kind: string; mib: number }>();
+  const byDeviceMib: Record<string, number> = {};
+  const latest = new Map<string, { device: string; kind: string; mib: number }>();
   for (const line of stderr.split("\n")) {
     const m = GPU_BUFFER_SIZE_LINE_RE.exec(line);
     if (!m) continue;
     seen = true;
     const mib = Number(m[3]);
     if (!Number.isFinite(mib) || HOST_BUFFER_NAME_RE.test(m[1])) continue;
-    if (m[2] === "model") weightsMib += mib;
-    else latest.set(`${m[1]}:${m[2]}`, { kind: m[2], mib });
+    if (m[2] === "model") byDeviceMib[m[1]] = (byDeviceMib[m[1]] ?? 0) + mib;
+    else latest.set(`${m[1]}:${m[2]}`, { device: m[1], kind: m[2], mib });
   }
   if (!seen) return null;
-  let deviceMib = weightsMib;
   let contextMib = 0;
-  for (const { kind, mib } of latest.values()) {
-    deviceMib += mib;
+  for (const { device, kind, mib } of latest.values()) {
+    byDeviceMib[device] = (byDeviceMib[device] ?? 0) + mib;
     if (kind === "KV" || kind === "compute") contextMib += mib;
   }
-  return { deviceMib, contextMib };
+  const deviceMib = Object.values(byDeviceMib).reduce((sum, mib) => sum + mib, 0);
+  return { deviceMib, contextMib, byDeviceMib };
 }
 
 // ---------------------------------------------------------------------------

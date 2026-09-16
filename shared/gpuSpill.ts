@@ -44,6 +44,9 @@ export interface GpuBufferReport {
   deviceMib: number;
   /** The part of deviceMib a smaller context shrinks: KV cache and compute buffer. */
   contextMib: number;
+  /** deviceMib split by llama.cpp device name ("Vulkan0", "CUDA1"), so a claim
+   * can be held against each device's own free memory. */
+  byDeviceMib?: Record<string, number>;
 }
 
 export interface GpuSpillInput {
@@ -101,4 +104,83 @@ export function measureGpuSpill(input: GpuSpillInput): GpuSpillVerdict {
     spilled: true,
     cause: input.atSmallestContext || excessMib > buffers.contextMib ? "layers" : "cache",
   };
+}
+
+// --- Spill by phase ----------------------------------------------------------
+//
+// One dedicated-VRAM figure per load (its peak once loaded) cannot show memory
+// that the driver moves to system RAM only once it is used. So the context test
+// reads this process's dedicated VRAM about once a second for the whole load
+// and judges two phases separately:
+//
+//   ready -- a short hold after the server reports ready, before any request.
+//            Judged on its LAST reading: a driver still paging buffers in right
+//            after load would otherwise read as a spill.
+//   work  -- the prompt and generation. Judged on the MEDIAN reading, so one
+//            reading taken mid-reshuffle cannot decide it.
+//
+// Each phase's tolerance is how far its own readings moved. The load's verdict
+// is its worse phase. A phase with no readings is left out; with neither, the
+// load is unmeasured.
+
+export interface MemoryReading {
+  /** Epoch ms the reading was taken (the end of the counter's own sample). */
+  atMs: number;
+  dedicatedMib: number | null;
+}
+
+export interface PhasedSpillInput {
+  buffers: GpuBufferReport | null;
+  readings: readonly MemoryReading[];
+  /** The ready hold: from the server reporting ready to the first request. */
+  ready: { fromMs: number; toMs: number } | null;
+  /** From the first request sent to the last token received. */
+  work: { fromMs: number; toMs: number } | null;
+  atSmallestContext?: boolean;
+}
+
+export interface PhasedSpillVerdict extends GpuSpillVerdict {
+  readyPhase: GpuSpillVerdict;
+  workPhase: GpuSpillVerdict;
+}
+
+/** How late after the work window a reading may land and still belong to it:
+ * the Windows counter takes about a second to produce each sample. The ready
+ * hold gets no such allowance -- a reading landing after the first request went
+ * out partly covers the prompt, and the hold's whole point is that nothing has
+ * touched the memory yet. */
+const READING_LAG_MS = 1000;
+
+export function measurePhasedGpuSpill(input: PhasedSpillInput): PhasedSpillVerdict {
+  const inWindow = (w: { fromMs: number; toMs: number } | null, lagMs: number) =>
+    w == null
+      ? []
+      : input.readings
+          .filter((r) => r.dedicatedMib != null && r.atMs > w.fromMs && r.atMs <= w.toMs + lagMs)
+          .map((r) => r.dedicatedMib as number);
+  const spread = (values: number[]) => (values.length > 1 ? Math.max(...values) - Math.min(...values) : 0);
+  const judge = (dedicatedMib: number | null, values: number[]) =>
+    measureGpuSpill({
+      buffers: input.buffers,
+      dedicatedMib,
+      dedicatedJitterMib: spread(values),
+      atSmallestContext: input.atSmallestContext,
+    });
+
+  const readyValues = inWindow(input.ready, 0);
+  const workValues = inWindow(input.work, READING_LAG_MS);
+  const readyPhase = judge(readyValues.length > 0 ? readyValues[readyValues.length - 1] : null, readyValues);
+  const workPhase = judge(workValues.length > 0 ? median(workValues) : null, workValues);
+
+  const excess = (v: GpuSpillVerdict) => (v.measured ? (v.inSystemRamMib ?? 0) - (v.jitterMib ?? 0) : -Infinity);
+  const measured = [readyPhase, workPhase].filter((v) => v.measured);
+  if (measured.length === 0) return { ...UNMEASURED_GPU_SPILL, readyPhase, workPhase };
+  const worst = measured.reduce((a, b) => (excess(b) > excess(a) ? b : a));
+  return { ...worst, readyPhase, workPhase };
+}
+
+function median(values: number[]): number {
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 1 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
 }

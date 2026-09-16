@@ -25,7 +25,9 @@ function row(overrides: Partial<ProbeAttemptDto>): ProbeAttemptDto {
     vram_shared_total_peak_mib: null, vram_claimed_peak_mib: null,
     gen_tps: 30, pp_tps: 400, ttft_ms: 700, prefill_cliff: 0,
     host_backed_method: null, host_backed_slope: null, kv_host_backed_frac: null,
-    gpu_buffers_mib: null, gpu_in_system_ram_mib: null, gpu_spill_jitter_mib: null, host_backed_fail: null,
+    gpu_buffers_mib: null, gpu_in_system_ram_mib: null, gpu_spill_jitter_mib: null, host_backed_fail: null, list_devices_free_mib: null, claim_fits_free: null,
+    load_kind: null, spill_ready_mib: null, spill_ready_jitter_mib: null, spill_work_mib: null, spill_work_jitter_mib: null,
+    ladder_ngl_max: null, ladder_max_ctx: null,
     error: null, created_at: 0, reused_from_run_id: null, vram_discrepancy: 0,
     gpu_layers_resident_est: null, gpu_layers_resident_exact: null,
     ...overrides,
@@ -88,7 +90,8 @@ describe("ProbeAttempts result badge", () => {
 });
 
 describe("ProbeAttempts in system RAM", () => {
-  const spillText = (r: HTMLElement) => r.children[r.children.length - 2].textContent;
+  // in system RAM, claim vs free, result
+  const spillText = (r: HTMLElement) => r.children[r.children.length - 3].textContent;
 
   it("shows the measured spill, none for a clean load, and a dash where nothing was measured", async () => {
     const { bodyRows } = await renderTable([
@@ -104,6 +107,35 @@ describe("ProbeAttempts in system RAM", () => {
   it("does not show a difference within the counter's own movement as a spill", async () => {
     const { bodyRows } = await renderTable([row({ gpu_buffers_mib: 2000, gpu_in_system_ram_mib: 20, gpu_spill_jitter_mib: 40 })]);
     expect(spillText(bodyRows[0])).toBe("none");
+  });
+});
+
+describe("ProbeAttempts claim vs free", () => {
+  const claimText = (r: HTMLElement) => r.children[r.children.length - 2].textContent;
+
+  it("holds llama.cpp's claim against the --list-devices free reading", async () => {
+    const { bodyRows } = await renderTable([
+      row({ gpu_buffers_mib: 7274, list_devices_free_mib: 7378 }),
+      row({ gpu_buffers_mib: 7673, list_devices_free_mib: 7378 }),
+      // Died before reporting buffers: it did not fit.
+      row({ ok: 0, oom: 1, gen_tps: null, gpu_buffers_mib: null, list_devices_free_mib: 7378 }),
+      row({ gpu_buffers_mib: 7000, list_devices_free_mib: null }),
+    ]);
+    expect(claimText(bodyRows[0])).toBe("104 MiB under");
+    expect(claimText(bodyRows[1])).toBe("295 MiB over");
+    expect(claimText(bodyRows[2])).toBe("no");
+    expect(claimText(bodyRows[3])).toBe("—");
+  });
+
+  it("follows the worker's per-device verdict, and reads a non-memory failure as no verdict", async () => {
+    const { bodyRows, table } = await renderTable([
+      // In total under free, but one GPU's own claim did not fit.
+      row({ gpu_buffers_mib: 7000, list_devices_free_mib: 22378, claim_fits_free: 0 }),
+      row({ ok: 0, gen_tps: null, gpu_buffers_mib: null, list_devices_free_mib: 7378, load_kind: "error" }),
+    ]);
+    expect(claimText(bodyRows[0])).toBe("over on one GPU");
+    expect(claimText(bodyRows[1])).toBe("—");
+    expect(table.getByText("failed — not a memory verdict")).toBeTruthy();
   });
 });
 

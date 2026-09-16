@@ -90,6 +90,21 @@ export interface ProbeAttemptDto {
   gpu_buffers_mib: number | null;
   gpu_in_system_ram_mib: number | null;
   gpu_spill_jitter_mib: number | null;
+  /** See ProbeAttemptReport.list_devices_free_mib. Null from a worker predating
+   * it, which leaves the rung without a second-target verdict. */
+  list_devices_free_mib: number | null;
+  /** See ProbeAttemptReport.load_kind; null from a worker predating it (= full). */
+  load_kind: "full" | "claim_stop" | "error" | null;
+  /** See ProbeAttemptReport.claim_fits_free. SQLite 0/1; null from an older worker. */
+  claim_fits_free: number | null;
+  /** See ProbeAttemptReport.spill_ready_mib and its siblings. */
+  spill_ready_mib: number | null;
+  spill_ready_jitter_mib: number | null;
+  spill_work_mib: number | null;
+  spill_work_jitter_mib: number | null;
+  /** See ProbeAttemptReport.ladder_ngl_max. */
+  ladder_ngl_max: number | null;
+  ladder_max_ctx: number | null;
   /** See ProbeAttemptReport.host_backed_fail. Null from a worker predating it,
    * where the reason has to be re-derived from the other fields. */
   host_backed_fail: "layers" | "cache" | null;
@@ -158,6 +173,14 @@ export interface ProbeDedupPoint {
   gpu_buffers_mib: number | null;
   gpu_in_system_ram_mib: number | null;
   gpu_spill_jitter_mib: number | null;
+  /** The SIBLING's reading; the reusing probe judges the claim against its own. */
+  list_devices_free_mib: number | null;
+  load_kind: "full" | "claim_stop" | "error" | null;
+  claim_fits_free: boolean | null;
+  spill_ready_mib: number | null;
+  spill_ready_jitter_mib: number | null;
+  spill_work_mib: number | null;
+  spill_work_jitter_mib: number | null;
   host_backed_fail: "layers" | "cache" | null;
   /** See ProbeAttemptDto.vram_discrepancy; coerced to false for a sibling row
    * predating the check, same as ok/oom/spill's own boolean coercion above. */

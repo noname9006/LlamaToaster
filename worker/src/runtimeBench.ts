@@ -723,6 +723,32 @@ export interface ProbeAttemptOutcome {
   gpuBuffersMib?: number | null;
   gpuInSystemRamMib?: number | null;
   gpuSpillJitterMib?: number | null;
+  /** What `llama-server --list-devices` reported free on the probe's devices,
+   * read once before the ladder's first load (binary-probe.ts's
+   * readListDevicesFreeMib). gpuBuffersMib below it is the probe's second
+   * target. */
+  listDevicesFreeMib?: number | null;
+  /** "full" -- loaded, prompted, generated, spill judged. "claim_stop" -- stopped
+   * once ready because the claim did not fit free VRAM: no generation, no spill
+   * verdict. "error" -- failed for a reason that is not memory (readiness
+   * timeout, a crash without an out-of-memory signature, a rejected request),
+   * so it decides nothing about the claim. */
+  loadKind?: "full" | "claim_stop" | "error";
+  /** Target 2's verdict for this load, judged per device where llama.cpp's
+   * buffer report and --list-devices both name the devices
+   * (claimFitsFreeByDevice), on the totals otherwise. Undefined from a load
+   * that never reported buffers. */
+  claimFitsFree?: boolean | null;
+  /** Spill per phase (shared/gpuSpill.ts measurePhasedGpuSpill): the ready hold's
+   * last reading and the prompt+generation's median, each with how far that
+   * phase's readings moved. Null where the phase had no reading. */
+  spillReadyMib?: number | null;
+  spillReadyJitterMib?: number | null;
+  spillWorkMib?: number | null;
+  spillWorkJitterMib?: number | null;
+  /** The ladder's bounds, repeated on every row -- see ProbeAttemptReport. */
+  ladderNglMax?: number | null;
+  ladderMaxCtx?: number | null;
   /** Which spill failed this rung: its LAYERS (more in system RAM than the
    * context's whole KV cache and compute buffer, so no smaller context fixes
    * it) or its context's buffers. Null on a pass and on every other kind of
@@ -829,6 +855,9 @@ export function probeSucceeded(input: {
   // This rung already runs at the smallest context the probe ever tries, so no
   // smaller context can fix a spill (see GpuSpillInput.atSmallestContext).
   atSmallestContext?: boolean;
+  // A spill verdict measured elsewhere (the context test's per-phase trace).
+  // When present it replaces the loaded-peak measurement below.
+  gpuSpillOverride?: GpuSpillVerdict;
 }): {
   ok: boolean;
   spill: boolean;
@@ -865,7 +894,7 @@ export function probeSucceeded(input: {
       reason: "the allocation spilled past this adapter's VRAM total",
     };
   }
-  const gpuSpill = measureGpuSpill({
+  const gpuSpill = input.gpuSpillOverride ?? measureGpuSpill({
     buffers: input.gpuBuffers ?? null,
     dedicatedMib: input.loadedDedicatedMib ?? null,
     dedicatedJitterMib: input.loadedDedicatedJitterMib ?? null,
@@ -959,6 +988,21 @@ export function toBenchResult(input: {
   };
 }
 
+/**
+ * The batch sibling's reading a probe may reuse for its next load of a point:
+ * the n-th load reuses a sibling's n-th load of that point, never the same
+ * reading twice -- a control is only a control if it is a second real load.
+ * `loadsHere` is how many times this probe has already loaded the point.
+ */
+export function pickDedupPoint<P extends { candidate_ctx: number; ngl: number | null }>(
+  points: readonly P[],
+  ctx: number,
+  ngl: number,
+  loadsHere: number
+): P | undefined {
+  return points.filter((p) => p.candidate_ctx === ctx && p.ngl === ngl)[loadsHere];
+}
+
 export const RUNTIME_DEFAULT_TIMEOUT_MS = DEFAULT_TIMEOUT_MS;
 export { contextSizeForSlots };
 
@@ -989,6 +1033,15 @@ export function toProbeAttemptReport(attempt: ProbeAttemptOutcome): ProbeAttempt
     gpu_buffers_mib: attempt.gpuBuffersMib,
     gpu_in_system_ram_mib: attempt.gpuInSystemRamMib,
     gpu_spill_jitter_mib: attempt.gpuSpillJitterMib,
+    list_devices_free_mib: attempt.listDevicesFreeMib,
+    load_kind: attempt.loadKind,
+    claim_fits_free: attempt.claimFitsFree,
+    spill_ready_mib: attempt.spillReadyMib,
+    spill_ready_jitter_mib: attempt.spillReadyJitterMib,
+    spill_work_mib: attempt.spillWorkMib,
+    spill_work_jitter_mib: attempt.spillWorkJitterMib,
+    ladder_ngl_max: attempt.ladderNglMax,
+    ladder_max_ctx: attempt.ladderMaxCtx,
     host_backed_fail: attempt.hostBackedFailCause,
     pp_tps: attempt.ppTps,
     ttft_ms: attempt.ttftMs,

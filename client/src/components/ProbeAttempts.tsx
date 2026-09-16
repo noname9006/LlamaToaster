@@ -99,11 +99,23 @@ function failedForHostBackedCache(
 // The measured spill for one load (shared/gpuSpill.ts): how much of what
 // llama.cpp put on the GPU this process's dedicated VRAM did not hold. "—" on a
 // load that could not be measured, including every older worker's row.
-function spillCell(a: Pick<ProbeAttemptDto, "gpu_buffers_mib" | "gpu_in_system_ram_mib" | "gpu_spill_jitter_mib">): {
+function spillCell(
+  a: Pick<
+    ProbeAttemptDto,
+    "gpu_buffers_mib" | "gpu_in_system_ram_mib" | "gpu_spill_jitter_mib" | "spill_ready_mib" | "spill_work_mib" | "load_kind"
+  >
+): {
   text: string;
   warn: boolean;
   title: string;
 } {
+  if (a.load_kind === "claim_stop") {
+    return {
+      text: "—",
+      warn: false,
+      title: "Not judged: the claim did not fit free VRAM, so the load stopped before any request.",
+    };
+  }
   if (a.gpu_in_system_ram_mib == null || a.gpu_buffers_mib == null) {
     return {
       text: "—",
@@ -123,8 +135,15 @@ function spillCell(a: Pick<ProbeAttemptDto, "gpu_buffers_mib" | "gpu_in_system_r
       `${mib(a.gpu_buffers_mib - inRam)} once the model loaded` +
       (jitter > 0 ? `, its readings moving by ${mib(jitter)}` : "") +
       ". " +
-      (spilled ? `The other ${mib(inRam)} is being served from system RAM.` : "All of it is in VRAM."),
+      (spilled ? `The other ${mib(inRam)} is being served from system RAM.` : "All of it is in VRAM.") +
+      (a.spill_ready_mib != null || a.spill_work_mib != null
+        ? ` By phase, from once-a-second readings: after load ${signedMib(a.spill_ready_mib)}, during prompt and generation ${signedMib(a.spill_work_mib)} -- the worse one decides.`
+        : ""),
   };
+}
+
+function signedMib(value: number | null): string {
+  return value == null ? "not read" : `${value > 0 ? "+" : ""}${Math.round(value).toLocaleString()} MiB`;
 }
 
 // How much a spilled row had in system RAM, measured where possible and the
@@ -162,6 +181,46 @@ function claimedCell(
     title:
       "No per-process VRAM reading on this worker (an older worker build, or a platform whose driver reports no per-process memory), so what llama-server claimed can't be measured.",
     mib: null,
+  };
+}
+
+// The probe's second target on one load: llama.cpp's GPU claim against what
+// --list-devices reported free before the probe's first load. "—" on a rung
+// from a worker predating the reading, or one that printed no buffers.
+function claimFitCell(
+  a: Pick<ProbeAttemptDto, "gpu_buffers_mib" | "list_devices_free_mib" | "gen_tps" | "load_kind" | "claim_fits_free">
+): {
+  text: string;
+  warn: boolean;
+  title: string;
+} {
+  const free = a.list_devices_free_mib;
+  if (free == null) {
+    return { text: "—", warn: false, title: "No --list-devices reading for this probe (an older worker, or a build without --list-devices)." };
+  }
+  if (a.load_kind === "error") {
+    return {
+      text: "—",
+      warn: false,
+      title: "This load failed for a reason that is not memory (it never became ready, or crashed without running out of memory), so it says nothing about whether the claim fits.",
+    };
+  }
+  if (a.gpu_buffers_mib == null) {
+    return a.gen_tps == null
+      ? { text: "no", warn: true, title: "The load never ran far enough to report its buffers, so it did not fit." }
+      : { text: "—", warn: false, title: "This build printed no GPU buffer sizes, so the claim is unknown." };
+  }
+  const totalFits = a.gpu_buffers_mib < free;
+  const diff = Math.abs(free - a.gpu_buffers_mib);
+  const title = `llama.cpp claimed ${mib(a.gpu_buffers_mib)} on the GPU; --list-devices reported ${mib(free)} free before the probe's first load.`;
+  // Judged per device by the worker: the total can have room while one GPU is full.
+  if (a.claim_fits_free === 0 && totalFits) {
+    return { text: "over on one GPU", warn: true, title: `${title} In total that fits, but at least one GPU's own claim did not fit its own free memory.` };
+  }
+  return {
+    text: totalFits ? `${mib(diff)} under` : `${mib(diff)} over`,
+    warn: !totalFits,
+    title,
   };
 }
 
@@ -309,6 +368,13 @@ export function ProbeAttempts({ testId, refreshKey }: ProbeAttemptsProps) {
               >
                 in system RAM
               </th>
+              <th
+                className="px-2 py-1.5 text-right"
+                rowSpan={2}
+                title="llama.cpp's GPU claim against the free VRAM llama-server --list-devices reported before the probe's first load -- the probe's second target."
+              >
+                claim vs free
+              </th>
               <th className="px-2 py-1.5" rowSpan={2}>result</th>
             </tr>
             <tr className="border-b border-border text-left text-[10px] uppercase tracking-wide text-muted">
@@ -352,6 +418,9 @@ export function ProbeAttempts({ testId, refreshKey }: ProbeAttemptsProps) {
               const resident = residentCell(a);
               const claimed = claimedCell(a);
               const spill = spillCell(a);
+              const claimFit = claimFitCell(a);
+              // The second load of a point is its control (shared/probeLadder.ts).
+              const isControl = attempts.some((b) => b.seq < a.seq && b.candidate_ctx === a.candidate_ctx && b.ngl === a.ngl);
               // More claimed than was free before the load: the rest had to
               // land in system RAM, whatever the counters' timing.
               const claimedOverFree = claimed.mib != null && a.vram_free_mib != null && claimed.mib > a.vram_free_mib;
@@ -428,9 +497,29 @@ export function ProbeAttempts({ testId, refreshKey }: ProbeAttemptsProps) {
                   >
                     {spill.text}
                   </td>
+                  <td
+                    className={`px-2 py-1.5 text-right font-mono ${claimFit.warn ? "font-bold text-warning" : "text-muted"}`}
+                    title={claimFit.title}
+                  >
+                    {claimFit.text}
+                  </td>
                   <td className="px-2 py-1.5 text-muted">
                     <div className="flex flex-wrap items-center gap-1.5">
-                      {a.ok ? (
+                      {a.load_kind === "error" ? (
+                        <span
+                          title={a.error ?? undefined}
+                          className="rounded-full bg-surface px-2 py-0.5 text-[10px] font-bold text-muted"
+                        >
+                          failed — not a memory verdict
+                        </span>
+                      ) : a.load_kind === "claim_stop" ? (
+                        <span
+                          title={a.error ?? undefined}
+                          className="rounded-full bg-surface px-2 py-0.5 text-[10px] font-bold text-muted"
+                        >
+                          claim over free — not generated
+                        </span>
+                      ) : a.ok ? (
                         <>
                           <span className="mr-1 inline-block h-2 w-2 rounded-full bg-success align-middle" /> passed
                         </>
@@ -462,6 +551,14 @@ export function ProbeAttempts({ testId, refreshKey }: ProbeAttemptsProps) {
                           className="rounded-full bg-warning-bg px-2 py-0.5 text-[10px] font-bold text-warning"
                         >
                           ⚠ possible VRAM fallback
+                        </span>
+                      )}
+                      {isControl && (
+                        <span
+                          title="The second load of this point: the control that confirms (or overturns) its no-spill verdict."
+                          className="rounded-full bg-accent/10 px-2 py-0.5 text-[10px] font-semibold text-accent"
+                        >
+                          control
                         </span>
                       )}
                       {a.reused_from_run_id && (

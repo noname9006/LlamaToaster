@@ -34,7 +34,7 @@ import { useWorkerStatuses } from "../api/useWorkerStatus";
 import { ModelPicker } from "../components/ModelPicker";
 import { GoalQuestionnaire, KV_PRESET_LABEL } from "../components/GoalQuestionnaire";
 import { TestStatusPill } from "../components/StatusPill";
-import { frontierFrom, toLadderAttempts } from "../components/ProbeFrontier";
+import { outcomeFrom } from "../components/ProbeFrontier";
 import { IconArrowRight, IconChevronDown, IconInfo } from "../components/icons";
 import { backendVisibleGpus } from "../types";
 import type { Model, Test, TestItem, ResultRow, TestKind, SweepConfig } from "../types";
@@ -49,7 +49,7 @@ import {
   type GoalsConfig,
 } from "../goals";
 import { expandSweep } from "../../../shared/sweep";
-import { bestLadderResult, type ProbeGranularity, type ProbeMode } from "../../../shared/probeLadder";
+import type { ProbeMode } from "../../../shared/probeLadder";
 import { priceMatrix, ETA_UNAVAILABLE } from "../../../shared/pricing";
 import type { ModelRatesResponse } from "../types";
 
@@ -920,7 +920,6 @@ export function Benchmark() {
     ngl: number,
     ctx: number,
     mode: ProbeMode,
-    granularity: ProbeGranularity,
     batchRootIdArg?: string
   ): Promise<string | undefined> {
     if (!modelId || !workerId || verifyStates[mode]?.status === "pending") return undefined;
@@ -939,7 +938,6 @@ export function Benchmark() {
           placement: { ngl, slots: 1 },
           kv_pair: ["f16", "f16"],
           mode,
-          granularity,
         },
         // Vestigial -- the worker derives its own n_prompt/n_gen from
         // candidate_ctx for a probe load (see worker/src/index.ts's
@@ -1019,8 +1017,7 @@ export function Benchmark() {
   // result is known, and only launched if it wasn't that failure.
   async function runModes(
     modes: ProbeMode[],
-    modeStarts: Record<ProbeMode, { ngl: number; ctx: number }>,
-    granularity: ProbeGranularity
+    modeStarts: Record<ProbeMode, { ngl: number; ctx: number }>
   ): Promise<void> {
     const toRun = modes.filter((m) => verifyStates[m]?.status !== "pending");
     if (toRun.length === 0) return;
@@ -1029,7 +1026,7 @@ export function Benchmark() {
 
     if (toRun.length === 1) {
       const start = modeStarts[toRun[0]];
-      const newId = await verifyPlacement(start.ngl, start.ctx, toRun[0], granularity, rootId);
+      const newId = await verifyPlacement(start.ngl, start.ctx, toRun[0], rootId);
       if (!rootId && newId) setBatchRootId(newId);
       return;
     }
@@ -1038,7 +1035,7 @@ export function Benchmark() {
     setHeldForPrecheck(new Set(rest));
     try {
       const firstStart = modeStarts[first];
-      const firstId = await verifyPlacement(firstStart.ngl, firstStart.ctx, first, granularity, rootId);
+      const firstId = await verifyPlacement(firstStart.ngl, firstStart.ctx, first, rootId);
       if (!firstId) return; // verifyPlacement already recorded the "error" state on `first`'s own card
       if (!rootId) {
         rootId = firstId;
@@ -1050,7 +1047,7 @@ export function Benchmark() {
       if (outcome === "failed_unsupported" || unmountedRef.current) return;
       for (const mode of rest) {
         const start = modeStarts[mode];
-        const newId = await verifyPlacement(start.ngl, start.ctx, mode, granularity, rootId);
+        const newId = await verifyPlacement(start.ngl, start.ctx, mode, rootId);
         if (!rootId && newId) {
           rootId = newId;
           setBatchRootId(newId);
@@ -1153,35 +1150,49 @@ export function Benchmark() {
           if (status === "failed" || status === "failed_oom") {
             setPoolHaircutFrac((f) => Math.min(0.3, f === 0 ? 0.15 : 0.3));
           }
-          if (status === "verified" && modelId && workerId) {
+          // A probe that found no no-spill answer ends "failed", but can still have
+          // found target 2 -- so the loads are read for those outcomes too.
+          const searched = status === "verified" || status === "failed" || status === "failed_oom";
+          if (searched && modelId && workerId) {
             try {
               const [limits, attemptsRes] = await Promise.all([
-                api.getVerifiedLimits(modelId, workerId),
+                status === "verified" ? api.getVerifiedLimits(modelId, workerId) : Promise.resolve({ limits: [] as { kv_type: string; created_at: number; verified_ctx_tokens: number }[] }),
                 api.getProbeAttempts(testId),
               ]);
               const match = limits.limits
                 .filter((l) => l.kv_type === "f16/f16")
                 .sort((a, b) => b.created_at - a.created_at)[0];
-              // The rung the stored ceiling came from, picked by the worker's
-              // own bestLadderResult rather than a hand-rolled copy of it --
-              // the copy that used to live here claimed parity, and would
-              // have drifted the moment the rule started preferring rungs
-              // whose cache placement was judged.
-              const best = bestLadderResult(toLadderAttempts(attemptsRes.attempts));
+              // Both answers, resolved by the same shared/probeLadder.ts
+              // function the worker searched with -- never a hand-rolled copy.
+              const outcome = outcomeFrom(attemptsRes.attempts, mode);
+              const twoTargets = attemptsRes.attempts.some((a) => a.list_devices_free_mib != null);
+              const best = outcome?.clean ?? null;
               const winner = best
                 ? attemptsRes.attempts.find((a) => a.candidate_ctx === best.ctx && a.ngl === best.ngl)
                 : undefined;
-              // A frontier probe measured a boundary per context stop, and
-              // that -- not the single stored ceiling -- is what its card
-              // names and applies. Derived with the same function the run's
-              // own page draws the curve with.
+              // A frontier probe measured both answers at every context stop,
+              // and that -- not the single stored ceiling -- is what its card
+              // names and applies.
               const curve =
                 mode === "frontier"
-                  ? frontierFrom(attemptsRes.attempts)
-                      .filter((s) => s.resolved && s.ngl != null)
-                      .map((s) => ({ ctx: s.ctx, ngl: s.ngl as number }))
+                  ? (outcome?.curve ?? [])
+                      .filter((s) => s.clean.resolved && s.clean.value != null)
+                      .map((s) => ({ ctx: s.ctx, ngl: s.clean.value as number }))
                   : undefined;
-              if (!unmountedRef.current && (match || winner)) {
+              const fitCurve =
+                mode === "frontier" && twoTargets
+                  ? (outcome?.curve ?? [])
+                      .filter((s) => s.fit?.resolved && s.fit.value != null)
+                      .map((s) => ({ ctx: s.ctx, ngl: s.fit!.value as number }))
+                  : undefined;
+              // null (not undefined) means "searched, nothing fit".
+              const fit = twoTargets && mode !== "frontier" ? (outcome?.fit ?? null) : undefined;
+              // The first context the Wizard never settled, when its budget ran out.
+              const unfinishedFrom =
+                mode === "frontier" && outcome?.next != null
+                  ? (outcome.curve?.find((s) => !s.clean.resolved)?.ctx ?? null)
+                  : null;
+              if (!unmountedRef.current && (match || winner || fit !== undefined || (fitCurve && fitCurve.length > 0))) {
                 setVerifyStates((prev) => {
                   const cur = prev[mode];
                   if (!cur || cur.testId !== testId) return prev;
@@ -1189,8 +1200,14 @@ export function Benchmark() {
                     ...prev,
                     [mode]: {
                       ...cur,
-                      verifiedCtxTokens: match?.verified_ctx_tokens,
+                      // This probe's own answer, never another probe's stored row: the
+                      // limits list holds the latest ceiling for the model, which is
+                      // someone else's whenever this probe found none.
+                      verifiedCtxTokens: best?.ctx ?? (status === "verified" ? match?.verified_ctx_tokens : undefined),
+                      unfinishedFrom,
                       curve: curve && curve.length > 0 ? curve : undefined,
+                      fitCurve: fitCurve && fitCurve.length > 0 ? fitCurve : undefined,
+                      fit,
                       measuredNgl: winner?.ngl ?? null,
                       measuredVramPeakMib: winner?.vram_peak_mib ?? null,
                       measuredRamPeakMib: winner?.ram_peak_mib ?? null,
