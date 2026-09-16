@@ -1759,6 +1759,33 @@ export interface ProbeAttemptReport {
   gpu_buffers_mib?: number | null;
   gpu_in_system_ram_mib?: number | null;
   gpu_spill_jitter_mib?: number | null;
+  // What `llama-server --list-devices` reported free on the devices the probe
+  // uses, read once before its first load and repeated on every rung. With
+  // gpu_buffers_mib -- sent whenever llama.cpp printed its buffers, measured
+  // spill or not -- it is the probe's second target: the claim fits when it is
+  // below this. Absent from a worker predating it.
+  list_devices_free_mib?: number | null;
+  // "full" -- loaded, prompted, generated, spill judged. "claim_stop" -- the
+  // claim did not fit free VRAM once the server was ready, so the load stopped
+  // there: no generation and no spill verdict. "error" -- failed for a reason
+  // that is not memory, so it decides nothing about the claim. Absent = "full".
+  load_kind?: "full" | "claim_stop" | "error";
+  // Target 2's verdict recorded at load time, per device where possible (see
+  // shared/probeLadder.ts claimFitsFreeByDevice). Absent from older workers,
+  // whose rows fall back to comparing the totals.
+  claim_fits_free?: boolean | null;
+  // Spill by phase (shared/gpuSpill.ts measurePhasedGpuSpill): the ready hold's
+  // last reading and the prompt+generation's median, each with how far that
+  // phase's once-a-second readings moved. Null where a phase had no reading.
+  spill_ready_mib?: number | null;
+  spill_ready_jitter_mib?: number | null;
+  spill_work_mib?: number | null;
+  spill_work_jitter_mib?: number | null;
+  // The ladder's own bounds (llama.cpp's -ngl ceiling for the model, and its
+  // trained context), repeated on every row so a stored probe can be re-resolved
+  // exactly by shared/probeLadder.ts's probeOutcome.
+  ladder_ngl_max?: number | null;
+  ladder_max_ctx?: number | null;
   // Which spill failed this rung: the layers (no smaller context fixes it) or
   // the context's buffers. Null on a pass or any other failure.
   host_backed_fail?: "layers" | "cache" | null;

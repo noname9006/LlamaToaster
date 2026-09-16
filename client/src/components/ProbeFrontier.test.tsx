@@ -1,39 +1,67 @@
-// Real render against crafted rungs, with the fetch and the canvas mocked.
-// What matters here is that the table says where each number CAME FROM: a
-// stop nobody loaded must not read like a measurement, a stop the budget never
-// reached must not read like a boundary, and a pass whose memory placement was
-// never measured has to carry its warning.
+// Real render against rows the real search produced (shared/probeLadder.ts run
+// against a simulated card), with the fetch and the canvas mocked. What matters
+// here is that the table says where each number came from: an unconfirmed
+// answer must say so, a context the budget never reached must not read like an
+// answer, and the stop once nothing fits must be named.
 
 import { describe, expect, it, vi } from "vitest";
 import { render, screen, within } from "@testing-library/react";
 import type { ProbeAttemptDto } from "../types";
+import { claimFitsFree, nextLadderRung, type LadderAttempt, type LadderRung } from "../../../shared/probeLadder";
 
 const attempts: ProbeAttemptDto[] = [];
 vi.mock("../api/client", () => ({
   api: { getProbeAttempts: vi.fn(async () => ({ attempts })) },
 }));
-// chart.js draws to a canvas jsdom does not implement, and the curve's
-// correctness lives in resolveFrontier (covered in shared/probeLadder.test.ts)
-// rather than in the drawing.
+// chart.js draws to a canvas jsdom does not implement.
 vi.mock("./Chart", () => ({ Chart: () => <div data-testid="chart" /> }));
 
-import { ProbeFrontier } from "./ProbeFrontier";
+import { ProbeFrontier, outcomeFrom } from "./ProbeFrontier";
 
-// Measured and clean by default: llama.cpp's buffers all in VRAM.
-function row(overrides: Partial<ProbeAttemptDto>): ProbeAttemptDto {
+const FREE = 7378;
+const claim = (r: LadderRung) => 280 + 405 * r.ngl + r.ctx * 0.004;
+const clean = (r: LadderRung) => (r.ctx <= 32_768 ? [0, 1, 2, 3, 4, 6].includes(r.ngl) : r.ctx <= 131_072 ? r.ngl <= 2 : false);
+
+function row(r: LadderRung, seq: number, overrides: Partial<ProbeAttemptDto> = {}): ProbeAttemptDto {
+  const c = claim(r);
+  const fits = c < FREE;
+  const ok = fits && clean(r);
   return {
-    id: `a${attempts.length}`, run_id: "r1", worker_id: "w1", model_id: "m1", seq: attempts.length,
-    candidate_ctx: 1024, ngl: 12, ok: 1, oom: 0, spill: 0,
-    vram_needed_mib: 9000, vram_free_mib: 9500, vram_peak_mib: 8800, ram_needed_mib: 2000, ram_free_mib: 20000,
-    ram_peak_mib: 1500, vram_process_peak_mib: 6200, ram_total_peak_mib: 12000, vram_shared_peak_mib: 300,
+    id: `a${seq}`, run_id: "r1", worker_id: "w1", model_id: "m1", seq,
+    candidate_ctx: r.ctx, ngl: r.ngl, ok: ok ? 1 : 0, oom: 0, spill: 0,
+    vram_needed_mib: null, vram_free_mib: 7600, vram_peak_mib: 7000, ram_needed_mib: null, ram_free_mib: 20000,
+    ram_peak_mib: 1500, vram_process_peak_mib: fits ? Math.round(c) : null, ram_total_peak_mib: 12000, vram_shared_peak_mib: 450,
     vram_shared_total_peak_mib: null, vram_claimed_peak_mib: null,
-    gen_tps: 22.5, pp_tps: 400, ttft_ms: 700, prefill_cliff: 0,
+    gen_tps: fits ? 12 - r.ngl * 0.1 : null, pp_tps: fits ? 100 : null, ttft_ms: 700, prefill_cliff: 0,
     host_backed_method: null, host_backed_slope: null, kv_host_backed_frac: null,
-    gpu_buffers_mib: 6190, gpu_in_system_ram_mib: -10, gpu_spill_jitter_mib: 0, host_backed_fail: null,
+    gpu_buffers_mib: c, gpu_in_system_ram_mib: fits ? (ok ? -10 : 150) : null, gpu_spill_jitter_mib: fits ? 2 : null,
+    host_backed_fail: fits && !ok ? "cache" : null, list_devices_free_mib: FREE, claim_fits_free: null,
+    load_kind: fits ? "full" : "claim_stop", spill_ready_mib: null, spill_ready_jitter_mib: null,
+    spill_work_mib: null, spill_work_jitter_mib: null, ladder_ngl_max: 41, ladder_max_ctx: 262_144,
     error: null, created_at: 0, reused_from_run_id: null, vram_discrepancy: 0,
     gpu_layers_resident_est: null, gpu_layers_resident_exact: null,
     ...overrides,
   };
+}
+
+/** Runs the real Wizard search against the simulated card for `loads` loads. */
+function wizardRows(loads: number): ProbeAttemptDto[] {
+  const history: LadderAttempt[] = [];
+  const rows: ProbeAttemptDto[] = [];
+  for (let i = 0; i < loads; i++) {
+    const next = nextLadderRung({
+      mode: "frontier", candidateCtx: 1024, candidateNgl: 10, nglMax: 41, maxCtx: 262_144, maxLoads: loads,
+      history, freeVramMib: FREE, calculateNgl: () => 12,
+    });
+    if (!next) break;
+    const r = row(next, rows.length);
+    rows.push(r);
+    history.push({
+      ...next, ok: r.ok === 1, placementJudged: true, claimedMib: r.gpu_buffers_mib,
+      fitsFree: claimFitsFree({ claimedMib: r.gpu_buffers_mib, freeMib: FREE, loaded: true }),
+    });
+  }
+  return rows;
 }
 
 async function renderCurve(rows: ProbeAttemptDto[]) {
@@ -44,86 +72,64 @@ async function renderCurve(rows: ProbeAttemptDto[]) {
   return { table: within(table), bodyRows };
 }
 
-// A flat curve: 12 layers at the floor and at the ceiling, with every stop
-// between them settled by monotonicity rather than by a load.
-const FLAT = [
-  row({ candidate_ctx: 1024, ngl: 12, ok: 1 }),
-  row({ candidate_ctx: 1024, ngl: 13, ok: 0 }),
-  row({ candidate_ctx: 8192, ngl: 12, ok: 1 }),
-];
-
 describe("ProbeFrontier", () => {
-  it("shows one row per context stop, with the layer count that fits there", async () => {
-    const { bodyRows } = await renderCurve(FLAT);
-    // 1024, 2048, 4096, 8192
-    expect(bodyRows).toHaveLength(4);
-    for (const r of bodyRows) expect(within(r).getByText("12")).toBeInTheDocument();
+  it("shows both answers per context, re-resolved exactly as the search found them", async () => {
+    const { bodyRows } = await renderCurve(wizardRows(200));
+    expect(bodyRows).toHaveLength(9);
+    const cells = (i: number) => within(bodyRows[i]).getAllByRole("cell").map((c) => c.textContent);
+    expect(cells(0)[1]).toMatch(/^6/);
+    expect(cells(0)[2]).toBe("17");
+    expect(cells(6)[1]).toMatch(/^2/);
+    expect(cells(6)[2]).toBe("16");
+    expect(cells(8)[1]).toBe("none");
+    expect(cells(8)[2]).toBe("14");
   });
 
-  it("says which stops were loaded and which were settled without a load", async () => {
-    const { bodyRows } = await renderCurve(FLAT);
-    expect(within(bodyRows[0]).getByText("measured")).toBeInTheDocument();
-    expect(within(bodyRows[1]).getByText("implied")).toBeInTheDocument();
-    expect(within(bodyRows[3]).getByText("measured")).toBeInTheDocument();
+  it("marks a confirmed answer, and the answer the budget left unconfirmed", async () => {
+    const full = await renderCurve(wizardRows(200));
+    expect(within(full.bodyRows[0]).getByTitle(/second time, clean again/)).toBeInTheDocument();
   });
 
-  it("shows measured figures only for stops that were really loaded", async () => {
-    const { bodyRows } = await renderCurve(FLAT);
-    expect(within(bodyRows[0]).getByText("6,200 MiB")).toBeInTheDocument();
-    expect(within(bodyRows[0]).getByText("22.5")).toBeInTheDocument();
-    expect(within(bodyRows[0]).getByText("none")).toBeInTheDocument();
-    // An implied stop has no rung of its own, so it has no measurements.
-    expect(within(bodyRows[1]).queryByText("6,200 MiB")).not.toBeInTheDocument();
+  it("says the probe stopped early and leaves unreached contexts not measured", async () => {
+    const { bodyRows } = await renderCurve(wizardRows(20));
+    expect(screen.getByText(/stopped before the search finished/)).toBeInTheDocument();
+    const last = within(bodyRows[bodyRows.length - 1]);
+    expect(last.getByText("not measured")).toBeInTheDocument();
+    expect(last.getAllByRole("cell")[1].textContent).toBe("—");
   });
 
-  it("captions the rate as an empty-cache figure, never the speed at that context", async () => {
-    await renderCurve(FLAT);
-    expect(screen.getByText(/gen tok\/s \(empty cache\)/)).toBeInTheDocument();
+  it("names the context from which nothing fits", async () => {
+    // Same search, on a card whose KV cache is so expensive nothing fits at 128k.
+    const expensive = (r: LadderRung) => 280 + 405 * r.ngl + r.ctx * 0.1;
+    const history: LadderAttempt[] = [];
+    const rows: ProbeAttemptDto[] = [];
+    for (let i = 0; i < 200; i++) {
+      const next = nextLadderRung({
+        mode: "frontier", candidateCtx: 1024, candidateNgl: 10, nglMax: 41, maxCtx: 262_144, maxLoads: 200,
+        history, freeVramMib: FREE, calculateNgl: () => 12,
+      });
+      if (!next) break;
+      const c = expensive(next);
+      const fits = c < FREE;
+      const r = row(next, rows.length, {
+        gpu_buffers_mib: c, ok: fits && next.ngl <= 2 ? 1 : 0, load_kind: fits ? "full" : "claim_stop", gen_tps: fits ? 10 : null,
+      });
+      rows.push(r);
+      history.push({ ...next, ok: r.ok === 1, placementJudged: true, claimedMib: c, fitsFree: fits });
+    }
+    await renderCurve(rows);
+    expect(screen.getByText(/Nothing fits free VRAM from 131,072 tokens up/)).toBeInTheDocument();
   });
 
-  it("warns when a stop rests on a pass whose placement was never measured", async () => {
-    const { bodyRows } = await renderCurve([
-      row({ candidate_ctx: 1024, ngl: 12, ok: 1, gpu_in_system_ram_mib: null, gpu_buffers_mib: null }),
-      row({ candidate_ctx: 1024, ngl: 13, ok: 0 }),
-      // No measurement: an older worker, or a platform with no per-process VRAM reading.
-      row({ candidate_ctx: 8192, ngl: 12, ok: 1, gpu_in_system_ram_mib: null, gpu_buffers_mib: null }),
-    ]);
-    expect(within(bodyRows[3]).getByTitle(/was never measured on this worker/)).toBeInTheDocument();
-    expect(screen.getByText(/allocation ceilings, not speeds/)).toBeInTheDocument();
+  it("says when a probe was recorded by an earlier version of the context test", async () => {
+    const rows = wizardRows(200).map((r) => ({ ...r, ladder_ngl_max: null, ladder_max_ctx: null }));
+    await renderCurve(rows);
+    expect(screen.getByText(/recorded by an earlier version of the context test/)).toBeInTheDocument();
+    expect(screen.queryByText(/stopped before the search finished/)).not.toBeInTheDocument();
   });
 
-  it("marks a stop the budget never reached as not measured, rather than guessing it", async () => {
-    const { bodyRows } = await renderCurve([
-      row({ candidate_ctx: 1024, ngl: 12, ok: 1 }),
-      row({ candidate_ctx: 1024, ngl: 13, ok: 0 }),
-      row({ candidate_ctx: 8192, ngl: 12, ok: 0, host_backed_fail: "cache" }),
-    ]);
-    const top = bodyRows[3];
-    expect(within(top).getByText("not measured")).toBeInTheDocument();
-    // No layer count either -- "not measured" must never be rendered as a 0 or
-    // as the neighbour's value.
-    expect(within(top).getAllByRole("cell")[1].textContent).toBe("—");
-  });
-
-  // A stop where something loaded but the budget ran out before the boundary
-  // was found knows a FLOOR, not an answer. Printing it as a plain number
-  // would read exactly like a measured boundary.
-  it("shows a layer count the budget never pinned down as a floor, not a boundary", async () => {
-    const { bodyRows } = await renderCurve([
-      row({ candidate_ctx: 1024, ngl: 12, ok: 1 }),
-      row({ candidate_ctx: 1024, ngl: 13, ok: 0 }),
-      row({ candidate_ctx: 4096, ngl: 9, ok: 1 }),
-      row({ candidate_ctx: 8192, ngl: 12, ok: 0, host_backed_fail: "cache" }),
-    ]);
-    const partial = bodyRows[2]; // 4096: 9 loaded, 12 unproven, boundary unknown
-    expect(within(partial).getByText("not measured")).toBeInTheDocument();
-    expect(within(partial).getByText(/≥ 9/)).toBeInTheDocument();
-  });
-
-  it("says outright when nothing fits at a context", async () => {
-    const { bodyRows } = await renderCurve([
-      row({ candidate_ctx: 1024, ngl: 0, ok: 0, oom: 1, gen_tps: null }),
-    ]);
-    expect(within(bodyRows[0]).getByText("none fit")).toBeInTheDocument();
+  it("re-resolves a Targets probe from its first load's pinned axis", () => {
+    const rows = [row({ ctx: 4096, ngl: 6 }, 0)];
+    expect(outcomeFrom(rows, "custom")?.clean).toMatchObject({ ctx: 4096, ngl: 6 });
   });
 });

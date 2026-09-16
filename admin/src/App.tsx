@@ -326,7 +326,7 @@ export default function App() {
               min={1}
               max={200}
               step={1}
-              value={settings?.probeMaxLoads ?? 24}
+              value={settings?.probeMaxLoads ?? 40}
               onChange={(e) => {
                 const parsed = Number.parseInt(e.target.value, 10);
                 if (Number.isFinite(parsed)) void handleSetProbeMaxLoads(parsed);

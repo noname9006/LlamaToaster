@@ -361,6 +361,21 @@ describe("parseGpuBufferReport", () => {
     expect(report.contextMib).toBeCloseTo(24 + 33.01, 2);
   });
 
+  it("splits the claim by device, so each GPU can be held against its own free memory", () => {
+    const report = parseGpuBufferReport(
+      [
+        "load_tensors:      CUDA0 model buffer size =  6000.00 MiB",
+        "load_tensors:      CUDA1 model buffer size =  2000.00 MiB",
+        "llama_kv_cache:    CUDA0 KV buffer size =   100.00 MiB",
+        "llama_kv_cache:    CUDA1 KV buffer size =    50.00 MiB",
+        "sched_reserve:    CUDA0 compute buffer size =   300.00 MiB",
+        "sched_reserve:    CUDA0 compute buffer size =   320.00 MiB",
+      ].join("\n")
+    )!;
+    expect(report.byDeviceMib).toEqual({ CUDA0: 6420, CUDA1: 2050 });
+    expect(report.deviceMib).toBeCloseTo(8470, 2);
+  });
+
   // Qwen3.6-35B-A3B at 1,024 tokens and 15 layers, which the calibration run
   // measured at 6462.03MiB of GPU buffers.
   it("counts a hybrid model's recurrent state on the GPU, but not as context", () => {

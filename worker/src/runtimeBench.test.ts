@@ -6,6 +6,7 @@ import {
   executeKneeLadder,
   probeSucceeded,
   failedForHostBackedLayers,
+  pickDedupPoint,
   toProbeAttemptReport,
   spawnRuntimeServer,
   streamedCompletion,
@@ -823,5 +824,23 @@ describe("toProbeAttemptReport", () => {
     expect("pp_tps" in report).toBe(true);
     expect(report.pp_tps).toBeNull();
     expect(report.gpu_in_system_ram_mib).toBeNull();
+  });
+});
+
+describe("pickDedupPoint", () => {
+  const sibling = [
+    { candidate_ctx: 1024, ngl: 6, seq: 7 },
+    { candidate_ctx: 1024, ngl: 7, seq: 3 },
+    { candidate_ctx: 1024, ngl: 6, seq: 11 },
+  ];
+
+  it("reuses the sibling's n-th load of a point for this probe's n-th load", () => {
+    expect(pickDedupPoint(sibling, 1024, 6, 0)?.seq).toBe(7);
+    expect(pickDedupPoint(sibling, 1024, 6, 1)?.seq).toBe(11);
+  });
+
+  it("never offers one reading twice, so a control stays a real second load", () => {
+    expect(pickDedupPoint(sibling, 1024, 7, 1)).toBeUndefined();
+    expect(pickDedupPoint(sibling, 2048, 6, 0)).toBeUndefined();
   });
 });

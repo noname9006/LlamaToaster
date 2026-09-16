@@ -30,8 +30,8 @@ import {
   executeCurvePoint,
   executeKneeLadder,
   probeSucceeded,
-  failedForHostBackedLayers,
   toProbeAttemptReport,
+  pickDedupPoint,
   toBenchResult,
   PROBE_GEN_TOKENS,
   PROBE_PROMPT_TOKENS,
@@ -40,16 +40,21 @@ import {
   type ProbeAttemptOutcome,
 } from "./runtimeBench.js";
 import {
-  bestLadderEvidence,
+  claimFitsFree,
+  claimFitsFreeByDevice,
+  isProbeMode,
   nextLadderRung,
+  probeOutcome,
   PROBE_LADDER_MIN_CTX,
   PROBE_MAX_LOADS,
   type LadderAttempt,
 } from "../../shared/probeLadder.js";
 import { DEFAULT_KNEE_SLOTS } from "./loadDriver.js";
 import { fetchFillerBlocks } from "./fillerPrompt.js";
-import { supportsFlag } from "./binary-probe.js";
+import { supportsFlag, readListDevices, usedListedDevices } from "./binary-probe.js";
 import { MemorySampler, captureFreeMemoryBaseline, type SampleStats, type FreeMemoryBaseline } from "./sampler.js";
+import { MemoryTrace } from "./memoryTrace.js";
+import { measurePhasedGpuSpill } from "../../shared/gpuSpill.js";
 import { readGpuMemory, readNvidiaDriverInfo, type NvidiaDriverInfo } from "./vram.js";
 import {
   estimateResidentGpuLayers,
@@ -57,7 +62,6 @@ import {
   estimateResidentGpuLayersFromBufferSizes,
   estimateVramNeededMib,
   estimateSafeNgl,
-  maxAffordableContext,
   isVramDiscrepancy,
   computeDualPoolFit,
   type TensorLayerBreakdown,
@@ -3105,9 +3109,14 @@ function describeProbePeak(attempt: ProbeAttemptOutcome): string {
       ? `; llama.cpp put ${fmt(buffers)} on the GPU, VRAM held ${fmt(buffers - inRam)} ` +
         `(${inRam >= 0 ? "+" : ""}${Math.round(inRam)}MiB not in VRAM, readings moved ${fmt(attempt.gpuSpillJitterMib ?? 0)})`
       : "; spill not measured";
+  const free = attempt.listDevicesFreeMib;
+  const claim =
+    buffers != null && free != null
+      ? `; claim ${fmt(buffers)} ${buffers < free ? "fits" : "does not fit"} the ${fmt(free)} --list-devices reports free`
+      : "";
   return (
     `peak: ${fmt(attempt.vramProcessPeakMib)} in VRAM + ${fmt(attempt.vramSharedPeakMib)} system-RAM-backed, ` +
-    `this process; ${fmt(attempt.vramPeakMib)} across the whole adapter${spill}`
+    `this process; ${fmt(attempt.vramPeakMib)} across the whole adapter${spill}${claim}`
   );
 }
 
@@ -3156,11 +3165,18 @@ async function executeRunProbeJob(payload: TestProbeJobPayload): Promise<void> {
   // of resolvedBuild.server_path through the loadThisRung closure below.
   const serverPath = resolvedBuild.server_path;
 
+  // The removed modes (max_gpu, max_context, balanced) and a payload with no
+  // mode at all are refused outright rather than run as something else: a
+  // queued job from before the removal should fail saying why.
+  if (!isProbeMode(payload.mode)) {
+    throw new Error(
+      `unsupported context test mode "${payload.mode ?? "(none)"}" -- this worker runs frontier, keep_context, fixed_offload and custom`
+    );
+  }
+  const mode = payload.mode;
   const label = `probe ${payload.run_id}`;
   setRunLogFile(runLogFilePath(payload.run_id));
   const attempts: ProbeAttemptOutcome[] = [];
-  const mode = payload.mode ?? "max_context";
-  const granularity = payload.granularity ?? "basic";
   // Fresh per-run, same reasoning as the sweep job's own reset above: a
   // fallback confirmed persistent in an EARLIER run (sweep or probe -- this
   // flag is shared across job types on this worker) must not pre-fail this
@@ -3177,8 +3193,8 @@ async function executeRunProbeJob(payload: TestProbeJobPayload): Promise<void> {
   if (dedupPoints.length > 0) {
     log.info(`${label}: ${dedupPoints.length} point(s) already measured by an earlier batch sibling`);
   }
-  function findDedupMatch(ctx: number, ngl: number): ProbeDedupPoint | undefined {
-    return dedupPoints.find((p) => p.candidate_ctx === ctx && p.ngl === ngl);
+  function findDedupMatch(ctx: number, ngl: number, loadsHere: number): ProbeDedupPoint | undefined {
+    return pickDedupPoint(dedupPoints, ctx, ngl, loadsHere);
   }
   // The ladder never probes above what the model was trained for. With no
   // trained_ctx in the header there is no honest ceiling to search toward, so
@@ -3196,78 +3212,47 @@ async function executeRunProbeJob(payload: TestProbeJobPayload): Promise<void> {
   // this whole probe starts is a stable enough basis for it.
   const preflight = await captureFreeMemoryBaseline(payload.llama_cpp_backend).catch(() => null);
   const freeVramMib = preflight?.vram_free_before_mib ?? payload.gpu_total_mib ?? 0;
+  // The second target's line: what this llama.cpp build itself reports free on
+  // the devices the loads will use. Read ONCE, before any load, so every rung is
+  // judged against the same threshold -- a figure re-read between loads would
+  // move the boundary the search is bisecting. Measured stable across 24
+  // back-to-back loads on the RX 6600 XT, so once loses nothing. Null (no
+  // --list-devices, or nothing listed) leaves the probe on its spill target alone.
+  // Kept per device too: a load fits only if every device it uses has room, so an
+  // integrated GPU's large shared "free" cannot hide a full discrete card.
+  const usedDevices = usedListedDevices(await readListDevices(serverPath).catch(() => []), payload.main_gpu);
+  const listDevicesFreeMib = usedDevices.length > 0 ? usedDevices.reduce((sum, d) => sum + d.freeMib, 0) : null;
+  const freeByDevice = usedDevices.length > 0 ? Object.fromEntries(usedDevices.map((d) => [d.name, d.freeMib])) : null;
 
-  // estimateSafeNgl's own math sizes weights only (no KV cache), so it does
-  // not vary with the pinned context -- pinnedCtx exists only so this has the
-  // same shape as calculateCtx below, which genuinely does depend on ngl.
+  // Only ever the first load's layer count (probeOutcome's opener), never a
+  // verdict. estimateSafeNgl sizes weights only, so it does not vary with context.
   function calculateNgl(): number {
     return estimateSafeNgl(payload.model.size_bytes, nglMax, freeVramMib, payload.model.metadata.tensor_layer_bytes ?? null);
   }
 
-  function calculateCtx(pinnedNgl: number): number {
-    const meta = payload.model.metadata;
-    const nLayer = meta.n_layer;
-    if (nLayer == null || nLayer <= 0 || meta.n_head_kv == null) return maxCtx;
-    const weightsMib =
-      estimateVramNeededMib({
-        modelSizeBytes: payload.model.size_bytes,
-        totalModelLayers: nLayer + 1,
-        requestedNgl: pinnedNgl,
-        nCpuMoe: payload.placement.nCpuMoe,
-        tensorBreakdown: meta.tensor_layer_bytes ?? null,
-      }) ?? 0;
-    const affordable = maxAffordableContext({
-      totalMib: freeVramMib,
-      weightsMib,
-      nLayer,
-      nHeadKv: meta.n_head_kv,
-      headDimK: meta.head_dim_k,
-      headDimV: meta.head_dim_v,
-      nEmbd: meta.n_embd,
-      nHead: meta.n_head,
-      cacheTypeK: payload.kvPair[0],
-      cacheTypeV: payload.kvPair[1],
-      slidingWindow: meta.sliding_window,
-      slidingWindowPattern: meta.sliding_window_pattern,
-      sharedKvLayers: meta.shared_kv_layers,
-      parallelSlots: payload.placement.slots,
-      // freeVramMib is ALREADY the free budget -- maxAffordableContext's own
-      // 10% headroom is calibrated against callers passing TOTAL vram, and
-      // stacking it here would double-apply headroom silently.
-      activationsHeadroomFrac: 0,
-      trainedCtx: payload.trained_ctx ?? undefined,
-    });
-    if (affordable.tokens > 0) return affordable.tokens;
-    // A REAL zero (the estimator had the KV geometry and still says the
-    // weights leave no room) must not fall back to the trained ceiling: that
-    // inverts "nothing fits here" into "everything fits here", which seeds a
-    // context phase at the top of the ladder and, worse, makes that ngl look
-    // like the best possible choice to bestNglForMaxContext. The floor is the
-    // honest anchor -- the ladder walks up from it on its own if the estimate
-    // was too pessimistic. Only a "unknown" verdict (no per-token geometry to
-    // reason with at all) keeps the old caller's-ceiling fallback, matching
-    // the missing-metadata guard at the top of this function.
-    return affordable.confidence === "unknown" ? maxCtx : PROBE_LADDER_MIN_CTX;
-  }
-
   const ladderInput = {
     mode,
-    granularity,
     candidateCtx: payload.candidateCtx,
     candidateNgl: payload.placement.ngl,
     nglMax,
     maxCtx,
     calculateNgl,
-    calculateCtx,
     // Live admin-configurable cap (see the module-level probeMaxLoads doc
     // comment above) rather than the ladder module's own PROBE_MAX_LOADS
     // default -- an operator's override on the supervise dashboard must
     // actually take effect here, not just be advertised.
     maxLoads: probeMaxLoads,
+    freeVramMib: listDevicesFreeMib,
   };
   log.info(
-    `${label}: ${mode} / ${granularity} ladder -- context within [${PROBE_LADDER_MIN_CTX}, ${maxCtx}], ` +
+    `${label}: ${mode} ladder -- context within [${PROBE_LADDER_MIN_CTX}, ${maxCtx}], ` +
       `layers within [0, ${nglMax}], at most ${probeMaxLoads} loads`
+  );
+  log.info(
+    listDevicesFreeMib != null
+      ? `${label}: targets -- no spill, and llama.cpp's GPU claim below what --list-devices reports free on ` +
+        usedDevices.map((d) => `${d.name} (${d.freeMib}MiB)`).join(", ")
+      : `${label}: --list-devices reported no free VRAM figure -- searching the no-spill target only`
   );
 
   let stoppedMidLadder = false;
@@ -3291,7 +3276,8 @@ async function executeRunProbeJob(payload: TestProbeJobPayload): Promise<void> {
       // rediscover the same answer. Still feeds nextLadderRung's bisection
       // (attempts.push below) and still gets a live tick, just with no real
       // load in between.
-      const dedupMatch = findDedupMatch(rung.ctx, rung.ngl);
+      const loadsHere = attempts.filter((a) => a.candidateCtx === rung.ctx && a.ngl === rung.ngl).length;
+      const dedupMatch = findDedupMatch(rung.ctx, rung.ngl, loadsHere);
       if (dedupMatch) {
         log.info(
           `${label}: candidate ${rung.ctx}/${rung.ngl} reused from batch sibling ${dedupMatch.source_run_id} -- not reloaded`
@@ -3328,6 +3314,16 @@ async function executeRunProbeJob(payload: TestProbeJobPayload): Promise<void> {
           vramDiscrepancy: dedupMatch.vram_discrepancy,
           gpuLayersResidentEst: dedupMatch.gpu_layers_resident_est,
           gpuLayersResidentExact: dedupMatch.gpu_layers_resident_exact,
+          // The sibling's claim, judged against THIS probe's threshold.
+          listDevicesFreeMib,
+          claimFitsFree: dedupMatch.claim_fits_free ?? undefined,
+          loadKind: dedupMatch.load_kind ?? "full",
+          spillReadyMib: dedupMatch.spill_ready_mib,
+          spillReadyJitterMib: dedupMatch.spill_ready_jitter_mib,
+          spillWorkMib: dedupMatch.spill_work_mib,
+          spillWorkJitterMib: dedupMatch.spill_work_jitter_mib,
+          ladderNglMax: nglMax,
+          ladderMaxCtx: maxCtx,
         };
         attempts.push(reusedAttempt);
         sendProbeAttemptTick(payload.run_id, attempts.length - 1, toProbeAttemptReport(reusedAttempt));
@@ -3345,9 +3341,12 @@ async function executeRunProbeJob(payload: TestProbeJobPayload): Promise<void> {
       // effort/fire-and-forget, same as every other sendTick call: a probe
       // routinely runs 5-10+ loads over several minutes, and losing one tick
       // just means the card's live text lags until the next candidate's.
+      const isControl = attempts.some((a) => a.candidateCtx === rung.ctx && a.ngl === rung.ngl);
       sendTick(payload.run_id, 0, {
         status: "benchmarking",
-        detail: `probe load ${attempts.length + 1}: ctx ${rung.ctx.toLocaleString()} / ${rung.ngl} layers`,
+        detail:
+          `probe load ${attempts.length + 1} of up to ${probeMaxLoads}: ctx ${rung.ctx.toLocaleString()} / ${rung.ngl} layers` +
+          (isControl ? " (control)" : ""),
       });
       const loadThisRung = () =>
         runOneProbeLoad({
@@ -3358,6 +3357,10 @@ async function executeRunProbeJob(payload: TestProbeJobPayload): Promise<void> {
           ngl: rung.ngl,
           estimate,
           label,
+          listDevicesFreeMib,
+          freeByDevice,
+          ladderNglMax: nglMax,
+          ladderMaxCtx: maxCtx,
           // Best prefill rate from a rung that was NOT host-backed. Taking it
           // from any rung would let a rung already over the cliff set the
           // reference and hide every later one.
@@ -3408,15 +3411,39 @@ async function executeRunProbeJob(payload: TestProbeJobPayload): Promise<void> {
       }
     }
 
-    const evidence = bestLadderEvidence(attempts.map(toLadderAttempt));
-    const best = evidence?.attempt ?? null;
-    // Labelled, not silently promoted: when this probe never judged the winning
-    // rung's cache placement (no smaller-context reference, or no shared-memory
-    // counter on this platform), "it loaded" must not read as "it fits".
-    if (evidence && !evidence.judged) {
+    const outcome = probeOutcome({ ...ladderInput, history: attempts.map(toLadderAttempt) });
+    const best = outcome.clean;
+    // The stored ceiling stays target 1 (no spill) -- it is what every other
+    // consumer of verified limits means by "fits". Target 2 and the Wizard's
+    // curve live on the rows themselves and are derived where they are shown.
+    for (const stop of outcome.curve ?? []) {
+      const fmt = (v: number | null, resolved: boolean) => (!resolved ? "not measured" : v == null ? "none" : `${v} layers`);
+      log.info(
+        `${label}: ${stop.ctx} tokens -- no spill ${fmt(stop.clean.value, stop.clean.resolved)}` +
+          (stop.clean.control === "confirmed" ? " (control confirmed)" : stop.clean.control === "pending" ? " (control not run)" : "") +
+          (stop.fit ? `; claim fits free VRAM ${fmt(stop.fit.value, stop.fit.resolved)}` : "")
+      );
+    }
+    if (!outcome.curve) {
+      log.info(
+        `${label}: no spill -- ${best ? `${best.ctx}/${best.ngl} (control ${best.control})` : "none"}` +
+          (listDevicesFreeMib != null
+            ? `; claim below ${listDevicesFreeMib}MiB free -- ${outcome.fit ? `${outcome.fit.ctx}/${outcome.fit.ngl}` : "none"}`
+            : "")
+      );
+    }
+    if (outcome.nothingFitsFrom != null) {
+      log.info(`${label}: nothing fits free VRAM from ${outcome.nothingFitsFrom} tokens up -- stopped there`);
+    }
+    if (outcome.next != null) {
+      log.warn(`${label}: the load budget (${probeMaxLoads}) ran out before the search finished -- unfinished answers are reported as not measured`);
+    }
+    // Labelled, not silently promoted: a verdict whose placement was never
+    // measured means "it loaded", not "it stayed in VRAM".
+    if (best && !best.judged) {
       log.warn(
-        `${label}: verdict ${evidence.attempt.ctx}/${evidence.attempt.ngl} rests on a load whose cache placement ` +
-          `was never judged -- it loaded, but its cache may be in system RAM`
+        `${label}: verdict ${best.ctx}/${best.ngl} rests on a load whose placement was never measured -- ` +
+          `it loaded, but part of it may be in system RAM`
       );
     }
     // Reported EXACTLY as loaded, both axes. This used to snap the context
@@ -3432,6 +3459,7 @@ async function executeRunProbeJob(payload: TestProbeJobPayload): Promise<void> {
     // requested at, and a ceiling filed under the requested placement is a
     // ceiling attributed to a placement that was never verified.
     const bestAttempt = best ? attempts.find((a) => a.candidateCtx === best.ctx && a.ngl === best.ngl) : undefined;
+    const budgetNote = outcome.next != null ? ` -- the ${probeMaxLoads}-load budget ran out before the search finished` : "";
     const report: ProbeResultInput = best != null
       ? {
           status: "verified",
@@ -3472,8 +3500,7 @@ async function executeRunProbeJob(payload: TestProbeJobPayload): Promise<void> {
               method_version: METHOD_VERSION,
               attempts: attempts.map(toProbeAttemptReport),
               error:
-                attempts[attempts.length - 1]?.error ??
-                "no candidate context loaded and generated above the usable floor",
+                (attempts[attempts.length - 1]?.error ?? "no placement loaded without spilling into system RAM") + budgetNote,
             };
     await withAuth((token) => postProbeResult(config.url, token, payload.run_id, report));
     log.info(
@@ -3496,17 +3523,24 @@ function toLadderAttempt(attempt: ProbeAttemptOutcome): LadderAttempt {
     ctx: attempt.candidateCtx,
     ngl: attempt.ngl ?? 0,
     ok: attempt.ok,
-    // WHY it failed, not just that it did: a host-backed placement cannot be
-    // rescued by a smaller context, so the ladder stops walking that axis
-    // immediately instead of re-proving it at every stop down to the floor.
-    // Not just `!ok && vramDiscrepancy` -- a rung that generated nothing can
-    // carry an INFERRED discrepancy too, and that is no proof the layers moved.
-    hostBacked: failedForHostBackedLayers(attempt),
     // Whether this rung's memory placement was actually measured. A pass
     // without it means "it loaded" and nothing about where the memory went, so
     // neither the frontier nor the reported verdict lets it stand in for one
     // that was.
     placementJudged: attempt.gpuInSystemRamMib != null,
+    claimedMib: attempt.gpuBuffersMib ?? null,
+    inconclusive: attempt.loadKind === "error",
+    // The per-device verdict recorded at load time wins; otherwise the totals. A
+    // load that generated nothing either never allocated or died doing it --
+    // unless it was stopped on purpose once its claim was known.
+    fitsFree:
+      attempt.claimFitsFree !== undefined
+        ? attempt.claimFitsFree
+        : claimFitsFree({
+            claimedMib: attempt.gpuBuffersMib,
+            freeMib: attempt.listDevicesFreeMib,
+            loaded: attempt.genTps != null || attempt.loadKind === "claim_stop",
+          }),
   };
 }
 
@@ -3525,11 +3559,27 @@ interface ProbeLoadInput {
    * host-backed check left alone -- the reference the prefill cliff is judged
    * against. Null until one exists. */
   bestCleanPpTps?: number | null;
+  /** The probe's --list-devices free reading, carried onto every rung. */
+  listDevicesFreeMib: number | null;
+  /** The same reading per device name, for the per-device claim verdict. */
+  freeByDevice: Record<string, number> | null;
+  /** The ladder's own bounds, carried onto every row so a stored probe can be
+   * re-resolved exactly (shared/probeLadder.ts's probeOutcome). */
+  ladderNglMax: number;
+  ladderMaxCtx: number;
 }
+
+// How long a load sits idle after the server reports ready, before any request:
+// long enough for about three once-a-second readings of where its memory landed
+// with nothing yet touching it (shared/gpuSpill.ts's measurePhasedGpuSpill).
+const PROBE_READY_HOLD_MS = 3500;
+// After the last token, long enough for the reading covering it to arrive.
+const PROBE_TRAILING_READING_MS = 1200;
 
 async function runOneProbeLoad(input: ProbeLoadInput): Promise<ProbeAttemptOutcome> {
   const { payload, candidateCtx, ngl, estimate } = input;
   const sampler = new MemorySampler();
+  const trace = new MemoryTrace();
   // Taken BEFORE the spawn, same as every sweep path: "free" has to mean
   // free-before-this-load, not free-while-the-model-is-resident.
   const baseline = await captureFreeMemoryBaseline(payload.llama_cpp_backend).catch(() => null);
@@ -3539,6 +3589,9 @@ async function runOneProbeLoad(input: ProbeLoadInput): Promise<ProbeAttemptOutco
     ramNeededMib: estimate?.ramMib ?? null,
     vramFreeMib: baseline?.vram_free_before_mib ?? null,
     ramFreeMib: baseline?.ram_free_before_mib ?? null,
+    listDevicesFreeMib: input.listDevicesFreeMib,
+    ladderNglMax: input.ladderNglMax,
+    ladderMaxCtx: input.ladderMaxCtx,
   };
   const item = {
     idx: 0,
@@ -3573,11 +3626,53 @@ async function runOneProbeLoad(input: ProbeLoadInput): Promise<ProbeAttemptOutco
       onSpawn: (proc) => {
         activeBenchProc = proc;
         sampler.start(proc.pid, payload.llama_cpp_backend, TICK_INTERVAL_MS);
+        trace.start(proc.pid, payload.llama_cpp_backend);
       },
     });
     // Ready means loaded: every buffer llama.cpp allocates for this load exists
     // from here on, so dedicated readings can be held against its buffer report.
     sampler.markLoaded();
+    const readyAtMs = Date.now();
+
+    // Target 2 is decided the moment the claim is known. A claim not below the
+    // free VRAM can be neither answer, so the load stops here: no prompt, no
+    // generation, no spill to judge.
+    const claimAtReady = parseGpuBufferReport(server.stderr());
+    const fitsAtReady =
+      claimAtReady == null
+        ? null
+        : (claimFitsFreeByDevice(claimAtReady.byDeviceMib, input.freeByDevice) ??
+          claimFitsFree({ claimedMib: claimAtReady.deviceMib, freeMib: input.listDevicesFreeMib, loaded: true }));
+    if (claimAtReady != null && fitsAtReady === false) {
+      const stats = sampler.stop();
+      trace.stop();
+      return {
+        candidateCtx,
+        ok: false,
+        oom: false,
+        spill: false,
+        vramPeakMib: stats.vram_peak_mib,
+        ramPeakMib: stats.ram_peak_mib,
+        vramProcessPeakMib: stats.vram_process_peak_mib,
+        ramTotalPeakMib: stats.ram_total_peak_mib,
+        vramSharedPeakMib: stats.vram_process_shared_peak_mib,
+        vramSharedTotalPeakMib: stats.vram_total_shared_peak_mib,
+        vramClaimedPeakMib: stats.vram_process_claimed_peak_mib,
+        genTps: null,
+        ...memoryFields,
+        loadKind: "claim_stop",
+        claimFitsFree: false,
+        gpuBuffersMib: claimAtReady.deviceMib,
+        error:
+          `llama.cpp's GPU claim (${Object.entries(claimAtReady.byDeviceMib)
+            .map(([device, mib]) => `${device} ${Math.round(mib)}MiB`)
+            .join(", ")}) does not fit what --list-devices reported free (${Object.entries(input.freeByDevice ?? {})
+            .map(([device, mib]) => `${device} ${Math.round(mib)}MiB`)
+            .join(", ")}) -- stopped without generating`,
+      };
+    }
+    await sleep(PROBE_READY_HOLD_MS);
+    const workFromMs = Date.now();
     // Retries a rejected generation on a rotated prompt, and falls back to a
     // grammar-constrained attempt, rather than letting one parser failure mark
     // the whole ladder fatal (see completeWithRetries).
@@ -3614,14 +3709,35 @@ async function runOneProbeLoad(input: ProbeLoadInput): Promise<ProbeAttemptOutco
         ? (sample.promptN / sample.promptMs) * 1000
         : null;
     const ttftMs = Number.isFinite(sample.ttftMs) ? sample.ttftMs : null;
+    const workToMs = Date.now();
     // Two readings taken now, whatever the tick cadence managed during a short
-    // load: the measured spill needs at least one after markLoaded, and a
-    // second shows how far the counter itself moves.
+    // load: the fallback spill (no trace readings) needs at least one after
+    // markLoaded, and a second shows how far the counter itself moves.
     await sampler.sampleVramNow();
     await sampler.sampleVramNow();
     const stats = sampler.stop();
+    const sinceWork = Date.now() - workToMs;
+    if (sinceWork < PROBE_TRAILING_READING_MS) await sleep(PROBE_TRAILING_READING_MS - sinceWork);
+    const readings = trace.stop();
     const serverOutput = server?.stderr() ?? "";
     const gpuBuffers = parseGpuBufferReport(serverOutput);
+    const phased = measurePhasedGpuSpill({
+      buffers: gpuBuffers,
+      readings,
+      ready: { fromMs: readyAtMs, toMs: workFromMs },
+      work: { fromMs: workFromMs, toMs: workToMs },
+      atSmallestContext: candidateCtx <= PROBE_LADDER_MIN_CTX,
+    });
+    // Every reading, in the run's log: what the phases were judged on.
+    if (readings.length > 0) {
+      const phaseOf = (at: number) => (at <= readyAtMs ? "load" : at <= workFromMs + 1000 ? "ready" : at <= workToMs + 1000 ? "work" : "after");
+      log.info(
+        `${input.label}: dedicated VRAM once a second (${Math.round(gpuBuffers?.deviceMib ?? 0)}MiB claimed): ` +
+          readings
+            .map((r) => `${phaseOf(r.atMs)} ${r.dedicatedMib != null ? Math.round(r.dedicatedMib) : "?"}`)
+            .join(", ")
+      );
+    }
     const verdict = probeSucceeded({
       oom: false,
       vramPeakMib: stats.vram_peak_mib,
@@ -3634,6 +3750,9 @@ async function runOneProbeLoad(input: ProbeLoadInput): Promise<ProbeAttemptOutco
       loadedDedicatedMib: stats.vram_process_loaded_peak_mib,
       loadedDedicatedJitterMib: stats.vram_process_loaded_jitter_mib,
       atSmallestContext: candidateCtx <= PROBE_LADDER_MIN_CTX,
+      // The per-phase verdict decides wherever the trace produced readings; the
+      // single loaded-peak figure above is only the fallback.
+      gpuSpillOverride: phased.measured ? phased : undefined,
     });
     const headroomFrac =
       stats.vram_peak_mib != null && payload.gpu_total_mib != null && payload.gpu_total_mib > 0
@@ -3676,15 +3795,24 @@ async function runOneProbeLoad(input: ProbeLoadInput): Promise<ProbeAttemptOutco
       ...memoryFields,
       error: verdict.reason ?? undefined,
       vramDiscrepancy: verdict.vramDiscrepancy,
-      gpuBuffersMib: verdict.gpuSpill.measured ? (gpuBuffers?.deviceMib ?? null) : null,
+      // Kept whether or not the spill could be measured: it is also the claim
+      // target 2 holds against --list-devices, which needs no VRAM counter.
+      gpuBuffersMib: gpuBuffers?.deviceMib ?? null,
       gpuInSystemRamMib: verdict.gpuSpill.inSystemRamMib,
       gpuSpillJitterMib: verdict.gpuSpill.jitterMib,
       hostBackedFailCause: verdict.failCause,
       gpuLayersResidentEst: resident.layers,
       gpuLayersResidentExact: resident.exact,
+      loadKind: "full",
+      claimFitsFree: fitsAtReady,
+      spillReadyMib: phased.readyPhase.inSystemRamMib,
+      spillReadyJitterMib: phased.readyPhase.jitterMib,
+      spillWorkMib: phased.workPhase.inSystemRamMib,
+      spillWorkJitterMib: phased.workPhase.jitterMib,
     };
   } catch (err) {
     const stats = sampler.stop();
+    trace.stop();
     const message = err instanceof Error ? err.message : String(err);
     // llama-server accepted the request and generated *something* -- this
     // isn't a load/capacity failure at all, and no other (ctx, ngl) rung will
@@ -3712,6 +3840,7 @@ async function runOneProbeLoad(input: ProbeLoadInput): Promise<ProbeAttemptOutco
         ...memoryFields,
         error: message,
         fatal: true,
+        loadKind: "error",
         // llama-server's own error text, unrewritten -- `error` above may
         // have been replaced with a friendlier sentence that no longer
         // quotes it directly, so this is where the raw diagnostic survives
@@ -3744,9 +3873,13 @@ async function runOneProbeLoad(input: ProbeLoadInput): Promise<ProbeAttemptOutco
       genTps: null,
       ...memoryFields,
       error: message,
+      // Out of memory is a memory verdict: it did not fit. Anything else (a
+      // readiness timeout, a crash, a failed request) says nothing about memory.
+      loadKind: oom ? "full" : "error",
       stderrTail: !oom ? probeStderrTail(stderrText) || undefined : undefined,
     };
   } finally {
+    trace.stop();
     activeBenchProc = null;
     await server?.stop();
   }

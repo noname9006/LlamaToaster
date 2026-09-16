@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { measureGpuSpill, UNMEASURED_GPU_SPILL } from "./gpuSpill.js";
+import { measureGpuSpill, measurePhasedGpuSpill, UNMEASURED_GPU_SPILL } from "./gpuSpill.js";
 
 // Real loads, 2026-09-14: Qwen3.6-35B-A3B-UD-IQ4_NL on a Radeon RX 6600 XT
 // (8176MiB), Vulkan, llama.cpp b10956. deviceMib and contextMib are sums of
@@ -72,5 +72,52 @@ describe("measureGpuSpill", () => {
     ["nothing placed on a GPU", { buffers: { deviceMib: 0, contextMib: 0 }, dedicatedMib: 0, dedicatedJitterMib: 0 }],
   ])("is unmeasured, never clean, with %s", (_label, input) => {
     expect(measureGpuSpill(input)).toEqual(UNMEASURED_GPU_SPILL);
+  });
+});
+
+describe("measurePhasedGpuSpill", () => {
+  const buffers = { deviceMib: 2408, contextMib: 263 };
+  const at = (atMs: number, dedicatedMib: number | null) => ({ atMs, dedicatedMib });
+  const ready = { fromMs: 1000, toMs: 4500 };
+  const work = { fromMs: 4500, toMs: 30_000 };
+
+  it("judges the hold on its last reading, so memory still paging in right after load is not a spill", () => {
+    const readings = [at(2000, 2100), at(3000, 2300), at(4000, 2420), ...[6000, 12_000, 20_000, 29_000].map((t) => at(t, 2421))];
+    const v = measurePhasedGpuSpill({ buffers, readings, ready, work });
+    expect(v.readyPhase).toMatchObject({ measured: true, spilled: false });
+    expect(v).toMatchObject({ measured: true, spilled: false });
+  });
+
+  it("catches memory moved to system RAM only once the model is used", () => {
+    const readings = [at(2000, 2420), at(3000, 2421), at(4000, 2420), ...[6000, 12_000, 20_000, 29_000].map((t) => at(t, 2249))];
+    const v = measurePhasedGpuSpill({ buffers, readings, ready, work });
+    expect(v.readyPhase.spilled).toBe(false);
+    expect(v.workPhase).toMatchObject({ spilled: true, inSystemRamMib: 159 });
+    expect(v).toMatchObject({ spilled: true, inSystemRamMib: 159 });
+  });
+
+  it("judges work on the median, so one reading mid-reshuffle cannot decide it", () => {
+    const readings = [at(4000, 2420), at(6000, 2420), at(8000, 2200), at(10_000, 2420), at(12_000, 2421)];
+    const v = measurePhasedGpuSpill({ buffers, readings, ready, work });
+    // The dip widens the tolerance instead of deciding the verdict.
+    expect(v.workPhase).toMatchObject({ spilled: false, jitterMib: 221 });
+  });
+
+  it("never counts a reading taken after the first request toward the ready hold", () => {
+    // The only hold reading lands 500ms into the prompt: it belongs to work only.
+    const readings = [at(5000, 2249)];
+    const v = measurePhasedGpuSpill({ buffers, readings, ready, work });
+    expect(v.readyPhase.measured).toBe(false);
+    expect(v.workPhase).toMatchObject({ measured: true, inSystemRamMib: 159 });
+  });
+
+  it("counts a reading that lands up to a second after the work window", () => {
+    const readings = [at(30_900, 2249)];
+    expect(measurePhasedGpuSpill({ buffers, readings, ready: null, work }).workPhase.measured).toBe(true);
+  });
+
+  it("is unmeasured with no readings in either phase", () => {
+    const v = measurePhasedGpuSpill({ buffers, readings: [at(500, 2400)], ready, work });
+    expect(v).toMatchObject({ measured: false, spilled: false });
   });
 });

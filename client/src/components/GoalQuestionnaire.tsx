@@ -35,11 +35,9 @@ import {
 } from "../vramEstimate";
 import {
   computeCtxStops,
-  PROBE_GRANULARITIES,
   PROBE_LADDER_MIN_CTX,
   PROBE_MAX_LOADS,
   snapToSafeCtx,
-  type ProbeGranularity,
   type ProbeMode,
 } from "../../../shared/probeLadder";
 
@@ -120,11 +118,7 @@ export interface GoalQuestionnaireProps {
      * FINISH: every selected mode's own card starts polling independently
      * as soon as its trigger POST resolves, while the worker_jobs FIFO queue
      * serializes actual execution on the worker. */
-    onRunModes: (
-      modes: ProbeMode[],
-      modeStarts: Record<ProbeMode, { ngl: number; ctx: number }>,
-      granularity: ProbeGranularity
-    ) => Promise<void>;
+    onRunModes: (modes: ProbeMode[], modeStarts: Record<ProbeMode, { ngl: number; ctx: number }>) => Promise<void>;
     /** Selected modes NOT yet fired -- runModes holds every mode but the
      * first back until that first one's own result is known (a
      * failed_unsupported outcome is model/build-wide, so the rest would just
@@ -182,7 +176,21 @@ export interface PlacementVerifyResult {
    * aiming at.
    */
   curve?: { ctx: number; ngl: number }[];
+  /**
+   * The second target -- the most offload whose llama.cpp GPU claim stayed
+   * below the free VRAM --list-devices reported: one placement for Targets,
+   * a curve for the Wizard. Absent when the probe had no such reading. The
+   * fields above are the first target (no spill).
+   */
+  fit?: { ctx: number; ngl: number } | null;
+  fitCurve?: { ctx: number; ngl: number }[];
+  /** The Wizard's load budget ran out before this context was settled; the
+   * curves above end below it. Null or absent when the search finished. */
+  unfinishedFrom?: number | null;
 }
+
+/** Which of a probe's two answers to put on the sliders. */
+export type ApplyTarget = "clean" | "fit";
 
 const GOAL_CHOICES: { value: GoalKind; label: string }[] = [
   { value: "balanced", label: "Balanced" },
@@ -237,9 +245,25 @@ function appliedConfig(
   result: PlacementVerifyResult | null,
   start: { ngl: number; ctx: number },
   trainedCtx: number | null,
-  targetCtx?: number
+  targetCtx?: number,
+  target: ApplyTarget = "clean"
 ): { ngl: number; ctx: number } {
-  if (result?.status !== "verified") return start;
+  if (!result) return start;
+  // Target 2 can exist on a probe that found no no-spill answer and ended
+  // "failed"; target 1 only ever comes from a verified one.
+  if (target === "fit" && result.status !== "verified" && result.status !== "failed" && result.status !== "failed_oom") return start;
+  if (target === "clean" && result.status !== "verified") return start;
+  if (target === "fit") {
+    const fitCurve = result.fitCurve;
+    if (fitCurve && fitCurve.length > 0) {
+      const wanted = targetCtx ?? start.ctx;
+      const atOrBelow = fitCurve.filter((p) => p.ctx <= wanted);
+      const point = atOrBelow.length > 0 ? atOrBelow[atOrBelow.length - 1] : fitCurve[0];
+      return { ngl: point.ngl, ctx: point.ctx };
+    }
+    if (result.fit) return { ngl: result.fit.ngl, ctx: snapToSafeCtx(result.fit.ctx, trainedCtx ?? result.fit.ctx) };
+    return start;
+  }
   // A curve has no single answer to apply, so it answers the question the user
   // has already asked with the context slider: the measured point at the
   // largest context they are still willing to accept. Applying the curve's own
@@ -267,23 +291,6 @@ function describeCurve(curve: { ctx: number; ngl: number }[]): string {
   if (curve.length === 1 || first.ngl === last.ngl) return `${first.ngl} layers @ ${short(first.ctx)}–${short(last.ctx)}`;
   return `${first.ngl} layers @ ${short(first.ctx)} → ${last.ngl} @ ${short(last.ctx)}`;
 }
-
-const GRANULARITY_LABEL: Record<ProbeGranularity, string> = {
-  basic: "Basic",
-  fine: "Fine tune",
-};
-
-const GRANULARITY_BLURB: Record<ProbeGranularity, string> = {
-  basic: "Converges on a value within about 1/16th of the search range.",
-  fine: "Converges four times tighter — more precise, more loads.",
-};
-
-// The Wizard's frontier search has no finer grid to converge onto: its answer
-// is one layer boundary per context stop, and layers are already whole
-// numbers. So this control only changes what Targets does, and says so rather
-// than sitting there looking effective.
-const GRANULARITY_INERT_NOTE =
-  "Applies to Targets. The Wizard measures a layer boundary at each context stop, which has no finer setting.";
 
 // The context-target slider stops now live in shared/probeLadder.ts, so the
 // slider and the probe cannot disagree about what a legal context is --
@@ -795,7 +802,6 @@ function PlacementMatrix({
   affordability: GoalQuestionnaireProps["affordability"];
   onApplyConfig: (ngl: number, ctx: number) => void;
 }) {
-  const [granularity, setGranularity] = useState<ProbeGranularity>("basic");
   // Two scenarios, not six modes: Wizard is nothing pinned (the frontier
   // search, see WIZARD_MODE); Targets pins context, offload, or both onto
   // whichever underlying ProbeMode answers that combination. Selecting a
@@ -814,10 +820,6 @@ function PlacementMatrix({
 
   const targetsMode: ProbeMode =
     targetsPin === "both" ? "custom" : targetsPin === "ngl" ? "fixed_offload" : "keep_context";
-  // Granularity is a Targets-only setting (see GRANULARITY_INERT_NOTE), so it
-  // goes quiet when the Wizard is the only thing selected. Still live when
-  // nothing is selected: the choice is about the run the user is building.
-  const granularityInert = wizardSelected && !targetsSelected;
   const selectedScenarioCount = (wizardSelected ? 1 : 0) + (targetsSelected ? 1 : 0);
   const targetsFamilyBusy = TARGETS_FAMILY_MODES.some(
     (m) => placement.verifyResults[m]?.status === "pending" || placement.heldModes.has(m)
@@ -900,7 +902,7 @@ function PlacementMatrix({
     if (modes.length === 0) return;
     setRunning(true);
     try {
-      await placement.onRunModes(modes, modeStarts, granularity);
+      await placement.onRunModes(modes, modeStarts);
     } finally {
       setRunning(false);
     }
@@ -1001,32 +1003,6 @@ function PlacementMatrix({
             </small>
           </span>
           <div className="flex items-center gap-2">
-            <div
-              className={`inline-flex overflow-hidden rounded-lg border border-border ${granularityInert ? "opacity-40" : ""}`}
-              role="radiogroup"
-              aria-label="Test granularity"
-              aria-disabled={granularityInert}
-              title={granularityInert ? GRANULARITY_INERT_NOTE : undefined}
-            >
-              {PROBE_GRANULARITIES.map((value) => (
-                <button
-                  key={value}
-                  type="button"
-                  role="radio"
-                  aria-checked={granularity === value}
-                  disabled={granularityInert}
-                  title={granularityInert ? GRANULARITY_INERT_NOTE : GRANULARITY_BLURB[value]}
-                  onClick={() => setGranularity(value)}
-                  className={
-                    granularity === value
-                      ? "bg-accent px-2.5 py-1 text-[11px] font-semibold text-accent-fg"
-                      : "bg-surface px-2.5 py-1 text-[11px] text-muted hover:text-fg"
-                  }
-                >
-                  {GRANULARITY_LABEL[value]}
-                </button>
-              ))}
-            </div>
             <button
               type="button"
               title="Selects both cards -- click again to clear the selection. Run test still has to be clicked to actually fire them"
@@ -1050,7 +1026,10 @@ function PlacementMatrix({
             </button>
           </div>
         </div>
-        <p className="mt-1.5 text-[11px] leading-relaxed text-muted">{GRANULARITY_BLURB[granularity]}</p>
+        <p className="mt-1.5 text-[11px] leading-relaxed text-muted">
+          Every test finds two answers: the most layers whose GPU memory all stays in VRAM (no spill), and the most whose
+          llama.cpp claim fits the free VRAM llama-server reports. Each no-spill answer is loaded a second time to confirm it.
+        </p>
 
         {Object.values(placement.verifyResults).some((r) => r?.status === "failed_unsupported") && (
           <p className="mt-1.5 rounded-lg border border-danger/40 bg-danger/10 px-2.5 py-1.5 text-[11px] font-semibold leading-relaxed text-danger">
@@ -1085,10 +1064,14 @@ function PlacementMatrix({
             // `fine` probe verifies values between two stops, which the
             // slider cannot express); down, never up, so applying never
             // claims a context that wasn't loaded.
-            const applyFrom = (result: PlacementVerifyResult | null, start: { ngl: number; ctx: number }) => {
+            const applyFrom = (
+              result: PlacementVerifyResult | null,
+              start: { ngl: number; ctx: number },
+              target: ApplyTarget = "clean"
+            ) => {
               // ctx is the user's own context target -- what a curve result is
               // read against (see appliedConfig).
-              const applied = appliedConfig(result, start, trainedCtx, ctx);
+              const applied = appliedConfig(result, start, trainedCtx, ctx, target);
               onApplyConfig(applied.ngl, applied.ctx);
             };
             return (
@@ -1107,6 +1090,7 @@ function PlacementMatrix({
                     setWizardSelected((v) => !v);
                     applyFrom(wizardResult, wizardStart);
                   }}
+                  onApplyTarget={(target) => applyFrom(wizardResult, wizardStart, target)}
                   onReset={() => placement.onReset(WIZARD_MODE)}
                 />
                 <ModeCard
@@ -1134,6 +1118,7 @@ function PlacementMatrix({
                     setTargetsSelected((v) => !v);
                     applyFrom(targetsResult, targetsStart);
                   }}
+                  onApplyTarget={(target) => applyFrom(targetsResult, targetsStart, target)}
                   onReset={() => placement.onReset(targetsMode)}
                 />
               </>
@@ -1142,8 +1127,8 @@ function PlacementMatrix({
         </div>
 
         <p className="mt-2 text-[11px] leading-relaxed text-muted">
-          Testing really loads the model on this machine — up to {PROBE_MAX_LOADS} loads, narrowing in on the boundary
-          rather than walking to it. Results land on the run’s own page, and every load is kept.
+          Testing really loads the model on this machine — up to {PROBE_MAX_LOADS} loads, often 30–60 minutes for the
+          Wizard. Results land on the run’s own page, and every load is kept.
         </p>
       </div>
     </div>
@@ -1212,6 +1197,7 @@ function ModeCard({
   held,
   result,
   onActivate,
+  onApplyTarget,
   onReset,
 }: {
   /** Which underlying search this card's result/reset/start actually refer
@@ -1233,6 +1219,8 @@ function ModeCard({
   held: boolean;
   result: PlacementVerifyResult | null;
   onActivate: () => void;
+  /** Applies one of a two-target result's answers without toggling selection. */
+  onApplyTarget: (target: ApplyTarget) => void;
   onReset: () => void;
 }) {
   const running = result?.status === "pending";
@@ -1295,7 +1283,18 @@ function ModeCard({
             {result?.liveDetail ?? (result?.runStatus === "scheduled" ? "queued, waiting its turn…" : "starting…")}
           </span>
         )}
-        {result?.status === "verified" && (
+        {(result?.status === "verified" || failedCapacity) && result && (result.fit !== undefined || result.fitCurve) && (
+          <TwoTargetResult result={result} onApply={onApplyTarget} />
+        )}
+        {result?.unfinishedFrom != null && (
+          <span
+            className="block font-mono text-[10.5px] text-warning"
+            title="The load budget ran out before the search reached this context. Raise the probe load budget in admin settings to map the rest."
+          >
+            budget ran out at {formatTokens(result.unfinishedFrom)}
+          </span>
+        )}
+        {result?.status === "verified" && result.fit === undefined && !result.fitCurve && (
           <span className="block font-mono text-[11px] font-semibold text-success">
             {result.curve && result.curve.length > 0 ? (
               <span title="The layer split measured at each context. Clicking this card applies the point at your current context target.">
@@ -1309,7 +1308,9 @@ function ModeCard({
             )}
           </span>
         )}
-        {failedCapacity && <span className="block font-mono text-[11px] font-semibold text-danger">✗ didn’t fit</span>}
+        {failedCapacity && result?.fit === undefined && !result?.fitCurve && (
+          <span className="block font-mono text-[11px] font-semibold text-danger">✗ didn’t fit</span>
+        )}
         {/* The section-level warning banner above already carries the full
             message once -- repeating it per card is redundant. This just
             matches failedCapacity's own terse label; the "Test ↗" link
@@ -1339,6 +1340,57 @@ function ModeCard({
         )}
       </div>
     </div>
+  );
+}
+
+// A two-target result: both answers, each its own apply button. Clicking the
+// card itself still applies the no-spill answer, as it always has.
+function TwoTargetResult({
+  result,
+  onApply,
+}: {
+  result: PlacementVerifyResult;
+  onApply: (target: ApplyTarget) => void;
+}) {
+  const short = (v: number) => (v >= 1024 && v % 1024 === 0 ? `${v / 1024}k` : v.toLocaleString());
+  const single = (p: { ctx: number; ngl: number }) => `${p.ngl} layers @ ${short(p.ctx)}`;
+  const clean =
+    result.curve && result.curve.length > 0
+      ? describeCurve(result.curve)
+      : result.verifiedCtxTokens != null && result.measuredNgl != null
+        ? single({ ctx: result.verifiedCtxTokens, ngl: result.measuredNgl })
+        : null;
+  const fit = result.fitCurve && result.fitCurve.length > 0 ? describeCurve(result.fitCurve) : result.fit ? single(result.fit) : null;
+  const row = (target: ApplyTarget, label: string, text: string | null, title: string) => (
+    <button
+      type="button"
+      disabled={text == null}
+      title={text == null ? undefined : title}
+      onClick={(e) => {
+        e.stopPropagation();
+        onApply(target);
+      }}
+      className="block w-full truncate rounded text-left font-mono text-[10.5px] font-semibold text-success hover:underline disabled:cursor-default disabled:text-muted disabled:no-underline"
+    >
+      {text == null ? `✗ ${label}: none` : `✓ ${label}: ${text}`}
+    </button>
+  );
+  return (
+    <>
+      {row(
+        "clean",
+        "no spill",
+        clean,
+        "Apply the most offload whose GPU memory all stayed in VRAM" + (result.curve ? ", at your context target." : ".")
+      )}
+      {row(
+        "fit",
+        "fits VRAM",
+        fit,
+        "Apply the most offload whose llama.cpp GPU claim stayed below the free VRAM --list-devices reported" +
+          (result.fitCurve ? ", at your context target." : ".")
+      )}
+    </>
   );
 }
 

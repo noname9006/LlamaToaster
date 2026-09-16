@@ -112,19 +112,89 @@ describe("GoalQuestionnaire's Tested-configurations section", () => {
     });
   });
 
-  // Granularity changes how finely a Targets search converges. The Wizard's
-  // frontier has no finer setting -- one boundary per context stop, and layers
-  // are whole numbers -- so the control must not look effective when the
-  // Wizard is the only thing selected.
-  it("goes quiet about granularity when only the Wizard is selected", () => {
+  // A probe with a --list-devices reading answers twice: the most offload with
+  // no spill, and the most offload whose llama.cpp claim fits free VRAM. The
+  // card names both and lets the user pick which one goes on the sliders.
+  describe("a card holding both targets", () => {
+    const wizardResult = {
+      ngl: 41,
+      ctx: 1024,
+      testId: "t-two",
+      status: "verified" as const,
+      mode: "frontier" as const,
+      verifiedCtxTokens: 131_072,
+      measuredNgl: 2,
+      curve: [
+        { ctx: 1024, ngl: 6 },
+        { ctx: 131_072, ngl: 2 },
+      ],
+      fitCurve: [
+        { ctx: 1024, ngl: 17 },
+        { ctx: 262_144, ngl: 14 },
+      ],
+    };
+
+    it("names both answers", () => {
+      const placement = basePlacement();
+      placement.verifyResults = { frontier: wizardResult };
+      renderWithPlacement({ placement });
+      expect(screen.getByText(/no spill: 6 layers @ 1k → 2 @ 128k/)).toBeInTheDocument();
+      expect(screen.getByText(/fits VRAM: 17 layers @ 1k → 14 @ 256k/)).toBeInTheDocument();
+    });
+
+    it("applies the chosen answer without selecting the card", () => {
+      const placement = basePlacement();
+      placement.verifyResults = { frontier: wizardResult };
+      renderWithPlacement({ placement });
+      fireEvent.click(screen.getByText(/fits VRAM:/));
+      const appliedNgl = (placement.onNglChange as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[0];
+      expect(wizardResult.fitCurve.map((p) => p.ngl)).toContain(appliedNgl);
+      expect(screen.getByRole("button", { name: /^Wizard/ })).toHaveAttribute("aria-pressed", "false");
+
+      fireEvent.click(screen.getByText(/no spill:/));
+      const cleanNgl = (placement.onNglChange as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[0];
+      expect(wizardResult.curve.map((p) => p.ngl)).toContain(cleanNgl);
+    });
+
+    it("shows target 2 on a Targets probe that found no no-spill answer, instead of a bare 'didn't fit'", () => {
+      const placement = basePlacement();
+      placement.verifyResults = {
+        keep_context: { ngl: 11, ctx: 262_144, testId: "t-f", status: "failed", measuredNgl: null, fit: { ctx: 262_144, ngl: 11 } },
+      };
+      renderWithPlacement({ placement });
+      expect(screen.getByText("✓ fits VRAM: 11 layers @ 256k")).toBeInTheDocument();
+      expect(screen.getByText("✗ no spill: none")).toBeInTheDocument();
+      expect(screen.queryByText("✗ didn’t fit")).not.toBeInTheDocument();
+      fireEvent.click(screen.getByText(/fits VRAM:/));
+      expect((placement.onNglChange as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[0]).toBe(11);
+    });
+
+    it("says where the Wizard's budget ran out", () => {
+      const placement = basePlacement();
+      placement.verifyResults = { frontier: { ...wizardResult, unfinishedFrom: 262_144 } };
+      renderWithPlacement({ placement });
+      expect(screen.getByText(/budget ran out at 262 k/)).toBeInTheDocument();
+    });
+
+    it("names both answers on a Targets card as single placements", () => {
+      const placement = basePlacement();
+      placement.verifyResults = {
+        keep_context: {
+          ngl: 17, ctx: 1024, testId: "t-k", status: "verified", verifiedCtxTokens: 1024, measuredNgl: 6,
+          fit: { ctx: 1024, ngl: 17 },
+        },
+      };
+      renderWithPlacement({ placement });
+      expect(screen.getByText("✓ no spill: 6 layers @ 1k")).toBeInTheDocument();
+      expect(screen.getByText("✓ fits VRAM: 17 layers @ 1k")).toBeInTheDocument();
+    });
+  });
+
+  // The fine setting is gone: the search has no finer grid any more.
+  it("offers no granularity choice", () => {
     renderWithPlacement();
-    const [basic] = screen.getAllByRole("radio", { name: "Basic" });
-    expect(basic).not.toBeDisabled();
-    fireEvent.click(screen.getByRole("button", { name: /^Wizard/ }));
-    expect(screen.getAllByRole("radio", { name: "Basic" })[0]).toBeDisabled();
-    // Selecting Targets as well brings it back: it applies to that search.
-    fireEvent.click(screen.getByRole("button", { name: /^Targets/ }));
-    expect(screen.getAllByRole("radio", { name: "Basic" })[0]).not.toBeDisabled();
+    expect(screen.queryByRole("radiogroup", { name: "Test granularity" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("radio", { name: "Fine tune" })).not.toBeInTheDocument();
   });
 
   it("labels the Wizard card with its real dispatch mode for assistive tech", () => {

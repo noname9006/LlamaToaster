@@ -420,26 +420,26 @@ describe("admin settings (AppSettings toggles)", () => {
     expect(res.status).toBe(400);
   });
 
-  it("probeMaxLoads defaults to 24 and persists an accepted override", async () => {
+  it("probeMaxLoads defaults to 40 and persists an accepted override", async () => {
     const adminToken = await superadminSession();
     const headers = { "content-type": "application/json", ...withHost(ADMIN_HOST, { authorization: `Bearer ${adminToken}` }) };
 
     const res1 = await fetch(`${baseUrl}/api/admin/settings`, { headers: withHost(ADMIN_HOST, { authorization: `Bearer ${adminToken}` }) });
     expect(res1.status).toBe(200);
     // Fresh DB -- the documented default.
-    expect(((await res1.json()) as { probeMaxLoads?: number }).probeMaxLoads ?? 24).toBe(24);
+    expect(((await res1.json()) as { probeMaxLoads?: number }).probeMaxLoads ?? 40).toBe(40);
 
     const res2 = await fetch(`${baseUrl}/api/admin/settings`, {
       method: "POST",
       headers,
-      body: JSON.stringify({ probeMaxLoads: 40 }),
+      body: JSON.stringify({ probeMaxLoads: 32 }),
     });
     expect(res2.status).toBe(200);
     const body2 = (await res2.json()) as { probeMaxLoads: number };
-    expect(body2.probeMaxLoads).toBe(40);
+    expect(body2.probeMaxLoads).toBe(32);
 
     // Restore the default for later tests in this file/process.
-    await fetch(`${baseUrl}/api/admin/settings`, { method: "POST", headers, body: JSON.stringify({ probeMaxLoads: 24 }) });
+    await fetch(`${baseUrl}/api/admin/settings`, { method: "POST", headers, body: JSON.stringify({ probeMaxLoads: 40 }) });
   });
 
   it("400s a probeMaxLoads value outside [1, 200] instead of storing it", async () => {
