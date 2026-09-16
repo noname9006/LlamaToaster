@@ -768,7 +768,7 @@ function deriveModelId(input: RegisterModelInput): string {
 // appSettingsRepo.get()'s default when no admin override has ever been
 // stored -- see that repo method's own comment for why this is a literal
 // rather than an import from shared/probeLadder.ts's own PROBE_MAX_LOADS.
-const DEFAULT_PROBE_MAX_LOADS = 24;
+const DEFAULT_PROBE_MAX_LOADS = 40;
 
 // The k-anonymity floor communityRepo's aggregates are subject to: the
 // minimum number of DISTINCT opted-in contributors a group must combine
@@ -3431,8 +3431,9 @@ export const repo = {
               reused_from_run_id, vram_discrepancy, gpu_layers_resident_est, gpu_layers_resident_exact,
               pp_tps, ttft_ms, prefill_cliff, host_backed_method, host_backed_slope, kv_host_backed_frac,
               vram_shared_total_peak_mib, vram_claimed_peak_mib, gpu_buffers_mib, gpu_in_system_ram_mib,
-              gpu_spill_jitter_mib, host_backed_fail)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+              gpu_spill_jitter_mib, host_backed_fail, list_devices_free_mib, load_kind, spill_ready_mib,
+              spill_ready_jitter_mib, spill_work_mib, spill_work_jitter_mib, ladder_ngl_max, ladder_max_ctx, claim_fits_free)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         );
         input.attempts.forEach((a, seq) => {
           insert.run(
@@ -3473,7 +3474,16 @@ export const repo = {
             a.gpu_buffers_mib ?? null,
             a.gpu_in_system_ram_mib ?? null,
             a.gpu_spill_jitter_mib ?? null,
-            a.host_backed_fail ?? null
+            a.host_backed_fail ?? null,
+            a.list_devices_free_mib ?? null,
+            a.load_kind ?? null,
+            a.spill_ready_mib ?? null,
+            a.spill_ready_jitter_mib ?? null,
+            a.spill_work_mib ?? null,
+            a.spill_work_jitter_mib ?? null,
+            a.ladder_ngl_max ?? null,
+            a.ladder_max_ctx ?? null,
+            a.claim_fits_free == null ? null : a.claim_fits_free ? 1 : 0
           );
         });
       });
@@ -3513,8 +3523,9 @@ export const repo = {
               reused_from_run_id, vram_discrepancy, gpu_layers_resident_est, gpu_layers_resident_exact,
               pp_tps, ttft_ms, prefill_cliff, host_backed_method, host_backed_slope, kv_host_backed_frac,
               vram_shared_total_peak_mib, vram_claimed_peak_mib, gpu_buffers_mib, gpu_in_system_ram_mib,
-              gpu_spill_jitter_mib, host_backed_fail)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              gpu_spill_jitter_mib, host_backed_fail, list_devices_free_mib, load_kind, spill_ready_mib,
+              spill_ready_jitter_mib, spill_work_mib, spill_work_jitter_mib, ladder_ngl_max, ladder_max_ctx, claim_fits_free)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(run_id, seq) DO UPDATE SET
              candidate_ctx = excluded.candidate_ctx,
              ngl = excluded.ngl,
@@ -3548,7 +3559,16 @@ export const repo = {
              gpu_buffers_mib = excluded.gpu_buffers_mib,
              gpu_in_system_ram_mib = excluded.gpu_in_system_ram_mib,
              gpu_spill_jitter_mib = excluded.gpu_spill_jitter_mib,
-             host_backed_fail = excluded.host_backed_fail`
+             host_backed_fail = excluded.host_backed_fail,
+             list_devices_free_mib = excluded.list_devices_free_mib,
+             load_kind = excluded.load_kind,
+             spill_ready_mib = excluded.spill_ready_mib,
+             spill_ready_jitter_mib = excluded.spill_ready_jitter_mib,
+             spill_work_mib = excluded.spill_work_mib,
+             spill_work_jitter_mib = excluded.spill_work_jitter_mib,
+             ladder_ngl_max = excluded.ladder_ngl_max,
+             ladder_max_ctx = excluded.ladder_max_ctx,
+             claim_fits_free = excluded.claim_fits_free`
         )
         .run(
           uuid(),
@@ -3588,7 +3608,16 @@ export const repo = {
           a.gpu_buffers_mib ?? null,
           a.gpu_in_system_ram_mib ?? null,
           a.gpu_spill_jitter_mib ?? null,
-          a.host_backed_fail ?? null
+          a.host_backed_fail ?? null,
+          a.list_devices_free_mib ?? null,
+          a.load_kind ?? null,
+          a.spill_ready_mib ?? null,
+          a.spill_ready_jitter_mib ?? null,
+          a.spill_work_mib ?? null,
+          a.spill_work_jitter_mib ?? null,
+          a.ladder_ngl_max ?? null,
+          a.ladder_max_ctx ?? null,
+          a.claim_fits_free == null ? null : a.claim_fits_free ? 1 : 0
         );
     },
   },
@@ -3820,6 +3849,15 @@ export interface ProbeAttemptRow {
   gpu_in_system_ram_mib: number | null;
   gpu_spill_jitter_mib: number | null;
   host_backed_fail: string | null;
+  list_devices_free_mib: number | null;
+  load_kind: string | null;
+  spill_ready_mib: number | null;
+  spill_ready_jitter_mib: number | null;
+  spill_work_mib: number | null;
+  spill_work_jitter_mib: number | null;
+  ladder_ngl_max: number | null;
+  ladder_max_ctx: number | null;
+  claim_fits_free: number | null;
 }
 
 // N4 storage shapes.

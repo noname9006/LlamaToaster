@@ -68,6 +68,24 @@ function migrate(database: Database.Database): void {
   createHfGgufIndexSha256Index(database);
   createHfGgufIndexDeletedAtIndex(database);
   createV8Indexes(database);
+  raiseStoredProbeMaxLoads(database);
+}
+
+// The context test's default load budget went from 24 to 40 when controls and
+// the per-context no-spill search arrived. appSettingsRepo only falls back to
+// the default when nothing is stored, so an install whose admin ever saved the
+// setting still holds the old 24 and would silently keep cutting every Wizard
+// probe short. Raised once, and only from exactly 24: a deliberate 24 cannot be
+// told apart from the old default, which is why this logs what it did.
+function raiseStoredProbeMaxLoads(database: Database.Database): void {
+  const done = database.prepare(`SELECT value FROM meta WHERE key = 'probe_max_loads_v2_raised'`).get();
+  if (done) return;
+  const stored = database.prepare(`SELECT value FROM meta WHERE key = 'probe_max_loads'`).get() as { value: string } | undefined;
+  if (stored?.value === "24") {
+    database.prepare(`UPDATE meta SET value = '40' WHERE key = 'probe_max_loads'`).run();
+    log.warn("[migrate] probe_max_loads was the old default 24 -- raised to 40 for context tests v2");
+  }
+  database.prepare(`INSERT INTO meta (key, value) VALUES ('probe_max_loads_v2_raised', '1')`).run();
 }
 
 interface ColumnSpec {
@@ -375,6 +393,21 @@ const COLUMN_MIGRATIONS: ColumnSpec[] = [
   { table: "probe_attempts", column: "gpu_in_system_ram_mib", ddlType: "REAL" },
   { table: "probe_attempts", column: "gpu_spill_jitter_mib", ddlType: "REAL" },
   { table: "probe_attempts", column: "host_backed_fail", ddlType: "TEXT" },
+  // The probe's second target: what --list-devices reported free, held against
+  // gpu_buffers_mib. See shared/types.ts's ProbeAttemptReport. NULL on every
+  // rung reported before this migration.
+  { table: "probe_attempts", column: "list_devices_free_mib", ddlType: "REAL" },
+  // Context tests v2 (docs/CONTEXT_TEST_REDESIGN.md §10): loads stopped once
+  // their claim was known, spill per phase, and the ladder's own bounds. See
+  // shared/types.ts's ProbeAttemptReport. NULL on every earlier row.
+  { table: "probe_attempts", column: "load_kind", ddlType: "TEXT" },
+  { table: "probe_attempts", column: "spill_ready_mib", ddlType: "REAL" },
+  { table: "probe_attempts", column: "spill_ready_jitter_mib", ddlType: "REAL" },
+  { table: "probe_attempts", column: "spill_work_mib", ddlType: "REAL" },
+  { table: "probe_attempts", column: "spill_work_jitter_mib", ddlType: "REAL" },
+  { table: "probe_attempts", column: "ladder_ngl_max", ddlType: "INTEGER" },
+  { table: "probe_attempts", column: "ladder_max_ctx", ddlType: "INTEGER" },
+  { table: "probe_attempts", column: "claim_fits_free", ddlType: "INTEGER" },
 ];
 
 function applyColumnMigrations(database: Database.Database): void {

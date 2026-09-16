@@ -1,0 +1,898 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Spill Tax</title>
+<style>
+  :root{
+    --bg:#faf8f5; --surface:#ffffff; --surface-2:#f2ede4; --border:#e3dccd;
+    --ink:#211d17; --ink-soft:#4a4437; --muted:#847b69;
+    --accent:#a8461f; --accent-soft:#f2e2d6;
+    --good:#0b6b5c; --bad:#a8341f;
+    /* ngl is an ORDERED quantity with many levels, so it gets a sequential
+       ramp rather than categorical hues: low layer counts light, high layer
+       counts deep. Interpolated in OKLab between these two ends. */
+    --ramp-lo:#c8842a; --ramp-hi:#4a1220;
+    --mono:'IBM Plex Mono',ui-monospace,'SFMono-Regular',Consolas,monospace;
+    --serif:'Fraunces',Georgia,'Times New Roman',serif;
+    --sans:'Source Sans 3','Source Sans Pro',system-ui,-apple-system,sans-serif;
+  }
+  @media (prefers-color-scheme: dark){
+    :root:not([data-theme="light"]){
+      --bg:#17140f; --surface:#1e1a14; --surface-2:#241f18; --border:#3a3226;
+      --ink:#ece5d8; --ink-soft:#c9bfad; --muted:#948a76;
+      --accent:#e2793f; --accent-soft:#33241a;
+      --good:#3ecbb4; --bad:#e2793f;
+      /* Same ramp, re-stepped for a dark ground: the direction of LIGHTNESS
+         inverts so the high end stays the prominent one on black. */
+      --ramp-lo:#b86a28; --ramp-hi:#ffd98c;
+    }
+  }
+  :root[data-theme="dark"]{
+    --bg:#17140f; --surface:#1e1a14; --surface-2:#241f18; --border:#3a3226;
+    --ink:#ece5d8; --ink-soft:#c9bfad; --muted:#948a76;
+    --accent:#e2793f; --accent-soft:#33241a;
+    --good:#3ecbb4; --bad:#e2793f;
+    --ramp-lo:#b86a28; --ramp-hi:#ffd98c;
+  }
+
+  *{box-sizing:border-box}
+  body{
+    margin:0; background:var(--bg); color:var(--ink); font-family:var(--sans);
+    font-size:16px; line-height:1.6; padding-inline:20px; padding-block:0;
+  }
+  .wrap{max-width:960px; margin:0 auto;}
+  .prose{max-width:68ch;}
+  h1,h2,h3{font-family:var(--serif); text-wrap:balance; color:var(--ink); font-weight:600; margin:0;}
+  h1{font-size:clamp(1.9rem,4vw,2.7rem); font-weight:640; letter-spacing:-0.01em;}
+  h2{font-size:1.5rem; margin-top:3rem; padding-top:1.25rem; border-top:1px solid var(--border);}
+  h3{font-size:1.1rem; margin-top:1.75rem; color:var(--ink-soft);}
+  p{margin:0.9em 0;}
+  a{color:var(--accent)}
+  .eyebrow{
+    font-family:var(--mono); font-size:0.72rem; letter-spacing:0.14em; text-transform:uppercase;
+    color:var(--accent); margin:0 0 0.6rem;
+  }
+  .dek{color:var(--ink-soft); font-size:1.08rem; max-width:62ch;}
+  .num{font-variant-numeric:tabular-nums; font-family:var(--mono);}
+
+  header.doc{padding-block:3rem 1.5rem;}
+  .specs{
+    display:grid; grid-template-columns:repeat(auto-fit,minmax(130px,1fr)); gap:1px;
+    background:var(--border); border:1px solid var(--border); border-radius:10px; overflow:hidden;
+    margin-top:1.75rem;
+  }
+  .spec{background:var(--surface); padding:0.7rem 0.9rem;}
+  .spec .k{font-family:var(--mono); font-size:0.68rem; letter-spacing:0.06em; text-transform:uppercase; color:var(--muted); display:block;}
+  .spec .v{font-family:var(--mono); font-size:0.95rem; color:var(--ink); margin-top:0.2rem;}
+
+  section{padding-bottom:0.5rem;}
+
+  .callout{
+    background:var(--surface-2); border:1px solid var(--border); border-left:3px solid var(--accent);
+    border-radius:0 8px 8px 0; padding:1rem 1.2rem; margin:1.4rem 0; max-width:68ch;
+  }
+  .callout p{margin:0.5em 0;}
+  .callout.warn{border-left-color:var(--bad);}
+
+  table{border-collapse:collapse; width:100%; font-size:0.85rem;}
+  .tablewrap{overflow-x:auto; border:1px solid var(--border); border-radius:10px; margin:1.4rem 0;}
+  thead th{
+    text-align:right; font-family:var(--mono); font-size:0.65rem; letter-spacing:0.05em; text-transform:uppercase;
+    color:var(--muted); background:var(--surface-2); padding:0.6rem 0.65rem; white-space:nowrap;
+    border-bottom:1px solid var(--border); position:sticky; top:0;
+  }
+  thead th:first-child, thead th:nth-child(2){text-align:left;}
+  thead th button{
+    all:unset; cursor:pointer; display:inline-flex; align-items:center; gap:0.3em;
+    font:inherit; letter-spacing:inherit; text-transform:inherit; color:inherit;
+    border-radius:4px; padding:0.1rem 0.15rem; margin:-0.1rem -0.15rem;
+  }
+  thead th button:hover{color:var(--ink);}
+  thead th button:focus-visible{outline:2px solid var(--accent); outline-offset:2px;}
+  thead th[aria-sort="ascending"] button, thead th[aria-sort="descending"] button{color:var(--ink); font-weight:600;}
+  thead th .sort-ind{display:inline-block; min-width:0.8em; font-size:0.85em; color:var(--accent);}
+  .sort-hint{font-size:0.8rem; color:var(--muted); margin:1.4rem 0 -0.8rem;}
+  tbody td{padding:0.5rem 0.65rem; text-align:right; font-family:var(--mono); white-space:nowrap; border-bottom:1px solid var(--border); color:var(--ink-soft);}
+  tbody td:first-child, tbody td:nth-child(2){text-align:left; color:var(--ink);}
+  tbody tr:last-child td{border-bottom:none;}
+  tbody tr:hover td{background:var(--surface-2);}
+  .tag{
+    display:inline-block; font-family:var(--mono); font-size:0.66rem; letter-spacing:0.03em;
+    padding:0.1rem 0.4rem; border-radius:5px; font-weight:600;
+  }
+  .tag.spill{background:color-mix(in srgb, var(--bad) 16%, transparent); color:var(--bad);}
+  .tag.spill-small{background:color-mix(in srgb, var(--accent) 16%, transparent); color:var(--accent);}
+  .tag.clean{background:color-mix(in srgb, var(--good) 16%, transparent); color:var(--good);}
+  .dot{display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:0.4em; vertical-align:1px;}
+
+  .chart-card{
+    background:var(--surface); border:1px solid var(--border); border-radius:12px;
+    padding:1.2rem 1.2rem 0.8rem; margin:1.6rem 0;
+  }
+  .chart-card h3{margin-top:0; font-size:1rem;}
+  .chart-note{font-size:0.82rem; color:var(--muted); margin-top:0.4rem;}
+
+  .legend{display:flex; gap:0.3rem; flex-wrap:wrap; margin-bottom:0.7rem;}
+  .legend button{
+    display:inline-flex; align-items:center; gap:0.4em;
+    font-family:var(--mono); font-size:0.72rem; line-height:1.4; color:var(--ink-soft);
+    background:transparent; border:1px solid var(--border); border-radius:999px;
+    padding:0.12rem 0.5rem 0.12rem 0.35rem; cursor:pointer;
+    transition:background 0.12s, border-color 0.12s, color 0.12s;
+  }
+  .legend button:hover{border-color:var(--muted); color:var(--ink);}
+  .legend button[aria-pressed="true"]{background:var(--surface-2); border-color:var(--ink-soft); color:var(--ink); font-weight:600;}
+  .legend button:focus-visible{outline:2px solid var(--accent); outline-offset:2px;}
+  .legend .swatch{width:11px; height:11px; border-radius:3px; flex:none;}
+  .legend-hint{font-size:0.8rem; color:var(--muted); margin:0.2rem 0 0;}
+  .legend-reset{
+    font-family:var(--mono); font-size:0.72rem; color:var(--accent); background:transparent;
+    border:1px dashed var(--border); border-radius:999px; padding:0.12rem 0.6rem; cursor:pointer;
+  }
+  .legend-reset[hidden]{display:none !important;}
+
+  svg.chart{width:100%; height:auto; overflow:visible; display:block;}
+  svg.chart text{font-family:var(--mono); fill:var(--muted);}
+  svg.chart .gridline{stroke:var(--border); stroke-width:1;}
+  svg.chart .zeroline{stroke:var(--ink-soft); stroke-width:1.25; stroke-dasharray:4 4;}
+  svg.chart .axis-label{fill:var(--muted); font-size:12px;}
+  svg.chart .axis-title{fill:var(--muted); font-size:12px;}
+  svg.chart .value-label{font-size:11px; font-weight:600;}
+  svg.chart .mark{cursor:pointer;}
+  svg.chart .hit{fill:transparent;}
+  svg.chart .refline{stroke:var(--ink); stroke-width:1.6; stroke-dasharray:7 5; opacity:0.75;}
+  svg.chart .ref-label{fill:var(--ink); font-size:12px; font-weight:600; paint-order:stroke; stroke:var(--surface); stroke-width:4px; stroke-linejoin:round;}
+  svg.chart [data-series]{transition:opacity 0.14s ease;}
+  svg.chart [data-series][data-dimmed="true"]{opacity:0.1;}
+  @media (prefers-reduced-motion: reduce){
+    svg.chart [data-series]{transition:none;}
+    .legend button{transition:none;}
+  }
+
+  #tooltip{
+    position:fixed; pointer-events:none; background:var(--ink); color:var(--bg);
+    font-family:var(--mono); font-size:0.76rem; padding:0.4rem 0.6rem; border-radius:6px;
+    opacity:0; transform:translate(-50%,-120%); transition:opacity 0.1s; z-index:50; white-space:nowrap;
+    box-shadow:0 4px 14px rgba(0,0,0,0.25);
+  }
+
+  footer{
+    margin-top:3rem; padding-block:2rem 3rem; border-top:1px solid var(--border);
+    color:var(--muted); font-size:0.82rem; max-width:68ch;
+  }
+  footer code{font-family:var(--mono); font-size:0.8em; background:var(--surface-2); padding:0.1em 0.35em; border-radius:4px;}
+
+  ul.findings{padding-left:1.2rem; max-width:68ch;}
+  ul.findings li{margin:0.6em 0;}
+
+  @media (max-width:600px){
+    h1{font-size:1.7rem;}
+    thead th, tbody td{padding:0.5rem 0.45rem;}
+  }
+</style>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,640&family=Source+Sans+3:wght@400;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+</head>
+<body>
+<div class="wrap">
+
+<header class="doc">
+  <p class="eyebrow">LlamaToaster &middot; speed investigation &middot; rebuilt 2026-09-15</p>
+  <h1>The Spill Tax</h1>
+  <p class="dek">Eighteen GPU-layer counts &mdash; from 3 all the way to 41, the model's ceiling &mdash; four context sizes, one 35B mixture-of-experts model on an 8&nbsp;GB card. About 170 model loads across four sweeps. Far enough up the ladder to find where generation speed <em>stops</em> improving, dense enough around that point to see its shape, and enough to kill the threshold theory the earlier, shorter ladder suggested.</p>
+  <div class="specs">
+    <div class="spec"><span class="k">GPU</span><span class="v">RX 6600 XT, 8176&nbsp;MiB</span></div>
+    <div class="spec"><span class="k">Backend</span><span class="v">Vulkan, b10956</span></div>
+    <div class="spec"><span class="k">CPU</span><span class="v">Ryzen 5 5600X</span></div>
+    <div class="spec"><span class="k">Model</span><span class="v">Qwen3.6&#8209;35B&#8209;A3B</span></div>
+    <div class="spec"><span class="k">Quant</span><span class="v">UD&#8209;IQ4_NL, 16.8&nbsp;GiB</span></div>
+    <div class="spec"><span class="k">Layers</span><span class="v">40 + output, MoE</span></div>
+  </div>
+</header>
+
+<section>
+  <p class="eyebrow">1&nbsp;&middot; The ladder</p>
+  <h2 style="border-top:none; margin-top:0; padding-top:0;">Eighteen rungs, dense where the structure is, all the way to the ceiling</h2>
+  <div class="prose">
+    <p>The ladder is deliberately uneven, because the interesting structure is not evenly spaced. <strong>Every integer from 3 to 8</strong> resolves the boundary between configurations that fit in VRAM and ones that don't, which earlier work placed somewhere in there. <strong>14, then +3 all the way to 41</strong> (40 transformer layers plus the output pseudo-layer &mdash; llama.cpp's own ceiling for this model) covers the whole oversubscribed range, up to asking the card to hold 16.8&nbsp;GB of weights in 8&nbsp;GB of VRAM. <strong>16 and 18</strong> were added last, either side of ngl&nbsp;17, once the first pass up the ladder put the decode peak there.</p>
+    <p>Rungs 3&ndash;8, 14, 16 and 18 were measured in <strong>three independent runs</strong>, so those carry a real p50 and spread. The rest of the high rungs (17, 20&ndash;41) were measured <strong>once</strong> &mdash; three passes at the top of the ladder would have run 20+ hours and, at these levels of oversubscription, carries a documented risk of driver-timeout cascades on this card. The table marks which is which; nothing mixes n=3 and n=1 silently.</p>
+    <p>Two points at the very top could not be measured at all: at <span class="num">ngl&nbsp;41</span>, contexts of 8k and 16k never finished loading inside the 120-second startup budget the application itself allows. That's reported as a failure, not dropped.</p>
+  </div>
+</section>
+
+<section>
+  <p class="eyebrow">2&nbsp;&middot; Method</p>
+  <h2>One choreography, about 170 loads</h2>
+  <div class="prose">
+    <p>Each load is a full <code>llama-server</code> restart at that exact <span class="num">(ngl, ctx)</span>, driven by <code>worker/src/runtimeBench.ts</code>'s own <code>executeCurvePoint</code> unmodified &mdash; the same N1 request choreography the production Benchmark page uses: <code>warm_discard</code> to prime the pipeline (uncounted), <code>cold_timed</code> at <code>n_predict&#8202;=&#8202;1</code> against the full prompt (PP and TTFT), then three <code>warm_repeat</code> requests generating 64 tokens each with <code>cache_prompt&#8202;=&#8202;true</code> (TG). Context size is set to the tested value exactly; the prompt fills it to within 128 tokens of the ceiling.</p>
+    <p>Four sweeps produced the numbers below. A <strong>3-pass speed sweep</strong> over ngl 3&ndash;14 (28 points &times; 3 = 84 loads, the whole ladder walked three times rather than repeating each point back to back, so no two measurements of a point sit close together in time). A <strong>memory sweep</strong> over the same 28 points, sampling GPU memory once a second throughout each load. And a <strong>high-ngl sweep</strong> over 17&ndash;41 (35 load attempts), capturing speed and memory together in one pass with a 15-minute per-request timeout, because the production completion path has no timeout of its own and these configurations can stall for a very long time. Finally, a <strong>summit sweep</strong> over ngl 16 and 18 (24 loads), three runs each, <em>interleaved</em> &mdash; run 1 of 16, run 1 of 18, run 2 of 16, and so on &mdash; so neither rung's runs cluster in time. That sweep also recorded <code>llama-server --list-devices</code> immediately before every load, to put llama.cpp's own idea of free VRAM next to what the card actually held.</p>
+  </div>
+  <div class="callout">
+    <p><strong>p90 and p99 are the same number here, and that's disclosed rather than hidden.</strong> Where a point has 3 samples, the 90th and 99th percentile both resolve to the maximum of those 3 &mdash; there is no third value to distinguish them, so every "p90/p99" figure is really "the highest of 3 runs," and p50 is the middle one. Where a point has 1 sample (ngl&nbsp;17 and above), p50 and p90/p99 are the same single measurement and no spread exists at all. Real percentiles would need an order of magnitude more samples per point; three replicates catch whether a point is stable, not what its tail looks like.</p>
+  </div>
+  <div class="callout warn">
+    <p><strong>GPU core clock and hotspot temperature are still not in this report.</strong> LibreHardwareMonitor's Remote Web Server was not running elevated this session either.</p>
+  </div>
+</section>
+
+<section>
+  <p class="eyebrow">3&nbsp;&middot; Results</p>
+  <h2>A cliff, a summit, and a ceiling</h2>
+  <div class="callout">
+    <p><strong>Every chart below is interactive.</strong> Click a layer count in any legend to isolate that rung &mdash; it stays highlighted and labelled while the rest dim, and the selection applies to <em>every</em> chart on the page at once, so you can follow one configuration from prompt speed through to its memory footprint. Click again to release it, or pick several to compare. Hovering any point gives its exact value.</p>
+    <p class="legend-hint">Layer count is encoded as a <em>ramp</em>, not as separate colours: low counts light, high counts deep. It's an ordered quantity, and with sixteen rungs a ramp reads as the ladder it actually is.</p>
+  </div>
+
+  <div class="chart-card">
+    <h3>PP &mdash; prompt processing rate</h3>
+    <div class="legend" id="legend-pp"></div>
+    <svg class="chart" id="chart-pp" viewBox="0 0 900 420"></svg>
+    <p class="chart-note">tok/s, from llama-server's own <code>timings.prompt_n / timings.prompt_ms</code>. Median of 3 loads for ngl&nbsp;3&ndash;16 and 18; single measurement for 17 and 20&ndash;41. Axis starts at zero.</p>
+  </div>
+  <div class="prose">
+    <p><strong>Prefill is binary.</strong> There are two flat bands and nothing in between: <span class="num">ngl&nbsp;3&ndash;6</span> run at <span class="num">100&ndash;147&nbsp;tok/s</span>, and <span class="num">ngl&nbsp;7&ndash;41</span> run at <span class="num">19&ndash;40&nbsp;tok/s</span>. The cliff sits between 6 and 7 and never recovers &mdash; but it also never gets meaningfully <em>worse</em>. Going from ngl&nbsp;7 to ngl&nbsp;41 multiplies the spilled memory by 27&times;, from 366&nbsp;MiB to 10,012&nbsp;MiB, and prefill does not care: ngl&nbsp;41 at ctx&nbsp;2k turns in <span class="num">39.3&nbsp;tok/s</span>, among the <em>fastest</em> readings in the entire slow band, while holding 10&nbsp;GB of weights in system RAM.</p>
+    <p><strong>This kills the threshold theory outright.</strong> The earlier, shorter ladder suggested a spill-size threshold somewhere between 160 and 240&nbsp;MiB, with small spills costing little and large ones costing 3&ndash;5&times;. The full ladder falsifies it in both directions. <span class="num">ngl&nbsp;5</span> spills <span class="num">158&nbsp;MiB</span> and is <em>fast</em> (100&nbsp;tok/s). <span class="num">ngl&nbsp;8</span> spills <span class="num">141&nbsp;MiB</span> &mdash; less &mdash; and is <em>slow</em> (26&nbsp;tok/s). Two configurations with all but identical spill, sitting on opposite sides of a 4&times; performance cliff. Whatever separates them, it is not how many megabytes ended up in system RAM.</p>
+  </div>
+
+  <div class="chart-card">
+    <h3>TG &mdash; token generation rate</h3>
+    <div class="legend" id="legend-tg"></div>
+    <svg class="chart" id="chart-tg" viewBox="0 0 900 420"></svg>
+    <p class="chart-note">tok/s, mean of each load's 3 warm_repeat samples. Median of 3 loads for ngl&nbsp;3&ndash;16 and 18; single measurement for 17 and 20&ndash;41. Axis starts at zero.</p>
+  </div>
+  <div class="prose">
+    <p><strong>Decode has an optimum, and it is not at the top.</strong> Generation climbs steadily with layer count, tops out around <span class="num">ngl&nbsp;16&ndash;17</span>, and then falls away for the rest of the ladder. At ctx&nbsp;1k, in order: 9.70, 10.04, 10.15, 10.56, 10.81, 11.13 (ngl 3&ndash;8), 12.16 (14), 12.80 (16), <strong>13.07 (17)</strong>, 12.46 (18), 12.47 (20), then 11.49, 10.81, 10.43, 9.86, 8.97, 8.58, <strong>8.47 (41)</strong>. An inverted U, the same shape at every context.</p>
+    <p><strong>The top is a plateau, not a point.</strong> Bracketing ngl&nbsp;17 with three runs each of 16 and 18 shows how flat it is. ngl&nbsp;17 has the highest reading at ctx&nbsp;1k, 2k and 16k; ngl&nbsp;16 has it at 8k (10.87 against 10.40); and ngl&nbsp;16's own best single run at 1k, 13.10&nbsp;tok/s, edges past ngl&nbsp;17's only one. Past the plateau the decline is real but shallow at first &mdash; ngl&nbsp;18 and 20 sit within a few hundredths of each other at 1k and 8k &mdash; and only becomes steep and unambiguous from about ngl&nbsp;23 up.</p>
+    <p>That summit matters practically: <strong>full offload is the worst decode setting on this card</strong>, 35% slower than the plateau and slower even than ngl&nbsp;3, which puts almost nothing on the GPU. And the best settings are ones that spill &mdash; ngl&nbsp;16 and 17 each push roughly 860&ndash;890&nbsp;MiB into system RAM and are still the fastest configurations measured. Up to a point, buying more GPU-resident layers is worth paying some spill for; past it, the spill costs more than the layers return.</p>
+    <p>An earlier reading of the shorter ladder called this relationship monotonic &mdash; "more layers on GPU always means faster decode, regardless of spill." That was an artifact of the ladder stopping at 14. It stops being true three rungs later.</p>
+  </div>
+
+  <div class="chart-card">
+    <h3>Measured spill</h3>
+    <div class="legend" id="legend-spill"></div>
+    <svg class="chart" id="chart-spill" viewBox="0 0 900 420"></svg>
+    <p class="chart-note">MiB llama.cpp put on the GPU minus this process's dedicated VRAM peak. Thin vertical ticks show the min&ndash;max across 3 loads where the passes disagreed.</p>
+  </div>
+  <div class="prose">
+    <p>Above the cliff the spill grows almost perfectly linearly with layer count &mdash; roughly <span class="num">380&nbsp;MiB per additional layer</span>, which is simply this model's per-layer weight size going somewhere other than VRAM. It reaches <span class="num">10&nbsp;GB</span> at full offload, on a card with 8&nbsp;GB total.</p>
+    <p>Two departures from that line are worth noting. <span class="num">ngl&nbsp;8</span> at ctx&nbsp;16k goes <em>clean</em> (&minus;91&nbsp;MiB) after spilling 141&ndash;166&nbsp;MiB at the three smaller contexts &mdash; the only rung that crosses back over zero. And <span class="num">ngl&nbsp;14</span> is the one configuration in the entire 3-pass sweep that failed to reproduce: pass&nbsp;1 measured 129, 134, 219 and 26&nbsp;MiB at its four contexts; passes&nbsp;2 and 3 both measured 243, 248, 268 and 139&nbsp;MiB, identical to each other and different from pass&nbsp;1 every time. Every other rung gave bit-identical spill across all three passes. See &sect;4.</p>
+  </div>
+
+  <div class="chart-card">
+    <h3>PP vs. measured spill &mdash; every measured point</h3>
+    <div class="legend" id="legend-scatter"></div>
+    <svg class="chart" id="chart-scatter" viewBox="0 0 900 440"></svg>
+    <p class="chart-note">Each point is one configuration. The vertical gap between the two bands is the whole finding; the horizontal spread within the lower band is noise around it.</p>
+  </div>
+  <div class="prose">
+    <p>Laid out against spill directly, prefill shows no dose-response at all. The fast band sits at the far left, clustered near zero spill. The slow band stretches from 134&nbsp;MiB to 10&nbsp;GB along the x-axis and stays resolutely flat in y &mdash; a horizontal smear, not a slope. If spilled megabytes were what cost prefill its speed, this chart would fall away to the right. It doesn't.</p>
+    <p>The honest conclusion is narrower than the one this report previously drew: <strong>something that happens between ngl&nbsp;6 and ngl&nbsp;7 costs prefill a factor of four, and the amount of memory displaced is not it.</strong> Establishing what it actually is would need per-buffer allocation tracing &mdash; which specific tensors land in shared memory, not how many bytes &mdash; and that is past what Windows' counters and llama.cpp's own logs can show.</p>
+  </div>
+  <h3>Memory footprint: what llama.cpp claims vs. what's actually held</h3>
+  <div class="prose">
+    <p>Five more readings, sampled once per second for the full duration of every load. <strong>Claimed</strong> is llama.cpp's own self-reported GPU allocation (model + KV + compute buffers) from its startup log. <strong>Per&#8209;process</strong> is this specific <code>llama-server</code> process's own reading (Windows GPU Process Memory). <strong>Global</strong> is the whole adapter &mdash; every process on the machine combined, sitting a fairly constant 1.1&ndash;1.5&nbsp;GiB above the per-process figure, which is this desktop's own background GPU footprint (compositor, browser, LibreHardwareMonitor) riding along under every measurement in this report.</p>
+    <p><strong>Together these four charts show the ceiling doing its work.</strong> Claimed VRAM climbs in a straight line the whole length of the ladder, from 1.6&nbsp;GB at ngl&nbsp;3 to 16.8&nbsp;GB at full offload. Held VRAM does not: it tracks claimed exactly up to about ngl&nbsp;14, then flattens hard at <span class="num">~6.1&ndash;6.8&nbsp;GB</span> and stays there for the entire rest of the ladder &mdash; ngl&nbsp;17 and ngl&nbsp;41 hold the same amount of real VRAM as each other. Everything claimed past that point goes to shared memory instead, essentially one-for-one: per-process shared rises from 1.5&nbsp;GB at ngl&nbsp;17 to 10.5&nbsp;GB at ngl&nbsp;41.</p>
+    <p><strong>llama.cpp's own free-memory figure doesn't predict any of this.</strong> The dashed line on the claimed, held and global charts is what <code>llama-server --list-devices</code> reported immediately before each of the 24 summit-sweep loads: <span class="num">7,378&nbsp;MiB free</span>, identical every single time &mdash; including before the one run that spilled 380&nbsp;MiB more than its repeats. Held VRAM never reaches that line at any rung; its highest reading anywhere in the report is 6,833&nbsp;MiB, about 550&nbsp;MiB short. And spilling starts far below it: ngl&nbsp;5 spills 158&nbsp;MiB while claiming only 2,408&nbsp;MiB, less than a third of what llama.cpp reports as free. A fit check built on that number would pass configurations that measurably spill.</p>
+    <p>The arithmetic closes cleanly. Across every rung, held VRAM plus shared memory exceeds claimed by a near-constant <span class="num">~500&nbsp;MiB</span> &mdash; the driver's own non-buffer overhead, which this project's earlier calibration work on this same card independently pinned at 430&ndash;480&nbsp;MiB. Two separate measurement paths, years apart in the codebase, agreeing on the same constant.</p>
+  </div>
+
+  <div class="chart-card">
+    <h3>Claimed VRAM &mdash; llama.cpp's own self-report</h3>
+    <div class="legend" id="legend-claimed"></div>
+    <svg class="chart" id="chart-claimed" viewBox="0 0 900 420"></svg>
+    <p class="chart-note">MiB, from llama.cpp's startup buffer report. A static allocation plan, not a live sample &mdash; single value per load.</p>
+  </div>
+
+  <div class="chart-card">
+    <h3>VRAM held &mdash; per process (dot = mean, tick = max)</h3>
+    <div class="legend" id="legend-procvram"></div>
+    <svg class="chart" id="chart-procvram" viewBox="0 0 900 420"></svg>
+    <p class="chart-note">This process's own dedicated VRAM, Windows GPU Process Memory. Note where the lines stop rising &mdash; that flat top at ~6.1&ndash;6.8&nbsp;GB is the card's practical ceiling, and every rung from 17 upward sits on it.</p>
+  </div>
+
+  <div class="chart-card">
+    <h3>Shared (system-RAM-backed) VRAM &mdash; per process</h3>
+    <div class="legend" id="legend-procshared"></div>
+    <svg class="chart" id="chart-procshared" viewBox="0 0 900 420"></svg>
+    <p class="chart-note">The direct measured counterpart to the spill figures above &mdash; this is the raw shared-memory reading spill is computed from, before subtracting the dedicated-VRAM baseline.</p>
+  </div>
+
+  <div class="chart-card">
+    <h3>VRAM used &mdash; whole adapter (global)</h3>
+    <div class="legend" id="legend-globalvram"></div>
+    <svg class="chart" id="chart-globalvram" viewBox="0 0 900 420"></svg>
+    <p class="chart-note">Same shape as the per-process chart, offset upward by this machine's background GPU usage.</p>
+  </div>
+
+  <div class="chart-card">
+    <h3>Shared VRAM &mdash; whole adapter (global)</h3>
+    <div class="legend" id="legend-globalshared"></div>
+    <svg class="chart" id="chart-globalshared" viewBox="0 0 900 420"></svg>
+    <p class="chart-note">Background applications hold a small, fairly constant amount of shared memory too (~150&ndash;300&nbsp;MiB), on top of whatever this process is spilling.</p>
+  </div>
+
+  <p class="sort-hint">Click any column heading to sort by it; click again to reverse. Rows that never loaded always sort to the bottom.</p>
+  <div class="tablewrap">
+    <table id="results-table">
+      <thead>
+        <tr>
+          <th aria-sort="ascending"><button type="button" data-sort="ngl">ngl<span class="sort-ind"></span></button></th>
+          <th aria-sort="none"><button type="button" data-sort="ctx">ctx<span class="sort-ind"></span></button></th>
+          <th aria-sort="none"><button type="button" data-sort="n">n<span class="sort-ind"></span></button></th>
+          <th aria-sort="none"><button type="button" data-sort="pp">PP p50 (p90/99)<span class="sort-ind"></span></button></th>
+          <th aria-sort="none"><button type="button" data-sort="tg">TG p50 (p90/99)<span class="sort-ind"></span></button></th>
+          <th aria-sort="none"><button type="button" data-sort="spill">spill (range)<span class="sort-ind"></span></button></th>
+          <th aria-sort="none"><button type="button" data-sort="claimed">claimed<span class="sort-ind"></span></button></th>
+          <th aria-sort="none"><button type="button" data-sort="held">VRAM held<span class="sort-ind"></span></button></th>
+          <th aria-sort="none"><button type="button" data-sort="shared">shared<span class="sort-ind"></span></button></th>
+        </tr>
+      </thead>
+      <tbody id="results-body"></tbody>
+    </table>
+  </div>
+  <p class="chart-note"><strong>n</strong> is how many independent loads that row averages: 3 for ngl&nbsp;3&ndash;16 and 18, 1 for ngl&nbsp;17 and 20&ndash;41, 0 for the two that never loaded. The parenthesised figure after PP and TG is the highest of the 3; single-sample rows show one number because there is no second one to report. "spill (range)" shows min&ndash;max only where the passes disagreed. Claimed / VRAM held / shared are MiB, per process. TTFT is covered in &sect;4 &mdash; its raw values aren't informative row by row.</p>
+</section>
+
+<section>
+  <p class="eyebrow">4&nbsp;&middot; Caveats</p>
+  <h2>What the raw numbers don't show at face value</h2>
+  <div class="callout warn">
+    <p><strong>Most high rungs are single measurements &mdash; including the one at the top.</strong> ngl&nbsp;17 and 20&ndash;41 were each measured once, so they carry no spread and a single unlucky load would not show as one. That matters most for ngl&nbsp;17 itself: it sits between two rungs with three runs each, and which of 16 and 17 is actually higher is not resolved &mdash; ngl&nbsp;16's three runs at 1k spanned 11.95 to 13.10&nbsp;tok/s, a range wide enough to contain ngl&nbsp;17's lone 13.07. The <em>existence</em> of a plateau near 16&ndash;17, with decline on both sides, holds at every context. Pinning its exact top would need three runs of ngl&nbsp;17 too.</p>
+  </div>
+  <div class="callout">
+    <p><strong>TTFT still plateaus at ~30&nbsp;s and is not first-token latency.</strong> 50 of the 70 measured points report TTFT in a narrow band around 30&nbsp;s regardless of how long the load actually ran &mdash; and those loads ran anywhere from 34&nbsp;s to 866&nbsp;s. The 17 that finished inside 30&nbsp;s report TTFT exactly equal to their end-to-end time, as they should. The pattern is consistent with a periodic keep-alive frame on llama-server's SSE stream arriving long before the real first token. <strong>PP is unaffected</strong>: it comes from llama-server's own <code>prompt_ms</code> timing, not from the client-observed stream.</p>
+  </div>
+  <div class="callout">
+    <p><strong>Every warm_repeat request in every sweep is flagged <code>cache_evicted</code></strong> &mdash; 3 per load across all 170 successful loads, none of which hit the prefix cache. TG is still computed from the decode-only window after the first token, and lands in the same band this application's own probe path measures through an entirely different request path, so it is treated as trustworthy despite the flag.</p>
+  </div>
+  <div class="callout warn">
+    <p><strong>The first run of a sweep places memory differently from the runs after it.</strong> This has now happened at three rungs in two separate sweeps. In the 3-pass sweep, ngl&nbsp;14's spill was lower in pass&nbsp;1 than in passes 2 and 3 at all four contexts, while every other rung reproduced bit-for-bit. In the summit sweep, run&nbsp;1 of <em>both</em> ngl&nbsp;16 and ngl&nbsp;18 spilled more than their later runs &mdash; at ctx&nbsp;1k, 1,271 against 887 and 887&nbsp;MiB, and 1,652 against 1,524 and 1,524 &mdash; while runs 2 and 3 matched each other almost exactly. The direction isn't consistent (lower for 14, higher for 16 and 18); what's consistent is that the <em>first</em> loads of a session are the ones that differ. Later runs followed a stretch of continuous heavy GPU load; the first ones followed none. This is the same shape of effect the earlier <em>PP/GPU Investigation</em> on this box documented for a different model &mdash; allocator state accumulating over a long session of heavy GPU use &mdash; here surfacing as a shift in which layers spilled rather than in raw speed.</p>
+  </div>
+  <div class="callout warn">
+    <p><strong>GPU core clock and hotspot temperature are absent from this report entirely.</strong> They are only available on this machine through LibreHardwareMonitor's Remote Web Server, which was not running elevated for any of the four sweeps. Every sample came back null. Nothing has been estimated in their place, which does mean thermal throttling cannot be ruled out as a contributor to anything here &mdash; though the earlier investigation on this card tested that directly and found clock held near maximum boost throughout.</p>
+  </div>
+</section>
+
+<section>
+  <p class="eyebrow">5&nbsp;&middot; Bottom line</p>
+  <h2>What the full ladder establishes</h2>
+  <ul class="findings prose">
+    <li><strong>Prefill is binary, and the split is not about spill size.</strong> ngl&nbsp;3&ndash;6 run at 100&ndash;147&nbsp;tok/s; ngl&nbsp;7&ndash;41 run at 19&ndash;40&nbsp;tok/s. Between those bands is a 4&times; cliff with nothing in it. Crucially, ngl&nbsp;5 spills 158&nbsp;MiB and lands in the fast band while ngl&nbsp;8 spills <em>less</em> (141&nbsp;MiB) and lands in the slow one &mdash; so the amount of displaced memory cannot be what causes the penalty.</li>
+    <li><strong>Past the cliff, more spill costs nothing further.</strong> From ngl&nbsp;7 to ngl&nbsp;41 the spill grows 27&times;, to 10&nbsp;GB on an 8&nbsp;GB card, and prefill stays flat &mdash; full offload at ctx&nbsp;2k is among the <em>fastest</em> readings in the slow band. This falsifies the spill-size threshold this report previously proposed on the shorter ladder.</li>
+    <li><strong>Decode tops out on a plateau at ngl&nbsp;16&ndash;17, not at full offload.</strong> TG rises to about 13&nbsp;tok/s there, then falls to 8.47 at ngl&nbsp;41. Three runs each of 16 and 18 show the top is flat: 17 leads at three contexts, 16 at the fourth, and which is truly higher isn't resolved. Full offload is the <em>worst</em> decode configuration tested, slower even than ngl&nbsp;3.</li>
+    <li><strong>The best decode settings are ones that spill.</strong> ngl&nbsp;16 and 17 each push roughly 860&ndash;890&nbsp;MiB into system RAM and are still the fastest configurations measured. Some spill buys more than it costs; roughly 2&nbsp;GB of it stops doing so.</li>
+    <li><strong>Held VRAM saturates at ~6.1&ndash;6.8&nbsp;GB and every claimed byte past that goes to shared memory one-for-one.</strong> ngl&nbsp;17 and ngl&nbsp;41 hold the same real VRAM as each other while their claims differ by 9.5&nbsp;GB. Held + shared exceeds claimed by a near-constant ~500&nbsp;MiB of driver overhead &mdash; matching this project's own independent calibration of 430&ndash;480&nbsp;MiB on this card.</li>
+    <li><strong><code>--list-devices</code> free memory is not a usable fit check.</strong> llama.cpp reported 7,378&nbsp;MiB free before all 24 loads where it was recorded, never varying. Held VRAM never got within 550&nbsp;MiB of it, and spilling began at a claim of just 2,408&nbsp;MiB.</li>
+    <li><strong>Full offload stops being loadable at all past ctx&nbsp;2k.</strong> At ngl&nbsp;41, contexts of 8k and 16k never became ready inside the 120-second startup budget the application allows.</li>
+    <li><strong>Not established:</strong> what actually changes between ngl&nbsp;6 and ngl&nbsp;7 to cost prefill a factor of four, given it demonstrably isn't spill volume &mdash; answering that needs per-buffer allocation tracing, not counters. Also open: whether ngl&nbsp;16 or 17 is the true top (17 needs three runs of its own), why the plateau sits there at all, and whether any of this generalises past Vulkan on this particular AMD card.</li>
+  </ul>
+</section>
+
+<footer>
+  <p>Methodology and tooling: <code>worker/src/runtimeBench.ts</code> (<code>spawnRuntimeServer</code>, <code>executeCurvePoint</code>), <code>worker/src/vram.ts</code>, <code>worker/src/bench.ts</code> &mdash; LlamaToaster, github.com/noname9006/LlamaToaster, commit 44affaa. The measurement choreography is the application's own, unmodified; orchestration around it was a separate ad hoc script outside the production code. About 170 model loads in total across four sweeps: a 3-pass speed sweep of ngl&nbsp;3&ndash;14 (84 loads), a memory-telemetry sweep of the same rungs (28), a single-pass sweep of ngl&nbsp;17&ndash;41 (35 attempts, 34 successful), and an interleaved 3-run summit sweep of ngl&nbsp;16 and 18 (24). 2026-09-15 to 2026-09-16.</p>
+</footer>
+
+</div>
+
+<div id="tooltip"></div>
+
+<script>
+const DATA = [
+  {ngl:3, ctx:1024, ppP50:100.65, ppMax:100.9, ttftP50:8925, ttftMax:9004, e2eP50:8925, e2eMax:9004, tgP50:9.7, tgMax:10.08, spillP50:-61.4, spillMin:-61.4, spillMax:-61.4, vramP50:2504, vramMax:2512, shP50:667, shMax:697, claimed:1595.6, procVramMean:1643.6, procVramMax:1657, procSharedMean:541.9, procSharedMax:551, globalVramMean:3222.3, globalVramMax:3253, globalSharedMean:720.8, globalSharedMax:746, n:3},
+  {ngl:3, ctx:2048, ppP50:124.17, ppMax:124.86, ttftP50:15485, ttftMax:15691, e2eP50:15486, e2eMax:15691, tgP50:9.47, tgMax:9.53, spillP50:-61.4, spillMin:-61.4, spillMax:-61.4, vramP50:2512, vramMax:2515, shP50:693, shMax:723, claimed:1602.6, procVramMean:1653.2, procVramMax:1664, procSharedMean:572.3, procSharedMax:577, globalVramMean:3243.3, globalVramMax:3282, globalSharedMean:736.1, globalSharedMax:752, n:3},
+  {ngl:3, ctx:8192, ppP50:138.86, ppMax:139.49, ttftP50:30222, ttftMax:30317, e2eP50:58101, e2eMax:61274, tgP50:7.83, tgMax:8.34, spillP50:-61.4, spillMin:-61.4, spillMax:-61.4, vramP50:2561, vramMax:2688, shP50:699, shMax:729, claimed:1651.6, procVramMean:1708.4, procVramMax:1713, procSharedMean:581, procSharedMax:583, globalVramMean:3290.2, globalVramMax:3346, globalSharedMean:766.1, globalSharedMax:788, n:3},
+  {ngl:3, ctx:16384, ppP50:130.53, ppMax:131.72, ttftP50:30212, ttftMax:30222, e2eP50:124576, e2eMax:124944, tgP50:6.91, tgMax:7, spillP50:-75.4, spillMin:-75.4, spillMax:-75.4, vramP50:2593, vramMax:2610, shP50:719, shMax:737, claimed:1667.6, procVramMean:1734.4, procVramMax:1743, procSharedMean:590, procSharedMax:591, globalVramMean:3303.1, globalVramMax:3382, globalSharedMean:778.7, globalSharedMax:791, n:3},
+  {ngl:4, ctx:1024, ppP50:102.42, ppMax:102.68, ttftP50:8771, ttftMax:8780, e2eP50:8772, e2eMax:8781, tgP50:10.04, tgMax:10.28, spillP50:-63.4, spillMin:-63.4, spillMax:-63.4, vramP50:2913, vramMax:2915, shP50:667, shMax:695, claimed:2001.6, procVramMean:2052.2, procVramMax:2065, procSharedMean:541.5, procSharedMax:551, globalVramMean:3665.4, globalVramMax:3737, globalSharedMean:728.3, globalSharedMax:748, n:3},
+  {ngl:4, ctx:2048, ppP50:126.64, ppMax:126.81, ttftP50:15184, ttftMax:15241, e2eP50:15185, e2eMax:15242, tgP50:9.47, tgMax:9.81, spillP50:-63.4, spillMin:-63.4, spillMax:-63.4, vramP50:2920, vramMax:2922, shP50:693, shMax:721, claimed:2008.6, procVramMean:2061.5, procVramMax:2072, procSharedMean:568.6, procSharedMax:577, globalVramMean:3658.5, globalVramMax:3698, globalSharedMean:752.7, globalSharedMax:766, n:3},
+  {ngl:4, ctx:8192, ppP50:141.51, ppMax:141.54, ttftP50:30191, ttftMax:30209, e2eP50:57013, e2eMax:57931, tgP50:8.37, tgMax:8.4, spillP50:-63.4, spillMin:-63.4, spillMax:-63.4, vramP50:2969, vramMax:2992, shP50:699, shMax:727, claimed:2057.6, procVramMean:2116.2, procVramMax:2121, procSharedMean:579.1, procSharedMax:583, globalVramMean:3709.1, globalVramMax:3739, globalSharedMean:766.4, globalSharedMax:778, n:3},
+  {ngl:4, ctx:16384, ppP50:133.76, ppMax:134.12, ttftP50:30224, ttftMax:30233, e2eP50:121562, e2eMax:123791, tgP50:7.05, tgMax:7.07, spillP50:-77.4, spillMin:-77.4, spillMax:-77.4, vramP50:2998, vramMax:3005, shP50:707, shMax:737, claimed:2073.6, procVramMean:2142.3, procVramMax:2151, procSharedMean:589.9, procSharedMax:591, globalVramMean:3728, globalVramMax:3769, globalSharedMean:777.6, globalSharedMax:791, n:3},
+  {ngl:5, ctx:1024, ppP50:100.46, ppMax:100.63, ttftP50:8941, ttftMax:9027, e2eP50:8942, e2eMax:9027, tgP50:10.15, tgMax:10.28, spillP50:158.5, spillMin:158.5, spillMax:158.5, vramP50:3097, vramMax:3097, shP50:893, shMax:921, claimed:2407.5, procVramMean:2236.8, procVramMax:2249, procSharedMean:766.7, procSharedMax:776, globalVramMean:3660.1, globalVramMax:3882, globalSharedMean:956.8, globalSharedMax:976, n:3},
+  {ngl:5, ctx:2048, ppP50:122.96, ppMax:123.54, ttftP50:15640, ttftMax:16334, e2eP50:15641, e2eMax:16335, tgP50:9.78, tgMax:9.94, spillP50:157.5, spillMin:157.5, spillMax:157.5, vramP50:3105, vramMax:3108, shP50:919, shMax:954, claimed:2414.5, procVramMean:2246.8, procVramMax:2257, procSharedMean:794.7, procSharedMax:803, globalVramMean:3720.8, globalVramMax:3884, globalSharedMean:985.2, globalSharedMax:1003, n:3},
+  {ngl:5, ctx:8192, ppP50:136.69, ppMax:136.93, ttftP50:30241, ttftMax:30256, e2eP50:59020, e2eMax:60032, tgP50:8.49, tgMax:8.54, spillP50:157.5, spillMin:157.5, spillMax:157.5, vramP50:3154, vramMax:3155, shP50:925, shMax:960, claimed:2463.5, procVramMean:2301.8, procVramMax:2306, procSharedMean:807.1, procSharedMax:809, globalVramMean:3947.3, globalVramMax:4223, globalSharedMean:995.1, globalSharedMax:1012, n:3},
+  {ngl:5, ctx:16384, ppP50:129.43, ppMax:129.49, ttftP50:30188, ttftMax:30255, e2eP50:125628, e2eMax:127866, tgP50:7.14, tgMax:7.17, spillP50:143.5, spillMin:143.5, spillMax:143.5, vramP50:3184, vramMax:3186, shP50:933, shMax:967, claimed:2479.5, procVramMean:2323.6, procVramMax:2336, procSharedMean:814.6, procSharedMax:817, globalVramMean:3939.8, globalVramMax:4080, globalSharedMean:1008.6, globalSharedMax:1021, n:3},
+  {ngl:6, ctx:1024, ppP50:107.44, ppMax:107.53, ttftP50:8362, ttftMax:8392, e2eP50:8363, e2eMax:8393, tgP50:10.56, tgMax:10.64, spillP50:-66.7, spillMin:-66.7, spillMax:-66.7, vramP50:3722, vramMax:3749, shP50:669, shMax:683, claimed:2806.3, procVramMean:2859.7, procVramMax:2873, procSharedMean:540.4, procSharedMax:553, globalVramMean:4181.6, globalVramMax:4230, globalSharedMean:699.9, globalSharedMax:723, n:3},
+  {ngl:6, ctx:2048, ppP50:131.92, ppMax:132.28, ttftP50:14579, ttftMax:14595, e2eP50:14580, e2eMax:14595, tgP50:10.13, tgMax:10.13, spillP50:-67.7, spillMin:-67.7, spillMax:-67.7, vramP50:3731, vramMax:3758, shP50:696, shMax:709, claimed:2815.3, procVramMean:2871.3, procVramMax:2883, procSharedMean:570.4, procSharedMax:580, globalVramMean:4191.8, globalVramMax:4221, globalSharedMean:729.9, globalSharedMax:754, n:3},
+  {ngl:6, ctx:8192, ppP50:147.12, ppMax:147.16, ttftP50:30186, ttftMax:30199, e2eP50:54838, e2eMax:55021, tgP50:8.82, tgMax:8.85, spillP50:-67.7, spillMin:-67.7, spillMax:-67.7, vramP50:3792, vramMax:3820, shP50:702, shMax:716, claimed:2876.3, procVramMean:2938.9, procVramMax:2944, procSharedMean:581.7, procSharedMax:586, globalVramMean:4263, globalVramMax:4304, globalSharedMean:759.2, globalSharedMax:778, n:3},
+  {ngl:6, ctx:16384, ppP50:138.5, ppMax:138.62, ttftP50:30246, ttftMax:30255, e2eP50:117407, e2eMax:118203, tgP50:7.51, tgMax:7.54, spillP50:-81.7, spillMin:-81.7, spillMax:-81.7, vramP50:3838, vramMax:3876, shP50:710, shMax:739, claimed:2908.3, procVramMean:2981.3, procVramMax:2990, procSharedMean:591.9, procSharedMax:594, globalVramMean:4302.8, globalVramMax:4423, globalSharedMean:783.4, globalSharedMax:812, n:3},
+  {ngl:7, ctx:1024, ppP50:25.79, ppMax:25.85, ttftP50:30184, ttftMax:30205, e2eP50:34759, e2eMax:35407, tgP50:10.81, tgMax:11.12, spillP50:365.8, spillMin:365.8, spillMax:365.8, vramP50:3710, vramMax:3720, shP50:1106, shMax:1120, claimed:3228.8, procVramMean:2843.3, procVramMax:2863, procSharedMean:976.8, procSharedMax:990, globalVramMean:4080.8, globalVramMax:4103, globalSharedMean:1158.9, globalSharedMax:1178, n:3},
+  {ngl:7, ctx:2048, ppP50:28.24, ppMax:28.27, ttftP50:30199, ttftMax:30219, e2eP50:68004, e2eMax:69172, tgP50:10.55, tgMax:10.78, spillP50:370.8, spillMin:370.8, spillMax:370.8, vramP50:3714, vramMax:3762, shP50:1138, shMax:1152, claimed:3237.8, procVramMean:2854.7, procVramMax:2867, procSharedMean:1016.9, procSharedMax:1022, globalVramMean:4092.5, globalVramMax:4135, globalSharedMean:1196, globalSharedMax:1207, n:3},
+  {ngl:7, ctx:8192, ppP50:29.79, ppMax:29.84, ttftP50:30204, ttftMax:30263, e2eP50:270733, e2eMax:275171, tgP50:9.16, tgMax:9.34, spillP50:391.3, spillMin:391.3, spillMax:391.3, vramP50:3738, vramMax:3774, shP50:1164, shMax:1179, claimed:3282.3, procVramMean:2887.2, procVramMax:2891, procSharedMean:1046.5, procSharedMax:1048, globalVramMean:4125.3, globalVramMax:4157, globalSharedMean:1216.9, globalSharedMax:1233, n:3},
+  {ngl:7, ctx:16384, ppP50:37.23, ppMax:37.57, ttftP50:30209, ttftMax:30217, e2eP50:436660, e2eMax:437721, tgP50:7.61, tgMax:7.65, spillP50:134.3, spillMin:134.3, spillMax:134.3, vramP50:3783, vramMax:4056, shP50:1172, shMax:1204, claimed:3314.3, procVramMean:2953.4, procVramMax:3180, procSharedMean:1026.4, procSharedMax:1075, globalVramMean:4260.1, globalVramMax:4531, globalSharedMean:1206, globalSharedMax:1264, n:3},
+  {ngl:8, ctx:1024, ppP50:26.32, ppMax:26.39, ttftP50:30166, ttftMax:30254, e2eP50:34066, e2eMax:34136, tgP50:11.13, tgMax:11.41, spillP50:140.7, spillMin:140.7, spillMax:140.7, vramP50:4360, vramMax:4364, shP50:883, shMax:897, claimed:3634.7, procVramMean:3472, procVramMax:3494, procSharedMean:750.8, procSharedMax:767, globalVramMean:4750.5, globalVramMax:4855, globalSharedMean:927.2, globalSharedMax:953, n:3},
+  {ngl:8, ctx:2048, ppP50:28.9, ppMax:28.93, ttftP50:30187, ttftMax:30196, e2eP50:66456, e2eMax:66545, tgP50:10.73, tgMax:10.98, spillP50:145.7, spillMin:145.7, spillMax:145.7, vramP50:4364, vramMax:4369, shP50:915, shMax:928, claimed:3643.7, procVramMean:3485.1, procVramMax:3498, procSharedMean:793.6, procSharedMax:799, globalVramMean:4773.9, globalVramMax:4946, globalSharedMean:975, globalSharedMax:999, n:3},
+  {ngl:8, ctx:8192, ppP50:30.35, ppMax:30.64, ttftP50:30181, ttftMax:30230, e2eP50:265745, e2eMax:265936, tgP50:9.37, tgMax:9.42, spillP50:166.2, spillMin:166.2, spillMax:166.2, vramP50:4376, vramMax:4403, shP50:955, shMax:957, claimed:3688.2, procVramMean:3518.2, procVramMax:3522, procSharedMean:823.4, procSharedMax:825, globalVramMean:4779.6, globalVramMax:4868, globalSharedMean:1004.6, globalSharedMax:1023, n:3},
+  {ngl:8, ctx:16384, ppP50:38.46, ppMax:38.81, ttftP50:30183, ttftMax:30197, e2eP50:422760, e2eMax:424843, tgP50:7.83, tgMax:7.91, spillP50:-90.8, spillMin:-90.8, spillMax:-90.8, vramP50:4408, vramMax:4709, shP50:947, shMax:982, claimed:3720.2, procVramMean:3586.7, procVramMax:3811, procSharedMean:802.3, procSharedMax:852, globalVramMean:4825.1, globalVramMax:5079, globalSharedMean:986.4, globalSharedMax:1037, n:3},
+  {ngl:14, ctx:1024, ppP50:30.3, ppMax:30.6, ttftP50:29598, ttftMax:29742, e2eP50:29599, e2eMax:29742, tgP50:12.16, tgMax:12.6, spillP50:243.1, spillMin:129.1, spillMax:243.1, vramP50:6683, vramMax:6745, shP50:1005, shMax:1035, claimed:6056.1, procVramMean:5624.2, procVramMax:5813, procSharedMean:1016.2, procSharedMax:1365, globalVramMean:7177.4, globalVramMax:8054, globalSharedMean:1284.4, globalSharedMax:1813, n:3},
+  {ngl:14, ctx:2048, ppP50:33.09, ppMax:33.1, ttftP50:30237, ttftMax:30259, e2eP50:58057, e2eMax:58428, tgP50:11.74, tgMax:12.21, spillP50:248.1, spillMin:134.1, spillMax:248.1, vramP50:6691, vramMax:6757, shP50:1035, shMax:1035, claimed:6069.1, procVramMean:5805.8, procVramMax:5821, procSharedMean:910.3, procSharedMax:922, globalVramMean:6800.3, globalVramMax:7143, globalSharedMean:1071.5, globalSharedMax:1098, n:3},
+  {ngl:14, ctx:8192, ppP50:34.4, ppMax:34.58, ttftP50:30209, ttftMax:30238, e2eP50:234417, e2eMax:235045, tgP50:10.37, tgMax:10.49, spillP50:267.6, spillMin:218.6, spillMax:267.6, vramP50:6738, vramMax:6779, shP50:1062, shMax:1076, claimed:6137.6, procVramMean:5865.1, procVramMax:5870, procSharedMean:944.3, procSharedMax:948, globalVramMean:7101.3, globalVramMax:7547, globalSharedMean:1113.3, globalSharedMax:1172, n:3},
+  {ngl:14, ctx:16384, ppP50:41.71, ppMax:41.75, ttftP50:30203, ttftMax:30203, e2eP50:389792, e2eMax:389890, tgP50:8.26, tgMax:8.49, spillP50:138.6, spillMin:25.6, spillMax:138.6, vramP50:6676, vramMax:7043, shP50:1198, shMax:1218, claimed:6201.6, procVramMean:5839.6, procVramMax:6063, procSharedMean:1046.8, procSharedMax:1103, globalVramMean:7133.6, globalVramMax:7590, globalSharedMean:1219.3, globalSharedMax:1291, n:3},
+  {ngl:16, ctx:1024, n:3, ppP50:32.36, ppMax:35.61, ttftP50:27718, ttftMax:30326, e2eP50:27719, e2eMax:40327, tgP50:12.8, tgMax:13.1, spillP50:886.9, spillMin:886.9, spillMax:1270.9, vramP50:7143, vramMax:7305, shP50:1670, shMax:2359, claimed:6867.9, procVramMean:5956.3, procVramMax:5981, procSharedMean:1511.9, procSharedMax:2169, globalVramMean:7143, globalVramMax:7305, globalSharedMean:1670.1, globalSharedMax:2359},
+  {ngl:16, ctx:2048, n:3, ppP50:35.69, ppMax:38.8, ttftP50:30283, ttftMax:30343, e2eP50:53825, e2eMax:56262, tgP50:12.23, tgMax:12.31, spillP50:891.9, spillMin:891.9, spillMax:1147.9, vramP50:7209, vramMax:7313, shP50:1716, shMax:2135, claimed:6880.9, procVramMean:5973, procVramMax:5989, procSharedMean:1556.4, procSharedMax:1957, globalVramMean:7208.7, globalVramMax:7313, globalSharedMean:1715.9, globalSharedMax:2135},
+  {ngl:16, ctx:8192, n:3, ppP50:38.22, ppMax:39.77, ttftP50:30280, ttftMax:30292, e2eP50:211047, e2eMax:218641, tgP50:10.87, tgMax:11.02, spillP50:911.4, spillMin:911.4, spillMax:1039.4, vramP50:7328, vramMax:7384, shP50:1761, shMax:1925, claimed:6949.4, procVramMean:6032.3, procVramMax:6038, procSharedMean:1594, procSharedMax:1727, globalVramMean:7327.9, globalVramMax:7384, globalSharedMean:1761.5, globalSharedMax:1925},
+  {ngl:16, ctx:16384, n:3, ppP50:34.72, ppMax:35.25, ttftP50:30321, ttftMax:30341, e2eP50:468268, e2eMax:473316, tgP50:8.16, tgMax:8.22, spillP50:1038.4, spillMin:1038.4, spillMax:1166.4, vramP50:7281, vramMax:7302, shP50:1913, shMax:2058, claimed:7013.4, procVramMean:5972, procVramMax:5975, procSharedMean:1741.4, procSharedMax:1882, globalVramMean:7280.8, globalVramMax:7302, globalSharedMean:1913, globalSharedMax:2058},
+  {ngl:17, ctx:1024, n:1, ppP50:25.29, ppMax:25.29, ttftP50:30280, ttftMax:30280, e2eP50:35457, e2eMax:35457, tgP50:13.07, tgMax:13.07, spillP50:858.9, spillMin:858.9, spillMax:858.9, vramP50:7263, vramMax:7297, shP50:1562, shMax:1628, claimed:7273.9, procVramMean:6386.4, procVramMax:6415, procSharedMean:1476.8, procSharedMax:1515, globalVramMean:7263.1, globalVramMax:7297, globalSharedMean:1561.8, globalSharedMax:1628},
+  {ngl:17, ctx:2048, n:1, ppP50:34.62, ppMax:34.62, ttftP50:30298, ttftMax:30298, e2eP50:55483, e2eMax:55483, tgP50:12.73, tgMax:12.73, spillP50:863.9, spillMin:863.9, spillMax:863.9, vramP50:7288, vramMax:7314, shP50:1638, shMax:1660, claimed:7286.9, procVramMean:6408.4, procVramMax:6423, procSharedMean:1536, procSharedMax:1547, globalVramMean:7287.8, globalVramMax:7314, globalSharedMean:1637.7, globalSharedMax:1660},
+  {ngl:17, ctx:8192, n:1, ppP50:36.49, ppMax:36.49, ttftP50:30284, ttftMax:30284, e2eP50:221012, e2eMax:221012, tgP50:10.4, tgMax:10.4, spillP50:883.4, spillMin:883.4, spillMax:883.4, vramP50:7352, vramMax:7408, shP50:1675, shMax:1686, claimed:7355.4, procVramMean:6467.1, procVramMax:6472, procSharedMean:1569.2, procSharedMax:1573, globalVramMean:7352.2, globalVramMax:7408, globalSharedMean:1675.3, globalSharedMax:1686},
+  {ngl:17, ctx:16384, n:1, ppP50:34.36, ppMax:34.36, ttftP50:30326, ttftMax:30326, e2eP50:473223, e2eMax:473223, tgP50:8.33, tgMax:8.33, spillP50:1010.4, spillMin:1010.4, spillMax:1010.4, vramP50:7256, vramMax:7312, shP50:1825, shMax:1841, claimed:7419.4, procVramMean:6406, procVramMax:6409, procSharedMean:1715.1, procSharedMax:1728, globalVramMean:7256.3, globalVramMax:7312, globalSharedMean:1824.6, globalSharedMax:1841},
+  {ngl:18, ctx:1024, n:3, ppP50:33.21, ppMax:35.89, ttftP50:27010, ttftMax:27735, e2eP50:27010, e2eMax:27735, tgP50:12.46, tgMax:12.51, spillP50:1523.7, spillMin:1523.7, spillMax:1651.7, vramP50:7319, vramMax:7473, shP50:2302, shMax:2473, claimed:7672.7, procVramMean:6124.3, procVramMax:6149, procSharedMean:2152.4, procSharedMax:2312, globalVramMean:7318.6, globalVramMax:7473, globalSharedMean:2301.9, globalSharedMax:2473},
+  {ngl:18, ctx:2048, n:3, ppP50:36.55, ppMax:39.56, ttftP50:30329, ttftMax:30350, e2eP50:52573, e2eMax:55026, tgP50:11.98, tgMax:12.05, spillP50:1527.7, spillMin:1527.7, spillMax:1655.7, vramP50:7381, vramMax:7489, shP50:2358, shMax:2519, claimed:7687.7, procVramMean:6143, procVramMax:6160, procSharedMean:2197.1, procSharedMax:2343, globalVramMean:7380.9, globalVramMax:7489, globalSharedMean:2358.1, globalSharedMax:2519},
+  {ngl:18, ctx:8192, n:3, ppP50:38.12, ppMax:38.63, ttftP50:30328, ttftMax:30348, e2eP50:211585, e2eMax:212599, tgP50:10.33, tgMax:10.34, spillP50:1573.2, spillMin:1573.2, spillMax:1701.2, vramP50:7486, vramMax:7570, shP50:2424, shMax:2573, claimed:7768.2, procVramMean:6189.4, procVramMax:6195, procSharedMean:2261.1, procSharedMax:2395, globalVramMean:7486, globalVramMax:7570, globalSharedMean:2424, globalSharedMax:2573},
+  {ngl:18, ctx:16384, n:3, ppP50:34.86, ppMax:34.93, ttftP50:30308, ttftMax:30329, e2eP50:466406, e2eMax:474810, tgP50:7.97, tgMax:8, spillP50:1707.2, spillMin:1707.2, spillMax:1707.2, vramP50:7450, vramMax:7555, shP50:2574, shMax:2605, claimed:7848.2, procVramMean:6138, procVramMax:6141, procSharedMean:2415.7, procSharedMax:2429, globalVramMean:7449.8, globalVramMax:7555, globalSharedMean:2574, globalSharedMax:2605},
+  {ngl:20, ctx:1024, n:1, ppP50:32.66, ppMax:32.66, ttftP50:27470, ttftMax:27470, e2eP50:27471, e2eMax:27471, tgP50:12.47, tgMax:12.47, spillP50:2037.6, spillMin:2037.6, spillMax:2037.6, vramP50:7137, vramMax:7298, shP50:2769, shMax:2818, claimed:8484.6, procVramMean:6422.2, procVramMax:6447, procSharedMean:2671.9, procSharedMax:2705, globalVramMean:7137.4, globalVramMax:7298, globalSharedMean:2769.2, globalSharedMax:2818},
+  {ngl:20, ctx:2048, n:1, ppP50:35.71, ppMax:35.71, ttftP50:30323, ttftMax:30323, e2eP50:53798, e2eMax:53798, tgP50:12.08, tgMax:12.08, spillP50:2042.6, spillMin:2042.6, spillMax:2042.6, vramP50:7204, vramMax:7308, shP50:2819, shMax:2849, claimed:8499.6, procVramMean:6440.4, procVramMax:6457, procSharedMean:2717, procSharedMax:2736, globalVramMean:7204.2, globalVramMax:7308, globalSharedMean:2819.2, globalSharedMax:2849},
+  {ngl:20, ctx:8192, n:1, ppP50:37.42, ppMax:37.42, ttftP50:30321, ttftMax:30321, e2eP50:215530, e2eMax:215530, tgP50:10.37, tgMax:10.37, spillP50:2092.1, spillMin:2092.1, spillMax:2092.1, vramP50:7307, vramMax:7346, shP50:2896, shMax:2914, claimed:8580.1, procVramMean:6482.5, procVramMax:6488, procSharedMean:2785.8, procSharedMax:2792, globalVramMean:7307.3, globalVramMax:7346, globalSharedMean:2896.5, globalSharedMax:2914},
+  {ngl:20, ctx:16384, n:1, ppP50:35.08, ppMax:35.08, ttftP50:30324, ttftMax:30324, e2eP50:463495, e2eMax:463495, tgP50:8.02, tgMax:8.02, spillP50:2221.1, spillMin:2221.1, spillMax:2221.1, vramP50:7278, vramMax:7294, shP50:3038, shMax:3054, claimed:8660.1, procVramMean:6435.8, procVramMax:6439, procSharedMean:2936.4, procSharedMax:2950, globalVramMean:7277.5, globalVramMax:7294, globalSharedMean:3037.7, globalSharedMax:3054},
+  {ngl:23, ctx:1024, n:1, ppP50:33.5, ppMax:33.5, ttftP50:26776, ttftMax:26776, e2eP50:26776, e2eMax:26776, tgP50:11.49, tgMax:11.49, spillP50:3170.3, spillMin:3170.3, spillMax:3170.3, vramP50:7221, vramMax:7380, shP50:3898, shMax:3952, claimed:9695.3, procVramMean:6498.8, procVramMax:6525, procSharedMean:3808.8, procSharedMax:3848, globalVramMean:7221.5, globalVramMax:7380, globalSharedMean:3897.7, globalSharedMax:3952},
+  {ngl:23, ctx:2048, n:1, ppP50:36.63, ppMax:36.63, ttftP50:30326, ttftMax:30326, e2eP50:52438, e2eMax:52438, tgP50:11.08, tgMax:11.08, spillP50:3175.3, spillMin:3175.3, spillMax:3175.3, vramP50:7286, vramMax:7392, shP50:3949, shMax:3984, claimed:9712.3, procVramMean:6518.8, procVramMax:6537, procSharedMean:3854.6, procSharedMax:3879, globalVramMean:7286.4, globalVramMax:7392, globalSharedMean:3948.9, globalSharedMax:3984},
+  {ngl:23, ctx:8192, n:1, ppP50:38.32, ppMax:38.32, ttftP50:30297, ttftMax:30297, e2eP50:210471, e2eMax:210471, tgP50:9.9, tgMax:9.9, spillP50:3228.8, spillMin:3228.8, spillMax:3228.8, vramP50:7396, vramMax:7431, shP50:4031, shMax:4044, claimed:9804.8, procVramMean:6569.6, procVramMax:6576, procSharedMean:3930.6, procSharedMax:3939, globalVramMean:7396, globalVramMax:7431, globalSharedMean:4031, globalSharedMax:4044},
+  {ngl:23, ctx:16384, n:1, ppP50:35.81, ppMax:35.81, ttftP50:30326, ttftMax:30326, e2eP50:454030, e2eMax:454030, tgP50:7.82, tgMax:7.82, spillP50:3385.8, spillMin:3385.8, spillMax:3385.8, vramP50:7353, vramMax:7371, shP50:4211, shMax:4229, claimed:9900.8, procVramMean:6511.6, procVramMax:6515, procSharedMean:4109.9, procSharedMax:4125, globalVramMean:7353.2, globalVramMax:7371, globalSharedMean:4210.8, globalSharedMax:4229},
+  {ngl:26, ctx:1024, n:1, ppP50:34.17, ppMax:34.17, ttftP50:26259, ttftMax:26259, e2eP50:26260, e2eMax:26260, tgP50:10.81, tgMax:10.81, spillP50:4298, spillMin:4298, spillMax:4298, vramP50:7304, vramMax:7462, shP50:5032, shMax:5088, claimed:10906, procVramMean:6581.9, procVramMax:6608, procSharedMean:4943.1, procSharedMax:4983, globalVramMean:7304.2, globalVramMax:7462, globalSharedMean:5032.3, globalSharedMax:5088},
+  {ngl:26, ctx:2048, n:1, ppP50:37.34, ppMax:37.34, ttftP50:30308, ttftMax:30308, e2eP50:51452, e2eMax:51452, tgP50:10.64, tgMax:10.64, spillP50:4175, spillMin:4175, spillMax:4175, vramP50:7469, vramMax:7579, shP50:4942, shMax:4991, claimed:10925, procVramMean:6731.5, procVramMax:6750, procSharedMean:4860.7, procSharedMax:4887, globalVramMean:7468.7, globalVramMax:7579, globalSharedMean:4942.3, globalSharedMax:4991},
+  {ngl:26, ctx:8192, n:1, ppP50:38.14, ppMax:38.14, ttftP50:30296, ttftMax:30296, e2eP50:211475, e2eMax:211475, tgP50:9.08, tgMax:9.08, spillP50:4306.5, spillMin:4306.5, spillMax:4306.5, vramP50:7517, vramMax:7551, shP50:5112, shMax:5130, claimed:11029.5, procVramMean:6717.4, procVramMax:6723, procSharedMean:5015.6, procSharedMax:5025, globalVramMean:7516.5, globalVramMax:7551, globalSharedMean:5112.1, globalSharedMax:5130},
+  {ngl:26, ctx:16384, n:1, ppP50:36.42, ppMax:36.42, ttftP50:30300, ttftMax:30300, e2eP50:446378, e2eMax:446378, tgP50:7.59, tgMax:7.59, spillP50:4416.5, spillMin:4416.5, spillMax:4416.5, vramP50:7535, vramMax:7553, shP50:5250, shMax:5269, claimed:11141.5, procVramMean:6720.8, procVramMax:6725, procSharedMean:5148.1, procSharedMax:5164, globalVramMean:7535, globalVramMax:7553, globalSharedMean:5249.7, globalSharedMax:5269},
+  {ngl:29, ctx:1024, n:1, ppP50:34.85, ppMax:34.85, ttftP50:25746, ttftMax:25746, e2eP50:25746, e2eMax:25746, tgP50:10.43, tgMax:10.43, spillP50:5315.8, spillMin:5315.8, spillMax:5315.8, vramP50:7571, vramMax:7599, shP50:6063, shMax:6117, claimed:12123.8, procVramMean:6782.5, procVramMax:6808, procSharedMean:5972.4, procSharedMax:6012, globalVramMean:7571.1, globalVramMax:7599, globalSharedMean:6062.8, globalSharedMax:6117},
+  {ngl:29, ctx:2048, n:1, ppP50:34.12, ppMax:34.12, ttftP50:30287, ttftMax:30287, e2eP50:56311, e2eMax:56311, tgP50:10.25, tgMax:10.25, spillP50:5367.8, spillMin:5367.8, spillMax:5367.8, vramP50:7560, vramMax:7566, shP50:6148, shMax:6195, claimed:12142.8, procVramMean:6770.6, procVramMax:6775, procSharedMean:6055.4, procSharedMax:6091, globalVramMean:7559.6, globalVramMax:7566, globalSharedMean:6147.7, globalSharedMax:6195},
+  {ngl:29, ctx:8192, n:1, ppP50:38.8, ppMax:38.8, ttftP50:30227, ttftMax:30227, e2eP50:207888, e2eMax:207888, tgP50:8.79, tgMax:8.79, spillP50:5452.3, spillMin:5452.3, spillMax:5452.3, vramP50:7580, vramMax:7586, shP50:6273, shMax:6287, claimed:12247.3, procVramMean:6789.2, procVramMax:6795, procSharedMean:6173, procSharedMax:6182, globalVramMean:7579.6, globalVramMax:7586, globalSharedMean:6273.1, globalSharedMax:6287},
+  {ngl:29, ctx:16384, n:1, ppP50:37, ppMax:37, ttftP50:30319, ttftMax:30319, e2eP50:439417, e2eMax:439417, tgP50:7.47, tgMax:7.47, spillP50:5563.3, spillMin:5563.3, spillMax:5563.3, vramP50:7584, vramMax:7588, shP50:6414, shMax:6434, claimed:12359.3, procVramMean:6792.5, procVramMax:6796, procSharedMean:6305.4, procSharedMax:6321, globalVramMean:7583.9, globalVramMax:7588, globalSharedMean:6414.4, globalSharedMax:6434},
+  {ngl:32, ctx:1024, n:1, ppP50:36.06, ppMax:36.06, ttftP50:24885, ttftMax:24885, e2eP50:24886, e2eMax:24886, tgP50:9.86, tgMax:9.86, spillP50:6573.5, spillMin:6573.5, spillMax:6573.5, vramP50:7391, vramMax:7552, shP50:7292, shMax:7395, claimed:13334.5, procVramMean:6733, procVramMax:6761, procSharedMean:7233.9, procSharedMax:7281, globalVramMean:7390.7, globalVramMax:7552, globalSharedMean:7292.3, globalSharedMax:7395},
+  {ngl:32, ctx:2048, n:1, ppP50:35.08, ppMax:35.08, ttftP50:30333, ttftMax:30333, e2eP50:54758, e2eMax:54758, tgP50:9.73, tgMax:9.73, spillP50:6625.5, spillMin:6625.5, spillMax:6625.5, vramP50:7431, vramMax:7521, shP50:7392, shMax:7473, claimed:13355.5, procVramMean:6724, procVramMax:6730, procSharedMean:7317.3, procSharedMax:7360, globalVramMean:7431.3, globalVramMax:7521, globalSharedMean:7391.9, globalSharedMax:7473},
+  {ngl:32, ctx:8192, n:1, ppP50:39.56, ppMax:39.56, ttftP50:30295, ttftMax:30295, e2eP50:203892, e2eMax:203892, tgP50:8.31, tgMax:8.31, spillP50:6727, spillMin:6727, spillMax:6727, vramP50:7501, vramMax:7537, shP50:7553, shMax:7580, claimed:13472, procVramMean:6738.9, procVramMax:6745, procSharedMean:7454.5, procSharedMax:7467, globalVramMean:7501.3, globalVramMax:7537, globalSharedMean:7553.1, globalSharedMax:7580},
+  {ngl:32, ctx:16384, n:1, ppP50:37.55, ppMax:37.55, ttftP50:30317, ttftMax:30317, e2eP50:432942, e2eMax:432942, tgP50:7.3, tgMax:7.3, spillP50:6853, spillMin:6853, spillMax:6853, vramP50:7520, vramMax:7539, shP50:7707, shMax:7735, claimed:13600, procVramMean:6743.1, procVramMax:6747, procSharedMean:7603.3, procSharedMax:7622, globalVramMean:7520.1, globalVramMax:7539, globalSharedMean:7707.4, globalSharedMax:7735},
+  {ngl:35, ctx:1024, n:1, ppP50:23.78, ppMax:23.78, ttftP50:30381, ttftMax:30381, e2eP50:37727, e2eMax:37727, tgP50:8.97, tgMax:8.97, spillP50:7789.7, spillMin:7789.7, spillMax:7789.7, vramP50:7483, vramMax:7525, shP50:8538, shMax:8617, claimed:14532.7, procVramMean:6735.1, procVramMax:6743, procSharedMean:8439, procSharedMax:8504, globalVramMean:7483.4, globalVramMax:7525, globalSharedMean:8537.9, globalSharedMax:8617},
+  {ngl:35, ctx:2048, n:1, ppP50:30.7, ppMax:30.7, ttftP50:30317, ttftMax:30317, e2eP50:62579, e2eMax:62579, tgP50:8.96, tgMax:8.96, spillP50:7807.2, spillMin:7807.2, spillMax:7807.2, vramP50:7482, vramMax:7491, shP50:8607, shMax:8661, claimed:14568.2, procVramMean:6754.9, procVramMax:6761, procSharedMean:8504.3, procSharedMax:8548, globalVramMean:7482.5, globalVramMax:7491, globalSharedMean:8607, globalSharedMax:8661},
+  {ngl:35, ctx:8192, n:1, ppP50:38.06, ppMax:38.06, ttftP50:30253, ttftMax:30253, e2eP50:211894, e2eMax:211894, tgP50:7.98, tgMax:7.98, spillP50:7923.7, spillMin:7923.7, spillMax:7923.7, vramP50:7493, vramMax:7502, shP50:8765, shMax:8784, claimed:14696.7, procVramMean:6764.3, procVramMax:6773, procSharedMean:8657, procSharedMax:8671, globalVramMean:7492.7, globalVramMax:7502, globalSharedMean:8765, globalSharedMax:8784},
+  {ngl:35, ctx:16384, n:1, ppP50:36.36, ppMax:36.36, ttftP50:32510, ttftMax:32510, e2eP50:449304, e2eMax:449304, tgP50:7.16, tgMax:7.16, spillP50:8035.7, spillMin:8035.7, spillMax:8035.7, vramP50:7529, vramMax:7535, shP50:8900, shMax:8923, claimed:14840.7, procVramMean:6799.7, procVramMax:6805, procSharedMean:8790.2, procSharedMax:8810, globalVramMean:7528.9, globalVramMax:7535, globalSharedMean:8900.1, globalSharedMax:8923},
+  {ngl:38, ctx:1024, n:1, ppP50:23.09, ppMax:23.09, ttftP50:35973, ttftMax:35973, e2eP50:44302, e2eMax:44302, tgP50:8.58, tgMax:8.58, spillP50:8927.4, spillMin:8927.4, spillMax:8927.4, vramP50:7530, vramMax:7543, shP50:9644, shMax:9765, claimed:15740.4, procVramMean:6802.5, procVramMax:6813, procSharedMean:9541, procSharedMax:9652, globalVramMean:7529.8, globalVramMax:7543, globalSharedMean:9644.2, globalSharedMax:9765},
+  {ngl:38, ctx:2048, n:1, ppP50:34.4, ppMax:34.4, ttftP50:30666, ttftMax:30666, e2eP50:56235, e2eMax:56235, tgP50:8.56, tgMax:8.56, spillP50:8927.4, spillMin:8927.4, spillMax:8927.4, vramP50:7552, vramMax:7563, shP50:9712, shMax:9791, claimed:15760.4, procVramMean:6824.7, procVramMax:6833, procSharedMean:9609.7, procSharedMax:9678, globalVramMean:7552.3, globalVramMax:7563, globalSharedMean:9712.2, globalSharedMax:9791},
+  {ngl:38, ctx:8192, n:1, ppP50:25.74, ppMax:25.74, ttftP50:30464, ttftMax:30464, e2eP50:313539, e2eMax:313539, tgP50:7.71, tgMax:7.71, spillP50:9087.4, spillMin:9087.4, spillMax:9087.4, vramP50:7521, vramMax:7523, shP50:9928, shMax:9957, claimed:15880.4, procVramMean:6791.1, procVramMax:6793, procSharedMean:9818.4, procSharedMax:9844, globalVramMean:7520.7, globalVramMax:7523, globalSharedMean:9927.9, globalSharedMax:9957},
+  {ngl:38, ctx:16384, n:1, ppP50:18.84, ppMax:18.84, ttftP50:33214, ttftMax:33214, e2eP50:865553, e2eMax:865553, tgP50:7, tgMax:7, spillP50:9246.4, spillMin:9246.4, spillMax:9246.4, vramP50:7523, vramMax:7524, shP50:10115, shMax:10125, claimed:16040.4, procVramMean:6793.3, procVramMax:6794, procSharedMean:10003.6, procSharedMax:10012, globalVramMean:7523.2, globalVramMax:7524, globalSharedMean:10114.7, globalSharedMax:10125},
+  {ngl:41, ctx:1024, n:1, ppP50:35.76, ppMax:35.76, ttftP50:25111, ttftMax:25111, e2eP50:25114, e2eMax:25114, tgP50:8.47, tgMax:8.47, spillP50:10012.2, spillMin:10012.2, spillMax:10012.2, vramP50:7527, vramMax:7554, shP50:10651, shMax:10708, claimed:16836.2, procVramMean:6801, procVramMax:6824, procSharedMean:10542.9, procSharedMax:10595, globalVramMean:7527.2, globalVramMax:7554, globalSharedMean:10650.8, globalSharedMax:10708},
+  {ngl:41, ctx:2048, n:1, ppP50:39.32, ppMax:39.32, ttftP50:30336, ttftMax:30336, e2eP50:48888, e2eMax:48888, tgP50:8.18, tgMax:8.18, spillP50:10028.2, spillMin:10028.2, spillMax:10028.2, vramP50:7528, vramMax:7558, shP50:10689, shMax:10726, claimed:16857.2, procVramMean:6801.8, procVramMax:6829, procSharedMean:10579.8, procSharedMax:10613, globalVramMean:7528.3, globalVramMax:7558, globalSharedMean:10688.6, globalSharedMax:10726},
+  {ngl:41, ctx:8192, n:0, failed:true, failNote:"did not load in 120s", ppP50:null, ppMax:null, ttftP50:null, ttftMax:null, e2eP50:null, e2eMax:null, tgP50:null, tgMax:null, spillP50:null, spillMin:null, spillMax:null, vramP50:null, vramMax:null, shP50:null, shMax:null, claimed:null, procVramMean:null, procVramMax:null, procSharedMean:null, procSharedMax:null, globalVramMean:null, globalVramMax:null, globalSharedMean:null, globalSharedMax:null},
+  {ngl:41, ctx:16384, n:0, failed:true, failNote:"not attempted", ppP50:null, ppMax:null, ttftP50:null, ttftMax:null, e2eP50:null, e2eMax:null, tgP50:null, tgMax:null, spillP50:null, spillMin:null, spillMax:null, vramP50:null, vramMax:null, shP50:null, shMax:null, claimed:null, procVramMean:null, procVramMax:null, procSharedMean:null, procSharedMax:null, globalVramMean:null, globalVramMax:null, globalSharedMean:null, globalSharedMax:null},
+];
+// llama.cpp's own view of free device memory, from `llama-server --list-devices`,
+// read immediately before every load of the ngl 16/18 sweep.
+const LIST_DEVICES_FREE = {p50: 7378, min: 7378, max: 7378, n: 24};
+const CTXS = [1024,2048,8192,16384];
+const CTX_LABELS = {1024:"1k",2048:"2k",8192:"8k",16384:"16k"};
+// Ascending, derived from the data itself: ngl is an ORDERED quantity, so the
+// ramp maps position in this list rather than assigning arbitrary hues.
+const NGLS = [...new Set(DATA.map(d=>d.ngl))].sort((a,b)=>a-b);
+
+// ---- the ngl ramp, interpolated in OKLab between two theme tokens ----------
+function parseHex(hex){
+  const h = hex.trim().replace('#','');
+  const n = h.length===3 ? h.split('').map(c=>c+c).join('') : h;
+  return [0,2,4].map(i=>parseInt(n.slice(i,i+2),16));
+}
+const toLinear = c => { c/=255; return c<=0.04045 ? c/12.92 : Math.pow((c+0.055)/1.055, 2.4); };
+const toSrgb = c => {
+  const v = c<=0.0031308 ? 12.92*c : 1.055*Math.pow(Math.max(c,0),1/2.4)-0.055;
+  return Math.min(255, Math.max(0, Math.round(v*255)));
+};
+function rgbToOklab(rgb){
+  const [r,g,b] = rgb.map(toLinear);
+  const l = Math.cbrt(0.4122214708*r + 0.5363325363*g + 0.0514459929*b);
+  const m = Math.cbrt(0.2119034982*r + 0.6806995451*g + 0.1073969566*b);
+  const s = Math.cbrt(0.0883024619*r + 0.2817188376*g + 0.6299787005*b);
+  return [
+    0.2104542553*l + 0.7936177850*m - 0.0040720468*s,
+    1.9779984951*l - 2.4285922050*m + 0.4505937099*s,
+    0.0259040371*l + 0.7827717662*m - 0.8086757660*s,
+  ];
+}
+function oklabToHex(lab){
+  const [L,a,b] = lab;
+  const l = Math.pow(L + 0.3963377774*a + 0.2158037573*b, 3);
+  const m = Math.pow(L - 0.1055613458*a - 0.0638541728*b, 3);
+  const s = Math.pow(L - 0.0894841775*a - 1.2914855480*b, 3);
+  const rgb = [
+    toSrgb( 4.0767416621*l - 3.3077115913*m + 0.2309699292*s),
+    toSrgb(-1.2684380046*l + 2.6097574011*m - 0.3413193965*s),
+    toSrgb(-0.0041960863*l - 0.7034186147*m + 1.7076147010*s),
+  ];
+  return '#' + rgb.map(v=>v.toString(16).padStart(2,'0')).join('');
+}
+let rampCache = null;
+function buildRamp(){
+  const cs = getComputedStyle(document.documentElement);
+  const lo = rgbToOklab(parseHex(cs.getPropertyValue('--ramp-lo') || '#c8842a'));
+  const hi = rgbToOklab(parseHex(cs.getPropertyValue('--ramp-hi') || '#4a1220'));
+  const n = Math.max(1, NGLS.length - 1);
+  rampCache = NGLS.map((_, i) => oklabToHex(lo.map((v,k) => v + (hi[k]-v) * (i/n))));
+}
+function seriesColor(ngl){
+  if (!rampCache) buildRamp();
+  const i = NGLS.indexOf(ngl);
+  return rampCache[i < 0 ? 0 : i];
+}
+
+// ---- click-to-isolate, shared by every chart on the page -------------------
+const selected = new Set();
+function applyHighlight(){
+  const any = selected.size > 0;
+  document.querySelectorAll('svg.chart [data-series]').forEach(el=>{
+    const ngl = Number(el.getAttribute('data-series'));
+    const on = selected.has(ngl);
+    el.setAttribute('data-dimmed', (any && !on) ? 'true' : 'false');
+    if (el.getAttribute('data-role') === 'value-label') el.style.display = on ? '' : 'none';
+    if (el.getAttribute('data-role') === 'line') el.setAttribute('stroke-width', on ? '3.6' : '2.2');
+  });
+  document.querySelectorAll('.legend button[data-series]').forEach(b=>{
+    b.setAttribute('aria-pressed', selected.has(Number(b.getAttribute('data-series'))) ? 'true' : 'false');
+  });
+  document.querySelectorAll('.legend-reset').forEach(b=>{ b.hidden = !any; });
+}
+function toggleSeries(ngl){
+  if (selected.has(ngl)) selected.delete(ngl); else selected.add(ngl);
+  applyHighlight();
+}
+function buildLegend(el){
+  el.innerHTML = '';
+  const label = document.createElement('span');
+  label.className = 'legend-label';
+  label.textContent = 'ngl';
+  label.style.cssText = 'font-family:var(--mono);font-size:0.72rem;color:var(--muted);align-self:center;margin-right:0.15rem;';
+  el.appendChild(label);
+  NGLS.forEach(ngl=>{
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.setAttribute('data-series', String(ngl));
+    b.setAttribute('aria-pressed', 'false');
+    b.innerHTML = '<span class="swatch" style="background:'+seriesColor(ngl)+'"></span>'+ngl;
+    b.addEventListener('click', ()=>toggleSeries(ngl));
+    el.appendChild(b);
+  });
+  const reset = document.createElement('button');
+  reset.type = 'button';
+  reset.className = 'legend-reset';
+  reset.textContent = 'show all';
+  reset.hidden = true;
+  reset.addEventListener('click', ()=>{ selected.clear(); applyHighlight(); });
+  el.appendChild(reset);
+}
+
+function fmt(n, d=1){ return n==null || isNaN(n) ? '\u2014' : n.toFixed(d); }
+function fmtTime(ms){
+  if (ms==null) return '\u2014';
+  const s = ms/1000;
+  return s<60 ? s.toFixed(1)+'s' : (s/60).toFixed(1)+'m';
+}
+
+// ---- results table (sortable) ----
+const tbody = document.getElementById('results-body');
+const mib = v => v == null ? '\u2014' : Math.round(v).toLocaleString();
+const SORT_KEYS = {
+  ngl: d => d.ngl, ctx: d => d.ctx, n: d => d.n,
+  pp: d => d.ppP50, tg: d => d.tgP50, spill: d => d.spillP50,
+  claimed: d => d.claimed, held: d => d.procVramMean, shared: d => d.procSharedMean,
+};
+// Default order is the ladder itself; ties always fall back to ngl then ctx so
+// a sort never scrambles rows it has no opinion about.
+let sortState = {key: 'ngl', dir: 1};
+function sortedRows(){
+  const get = SORT_KEYS[sortState.key];
+  return [...DATA].sort((a,b)=>{
+    const va = get(a), vb = get(b);
+    // Rows with no measurement always sink to the bottom, whichever direction.
+    if (va == null && vb == null) return a.ngl-b.ngl || a.ctx-b.ctx;
+    if (va == null) return 1;
+    if (vb == null) return -1;
+    return (va-vb)*sortState.dir || a.ngl-b.ngl || a.ctx-b.ctx;
+  });
+}
+function setSort(key){
+  sortState = sortState.key === key ? {key, dir: -sortState.dir} : {key, dir: key === 'ngl' || key === 'ctx' ? 1 : -1};
+  renderTable();
+}
+document.querySelectorAll('#results-table thead button[data-sort]').forEach(b=>{
+  b.addEventListener('click', ()=>setSort(b.getAttribute('data-sort')));
+});
+function renderTable(){
+  document.querySelectorAll('#results-table thead th').forEach(th=>{
+    const b = th.querySelector('button[data-sort]');
+    if (!b) return;
+    const active = b.getAttribute('data-sort') === sortState.key;
+    th.setAttribute('aria-sort', active ? (sortState.dir > 0 ? 'ascending' : 'descending') : 'none');
+    b.querySelector('.sort-ind').textContent = active ? (sortState.dir > 0 ? '\u25b2' : '\u25bc') : '';
+  });
+  tbody.innerHTML = '';
+  sortedRows().forEach(renderRow);
+}
+function renderRow(d){
+  const tr = document.createElement('tr');
+  const head =
+    '<td><span class="dot" style="background:'+seriesColor(d.ngl)+'"></span>'+d.ngl+'</td>'+
+    '<td>'+CTX_LABELS[d.ctx]+'</td>';
+
+  if (d.failed){
+    tr.innerHTML = head + '<td>0</td><td colspan="6" style="text-align:left;color:var(--muted)">'+d.failNote+'</td>';
+    tbody.appendChild(tr);
+    return;
+  }
+
+  const tier = d.spillP50 > 200 ? 'spill' : d.spillP50 > 20 ? 'spill-small' : 'clean';
+  const spread = (d.spillMin != null && d.spillMax != null) ? Math.abs(d.spillMax - d.spillMin) : 0;
+  const sgn = v => (v>=0?'+':'') + Math.round(v).toLocaleString();
+  const spillRangeText = spread > 1 ? sgn(d.spillMin)+'\u2026'+sgn(d.spillMax) : sgn(d.spillP50);
+  // With one sample there is no "highest of N" to report -- show the single value.
+  const pair = (p50, max, dp) => d.n > 1
+    ? fmt(p50,dp)+' <span style="color:var(--muted)">('+fmt(max,dp)+')</span>'
+    : fmt(p50,dp);
+  tr.innerHTML = head +
+    '<td>'+d.n+'</td>'+
+    '<td>'+pair(d.ppP50, d.ppMax, 1)+'</td>'+
+    '<td>'+pair(d.tgP50, d.tgMax, 2)+'</td>'+
+    '<td><span class="tag '+tier+'">'+spillRangeText+' MiB</span></td>'+
+    '<td>'+mib(d.claimed)+'</td>'+
+    '<td>'+mib(d.procVramMean)+'</td>'+
+    '<td>'+mib(d.procSharedMean)+'</td>';
+  tbody.appendChild(tr);
+}
+
+// ---- chart engine (tiny, hand-rolled, no library) ----
+// Every drawn element carries data-series="<ngl>" so the legend's isolate
+// interaction can dim/undim without a redraw. Point value labels are hidden
+// until a rung is selected -- with this many series, labelling every point
+// would be unreadable.
+const SVG_NS = 'http://www.w3.org/2000/svg';
+const mk = (tag, attrs) => {
+  const el = document.createElementNS(SVG_NS, tag);
+  for (const k in attrs) el.setAttribute(k, attrs[k]);
+  return el;
+};
+
+function attachTip(g, html){
+  const tip = document.getElementById('tooltip');
+  g.addEventListener('mouseenter', ()=>{ tip.innerHTML = html; tip.style.opacity = 1; });
+  g.addEventListener('mousemove', e=>{ tip.style.left = e.clientX+'px'; tip.style.top = e.clientY+'px'; });
+  g.addEventListener('mouseleave', ()=>{ tip.style.opacity = 0; });
+}
+
+// Axis domains are derived from the data rather than hardcoded, so the charts
+// stay correctly scaled as rungs are added to the ladder.
+function niceDomain(values, opts){
+  const vals = values.filter(v => v != null && Number.isFinite(v));
+  if (vals.length === 0) return {yMin:0, yMax:1, yStep:1};
+  const rawMax = Math.max(...vals);
+  const rawMin = Math.min(...vals, 0);
+  const span = (rawMax - rawMin) || Math.abs(rawMax) || 1;
+  const rough = span / (opts && opts.targetTicks ? opts.targetTicks : 6);
+  const mag = Math.pow(10, Math.floor(Math.log10(rough)));
+  const step = [1, 2, 2.5, 5, 10].map(m => m*mag).find(s => s >= rough) || 10*mag;
+  const yMax = Math.ceil((rawMax + span*0.06) / step) * step;
+  // A small negative tail (a noise-level reading below zero) shouldn't cost a
+  // whole gridline's worth of empty axis -- floor it to a quarter step instead.
+  const minStep = Math.abs(rawMin) < step ? step/4 : step;
+  const yMin = rawMin < 0 ? Math.floor(rawMin / minStep) * minStep : 0;
+  return {yMin, yMax, yStep: step};
+}
+function domainFor(fields, opts){
+  const vals = [];
+  DATA.forEach(d => fields.forEach(f => vals.push(d[f])));
+  if (opts && opts.include) vals.push(...opts.include);
+  return niceDomain(vals, opts);
+}
+
+function drawFrame(svg, opts){
+  const {W,H,mL,mR,mT,mB,yMin,yMax,yStep} = opts;
+  const plotW = W-mL-mR, plotH = H-mT-mB;
+  const yFor = v => mT + plotH - ((v-yMin)/(yMax-yMin))*plotH;
+  svg.innerHTML = '';
+  // Ticks are anchored to multiples of the step, not to yMin, so zero always
+  // lands on a gridline -- it's the meaningful boundary on the spill charts.
+  for (let v=Math.ceil(yMin/yStep)*yStep; v<=yMax+1e-9; v+=yStep){
+    const y = yFor(v);
+    svg.appendChild(mk('line',{class: (v===0 && yMin<0) ? 'zeroline':'gridline', x1:mL, x2:W-mR, y1:y, y2:y}));
+    const t = mk('text',{class:'axis-label', x:mL-10, y:y+4, 'text-anchor':'end'});
+    t.textContent = v;
+    svg.appendChild(t);
+  }
+  return {plotW, plotH, yFor};
+}
+
+function buildLineChart(svgId, legendId, metricKey, opts){
+  const svg = document.getElementById(svgId);
+  const legend = document.getElementById(legendId);
+  const geom = {W:900, H:420, mL:58, mR:22, mT:18, mB:42, ...opts};
+  const {W,H,mL,mR,mT,mB} = geom;
+  const {yMax, valueFmt, unit, showWhiskers} = opts;
+  const {plotW, plotH, yFor} = drawFrame(svg, geom);
+  const xFor = i => mL + (i/(CTXS.length-1))*plotW;
+
+  CTXS.forEach((c,i)=>{
+    const t = mk('text',{class:'axis-label', x:xFor(i), y:H-12, 'text-anchor':'middle'});
+    t.textContent = CTX_LABELS[c];
+    svg.appendChild(t);
+  });
+  const xt = mk('text',{class:'axis-title', x:mL+plotW/2, y:H-0, 'text-anchor':'middle'});
+  xt.textContent = 'context';
+  svg.appendChild(xt);
+
+  NGLS.forEach(ngl=>{
+    const color = seriesColor(ngl);
+    const pts = CTXS.map((c,i)=>{
+      const row = DATA.find(d=>d.ngl===ngl && d.ctx===c);
+      if (!row || row[metricKey+'P50'] == null) return null;
+      return {x:xFor(i), y:yFor(row[metricKey+'P50']), v:row[metricKey+'P50'],
+              min:row[metricKey+'Min'], max:row[metricKey+'Max'], ctx:c};
+    }).filter(Boolean);
+    if (pts.length === 0) return;
+
+    const path = pts.map((p,i)=>(i===0?'M':'L')+p.x.toFixed(1)+','+p.y.toFixed(1)).join(' ');
+    svg.appendChild(mk('path',{d:path, fill:'none', stroke:color, 'stroke-width':2.2,
+      'stroke-linecap':'round', 'stroke-linejoin':'round',
+      'data-series':ngl, 'data-role':'line', 'data-dimmed':'false'}));
+
+    pts.forEach((p,i)=>{
+      const g = mk('g',{class:'mark', 'data-series':ngl, 'data-dimmed':'false'});
+      if (showWhiskers && p.min!=null && p.max!=null && Math.abs(p.max-p.min) > (yMax-geom.yMin)*0.01){
+        g.appendChild(mk('line',{x1:p.x, x2:p.x, y1:yFor(p.max), y2:yFor(p.min),
+          stroke:color, 'stroke-width':1.6, opacity:0.55}));
+      }
+      g.appendChild(mk('circle',{cx:p.x, cy:p.y, r:4.6, fill:color, stroke:'var(--surface)', 'stroke-width':1.6}));
+      g.appendChild(mk('circle',{class:'hit', cx:p.x, cy:p.y, r:16}));
+      const rangeText = p.min!=null && Math.abs(p.max-p.min)>0.05
+        ? ' (range '+valueFmt(p.min)+'&ndash;'+valueFmt(p.max)+')' : '';
+      attachTip(g, 'ngl '+ngl+' &middot; ctx '+CTX_LABELS[p.ctx]+'<br>'+opts.tipLabel+
+        ': <strong>'+valueFmt(p.v)+' '+unit+'</strong>'+rangeText);
+      svg.appendChild(g);
+
+      const above = metricKey==='spill' ? p.v < 0 : true;
+      const label = mk('text',{class:'value-label', x:p.x, y: above ? p.y-11 : p.y+18,
+        'text-anchor': i===0?'start' : i===pts.length-1?'end' : 'middle', fill:color,
+        'data-series':ngl, 'data-role':'value-label', 'data-dimmed':'false'});
+      label.textContent = valueFmt(p.v);
+      label.style.display = 'none';
+      svg.appendChild(label);
+    });
+  });
+
+  buildLegend(legend);
+}
+
+function buildScatterChart(svgId, legendId){
+  const svg = document.getElementById(svgId);
+  const legend = document.getElementById(legendId);
+  const geom = {W:900, H:440, mL:58, mR:22, mT:18, mB:46, ...domainFor(['ppP50'])};
+  const {W,H,mL,mR,mT,mB} = geom;
+  const xDom = domainFor(['spillP50'], {targetTicks:6});
+  const xMin = xDom.yMin, xMax = xDom.yMax, xStep = xDom.yStep;
+  const {plotW, plotH, yFor} = drawFrame(svg, geom);
+  const xFor = v => mL + ((v-xMin)/(xMax-xMin))*plotW;
+
+  for (let v=Math.ceil(xMin/xStep)*xStep; v<=xMax+1e-9; v+=xStep){
+    const x = xFor(v);
+    svg.appendChild(mk('line',{class: v===0?'zeroline':'gridline', x1:x, x2:x, y1:mT, y2:H-mB, opacity:v===0?1:0.5}));
+    const t = mk('text',{class:'axis-label', x:x, y:H-16, 'text-anchor':'middle'});
+    t.textContent = Math.abs(v) >= 1000 ? (v/1000)+'k' : v;
+    svg.appendChild(t);
+  }
+  const xTitle = mk('text',{class:'axis-title', x:mL+plotW/2, y:H-1, 'text-anchor':'middle'});
+  xTitle.textContent = 'measured spill, MiB';
+  svg.appendChild(xTitle);
+
+  DATA.forEach(d=>{
+    if (d.ppP50 == null || d.spillP50 == null) return;
+    const color = seriesColor(d.ngl);
+    const cx = xFor(Math.max(xMin, Math.min(xMax, d.spillP50)));
+    const cy = yFor(d.ppP50);
+    const g = mk('g',{class:'mark', 'data-series':d.ngl, 'data-dimmed':'false'});
+    g.appendChild(mk('circle',{cx, cy, r:5.6, fill:color, stroke:'var(--surface)', 'stroke-width':1.6, opacity:0.92}));
+    g.appendChild(mk('circle',{class:'hit', cx, cy, r:15}));
+    attachTip(g, 'ngl '+d.ngl+' &middot; ctx '+CTX_LABELS[d.ctx]+'<br>spill: <strong>'+
+      (d.spillP50>=0?'+':'')+d.spillP50.toFixed(0)+' MiB</strong> &middot; PP: <strong>'+
+      d.ppP50.toFixed(1)+' tok/s</strong>');
+    svg.appendChild(g);
+  });
+
+  buildLegend(legend);
+}
+
+function buildMemChart(svgId, legendId, valueKey, maxKey, opts){
+  const svg = document.getElementById(svgId);
+  const legend = document.getElementById(legendId);
+  const geom = {W:900, H:420, mL:64, mR:22, mT:18, mB:42, ...opts};
+  const {W,H,mL,mR,mT,mB} = geom;
+  const {yMax, yMin, valueFmt, unit} = opts;
+  const {plotW, plotH, yFor} = drawFrame(svg, geom);
+  const xFor = i => mL + (i/(CTXS.length-1))*plotW;
+
+  CTXS.forEach((c,i)=>{
+    const t = mk('text',{class:'axis-label', x:xFor(i), y:H-12, 'text-anchor':'middle'});
+    t.textContent = CTX_LABELS[c];
+    svg.appendChild(t);
+  });
+  const xt = mk('text',{class:'axis-title', x:mL+plotW/2, y:H-0, 'text-anchor':'middle'});
+  xt.textContent = 'context';
+  svg.appendChild(xt);
+
+  NGLS.forEach(ngl=>{
+    const color = seriesColor(ngl);
+    const pts = CTXS.map((c,i)=>{
+      const row = DATA.find(d=>d.ngl===ngl && d.ctx===c);
+      if (!row || row[valueKey] == null) return null;
+      return {x:xFor(i), y:yFor(row[valueKey]), v:row[valueKey], max:maxKey?row[maxKey]:null, ctx:c};
+    }).filter(Boolean);
+    if (pts.length === 0) return;
+
+    const path = pts.map((p,i)=>(i===0?'M':'L')+p.x.toFixed(1)+','+p.y.toFixed(1)).join(' ');
+    svg.appendChild(mk('path',{d:path, fill:'none', stroke:color, 'stroke-width':2.2,
+      'stroke-linecap':'round', 'stroke-linejoin':'round',
+      'data-series':ngl, 'data-role':'line', 'data-dimmed':'false'}));
+
+    pts.forEach((p,i)=>{
+      const g = mk('g',{class:'mark', 'data-series':ngl, 'data-dimmed':'false'});
+      if (p.max!=null && p.max - p.v > (yMax-yMin)*0.008){
+        g.appendChild(mk('line',{x1:p.x, x2:p.x, y1:yFor(p.max), y2:p.y, stroke:color, 'stroke-width':1.6, opacity:0.55}));
+        g.appendChild(mk('line',{x1:p.x-4, x2:p.x+4, y1:yFor(p.max), y2:yFor(p.max), stroke:color, 'stroke-width':1.6, opacity:0.55}));
+      }
+      g.appendChild(mk('circle',{cx:p.x, cy:p.y, r:4.6, fill:color, stroke:'var(--surface)', 'stroke-width':1.6}));
+      g.appendChild(mk('circle',{class:'hit', cx:p.x, cy:p.y, r:16}));
+      attachTip(g, 'ngl '+ngl+' &middot; ctx '+CTX_LABELS[p.ctx]+'<br>'+opts.tipLabel+
+        ': <strong>'+valueFmt(p.v)+' '+unit+'</strong>'+(p.max!=null ? ' (max '+valueFmt(p.max)+')' : ''));
+      svg.appendChild(g);
+
+      const label = mk('text',{class:'value-label', x:p.x, y:p.y-11,
+        'text-anchor': i===0?'start' : i===pts.length-1?'end' : 'middle', fill:color,
+        'data-series':ngl, 'data-role':'value-label', 'data-dimmed':'false'});
+      label.textContent = valueFmt(p.v);
+      label.style.display = 'none';
+      svg.appendChild(label);
+    });
+  });
+
+  // Drawn after the series so it stays legible over dense lines. Not tagged
+  // with data-series: it's a device-level reference, never dimmed.
+  if (opts.refLine){
+    const {p50, min, max, label} = opts.refLine;
+    if (max - min > 1){
+      svg.appendChild(mk('rect',{x:mL, width:plotW, y:yFor(max), height:Math.max(1, yFor(min)-yFor(max)),
+        fill:'var(--ink)', opacity:0.07}));
+    }
+    const y = yFor(p50);
+    svg.appendChild(mk('line',{class:'refline', x1:mL, x2:W-mR, y1:y, y2:y}));
+    const t = mk('text',{class:'ref-label', x:W-mR-4, y:y-8, 'text-anchor':'end'});
+    t.textContent = label;
+    svg.appendChild(t);
+  }
+
+  buildLegend(legend);
+}
+
+function drawAll(){
+  buildRamp();
+  buildLineChart('chart-pp','legend-pp','pp',
+    {...domainFor(['ppP50','ppMax']), unit:'tok/s', tipLabel:'PP', valueFmt:v=>v.toFixed(1)});
+  buildLineChart('chart-tg','legend-tg','tg',
+    {...domainFor(['tgP50','tgMax']), unit:'tok/s', tipLabel:'TG', valueFmt:v=>v.toFixed(2)});
+  buildLineChart('chart-spill','legend-spill','spill',
+    {...domainFor(['spillP50','spillMin','spillMax']), unit:'MiB', tipLabel:'spill',
+     valueFmt:v=>(v>=0?'+':'')+v.toFixed(0), showWhiskers:true});
+  buildScatterChart('chart-scatter','legend-scatter');
+  const lf = LIST_DEVICES_FREE;
+  const refLine = {...lf, label:'llama.cpp free (--list-devices): '+Math.round(lf.p50).toLocaleString()+' MiB'};
+  const refInclude = {include:[lf.min, lf.max]};
+  buildMemChart('chart-claimed','legend-claimed','claimed',null,
+    {...domainFor(['claimed'], refInclude), unit:'MiB', tipLabel:'claimed', valueFmt:v=>v.toFixed(0), refLine});
+  buildMemChart('chart-procvram','legend-procvram','procVramMean','procVramMax',
+    {...domainFor(['procVramMean','procVramMax'], refInclude), unit:'MiB', tipLabel:'VRAM (mean)', valueFmt:v=>v.toFixed(0), refLine});
+  buildMemChart('chart-procshared','legend-procshared','procSharedMean','procSharedMax',
+    {...domainFor(['procSharedMean','procSharedMax']), unit:'MiB', tipLabel:'shared (mean)', valueFmt:v=>v.toFixed(0)});
+  buildMemChart('chart-globalvram','legend-globalvram','globalVramMean','globalVramMax',
+    {...domainFor(['globalVramMean','globalVramMax'], refInclude), unit:'MiB', tipLabel:'global VRAM (mean)', valueFmt:v=>v.toFixed(0), refLine});
+  buildMemChart('chart-globalshared','legend-globalshared','globalSharedMean','globalSharedMax',
+    {...domainFor(['globalSharedMean','globalSharedMax']), unit:'MiB', tipLabel:'global shared (mean)', valueFmt:v=>v.toFixed(0)});
+  renderTable();
+  applyHighlight();
+}
+drawAll();
+if (window.matchMedia){
+  window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', drawAll);
+}
+</script>
+</body>
+</html>

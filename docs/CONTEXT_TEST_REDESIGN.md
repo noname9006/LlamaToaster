@@ -7,24 +7,20 @@ Companion reading: `docs/PROBE_CONTEXT_SCENARIOS.md` (what the ladder does per
 architecture), `shared/probeLadder.ts` (the search), `shared/vramEstimate.ts`
 (the cost model and the spill verdict).
 
-**Status.** The verdict changes in §7 are implemented, and so is the
-Wizard/Targets scenario structure (the client collapsed the six per-mode
-cards into two — Wizard dispatches `max_gpu`, Targets picks among
-`keep_context`/`fixed_offload`/`custom` via a Context/Offload/Both pin). The
-reuse widening and persisting the new verdict fields remain specification,
-not code.
+**Status (16 Sep 2026).** The search the probe runs today is §10. Sections
+2–5 and 9 describe the searches it replaced — the removed `max_gpu`,
+`max_context` and `balanced` modes, the `fine` setting, and the first
+frontier — and are kept for the reasoning behind them. §1, §6, §7 and §8 still
+hold, except that §7's single loaded-peak reading is now the fallback behind
+the per-phase readings in §10.
 
 | part | state |
 |---|---|
-| Resident slope as a required second opinion | implemented |
-| Bootstrap residency veto | implemented |
-| Pressure gate | **proposed and withdrawn** — see §7 |
-| Span-1 slope references | **proposed and withdrawn** — see §7 |
+| Measured spill rule (§7) | implemented |
 | Wizard / Targets structure | implemented |
-| Context-axis KV spill fails a rung | implemented |
-| Frontier mode — the Wizard's search (§9) | implemented |
+| Two targets, per-context order, controls, per-phase spill (§10) | implemented |
+| `max_gpu` / `max_context` / `balanced` modes, `fine` | **removed** |
 | Reuse across probes (not just batch siblings) | spec only |
-| `residentSlopeRatio` / `abstained` persisted and displayed | spec only |
 
 ---
 
@@ -53,6 +49,8 @@ never exercised it.
 
 ## 2. The candidate space
 
+> Superseded by §10 — kept for the reasoning. The search described here no longer runs.
+
 Two axes, and they are not sampled alike.
 
 | axis | grid | points | why that grid |
@@ -67,6 +65,8 @@ is the whole design; the search itself is trivial once the candidate is chosen.
 ---
 
 ## 3. How the next point is chosen
+
+> Superseded by §10 — kept for the reasoning. The search described here no longer runs.
 
 Three mechanisms, cheapest first.
 
@@ -102,6 +102,8 @@ context axis, where grid points are far apart.
 ---
 
 ## 4. Which point, concretely
+
+> Superseded by §10 — kept for the reasoning. The search described here no longer runs.
 
 Four rules decide every candidate. Nothing else is consulted, and no rule
 depends on which scenario asked.
@@ -139,6 +141,8 @@ an answer. See §9.
 ---
 
 ## 5. Which axis moves first
+
+> Superseded by §10 — kept for the reasoning. The search described here no longer runs.
 
 The offload axis is resolved first, at the floor context. Three reasons, and
 only the first is about speed:
@@ -321,6 +325,8 @@ context result should be read as *this much will allocate*, and nothing further.
 
 ## 9. The frontier — what the Wizard actually runs
 
+> Superseded by §10 — kept for the reasoning. The search described here no longer runs.
+
 §4 resolves one corner: the most layers at the cheapest context, then the
 largest context at that placement. That is a real answer to a question nobody
 asked. The question users trade against is *what does context cost in layers* —
@@ -360,6 +366,139 @@ just failed; bounding it is what keeps the walk from wandering.
 pass whose memory placement was never measured is flagged `unverified` rather than
 presented as a boundary. Rates shown beside a stop are empty-cache figures
 (§1), and are labelled as such in the UI.
+
+---
+
+## 10. Context tests v2 — two targets, one context at a time
+
+The Wizard (`frontier`) and Targets (`keep_context`, `fixed_offload`) find
+two answers from the same loads (`shared/probeLadder.ts`, `probeOutcome`):
+
+| target | rule |
+|---|---|
+| 2. Claim fits free VRAM | the most layers whose llama.cpp GPU claim is below what `llama-server --list-devices` reported free on the probe's devices, read once before the first load |
+| 1. No spill | the most layers whose GPU memory all stayed in VRAM (§7), at or below target 2 |
+
+### Order
+
+The Wizard settles each context stop before the next, smallest first:
+
+1. **Target 2 at this stop.** A load that fits carries down the context axis
+   and one that does not carries up, because a claim only grows with context.
+   The first load at the smallest stop is the estimator's layer count, never
+   every layer. From one load, its claim over its layer count gives a low
+   estimate; from two, the per-layer claim predicts the boundary, and the search
+   loads the prediction and its neighbour.
+2. **If nothing fits here, the probe ends** — nothing fits at any larger stop.
+3. **The control of the previous stop's no-spill answer**: that placement is
+   loaded a second time. It runs here, after this stop's target 2, so other
+   loads sit between the two, and before this stop's target 1, so this stop's
+   ceiling is never an unconfirmed answer. A control that spills overturns the
+   answer (a point is clean only when every load of it was), the search resumes
+   at the previous stop, and the new answer gets its own control.
+4. **Target 1 at this stop**, capped by this stop's target 2 and by the
+   previous stop's no-spill answer.
+
+keep_context runs steps 1 and 4 and the control on its one context.
+fixed_offload runs the same rules over the context stops at its pinned layers,
+with "two stops above" in place of "two layers above". custom is one load.
+
+### Target 1: where spill starts, then two above
+
+Spill does not grow steadily with layers or with context. On the RX 6600 XT
+(`docs/research/spill-tax-dataset.json`) 5 layers spilled 159 MiB and 6
+spilled nothing, at four contexts; 8 layers spilled at 1k–8k and not at 16k.
+So no spill verdict is carried between contexts, and the search:
+
+1. bisects between the highest clean and the lowest spilling layer count until
+   they are adjacent — where spill starts;
+2. loads the two layer counts above the first spilling one;
+3. repeats from any of those that is clean.
+
+A clean island three or more layers above where spill starts is missed on
+purpose. The cap from the previous stop is the other deliberate cost: 16k never
+tries 8 layers after 8k settled on 6.
+
+### Judging a claim device by device
+
+A load fits only if every device llama.cpp put buffers on claimed less than
+that device's own free memory, as `--list-devices` reported it. The devices are
+the `-mg` one alone when the test pins a GPU, and every listed device otherwise.
+Comparing totals would let one device's spare room hide another's overflow — most
+often an integrated GPU, whose large "free" is mostly shared system RAM, masking
+a discrete card that is already full. The verdict is stored per load
+(`claim_fits_free`); rows from older workers fall back to comparing totals.
+
+### Loads that say nothing about memory
+
+A load that never becomes ready in time, crashes without an out-of-memory
+signature, or has its request rejected is stored with `load_kind = error`. It
+is never offered again. Target 2 draws no fit or miss from it, so it cannot drag
+a boundary down. Target 1 still counts it as not clean, since nothing clean was
+seen there. An out-of-memory failure is a memory verdict: it did not fit.
+
+### Loads stopped at ready
+
+When the server reports ready, its claim is known. A claim not below the free
+figure can be neither answer, so the load stops there — no prompt, no
+generation, no spill — and is stored with `load_kind = claim_stop`.
+
+### Spill by phase
+
+The worker reads the process's dedicated VRAM about once a second for the whole
+load (`worker/src/memoryTrace.ts`: one PowerShell session on Windows, because a
+fresh one costs ~5.5 s and `Get-Counter` itself takes ~1 s per sample; on Linux,
+one reading at a time, so a slow `nvidia-smi` never overlaps itself). The ready
+hold uses only readings taken before the first request. A full
+load holds 3.5 s after ready before its request, then `measurePhasedGpuSpill`
+judges:
+
+| phase | reading used | why |
+|---|---|---|
+| ready hold | the last | a driver still paging buffers in right after load must not read as spill |
+| prompt + generation | the median | one reading mid-reshuffle must not decide it |
+
+Each phase's tolerance is how far its own readings moved; the worse phase
+decides. Every reading goes to the run's log. With no readings, §7's
+loaded-peak rule still applies.
+
+### Budget
+
+The default is 40 loads (admin-configurable). The real run on the RX 6600 XT
+with Qwen3.6-35B-A3B needed 46 loads for the whole curve — 8 of them controls,
+5 stopped at ready — so at 40 it stopped with 128k's control and all of 256k
+still open. A stored budget of exactly the old default, 24, is raised to 40
+once by the server's migration.
+
+When the budget runs out, the stored ceiling (below) prefers the largest context
+whose answer a control confirmed over a larger one that was only loaded once,
+and the Wizard card names the context where the budget ran out.
+
+A Targets probe that finds no no-spill answer ends as failed, but its card still
+shows target 2 when there is one, and it can be applied.
+
+### Deploying it
+
+Deploy the server before the workers. A new worker refuses the removed modes
+and a probe with no mode; a new server refuses to create them, and accepts the
+new `probe_attempts` fields. An old worker on a new server keeps working with
+its old search. After the server update, check the probe load budget in the
+admin settings: the migration only raises a stored value of exactly 24.
+
+A worker that authenticates with the shared deployment token cannot report
+context-test results — those routes require an enrolled worker session — so an
+end-to-end check needs an enrolled worker.
+
+### Stored and shown
+
+`model_machine_limits` records target 1 at the largest context whose answer a
+control confirmed (an unconfirmed one only when none was).
+Every `probe_attempts` row carries the claim, the `--list-devices` figure,
+`load_kind`, the per-phase spill and the ladder's own bounds
+(`ladder_ngl_max`, `ladder_max_ctx`), so the client re-resolves both answers
+with `probeOutcome` itself. Without a `--list-devices` figure, target 2 is
+skipped and target 1 is searched with every layer as its cap, opening at the
+estimate.
 
 ---
 

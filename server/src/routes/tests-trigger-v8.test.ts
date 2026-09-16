@@ -266,7 +266,7 @@ describe("§0.7/N2 capability gates", () => {
       model_id: "v8-model",
       worker_id: worker.id,
       kind: "probe",
-      probe: { candidate_ctx: 32768, placement: { ngl: 16, slots: 1 }, kv_pair: ["f16", "f16"] },
+      probe: { candidate_ctx: 32768, placement: { ngl: 16, slots: 1 }, kv_pair: ["f16", "f16"], mode: "keep_context" },
       sweep: baseSweep,
     });
     expect(res.status).toBe(409);
@@ -281,7 +281,7 @@ describe("§0.7/N2 capability gates", () => {
       model_id: "v8-model",
       worker_id: worker.id,
       kind: "probe",
-      probe: { candidate_ctx: 32768, placement: { ngl: 16, slots: 1 }, kv_pair: ["f16", "f16"] },
+      probe: { candidate_ctx: 32768, placement: { ngl: 16, slots: 1 }, kv_pair: ["f16", "f16"], mode: "keep_context" },
       sweep: baseSweep,
     });
     expect(res.status).toBe(201);
@@ -296,7 +296,7 @@ describe("§0.7/N2 capability gates", () => {
       model_id: "v8-model",
       worker_id: worker.id,
       kind: "probe",
-      probe: { candidate_ctx: 100, placement: { ngl: 16, slots: 1 }, kv_pair: ["f16", "f16"] },
+      probe: { candidate_ctx: 100, placement: { ngl: 16, slots: 1 }, kv_pair: ["f16", "f16"], mode: "keep_context" },
       sweep: baseSweep,
     });
     expect(res.status).toBe(400);
@@ -304,7 +304,7 @@ describe("§0.7/N2 capability gates", () => {
       model_id: "v8-model",
       worker_id: worker.id,
       kind: "probe",
-      probe: { candidate_ctx: 4096, placement: { ngl: 99999, slots: 1 }, kv_pair: ["f16", "f16"] },
+      probe: { candidate_ctx: 4096, placement: { ngl: 99999, slots: 1 }, kv_pair: ["f16", "f16"], mode: "keep_context" },
       sweep: baseSweep,
     });
     expect(res2.status).toBe(400);
@@ -312,7 +312,7 @@ describe("§0.7/N2 capability gates", () => {
       model_id: "v8-model",
       worker_id: worker.id,
       kind: "probe",
-      probe: { candidate_ctx: 4096, placement: { ngl: 0, slots: 1 }, kv_pair: ["bogus", "f16"] },
+      probe: { candidate_ctx: 4096, placement: { ngl: 0, slots: 1 }, kv_pair: ["bogus", "f16"], mode: "keep_context" },
       sweep: baseSweep,
     });
     expect(res3.status).toBe(400);
@@ -329,19 +329,19 @@ describe("§0.7/N2 capability gates", () => {
         candidate_ctx: 32768,
         placement: { ngl: 16, slots: 1 },
         kv_pair: ["f16", "f16"],
-        mode: "max_gpu",
+        mode: "keep_context",
         granularity: "fine",
       },
       sweep: baseSweep,
     });
     expect(res.status).toBe(201);
     const run = ((await res.json()) as { run: { id: string; config: { probe: Record<string, unknown> } } }).run;
-    expect(run.config.probe.mode).toBe("max_gpu");
+    expect(run.config.probe.mode).toBe("keep_context");
     expect(run.config.probe.granularity).toBe("fine");
 
     const job = repo.queueRepo.claimNextJob(worker.id);
     expect(job?.type).toBe("run_probe");
-    expect((job?.payload as { mode?: string; granularity?: string }).mode).toBe("max_gpu");
+    expect((job?.payload as { mode?: string; granularity?: string }).mode).toBe("keep_context");
     expect((job?.payload as { mode?: string; granularity?: string }).granularity).toBe("fine");
   });
 
@@ -358,7 +358,7 @@ describe("§0.7/N2 capability gates", () => {
       model_id: "v8-model",
       worker_id: worker.id,
       kind: "probe",
-      probe: { candidate_ctx: 32768, placement: { ngl: 16, slots: 1 }, kv_pair: ["f16", "f16"] },
+      probe: { candidate_ctx: 32768, placement: { ngl: 16, slots: 1 }, kv_pair: ["f16", "f16"], mode: "keep_context" },
       sweep: baseSweep,
     });
     expect(res.status).toBe(201);
@@ -386,10 +386,22 @@ describe("§0.7/N2 capability gates", () => {
       model_id: "v8-model",
       worker_id: worker.id,
       kind: "probe",
-      probe: { candidate_ctx: 4096, placement: { ngl: 0, slots: 1 }, kv_pair: ["f16", "f16"], granularity: "coarse" },
+      probe: { candidate_ctx: 4096, placement: { ngl: 0, slots: 1 }, kv_pair: ["f16", "f16"], mode: "keep_context", granularity: "coarse" },
       sweep: baseSweep,
     });
     expect(badGranularity.status).toBe(400);
+
+    // The removed searches, and no mode at all, are refused rather than run as something else.
+    for (const mode of ["max_gpu", "max_context", "balanced", undefined]) {
+      const res = await postJson("/api/runs/trigger", {
+        model_id: "v8-model",
+        worker_id: worker.id,
+        kind: "probe",
+        probe: { candidate_ctx: 4096, placement: { ngl: 0, slots: 1 }, kv_pair: ["f16", "f16"], mode },
+        sweep: baseSweep,
+      });
+      expect(res.status).toBe(400);
+    }
   });
 
   it("refuses N4 quality runs on workers without quality-v1, with the update copy", async () => {
@@ -536,7 +548,7 @@ describe("N2 probe batching", () => {
       model_id: "v8-model",
       worker_id: workerId,
       kind: "probe",
-      probe: { candidate_ctx: 4096, placement: { ngl: 0, slots: 1 }, kv_pair: ["f16", "f16"] },
+      probe: { candidate_ctx: 4096, placement: { ngl: 0, slots: 1 }, kv_pair: ["f16", "f16"], mode: "keep_context" },
       sweep: baseSweep,
       ...extra,
     });
@@ -813,7 +825,7 @@ describe("§0.5 chain quotas", () => {
       model_id: "v8-model-x",
       worker_id: worker.id,
       kind: "probe",
-      probe: { candidate_ctx: 4096, placement: { ngl: 0, slots: 1 }, kv_pair: ["f16", "f16"] },
+      probe: { candidate_ctx: 4096, placement: { ngl: 0, slots: 1 }, kv_pair: ["f16", "f16"], mode: "keep_context" },
       sweep: baseSweep,
     });
     expect(probe.status).toBe(201);

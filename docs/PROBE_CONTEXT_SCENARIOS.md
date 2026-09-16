@@ -1,5 +1,7 @@
 # How the context test behaves, per architecture
 
+> **16 Sep 2026:** the `max_gpu`, `max_context` and `balanced` modes and the `fine` setting were removed, and the search was replaced (docs/CONTEXT_TEST_REDESIGN.md §10). What this file says about each architecture's memory still holds; what it says about those modes and walks is history.
+
 The probe's context phase asks one question — *how many tokens can this machine
 actually hold for this model?* — and answers it by loading the model
 repeatedly. What it costs to answer, how many loads it spends, and where it

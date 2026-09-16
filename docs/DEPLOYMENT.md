@@ -26,6 +26,17 @@ public Internet:
    (WAL-safe `sqlite3 .backup`, integrity-checked, retention-pruned) is meant
    to run daily from cron.
 
+## Context tests v2 (Sep 2026)
+
+Deploy the server before any worker. The new server refuses probes with the
+removed `max_gpu` / `max_context` / `balanced` modes or with no mode, and
+stores the new `probe_attempts` columns (added by migration). A new worker
+refuses those same probes, so a job queued by an old server fails with a clear
+error rather than running a different search. After deploying the server, open
+the admin settings and check the probe load budget: the migration raises a
+stored value of exactly 24 to 40 and leaves any other value alone. See
+docs/CONTEXT_TEST_REDESIGN.md §10.
+
 ## Deploying a CPU worker on the server's own box
 
 Same worker process as any other, just declared `"backend": "cpu"`. As of

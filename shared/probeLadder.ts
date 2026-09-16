@@ -1,90 +1,50 @@
-// BENCHMARKING_PLAN_V8.md N2 -- the probe's search strategy, as pure
-// functions so the whole ladder is testable without loading a model. The
-// process/HTTP plumbing that consumes this lives in worker/src/index.ts, the
-// same split loadDriver.ts has against runtimeBench.ts.
+// The context test's search, as pure functions of the loads already made, so
+// the whole ladder is testable without a GPU and a stored probe can be replayed
+// from its probe_attempts rows. The process/HTTP plumbing that consumes this
+// lives in worker/src/index.ts.
 //
-// Three ideas carry the whole design:
+// Two answers come out of the same loads (docs/CONTEXT_TEST_REDESIGN.md §10):
 //
-//  1. THE CTX AXIS ALWAYS WALKS A REAL GRID, NEVER LANDS ON AN ARBITRARY
-//     NUMBER. Every ctx-axis phase, at BOTH granularities, walks the same
-//     power-of-two ladder (1024, 2048, 4096, ...) one notch at a time from a
-//     seed near the mode's own target (nextSliderCandidate). "basic" is
-//     exactly that walk, converged. "fine" is the SAME walk, continued: once
-//     it converges on an adjacent-stops bracket, refine WITHIN that bracket
-//     via ordinary bisection, down to a minimum step of 1/16 of the
-//     bracket's own (fixed, not re-shrinking) width (nextSliderRefineCandidate).
-//     The ngl axis has no such grid -- every integer layer count is already
-//     individually selectable -- so it keeps the original continuous
-//     bisection (nextAnchoredCandidate): a failure bisects toward a SHRINK
-//     target (typically the safe-ngl estimate), a success toward a GROW
-//     target (typically the axis's own hard ceiling), and once both a
-//     success and a failure are known, it bisects the two real values
-//     directly. One phase trusts its shrink target enough to skip the
-//     approach entirely: max_gpu's layer phase (nextDirectCandidate) tests
-//     the safe-ngl estimate outright on the seed's first failure instead of
-//     stepping toward it.
+//   target 2, FITS FREE VRAM -- the most layers whose llama.cpp GPU claim stays
+//     below what `llama-server --list-devices` reported free before the first
+//     load. A claim is buffer sizes, which only grow with layers and with
+//     context, so this boundary bisects -- and after two loads at one context
+//     the per-layer claim predicts it outright (predictFitNgl).
 //
-//  2. A MODE IS A SEQUENCE OF SINGLE-AXIS PHASES. Rather than moving two axes
-//     at once (which has no well-defined bracket), each mode resolves one
-//     axis, pins it, then resolves the next. A phase whose seed already IS
-//     its own grow/shrink target (e.g. max_gpu's layer phase seeded at every
-//     layer, with nowhere higher to go) converges in exactly one load when
-//     that seed works -- this is what makes "if it succeeds outright, skip
-//     straight to the next phase" fall out of the general rule rather than
-//     needing its own special case.
+//   target 1, NO SPILL -- the most layers whose GPU memory all stayed in VRAM.
+//     Spill does NOT grow steadily with layers: on the RX 6600 XT at 1,024
+//     tokens 5 layers spilled 159MiB while 6 spilled nothing, the same at four
+//     contexts. So the search finds where spill starts, then loads the two
+//     layer counts above the first spilling one, and repeats from any that
+//     comes back clean (cleanStep).
 //
-//  3. max_context's "highest possible context is the top priority" PINS ITS
-//     OWN STARTING ngl BY SEARCHING FOR IT, not by assuming it. Before its
-//     phase 0 even runs, bestNglForMaxContext climbs calculateCtx(ngl) over
-//     every candidate layer count -- pure estimate evaluations, zero real
-//     loads spent -- since the VRAM/RAM dual-pool split is not necessarily
-//     monotonic in ngl. Phase 1 then only ever ADDS layers on top of
-//     whatever ctx phase 0 found, never sacrificing ctx to do it.
+// Every scenario runs target 2 before target 1, because target 2 caps it: a
+// claim larger than free VRAM cannot all sit in VRAM. Nor does spill grow
+// steadily with context -- 8 layers spilled at 1k, 2k and 8k and not at 16k --
+// so no verdict is carried between contexts. Instead a larger context may never
+// use more layers than the smaller one's no-spill answer (the Wizard's ceiling).
 //
-// Two rules keep a "grow more layers" phase from spending its budget on a
-// staircase that cannot succeed, and keep max_gpu from reporting a context
-// nobody can use:
-//
-//  4. EVERY GROW-LAYERS PHASE IS BOUNDED BY THE ESTIMATE, NOT BY nglMax.
-//     bestNglAtContext answers "the most layers whose estimate still affords
-//     the context this phase has pinned" -- again pure calculateCtx()
-//     evaluations, zero loads. That answer becomes the phase's growTarget
-//     (jumped to directly, not halved toward), so a failure brackets against
-//     it instead of against every layer; and when it says no additional
-//     layer fits at all, a pure grow phase (max_context/balanced phase 1) is
-//     skipped outright rather than descending one integer at a time proving
-//     the estimate right.
-//
-//  5. max_gpu BACKS OFF WHEN ITS CONTEXT COLLAPSES TO THE FLOOR. Its layer
-//     phase deliberately pins ctx at PROBE_LADDER_MIN_CTX, so "every layer
-//     that fits" can be an offload that leaves room for nothing else. When
-//     the context phase then converges at that same floor, two more phases
-//     run: give back the fewest layers that let the NEXT stop up load
-//     (phases 2), then re-walk the context ladder from there (phase 3). The
-//     mode still reports the largest context that loaded, so the back-off
-//     only ever wins when it actually bought context.
+// Each no-spill answer is loaded a second time (the control), because the first
+// load of a session has measured differently from later ones. In the Wizard the
+// control runs after the next context's target 2, so other loads sit between
+// the two and the next context's ceiling is never taken from an unconfirmed
+// answer.
 
 // --- Public vocabulary ------------------------------------------------------
 
-export type ProbeMode =
-  | "max_gpu"
-  | "max_context"
-  | "keep_context"
-  | "balanced"
-  | "fixed_offload"
-  | "custom"
-  | "frontier";
+/**
+ * frontier -- the Wizard: both targets at every context stop, smallest first.
+ * keep_context -- Targets with context pinned: both targets on the layer axis.
+ * fixed_offload -- Targets with layers pinned: both targets on the context axis.
+ * custom -- Targets with both pinned: one load.
+ */
+export type ProbeMode = "frontier" | "keep_context" | "fixed_offload" | "custom";
+
+/** Still accepted on the wire so older clients and stored configs validate;
+ * the search no longer has a finer setting and ignores it. */
 export type ProbeGranularity = "basic" | "fine";
 
-export const PROBE_MODES: readonly ProbeMode[] = [
-  "max_gpu",
-  "max_context",
-  "keep_context",
-  "balanced",
-  "fixed_offload",
-  "custom",
-  "frontier",
-];
+export const PROBE_MODES: readonly ProbeMode[] = ["frontier", "keep_context", "fixed_offload", "custom"];
 export const PROBE_GRANULARITIES: readonly ProbeGranularity[] = ["basic", "fine"];
 
 export function isProbeMode(value: unknown): value is ProbeMode {
@@ -99,738 +59,28 @@ export function isProbeGranularity(value: unknown): value is ProbeGranularity {
  * Nothing is ever probed below this. Deliberately ABOVE the server's absolute
  * MIN_PROBE_CTX (256, routes/measurements.ts): that bound stays where it is so
  * rows written before this ladder existed still validate, while the ladder
- * itself refuses to spend a real model load proving a context nobody would
- * run.
+ * itself refuses to spend a real model load proving a context nobody would run.
  */
 export const PROBE_LADDER_MIN_CTX = 1024;
 
 /**
- * Hard ceiling on real model loads per probe, across every phase. The server
- * enforces the same number independently (MAX_PROBE_ATTEMPTS) so a
- * misbehaving worker cannot report an unbounded ladder. Admin-configurable
- * at runtime (AppSettings.probeMaxLoads, propagated over the worker
- * heartbeat) -- this is only the default a caller falls back to when no
- * live setting has reached it yet (LadderInput.maxLoads overrides it).
+ * Default ceiling on loads per probe. Admin-configurable at runtime
+ * (AppSettings.probeMaxLoads, propagated over the worker heartbeat); the server
+ * enforces the live value independently. Raised from 24 when controls and the
+ * per-context target 1 search arrived. A full Wizard curve took 46 loads on the
+ * RX 6600 XT with Qwen3.6-35B-A3B (docs/CONTEXT_TEST_REDESIGN.md §10).
  */
-export const PROBE_MAX_LOADS = 24;
+export const PROBE_MAX_LOADS = 40;
 
 /**
- * What one rung actually exercises, regardless of the context it allocates.
- *
- * Every load runs this prompt and generates this many tokens whether `-c` is
- * 1024 or 262144, so the speeds a rung reports describe roughly
- * PROBE_EXERCISED_TOKENS of context and NOT the context in its row. A
- * 262144-token KV cache is allocated and never read. Lives here, shared, so
- * the worker that sets these values and the UI that has to caption them
- * cannot drift apart -- the caption is the only thing standing between a
- * reader and "this machine does 10.4 tok/s at 262k tokens", which is not what
- * was measured.
+ * What one full load actually exercises, regardless of the context it
+ * allocates: every load runs this prompt and generates this many tokens, so
+ * the speeds a rung reports describe roughly PROBE_EXERCISED_TOKENS of context
+ * and NOT the context in its row.
  */
 export const PROBE_PROMPT_TOKENS = 256;
 export const PROBE_GEN_TOKENS = 256;
 export const PROBE_EXERCISED_TOKENS = PROBE_PROMPT_TOKENS + PROBE_GEN_TOKENS;
-
-/** ngl converges once a bracket is this narrow -- every integer is already
- * individually selectable, so there is no coarser "basic" grid to round to
- * the way context has. */
-const NGL_TOLERANCE = 1;
-
-// --- The anchored bisection primitive ---------------------------------------
-
-export interface AnchoredOutcome {
-  value: number;
-  ok: boolean;
-}
-
-export interface AnchoredBisectInput {
-  /** This phase's own outcomes only, in the order they were tested. */
-  history: AnchoredOutcome[];
-  /** Where to bisect toward while every outcome so far has succeeded. */
-  growTarget: number;
-  /** Where to bisect toward while every outcome so far has failed. */
-  shrinkTarget: number;
-  min: number;
-  max: number;
-  /** Stop once the live bracket (or the gap to a target) is this narrow. */
-  tolerance: number;
-}
-
-/**
- * The next value to try on one axis, or null once this phase has converged.
- * The seed itself is NOT produced here -- the caller already knows it (it's
- * the phase's own definition), so this only ever answers "given what has
- * already been tried, what's next."
- *
- * Both axes are monotone in the same direction -- a smaller context, or
- * fewer GPU layers, is never harder to fit than a larger one -- so "fits" is
- * a downward-closed set and the boundary is a single crossing point.
- *
- * Decision order:
- *   1. A bracket exists (a success AND a failure are both known) -> bisect
- *      their mean directly -- both ends are real, already-tested values, so
- *      converging here needs no further verification.
- *   2. Only successes so far -> bisect toward growTarget. A seed that IS
- *      already its own growTarget (nothing higher to try, e.g. every GPU
- *      layer) converges here after exactly one success.
- *   3. Only failures so far -> bisect toward shrinkTarget, the same rule
- *      pointed the other way.
- *
- * Cases 2 and 3 bisect toward a TARGET the caller supplied but this function
- * has never itself tested. Once the live gap to that target closes to within
- * tolerance, the honest next move is to test the target exactly -- NOT to
- * declare victory on proximity alone. Skipping that would mean, in the
- * all-failures case, reporting "nothing fits" without ever having tried the
- * one value (shrinkTarget) that might actually work. Only once the target
- * itself has been tried (win or lose) does this return null.
- *
- * A stray result on the wrong side of an already-proven value (a flaky load,
- * or another process taking memory mid-probe) is ignored: only a failure
- * ABOVE the best success, or a success BELOW the worst qualifying failure,
- * ever defines the bracket.
- */
-export function nextAnchoredCandidate(input: AnchoredBisectInput): number | null {
-  const { history, min, max, tolerance } = input;
-  if (history.length === 0) return null;
-
-  const tried = new Set(history.map((h) => h.value));
-  const finalize = (raw: number): number | null => {
-    const candidate = clamp(Math.round(raw), min, max);
-    return tried.has(candidate) ? null : candidate;
-  };
-
-  const goods = history.filter((h) => h.ok).map((h) => h.value);
-  const bads = history.filter((h) => !h.ok).map((h) => h.value);
-  const bestGood = goods.length > 0 ? Math.max(...goods) : null;
-  const badsAbove = bads.filter((b) => bestGood === null || b > bestGood);
-  const worstBad = badsAbove.length > 0 ? Math.min(...badsAbove) : null;
-
-  if (bestGood !== null && worstBad !== null) {
-    if (worstBad - bestGood <= tolerance) return null;
-    return finalize((bestGood + worstBad) / 2);
-  }
-  if (bestGood !== null) {
-    if (Math.abs(input.growTarget - bestGood) <= tolerance) return finalize(input.growTarget);
-    return finalize((bestGood + input.growTarget) / 2);
-  }
-  const worstTried = bads.length > 0 ? Math.min(...bads) : null;
-  if (worstTried === null) return null;
-  if (Math.abs(worstTried - input.shrinkTarget) <= tolerance) return finalize(input.shrinkTarget);
-  return finalize((worstTried + input.shrinkTarget) / 2);
-}
-
-/**
- * Variant of nextAnchoredCandidate for phases where growTarget/shrinkTarget
- * is not just a direction to average toward but a trusted precalculated
- * estimate worth testing outright: the FIRST probe on either side of the
- * seed jumps straight to that target (shrinkTarget after a failure,
- * growTarget after a success) instead of nextAnchoredCandidate's gradual
- * halving toward it. Once the target itself has ALSO been tried, this falls
- * back to ordinary bracket bisection -- and if it was the target that
- * failed (the estimate was wrong), retargets toward the axis's own hard
- * bound (min on the shrink side, max on the grow side) rather than getting
- * stuck re-offering the same disproven value forever.
- *
- * Used by max_gpu's layer phase (BENCHMARKING_PLAN_V8.md N2): when every
- * layer fails to fit, the very next load should be the safe-estimate layer
- * count, not an arbitrary point between it and the ceiling.
- */
-export function nextDirectCandidate(input: AnchoredBisectInput): number | null {
-  const { history, min, max, tolerance } = input;
-  if (history.length === 0) return null;
-
-  const tried = new Set(history.map((h) => h.value));
-  const finalize = (raw: number): number | null => {
-    const candidate = clamp(Math.round(raw), min, max);
-    return tried.has(candidate) ? null : candidate;
-  };
-
-  const goods = history.filter((h) => h.ok).map((h) => h.value);
-  const bads = history.filter((h) => !h.ok).map((h) => h.value);
-  const bestGood = goods.length > 0 ? Math.max(...goods) : null;
-  const badsAbove = bads.filter((b) => bestGood === null || b > bestGood);
-  const worstBad = badsAbove.length > 0 ? Math.min(...badsAbove) : null;
-
-  if (bestGood !== null && worstBad !== null) {
-    if (worstBad - bestGood <= tolerance) return null;
-    return finalize((bestGood + worstBad) / 2);
-  }
-
-  if (bestGood !== null) {
-    const growCandidate = clamp(Math.round(input.growTarget), min, max);
-    if (!tried.has(growCandidate)) return finalize(input.growTarget);
-    // growTarget itself already tried (and it also succeeded, or every
-    // candidate this rule could offer clamps onto it) -- fall back to
-    // bisecting the remaining room up to the hard ceiling.
-    if (Math.abs(bestGood - max) <= tolerance) return finalize(max);
-    return finalize((bestGood + max) / 2);
-  }
-
-  const shrinkCandidate = clamp(Math.round(input.shrinkTarget), min, max);
-  if (!tried.has(shrinkCandidate)) return finalize(input.shrinkTarget);
-  // The trusted estimate itself failed -- there is no more "trusted" value
-  // left to jump to, so retarget toward the hard floor via ordinary
-  // bisection, same as nextAnchoredCandidate's own shrink-target rule.
-  const worstTried = Math.min(...bads);
-  if (Math.abs(worstTried - min) <= tolerance) return finalize(min);
-  return finalize((worstTried + min) / 2);
-}
-
-export interface SliderStepInput {
-  /** This phase's own outcomes only, in the order they were tested. */
-  history: AnchoredOutcome[];
-  /** The full discrete ladder this phase may test, ascending, deduped. */
-  stops: readonly number[];
-}
-
-/**
- * The next slider-aligned candidate for a "basic"-granularity context phase:
- * one notch up the ladder on a success, one notch down on a failure -- so
- * every value this phase ever tests is a real slider stop a user could
- * actually pick, unlike nextAnchoredCandidate's continuous bisection (which
- * happily lands on numbers like 260104 that mean nothing to the UI).
- * Converges the instant the walk reverses (a failure immediately above a
- * success, or vice versa): those two stops are already adjacent on the
- * ladder, so there is nothing coarser left to try between them.
- */
-export function nextSliderCandidate(input: SliderStepInput): number | null {
-  const { history, stops } = input;
-  if (history.length === 0 || stops.length === 0) return null;
-  const last = history[history.length - 1];
-  const anchorIdx = stops.indexOf(last.value);
-  const idx = anchorIdx >= 0 ? anchorIdx : nearestStopIndex(stops, last.value);
-  const nextIdx = last.ok ? idx + 1 : idx - 1;
-  if (nextIdx < 0 || nextIdx >= stops.length) return null;
-  const candidate = stops[nextIdx];
-  return history.some((h) => h.value === candidate) ? null : candidate;
-}
-
-/**
- * Binary search over the SAME power-of-two stop list nextSliderCandidate
- * walks, for a phase whose goal is the ceiling rather than a boundary near
- * some estimate.
- *
- * The walk costs one load per notch, in whichever direction it is going. That
- * is the right shape when the seed is a good guess and the answer is nearby,
- * and the wrong shape when the mode already knows which end it wants: seeded
- * at the trained-context ceiling, a machine with room to spare converges in a
- * SINGLE load, and one without it brackets in log2(stops) instead of walking
- * every doubling down.
- *
- * Measured motivation: a max_gpu probe spent 8 of its 13 loads walking
- * 1024 -> 262144 one notch at a time, every rung passing, on a model whose KV
- * cache is a rounding error next to its weights. Those loads belong to the
- * layer axis, which on the same machine spanned 13.1 -> 6.9 tok/s.
- *
- * Every value tested is still a real slider stop, so `fine` refinement inside
- * the converged bracket works exactly as it does after a walk.
- */
-export function nextStopBisectCandidate(input: SliderStepInput): number | null {
-  const { history, stops } = input;
-  if (history.length === 0 || stops.length === 0) return null;
-  const tried = new Set(history.map((h) => h.value));
-  const idxOf = (value: number) => {
-    const exact = stops.indexOf(value);
-    return exact >= 0 ? exact : nearestStopIndex(stops, value);
-  };
-  const goodIdx = history.filter((h) => h.ok).map((h) => idxOf(h.value));
-  const badIdx = history.filter((h) => !h.ok).map((h) => idxOf(h.value));
-  const bestGood = goodIdx.length > 0 ? Math.max(...goodIdx) : null;
-  // Only a failure ABOVE the best success bounds the search -- a stray failure
-  // below one already proven to work is noise, same rule the ngl axis uses.
-  const badsAbove = badIdx.filter((b) => bestGood === null || b > bestGood);
-  const worstBad = badsAbove.length > 0 ? Math.min(...badsAbove) : null;
-
-  // Bracketed: adjacent stops means there is nothing coarser left to try.
-  if (bestGood !== null && worstBad !== null) {
-    if (worstBad - bestGood <= 1) return null;
-    const mid = Math.floor((bestGood + worstBad) / 2);
-    return tried.has(stops[mid]) ? null : stops[mid];
-  }
-  // Nothing has failed yet: the only thing left worth testing is higher, and
-  // a seed at the ceiling means there is nothing higher at all.
-  if (bestGood !== null) {
-    if (bestGood >= stops.length - 1) return null;
-    const mid = Math.ceil((bestGood + stops.length - 1) / 2);
-    return tried.has(stops[mid]) ? null : stops[mid];
-  }
-  // Everything has failed so far: bisect down toward the floor.
-  const worstTried = Math.min(...badIdx);
-  if (worstTried <= 0) return null;
-  const mid = Math.floor(worstTried / 2);
-  return tried.has(stops[mid]) ? null : stops[mid];
-}
-
-function nearestStopIndex(stops: readonly number[], target: number): number {
-  let best = 0;
-  let bestDist = Math.abs(target - stops[0]);
-  for (let i = 1; i < stops.length; i++) {
-    const d = Math.abs(target - stops[i]);
-    if (d < bestDist) {
-      best = i;
-      bestDist = d;
-    }
-  }
-  return best;
-}
-
-export interface SliderRefineInput {
-  /** This phase's own outcomes only, in the order they were tested. */
-  history: AnchoredOutcome[];
-  /** The full discrete ladder this phase may test, ascending, deduped. */
-  stops: readonly number[];
-  granularity: ProbeGranularity;
-  min: number;
-  max: number;
-  /** Seeded at the ceiling and bisecting, rather than walking a notch at a
-   * time from an estimate -- for a mode that wants the largest context that
-   * loads rather than the boundary nearest a guess. See
-   * nextStopBisectCandidate. */
-  ceilingFirst?: boolean;
-}
-
-/**
- * The ctx axis's whole search, at BOTH granularities: walk the power-of-two
- * ladder (nextSliderCandidate) until it converges on an adjacent-stops
- * bracket -- that IS "basic"'s complete answer, and every value tested along
- * the way is a real stop the UI can express. "fine" is not a different
- * search, it is the SAME walk with extra steps afterward: once the walk
- * converges, refine WITHIN that specific bracket via ordinary bracket
- * bisection (nextAnchoredCandidate), down to a minimum step of 1/16 of the
- * bracket's OWN width. That width is fixed once, from the literal
- * slider-stop pair the walk itself found (identified by filtering history
- * down to values that are actual stops) -- not recomputed smaller on every
- * subsequent refine step, which would otherwise quietly turn "never finer
- * than a 16th" into a 16th of an already-narrowed gap a few loads later.
- *
- * Only ever consults nextSliderCandidate while EVERY outcome so far is a
- * real stop -- the instant refine has tested one off-grid value, that value
- * is neither in `stops` nor found by indexOf, so nextSliderCandidate's own
- * nearest-stop fallback (built for snapping an odd SEED, not a bisection
- * midpoint) would otherwise silently reinterpret it as "closest to
- * whichever stop is nearest" and jump the walk sideways instead of
- * continuing the bisection.
- */
-export function nextSliderRefineCandidate(input: SliderRefineInput): number | null {
-  const { history, stops, granularity, min, max } = input;
-  const stopSet = new Set(stops);
-  const stillWalking = history.every((h) => stopSet.has(h.value));
-  if (stillWalking) {
-    // Same stop grid either way; only how it is traversed differs. `fine`
-    // refinement below is unaffected, since both leave a converged bracket of
-    // two adjacent real stops behind them.
-    const sliderNext = input.ceilingFirst
-      ? nextStopBisectCandidate({ history, stops })
-      : nextSliderCandidate({ history, stops });
-    if (sliderNext !== null) return sliderNext;
-  }
-  if (granularity !== "fine") return null;
-
-  const stopOutcomes = history.filter((h) => stopSet.has(h.value));
-  const stopGoods = stopOutcomes.filter((h) => h.ok).map((h) => h.value);
-  const stopBads = stopOutcomes.filter((h) => !h.ok).map((h) => h.value);
-  const bestStopGood = stopGoods.length > 0 ? Math.max(...stopGoods) : null;
-  const stopBadsAbove = stopBads.filter((b) => bestStopGood === null || b > bestStopGood);
-  const worstStopBad = stopBadsAbove.length > 0 ? Math.min(...stopBadsAbove) : null;
-  // The walk never bracketed at all (ran off the top or bottom of the
-  // ladder without ever seeing both an ok and a fail) -- nothing to refine.
-  if (bestStopGood === null || worstStopBad === null) return null;
-
-  const bracketWidth = worstStopBad - bestStopGood;
-  const tolerance = Math.max(1, Math.round(bracketWidth / 16));
-  return nextAnchoredCandidate({ history, growTarget: worstStopBad, shrinkTarget: bestStopGood, min, max, tolerance });
-}
-
-/**
- * max_context's own pre-step, entirely calculateCtx() evaluations -- zero
- * real loads spent, since this is just re-running a cheap formula -- to find
- * which layer count actually maximizes affordable context. "Highest possible
- * context is the top priority" means phase 0 must not just assume the
- * ceiling sits at the user's own ngl, or even at ngl=0: the VRAM/RAM
- * dual-pool split is not necessarily monotonic in ngl (a little GPU offload
- * can sometimes free more room than either extreme), so this climbs the
- * curve rather than assuming a shape for it. Coarse step-2 climb from 0
- * until the estimate stops improving, then a step-1 refine from that coarse
- * peak -- BOTH directions, not just back down through the skipped odd
- * values below it, since the true (odd-resolution) peak can sit just above
- * the coarse peak too (between it and the next even point the coarse pass
- * rejected). Each direction keeps stepping while it keeps improving.
- */
-export function bestNglForMaxContext(nglMax: number, calculateCtx: (ngl: number) => number): number {
-  const ceiling = Math.max(0, Math.floor(nglMax));
-
-  let bestNgl = 0;
-  let bestCtx = calculateCtx(0);
-  for (let ngl = 2; ngl <= ceiling; ngl += 2) {
-    const ctx = calculateCtx(ngl);
-    if (ctx <= bestCtx) break;
-    bestNgl = ngl;
-    bestCtx = ctx;
-  }
-
-  for (const step of [1, -1] as const) {
-    for (let ngl = bestNgl + step; ngl >= 0 && ngl <= ceiling; ngl += step) {
-      const ctx = calculateCtx(ngl);
-      if (ctx <= bestCtx) break;
-      bestNgl = ngl;
-      bestCtx = ctx;
-    }
-  }
-
-  return bestNgl;
-}
-
-/**
- * The most layers whose ESTIMATE still affords `targetCtx`, never below
- * `floorNgl` -- the grow-side counterpart to bestNglForMaxContext, and like
- * it, pure calculateCtx() evaluations with zero real loads spent.
- *
- * Every "now add layers at the context we just resolved" phase used to grow
- * toward nglMax, which is almost never reachable: phase 0 has just pushed
- * context to that placement's real boundary, so the layer counts between the
- * seed and nglMax are exactly the ones that cannot fit. Bisecting that range
- * spends the whole remaining budget walking a descending staircase of
- * failures. Bounding the target by the estimate instead turns the same
- * search into "test the estimate, then bracket against it".
- *
- * Deliberately a full scan rather than a climb-until-worse: calculateCtx is
- * not guaranteed monotonic in ngl (the same dual-pool reason
- * bestNglForMaxContext scans), and nglMax is at most a few hundred.
- * Returns floorNgl when nothing above it affords the target -- callers read
- * "the estimate says there is no room to grow" from `result <= seed`.
- */
-export function bestNglAtContext(
-  nglMax: number,
-  targetCtx: number,
-  calculateCtx: (ngl: number) => number,
-  floorNgl = 0
-): number {
-  const ceiling = Math.max(0, Math.floor(nglMax));
-  const floor = clamp(Math.floor(floorNgl), 0, ceiling);
-  let best = floor;
-  for (let ngl = floor + 1; ngl <= ceiling; ngl++) {
-    if (calculateCtx(ngl) >= targetCtx) best = ngl;
-  }
-  return best;
-}
-
-// --- Modes as phase sequences ------------------------------------------------
-
-export type LadderAxis = "ctx" | "ngl";
-
-interface PhaseSpec {
-  axis: LadderAxis;
-  seed: number;
-  growTarget: number;
-  shrinkTarget: number;
-  /**
-   * "bisect" (default ngl engine): nextAnchoredCandidate, continuous.
-   * "direct" (max_gpu's layer phase only): nextDirectCandidate -- jump
-   * straight to the estimate on the first probe, bisect afterward.
-   * "slider_refine" (every ctx-axis phase, both granularities):
-   * nextSliderRefineCandidate -- walk the power-of-two ctx ladder, then
-   * (fine only) refine within the bracket it converges on.
-   */
-  searchStyle: "bisect" | "direct" | "slider_refine";
-  /**
-   * Traverse the ctx stop grid by BISECTION FROM THE CEILING rather than by
-   * walking up a notch at a time (nextStopBisectCandidate vs
-   * nextSliderCandidate). Same grid, same converged bracket, same `fine`
-   * refinement afterwards -- only the order of visits changes.
-   *
-   * For a mode whose goal IS the ceiling, the walk is pure overhead whenever
-   * context is cheap: measured live on an 8GiB card with a weights-bound MoE,
-   * max_gpu spent 8 of its 13 loads climbing 1024 -> 262144 without a single
-   * failure, on an axis where throughput then varied by 4% (most of it noise)
-   * while the layer axis it had already left behind spanned 2x. Seeding at
-   * the ceiling makes that case cost ONE load, and a genuinely context-bound
-   * machine cost log2(stops) instead of a full climb.
-   *
-   * Deliberately NOT applied to modes that seed from the user's own context
-   * (balanced, fixed_offload): there the seed is the answer being checked,
-   * not a bound being searched for, and jumping to the ceiling would spend
-   * loads far away from what the user asked about.
-   */
-  ceilingFirst?: boolean;
-  /**
-   * Re-pin the OTHER axis at this value for the duration of this phase,
-   * instead of inheriting whatever the previous phase resolved it to. Only
-   * max_gpu's back-off phases use it: giving layers back is only meaningful
-   * measured against a context above the floor the layer phase pinned, so
-   * that phase has to move ctx before it can search ngl again.
-   */
-  pinOther?: number;
-  /**
-   * Marks the "the context axis found nothing at this placement, back the
-   * layers off and try again" phase. The mode after it needs to know the
-   * rescue actually ran, since it re-walks context at whatever placement the
-   * rescue settled on.
-   */
-  isRescue?: boolean;
-}
-
-/**
- * The `phaseIndex`'th phase a mode runs, given whatever the OTHER axis is
- * currently pinned to (the previous phase's own resolution, or the caller's
- * starting candidate before any phase has run) -- null once the mode has no
- * more phases. `calculateNgl`/`calculateCtx` are the caller's real estimator
- * calls (estimateSafeNgl / maxAffordableContext in shared/vramEstimate.ts);
- * this module never imports that file directly, so a phase whose target
- * depends on the estimate asks for it fresh, at the axis value THIS phase
- * actually pins the other one to.
- *
- *  * `max_gpu`      -- phase 0: every layer, shrinking toward the safe
- *                      estimate on failure (nowhere higher to grow -- grow
- *                      target IS the seed, so a working seed converges in one
- *                      load). phase 1: the ctx stop nearest the max-affordable
- *                      estimate at the now-resolved layers, walking the
- *                      power-of-two ladder from there. phases 2+3 run ONLY
- *                      when phase 1 converged at the floor context the layer
- *                      phase had pinned: give back the fewest layers that let
- *                      the next stop up load (phase 2), then re-walk the ctx
- *                      ladder at that placement (phase 3). Whichever rung
- *                      reached the larger context wins the verdict, so the
- *                      back-off can only ever help.
- *  * `max_context`  -- phase 0: the ctx stop nearest the max-affordable
- *                      estimate, pinned at whichever ngl bestNglForMaxContext
- *                      found maximizes that estimate (NOT necessarily the
- *                      user's own ngl, or 0 -- "highest possible context" is
- *                      searched for, not assumed). phase 1: THAT SAME pinned
- *                      layer count -- not the user's own -- already proven at
- *                      the resolved context by phase 0's own search (phase 0
- *                      never moves ngl), so the seed always comes from
- *                      history rather than a real load, growing toward
- *                      whatever bestNglAtContext says the resolved context
- *                      still affords (see growLayersPhase), never shrinking
- *                      ctx back down to make room.
- *  * `balanced`     -- same two phases as max_context, seeded at the user's
- *                      OWN current (ctx, ngl) instead of the estimate/every
- *                      layer -- no ngl pre-step, "trades context against
- *                      layers" is the whole point of this mode.
- *  * `keep_context` -- ("Fixed context") one phase: the user's own layers,
- *                      growing toward whatever the estimate still affords at
- *                      that fixed context, shrinking toward the safe-ngl
- *                      estimate -- jumping directly to whichever of the two
- *                      the seed's own verdict points at.
- *  * `fixed_offload`-- one phase: the ctx stop nearest the user's own ctx,
- *                      walking the power-of-two ladder at the user's fixed
- *                      layers.
- *  * `custom`       -- no phases; handled directly in nextLadderRung.
- */
-interface PhaseState {
-  /** The phase just before this one produced no successes at all. */
-  lastPhaseAllFailed: boolean;
-  /** A rescue phase has already run in this mode. */
-  rescueRan: boolean;
-}
-
-function phaseSpecFor(
-  mode: ProbeMode,
-  phaseIndex: number,
-  pinnedCtx: number,
-  pinnedNgl: number,
-  nglMax: number,
-  maxCtx: number,
-  calculateNgl: (pinnedCtx: number) => number,
-  calculateCtx: (pinnedNgl: number) => number,
-  state: PhaseState
-): PhaseSpec | null {
-  const clampNgl = (v: number): number => clamp(Math.round(v), 0, nglMax);
-  const clampCtx = (v: number): number => clamp(Math.round(v), PROBE_LADDER_MIN_CTX, maxCtx);
-  // Every ctx-axis phase below walks the SAME power-of-two ladder, seeded at
-  // whichever real value the mode cares about (an estimate, or the user's
-  // own ctx) snapped to the nearest stop -- growTarget/shrinkTarget are
-  // vestigial for these (nextSliderRefineCandidate drives the walk off the
-  // stops list alone), kept only so PhaseSpec has one shape for both axes.
-  const ctxPhase = (seedTarget: number): PhaseSpec => ({
-    axis: "ctx",
-    seed: nearestStop(ctxLadderStops(maxCtx), clampCtx(seedTarget)),
-    growTarget: maxCtx,
-    shrinkTarget: PROBE_LADDER_MIN_CTX,
-    searchStyle: "slider_refine",
-  });
-  // Same phase, entered from the top: the seed IS the ceiling, and failures
-  // bisect down the stop grid instead of the walk stepping up to it.
-  const ctxCeilingPhase = (): PhaseSpec => ({
-    ...ctxPhase(maxCtx),
-    seed: maxCtx,
-    ceilingFirst: true,
-  });
-  /**
-   * "Now add layers at the context we just resolved" -- max_context's and
-   * balanced's phase 1. The seed is always a rung phase 0 already loaded
-   * (phase 0 never moves ngl), so it costs no load; what this decides is how
-   * far above it to look. That ceiling is the ESTIMATE's answer, not nglMax:
-   * phase 0 has just pushed context to this placement's real boundary, so
-   * growing toward every layer means bisecting a range whose every member is
-   * known-hopeless. Null -- no phase at all -- when the estimate says not
-   * even one more layer affords this context, which is the common case after
-   * a `fine` refine and used to cost five or six guaranteed failures.
-   */
-  /**
-   * "The context axis found nothing at this placement" -- back the layers off
-   * and search again at the cheapest context.
-   *
-   * Without this, a mode whose pinned layer count is unusable at EVERY context
-   * simply reports total failure: confirmed live, a balanced probe seeded at
-   * 41 layers walked 32768 -> 1024 and failed all six loads, never once trying
-   * fewer layers, on a machine that runs the same model happily at 10. That is
-   * the opposite of what "trades context against layers" promises, and it got
-   * much more likely once silent host-backed placements started failing
-   * honestly instead of passing with a warning.
-   *
-   * Shrink-only and pinned at the floor context: the point is to find ANY
-   * workable placement cheaply, after which the mode re-walks context from
-   * there. Jumps straight to the safe-ngl estimate rather than bisecting
-   * toward it, same reasoning as max_gpu's own layer phase.
-   */
-  const rescueLayersPhase = (nglNow: number): PhaseSpec | null => {
-    if (nglNow <= 0) return null;
-    const ceiling = clampNgl(nglNow - 1);
-    const safe = clampNgl(calculateNgl(PROBE_LADDER_MIN_CTX));
-    return {
-      axis: "ngl",
-      pinOther: PROBE_LADDER_MIN_CTX,
-      seed: Math.min(ceiling, safe),
-      growTarget: ceiling,
-      shrinkTarget: 0,
-      searchStyle: "direct",
-      isRescue: true,
-    };
-  };
-
-  const growLayersPhase = (ctxNow: number, nglNow: number): PhaseSpec | null => {
-    if (nglNow >= nglMax) return null;
-    const estimateSaysGrow = bestNglAtContext(nglMax, ctxNow, calculateCtx, nglNow);
-    // When the estimate says not even one more layer affords this context,
-    // that used to end the mode. It must not, because the condition is
-    // self-inflicted: phase 0 walks context up until a real load FAILS, so a
-    // machine that outperforms the estimate lands on a ctxNow above
-    // calculateCtx(nglNow) by construction -- and then no ngl at all
-    // "affords" it, every time, and the layer axis is never measured. On a
-    // GPU whose driver silently backs overcommitted allocations with system
-    // RAM, the estimate is not what decides placement anyway (measured: the
-    // driver stopped taking weights with 1.9GiB of VRAM still free), so
-    // treating it as a veto over whether to MEASURE is exactly backwards.
-    //
-    // So the estimate now only chooses the target to jump to, never whether
-    // to run at all: its own safe-ngl answer when it has one, and otherwise
-    // a single step up, which costs one load and brackets immediately if it
-    // fails. "direct" jumps straight to the target rather than climbing, so
-    // a hopeless target costs one load, not a staircase of them.
-    const grow = estimateSaysGrow > nglNow ? estimateSaysGrow : Math.min(nglMax, nglNow + 1);
-    return { axis: "ngl", seed: nglNow, growTarget: grow, shrinkTarget: nglNow, searchStyle: "direct" };
-  };
-
-  switch (mode) {
-    case "max_gpu":
-      if (phaseIndex === 0) {
-        return {
-          axis: "ngl",
-          seed: nglMax,
-          growTarget: nglMax,
-          shrinkTarget: clampNgl(calculateNgl(PROBE_LADDER_MIN_CTX)),
-          // Nowhere higher than nglMax to jump to, so "direct" only ever
-          // bites on the shrink side: a failed full-offload attempt goes
-          // straight to the safe estimate next, not a midpoint toward it.
-          searchStyle: "direct",
-        };
-      }
-      // The estimate no longer picks the seed here: this mode wants the
-      // largest context its resolved placement will hold, so the ceiling is
-      // the hypothesis worth testing first. A machine where it fits pays one
-      // load; one where it does not brackets down the same stop grid.
-      if (phaseIndex === 1) return ctxCeilingPhase();
-      // Back-off. The layer phase pinned ctx at the floor while it searched,
-      // so "the most layers that fit" can be a placement with room for
-      // nothing else -- and phase 1 converging AT that same floor is exactly
-      // that outcome. Rather than report a context nobody can run, give back
-      // the fewest layers that let the next stop up load, then re-walk the
-      // ladder from there. pinnedNgl is known to FAIL at backoffCtx (phase 1
-      // just proved it, which is why it converged at the floor), so this
-      // phase's own ceiling is one layer below it.
-      if (phaseIndex === 2) {
-        const backoffCtx = clampCtx(PROBE_LADDER_MIN_CTX * 2);
-        // "Still at the floor" is measured against the NEXT stop up, not
-        // against the floor exactly: a `fine` context phase refines inside
-        // the [floor, next stop] bracket, so it lands on something like 1920
-        // -- larger than the floor, and just as unusable. Anything below the
-        // stop the back-off is trying to reach counts as not having reached
-        // it.
-        if (pinnedCtx >= backoffCtx || pinnedNgl < 1 || backoffCtx <= PROBE_LADDER_MIN_CTX) return null;
-        const ceiling = clampNgl(pinnedNgl - 1);
-        return {
-          axis: "ngl",
-          pinOther: backoffCtx,
-          seed: Math.min(ceiling, bestNglAtContext(nglMax, backoffCtx, calculateCtx)),
-          growTarget: ceiling,
-          shrinkTarget: 0,
-          searchStyle: "bisect",
-        };
-      }
-      // Only reachable when phase 2 actually ran (a null phase ends the
-      // mode), so the pin is already the backed-off placement.
-      // Seeded at the context phase 2 just PROVED at this placement, not at
-      // the estimate: the estimate is what sent the layer phase past a
-      // usable context in the first place, and re-seeding on it walks the
-      // ladder back down through failures to get here anyway. The proven
-      // rung costs no load (history reuse), so this walks up from it.
-      // NOT ceiling-first, unlike phase 1: this phase only exists because the
-      // context axis already collapsed to the floor at the previous
-      // placement, so "context is tight here" is established rather than
-      // unknown. Phase 2 has just proved backoffCtx loads, and walking up
-      // from a proven rung costs one load where bisecting down from the
-      // ceiling costs log2(stops) re-proving what the back-off implied.
-      if (phaseIndex === 3) return ctxPhase(pinnedCtx);
-      return null;
-
-    case "max_context":
-      // pinnedNgl here is ALREADY bestNglForMaxContext's answer -- set once,
-      // upstream in nextLadderRung, before any phase runs.
-      if (phaseIndex === 0) return ctxPhase(calculateCtx(pinnedNgl));
-      if (phaseIndex === 1) {
-        return state.lastPhaseAllFailed ? rescueLayersPhase(pinnedNgl) : growLayersPhase(pinnedCtx, pinnedNgl);
-      }
-      // Only after a rescue: re-walk context at the placement it settled on.
-      if (phaseIndex === 2 && state.rescueRan) return ctxPhase(calculateCtx(pinnedNgl));
-      return null;
-
-    case "balanced":
-      if (phaseIndex === 0) return ctxPhase(pinnedCtx);
-      if (phaseIndex === 1) {
-        return state.lastPhaseAllFailed ? rescueLayersPhase(pinnedNgl) : growLayersPhase(pinnedCtx, pinnedNgl);
-      }
-      if (phaseIndex === 2 && state.rescueRan) return ctxPhase(calculateCtx(pinnedNgl));
-      return null;
-
-    case "keep_context":
-      if (phaseIndex === 0) {
-        const shrink = clampNgl(calculateNgl(pinnedCtx));
-        // Unlike a pure grow phase this one can never be skipped -- it is the
-        // mode's ONLY phase, and a seed that fails still has to find its way
-        // down. So the estimate bounds the grow direction (never below the
-        // seed, which would close it entirely) and the shrink target stays
-        // the safe-ngl estimate; "direct" jumps to whichever of the two the
-        // seed's own verdict points at.
-        const grow = Math.max(pinnedNgl, bestNglAtContext(nglMax, pinnedCtx, calculateCtx, pinnedNgl));
-        return { axis: "ngl", seed: pinnedNgl, growTarget: grow, shrinkTarget: shrink, searchStyle: "direct" };
-      }
-      return null;
-
-    case "fixed_offload":
-      if (phaseIndex === 0) return ctxPhase(pinnedCtx);
-      return null;
-
-    // Neither mode is a phase sequence: "custom" is one caller-specified rung,
-    // and "frontier" searches both axes at once against a monotone boundary
-    // (nextFrontierRung). nextLadderRung dispatches both before it ever gets
-    // here.
-    case "custom":
-    case "frontier":
-      return null;
-  }
-}
-
-// --- The whole ladder --------------------------------------------------------
 
 export interface LadderRung {
   ctx: number;
@@ -838,242 +88,666 @@ export interface LadderRung {
 }
 
 export interface LadderAttempt extends LadderRung {
+  /** Target 1's verdict for this load: it loaded, generated, and its measured
+   * spill stayed within the counter's own movement. */
   ok: boolean;
   /**
-   * This rung failed because its weights were measurably host-backed, rather
-   * than because it did not fit. The distinction matters to the search: a
-   * smaller context cannot fix a placement whose LAYERS are in system RAM, so
-   * a context phase that hits this stops immediately instead of walking the
-   * whole ladder down proving it. Observed live: six loads spent walking
-   * 32768 -> 1024 at 41 layers, every one failing for the same reason.
-   */
-  hostBacked?: boolean;
-  /**
-   * Whether this rung's GPU memory placement was measured: llama.cpp's own
-   * buffer report held against a per-process dedicated VRAM reading
-   * (shared/gpuSpill.ts). A pass without it means "it loaded" and nothing about
-   * where the memory went -- a platform with no per-process VRAM reading, a
-   * build that printed no buffer sizes, or a row from an older worker. Neither
-   * the frontier nor bestLadderResult lets an unmeasured pass stand in for a
-   * measured one; see both.
+   * Whether this load's GPU memory placement was measured (llama.cpp's buffer
+   * report against a per-process VRAM reading). A clean verdict without it
+   * means "it loaded" and nothing about where the memory went.
    */
   placementJudged?: boolean;
+  /**
+   * Target 2's verdict: llama.cpp's GPU claim stayed below the free VRAM
+   * --list-devices reported (claimFitsFree). Null or absent where either figure
+   * is missing.
+   */
+  fitsFree?: boolean | null;
+  /** Everything llama.cpp reported placing on GPU devices, MiB -- what
+   * predictFitNgl extrapolates from. */
+  claimedMib?: number | null;
+  /**
+   * The load failed for a reason that says nothing about memory: the server
+   * never became ready in time, or died without an out-of-memory signature.
+   * Target 2 ignores it (no fit or miss is carried from it); target 1 still
+   * treats it as not clean, since nothing clean was observed there.
+   */
+  inconclusive?: boolean;
+}
+
+/**
+ * Target 2's verdict for one load. `loaded` is whether the load ran far enough
+ * to report its buffers at all: one that died first claimed more than it could
+ * get, so it does not fit; one that ran without printing buffers (an older
+ * build) is unknown rather than a failure.
+ */
+export function claimFitsFree(input: {
+  claimedMib: number | null | undefined;
+  freeMib: number | null | undefined;
+  loaded: boolean;
+}): boolean | null {
+  if (input.freeMib == null) return null;
+  if (input.claimedMib == null) return input.loaded ? null : false;
+  return input.claimedMib < input.freeMib;
+}
+
+/**
+ * Target 2's verdict device by device: every device llama.cpp put buffers on
+ * must have claimed less than its own free memory. Summing instead lets one
+ * device's spare room hide another's overflow -- most often an integrated GPU,
+ * whose "free" is mostly shared system RAM, masking a discrete card that is
+ * already full. Null when either side is missing, or a used device was not
+ * listed by --list-devices.
+ */
+export function claimFitsFreeByDevice(
+  claimByDevice: Record<string, number> | null | undefined,
+  freeByDevice: Record<string, number> | null | undefined
+): boolean | null {
+  if (!claimByDevice || !freeByDevice) return null;
+  const used = Object.entries(claimByDevice).filter(([, mib]) => mib > 0);
+  if (used.length === 0) return null;
+  for (const [device, mib] of used) {
+    const free = freeByDevice[device];
+    if (free == null) return null;
+    if (mib >= free) return false;
+  }
+  return true;
+}
+
+/** How one boundary at one context was settled. */
+export interface BoundaryState {
+  /** The answer: a layer count (or a context, on fixed_offload's axis). Null
+   * when nothing qualifies -- or, while unresolved, nothing known to yet. */
+  value: number | null;
+  resolved: boolean;
+  /** "measured" -- loads at this context decided it. "implied" -- settled
+   * without one (a ceiling of 0 from the context below, or nothing fitting
+   * there). "unmeasured" -- still open when the probe stopped. */
+  source: "measured" | "implied" | "unmeasured";
+}
+
+/** Target 1 plus the state of its control load. */
+export interface CleanState extends BoundaryState {
+  /** "confirmed" -- a second load of the answer was clean too. "pending" --
+   * only loaded once so far. "none" -- no answer to control. */
+  control: "confirmed" | "pending" | "none";
+  /** The answer's placement was measured on every load of it (see
+   * LadderAttempt.placementJudged). False means "it loaded" only. */
+  judged: boolean;
 }
 
 export interface LadderInput {
   mode: ProbeMode;
-  granularity: ProbeGranularity;
   candidateCtx: number;
   candidateNgl: number;
+  /** llama.cpp's -ngl ceiling for this model (n_layer + the output layer). */
   nglMax: number;
   /** The model's trained context -- the ladder never probes above it. */
   maxCtx: number;
   maxLoads?: number;
-  /** Every rung already loaded, in order. */
-  history: LadderAttempt[];
-  /** The estimate's own predicted safe layer count at a given pinned context. */
-  calculateNgl: (pinnedCtx: number) => number;
-  /** The estimate's own predicted max-affordable context at a given pinned ngl. */
-  calculateCtx: (pinnedNgl: number) => number;
+  /** Every load already made, in order. */
+  history: readonly LadderAttempt[];
+  /**
+   * What `llama-server --list-devices` reported free on the devices this probe
+   * uses, read once before the first load. Null or absent: target 2 cannot be
+   * judged, so target 1 is searched alone with every layer as its cap.
+   */
+  freeVramMib?: number | null;
+  /** The estimator's safe layer count at a context -- only ever the first load's
+   * layer count, never a verdict. Absent where only display is wanted. */
+  calculateNgl?: (ctx: number) => number;
 }
 
-/**
- * The next rung to load, or null when the ladder is finished.
- *
- * Stateless by design: the worker hands back the full history each time, so
- * a probe's decisions can be replayed from its stored probe_attempts rows.
- * The budget is a single pool shared across every phase (not pre-split): a
- * phase that converges in one load leaves the rest for whichever phase needs
- * it, rather than wasting a fixed share on a phase that didn't need it.
- */
+/** One context stop of the Wizard's result. */
+export interface CurveStop {
+  ctx: number;
+  /** Null when the probe had no --list-devices reading. */
+  fit: BoundaryState | null;
+  clean: CleanState;
+}
+
+export interface ProbeOutcome {
+  /** The next load to make, or null when the search is finished. Ignores the
+   * budget -- nextLadderRung applies that. */
+  next: LadderRung | null;
+  /** Target 1's answer as a placement; null when none was found. */
+  clean: (LadderRung & { control: CleanState["control"]; judged: boolean }) | null;
+  /** Target 2's answer as a placement; null when nothing fits or no reading. */
+  fit: LadderRung | null;
+  /** The Wizard's per-context result; absent for the other modes. */
+  curve?: CurveStop[];
+  /** The Wizard stopped because nothing fits at this context (or anywhere above). */
+  nothingFitsFrom?: number | null;
+}
+
+/** The next load, or null when the ladder is finished or out of budget. */
 export function nextLadderRung(input: LadderInput): LadderRung | null {
   const maxLoads = input.maxLoads ?? PROBE_MAX_LOADS;
   if (input.history.length >= maxLoads) return null;
+  return probeOutcome(input).next;
+}
 
+/**
+ * Everything a probe has established so far and what to load next. The search
+ * (nextLadderRung) and every display of a probe's result call this same
+ * function, so they cannot disagree about what was found.
+ */
+export function probeOutcome(input: LadderInput): ProbeOutcome {
   const nglMax = Math.max(0, Math.floor(input.nglMax));
   const maxCtx = Math.max(PROBE_LADDER_MIN_CTX, Math.floor(input.maxCtx));
+  const history = input.history.filter((h) => h.ngl >= 0 && h.ngl <= nglMax);
+  const free = input.freeVramMib ?? null;
 
-  if (input.mode === "custom") {
-    const ctx = clamp(Math.floor(input.candidateCtx), PROBE_LADDER_MIN_CTX, maxCtx);
-    const ngl = clamp(Math.floor(input.candidateNgl), 0, nglMax);
-    return input.history.length === 0 ? { ctx, ngl } : null;
+  switch (input.mode) {
+    case "custom": {
+      const ctx = clamp(Math.floor(input.candidateCtx), PROBE_LADDER_MIN_CTX, maxCtx);
+      const ngl = clamp(Math.floor(input.candidateNgl), 0, nglMax);
+      const loads = loadsAt(history, ctx, ngl);
+      if (loads.length === 0) return { next: { ctx, ngl }, clean: null, fit: null };
+      const clean = loads.every((h) => h.ok);
+      return {
+        next: null,
+        clean: clean ? { ctx, ngl, control: "none", judged: loads.every((h) => h.placementJudged === true) } : null,
+        fit: free != null && loads.some((h) => fitVerdict(h)) ? { ctx, ngl } : null,
+      };
+    }
+    case "keep_context":
+      return keepContextOutcome(history, input, nglMax, maxCtx, free);
+    case "fixed_offload":
+      return fixedOffloadOutcome(history, input, nglMax, maxCtx, free);
+    case "frontier":
+      return frontierOutcome(history, input, nglMax, maxCtx, free);
+  }
+}
+
+// --- Verdicts ---------------------------------------------------------------
+
+function loadsAt(history: readonly LadderAttempt[], ctx: number, ngl: number): LadderAttempt[] {
+  return history.filter((h) => h.ctx === ctx && h.ngl === ngl);
+}
+
+/** Target 2's verdict. A load with no claim reading (a build that printed no
+ * buffer sizes) falls back to its spill verdict rather than stalling. */
+function fitVerdict(h: LadderAttempt): boolean {
+  return h.fitsFree ?? h.ok;
+}
+
+/** Target 1's verdict at one point: clean only when EVERY load there was clean,
+ * so a control that spills overturns the first reading. Null when never loaded. */
+function cleanAt(history: readonly LadderAttempt[], ctx: number, ngl: number): boolean | null {
+  const loads = loadsAt(history, ctx, ngl);
+  return loads.length === 0 ? null : loads.every((h) => h.ok);
+}
+
+// --- Target 2 on the layer axis ---------------------------------------------
+
+/**
+ * Target 2 at one context. A load that fits carries DOWN the context axis and
+ * one that does not carries UP it, because a claim only grows with context --
+ * and `ceiling` (the answer at the context below) caps it from above.
+ *
+ * Next load, in order of preference: the claim prediction inside what is still
+ * open; the caller's opener when nothing has been loaded here yet; bisection.
+ */
+function fitStep(input: {
+  history: readonly LadderAttempt[];
+  ctx: number;
+  nglMax: number;
+  free: number;
+  ceiling: number | null;
+  opener: number | null;
+}): { state: BoundaryState; next: number | null } {
+  const { ctx, nglMax, free } = input;
+  // An inconclusive load is still "tried" (it is never offered again), but it
+  // decides nothing about the claim.
+  const history = input.history.filter((h) => !h.inconclusive);
+  const fits = history.filter((h) => h.ctx >= ctx && fitVerdict(h)).map((h) => h.ngl);
+  const misses = history.filter((h) => h.ctx <= ctx && !fitVerdict(h)).map((h) => h.ngl);
+  if (input.ceiling != null) misses.push(input.ceiling + 1);
+  const knownFit = fits.length > 0 ? Math.max(...fits) : null;
+  const missesAbove = misses.filter((m) => knownFit == null || m > knownFit);
+  const firstMiss = missesAbove.length > 0 ? Math.min(...missesAbove) : null;
+
+  const hereDecides = (n: number | null) => history.some((h) => h.ctx === ctx && (n == null || h.ngl === n));
+  if (firstMiss === 0) {
+    return { state: { value: null, resolved: true, source: hereDecides(0) ? "measured" : "implied" }, next: null };
+  }
+  if (knownFit != null && (knownFit >= nglMax || firstMiss === knownFit + 1)) {
+    const measured = history.some((h) => h.ctx === ctx && (h.ngl === knownFit || h.ngl === firstMiss));
+    return { state: { value: knownFit, resolved: true, source: measured ? "measured" : "implied" }, next: null };
   }
 
-  // Not a phase sequence: the frontier resolves ONE ngl boundary per context
-  // stop, and which stop is worth a load next depends on what the stops
-  // already resolved imply about the ones between them. See nextFrontierRung.
-  if (input.mode === "frontier") {
-    return nextFrontierRung({
-      history: input.history,
-      nglMax,
-      maxCtx,
-      calculateNgl: input.calculateNgl,
-      calculateCtx: input.calculateCtx,
+  const tried = new Set(input.history.filter((h) => h.ctx === ctx).map((h) => h.ngl));
+  const lo = knownFit ?? -1;
+  const hi = Math.min(firstMiss ?? nglMax + 1, nglMax + 1);
+  const open = (n: number) => n > lo && n < hi && !tried.has(n);
+  const state: BoundaryState = { value: knownFit, resolved: false, source: "unmeasured" };
+
+  const guided = claimGuidedNgl(predictFitNgl(history, ctx, free), knownFit, firstMiss, nglMax, tried);
+  if (guided != null) return { state, next: guided };
+  if (tried.size === 0 && input.opener != null) {
+    const opener = clamp(Math.round(input.opener), lo + 1, hi - 1);
+    if (open(opener)) return { state, next: opener };
+  }
+  const mid = clamp(Math.floor((lo + hi) / 2), lo + 1, hi - 1);
+  if (open(mid)) return { state, next: mid };
+  for (let n = hi - 1; n > lo; n--) if (open(n)) return { state, next: n };
+  return { state, next: null };
+}
+
+/**
+ * Target 2's boundary at one context, predicted from claims already measured:
+ * the most layers whose claim would stay below the free VRAM, or -1 when not
+ * even 0 would. Null until two loads at one context give a per-layer cost.
+ *
+ * A claim is buffer sizes, so it is close to linear in layers -- ~405MiB a layer
+ * on the RX 6600 XT sweep, a little more for the output layer. The prediction
+ * extrapolates from the measured rung nearest the free line, so every load
+ * sharpens it where it matters. Between two measured contexts the fixed part of
+ * the claim (KV cache, compute buffer) is interpolated linearly; beyond them it
+ * is extrapolated, and with only one context measured it is assumed not to grow,
+ * which errs toward too many layers -- one failing load, never a missed one.
+ *
+ * Only ever a seed (claimGuidedNgl): every boundary it names is still loaded.
+ */
+export function predictFitNgl(history: readonly LadderAttempt[], ctx: number, freeVramMib: number): number | null {
+  const byCtx = new Map<number, { ngl: number; claim: number }[]>();
+  for (const h of history) {
+    if (h.claimedMib == null || !(h.claimedMib > 0)) continue;
+    byCtx.set(h.ctx, [...(byCtx.get(h.ctx) ?? []), { ngl: h.ngl, claim: h.claimedMib }]);
+  }
+  let perLayer: number | null = null;
+  let span = 0;
+  for (const rungs of byCtx.values()) {
+    const low = rungs.reduce((a, b) => (b.ngl < a.ngl ? b : a));
+    const high = rungs.reduce((a, b) => (b.ngl > a.ngl ? b : a));
+    if (high.ngl - low.ngl > span) {
+      span = high.ngl - low.ngl;
+      perLayer = (high.claim - low.claim) / span;
+    }
+  }
+  if (perLayer == null) {
+    // One load only: its whole claim over its layer count overstates the cost
+    // of a layer (the claim also holds the KV cache and compute buffer), so this
+    // answer errs LOW -- the next load then fits, and two loads give the slope.
+    const one = history.find((h) => h.ctx === ctx && h.ngl > 0 && h.claimedMib != null && h.claimedMib > 0);
+    return one ? Math.ceil((freeVramMib * one.ngl) / one.claimedMib!) - 1 : null;
+  }
+  if (!(perLayer > 0)) return null;
+  const slope = perLayer;
+
+  const fixedPartAt = (c: number): number => {
+    const rungs = byCtx.get(c)!;
+    const nearest = rungs.reduce((a, b) => (Math.abs(freeVramMib - b.claim) < Math.abs(freeVramMib - a.claim) ? b : a));
+    return nearest.claim - slope * nearest.ngl;
+  };
+  const measured = [...byCtx.keys()].sort((a, b) => a - b);
+  let fixed: number;
+  if (byCtx.has(ctx)) {
+    fixed = fixedPartAt(ctx);
+  } else {
+    const below = measured.filter((c) => c < ctx);
+    const above = measured.filter((c) => c > ctx);
+    const pair =
+      below.length > 0 && above.length > 0
+        ? [below[below.length - 1], above[0]]
+        : below.length >= 2
+          ? below.slice(-2)
+          : above.length >= 2
+            ? above.slice(0, 2)
+            : null;
+    if (pair) {
+      const [c1, c2] = pair;
+      const f1 = fixedPartAt(c1);
+      fixed = f1 + ((fixedPartAt(c2) - f1) * (ctx - c1)) / (c2 - c1);
+    } else {
+      fixed = fixedPartAt(measured[0]);
+    }
+  }
+  return Math.ceil((freeVramMib - fixed) / slope) - 1;
+}
+
+/**
+ * The layer count a prediction says to load next, inside what is still open:
+ * above the most layers known to fit, below the fewest known not to. Once a
+ * predicted boundary has been loaded and fit, the open interval starts one above
+ * it, so the next move tests that neighbour and closes the bracket in two loads.
+ * A prediction more than a layer outside the open interval has been contradicted
+ * by real loads, and the caller bisects instead.
+ */
+function claimGuidedNgl(
+  predicted: number | null,
+  knownFit: number | null,
+  knownMiss: number | null,
+  nglMax: number,
+  tried: Set<number>
+): number | null {
+  if (predicted == null) return null;
+  const lo = (knownFit ?? -1) + 1;
+  const hi = Math.min(nglMax, (knownMiss ?? nglMax + 1) - 1);
+  if (hi < lo || predicted < lo - 1 || predicted > hi + 1) return null;
+  const target = clamp(predicted, lo, hi);
+  return tried.has(target) ? null : target;
+}
+
+// --- Target 1 ----------------------------------------------------------------
+
+/**
+ * Target 1 on one axis, over the positions 0..cap (layer counts, or indices
+ * into the context stops). `cleanOf(p)` is the verdict at a position: true
+ * clean, false spilled, null never loaded.
+ *
+ * With A the highest clean position loaded and S the lowest spilling one above
+ * it: bisect between them until S is A+1 -- where spill starts -- then load
+ * A+2 and A+3. If one comes back clean it becomes A and the same rule runs
+ * again from there; once A+1..A+3 (those not above the cap) all spilled, A is
+ * the answer. A clean island more than two positions above spill is missed on
+ * purpose: finding every one means loading everything below the cap.
+ *
+ * Nothing loaded yet: the opener if given, else the cap itself -- which in the
+ * Wizard is the context below's answer, usually clean again in one load.
+ */
+function cleanStep(input: {
+  cap: number | null;
+  cleanOf: (p: number) => boolean | null;
+  opener?: number | null;
+}): { value: number | null; resolved: boolean; next: number | null } {
+  const { cap, cleanOf } = input;
+  if (cap == null || cap < 0) return { value: null, resolved: true, next: null };
+
+  let highestClean = -1;
+  let anyLoaded = false;
+  for (let p = 0; p <= cap; p++) {
+    const v = cleanOf(p);
+    if (v != null) anyLoaded = true;
+    if (v === true) highestClean = p;
+  }
+  if (!anyLoaded) {
+    const opener = input.opener != null ? clamp(Math.round(input.opener), 0, cap) : cap;
+    return { value: null, resolved: false, next: opener };
+  }
+  const value = highestClean >= 0 ? highestClean : null;
+  if (highestClean === cap) return { value, resolved: true, next: null };
+
+  let lowestSpillAbove: number | null = null;
+  for (let p = highestClean + 1; p <= cap; p++) {
+    if (cleanOf(p) === false) {
+      lowestSpillAbove = p;
+      break;
+    }
+  }
+  if (lowestSpillAbove == null) {
+    // Nothing loaded above the highest clean position: grow toward the cap.
+    return { value, resolved: false, next: Math.ceil((highestClean + cap + 1) / 2) };
+  }
+  if (lowestSpillAbove > highestClean + 1) {
+    return { value, resolved: false, next: Math.floor((highestClean + lowestSpillAbove) / 2) };
+  }
+  for (const p of [highestClean + 2, highestClean + 3]) {
+    if (p <= cap && cleanOf(p) == null) return { value, resolved: false, next: p };
+  }
+  return { value, resolved: true, next: null };
+}
+
+function controlOf(history: readonly LadderAttempt[], rung: LadderRung | null): CleanState["control"] {
+  if (rung == null) return "none";
+  return loadsAt(history, rung.ctx, rung.ngl).length >= 2 ? "confirmed" : "pending";
+}
+
+function judgedAt(history: readonly LadderAttempt[], rung: LadderRung | null): boolean {
+  if (rung == null) return false;
+  const loads = loadsAt(history, rung.ctx, rung.ngl);
+  return loads.length > 0 && loads.every((h) => h.placementJudged === true);
+}
+
+// --- keep_context: context pinned --------------------------------------------
+
+function keepContextOutcome(
+  history: readonly LadderAttempt[],
+  input: LadderInput,
+  nglMax: number,
+  maxCtx: number,
+  free: number | null
+): ProbeOutcome {
+  const ctx = clamp(Math.floor(input.candidateCtx), PROBE_LADDER_MIN_CTX, maxCtx);
+  const seed = clamp(Math.floor(input.candidateNgl), 0, nglMax);
+  const here = history.filter((h) => h.ctx === ctx);
+
+  let cap = nglMax;
+  let fit: LadderRung | null = null;
+  if (free != null) {
+    const step = fitStep({ history: here, ctx, nglMax, free, ceiling: null, opener: seed });
+    if (!step.state.resolved) return { next: step.next == null ? null : { ctx, ngl: step.next }, clean: null, fit: null };
+    if (step.state.value == null) return { next: null, clean: null, fit: null };
+    cap = step.state.value;
+    fit = { ctx, ngl: cap };
+  }
+
+  const clean = cleanStep({
+    cap,
+    cleanOf: (n) => cleanAt(here, ctx, n),
+    opener: free == null ? seed : null,
+  });
+  if (!clean.resolved) return { next: clean.next == null ? null : { ctx, ngl: clean.next }, clean: null, fit };
+  const answer = clean.value == null ? null : { ctx, ngl: clean.value };
+  const control = controlOf(here, answer);
+  return {
+    next: control === "pending" ? answer : null,
+    clean: answer ? { ...answer, control, judged: judgedAt(here, answer) } : null,
+    fit,
+  };
+}
+
+// --- fixed_offload: layers pinned --------------------------------------------
+
+function fixedOffloadOutcome(
+  history: readonly LadderAttempt[],
+  input: LadderInput,
+  nglMax: number,
+  maxCtx: number,
+  free: number | null
+): ProbeOutcome {
+  const ngl = clamp(Math.floor(input.candidateNgl), 0, nglMax);
+  const stops = ctxLadderStops(maxCtx);
+  const here = history.filter((h) => h.ngl === ngl);
+  const seedIdx = nearestStopIndex(stops, clamp(Math.floor(input.candidateCtx), PROBE_LADDER_MIN_CTX, maxCtx));
+  const loadsAtIdx = (i: number) => here.filter((h) => h.ctx === stops[i]);
+
+  let capIdx = stops.length - 1;
+  let fit: LadderRung | null = null;
+  if (free != null) {
+    // A claim only grows with context: a fit carries down the stops, a miss up.
+    let knownFit = -1;
+    const misses: number[] = [];
+    stops.forEach((_, i) => {
+      const loads = loadsAtIdx(i).filter((h) => !h.inconclusive);
+      if (loads.length === 0) return;
+      if (loads.some(fitVerdict)) knownFit = Math.max(knownFit, i);
+      else misses.push(i);
+    });
+    // A miss at or below a known fit contradicts it (a flaky load): trust the
+    // fit and ignore that miss, but keep every miss above it.
+    const firstMiss = Math.min(stops.length, ...misses.filter((i) => i > knownFit));
+    const resolved = firstMiss === 0 || knownFit === stops.length - 1 || firstMiss === knownFit + 1;
+    if (!resolved) {
+      const tried = new Set(here.map((h) => h.ctx));
+      let nextIdx: number;
+      if (knownFit < 0 && firstMiss === stops.length) nextIdx = seedIdx;
+      else if (firstMiss === stops.length) nextIdx = Math.ceil((knownFit + stops.length) / 2);
+      else nextIdx = Math.floor((knownFit + firstMiss) / 2);
+      nextIdx = clamp(nextIdx, knownFit + 1, firstMiss - 1);
+      const next = tried.has(stops[nextIdx]) ? null : { ctx: stops[nextIdx], ngl };
+      return { next, clean: null, fit: null };
+    }
+    if (firstMiss === 0) return { next: null, clean: null, fit: null };
+    capIdx = knownFit;
+    fit = { ctx: stops[capIdx], ngl };
+  }
+
+  const cleanOfIdx = (i: number) => {
+    const loads = loadsAtIdx(i);
+    return loads.length === 0 ? null : loads.every((h) => h.ok);
+  };
+  const clean = cleanStep({ cap: capIdx, cleanOf: cleanOfIdx, opener: free == null ? seedIdx : null });
+  if (!clean.resolved) return { next: clean.next == null ? null : { ctx: stops[clean.next], ngl }, clean: null, fit };
+  const answer = clean.value == null ? null : { ctx: stops[clean.value], ngl };
+  const control = controlOf(here, answer);
+  return {
+    next: control === "pending" ? answer : null,
+    clean: answer ? { ...answer, control, judged: judgedAt(here, answer) } : null,
+    fit,
+  };
+}
+
+// --- frontier: the Wizard ------------------------------------------------------
+
+/**
+ * Both targets at every context stop, smallest first:
+ *
+ *   1. target 2 here, capped by target 2 at the stop below. Nothing fits here
+ *      means nothing fits above either -- after the pending control below, the
+ *      probe ends.
+ *   2. the control of the stop below's no-spill answer.
+ *   3. target 1 here, capped by target 2 here and by the stop below's no-spill
+ *      answer -- a larger context never tries more layers than a smaller one
+ *      held clean.
+ *
+ * The first load at the smallest stop is the estimate's layer count, never
+ * every layer: after two loads the claim prediction takes over, and a
+ * full-offload load of a model larger than VRAM is the slowest load there is.
+ */
+function frontierOutcome(
+  history: readonly LadderAttempt[],
+  input: LadderInput,
+  nglMax: number,
+  maxCtx: number,
+  free: number | null
+): ProbeOutcome {
+  const stops = ctxLadderStops(maxCtx);
+  const curve: CurveStop[] = [];
+  const unmeasured = (ctx: number): CurveStop => ({
+    ctx,
+    fit: free == null ? null : { value: null, resolved: false, source: "unmeasured" },
+    clean: { value: null, resolved: false, source: "unmeasured", control: "none", judged: false },
+  });
+  const finish = (next: LadderRung | null, from: number, nothingFitsFrom: number | null = null): ProbeOutcome => {
+    for (let j = from; j < stops.length; j++) curve.push(unmeasured(stops[j]));
+    return summarise(curve, next, nothingFitsFrom);
+  };
+  const estimate = (ctx: number): number | null => {
+    if (!input.calculateNgl) return null;
+    const safe = clamp(Math.round(input.calculateNgl(ctx)), 0, nglMax);
+    return safe;
+  };
+
+  for (let i = 0; i < stops.length; i++) {
+    const ctx = stops[i];
+    const below = i > 0 ? curve[i - 1] : null;
+    let fitState: BoundaryState | null = null;
+
+    if (free != null) {
+      const ceiling = below?.fit?.value ?? null;
+      const step = fitStep({
+        history,
+        ctx,
+        nglMax,
+        free,
+        ceiling,
+        opener: i === 0 ? estimate(ctx) : ceiling,
+      });
+      if (!step.state.resolved) {
+        curve.push({ ctx, fit: step.state, clean: unmeasured(ctx).clean });
+        return finish(step.next == null ? null : { ctx, ngl: step.next }, i + 1);
+      }
+      fitState = step.state;
+    }
+
+    if (below && below.clean.control === "pending" && below.clean.value != null) {
+      curve.push({ ctx, fit: fitState, clean: unmeasured(ctx).clean });
+      return finish({ ctx: below.ctx, ngl: below.clean.value }, i + 1);
+    }
+
+    if (fitState && fitState.value == null) {
+      curve.push({
+        ctx,
+        fit: fitState,
+        clean: { value: null, resolved: true, source: "implied", control: "none", judged: false },
+      });
+      for (let j = i + 1; j < stops.length; j++) {
+        curve.push({
+          ctx: stops[j],
+          fit: { value: null, resolved: true, source: "implied" },
+          clean: { value: null, resolved: true, source: "implied", control: "none", judged: false },
+        });
+      }
+      return summarise(curve, null, ctx);
+    }
+
+    const cap = below ? (below.clean.value == null ? null : Math.min(below.clean.value, fitState?.value ?? nglMax)) : (fitState?.value ?? nglMax);
+    const clean = cleanStep({
+      cap,
+      cleanOf: (n) => cleanAt(history, ctx, n),
+      opener: i === 0 && free == null ? estimate(ctx) : null,
+    });
+    if (!clean.resolved) {
+      curve.push({
+        ctx,
+        fit: fitState,
+        clean: { value: clean.value, resolved: false, source: "unmeasured", control: "none", judged: false },
+      });
+      return finish(clean.next == null ? null : { ctx, ngl: clean.next }, i + 1);
+    }
+    const answer = clean.value == null ? null : { ctx, ngl: clean.value };
+    curve.push({
+      ctx,
+      fit: fitState,
+      clean: {
+        value: clean.value,
+        resolved: true,
+        source: history.some((h) => h.ctx === ctx) ? "measured" : "implied",
+        control: controlOf(history, answer),
+        judged: judgedAt(history, answer),
+      },
     });
   }
 
-  // max_gpu's whole definition is "start at every layer and the floor
-  // context" -- it ignores the caller's own candidate entirely, the same way
-  // "custom" above ignores everything BUT the caller's candidate. max_context
-  // similarly ignores the user's own ngl for its STARTING pin -- "highest
-  // possible context is top priority" means searching for whichever layer
-  // count actually maximizes the estimate (bestNglForMaxContext, pure
-  // estimate evaluations, zero real loads), not assuming it's the user's own.
-  let pinnedCtx =
-    input.mode === "max_gpu" ? PROBE_LADDER_MIN_CTX : clamp(Math.floor(input.candidateCtx), PROBE_LADDER_MIN_CTX, maxCtx);
-  let pinnedNgl =
-    input.mode === "max_gpu"
-      ? nglMax
-      : input.mode === "max_context"
-      ? bestNglForMaxContext(nglMax, input.calculateCtx)
-      : clamp(Math.floor(input.candidateNgl), 0, nglMax);
-  // Forward replay: history is a flat list with no phase markers, so the only
-  // way to know which rung belonged to which phase is to re-run the same
-  // deterministic decisions and consume history in lockstep.
-  let cursor = 0;
-  const state: PhaseState = { lastPhaseAllFailed: false, rescueRan: false };
+  const last = curve[curve.length - 1];
+  const next = last && last.clean.control === "pending" && last.clean.value != null ? { ctx: last.ctx, ngl: last.clean.value } : null;
+  return summarise(curve, next, null);
+}
 
-  for (let phaseIdx = 0; ; phaseIdx++) {
-    const spec = phaseSpecFor(
-      input.mode,
-      phaseIdx,
-      pinnedCtx,
-      pinnedNgl,
-      nglMax,
-      maxCtx,
-      input.calculateNgl,
-      input.calculateCtx,
-      state
-    );
-    if (!spec) break;
-    if (spec.isRescue) state.rescueRan = true;
-    // A phase that re-pins the other axis (max_gpu's back-off) must do so
-    // BEFORE its first rung is built, and the new pin has to persist into
-    // the phases after it -- phase 3 re-walks the ctx ladder at exactly the
-    // placement phase 2 settled on.
-    if (spec.pinOther != null) {
-      if (spec.axis === "ngl") pinnedCtx = clamp(Math.round(spec.pinOther), PROBE_LADDER_MIN_CTX, maxCtx);
-      else pinnedNgl = clamp(Math.round(spec.pinOther), 0, nglMax);
+/** The Wizard's headline answers, plus the whole curve. Target 1's headline --
+ * the stored ceiling -- is the largest context whose answer a control confirmed;
+ * only when none was confirmed (the budget ran out first) does an unconfirmed
+ * one stand in, labelled by its `control`. Target 2 needs no control. */
+function summarise(curve: CurveStop[], next: LadderRung | null, nothingFitsFrom: number | null): ProbeOutcome {
+  let confirmed: ProbeOutcome["clean"] = null;
+  let unconfirmed: ProbeOutcome["clean"] = null;
+  let fit: LadderRung | null = null;
+  for (const stop of curve) {
+    if (stop.clean.resolved && stop.clean.value != null) {
+      const answer = { ctx: stop.ctx, ngl: stop.clean.value, control: stop.clean.control, judged: stop.clean.judged };
+      if (stop.clean.control === "confirmed") confirmed = answer;
+      else unconfirmed = answer;
     }
-
-    const min = spec.axis === "ctx" ? PROBE_LADDER_MIN_CTX : 0;
-    const max = spec.axis === "ctx" ? maxCtx : nglMax;
-    const tolerance = NGL_TOLERANCE; // only "bisect"/"direct" (ngl-axis) phases consume this -- ctx-axis phases compute their own
-    const stops = spec.axis === "ctx" ? ctxLadderStops(maxCtx) : null;
-
-    const outcomes: AnchoredOutcome[] = [];
-    let candidate: number | null = spec.seed;
-
-    while (candidate !== null) {
-      const rung: LadderRung = spec.axis === "ctx" ? { ctx: candidate, ngl: pinnedNgl } : { ctx: pinnedCtx, ngl: candidate };
-
-      // A phase's own seed is frequently a rung an earlier phase already
-      // loaded (max_context/balanced's layer phase starts exactly where the
-      // context phase already proved it). Reuse that verdict instead of
-      // spending a real model load re-proving it.
-      const prior = input.history.slice(0, cursor).find((h) => h.ctx === rung.ctx && h.ngl === rung.ngl);
-      let ok: boolean;
-      let hostBacked = false;
-      if (prior) {
-        ok = prior.ok;
-        hostBacked = prior.hostBacked === true;
-      } else if (cursor < input.history.length) {
-        ok = input.history[cursor].ok;
-        hostBacked = input.history[cursor].hostBacked === true;
-        cursor++;
-      } else {
-        if (cursor >= maxLoads) return null; // out of budget entirely
-        return rung; // not loaded yet: run it now
-      }
-
-      outcomes.push({ value: candidate, ok });
-      if (ok) {
-        if (spec.axis === "ctx") pinnedCtx = candidate;
-        else pinnedNgl = candidate;
-      }
-
-      // A context phase cannot fix a host-backed PLACEMENT: the layers are in
-      // system RAM regardless of how small the context gets. Stop the walk on
-      // the first such failure and let the next phase move the other axis --
-      // this is the difference between one wasted load and six.
-      if (spec.axis === "ctx" && !ok && hostBacked) break;
-
-      candidate =
-        spec.searchStyle === "slider_refine"
-          ? nextSliderRefineCandidate({
-              history: outcomes,
-              stops: stops!,
-              granularity: input.granularity,
-              min,
-              max,
-              ceilingFirst: spec.ceilingFirst,
-            })
-          : spec.searchStyle === "direct"
-          ? nextDirectCandidate({ history: outcomes, growTarget: spec.growTarget, shrinkTarget: spec.shrinkTarget, min, max, tolerance })
-          : nextAnchoredCandidate({ history: outcomes, growTarget: spec.growTarget, shrinkTarget: spec.shrinkTarget, min, max, tolerance });
-    }
-
-    // Nothing on this axis fit at all. On the NGL axis that is terminal --
-    // the search already went as low as 0 layers. On the CTX axis it is not:
-    // a later phase moving the other axis genuinely can rescue it, and
-    // treating it as terminal is what made a balanced probe give up after six
-    // failures without ever trying fewer layers. The mode decides, via
-    // PhaseState.lastPhaseAllFailed; if it offers no rescue, the loop ends at
-    // the next phaseSpecFor returning null anyway.
-    state.lastPhaseAllFailed = outcomes.length > 0 && !outcomes.some((o) => o.ok);
-    if (state.lastPhaseAllFailed && spec.axis === "ngl") return null;
+    if (stop.fit?.resolved && stop.fit.value != null) fit = { ctx: stop.ctx, ngl: stop.fit.value };
   }
-  return null;
+  return { next, clean: confirmed ?? unconfirmed, fit, curve, nothingFitsFrom };
 }
 
-/**
- * The rung a probe should report as its verdict: the largest context that
- * passed, preferring the placement that achieved it -- and, when any pass had
- * its placement measured, only among measured passes.
- *
- * Without that preference "it loaded" became "verified": a frontier probe on a
- * 10GiB RTX 3080 reported 262,144 tokens at 15 layers from a rung whose own
- * estimate needed 10,225MiB, because nothing had measured where that memory
- * went. Every rung measures its own placement where the platform allows it
- * (shared/gpuSpill.ts), so on a platform that cannot, no pass is measured and
- * the verdict is the largest pass exactly as before -- only labelled.
- */
-export function bestLadderResult(history: LadderAttempt[]): LadderAttempt | null {
-  return bestLadderEvidence(history)?.attempt ?? null;
-}
-
-/** bestLadderResult's pick, plus whether its placement was measured -- so a
- * caller can label an unmeasured verdict instead of presenting it as verified. */
-export function bestLadderEvidence(
-  history: readonly LadderAttempt[]
-): { attempt: LadderAttempt; judged: boolean } | null {
-  const passing = history.filter((h) => h.ok);
-  if (passing.length === 0) return null;
-  const measured = passing.filter(placementMeasured);
-  const pool = measured.length > 0 ? measured : passing;
-  const attempt = pool.reduce((best, h) => (h.ctx > best.ctx || (h.ctx === best.ctx && h.ngl > best.ngl) ? h : best));
-  return { attempt, judged: placementMeasured(attempt) };
-}
-
-// --- The probe's ctx ladder + the client's OWN separate slider grid --------
+// --- The context grids -------------------------------------------------------
 //
 // Two different discrete grids on purpose:
-//  - ctxLadderStops (below): pure power-of-two doublings from the hard floor
-//    (1024, 2048, 4096, 8192, ...) up to the model's own ceiling. This is
-//    what the basic/fine engine walks and what snapToSafeCtx rounds down to
-//    -- every value `basic` probes is one of these; `fine` additionally
-//    tests values strictly between two adjacent ones.
-//  - computeCtxStops (further below): a fraction-of-trained-ctx ladder
-//    (100/75/50/25/12.5/...%) for the CLIENT's own context-target slider
-//    display. Unrelated to what the probe itself tests; kept here (not the
-//    client) only so nothing else has to duplicate it.
+//  - ctxLadderStops: power-of-two doublings from the hard floor up to the
+//    model's own ceiling. Every context the probe loads is one of these.
+//  - computeCtxStops: a fraction-of-trained-ctx ladder for the CLIENT's own
+//    context-target slider display. Unrelated to what the probe tests; kept here
+//    only so nothing else has to duplicate it.
 
 /**
- * The discrete ctx ladder the probe's walk steps along, and the value the
- * apply-to-slider snap rounds down to: doublings from the hard floor up to
- * the model's own ceiling, which is always included exactly even when it
- * isn't itself a power of two -- otherwise the true ceiling could never be
- * reached or reported.
+ * The discrete context ladder the probe loads: doublings from the hard floor up
+ * to the model's own ceiling, which is always included exactly even when it is
+ * not itself a power of two -- otherwise the true ceiling could never be reached.
  */
 export function ctxLadderStops(maxCtx: number): number[] {
   const ceiling = Math.max(PROBE_LADDER_MIN_CTX, Math.floor(maxCtx));
@@ -1083,322 +757,10 @@ export function ctxLadderStops(maxCtx: number): number[] {
   return stops;
 }
 
-// --- The frontier: one ngl boundary per context stop -------------------------
-//
-// The other modes answer "what is the best single placement". This one answers
-// "what does context COST in layers", which is the question a user actually
-// trades against: 16 layers holding 16k tokens and 12 layers holding 128k are
-// both true of the same machine, and today only the first is ever reported.
-//
-// The whole search rests on one physical fact: at a fixed layer count, a
-// larger context needs strictly more memory. So
-//
-//   a PASS at (ctx, n) means every SMALLER context also passes at n, and
-//   a FAIL at (ctx, n) means every LARGER context also fails at n.
-//
-// which makes the boundary a staircase that only ever steps down, and lets a
-// handful of measured rungs decide stops that were never loaded. Two resolved
-// stops with the SAME layer count prove every stop between them outright --
-// the flat case costs nothing beyond the two ends, which is what keeps this
-// affordable inside the same PROBE_MAX_LOADS budget every other mode uses.
-
-export interface FrontierStop {
-  ctx: number;
-  /** The largest layer count known to load here; null when none is. */
-  ngl: number | null;
-  /** The smallest layer count known to fail here; null when none is known to. */
-  firstFailingNgl: number | null;
-  /** The boundary here is pinned down: the pass and the fail are adjacent, or
-   * the pass is every layer, or even 0 layers failed. */
-  resolved: boolean;
-  /** "measured" -- a rung at this exact context decided it. "implied" --
-   * monotonicity carried it over from another stop, no load spent.
-   * "unmeasured" -- still open when the budget ran out. */
-  source: "measured" | "implied" | "unmeasured";
-  /** The pass this rests on never had its CACHE placement judged (see
-   * LadderAttempt.placementJudged), so "it loaded" is all that is known --
-   * the cache may be sitting in system RAM. Display must say so. */
-  unverified: boolean;
-}
-
-/** A pass is only evidence that its memory stayed in VRAM when that was
- * actually measured (LadderAttempt.placementJudged). */
-function placementMeasured(attempt: LadderAttempt): boolean {
-  return attempt.placementJudged === true;
-}
-
-/**
- * What every context stop's layer boundary currently is, given the rungs
- * loaded so far -- measured where a rung decided it, implied where
- * monotonicity does, open where neither has yet.
- *
- * Pure and total: the search uses it to choose the next load, and the UI uses
- * the same function to draw the curve, so the two cannot disagree about what
- * was actually established.
- */
-export function resolveFrontier(input: {
-  history: readonly LadderAttempt[];
-  stops: readonly number[];
-  nglMax: number;
-}): FrontierStop[] {
-  const nglMax = Math.max(0, Math.floor(input.nglMax));
-
-  return input.stops.map((ctx) => {
-    // A pass carries DOWN the context axis, a failure carries UP it -- and a
-    // failure whose weights were measurably host-backed carries both ways,
-    // since no context makes layers in system RAM acceptable.
-    const passes = input.history.filter((h) => h.ok && h.ctx >= ctx && h.ngl <= nglMax);
-    const fails = input.history.filter(
-      (h) => !h.ok && h.ngl <= nglMax && (h.ctx <= ctx || h.hostBacked === true)
-    );
-
-    let pass: LadderAttempt | null = null;
-    for (const p of passes) {
-      // Among equals prefer the rung measured at this very stop: it is the one
-      // whose own evidence decided it, and "measured" should not read as
-      // "implied" just because a larger context proved the same layer count.
-      if (pass == null || p.ngl > pass.ngl || (p.ngl === pass.ngl && p.ctx === ctx && pass.ctx !== ctx)) pass = p;
-    }
-    let fail: LadderAttempt | null = null;
-    for (const f of fails) {
-      if (fail == null || f.ngl < fail.ngl || (f.ngl === fail.ngl && f.ctx === ctx && fail.ctx !== ctx)) fail = f;
-    }
-
-    const ngl = pass?.ngl ?? null;
-    const firstFailingNgl = fail?.ngl ?? null;
-    // Contradictory rungs (a flaky load, or another process taking memory
-    // mid-probe) are read the same way the bisection primitives read them:
-    // trust the pass, ignore a failure at or below it.
-    const bracketClosed = ngl != null && firstFailingNgl != null && firstFailingNgl <= ngl + 1;
-    const nothingFits = firstFailingNgl === 0;
-    const everyLayerFits = ngl === nglMax;
-    const resolved = bracketClosed || nothingFits || everyLayerFits;
-
-    const decider = nothingFits ? fail : pass;
-    const source: FrontierStop["source"] = !resolved
-      ? "unmeasured"
-      : decider != null && decider.ctx === ctx
-      ? "measured"
-      : "implied";
-
-    return {
-      ctx,
-      ngl: nothingFits ? null : ngl,
-      firstFailingNgl,
-      resolved,
-      source,
-      // Only a PASS can be untrustworthy this way: a failure is a failure
-      // whatever the cache did.
-      // A measured pass at a larger context vouches for the same layer count
-      // here too, so any measured pass at this layer count will do.
-      unverified:
-        resolved && pass != null && !nothingFits && !passes.some((p) => p.ngl === ngl && placementMeasured(p)),
-    };
-  });
-}
-
-/**
- * The next rung a frontier probe should load, or null when every stop is
- * settled (or nothing fits at all).
- *
- * Priority, and the reasons are not interchangeable:
- *
- *  1. THE FLOOR STOP FIRST. Its loads are the cheapest the probe can buy (a
- *     1,024-token cache is a rounding error against the weights) and its
- *     verdict is the only uncontaminated one: system RAM appearing there is
- *     attributable to weights alone. Every other stop's boundary is bounded
- *     above by this one, so resolving it first bounds the entire search.
- *  2. THE CEILING STOP NEXT. Together with the floor it brackets the whole
- *     curve, and when the two agree the curve is proven flat for free.
- *  3. THEN THE WIDEST REMAINING STEP. Splitting the interval whose ends differ
- *     most puts each remaining load where the curve actually bends; an
- *     interval whose ends already match needs no load at all, because
- *     resolveFrontier has already settled everything inside it.
- *
- * Every rung measures its own spill (shared/gpuSpill.ts), so no load is spent
- * buying a smaller-context reference for another rung to be compared against.
- */
-export function nextFrontierRung(input: {
-  history: readonly LadderAttempt[];
-  nglMax: number;
-  maxCtx: number;
-  calculateNgl: (pinnedCtx: number) => number;
-  calculateCtx: (pinnedNgl: number) => number;
-}): LadderRung | null {
-  const nglMax = Math.max(0, Math.floor(input.nglMax));
-  const stops = ctxLadderStops(Math.max(PROBE_LADDER_MIN_CTX, Math.floor(input.maxCtx)));
-  const frontier = resolveFrontier({ history: input.history, stops, nglMax });
-  const tried = new Set(input.history.map((h) => `${h.ctx}:${h.ngl}`));
-
-  // Nothing loads even at the cheapest context: no stop above it can, and the
-  // model simply does not run on this machine.
-  if (frontier[0].resolved && frontier[0].ngl == null) return null;
-
-  for (const idx of frontierWorkOrder(frontier)) {
-    const ctx = stops[idx];
-    const candidate = nextNglAtStop({
-      stop: frontier[idx],
-      isFloor: idx === 0,
-      bounds: frontierBounds(frontier, idx, nglMax),
-      history: input.history,
-      nglMax,
-      calculateNgl: input.calculateNgl,
-      calculateCtx: input.calculateCtx,
-    });
-    if (candidate == null) continue;
-
-    if (!tried.has(`${ctx}:${candidate}`)) return { ctx, ngl: candidate };
-  }
-  return null;
-}
-
-/** Which stops to consider, in the order step 1-3 above describes. */
-function frontierWorkOrder(frontier: readonly FrontierStop[]): number[] {
-  const last = frontier.length - 1;
-  if (!frontier[0].resolved) return [0];
-  if (last > 0 && !frontier[last].resolved) return [last];
-
-  // Both ends known: split the widest unresolved span. Spans whose ends carry
-  // the same layer count are already fully resolved by implication, so they
-  // never appear here.
-  const resolvedIdx = frontier.map((s, i) => (s.resolved ? i : -1)).filter((i) => i >= 0);
-  const spans: { middle: number; width: number }[] = [];
-  for (let k = 0; k + 1 < resolvedIdx.length; k++) {
-    const a = resolvedIdx[k];
-    const b = resolvedIdx[k + 1];
-    if (b - a < 2) continue;
-    spans.push({ middle: Math.floor((a + b) / 2), width: (frontier[a].ngl ?? 0) - (frontier[b].ngl ?? 0) });
-  }
-  // Any stop left over when the ends themselves never resolved -- belt and
-  // braces, so a stop can never be skipped silently.
-  const orphans = frontier.map((s, i) => (s.resolved ? -1 : i)).filter((i) => i >= 0);
-  return [...spans.sort((x, y) => y.width - x.width).map((s) => s.middle), ...orphans];
-}
-
-/**
- * The live bracket for one stop: the most layers that could still work here,
- * and the fewest already known to.
- *
- * Monotonicity supplies both ends for free. A stop below this one (less
- * context) resolved at n means this one can never exceed n; a stop above it
- * resolved at m means this one is at least m. Without those bounds the search
- * has nothing to stop it proposing a layer count a neighbour already
- * disproved: measured, a raw estimator answer (estimateSafeNgl does not vary
- * with context at all) offered 20 layers at a context where 13 had just
- * failed, and the walk then spent nine loads wandering.
- */
-function frontierBounds(
-  frontier: readonly FrontierStop[],
-  idx: number,
-  nglMax: number
-): { lower: number; upper: number } {
-  let upper = nglMax;
-  for (let i = idx - 1; i >= 0; i--) {
-    if (frontier[i].resolved) {
-      upper = Math.min(upper, frontier[i].ngl ?? 0);
-      break;
-    }
-  }
-  let lower = 0;
-  for (let i = idx + 1; i < frontier.length; i++) {
-    if (frontier[i].resolved) {
-      lower = Math.max(lower, frontier[i].ngl ?? 0);
-      break;
-    }
-  }
-  const stop = frontier[idx];
-  if (stop.ngl != null) lower = Math.max(lower, stop.ngl);
-  if (stop.firstFailingNgl != null) upper = Math.min(upper, stop.firstFailingNgl - 1);
-  return { lower, upper: Math.max(lower, upper) };
-}
-
-/**
- * The next layer count to try at one stop, or null when its boundary is
- * already pinned down.
- *
- * Everything already known about this stop is fed to the same bisection
- * primitives the other modes use: rungs really loaded here, plus the bounds
- * its neighbours imply, as synthetic outcomes. An implied pass at 12 and an
- * implied failure at 20 then bracket exactly as two real loads would, without
- * either having been loaded at this context.
- *
- * The estimate only ever picks the SEED, and only inside the bracket. That is
- * the division of labour the rest of the ladder already uses -- an estimate is
- * worth a good first guess and nothing more -- and it is what keeps a
- * context-blind estimator from proposing a layer count a neighbour has already
- * ruled out.
- */
-function nextNglAtStop(input: {
-  stop: FrontierStop;
-  isFloor: boolean;
-  bounds: { lower: number; upper: number };
-  history: readonly LadderAttempt[];
-  nglMax: number;
-  calculateNgl: (pinnedCtx: number) => number;
-  calculateCtx: (pinnedNgl: number) => number;
-}): number | null {
-  const { stop, nglMax } = input;
-  const { lower, upper } = input.bounds;
-  if (stop.resolved || upper <= lower) return null;
-
-  const outcomes: AnchoredOutcome[] = [];
-  const push = (value: number, ok: boolean) => {
-    if (!outcomes.some((o) => o.value === value)) outcomes.push({ value, ok });
-  };
-  let measuredHere = 0;
-  for (const h of input.history) {
-    if (h.ctx === stop.ctx && h.ngl <= nglMax) {
-      push(h.ngl, h.ok);
-      measuredHere++;
-    }
-  }
-  if (stop.ngl != null) push(stop.ngl, true);
-  if (stop.firstFailingNgl != null) push(stop.firstFailingNgl, false);
-
-  // Nothing has actually been LOADED here yet. Bounds inherited from a
-  // neighbour are not a search in progress -- bisecting between them would
-  // step toward a bound one layer at a time (measured: 41, 45, 47, 48 at a
-  // stop whose neighbour already said 48). The opening move is the estimate's
-  // own answer, clamped into the bracket, exactly as every other mode seeds a
-  // phase. When the estimate lands on the upper bound that becomes a test OF
-  // the bound, which either collapses the whole span in one load or brackets
-  // on the spot.
-  if (measuredHere === 0) {
-    if (input.isFloor) return nglMax;
-    return clamp(bestNglAtContext(nglMax, stop.ctx, input.calculateCtx), lower, upper);
-  }
-
-  // Targets are the bracket itself, so neither direction can leave it, and
-  // both are TESTED rather than approached (nextDirectCandidate): a bound a
-  // neighbour already established is a real hypothesis about this stop, so the
-  // move after the seed is to try it outright. Measured on an estimate far
-  // below the truth, halving toward the bound instead climbed 24, 36, 42, 45,
-  // 47 -- five loads to reach a value that was known all along. The floor is
-  // the one stop with no resolved neighbour, so there the estimate itself is
-  // the shrink target, exactly as in max_gpu's layer phase.
-  // An estimate that has ALREADY failed here stops being a target. Clamping it
-  // into a bracket that its own failure just narrowed would otherwise hand back
-  // a fresh value every round -- measured: 26 failed, and the "target" became
-  // 25, then 24, then 23, one wasted load per layer all the way down. Once
-  // disproved, the honest target is the bracket's own floor.
-  const rawEstimate = clamp(Math.round(input.calculateNgl(stop.ctx)), 0, nglMax);
-  const estimateDisproved = stop.firstFailingNgl != null && rawEstimate >= stop.firstFailingNgl;
-  const shrinkTarget = input.isFloor && !estimateDisproved ? clamp(rawEstimate, lower, upper) : lower;
-  return nextDirectCandidate({
-    history: outcomes,
-    growTarget: upper,
-    shrinkTarget,
-    min: lower,
-    max: upper,
-    tolerance: NGL_TOLERANCE,
-  });
-}
-
 // Roughly 100/75/50/25/12.5/7.5/5/2.5/1% of the model's trained context, each
-// rounded to the nearest power of two and forced strictly below the stop
-// before it so two fractions can never collide on the same tick once
-// rounded. The client's own context-target slider grid ONLY -- see the note
-// above; the probe search itself no longer uses this.
+// rounded to the nearest power of two and forced strictly below the stop before
+// it so two fractions can never collide on the same tick once rounded. The
+// client's own context-target slider grid ONLY.
 const CTX_STOP_FRACTIONS = [1, 0.75, 0.5, 0.25, 0.125, 0.075, 0.05, 0.025, 0.01];
 
 export function computeCtxStops(maxCtx: number): number[] {
@@ -1415,31 +777,30 @@ export function computeCtxStops(maxCtx: number): number[] {
   return out.reverse();
 }
 
-function nearestStop(stops: readonly number[], target: number): number {
-  return stops[nearestStopIndex(stops, target)];
+function nearestStopIndex(stops: readonly number[], target: number): number {
+  let best = 0;
+  let bestDist = Math.abs(target - stops[0]);
+  for (let i = 1; i < stops.length; i++) {
+    const d = Math.abs(target - stops[i]);
+    if (d < bestDist) {
+      best = i;
+      bestDist = d;
+    }
+  }
+  return best;
 }
 
 /**
- * A verified context rounded to something a slider can actually express.
- *
- * A `fine` search converges on a context BETWEEN two stops. That number is
- * the real measurement and is what gets stored (model_machine_limits'
- * verified_ctx_tokens) and shown -- snapping it at that point was a mistake
- * this once made: refinement only ever happens inside one stop interval, so
- * snapping down always landed back on the stop `basic` had already found,
- * making every extra `fine` load incapable of changing the stored result.
- *
- * The snap belongs where a slider value is genuinely needed instead -- the
- * Benchmark page's "apply this card" action. Down, never up: rounding a
- * verified ceiling upward would claim a context that was never loaded.
+ * A verified context rounded down to something a slider can express. Every
+ * context the ladder loads is already a stop; this exists for results stored
+ * before `fine` was removed, which could land between two. Down, never up:
+ * rounding a verified ceiling upward would claim a context that was never loaded.
  */
 export function snapToSafeCtx(verifiedCtx: number, maxCtx: number): number {
   const stops = ctxLadderStops(maxCtx);
   const below = stops.filter((s) => s <= verifiedCtx);
   return below.length > 0 ? Math.max(...below) : Math.min(verifiedCtx, PROBE_LADDER_MIN_CTX);
 }
-
-// --- helpers ------------------------------------------------------------
 
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));

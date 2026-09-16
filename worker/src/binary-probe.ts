@@ -119,3 +119,62 @@ export async function readCpuIsa(path: string): Promise<string | null> {
   isaCache.set(key, pending);
   return pending;
 }
+
+export interface ListedDevice {
+  /** The backend's own device name, e.g. "Vulkan0" or "CUDA1". */
+  name: string;
+  description: string;
+  totalMib: number;
+  freeMib: number;
+}
+
+// One line per device, as llama.cpp's --list-devices prints it:
+//   Vulkan0: AMD Radeon RX 6600 XT (8176 MiB, 7378 MiB free)
+const LIST_DEVICES_LINE_RE = /^\s*(\S+):\s+(.*?)\s+\((\d+)\s+MiB,\s+(\d+)\s+MiB free\)\s*$/;
+
+export function parseListDevices(output: string): ListedDevice[] {
+  const devices: ListedDevice[] = [];
+  for (const line of output.split(/\r?\n/)) {
+    const m = LIST_DEVICES_LINE_RE.exec(line);
+    if (!m) continue;
+    devices.push({ name: m[1], description: m[2], totalMib: Number(m[3]), freeMib: Number(m[4]) });
+  }
+  return devices;
+}
+
+/**
+ * Every device this llama.cpp build lists, with its free memory as the build
+ * itself sees it -- the probe's second target compares each load's claim
+ * against this, device by device. Empty when the build has no --list-devices.
+ *
+ * Not memoized: free memory is a property of the moment, not of the binary.
+ */
+export async function readListDevices(path: string): Promise<ListedDevice[]> {
+  let output: string;
+  try {
+    const { stdout, stderr } = await execFileAsync(path, ["--list-devices"], { timeout: PROBE_TIMEOUT_MS, windowsHide: true });
+    output = `${stdout}\n${stderr}`;
+  } catch (err) {
+    const e = err as { stdout?: string; stderr?: string };
+    output = `${e.stdout ?? ""}\n${e.stderr ?? ""}`;
+  }
+  return parseListDevices(output);
+}
+
+/** The devices a load can place buffers on: the `-mg` one alone when set
+ * (the load runs `-sm none`), every listed device otherwise. */
+export function usedListedDevices(devices: readonly ListedDevice[], mainGpu?: number): ListedDevice[] {
+  if (mainGpu != null) return devices[mainGpu] ? [devices[mainGpu]] : [];
+  return [...devices];
+}
+
+/** Total free VRAM on the devices a load will use (usedListedDevices); null
+ * when the build lists nothing or names no device at that index. */
+export async function readListDevicesFreeMib(path: string, mainGpu?: number): Promise<number | null> {
+  return listDevicesFreeMib(await readListDevices(path), mainGpu);
+}
+
+export function listDevicesFreeMib(devices: readonly ListedDevice[], mainGpu?: number): number | null {
+  const used = usedListedDevices(devices, mainGpu);
+  return used.length === 0 ? null : used.reduce((sum, d) => sum + d.freeMib, 0);
+}

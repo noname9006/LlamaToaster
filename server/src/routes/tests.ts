@@ -910,11 +910,11 @@ export async function testsRoutes(app: FastifyInstance): Promise<void> {
             return reply.code(400).send({ error: `probe.kv_pair contains "${String(t)}" -- allowed: ${CACHE_TYPE_VALUES.join(", ")}` });
           }
         }
-        // Both optional (absent = the pre-modes single-axis search), but a
-        // value that IS supplied has to be one this app knows -- an unknown
-        // mode silently falling back to a different search would make the
-        // stored spec a lie about what the probe did.
-        if (p.mode !== undefined && !isProbeMode(p.mode)) {
+        // A mode is required: the pre-modes single-axis search and the removed
+        // max_gpu/max_context/balanced searches no longer exist, and a worker
+        // refuses a probe without a mode it runs. Granularity is still accepted
+        // so older clients validate, and ignored.
+        if (!isProbeMode(p.mode)) {
           return reply.code(400).send({ error: `probe.mode must be one of ${PROBE_MODES.join(", ")}` });
         }
         if (p.granularity !== undefined && !isProbeGranularity(p.granularity)) {
