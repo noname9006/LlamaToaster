@@ -404,7 +404,7 @@ describe("parseGpuBufferReport", () => {
         "sched_reserve:        CUDA0 compute buffer size =   150.00 MiB",
       ].join("\n")
     )!;
-    expect(report).toEqual({ deviceMib: 4150, contextMib: 150 });
+    expect(report).toEqual({ deviceMib: 4150, contextMib: 150, byDeviceMib: { CUDA0: 4150 } });
   });
 
   it("sums buffers across several GPUs", () => {
@@ -416,7 +416,7 @@ describe("parseGpuBufferReport", () => {
         "llama_kv_cache:        CUDA1 KV buffer size =    80.00 MiB",
       ].join("\n")
     )!;
-    expect(report).toEqual({ deviceMib: 3680, contextMib: 180 });
+    expect(report).toEqual({ deviceMib: 3680, contextMib: 180, byDeviceMib: { CUDA0: 2100, CUDA1: 1580 } });
   });
 
   it("reports nothing on a GPU for a CPU-only load, rather than no report", () => {
@@ -424,7 +424,7 @@ describe("parseGpuBufferReport", () => {
       parseGpuBufferReport(
         ["load_tensors:   CPU_Mapped model buffer size =  5880.00 MiB", "llama_kv_cache:          CPU KV buffer size =   512.00 MiB"].join("\n")
       )
-    ).toEqual({ deviceMib: 0, contextMib: 0 });
+    ).toEqual({ deviceMib: 0, contextMib: 0, byDeviceMib: {} });
   });
 
   it("returns null when the build printed no buffer sizes", () => {
