@@ -12,7 +12,14 @@ import type { IngestResultInput, ProbeAttemptReport } from "../../shared/types.j
 import { CURVE_METHOD_VERSION, SERVER_METHOD_VERSION, type CaveatFlag } from "../../shared/types.js";
 import type { SweepItem } from "../../shared/sweep.js";
 import { isVramDiscrepancy } from "../../shared/vramEstimate.js";
-import { measureGpuSpill, UNMEASURED_GPU_SPILL, type GpuBufferReport, type GpuSpillVerdict } from "../../shared/gpuSpill.js";
+import {
+  measureGpuSpill,
+  UNMEASURED_GPU_SPILL,
+  type GpuBufferReport,
+  type GpuSpillVerdict,
+  type GrowthSpillVerdict,
+  type SpillAnchor,
+} from "../../shared/gpuSpill.js";
 import {
   appendBoundedOutput,
   collapseTensorLoadSpam,
@@ -730,22 +737,32 @@ export interface ProbeAttemptOutcome {
   listDevicesFreeMib?: number | null;
   /** "full" -- loaded, prompted, generated, spill judged. "claim_stop" -- stopped
    * once ready because the claim did not fit free VRAM: no generation, no spill
-   * verdict. "error" -- failed for a reason that is not memory (readiness
+   * verdict. "claim_only" -- stopped once ready because the claim fit and the
+   * load could only ever answer that target (probeLadder.ts nextClaimOnly): no
+   * generation, no spill verdict. "error" -- failed for a reason that is not memory (readiness
    * timeout, a crash without an out-of-memory signature, a rejected request),
    * so it decides nothing about the claim. */
-  loadKind?: "full" | "claim_stop" | "error";
+  loadKind?: "full" | "claim_stop" | "claim_only" | "error";
   /** Target 2's verdict for this load, judged per device where llama.cpp's
    * buffer report and --list-devices both name the devices
    * (claimFitsFreeByDevice), on the totals otherwise. Undefined from a load
    * that never reported buffers. */
   claimFitsFree?: boolean | null;
-  /** Spill per phase (shared/gpuSpill.ts measurePhasedGpuSpill): the ready hold's
-   * last reading and the prompt+generation's median, each with how far that
-   * phase's readings moved. Null where the phase had no reading. */
+  /** Spill per phase (shared/gpuSpill.ts measureGrowthSpill): each phase's
+   * min(s, d) against the anchor, with its tolerance. Null where the phase had
+   * no reading. */
   spillReadyMib?: number | null;
   spillReadyJitterMib?: number | null;
   spillWorkMib?: number | null;
   spillWorkJitterMib?: number | null;
+  /** See ProbeAttemptReport.spill_method and its siblings. */
+  spillMethod?: "anchor" | "growth" | null;
+  spillSharedGrowthMib?: number | null;
+  spillUnlandedGrowthMib?: number | null;
+  /** The anchor as it stands after an anchor load (built from the first, noise
+   * folded in by the second). Worker-only: the ladder loop carries it to every
+   * later load; never reported. Undefined on every other load. */
+  spillAnchor?: SpillAnchor | null;
   /** The ladder's bounds, repeated on every row -- see ProbeAttemptReport. */
   ladderNglMax?: number | null;
   ladderMaxCtx?: number | null;
@@ -830,6 +847,13 @@ export { PROBE_GEN_TOKENS, PROBE_PROMPT_TOKENS } from "../../shared/probeLadder.
 // still runs, and only ever warns: it cannot tell a real fallback from an
 // estimate that was merely pessimistic, and failing on it is what 926ab8c
 // backed out.
+/** "+145MiB", "-3MiB", or "not measured" -- a growth reading, sign always shown. */
+export function signedMib(v: number | null | undefined): string {
+  if (v == null) return "not measured";
+  const r = Math.round(v);
+  return `${r >= 0 ? "+" : ""}${r}MiB`;
+}
+
 export function probeSucceeded(input: {
   oom: boolean;
   // WHOLE-ADAPTER VRAM peak, every process combined -- read only by the
@@ -923,15 +947,19 @@ export function probeSucceeded(input: {
     };
   }
   if (gpuSpill.spilled && gpuSpill.inSystemRamMib != null && input.gpuBuffers) {
-    const contextMib = Math.round(input.gpuBuffers.contextMib);
-    const beyondContext = gpuSpill.inSystemRamMib - (gpuSpill.jitterMib ?? 0) > input.gpuBuffers.contextMib;
+    // Judged as growth over the anchor, what a smaller context can take back is
+    // what this context ADDS in KV cache and compute buffer over the anchor's.
+    const growth = (gpuSpill as Partial<GrowthSpillVerdict>).unlandedGrowthMib != null ? (gpuSpill as GrowthSpillVerdict) : null;
+    const contextBuffersMib = growth?.contextGrowthMib ?? input.gpuBuffers.contextMib;
+    const contextMib = Math.round(contextBuffersMib);
+    const beyondContext = gpuSpill.inSystemRamMib - (gpuSpill.jitterMib ?? 0) > contextBuffersMib;
+    const contextWords = growth ? "what this context adds in KV cache and compute buffer over the anchor" : "this context's entire KV cache and compute buffer";
     const consequence =
       gpuSpill.cause === "cache"
-        ? `no more than this context's KV cache and compute buffer (${contextMib}MiB), so a smaller context can ` +
-          `bring it back into VRAM`
+        ? `no more than ${contextWords} (${contextMib}MiB), so a smaller context can bring it back into VRAM`
         : beyondContext
-          ? `more than this context's entire KV cache and compute buffer (${contextMib}MiB), so the model's layers ` +
-            `are in system RAM and no smaller context fixes it`
+          ? `more than ${contextWords} (${contextMib}MiB), so the model's layers are in system RAM and no smaller ` +
+            `context fixes it`
           : `and this is already the smallest context the probe tries, so only fewer layers can bring it back into VRAM`;
     return {
       ok: false,
@@ -939,9 +967,12 @@ export function probeSucceeded(input: {
       vramDiscrepancy,
       gpuSpill,
       failCause: gpuSpill.cause,
-      reason:
-        `${Math.round(gpuSpill.inSystemRamMib)}MiB of the ${Math.round(input.gpuBuffers.deviceMib)}MiB llama.cpp ` +
-        `put on the GPU is being served from system RAM, not VRAM -- ${consequence}`,
+      reason: growth
+        ? `${Math.round(gpuSpill.inSystemRamMib)}MiB more of llama.cpp's GPU memory is in system RAM than at the ` +
+          `anchor load (shared ${signedMib(growth.sharedGrowthMib)}, claim not in VRAM ` +
+          `${signedMib(growth.unlandedGrowthMib)}, tolerance ${Math.round(gpuSpill.jitterMib ?? 0)}MiB) -- ${consequence}`
+        : `${Math.round(gpuSpill.inSystemRamMib)}MiB of the ${Math.round(input.gpuBuffers.deviceMib)}MiB llama.cpp ` +
+          `put on the GPU is being served from system RAM, not VRAM -- ${consequence}`,
     };
   }
   return { ok: true, spill: false, vramDiscrepancy, gpuSpill, failCause: null, reason: null };
@@ -993,14 +1024,19 @@ export function toBenchResult(input: {
  * the n-th load reuses a sibling's n-th load of that point, never the same
  * reading twice -- a control is only a control if it is a second real load.
  * `loadsHere` is how many times this probe has already loaded the point.
+ * `needsSpill`: this load has to judge target 1, so a sibling's claim_only load
+ * -- stopped before any spill verdict -- cannot stand in for it.
  */
-export function pickDedupPoint<P extends { candidate_ctx: number; ngl: number | null }>(
+export function pickDedupPoint<P extends { candidate_ctx: number; ngl: number | null; load_kind?: string | null }>(
   points: readonly P[],
   ctx: number,
   ngl: number,
-  loadsHere: number
+  loadsHere: number,
+  needsSpill = true
 ): P | undefined {
-  return points.filter((p) => p.candidate_ctx === ctx && p.ngl === ngl)[loadsHere];
+  return points.filter(
+    (p) => p.candidate_ctx === ctx && p.ngl === ngl && !(needsSpill && p.load_kind === "claim_only")
+  )[loadsHere];
 }
 
 export const RUNTIME_DEFAULT_TIMEOUT_MS = DEFAULT_TIMEOUT_MS;
@@ -1040,6 +1076,9 @@ export function toProbeAttemptReport(attempt: ProbeAttemptOutcome): ProbeAttempt
     spill_ready_jitter_mib: attempt.spillReadyJitterMib,
     spill_work_mib: attempt.spillWorkMib,
     spill_work_jitter_mib: attempt.spillWorkJitterMib,
+    spill_method: attempt.spillMethod,
+    spill_shared_growth_mib: attempt.spillSharedGrowthMib,
+    spill_unlanded_growth_mib: attempt.spillUnlandedGrowthMib,
     ladder_ngl_max: attempt.ladderNglMax,
     ladder_max_ctx: attempt.ladderMaxCtx,
     host_backed_fail: attempt.hostBackedFailCause,

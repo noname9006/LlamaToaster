@@ -52,7 +52,7 @@ export function toLadderAttempts(rows: ProbeAttemptDto[]): LadderAttempt[] {
           : claimFitsFree({
               claimedMib: r.gpu_buffers_mib,
               freeMib: r.list_devices_free_mib,
-              loaded: r.gen_tps != null || r.load_kind === "claim_stop",
+              loaded: r.gen_tps != null || r.load_kind === "claim_stop" || r.load_kind === "claim_only",
             }),
     }));
 }
@@ -61,14 +61,16 @@ export function toLadderAttempts(rows: ProbeAttemptDto[]): LadderAttempt[] {
  * Re-resolves a stored probe exactly as the worker did. Every row repeats the
  * ladder's own bounds and the --list-devices reading; a row from a worker
  * predating them falls back to the largest layer count and context it loaded.
- * A Targets probe's pinned axis is read off its first load, which is always at
- * the pinned value.
+ * A Targets probe's pinned axis is read off its first load after the anchor,
+ * which is always at the pinned value. A probe whose rows carry a spill method
+ * was searched with the anchor first, and is re-resolved the same way.
  */
 export function outcomeFrom(rows: ProbeAttemptDto[], mode: ProbeMode): ProbeOutcome | null {
   const history = toLadderAttempts(rows);
   if (history.length === 0) return null;
-  const first = rows.find((r) => r.ngl != null)!;
+  const first = rows.find((r) => r.ngl != null && r.spill_method !== "anchor") ?? rows.find((r) => r.ngl != null)!;
   return probeOutcome({
+    anchored: rows.some((r) => r.spill_method != null),
     mode,
     candidateCtx: first.candidate_ctx,
     candidateNgl: first.ngl!,
@@ -115,7 +117,7 @@ export function ProbeFrontier({ testId, refreshKey }: { testId: string; refreshK
   const freeMib = useMemo(() => (rows ?? []).find((r) => r.list_devices_free_mib != null)?.list_devices_free_mib ?? null, [rows]);
   // The full loads at a point, newest last -- figures shown are the first's.
   const loadsAt = (ctx: number, ngl: number | null) =>
-    ngl == null ? [] : (rows ?? []).filter((r) => r.candidate_ctx === ctx && r.ngl === ngl && r.load_kind !== "claim_stop");
+    ngl == null ? [] : (rows ?? []).filter((r) => r.candidate_ctx === ctx && r.ngl === ngl && r.load_kind !== "claim_stop" && r.load_kind !== "claim_only");
 
   const chartConfig = useMemo(() => {
     const fg = cssVar("--color-fg", "#e8e8e8");

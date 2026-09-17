@@ -1,5 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { measureGpuSpill, measurePhasedGpuSpill, UNMEASURED_GPU_SPILL } from "./gpuSpill.js";
+import {
+  buildSpillAnchor,
+  measureGpuSpill,
+  measureGrowthSpill,
+  UNMEASURED_GPU_SPILL,
+  withAnchorControl,
+  type MeasuredLoad,
+  type MemoryReading,
+} from "./gpuSpill.js";
 
 // Real loads, 2026-09-14: Qwen3.6-35B-A3B-UD-IQ4_NL on a Radeon RX 6600 XT
 // (8176MiB), Vulkan, llama.cpp b10956. deviceMib and contextMib are sums of
@@ -75,49 +83,89 @@ describe("measureGpuSpill", () => {
   });
 });
 
-describe("measurePhasedGpuSpill", () => {
-  const buffers = { deviceMib: 2408, contextMib: 263 };
-  const at = (atMs: number, dedicatedMib: number | null) => ({ atMs, dedicatedMib });
+describe("measureGrowthSpill", () => {
+  // Real loads, 2026-09-16: Qwen3.8-27B-UD-Q5_K_M on the same RX 6600 XT, Vulkan,
+  // llama.cpp b11009, 1,024 tokens unless noted. Claim is llama.cpp's buffer
+  // report; dedicated and shared are the process's WDDM counters.
   const ready = { fromMs: 1000, toMs: 4500 };
   const work = { fromMs: 4500, toMs: 30_000 };
+  const READY_AT = [2000, 3000, 4000];
+  const WORK_AT = [6000, 10_000, 14_000, 18_000, 22_000, 26_000, 29_000];
 
-  it("judges the hold on its last reading, so memory still paging in right after load is not a spill", () => {
-    const readings = [at(2000, 2100), at(3000, 2300), at(4000, 2420), ...[6000, 12_000, 20_000, 29_000].map((t) => at(t, 2421))];
-    const v = measurePhasedGpuSpill({ buffers, readings, ready, work });
-    expect(v.readyPhase).toMatchObject({ measured: true, spilled: false });
-    expect(v).toMatchObject({ measured: true, spilled: false });
+  function load(
+    claim: number,
+    contextMib: number,
+    dedicated: number,
+    shared: number | null,
+    over: { ready?: [number, number | null][]; work?: [number, number | null][] } = {}
+  ): MeasuredLoad {
+    const readings: MemoryReading[] = [
+      ...(over.ready ?? READY_AT.map(() => [dedicated, shared] as [number, number | null])).map(([d, sh], i) => ({ atMs: READY_AT[i], dedicatedMib: d, sharedMib: sh })),
+      ...(over.work ?? WORK_AT.map(() => [dedicated, shared] as [number, number | null])).map(([d, sh], i) => ({ atMs: WORK_AT[i], dedicatedMib: d, sharedMib: sh })),
+    ];
+    return { buffers: { deviceMib: claim, contextMib }, readings, ready, work };
+  }
+
+  const A = load(1233, 240, 1005, 1272);
+  const anchor = withAnchorControl(buildSpillAnchor(A)!, A);
+
+  it("reads a load that grew in VRAM and not in shared as clean", () => {
+    expect(measureGrowthSpill({ ...load(1841, 244, 1616, 1272), atSmallestContext: true }, anchor)).toMatchObject({
+      measured: true,
+      spilled: false,
+      sharedGrowthMib: 0,
+      unlandedGrowthMib: -3,
+    });
   });
 
-  it("catches memory moved to system RAM only once the model is used", () => {
-    const readings = [at(2000, 2420), at(3000, 2421), at(4000, 2420), ...[6000, 12_000, 20_000, 29_000].map((t) => at(t, 2249))];
-    const v = measurePhasedGpuSpill({ buffers, readings, ready, work });
-    expect(v.readyPhase.spilled).toBe(false);
-    expect(v.workPhase).toMatchObject({ spilled: true, inSystemRamMib: 159 });
-    expect(v).toMatchObject({ spilled: true, inSystemRamMib: 159 });
+  it("fails a load whose shared growth and unlanded claim agree, filed under the layers at the smallest context", () => {
+    const v = measureGrowthSpill({ ...load(3330, 246, 2972, 1417), atSmallestContext: true }, anchor);
+    expect(v).toMatchObject({ spilled: true, sharedGrowthMib: 145, unlandedGrowthMib: 130, inSystemRamMib: 130, cause: "layers" });
+    // The two accounts disagree by 15: that is the whole tolerance on steady readings.
+    expect(v.jitterMib).toBe(15);
   });
 
-  it("judges work on the median, so one reading mid-reshuffle cannot decide it", () => {
-    const readings = [at(4000, 2420), at(6000, 2420), at(8000, 2200), at(10_000, 2420), at(12_000, 2421)];
-    const v = measurePhasedGpuSpill({ buffers, readings, ready, work });
-    // The dip widens the tolerance instead of deciding the verdict.
-    expect(v.workPhase).toMatchObject({ spilled: false, jitterMib: 221 });
+  it("does not call overhead growing in shared a spill while dedicated took the whole claim", () => {
+    expect(measureGrowthSpill(load(2228, 240, 2008, 2267), anchor)).toMatchObject({ spilled: false, sharedGrowthMib: 995, unlandedGrowthMib: -8 });
   });
 
-  it("never counts a reading taken after the first request toward the ready hold", () => {
-    // The only hold reading lands 500ms into the prompt: it belongs to work only.
-    const readings = [at(5000, 2249)];
-    const v = measurePhasedGpuSpill({ buffers, readings, ready, work });
-    expect(v.readyPhase.measured).toBe(false);
-    expect(v.workPhase).toMatchObject({ measured: true, inSystemRamMib: 159 });
+  it("stays clean when a buffer moved back into VRAM at a larger context", () => {
+    // 262,144 tokens, 5 layers: the compute buffer is resident here, d goes negative.
+    expect(measureGrowthSpill(load(4323, 3452, 4347, 1292), anchor)).toMatchObject({ spilled: false, sharedGrowthMib: 20, unlandedGrowthMib: -252 });
   });
 
-  it("counts a reading that lands up to a second after the work window", () => {
-    const readings = [at(30_900, 2249)];
-    expect(measurePhasedGpuSpill({ buffers, readings, ready: null, work }).workPhase.measured).toBe(true);
+  it("files a spill no larger than the context's own growth over the anchor under the cache", () => {
+    expect(measureGrowthSpill(load(6239, 3452, 5503, 2062), anchor)).toMatchObject({ spilled: true, inSystemRamMib: 508, cause: "cache" });
   });
 
-  it("is unmeasured with no readings in either phase", () => {
-    const v = measurePhasedGpuSpill({ buffers, readings: [at(500, 2400)], ready, work });
-    expect(v).toMatchObject({ measured: false, spilled: false });
+  it("widens every tolerance by how far the anchor's second load differed", () => {
+    const noisy = withAnchorControl(buildSpillAnchor(A)!, load(1233, 240, 999, 1272));
+    expect(noisy.work?.noiseMib).toBe(6);
+    const v = measureGrowthSpill(load(1841, 244, 1616, 1275), noisy);
+    // s +3 against d -3 disagree by 6, plus the anchor noise of 6.
+    expect(v.jitterMib).toBe(6 + 6);
+  });
+
+  it("judges the hold on its last reading, so memory still paging in after load is not a spill", () => {
+    const paging = load(1841, 244, 1616, 1272, { ready: [[1300, 1500], [1500, 1300], [1616, 1272]] });
+    expect(measureGrowthSpill(paging, anchor).readyPhase).toMatchObject({ measured: true, spilled: false, unlandedGrowthMib: -3 });
+  });
+
+  it("judges work on the median of paired readings, so a jump for a minority of it widens the tolerance", () => {
+    const jump: [number, number][] = [[1616, 1272], [1616, 1272], [1616, 1272], [1616, 1272], [1616, 1272], [1400, 1488], [1400, 1488]];
+    const v = measureGrowthSpill(load(1841, 244, 1616, 1272, { work: jump }), anchor).workPhase;
+    expect(v).toMatchObject({ spilled: false, unlandedGrowthMib: -3, sharedGrowthMib: 0 });
+    // The two accounts disagree by 3 at the median; the jump moved both by 216.
+    expect(v.jitterMib).toBe(3 + 216);
+  });
+
+  it("uses the unlanded claim alone where there is no shared counter", () => {
+    const noShared = withAnchorControl(buildSpillAnchor(load(1233, 240, 1005, null))!, load(1233, 240, 1005, null));
+    expect(measureGrowthSpill(load(3330, 246, 2972, null), noShared)).toMatchObject({ spilled: true, sharedGrowthMib: null, inSystemRamMib: 130, jitterMib: 0 });
+  });
+
+  it("is unmeasured without an anchor, and there is no anchor without a buffer report", () => {
+    expect(measureGrowthSpill(load(3330, 246, 2972, 1417), null)).toMatchObject({ measured: false, spilled: false });
+    expect(buildSpillAnchor({ ...A, buffers: null })).toBeNull();
   });
 });

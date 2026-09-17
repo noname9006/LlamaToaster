@@ -1767,20 +1767,34 @@ export interface ProbeAttemptReport {
   list_devices_free_mib?: number | null;
   // "full" -- loaded, prompted, generated, spill judged. "claim_stop" -- the
   // claim did not fit free VRAM once the server was ready, so the load stopped
-  // there: no generation and no spill verdict. "error" -- failed for a reason
+  // there: no generation and no spill verdict. "claim_only" -- the claim fit,
+  // but the load could only ever answer that target (shared/probeLadder.ts
+  // nextClaimOnly), so it stopped there too. "error" -- failed for a reason
   // that is not memory, so it decides nothing about the claim. Absent = "full".
-  load_kind?: "full" | "claim_stop" | "error";
+  load_kind?: "full" | "claim_stop" | "claim_only" | "error";
   // Target 2's verdict recorded at load time, per device where possible (see
   // shared/probeLadder.ts claimFitsFreeByDevice). Absent from older workers,
   // whose rows fall back to comparing the totals.
   claim_fits_free?: boolean | null;
-  // Spill by phase (shared/gpuSpill.ts measurePhasedGpuSpill): the ready hold's
-  // last reading and the prompt+generation's median, each with how far that
-  // phase's once-a-second readings moved. Null where a phase had no reading.
+  // Spill by phase. With spill_method set (shared/gpuSpill.ts
+  // measureGrowthSpill): each phase's spill -- min(s, d) against the anchor --
+  // and its tolerance. On earlier rows: llama.cpp's buffers minus dedicated
+  // VRAM, and how far the readings moved. Null where a phase had no reading.
   spill_ready_mib?: number | null;
   spill_ready_jitter_mib?: number | null;
   spill_work_mib?: number | null;
   spill_work_jitter_mib?: number | null;
+  // Which rule judged this load: "anchor" -- one of the probe's two anchor
+  // loads, which every other load is measured against; "growth" -- judged as
+  // growth over that anchor. Absent on rows judged against zero, and on loads
+  // with no spill verdict at all (stopped at ready, failed).
+  spill_method?: "anchor" | "growth" | null;
+  // The worse phase's two accounts of growth since the anchor: s, this
+  // process's shared GPU memory (null where no shared counter exists), and d,
+  // claim growth dedicated VRAM did not take. gpu_in_system_ram_mib is then
+  // min(s, d) and gpu_spill_jitter_mib the tolerance.
+  spill_shared_growth_mib?: number | null;
+  spill_unlanded_growth_mib?: number | null;
   // The ladder's own bounds (llama.cpp's -ngl ceiling for the model, and its
   // trained context), repeated on every row so a stored probe can be re-resolved
   // exactly by shared/probeLadder.ts's probeOutcome.

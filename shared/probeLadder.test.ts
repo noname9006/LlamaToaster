@@ -8,6 +8,7 @@ import {
   nextLadderRung,
   predictFitNgl,
   probeOutcome,
+  PROBE_ANCHOR_NGL,
   PROBE_LADDER_MIN_CTX,
   PROBE_MAX_LOADS,
   snapToSafeCtx,
@@ -58,7 +59,7 @@ function measure(machine: Machine, r: LadderRung, history: LadderAttempt[], free
 
 function run(
   mode: ProbeMode,
-  opts: { ctx?: number; ngl?: number; machine?: Machine; free?: number | null; maxLoads?: number; maxCtx?: number } = {}
+  opts: { ctx?: number; ngl?: number; machine?: Machine; free?: number | null; maxLoads?: number; maxCtx?: number; anchored?: boolean } = {}
 ): { history: LadderAttempt[]; input: LadderInput } {
   const machine = opts.machine ?? CARD;
   const free = opts.free === undefined ? FREE : opts.free;
@@ -73,6 +74,7 @@ function run(
     history,
     freeVramMib: free,
     calculateNgl: () => 12,
+    anchored: opts.anchored,
   };
   for (let guard = 0; guard < 300; guard++) {
     const next = nextLadderRung(input);
@@ -231,6 +233,54 @@ describe("the Wizard (frontier)", () => {
     expect(curve[curve.length - 1].fit?.source).toBe("unmeasured");
   });
 
+  describe("claim-only loads", () => {
+    // Runs the ladder the way the worker does: a load flagged nextClaimOnly stops
+    // at ready, so it carries its claim verdict but no clean one.
+    function runStopping(machine: Machine = CARD) {
+      const history: LadderAttempt[] = [];
+      const flagged: LadderRung[] = [];
+      const input: LadderInput = { ...run("frontier", { machine, maxLoads: 0 }).input, history, maxLoads: 200 };
+      for (let guard = 0; guard < 300; guard++) {
+        const outcome = probeOutcome(input);
+        if (outcome.next == null) return { history, flagged, input };
+        const measured = measure(machine, outcome.next, history, FREE);
+        if (outcome.nextClaimOnly) {
+          flagged.push(outcome.next);
+          if (measured.fitsFree) {
+            history.push({ ...measured, ok: false, placementJudged: false });
+            continue;
+          }
+        }
+        history.push(measured);
+      }
+      throw new Error("ladder did not terminate");
+    }
+
+    it("flags only loads above the stop below's final no-spill answer, never at the smallest context", () => {
+      const { flagged, input } = runStopping();
+      expect(flagged.length).toBeGreaterThan(0);
+      const curve = probeOutcome(input).curve!;
+      for (const r of flagged) {
+        const i = curve.findIndex((s) => s.ctx === r.ctx);
+        expect(i).toBeGreaterThan(0);
+        const below = curve[i - 1].clean.value;
+        if (below != null) expect(r.ngl).toBeGreaterThan(below);
+      }
+    });
+
+    it("reaches the same curve as generating on every load", () => {
+      const full = probeOutcome(run("frontier").input).curve;
+      expect(probeOutcome(runStopping().input).curve).toEqual(full);
+    });
+
+    it("flags every load past a smallest context with no clean answer", () => {
+      const nothingClean: Machine = { claim: CARD.claim, clean: () => false };
+      const { history, flagged, input } = runStopping(nothingClean);
+      expect(probeOutcome(input).curve![0].clean).toMatchObject({ value: null, resolved: true });
+      expect(flagged.map(key)).toEqual(history.filter((h) => h.ctx > 1024).map(key));
+    });
+  });
+
   it("without a --list-devices reading searches no spill alone, opening at the estimate", () => {
     const { history, input } = run("frontier", { free: null });
     expect(history[0]).toEqual(expect.objectContaining({ ctx: 1024, ngl: 12 }));
@@ -238,6 +288,49 @@ describe("the Wizard (frontier)", () => {
     expect(outcome.curve![0].fit).toBeNull();
     expect(outcome.curve![0].clean.value).toBe(6);
     expect(outcome.fit).toBeNull();
+  });
+});
+
+describe("the anchor", () => {
+  const anchorKey = `${PROBE_LADDER_MIN_CTX}/${PROBE_ANCHOR_NGL}`;
+
+  it("loads the anchor twice before any mode searches, flagged as anchor loads", () => {
+    for (const [mode, opts] of [
+      ["frontier", {}],
+      ["keep_context", { ctx: 8192 }],
+      ["fixed_offload", { ngl: 6 }],
+      ["custom", { ctx: 4096, ngl: 6 }],
+    ] as const) {
+      const { history, input } = run(mode, { ...opts, anchored: true });
+      expect(history.slice(0, 2).map(key)).toEqual([anchorKey, anchorKey]);
+      expect(probeOutcome({ ...input, history: [] })).toMatchObject({ next: { ctx: 1024, ngl: 1 }, nextIsAnchor: true });
+      expect(probeOutcome({ ...input, history: history.slice(0, 2) }).nextIsAnchor).toBeFalsy();
+    }
+  });
+
+  it("reaches the same Wizard curve, opening target 2 from the anchor claim", () => {
+    const plain = probeOutcome(run("frontier").input).curve!;
+    const { history, input } = run("frontier", { anchored: true });
+    // One claim is known (the anchor), so the opener is its prediction, which errs low.
+    expect(history[2]).toEqual(expect.objectContaining({ ctx: 1024, ngl: 10 }));
+    expect(probeOutcome(input).curve!.map((s) => [s.ctx, s.fit?.value, s.clean.value, s.clean.control])).toEqual(
+      plain.map((s) => [s.ctx, s.fit?.value, s.clean.value, s.clean.control])
+    );
+  });
+
+  it("ends the probe on a failed anchor, and reports nothing fits when its claim did not fit", () => {
+    const failing: Machine = { claim: CARD.claim, clean: (r) => !(r.ctx === 1024 && r.ngl === 1) };
+    const failed = run("frontier", { machine: failing, anchored: true });
+    expect(failed.history).toHaveLength(1);
+    expect(probeOutcome(failed.input)).toMatchObject({ next: null, clean: null });
+
+    // A claim over free stops at ready and is never clean.
+    const huge: Machine = { claim: () => FREE + 1, clean: () => false };
+    const none = run("frontier", { machine: huge, anchored: true });
+    expect(none.history).toHaveLength(1);
+    const outcome = probeOutcome(none.input);
+    expect(outcome.nothingFitsFrom).toBe(1024);
+    expect(outcome.curve!.every((s) => s.fit?.resolved && s.fit.value == null && s.clean.value == null)).toBe(true);
   });
 });
 

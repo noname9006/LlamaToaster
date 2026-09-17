@@ -843,4 +843,13 @@ describe("pickDedupPoint", () => {
     expect(pickDedupPoint(sibling, 1024, 7, 1)).toBeUndefined();
     expect(pickDedupPoint(sibling, 2048, 6, 0)).toBeUndefined();
   });
+
+  it("skips a sibling's claim-only load when this load has to judge spill, and reuses it when it does not", () => {
+    const withClaimOnly = [
+      { candidate_ctx: 2048, ngl: 17, load_kind: "claim_only", seq: 1 },
+      { candidate_ctx: 2048, ngl: 17, load_kind: "full", seq: 2 },
+    ];
+    expect(pickDedupPoint(withClaimOnly, 2048, 17, 0)?.seq).toBe(2);
+    expect(pickDedupPoint(withClaimOnly, 2048, 17, 0, false)?.seq).toBe(1);
+  });
 });
