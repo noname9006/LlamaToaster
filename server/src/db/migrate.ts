@@ -408,6 +408,12 @@ const COLUMN_MIGRATIONS: ColumnSpec[] = [
   { table: "probe_attempts", column: "ladder_ngl_max", ddlType: "INTEGER" },
   { table: "probe_attempts", column: "ladder_max_ctx", ddlType: "INTEGER" },
   { table: "probe_attempts", column: "claim_fits_free", ddlType: "INTEGER" },
+  // Spill as growth over the probe's anchor load (docs/CONTEXT_TEST_REDESIGN.md
+  // §7): which rule judged the row, and its two accounts s and d. NULL on every
+  // earlier row, whose spill columns hold the zero-based difference.
+  { table: "probe_attempts", column: "spill_method", ddlType: "TEXT" },
+  { table: "probe_attempts", column: "spill_shared_growth_mib", ddlType: "REAL" },
+  { table: "probe_attempts", column: "spill_unlanded_growth_mib", ddlType: "REAL" },
 ];
 
 function applyColumnMigrations(database: Database.Database): void {

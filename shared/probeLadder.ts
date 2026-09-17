@@ -73,6 +73,15 @@ export const PROBE_LADDER_MIN_CTX = 1024;
 export const PROBE_MAX_LOADS = 40;
 
 /**
+ * The anchor's layer count: every spill verdict is growth over a load of the
+ * model at this many layers and the smallest context (shared/gpuSpill.ts
+ * measureGrowthSpill). One layer, never zero: the process's shared memory jumps
+ * by about a gigabyte with the first layer on the GPU, overhead no later load
+ * should be charged with.
+ */
+export const PROBE_ANCHOR_NGL = 1;
+
+/**
  * What one full load actually exercises, regardless of the context it
  * allocates: every load runs this prompt and generates this many tokens, so
  * the speeds a rung reports describe roughly PROBE_EXERCISED_TOKENS of context
@@ -178,6 +187,13 @@ export interface CleanState extends BoundaryState {
 
 export interface LadderInput {
   mode: ProbeMode;
+  /**
+   * Spill is judged as growth over an anchor: before any search, every mode
+   * loads the anchor point (PROBE_ANCHOR_NGL layers, the smallest context)
+   * twice. A probe recorded before anchors existed leaves this unset, so its
+   * rows still resolve the way they were searched.
+   */
+  anchored?: boolean;
   candidateCtx: number;
   candidateNgl: number;
   /** llama.cpp's -ngl ceiling for this model (n_layer + the output layer). */
@@ -218,6 +234,15 @@ export interface ProbeOutcome {
   curve?: CurveStop[];
   /** The Wizard stopped because nothing fits at this context (or anywhere above). */
   nothingFitsFrom?: number | null;
+  /** `next` is an anchor load: the first or second load of the anchor point. */
+  nextIsAnchor?: boolean;
+  /**
+   * `next` can only ever answer target 2: it is above every layer count target 1
+   * may still accept at its context -- the stop below's no-spill answer, which a
+   * control can only lower, or no answer at all. The load stops once its claim
+   * is known to fit; generating would judge a spill nothing reads.
+   */
+  nextClaimOnly?: boolean;
 }
 
 /** The next load, or null when the ladder is finished or out of budget. */
@@ -237,6 +262,11 @@ export function probeOutcome(input: LadderInput): ProbeOutcome {
   const maxCtx = Math.max(PROBE_LADDER_MIN_CTX, Math.floor(input.maxCtx));
   const history = input.history.filter((h) => h.ngl >= 0 && h.ngl <= nglMax);
   const free = input.freeVramMib ?? null;
+
+  if (input.anchored) {
+    const gate = anchorGate(history, input.mode, nglMax, maxCtx, free);
+    if (gate) return gate;
+  }
 
   switch (input.mode) {
     case "custom": {
@@ -258,6 +288,38 @@ export function probeOutcome(input: LadderInput): ProbeOutcome {
     case "frontier":
       return frontierOutcome(history, input, nglMax, maxCtx, free);
   }
+}
+
+/**
+ * The anchor before anything else. Both loads are needed: the first is what
+ * every later load is measured against, the second how far two identical loads
+ * differ. A failed anchor ends the probe -- nothing else can be judged -- and
+ * one whose claim did not fit free VRAM means nothing fits at any placement.
+ * Null once both loads are in and clean: the mode's own search takes over, and
+ * counts them as the anchor point's load and control.
+ */
+function anchorGate(
+  history: readonly LadderAttempt[],
+  mode: ProbeMode,
+  nglMax: number,
+  maxCtx: number,
+  free: number | null
+): ProbeOutcome | null {
+  const anchor = { ctx: PROBE_LADDER_MIN_CTX, ngl: Math.min(PROBE_ANCHOR_NGL, nglMax) };
+  const loads = loadsAt(history, anchor.ctx, anchor.ngl);
+  const failed = loads.find((h) => !h.ok);
+  if (failed) {
+    const nothingFits = free != null && !failed.inconclusive && fitVerdict(failed) === false;
+    if (!nothingFits || mode !== "frontier") return { next: null, clean: null, fit: null };
+    const curve: CurveStop[] = ctxLadderStops(maxCtx).map((ctx) => ({
+      ctx,
+      fit: { value: null, resolved: true, source: ctx === anchor.ctx ? "measured" : "implied" },
+      clean: { value: null, resolved: true, source: "implied", control: "none", judged: false },
+    }));
+    return summarise(curve, null, anchor.ctx);
+  }
+  if (loads.length < 2) return { next: anchor, clean: null, fit: null, nextIsAnchor: true };
+  return null;
 }
 
 // --- Verdicts ---------------------------------------------------------------
@@ -630,9 +692,9 @@ function frontierOutcome(
     fit: free == null ? null : { value: null, resolved: false, source: "unmeasured" },
     clean: { value: null, resolved: false, source: "unmeasured", control: "none", judged: false },
   });
-  const finish = (next: LadderRung | null, from: number, nothingFitsFrom: number | null = null): ProbeOutcome => {
+  const finish = (next: LadderRung | null, from: number, nextClaimOnly = false): ProbeOutcome => {
     for (let j = from; j < stops.length; j++) curve.push(unmeasured(stops[j]));
-    return summarise(curve, next, nothingFitsFrom);
+    return { ...summarise(curve, next, null), nextClaimOnly: next != null && nextClaimOnly };
   };
   const estimate = (ctx: number): number | null => {
     if (!input.calculateNgl) return null;
@@ -657,7 +719,11 @@ function frontierOutcome(
       });
       if (!step.state.resolved) {
         curve.push({ ctx, fit: step.state, clean: unmeasured(ctx).clean });
-        return finish(step.next == null ? null : { ctx, ngl: step.next }, i + 1);
+        // Every stop below is resolved by now, so its no-spill answer already
+        // bounds target 1 here (step 3's cap).
+        const claimOnly =
+          below != null && step.next != null && (below.clean.value == null || step.next > below.clean.value);
+        return finish(step.next == null ? null : { ctx, ngl: step.next }, i + 1, claimOnly);
       }
       fitState = step.state;
     }

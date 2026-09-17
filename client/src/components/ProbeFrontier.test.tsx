@@ -37,7 +37,8 @@ function row(r: LadderRung, seq: number, overrides: Partial<ProbeAttemptDto> = {
     gpu_buffers_mib: c, gpu_in_system_ram_mib: fits ? (ok ? -10 : 150) : null, gpu_spill_jitter_mib: fits ? 2 : null,
     host_backed_fail: fits && !ok ? "cache" : null, list_devices_free_mib: FREE, claim_fits_free: null,
     load_kind: fits ? "full" : "claim_stop", spill_ready_mib: null, spill_ready_jitter_mib: null,
-    spill_work_mib: null, spill_work_jitter_mib: null, ladder_ngl_max: 41, ladder_max_ctx: 262_144,
+    spill_work_mib: null, spill_work_jitter_mib: null,
+    spill_method: null, spill_shared_growth_mib: null, spill_unlanded_growth_mib: null, ladder_ngl_max: 41, ladder_max_ctx: 262_144,
     error: null, created_at: 0, reused_from_run_id: null, vram_discrepancy: 0,
     gpu_layers_resident_est: null, gpu_layers_resident_exact: null,
     ...overrides,
@@ -130,6 +131,14 @@ describe("ProbeFrontier", () => {
 
   it("re-resolves a Targets probe from its first load's pinned axis", () => {
     const rows = [row({ ctx: 4096, ngl: 6 }, 0)];
+    expect(outcomeFrom(rows, "custom")?.clean).toMatchObject({ ctx: 4096, ngl: 6 });
+  });
+
+  it("re-resolves an anchored probe with its anchor first, reading the pinned axis past it", () => {
+    const anchor = { spill_method: "anchor" as const };
+    const anchorsOnly = [row({ ctx: 1024, ngl: 1 }, 0, anchor)];
+    expect(outcomeFrom(anchorsOnly, "custom")).toMatchObject({ next: { ctx: 1024, ngl: 1 }, nextIsAnchor: true });
+    const rows = [...anchorsOnly, row({ ctx: 1024, ngl: 1 }, 1, anchor), row({ ctx: 4096, ngl: 6 }, 2, { spill_method: "growth" })];
     expect(outcomeFrom(rows, "custom")?.clean).toMatchObject({ ctx: 4096, ngl: 6 });
   });
 });

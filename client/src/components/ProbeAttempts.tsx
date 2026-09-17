@@ -96,13 +96,25 @@ function failedForHostBackedCache(
   );
 }
 
-// The measured spill for one load (shared/gpuSpill.ts): how much of what
-// llama.cpp put on the GPU this process's dedicated VRAM did not hold. "—" on a
-// load that could not be measured, including every older worker's row.
+// The measured spill for one load (shared/gpuSpill.ts). Since the anchor: how
+// much more of llama.cpp's GPU memory is in system RAM than at the probe's
+// anchor load, min(s, d) against a measured tolerance. On older rows: how much
+// of what llama.cpp put on the GPU dedicated VRAM did not hold. "—" on a load
+// that could not be measured.
 function spillCell(
   a: Pick<
     ProbeAttemptDto,
-    "gpu_buffers_mib" | "gpu_in_system_ram_mib" | "gpu_spill_jitter_mib" | "spill_ready_mib" | "spill_work_mib" | "load_kind"
+    | "gpu_buffers_mib"
+    | "gpu_in_system_ram_mib"
+    | "gpu_spill_jitter_mib"
+    | "spill_ready_mib"
+    | "spill_ready_jitter_mib"
+    | "spill_work_mib"
+    | "spill_work_jitter_mib"
+    | "load_kind"
+    | "spill_method"
+    | "spill_shared_growth_mib"
+    | "spill_unlanded_growth_mib"
   >
 ): {
   text: string;
@@ -116,12 +128,46 @@ function spillCell(
       title: "Not judged: the claim did not fit free VRAM, so the load stopped before any request.",
     };
   }
+  if (a.load_kind === "claim_only") {
+    return {
+      text: "—",
+      warn: false,
+      title:
+        "Not judged: the claim fit, but this many layers is already above the no-spill answer at the context below, so a spill verdict here could not change any answer. The load stopped before any request.",
+    };
+  }
+  if (a.spill_method === "anchor") {
+    return {
+      text: "anchor",
+      warn: false,
+      title:
+        "One of the probe's two anchor loads (1 layer, smallest context). Every other load's spill is growth over the first; how far the second differed widens every tolerance.",
+    };
+  }
   if (a.gpu_in_system_ram_mib == null || a.gpu_buffers_mib == null) {
     return {
       text: "—",
       warn: false,
       title:
         "Not measured: this load had no llama.cpp buffer report or no per-process VRAM reading (an older worker, or a platform such as Metal that reports no per-process memory).",
+    };
+  }
+  if (a.spill_method === "growth") {
+    const tolerance = a.gpu_spill_jitter_mib ?? 0;
+    const spill = a.gpu_in_system_ram_mib;
+    const spilled = spill > tolerance;
+    return {
+      text: spilled ? mib(spill) : "none",
+      warn: spilled,
+      title:
+        `Since the anchor load: shared GPU memory ${signedMib(a.spill_shared_growth_mib)}, claim not taken by VRAM ` +
+        `${signedMib(a.spill_unlanded_growth_mib)}. Spill is the smaller of the two, ${signedMib(spill)}, against a tolerance of ` +
+        `${mib(tolerance)} (how far the two disagree, how far the readings moved, and the anchor's own movement and noise). ` +
+        (spilled ? "More than that is a spill." : "Within it: no spill.") +
+        (a.spill_ready_mib != null || a.spill_work_mib != null
+          ? ` By phase: after load ${signedMib(a.spill_ready_mib)} within ${mib(a.spill_ready_jitter_mib)}, during prompt and ` +
+            `generation ${signedMib(a.spill_work_mib)} within ${mib(a.spill_work_jitter_mib)} -- the worse one decides.`
+          : ""),
     };
   }
   const jitter = a.gpu_spill_jitter_mib ?? 0;
@@ -152,34 +198,24 @@ function spilledMib(a: Pick<ProbeAttemptDto, "gpu_in_system_ram_mib" | "vram_sha
   return a.gpu_in_system_ram_mib ?? a.vram_shared_peak_mib ?? 0;
 }
 
-// Everything llama-server claimed on the GPU, however the driver split it
-// between dedicated VRAM and shared system RAM. Measured as one sum per reading
-// when the worker sent it; a rung stored before that falls back to adding the
-// two separate peaks, marked "~" -- they can come from different moments of the
-// load, so that sum can only read high, never low.
-function claimedCell(
-  a: Pick<ProbeAttemptDto, "vram_claimed_peak_mib" | "vram_process_peak_mib" | "vram_shared_peak_mib">
-): { text: string; title: string; mib: number | null } {
-  if (a.vram_claimed_peak_mib != null) {
+// What llama-server claimed on the GPU: the sum of the GPU buffers llama.cpp
+// itself reported allocating (weights, KV cache, recurrent state, compute,
+// output) -- the same claim the probe holds against free VRAM. Host buffers
+// (CPU, *_Host) are not part of it. "—" when the build printed no buffer
+// report, rather than a figure rebuilt from memory counters.
+function claimedCell(a: Pick<ProbeAttemptDto, "gpu_buffers_mib">): { text: string; title: string; mib: number | null } {
+  if (a.gpu_buffers_mib != null) {
     return {
-      text: mib(a.vram_claimed_peak_mib),
-      title: "llama-server's own dedicated VRAM plus its shared system RAM, summed within one reading -- everything it claimed on the GPU.",
-      mib: a.vram_claimed_peak_mib,
-    };
-  }
-  if (a.vram_process_peak_mib != null) {
-    const sum = a.vram_process_peak_mib + (a.vram_shared_peak_mib ?? 0);
-    return {
-      text: `~${mib(sum)}`,
+      text: mib(a.gpu_buffers_mib),
       title:
-        "Recorded before claimed VRAM was measured directly: llama's VRAM peak plus its shared peak, which may come from different moments of the load, so this can read high.",
-      mib: sum,
+        "llama-server's own claim: every GPU buffer llama.cpp reported allocating (weights, KV cache, recurrent state, compute, output), wherever the driver then put it.",
+      mib: a.gpu_buffers_mib,
     };
   }
   return {
     text: "—",
     title:
-      "No per-process VRAM reading on this worker (an older worker build, or a platform whose driver reports no per-process memory), so what llama-server claimed can't be measured.",
+      "No GPU buffer report from this load (it failed before allocating, nothing was placed on a GPU, or the build or worker predates the report), so llama-server's claim is unknown.",
     mib: null,
   };
 }
@@ -346,7 +382,7 @@ export function ProbeAttempts({ testId, refreshKey }: ProbeAttemptsProps) {
               <th
                 className="px-2 py-1.5 text-right"
                 rowSpan={2}
-                title="Everything llama-server claimed on the GPU: its own dedicated VRAM plus its own shared system RAM, however the driver split the two."
+                title="llama-server's claim: every GPU buffer llama.cpp reported allocating, wherever the driver then put it."
               >
                 VRAM claimed
               </th>
@@ -519,6 +555,20 @@ export function ProbeAttempts({ testId, refreshKey }: ProbeAttemptsProps) {
                         >
                           claim over free — not generated
                         </span>
+                      ) : a.spill_method === "anchor" && a.ok === 1 ? (
+                        <span
+                          title="The anchor load every other load's spill is measured against -- loaded twice, so how far two identical loads differ is measured too."
+                          className="rounded-full bg-surface px-2 py-0.5 text-[10px] font-bold text-muted"
+                        >
+                          anchor
+                        </span>
+                      ) : a.load_kind === "claim_only" ? (
+                        <span
+                          title="The claim fit free VRAM. This many layers is above the no-spill answer at the context below, so only the claim could matter here -- the load stopped before any request."
+                          className="rounded-full bg-surface px-2 py-0.5 text-[10px] font-bold text-muted"
+                        >
+                          claim fits — not generated
+                        </span>
                       ) : a.ok ? (
                         <>
                           <span className="mr-1 inline-block h-2 w-2 rounded-full bg-success align-middle" /> passed
@@ -594,10 +644,9 @@ export function ProbeAttempts({ testId, refreshKey }: ProbeAttemptsProps) {
         number in this row — <b className="text-fg">free</b>, <b className="text-fg">claimed</b>,{" "}
         <b className="text-fg">peak</b>, <b className="text-fg">shared</b> — is a direct measurement, not a prediction:
         free is what the machine actually had available just before the load. <b className="text-fg">Claimed</b> is
-        everything llama-server allocated on the GPU — its own dedicated VRAM plus its own shared memory, summed within
-        one reading — however the driver split the two; once claimed exceeds VRAM free, the difference has to live in
-        system RAM. A claimed value marked <b className="text-fg">~</b> comes from a load recorded before claimed was
-        measured directly and adds the two separate peaks instead, so it can only read high.{" "}
+        llama-server's own claim: the GPU buffers llama.cpp reported allocating (weights, KV cache, recurrent state,
+        compute, output), wherever the driver then put them; once claimed exceeds VRAM free, the difference has to live
+        in system RAM.{" "}
         <b className="text-fg">Peak</b> and <b className="text-fg">Shared</b> are each split into{" "}
         <b className="text-fg">total</b> (every process on the GPU/machine combined, not just this load — the same
         thing "free" measures, which is why the two are comparable) and <b className="text-fg">llama</b> (llama-server's
@@ -610,14 +659,17 @@ export function ProbeAttempts({ testId, refreshKey }: ProbeAttemptsProps) {
         is different from a confirmed zero.
       </p>
       <p className="mt-2 text-[11px] leading-relaxed text-muted">
-        <b className="text-fg">In system RAM</b> is measured, not estimated: llama.cpp logs exactly how much it put on
-        the GPU — weights, KV cache, compute buffer — and the OS reports how much of this process actually sits in
-        dedicated VRAM. Whatever VRAM does not hold is being served from system RAM, and the load{" "}
-        <b className="text-fg">fails</b>; a clean load reads <b className="text-fg">none</b>. No limit is involved
-        beyond the VRAM counter's own movement during the load. The failure names what spilled: more than the
-        context's whole KV cache and compute buffer is <b className="text-warning">layers in system RAM</b>, and the
-        search backs off to fewer layers; anything less is <b className="text-warning">cache in system RAM</b>, and the
-        search tries a smaller context. <b className="text-warning">⚠ possible VRAM fallback</b> appears only where this
+        <b className="text-fg">In system RAM</b> is measured, not estimated, as growth over the probe's{" "}
+        <b className="text-fg">anchor</b> — its first two loads, at 1 layer and the smallest context. Two accounts
+        of that growth are compared: how much this process's shared GPU memory grew, and how much of llama.cpp's
+        growing claim dedicated VRAM did not take. Real spill moves both; the smaller one is the spill. Past a
+        tolerance measured on the probe itself — how far the two accounts disagree, how far the readings moved,
+        and how far the anchor's two loads differed — the load <b className="text-fg">fails</b>; within it, it
+        reads <b className="text-fg">none</b>. No fixed limit is involved. The failure names what spilled: more than
+        the context adds in KV cache and compute buffer over the anchor is{" "}
+        <b className="text-warning">layers in system RAM</b>, and the search backs off to fewer layers; anything less
+        is <b className="text-warning">cache in system RAM</b>, and the search tries a smaller context. Rows from
+        before the anchor existed were judged against zero instead. <b className="text-warning">⚠ possible VRAM fallback</b> appears only where this
         could not be measured, as an inference from the estimate. <b className="text-fg">Speeds</b> come from the same
         fixed {PROBE_EXERCISED_TOKENS}-token workload on every row, so they say whether a configuration runs — not how
         fast it is at the context beside them. There is no minimum rate: a slow load is reported with its rate, and only

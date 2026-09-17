@@ -34,6 +34,11 @@
 // already in system RAM with half the card free. "Was the GPU full" therefore
 // cannot be a precondition -- only the accounting can say.
 //
+// That zero-based difference (measureGpuSpill) is no longer how the context test
+// decides: it judges growth over an anchor load instead -- see "Spill as growth
+// over an anchor" below for why zero is not a usable baseline. measureGpuSpill
+// remains only as probeSucceeded's fallback for a caller that passes no verdict.
+//
 // Not yet confirmed on Windows CUDA, where the CUDA context's own allocation
 // may land in dedicated VRAM outside llama.cpp's buffers and pull clean
 // readings further below zero -- which would hide a spill smaller than that.
@@ -106,42 +111,84 @@ export function measureGpuSpill(input: GpuSpillInput): GpuSpillVerdict {
   };
 }
 
-// --- Spill by phase ----------------------------------------------------------
+// --- Spill as growth over an anchor -----------------------------------------
 //
-// One dedicated-VRAM figure per load (its peak once loaded) cannot show memory
-// that the driver moves to system RAM only once it is used. So the context test
-// reads this process's dedicated VRAM about once a second for the whole load
-// and judges two phases separately:
+// The context test's rule. The difference above assumes a clean load reads at
+// or below zero, and on some builds it does not: on b11009 a 1,024-token load
+// with nothing but the compute buffer on the GPU read +236MiB -- the whole
+// buffer -- and failed every placement at that context. And the process's
+// shared memory never reads zero: ~1GB of it appears with the first layer on
+// the GPU and matches no llama.cpp buffer at all.
 //
-//   ready -- a short hold after the server reports ready, before any request.
-//            Judged on its LAST reading: a driver still paging buffers in right
-//            after load would otherwise read as a spill.
-//   work  -- the prompt and generation. Judged on the MEDIAN reading, so one
-//            reading taken mid-reshuffle cannot decide it.
+// So a load is judged against an ANCHOR, not against zero: the same model at 1
+// layer and the smallest context, loaded first in the same probe (twice). What
+// the anchor already holds -- driver overhead in shared memory, a compute
+// buffer that never lands in VRAM -- cancels out, and only what changed since
+// is judged. Two independent accounts of that change, per reading:
 //
-// Each phase's tolerance is how far its own readings moved. The load's verdict
-// is its worse phase. A phase with no readings is left out; with neither, the
-// load is unmeasured.
+//   s = shared(n) - shared(A)                        shared memory grew
+//   d = (claim(n) - claim(A)) - (ded(n) - ded(A))    claim grew, VRAM did not
+//
+// Real spill moves both by the same amount; overhead growing in shared moves s
+// alone (dedicated still took the whole claim); a buffer moving back INTO VRAM
+// drives d negative. Measured on the RX 6600 XT (b11009, Qwen3.8-27B, 1,024
+// tokens, MiB): 2->4 layers s 0 / d -3; 4->9 s +145 / d +130; 9->20 s +716 /
+// d +696; and at 262,144 tokens 5 layers s +20 / d -252 against the 1k anchor.
+//
+//   spill     = min(s, d)                (d alone where no shared counter exists)
+//   tolerance = |s - d|                  how far the two accounts disagree
+//             + range of s and d         how far this phase's readings moved
+//             + anchor movement          how far the anchor's readings moved
+//             + anchor noise             how far its second load differed
+//   spilled   = spill > tolerance
+//
+// No constant anywhere: every term is a measurement of this probe.
+//
+// Phases: the ready hold (no request yet) is judged on its LAST reading, since
+// a driver still paging buffers in right after load must not read as spill;
+// the prompt and generation on the MEDIAN of paired readings, so a jump for a
+// minority of the phase widens the tolerance instead of deciding it. The worse
+// phase decides the load.
 
 export interface MemoryReading {
   /** Epoch ms the reading was taken (the end of the counter's own sample). */
   atMs: number;
   dedicatedMib: number | null;
+  /** This process's shared GPU memory from the SAME sample. Null or absent
+   * where the platform has no such counter (nvidia-smi). */
+  sharedMib?: number | null;
 }
 
-export interface PhasedSpillInput {
+export interface PhaseWindow {
+  fromMs: number;
+  toMs: number;
+}
+
+/** One load's raw material for the rule. */
+export interface MeasuredLoad {
   buffers: GpuBufferReport | null;
   readings: readonly MemoryReading[];
   /** The ready hold: from the server reporting ready to the first request. */
-  ready: { fromMs: number; toMs: number } | null;
+  ready: PhaseWindow | null;
   /** From the first request sent to the last token received. */
-  work: { fromMs: number; toMs: number } | null;
-  atSmallestContext?: boolean;
+  work: PhaseWindow | null;
 }
 
-export interface PhasedSpillVerdict extends GpuSpillVerdict {
-  readyPhase: GpuSpillVerdict;
-  workPhase: GpuSpillVerdict;
+export interface AnchorPhase {
+  dedicatedMib: number;
+  /** Null where no shared counter exists. */
+  sharedMib: number | null;
+  /** How far the anchor's own readings moved in this phase. */
+  movementMib: number;
+  /** How far the anchor's second load differed from its first (0 until it runs). */
+  noiseMib: number;
+}
+
+export interface SpillAnchor {
+  claimMib: number;
+  contextMib: number;
+  ready: AnchorPhase | null;
+  work: AnchorPhase | null;
 }
 
 /** How late after the work window a reading may land and still belong to it:
@@ -151,36 +198,145 @@ export interface PhasedSpillVerdict extends GpuSpillVerdict {
  * touched the memory yet. */
 const READING_LAG_MS = 1000;
 
-export function measurePhasedGpuSpill(input: PhasedSpillInput): PhasedSpillVerdict {
-  const inWindow = (w: { fromMs: number; toMs: number } | null, lagMs: number) =>
-    w == null
-      ? []
-      : input.readings
-          .filter((r) => r.dedicatedMib != null && r.atMs > w.fromMs && r.atMs <= w.toMs + lagMs)
-          .map((r) => r.dedicatedMib as number);
-  const spread = (values: number[]) => (values.length > 1 ? Math.max(...values) - Math.min(...values) : 0);
-  const judge = (dedicatedMib: number | null, values: number[]) =>
-    measureGpuSpill({
-      buffers: input.buffers,
-      dedicatedMib,
-      dedicatedJitterMib: spread(values),
-      atSmallestContext: input.atSmallestContext,
-    });
+type Phase = "ready" | "work";
 
-  const readyValues = inWindow(input.ready, 0);
-  const workValues = inWindow(input.work, READING_LAG_MS);
-  const readyPhase = judge(readyValues.length > 0 ? readyValues[readyValues.length - 1] : null, readyValues);
-  const workPhase = judge(workValues.length > 0 ? median(workValues) : null, workValues);
-
-  const excess = (v: GpuSpillVerdict) => (v.measured ? (v.inSystemRamMib ?? 0) - (v.jitterMib ?? 0) : -Infinity);
-  const measured = [readyPhase, workPhase].filter((v) => v.measured);
-  if (measured.length === 0) return { ...UNMEASURED_GPU_SPILL, readyPhase, workPhase };
-  const worst = measured.reduce((a, b) => (excess(b) > excess(a) ? b : a));
-  return { ...worst, readyPhase, workPhase };
+function phaseReadings(load: MeasuredLoad, phase: Phase): MemoryReading[] {
+  const w = phase === "ready" ? load.ready : load.work;
+  const lag = phase === "ready" ? 0 : READING_LAG_MS;
+  if (w == null) return [];
+  return load.readings.filter((r) => r.dedicatedMib != null && r.atMs > w.fromMs && r.atMs <= w.toMs + lag);
 }
 
-function median(values: number[]): number {
+function median(values: readonly number[]): number {
   const sorted = [...values].sort((a, b) => a - b);
   const mid = Math.floor(sorted.length / 2);
   return sorted.length % 2 === 1 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+const range = (values: readonly number[]) => (values.length > 1 ? Math.max(...values) - Math.min(...values) : 0);
+
+/** The value a phase is judged on: the hold's last reading, the work's median. */
+function pick(values: readonly number[], phase: Phase): number {
+  return phase === "ready" ? values[values.length - 1] : median(values);
+}
+
+/** Every reading has shared, or the phase is judged without it. */
+function sharedSeries(readings: readonly MemoryReading[]): number[] | null {
+  if (readings.length === 0 || readings.some((r) => r.sharedMib == null)) return null;
+  return readings.map((r) => r.sharedMib as number);
+}
+
+function anchorPhase(load: MeasuredLoad, phase: Phase): AnchorPhase | null {
+  const readings = phaseReadings(load, phase);
+  if (readings.length === 0) return null;
+  const dedicated = readings.map((r) => r.dedicatedMib as number);
+  const shared = sharedSeries(readings);
+  return {
+    dedicatedMib: pick(dedicated, phase),
+    sharedMib: shared ? pick(shared, phase) : null,
+    movementMib: Math.max(range(dedicated), shared ? range(shared) : 0),
+    noiseMib: 0,
+  };
+}
+
+/** The anchor from its first load. Null when that load has no buffer report or
+ * no reading in either phase -- every load of the probe is then unmeasured. */
+export function buildSpillAnchor(first: MeasuredLoad): SpillAnchor | null {
+  if (first.buffers == null || first.buffers.deviceMib <= 0) return null;
+  const anchor: SpillAnchor = {
+    claimMib: first.buffers.deviceMib,
+    contextMib: first.buffers.contextMib,
+    ready: anchorPhase(first, "ready"),
+    work: anchorPhase(first, "work"),
+  };
+  return anchor.ready == null && anchor.work == null ? null : anchor;
+}
+
+/** The anchor with its second load folded in: per phase, the larger of that
+ * load's |s| and |d| against the first, taken with no tolerance. A phase the
+ * second load did not measure gets no noise term. */
+export function withAnchorControl(anchor: SpillAnchor, second: MeasuredLoad): SpillAnchor {
+  const bare: SpillAnchor = {
+    ...anchor,
+    ready: anchor.ready && { ...anchor.ready, movementMib: 0, noiseMib: 0 },
+    work: anchor.work && { ...anchor.work, movementMib: 0, noiseMib: 0 },
+  };
+  const noiseOf = (phase: Phase): number => {
+    const v = judgePhase(second, bare, phase, false);
+    if (!v.measured) return 0;
+    return Math.max(Math.abs(v.unlandedGrowthMib ?? 0), Math.abs(v.sharedGrowthMib ?? 0));
+  };
+  return {
+    ...anchor,
+    ready: anchor.ready && { ...anchor.ready, noiseMib: noiseOf("ready") },
+    work: anchor.work && { ...anchor.work, noiseMib: noiseOf("work") },
+  };
+}
+
+export interface GrowthSpillVerdict extends GpuSpillVerdict {
+  /** s: shared memory grown since the anchor. Null where no shared counter exists. */
+  sharedGrowthMib: number | null;
+  /** d: claim grown since the anchor that dedicated VRAM did not take. */
+  unlandedGrowthMib: number | null;
+  /** How much of the claim's growth since the anchor is KV cache and compute
+   * buffer -- what a smaller context can take back. */
+  contextGrowthMib: number | null;
+}
+
+const UNMEASURED_GROWTH: GrowthSpillVerdict = {
+  ...UNMEASURED_GPU_SPILL,
+  sharedGrowthMib: null,
+  unlandedGrowthMib: null,
+  contextGrowthMib: null,
+};
+
+function judgePhase(load: MeasuredLoad, anchor: SpillAnchor, phase: Phase, atSmallestContext: boolean): GrowthSpillVerdict {
+  const a = phase === "ready" ? anchor.ready : anchor.work;
+  const readings = phaseReadings(load, phase);
+  if (a == null || readings.length === 0 || load.buffers == null || load.buffers.deviceMib <= 0) return UNMEASURED_GROWTH;
+  const claimGrowth = load.buffers.deviceMib - anchor.claimMib;
+  // Paired per reading: s and d come from the same sample, never from medians of
+  // two series that could describe different moments.
+  const dSeries = readings.map((r) => claimGrowth - ((r.dedicatedMib as number) - a.dedicatedMib));
+  const shared = a.sharedMib == null ? null : sharedSeries(readings);
+  const sSeries = shared ? shared.map((v) => v - (a.sharedMib as number)) : null;
+  const d = pick(dSeries, phase);
+  const s = sSeries ? pick(sSeries, phase) : null;
+  const spill = s == null ? d : Math.min(s, d);
+  const tolerance =
+    (s == null ? 0 : Math.abs(s - d)) + Math.max(range(dSeries), sSeries ? range(sSeries) : 0) + a.movementMib + a.noiseMib;
+  const excess = spill - tolerance;
+  const contextGrowthMib = load.buffers.contextMib - anchor.contextMib;
+  const spilled = excess > 0;
+  return {
+    measured: true,
+    inSystemRamMib: spill,
+    jitterMib: tolerance,
+    spilled,
+    cause: !spilled ? null : atSmallestContext || excess > contextGrowthMib ? "layers" : "cache",
+    sharedGrowthMib: s,
+    unlandedGrowthMib: d,
+    contextGrowthMib,
+  };
+}
+
+export interface PhasedSpillVerdict extends GrowthSpillVerdict {
+  readyPhase: GrowthSpillVerdict;
+  workPhase: GrowthSpillVerdict;
+}
+
+/** One load against the anchor, both phases; the worse one decides. Unmeasured
+ * without an anchor, never judged against zero instead. */
+export function measureGrowthSpill(
+  load: MeasuredLoad & { atSmallestContext?: boolean },
+  anchor: SpillAnchor | null
+): PhasedSpillVerdict {
+  if (anchor == null) return { ...UNMEASURED_GROWTH, readyPhase: UNMEASURED_GROWTH, workPhase: UNMEASURED_GROWTH };
+  const readyPhase = judgePhase(load, anchor, "ready", load.atSmallestContext === true);
+  const workPhase = judgePhase(load, anchor, "work", load.atSmallestContext === true);
+  const excess = (v: GpuSpillVerdict) => (v.measured ? (v.inSystemRamMib ?? 0) - (v.jitterMib ?? 0) : -Infinity);
+  const measured = [readyPhase, workPhase].filter((v) => v.measured);
+  if (measured.length === 0) return { ...UNMEASURED_GROWTH, readyPhase, workPhase };
+  const worst = measured.reduce((x, y) => (excess(y) > excess(x) ? y : x));
+  return { ...worst, readyPhase, workPhase };
 }

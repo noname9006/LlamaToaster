@@ -94,7 +94,7 @@ export interface ProbeAttemptDto {
    * it, which leaves the rung without a second-target verdict. */
   list_devices_free_mib: number | null;
   /** See ProbeAttemptReport.load_kind; null from a worker predating it (= full). */
-  load_kind: "full" | "claim_stop" | "error" | null;
+  load_kind: "full" | "claim_stop" | "claim_only" | "error" | null;
   /** See ProbeAttemptReport.claim_fits_free. SQLite 0/1; null from an older worker. */
   claim_fits_free: number | null;
   /** See ProbeAttemptReport.spill_ready_mib and its siblings. */
@@ -102,6 +102,10 @@ export interface ProbeAttemptDto {
   spill_ready_jitter_mib: number | null;
   spill_work_mib: number | null;
   spill_work_jitter_mib: number | null;
+  /** See ProbeAttemptReport.spill_method and its siblings; null on older rows. */
+  spill_method: "anchor" | "growth" | null;
+  spill_shared_growth_mib: number | null;
+  spill_unlanded_growth_mib: number | null;
   /** See ProbeAttemptReport.ladder_ngl_max. */
   ladder_ngl_max: number | null;
   ladder_max_ctx: number | null;
@@ -175,12 +179,15 @@ export interface ProbeDedupPoint {
   gpu_spill_jitter_mib: number | null;
   /** The SIBLING's reading; the reusing probe judges the claim against its own. */
   list_devices_free_mib: number | null;
-  load_kind: "full" | "claim_stop" | "error" | null;
+  load_kind: "full" | "claim_stop" | "claim_only" | "error" | null;
   claim_fits_free: boolean | null;
   spill_ready_mib: number | null;
   spill_ready_jitter_mib: number | null;
   spill_work_mib: number | null;
   spill_work_jitter_mib: number | null;
+  spill_method: "anchor" | "growth" | null;
+  spill_shared_growth_mib: number | null;
+  spill_unlanded_growth_mib: number | null;
   host_backed_fail: "layers" | "cache" | null;
   /** See ProbeAttemptDto.vram_discrepancy; coerced to false for a sibling row
    * predating the check, same as ok/oom/spill's own boolean coercion above. */

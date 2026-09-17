@@ -3432,8 +3432,9 @@ export const repo = {
               pp_tps, ttft_ms, prefill_cliff, host_backed_method, host_backed_slope, kv_host_backed_frac,
               vram_shared_total_peak_mib, vram_claimed_peak_mib, gpu_buffers_mib, gpu_in_system_ram_mib,
               gpu_spill_jitter_mib, host_backed_fail, list_devices_free_mib, load_kind, spill_ready_mib,
-              spill_ready_jitter_mib, spill_work_mib, spill_work_jitter_mib, ladder_ngl_max, ladder_max_ctx, claim_fits_free)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+              spill_ready_jitter_mib, spill_work_mib, spill_work_jitter_mib, ladder_ngl_max, ladder_max_ctx, claim_fits_free,
+              spill_method, spill_shared_growth_mib, spill_unlanded_growth_mib)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         );
         input.attempts.forEach((a, seq) => {
           insert.run(
@@ -3483,7 +3484,10 @@ export const repo = {
             a.spill_work_jitter_mib ?? null,
             a.ladder_ngl_max ?? null,
             a.ladder_max_ctx ?? null,
-            a.claim_fits_free == null ? null : a.claim_fits_free ? 1 : 0
+            a.claim_fits_free == null ? null : a.claim_fits_free ? 1 : 0,
+            a.spill_method ?? null,
+            a.spill_shared_growth_mib ?? null,
+            a.spill_unlanded_growth_mib ?? null
           );
         });
       });
@@ -3524,8 +3528,9 @@ export const repo = {
               pp_tps, ttft_ms, prefill_cliff, host_backed_method, host_backed_slope, kv_host_backed_frac,
               vram_shared_total_peak_mib, vram_claimed_peak_mib, gpu_buffers_mib, gpu_in_system_ram_mib,
               gpu_spill_jitter_mib, host_backed_fail, list_devices_free_mib, load_kind, spill_ready_mib,
-              spill_ready_jitter_mib, spill_work_mib, spill_work_jitter_mib, ladder_ngl_max, ladder_max_ctx, claim_fits_free)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              spill_ready_jitter_mib, spill_work_mib, spill_work_jitter_mib, ladder_ngl_max, ladder_max_ctx, claim_fits_free,
+              spill_method, spill_shared_growth_mib, spill_unlanded_growth_mib)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(run_id, seq) DO UPDATE SET
              candidate_ctx = excluded.candidate_ctx,
              ngl = excluded.ngl,
@@ -3568,7 +3573,10 @@ export const repo = {
              spill_work_jitter_mib = excluded.spill_work_jitter_mib,
              ladder_ngl_max = excluded.ladder_ngl_max,
              ladder_max_ctx = excluded.ladder_max_ctx,
-             claim_fits_free = excluded.claim_fits_free`
+             claim_fits_free = excluded.claim_fits_free,
+             spill_method = excluded.spill_method,
+             spill_shared_growth_mib = excluded.spill_shared_growth_mib,
+             spill_unlanded_growth_mib = excluded.spill_unlanded_growth_mib`
         )
         .run(
           uuid(),
@@ -3617,7 +3625,10 @@ export const repo = {
           a.spill_work_jitter_mib ?? null,
           a.ladder_ngl_max ?? null,
           a.ladder_max_ctx ?? null,
-          a.claim_fits_free == null ? null : a.claim_fits_free ? 1 : 0
+          a.claim_fits_free == null ? null : a.claim_fits_free ? 1 : 0,
+            a.spill_method ?? null,
+            a.spill_shared_growth_mib ?? null,
+            a.spill_unlanded_growth_mib ?? null
         );
     },
   },
@@ -3858,6 +3869,9 @@ export interface ProbeAttemptRow {
   ladder_ngl_max: number | null;
   ladder_max_ctx: number | null;
   claim_fits_free: number | null;
+  spill_method: string | null;
+  spill_shared_growth_mib: number | null;
+  spill_unlanded_growth_mib: number | null;
 }
 
 // N4 storage shapes.
