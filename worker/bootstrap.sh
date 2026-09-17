@@ -136,8 +136,17 @@ select_install_dir() {
 
 if [ -z "$DIR" ]; then
   DIR="$(select_install_dir)"
-  echo "Using $DIR"
 fi
+
+# Absolutize $DIR now, before anything below can `cd` into it. $DIR is
+# referenced again, as the same string, after this script does `cd "$DIR"`
+# further down (and again when forwarding --dir to setup-worker.sh) -- a
+# relative --dir, or a relative answer to select_install_dir's prompt (e.g.
+# "some/folder" instead of "~/some/folder" or "/abs/some/folder"), would
+# otherwise get re-resolved against the new cwd and doubled onto itself.
+mkdir -p "$DIR"
+DIR="$(cd "$DIR" && pwd)"
+echo "Using $DIR"
 
 # Trims a git checkout down to worker/ + shared/ -- everything directly in
 # the repo root (package.json, README, ...) is kept automatically by git's
