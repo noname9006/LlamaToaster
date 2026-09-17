@@ -5,18 +5,17 @@ does and does not tell you once it has run.
 
 Companion reading: `docs/PROBE_CONTEXT_SCENARIOS.md` (what the ladder does per
 architecture), `shared/probeLadder.ts` (the search), `shared/vramEstimate.ts`
-(the cost model and the spill verdict).
+(the cost model), `shared/gpuSpill.ts` (the spill verdict).
 
-**Status (16 Sep 2026).** The search the probe runs today is §10. Sections
-2–5 and 9 describe the searches it replaced — the removed `max_gpu`,
-`max_context` and `balanced` modes, the `fine` setting, and the first
-frontier — and are kept for the reasoning behind them. §1, §6, §7 and §8 still
-hold, except that §7's single loaded-peak reading is now the fallback behind
-the per-phase readings in §10.
+**Status (17 Sep 2026).** The search the probe runs today is §10, and the spill
+verdict it uses is §7. Sections 2–5 and 9 describe the searches it replaced — the
+removed `max_gpu`, `max_context` and `balanced` modes, the `fine` setting,
+and the first frontier — and are kept for the reasoning behind them. §1, §6 and
+§8 still hold.
 
 | part | state |
 |---|---|
-| Measured spill rule (§7) | implemented |
+| Spill as growth over an anchor load (§7) | implemented |
 | Wizard / Targets structure | implemented |
 | Two targets, per-context order, controls, per-phase spill (§10) | implemented |
 | `max_gpu` / `max_context` / `balanced` modes, `fine` | **removed** |
@@ -241,18 +240,107 @@ The load either allocated or it did not, and if it allocated, the driver either
 put it on the GPU or silently backed part of it with system RAM. Not one speed
 measurement is involved.
 
-**The measured rule.** Every load carries two independent accounts of the same
-memory. llama.cpp logs exactly how much it put in each GPU buffer — weights, KV
-cache, recurrent state, compute, output. The OS reports how much of the process
-sits in dedicated VRAM (Windows WDDM "Dedicated Usage", amdgpu fdinfo,
-nvidia-smi). Whatever VRAM does not hold is being served from system RAM, and
-the rung fails (`shared/gpuSpill.ts`). There is no reference rung, no estimate
-and no tuned limit: the only tolerance is how far the dedicated counter moved
-across the readings taken once the model had loaded.
+### The anchor
 
-Measured 14 Sep 2026 on the reference machine below, llama.cpp b10956:
+Every probe starts with two loads of the same model at **1 layer and 1,024
+tokens** — the anchor, A. Every other load n is judged on what changed since A,
+not against zero. What A already holds cancels out: overhead the driver keeps in
+the process's shared memory, and any buffer that never lands in VRAM at that
+placement.
 
-| load | GPU buffers (MiB) | in VRAM | in system RAM |
+One layer, never zero: the process's shared memory jumps by about a gigabyte
+with the first layer on the GPU (277 → 1,272 MiB on the reference machine below)
+while dedicated VRAM takes the whole claim — overhead no later load should be
+charged with.
+
+The anchor is this probe's own. The same placement has spilled 828 MiB in one
+session and 189 MiB in another, so a baseline from another probe is not one.
+Anchor loads are never taken from a batch sibling.
+
+### Two accounts of the change
+
+For each reading of n — dedicated and shared come from one sample of both
+counters, so they describe the same moment:
+
+| account | formula | moves when |
+|---|---|---|
+| **s** — shared grew | shared(n) − shared(A) | memory went to system RAM, *or* the driver's own overhead grew |
+| **d** — claim not taken by VRAM | (claim(n) − claim(A)) − (dedicated(n) − dedicated(A)) | memory went to system RAM, *or* a buffer that sat in system RAM at A moved into VRAM (negative) |
+
+Claim is llama.cpp's own report of every GPU buffer it allocated. Real spill
+moves both accounts by the same amount; each of the other causes moves only
+one. So:
+
+```
+spill     = min(s, d)                         (d alone where there is no shared counter)
+tolerance = |s − d|                           how far the two accounts disagree
+          + range of s and d in the phase     how far this load's readings moved
+          + movement of A's readings          how far the anchor's readings moved
+          + |A2 − A1|                         how far the anchor's two loads differed
+spilled   = spill > tolerance
+```
+
+No constant appears anywhere: every term is measured on this probe.
+
+### Phases
+
+| phase | value used | why |
+|---|---|---|
+| ready hold (3.5 s, no request) | the last reading | a driver still paging buffers in right after load must not read as spill |
+| prompt + generation | the median of paired readings | a jump for a minority of the phase widens the tolerance instead of deciding it |
+
+Each phase of n is compared with the same phase of A. The worse phase decides.
+Peaks are never used, and neither is a mean: at 20 layers dedicated VRAM held
+5,318 MiB for three quarters of generation and 5,386 MiB for the rest — the
+median reads what the load held, the mean (5,335) a value it never held, the
+peak one moment.
+
+### Measured
+
+Qwen3.8-27B-UD-Q5_K_M on the reference machine (RX 6600 XT, Vulkan, llama.cpp
+b11009), 1,024 tokens, MiB. Live check of the rule itself, 17 Sep 2026:
+
+| load | claim | ready: s / d / tolerance | work: s / d / tolerance | verdict |
+|---|---|---|---|---|
+| A1 — 1 layer | 1,233 | 0 / 0 / 0 | 0 / 0 / 0 | anchor |
+| A2 — 1 layer | 1,233 | 0 / 0 / 0 | 0 / 0 / 2 | anchor; loads differed by 0 |
+| 4 layers | 1,841 | 0 / −3 / 3 | 0 / −4 / 5 | clean |
+| 9 layers | 3,330 | +139 / +131 / 9 | +145 / +129 / 20 | spilled |
+
+From the probe run of 16 Sep 2026 (whole-load peaks for shared, which the rule
+no longer uses, but the steps agree):
+
+| step | claim grew | dedicated grew | d | s |
+|---|---|---|---|---|
+| 0 → 1 layers | 995 | 1,003 | −8 | +995 (overhead, not spill) |
+| 9 → 20 | 3,034 | 2,338 | 696 | 716 |
+| 20 → 23 | 779 | 94 | 685 | 691 |
+| 262,144 tok, 5 layers vs the 1k anchor | 3,090 | 3,342 | −252 | +20 (compute buffer moved *into* VRAM) |
+
+### What spilled
+
+A spill larger than what this context adds in KV cache and compute buffer over
+the anchor means the weights are affected: the load is a layer failure, and no
+smaller context is tried at that placement. So is any spill at the smallest
+context, where there is nothing smaller to try. A smaller spill anywhere else
+is a cache failure, and the context walk bisects down.
+
+### A spill that does not change is not counted
+
+A buffer that sits in system RAM at the anchor and stays there is part of the
+baseline. On b11009 that is the whole 238 MiB compute buffer at 1,024 tokens:
+held against zero it failed every placement at that context, 0 layers
+included, and with it the whole Wizard curve. The anchor rule deliberately
+does not see it. A cache spill that *grows* with context still shows, because
+every context is measured against the one 1k anchor.
+
+### What it replaced
+
+**Against zero (14–16 Sep 2026).** llama.cpp's buffers minus dedicated VRAM,
+failing past the counter's own movement. Calibrated on b10956 with
+Qwen3.6-35B-A3B, where a clean load read at or just below zero:
+
+| load | GPU buffers (MiB) | in VRAM | difference |
 |---|---|---|---|
 | 1,024 tok, 0 layers | 275 | 280 | −5 (clean) |
 | 1,024 tok, 4 layers | 2,002 | 2,017 | −16 (clean) |
@@ -261,51 +349,38 @@ Measured 14 Sep 2026 on the reference machine below, llama.cpp b10956:
 | 262,144 tok, 0 layers | 1,069 | 822 | 247 |
 | 262,144 tok, 4 layers | 3,320 | 3,085 | 234 |
 
-A clean load holds every buffer plus a sliver of driver overhead. The rest of
-the process's overhead — 430–480 MiB there — lives in *shared* memory, which is
-why the shared counter on its own could never tell overhead from spill.
+It assumed a clean load reads zero. On b11009 with Qwen3.8-27B it read +236 at
+0 layers and +228 at 1, 2 and 4, and failed the whole probe.
 
-**What spilled.** A spill larger than the context's entire KV cache and compute
-buffer means the weights are affected, so the rung is recorded as a layer
-failure and no smaller context is tried at that placement. So is any spill at
-the smallest context the probe tries, where there is nothing smaller to try. A
-smaller spill anywhere else is a cache failure, and the context walk bisects
-down.
+**Slopes (before 14 Sep).** System RAM appearing per layer or per context step
+against a reference rung, a bootstrap ratio without one, then a 768 MiB cache
+allowance. It was systematically late: the reference was itself already
+spilling, and a slope only sees growth above it. The anchor rule answers that
+failure with an anchor that has almost nothing on the GPU, and by requiring
+two independent accounts to agree.
 
-**The same load does not spill the same amount twice.** 8 layers at 1,024
-tokens put 828 MiB in system RAM in one run and 189 MiB in a later one on the
-same machine, while the counter itself moved by 2 MiB within the load. The
-driver's choice of what to demote depends on what else holds the card at the
-time. Detection held both times, but a rung close to the boundary can pass in
-one probe and fail in the next.
+### Settled along the way
 
-**What it replaced.** An earlier detector judged spill by *slopes* — system RAM
-appearing per layer or per context step against a reference rung, with a
-bootstrap ratio when no reference existed, and later a 768 MiB cache allowance.
-The accounting showed it was systematically late: 15 layers had passed on the
-reference machine, llama.cpp's own report put 1.7 GiB of those buffers in
-system RAM at 1,024 tokens, and the real boundary sat between 4 and 8 layers. A
-slope only ever sees growth *above* its reference, and the reference was
-already spilling.
-
-### Two things the accounting settled
-
-The driver does not wait for VRAM to run out. 8 layers had 828 MiB in system
-RAM with the card half full, so "was the GPU full" cannot be a precondition.
-
-Part of a large compute buffer lands in system RAM with the GPU nearly empty:
-about 240 MiB of 1,069 MiB at 262,144 tokens, at 0 and 4 layers alike. It is a
-real spill and fails the rung, so on that machine 262,144 tokens is not a
-verified context at any placement.
+- The driver does not wait for VRAM to run out. 9 layers put ~130 MiB in
+  system RAM with about 3 GB of the card still free, so "was the GPU full" cannot be
+  a precondition.
+- `llama-server --list-devices` free is not a fit check on Windows: it read
+  7,378 MiB — 90% of the card — on every load, while other processes held about
+  2 GB and dedicated VRAM never passed ~5.7 GB. It stays the claim target (§10)
+  by design, not as a spill test.
 
 ### Known gaps
 
-- Windows CUDA is unconfirmed. The CUDA context may land in dedicated VRAM
-  outside llama.cpp's buffers, pulling clean readings further below zero and
-  hiding a spill smaller than itself.
-- A load that cannot be measured — no per-process VRAM reading (Metal), or a
-  build that printed no buffer sizes — passes on the estimate-based inference,
-  which only warns.
+- **An anchor that already spills** cannot be seen directly. It would show as
+  the next load's s and d both growing by nearly its whole extra claim.
+- **Windows CUDA** is unconfirmed: the CUDA context may land in dedicated VRAM
+  in ways a 1-layer anchor does not represent.
+- **No shared counter** (nvidia-smi): d alone decides, with no disagreement term.
+- **No per-process dedicated counter** (Metal), or no buffer report: the load is
+  unmeasured and passes on the estimate-based inference, which only warns.
+  Nothing falls back to a difference against zero.
+- **Shared-counter noise** has been measured on one card: 0 MiB between the two
+  anchor loads and within steady phases.
 
 ---
 
@@ -381,14 +456,19 @@ two answers from the same loads (`shared/probeLadder.ts`, `probeOutcome`):
 
 ### Order
 
-The Wizard settles each context stop before the next, smallest first:
+Every mode starts with the **anchor** (§7): two loads at 1 layer and 1,024
+tokens. They are the smallest context's first load and control at 1 layer, so
+no search loads that point again. A failed anchor ends the probe; one whose
+claim does not fit free VRAM means nothing fits at any placement.
+
+The Wizard then settles each context stop before the next, smallest first:
 
 1. **Target 2 at this stop.** A load that fits carries down the context axis
    and one that does not carries up, because a claim only grows with context.
-   The first load at the smallest stop is the estimator's layer count, never
-   every layer. From one load, its claim over its layer count gives a low
-   estimate; from two, the per-layer claim predicts the boundary, and the search
-   loads the prediction and its neighbour.
+   The anchor's claim is already known, so the first load at the smallest stop
+   is the prediction from it, which errs low — never every layer. From two
+   claims the per-layer claim predicts the boundary, and the search loads the
+   prediction and its neighbour.
 2. **If nothing fits here, the probe ends** — nothing fits at any larger stop.
 3. **The control of the previous stop's no-spill answer**: that placement is
    loaded a second time. It runs here, after this stop's target 2, so other
@@ -443,28 +523,30 @@ When the server reports ready, its claim is known. A claim not below the free
 figure can be neither answer, so the load stops there — no prompt, no
 generation, no spill — and is stored with `load_kind = claim_stop`.
 
+A Wizard load searching target 2 can also be one no spill verdict could use: its
+layer count is above the no-spill answer at the context below (or that stop has
+none), and target 1 here never tries more layers than that — a control can only
+lower it. `probeOutcome` marks such a load `nextClaimOnly`; once its claim fits
+it stops at ready the same way and is stored with `load_kind = claim_only`.
+Batch dedup never reuses a `claim_only` row for a load that has to judge spill.
+
 ### Spill by phase
 
-The worker reads the process's dedicated VRAM about once a second for the whole
-load (`worker/src/memoryTrace.ts`: one PowerShell session on Windows, because a
-fresh one costs ~5.5 s and `Get-Counter` itself takes ~1 s per sample; on Linux,
-one reading at a time, so a slow `nvidia-smi` never overlaps itself). The ready
-hold uses only readings taken before the first request. A full
-load holds 3.5 s after ready before its request, then `measurePhasedGpuSpill`
-judges:
-
-| phase | reading used | why |
-|---|---|---|
-| ready hold | the last | a driver still paging buffers in right after load must not read as spill |
-| prompt + generation | the median | one reading mid-reshuffle must not decide it |
-
-Each phase's tolerance is how far its own readings moved; the worse phase
-decides. Every reading goes to the run's log. With no readings, §7's
-loaded-peak rule still applies.
+The worker reads the process's dedicated VRAM and shared GPU memory about once a
+second for the whole load, both in one sample (`worker/src/memoryTrace.ts`: one
+PowerShell session on Windows running one `Get-Counter` over both counters,
+because a fresh session costs ~5.5 s and `Get-Counter` itself takes ~1 s per
+sample; on Linux, one reading at a time, so a slow `nvidia-smi` never overlaps
+itself). The ready hold uses only readings taken before the first request. A
+full load holds 3.5 s after ready before its request, then
+`measureGrowthSpill` judges each phase against the same phase of the anchor
+(§7). Every paired reading goes to the run's log, as `dedicated/shared` per
+second, followed by s, d, spill and tolerance for each phase.
 
 ### Budget
 
-The default is 40 loads (admin-configurable). The real run on the RX 6600 XT
+The default is 40 loads (admin-configurable). The two anchor loads count
+toward it. The real run on the RX 6600 XT
 with Qwen3.6-35B-A3B needed 46 loads for the whole curve — 8 of them controls,
 5 stopped at ready — so at 40 it stopped with 128k's control and all of 256k
 still open. A stored budget of exactly the old default, 24, is raised to 40
@@ -485,6 +567,9 @@ new `probe_attempts` fields. An old worker on a new server keeps working with
 its old search. After the server update, check the probe load budget in the
 admin settings: the migration only raises a stored value of exactly 24.
 
+A probe recorded before the anchor carries no `spill_method`; the client
+re-resolves those rows without the anchor, exactly as they were searched.
+
 A worker that authenticates with the shared deployment token cannot report
 context-test results — those routes require an enrolled worker session — so an
 end-to-end check needs an enrolled worker.
@@ -494,9 +579,13 @@ end-to-end check needs an enrolled worker.
 `model_machine_limits` records target 1 at the largest context whose answer a
 control confirmed (an unconfirmed one only when none was).
 Every `probe_attempts` row carries the claim, the `--list-devices` figure,
-`load_kind`, the per-phase spill and the ladder's own bounds
-(`ladder_ngl_max`, `ladder_max_ctx`), so the client re-resolves both answers
-with `probeOutcome` itself. Without a `--list-devices` figure, target 2 is
+`load_kind`, the per-phase spill and tolerance (`spill_ready_*`,
+`spill_work_*`), which rule judged it (`spill_method`: `anchor` or
+`growth`), the worse phase's two accounts (`spill_shared_growth_mib`,
+`spill_unlanded_growth_mib`) and the ladder's own bounds (`ladder_ngl_max`,
+`ladder_max_ctx`), so the client re-resolves both answers with
+`probeOutcome` itself. A load reused from a batch sibling keeps the verdict it
+was given against that sibling's anchor. Without a `--list-devices` figure, target 2 is
 skipped and target 1 is searched with every layer as its cap, opening at the
 estimate.
 
@@ -508,6 +597,7 @@ estimate.
 262,144 trained context) on a Radeon RX 6600 XT, 8 GiB, Vulkan, llama.cpp
 b10819. Per-layer weight ~422 MiB, derived from the run's own reported slopes.
 
-The spill measurements quoted in §7 were taken on the same card and model with
-llama.cpp b10956 on 14 Sep 2026; all twelve are fixtures in
-`shared/gpuSpill.test.ts`.
+The zero-based measurements quoted in §7 were taken on the same card and model
+with llama.cpp b10956 on 14 Sep 2026; all twelve are fixtures in
+`shared/gpuSpill.test.ts`. The anchor-rule measurements are Qwen3.8-27B on the
+same card with b11009, 16–17 Sep 2026, and are fixtures in the same file.

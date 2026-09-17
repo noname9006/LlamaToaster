@@ -30,6 +30,7 @@ import {
   executeCurvePoint,
   executeKneeLadder,
   probeSucceeded,
+  signedMib,
   toProbeAttemptReport,
   pickDedupPoint,
   toBenchResult,
@@ -43,7 +44,6 @@ import {
   claimFitsFree,
   claimFitsFreeByDevice,
   isProbeMode,
-  nextLadderRung,
   probeOutcome,
   PROBE_LADDER_MIN_CTX,
   PROBE_MAX_LOADS,
@@ -54,7 +54,7 @@ import { fetchFillerBlocks } from "./fillerPrompt.js";
 import { supportsFlag, readListDevices, usedListedDevices } from "./binary-probe.js";
 import { MemorySampler, captureFreeMemoryBaseline, type SampleStats, type FreeMemoryBaseline } from "./sampler.js";
 import { MemoryTrace } from "./memoryTrace.js";
-import { measurePhasedGpuSpill } from "../../shared/gpuSpill.js";
+import { buildSpillAnchor, measureGrowthSpill, withAnchorControl, type SpillAnchor } from "../../shared/gpuSpill.js";
 import { readGpuMemory, readNvidiaDriverInfo, type NvidiaDriverInfo } from "./vram.js";
 import {
   estimateResidentGpuLayers,
@@ -3105,10 +3105,17 @@ function describeProbePeak(attempt: ProbeAttemptOutcome): string {
   const buffers = attempt.gpuBuffersMib;
   const inRam = attempt.gpuInSystemRamMib;
   const spill =
-    buffers != null && inRam != null
-      ? `; llama.cpp put ${fmt(buffers)} on the GPU, VRAM held ${fmt(buffers - inRam)} ` +
-        `(${inRam >= 0 ? "+" : ""}${Math.round(inRam)}MiB not in VRAM, readings moved ${fmt(attempt.gpuSpillJitterMib ?? 0)})`
-      : "; spill not measured";
+    attempt.spillMethod === "anchor"
+      ? `; llama.cpp put ${fmt(buffers)} on the GPU; anchor load, what every other load is measured against`
+      : attempt.spillMethod === "growth" && inRam != null
+        ? `; llama.cpp put ${fmt(buffers)} on the GPU; since the anchor, shared ${signedMib(attempt.spillSharedGrowthMib)}, ` +
+          `claim not in VRAM ${signedMib(attempt.spillUnlandedGrowthMib)} -> spill ${signedMib(inRam)} against a tolerance of ` +
+          `${fmt(attempt.gpuSpillJitterMib ?? 0)} (ready ${signedMib(attempt.spillReadyMib)} / ${fmt(attempt.spillReadyJitterMib)}, ` +
+          `work ${signedMib(attempt.spillWorkMib)} / ${fmt(attempt.spillWorkJitterMib)})`
+        : buffers != null && inRam != null
+          ? `; llama.cpp put ${fmt(buffers)} on the GPU, VRAM held ${fmt(buffers - inRam)} ` +
+            `(${inRam >= 0 ? "+" : ""}${Math.round(inRam)}MiB not in VRAM, readings moved ${fmt(attempt.gpuSpillJitterMib ?? 0)})`
+          : "; spill not measured";
   const free = attempt.listDevicesFreeMib;
   const claim =
     buffers != null && free != null
@@ -3117,6 +3124,24 @@ function describeProbePeak(attempt: ProbeAttemptOutcome): string {
   return (
     `peak: ${fmt(attempt.vramProcessPeakMib)} in VRAM + ${fmt(attempt.vramSharedPeakMib)} system-RAM-backed, ` +
     `this process; ${fmt(attempt.vramPeakMib)} across the whole adapter${spill}${claim}`
+  );
+}
+
+// The anchor as it stands after one of its loads: the baseline every later
+// load's growth is taken from, then how far its second load differed.
+function describeSpillAnchor(anchor: SpillAnchor | null, role: "first" | "control"): string {
+  if (!anchor) {
+    return "spill anchor could not be measured (no GPU buffer report or no per-process readings) -- every later load's spill is unmeasured";
+  }
+  const phase = (name: string, p: SpillAnchor["ready"]) =>
+    p == null
+      ? `${name} not measured`
+      : `${name} dedicated ${Math.round(p.dedicatedMib)}MiB, shared ${p.sharedMib != null ? `${Math.round(p.sharedMib)}MiB` : "not measured"}, ` +
+        `readings moved ${Math.round(p.movementMib)}MiB` +
+        (role === "control" ? `, second load differed by ${Math.round(p.noiseMib)}MiB` : "");
+  return (
+    `spill anchor ${role === "first" ? "measured" : "controlled"} -- claim ${Math.round(anchor.claimMib)}MiB; ` +
+    `${phase("ready", anchor.ready)}; ${phase("work", anchor.work)}`
   );
 }
 
@@ -3193,8 +3218,8 @@ async function executeRunProbeJob(payload: TestProbeJobPayload): Promise<void> {
   if (dedupPoints.length > 0) {
     log.info(`${label}: ${dedupPoints.length} point(s) already measured by an earlier batch sibling`);
   }
-  function findDedupMatch(ctx: number, ngl: number, loadsHere: number): ProbeDedupPoint | undefined {
-    return pickDedupPoint(dedupPoints, ctx, ngl, loadsHere);
+  function findDedupMatch(ctx: number, ngl: number, loadsHere: number, needsSpill: boolean): ProbeDedupPoint | undefined {
+    return pickDedupPoint(dedupPoints, ctx, ngl, loadsHere, needsSpill);
   }
   // The ladder never probes above what the model was trained for. With no
   // trained_ctx in the header there is no honest ceiling to search toward, so
@@ -3243,6 +3268,9 @@ async function executeRunProbeJob(payload: TestProbeJobPayload): Promise<void> {
     // actually take effect here, not just be advertised.
     maxLoads: probeMaxLoads,
     freeVramMib: listDevicesFreeMib,
+    // Every spill verdict is growth over the anchor load (shared/gpuSpill.ts), so
+    // the ladder loads it twice before any search.
+    anchored: true,
   };
   log.info(
     `${label}: ${mode} ladder -- context within [${PROBE_LADDER_MIN_CTX}, ${maxCtx}], ` +
@@ -3257,6 +3285,10 @@ async function executeRunProbeJob(payload: TestProbeJobPayload): Promise<void> {
 
   let stoppedMidLadder = false;
   let fatalError: string | undefined;
+  // Built by the first anchor load, noise folded in by the second; every later
+  // load's spill is judged against it. Null until then -- or for the whole probe
+  // when the anchor could not be measured, leaving every verdict unmeasured.
+  let spillAnchor: SpillAnchor | null = null;
   try {
     for (;;) {
       // Checked before every rung, same as the sweep-item loop above -- a
@@ -3269,15 +3301,25 @@ async function executeRunProbeJob(payload: TestProbeJobPayload): Promise<void> {
         stoppedMidLadder = true;
         break;
       }
-      const rung = nextLadderRung({ ...ladderInput, history: attempts.map(toLadderAttempt) });
+      if (attempts.length >= probeMaxLoads) break;
+      const planned = probeOutcome({ ...ladderInput, history: attempts.map(toLadderAttempt) });
+      const rung = planned.next;
       if (!rung) break;
+      const claimOnly = planned.nextClaimOnly === true;
+      const anchorRole: "first" | "control" | null = planned.nextIsAnchor
+        ? attempts.some((a) => a.candidateCtx === rung.ctx && a.ngl === rung.ngl)
+          ? "control"
+          : "first"
+        : null;
       // N2 batch dedup -- an earlier sibling already measured this EXACT
       // point, so reuse its outcome instead of spawning llama-server to
-      // rediscover the same answer. Still feeds nextLadderRung's bisection
+      // rediscover the same answer. Still feeds probeOutcome's bisection
       // (attempts.push below) and still gets a live tick, just with no real
       // load in between.
       const loadsHere = attempts.filter((a) => a.candidateCtx === rung.ctx && a.ngl === rung.ngl).length;
-      const dedupMatch = findDedupMatch(rung.ctx, rung.ngl, loadsHere);
+      // Never for the anchor: it has to be this probe's own loads, since the same
+      // placement spills differently from one session to the next.
+      const dedupMatch = anchorRole ? undefined : findDedupMatch(rung.ctx, rung.ngl, loadsHere, !claimOnly);
       if (dedupMatch) {
         log.info(
           `${label}: candidate ${rung.ctx}/${rung.ngl} reused from batch sibling ${dedupMatch.source_run_id} -- not reloaded`
@@ -3322,6 +3364,10 @@ async function executeRunProbeJob(payload: TestProbeJobPayload): Promise<void> {
           spillReadyJitterMib: dedupMatch.spill_ready_jitter_mib,
           spillWorkMib: dedupMatch.spill_work_mib,
           spillWorkJitterMib: dedupMatch.spill_work_jitter_mib,
+          // Judged against the sibling's own anchor, in the same batch.
+          spillMethod: dedupMatch.spill_method,
+          spillSharedGrowthMib: dedupMatch.spill_shared_growth_mib,
+          spillUnlandedGrowthMib: dedupMatch.spill_unlanded_growth_mib,
           ladderNglMax: nglMax,
           ladderMaxCtx: maxCtx,
         };
@@ -3357,6 +3403,9 @@ async function executeRunProbeJob(payload: TestProbeJobPayload): Promise<void> {
           ngl: rung.ngl,
           estimate,
           label,
+          claimOnly,
+          anchorRole,
+          spillAnchor,
           listDevicesFreeMib,
           freeByDevice,
           ladderNglMax: nglMax,
@@ -3380,6 +3429,10 @@ async function executeRunProbeJob(payload: TestProbeJobPayload): Promise<void> {
         log.info(`${label}: candidate ${rung.ctx}/${rung.ngl} discarded -- stopped mid-load`);
         break;
       }
+      if (anchorRole && attempt.spillAnchor !== undefined) {
+        spillAnchor = attempt.spillAnchor;
+        log.info(`${label}: ${describeSpillAnchor(spillAnchor, anchorRole)}`);
+      }
       attempt = describeProbeVramDiscrepancy(rung, estimate?.vramMib ?? null, attempt);
       attempts.push(attempt);
       sendProbeAttemptTick(payload.run_id, attempts.length - 1, toProbeAttemptReport(attempt));
@@ -3390,7 +3443,8 @@ async function executeRunProbeJob(payload: TestProbeJobPayload): Promise<void> {
       // could see.
       const actualNote = ` (${describeProbePeak(attempt)})`;
       log.info(
-        `${label}: candidate ${rung.ctx}/${rung.ngl} -> ${attempt.ok ? "ok" : "failed"}${actualNote}` +
+        `${label}: candidate ${rung.ctx}/${rung.ngl} -> ` +
+          `${attempt.loadKind === "claim_only" ? "claim fits; stopped at ready -- above what the no-spill search can still use here" : attempt.ok ? "ok" : "failed"}${actualNote}` +
           (attempt.error ? ` (${attempt.error})` : "")
       );
       // Not classified as OOM -- the generic case a human actually has to
@@ -3539,7 +3593,7 @@ function toLadderAttempt(attempt: ProbeAttemptOutcome): LadderAttempt {
         : claimFitsFree({
             claimedMib: attempt.gpuBuffersMib,
             freeMib: attempt.listDevicesFreeMib,
-            loaded: attempt.genTps != null || attempt.loadKind === "claim_stop",
+            loaded: attempt.genTps != null || attempt.loadKind === "claim_stop" || attempt.loadKind === "claim_only",
           }),
   };
 }
@@ -3555,6 +3609,14 @@ interface ProbeLoadInput {
   /** What this rung was predicted to need -- carried onto the outcome row. */
   estimate: { vramMib: number; ramMib: number } | null;
   label: string;
+  /** This load can only answer target 2 (probeOutcome's nextClaimOnly): once its
+   * claim is known to fit, it stops at ready instead of generating. */
+  claimOnly?: boolean;
+  /** "first" builds the spill anchor from this load, "control" folds this load
+   * in as its noise; null judges this load against `spillAnchor`. */
+  anchorRole?: "first" | "control" | null;
+  /** The anchor as it stands before this load. */
+  spillAnchor?: SpillAnchor | null;
   /** Best prompt-processing rate this run has measured at a rung the
    * host-backed check left alone -- the reference the prefill cliff is judged
    * against. Null until one exists. */
@@ -3643,7 +3705,11 @@ async function runOneProbeLoad(input: ProbeLoadInput): Promise<ProbeAttemptOutco
         ? null
         : (claimFitsFreeByDevice(claimAtReady.byDeviceMib, input.freeByDevice) ??
           claimFitsFree({ claimedMib: claimAtReady.deviceMib, freeMib: input.listDevicesFreeMib, loaded: true }));
-    if (claimAtReady != null && fitsAtReady === false) {
+    // A claim that fits on a claim-only load is equally finished: no layer count
+    // this high can be target 1's answer at this context, so a spill verdict
+    // would decide nothing -- and generating costs minutes a load.
+    if (claimAtReady != null && (fitsAtReady === false || (fitsAtReady === true && input.claimOnly))) {
+      const fits = fitsAtReady === true;
       const stats = sampler.stop();
       trace.stop();
       return {
@@ -3660,11 +3726,12 @@ async function runOneProbeLoad(input: ProbeLoadInput): Promise<ProbeAttemptOutco
         vramClaimedPeakMib: stats.vram_process_claimed_peak_mib,
         genTps: null,
         ...memoryFields,
-        loadKind: "claim_stop",
-        claimFitsFree: false,
+        loadKind: fits ? "claim_only" : "claim_stop",
+        claimFitsFree: fits,
         gpuBuffersMib: claimAtReady.deviceMib,
-        error:
-          `llama.cpp's GPU claim (${Object.entries(claimAtReady.byDeviceMib)
+        error: fits
+          ? undefined
+          : `llama.cpp's GPU claim (${Object.entries(claimAtReady.byDeviceMib)
             .map(([device, mib]) => `${device} ${Math.round(mib)}MiB`)
             .join(", ")}) does not fit what --list-devices reported free (${Object.entries(input.freeByDevice ?? {})
             .map(([device, mib]) => `${device} ${Math.round(mib)}MiB`)
@@ -3721,21 +3788,28 @@ async function runOneProbeLoad(input: ProbeLoadInput): Promise<ProbeAttemptOutco
     const readings = trace.stop();
     const serverOutput = server?.stderr() ?? "";
     const gpuBuffers = parseGpuBufferReport(serverOutput);
-    const phased = measurePhasedGpuSpill({
+    const measuredLoad = {
       buffers: gpuBuffers,
       readings,
       ready: { fromMs: readyAtMs, toMs: workFromMs },
       work: { fromMs: workFromMs, toMs: workToMs },
-      atSmallestContext: candidateCtx <= PROBE_LADDER_MIN_CTX,
-    });
+    };
+    // The anchor this load is judged against: built from it, completed by it,
+    // or the one the ladder carried in.
+    const anchor =
+      input.anchorRole === "first"
+        ? buildSpillAnchor(measuredLoad)
+        : input.anchorRole === "control" && input.spillAnchor
+          ? withAnchorControl(input.spillAnchor, measuredLoad)
+          : (input.spillAnchor ?? null);
+    const phased = measureGrowthSpill({ ...measuredLoad, atSmallestContext: candidateCtx <= PROBE_LADDER_MIN_CTX }, anchor);
     // Every reading, in the run's log: what the phases were judged on.
     if (readings.length > 0) {
       const phaseOf = (at: number) => (at <= readyAtMs ? "load" : at <= workFromMs + 1000 ? "ready" : at <= workToMs + 1000 ? "work" : "after");
+      const round = (v: number | null | undefined) => (v != null ? Math.round(v) : "?");
       log.info(
-        `${input.label}: dedicated VRAM once a second (${Math.round(gpuBuffers?.deviceMib ?? 0)}MiB claimed): ` +
-          readings
-            .map((r) => `${phaseOf(r.atMs)} ${r.dedicatedMib != null ? Math.round(r.dedicatedMib) : "?"}`)
-            .join(", ")
+        `${input.label}: dedicated/shared GPU memory once a second (${Math.round(gpuBuffers?.deviceMib ?? 0)}MiB claimed): ` +
+          readings.map((r) => `${phaseOf(r.atMs)} ${round(r.dedicatedMib)}/${round(r.sharedMib)}`).join(", ")
       );
     }
     const verdict = probeSucceeded({
@@ -3750,9 +3824,10 @@ async function runOneProbeLoad(input: ProbeLoadInput): Promise<ProbeAttemptOutco
       loadedDedicatedMib: stats.vram_process_loaded_peak_mib,
       loadedDedicatedJitterMib: stats.vram_process_loaded_jitter_mib,
       atSmallestContext: candidateCtx <= PROBE_LADDER_MIN_CTX,
-      // The per-phase verdict decides wherever the trace produced readings; the
-      // single loaded-peak figure above is only the fallback.
-      gpuSpillOverride: phased.measured ? phased : undefined,
+      // Growth over the anchor decides, measured or not: an unmeasured verdict
+      // falls to the estimate-based inference, which only warns -- never to a
+      // difference against zero.
+      gpuSpillOverride: phased,
     });
     const headroomFrac =
       stats.vram_peak_mib != null && payload.gpu_total_mib != null && payload.gpu_total_mib > 0
@@ -3809,6 +3884,10 @@ async function runOneProbeLoad(input: ProbeLoadInput): Promise<ProbeAttemptOutco
       spillReadyJitterMib: phased.readyPhase.jitterMib,
       spillWorkMib: phased.workPhase.inSystemRamMib,
       spillWorkJitterMib: phased.workPhase.jitterMib,
+      spillMethod: input.anchorRole ? "anchor" : "growth",
+      spillSharedGrowthMib: phased.sharedGrowthMib,
+      spillUnlandedGrowthMib: phased.unlandedGrowthMib,
+      spillAnchor: input.anchorRole ? anchor : undefined,
     };
   } catch (err) {
     const stats = sampler.stop();

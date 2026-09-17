@@ -27,6 +27,7 @@ function row(overrides: Partial<ProbeAttemptDto>): ProbeAttemptDto {
     host_backed_method: null, host_backed_slope: null, kv_host_backed_frac: null,
     gpu_buffers_mib: null, gpu_in_system_ram_mib: null, gpu_spill_jitter_mib: null, host_backed_fail: null, list_devices_free_mib: null, claim_fits_free: null,
     load_kind: null, spill_ready_mib: null, spill_ready_jitter_mib: null, spill_work_mib: null, spill_work_jitter_mib: null,
+    spill_method: null, spill_shared_growth_mib: null, spill_unlanded_growth_mib: null,
     ladder_ngl_max: null, ladder_max_ctx: null,
     error: null, created_at: 0, reused_from_run_id: null, vram_discrepancy: 0,
     gpu_layers_resident_est: null, gpu_layers_resident_exact: null,
@@ -137,20 +138,29 @@ describe("ProbeAttempts claim vs free", () => {
     expect(claimText(bodyRows[1])).toBe("—");
     expect(table.getByText("failed — not a memory verdict")).toBeTruthy();
   });
+
+  it("shows a claim-only load's claim, no spill verdict, and no pass or failure", async () => {
+    const { bodyRows, table } = await renderTable([
+      row({ candidate_ctx: 2048, ngl: 23, ok: 0, gen_tps: null, gpu_buffers_mib: 7172, list_devices_free_mib: 7378, claim_fits_free: 1, load_kind: "claim_only" }),
+    ]);
+    expect(claimText(bodyRows[0])).toBe("206 MiB under");
+    expect(bodyRows[0].children[bodyRows[0].children.length - 3].textContent).toBe("—");
+    expect(bodyRows[0].lastElementChild?.textContent).toBe("claim fits — not generated");
+    expect(table.queryByText("failed")).toBeNull();
+  });
 });
 
 describe("ProbeAttempts claimed VRAM", () => {
-  it("shows the measured claimed figure, and marks the peak-sum fallback for older rows", async () => {
+  it("shows llama.cpp's own GPU claim, never dedicated plus shared", async () => {
     const { bodyRows } = await renderTable([
-      row({ vram_claimed_peak_mib: 11040, vram_process_peak_mib: 6321, vram_shared_peak_mib: 5000 }),
-      // Recorded before claimed existed: the two separate peaks, added.
-      row({ vram_claimed_peak_mib: null, vram_process_peak_mib: 6000, vram_shared_peak_mib: 2000 }),
-      row({ vram_claimed_peak_mib: null, vram_process_peak_mib: null }),
+      // The 1,024-token / 1-layer load: 995 model + 238 compute claimed, while
+      // dedicated + shared read 1,005 + 1,272.
+      row({ gpu_buffers_mib: 1232.6, vram_claimed_peak_mib: 2277, vram_process_peak_mib: 1005, vram_shared_peak_mib: 1272 }),
+      row({ gpu_buffers_mib: null, vram_claimed_peak_mib: 8000, vram_process_peak_mib: 6000, vram_shared_peak_mib: 2000 }),
     ]);
     const claimedText = (i: number) => bodyRows[i].children[5].textContent;
-    expect(claimedText(0)).toBe("11,040 MiB");
-    expect(claimedText(1)).toBe("~8,000 MiB");
-    expect(claimedText(2)).toBe("—");
+    expect(claimedText(0)).toBe("1,233 MiB");
+    expect(claimedText(1)).toBe("—");
   });
 
   it("splits shared into total and llama", async () => {
@@ -158,5 +168,29 @@ describe("ProbeAttempts claimed VRAM", () => {
     // #, context, offload, resident, free, claimed, peak total, peak llama, shared total, shared llama
     expect(bodyRows[0].children[8].textContent).toBe("7,100 MiB");
     expect(bodyRows[0].children[9].textContent).toBe("6,900 MiB");
+  });
+});
+
+describe("ProbeAttempts growth over the anchor", () => {
+  const spillText = (r: HTMLElement) => r.children[r.children.length - 3].textContent;
+
+  it("labels the anchor loads, and judges the rest on min(s, d) against their tolerance", async () => {
+    const { bodyRows, table } = await renderTable([
+      row({ ngl: 1, gpu_buffers_mib: 1233, gpu_in_system_ram_mib: 0, gpu_spill_jitter_mib: 0, spill_method: "anchor", load_kind: "full" }),
+      row({ ngl: 1, gpu_buffers_mib: 1233, gpu_in_system_ram_mib: 0, gpu_spill_jitter_mib: 0, spill_method: "anchor", load_kind: "full" }),
+      row({ ngl: 4, gpu_buffers_mib: 1841, gpu_in_system_ram_mib: -3, gpu_spill_jitter_mib: 3, spill_method: "growth", spill_shared_growth_mib: 0, spill_unlanded_growth_mib: -3 }),
+      row({ ngl: 9, ok: 0, gpu_buffers_mib: 3330, gpu_in_system_ram_mib: 130, gpu_spill_jitter_mib: 15, spill_method: "growth", spill_shared_growth_mib: 145, spill_unlanded_growth_mib: 130, host_backed_fail: "layers" }),
+    ]);
+    expect(spillText(bodyRows[0])).toBe("anchor");
+    expect(bodyRows[0].lastElementChild?.textContent).toBe("anchor");
+    expect(spillText(bodyRows[2])).toBe("none");
+    expect(spillText(bodyRows[3])).toBe("130 MiB");
+    expect(table.getByText("layers in system RAM")).toBeTruthy();
+    expect(bodyRows[3].children[bodyRows[3].children.length - 3].getAttribute("title")).toMatch(/shared GPU memory \+145 MiB, claim not taken by VRAM \+130 MiB/);
+  });
+
+  it("still shows a failed anchor as failed", async () => {
+    const { bodyRows } = await renderTable([row({ ngl: 1, ok: 0, gen_tps: null, gpu_buffers_mib: 1233, spill_method: "anchor", load_kind: "full" })]);
+    expect(bodyRows[0].lastElementChild?.textContent).not.toBe("anchor");
   });
 });
