@@ -7,7 +7,7 @@
 // comparison members excluded -- trimmed comparison grids must not compete
 // with Test A's full-grid profiles.
 
-import type { CaveatFlag, TestType } from "./types.js";
+import type { TestType } from "./types.js";
 import type { GoalsConfig } from "./goals.js";
 import { WORKLOAD_WEIGHTS, defaultGoals } from "./goals.js";
 import { configHash, type ConfigHashInput } from "./configHash.js";
@@ -40,14 +40,13 @@ export interface ScoringRow {
   sample_count?: number;
   suspect_count?: number;
   repeat_samples?: number[];
-  caveat_flags?: CaveatFlag[];
   vram_peak_mib: number | null;
   ram_peak_mib: number;
   gpu_memory_total_mb: number | null;
   system_memory_total_mb: number | null;
 }
 
-export type RejectionGate = "stability" | "suspect_samples" | "missing_pp_or_tg" | "caveat_flagged";
+export type RejectionGate = "stability" | "suspect_samples" | "missing_pp_or_tg";
 
 export type ProfileId = "max_speed" | "balanced" | "max_context" | "low_memory";
 
@@ -74,7 +73,6 @@ export interface ScoredConfig {
   maxCtx: MaxCtxEstimate | null;
   /** min(1, maxCtx.tokens / target_ctx) when both exist; null otherwise. */
   fit: number | null;
-  caveatFlags: CaveatFlag[];
 }
 
 export interface ProfileCard {
@@ -255,12 +253,11 @@ interface TupleBucket {
   rows: ScoringRow[];
 }
 
-function nearestDepthRow(rows: ScoringRow[], target: number, excludeSwa: boolean): ScoringRow | undefined {
-  const usable = excludeSwa ? rows.filter((r) => !(r.caveat_flags ?? []).includes("swa")) : rows;
-  if (usable.length === 0) return undefined;
-  let best = usable[0];
+function nearestDepthRow(rows: ScoringRow[], target: number): ScoringRow | undefined {
+  if (rows.length === 0) return undefined;
+  let best = rows[0];
   let bestDelta = Math.abs((best.n_depth ?? 0) - target);
-  for (const row of usable.slice(1)) {
+  for (const row of rows.slice(1)) {
     const delta = Math.abs((row.n_depth ?? 0) - target);
     if (delta < bestDelta) {
       best = row;
@@ -278,7 +275,6 @@ export function scoreProfiles(input: ScoringInput): ScoringResult {
     stability: 0,
     suspect_samples: 0,
     missing_pp_or_tg: 0,
-    caveat_flagged: 0,
   };
 
   // §0.1 -- rows of different method_version are never averaged together.
@@ -350,14 +346,8 @@ export function scoreProfiles(input: ScoringInput): ScoringResult {
     }
 
     const targetDepth = referenceDepth ?? 0;
-    // §0.3 -- swa rows are excluded from the TG reference-depth comparison:
-    // depth past the sliding window is structurally misleading.
-    const tgRow = nearestDepthRow(tgRows, targetDepth, true);
-    if (!tgRow) {
-      tallies.caveat_flagged++;
-      continue;
-    }
-    const ppRow = nearestDepthRow(ppRows, tgRow.n_depth ?? 0, false)!;
+    const tgRow = nearestDepthRow(tgRows, targetDepth)!;
+    const ppRow = nearestDepthRow(ppRows, tgRow.n_depth ?? 0)!;
 
     const ppStats = statsFor(ppRow, input.repeats, discardFirst);
     const tgStats = statsFor(tgRow, input.repeats, discardFirst);
@@ -383,7 +373,6 @@ export function scoreProfiles(input: ScoringInput): ScoringResult {
       ramPeakMib: tgRow.ram_peak_mib,
       maxCtx,
       fit,
-      caveatFlags: [...new Set([...(ppRow.caveat_flags ?? []), ...(tgRow.caveat_flags ?? [])])],
     };
 
     if (ppStats.suspect > 0 || tgStats.suspect > 0) {
@@ -431,7 +420,6 @@ export function scoreProfiles(input: ScoringInput): ScoringResult {
     const onlyStability =
       stabilityOnlyFailures.length > 0 &&
       tallies.suspect_samples === 0 &&
-      tallies.caveat_flagged === 0 &&
       tallies.missing_pp_or_tg === 0;
     if (onlyStability) {
       const best = argmax(stabilityOnlyFailures, (c) => combined(c, weights));

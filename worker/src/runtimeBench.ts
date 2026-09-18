@@ -9,7 +9,8 @@
 
 import { spawn, type ChildProcess } from "node:child_process";
 import type { IngestResultInput, ProbeAttemptReport } from "../../shared/types.js";
-import { CURVE_METHOD_VERSION, SERVER_METHOD_VERSION, type CaveatFlag } from "../../shared/types.js";
+import { CURVE_METHOD_VERSION, FILL_CURVE_METHOD_VERSION, SERVER_METHOD_VERSION } from "../../shared/types.js";
+import { fillBoundaries, fillTarget } from "../../shared/fillCurve.js";
 import type { SweepItem } from "../../shared/sweep.js";
 import { isVramDiscrepancy } from "../../shared/vramEstimate.js";
 import {
@@ -33,7 +34,6 @@ import { buildPromptTokens, fetchFillerBlocks, type FillerBlocks } from "./fille
 import {
   buildServerArgs,
   contextSizeForSlots,
-  curveCaveatFlags,
   planConcurrentBatch,
   planCurvePoint,
   summarizeStreams,
@@ -89,6 +89,8 @@ export interface SpawnRuntimeServerInput {
   slots: number;
   mainGpu?: number;
   contextSizeOverride?: number;
+  /** Speed runs load the model fully into RAM instead of mmap-ing it. */
+  noMmap?: boolean;
   log?: BenchLogger;
   onSpawn?: (proc: ChildProcess) => void;
   spawnFn?: SpawnFn;
@@ -100,8 +102,7 @@ function defaultSpawn(path: string, args: string[]): ChildProcess {
 
 export async function spawnRuntimeServer(input: SpawnRuntimeServerInput): Promise<RuntimeServerHandle> {
   // §0.7 -- probed once per binary identity. An unsupported flag disables its
-  // behavior rather than failing the item; the row then carries a
-  // context_shift caveat if the logs show a shift happened anyway.
+  // behavior rather than failing the item.
   const supportsNoContextShift = await supportsFlag(input.llamaServerPath, "--no-context-shift").catch(() => false);
   // Same §0.7 probe pattern for --fit -- see buildServerArgs's own comment
   // for why this is forced off rather than left at llama-server's default.
@@ -109,6 +110,7 @@ export async function spawnRuntimeServer(input: SpawnRuntimeServerInput): Promis
   // Same §0.7 probe pattern for --mlock -- keeps the model locked in RAM for
   // the run's duration instead of left swappable.
   const supportsMlock = await supportsFlag(input.llamaServerPath, "--mlock").catch(() => false);
+  const noMmap = input.noMmap === true && (await supportsFlag(input.llamaServerPath, "--no-mmap").catch(() => false));
   const args = buildServerArgs({
     modelPath: input.modelPath,
     port: input.port,
@@ -119,6 +121,7 @@ export async function spawnRuntimeServer(input: SpawnRuntimeServerInput): Promis
     supportsFit,
     supportsMlock,
     contextSizeOverride: input.contextSizeOverride,
+    noMmap,
   });
   input.log?.info(`llama-server ${args.join(" ")}`);
   const proc = (input.spawnFn ?? defaultSpawn)(input.llamaServerPath, args);
@@ -200,9 +203,10 @@ export interface StreamedRequestInput {
   signal?: AbortSignal;
   /**
    * GBNF constraining what may be sampled. Only ever set by the last-resort
-   * retry below, and only for a model that cannot otherwise produce a parseable
-   * response at all -- constrained sampling has its own cost, so any row
-   * measured this way is flagged grammar_constrained.
+   * retry below, and only for a model that cannot otherwise produce a
+   * parseable response at all -- constrained sampling has its own cost, so a
+   * reading measured this way is not directly comparable with an
+   * unconstrained one.
    */
   grammar?: string;
 }
@@ -320,7 +324,7 @@ export async function completeWithRetries(input: ResilientCompletionInput): Prom
 
   input.log?.warn(
     "every unconstrained attempt was rejected; retrying under a grammar so this configuration " +
-      "still yields a reading -- the row will be flagged grammar_constrained"
+      "still yields a reading"
   );
   // A failure here is genuine and stays fatal: nothing about this model can
   // generate through this endpoint, and no other placement will differ.
@@ -419,8 +423,6 @@ export interface CurvePointExecutionInput {
   repeats: number;
   port: number;
   promptOffset?: number;
-  serverLog: string;
-  supportsNoContextShift: boolean;
   completion?: CompletionFn;
   /**
    * Tokenized filler blocks (see fillerPrompt.ts). Omit and they are fetched
@@ -453,7 +455,6 @@ export async function executeCurvePoint(input: CurvePointExecutionInput): Promis
   });
 
   const samples: (StreamSample & { requestClass: RequestClass })[] = [];
-  let grammarConstrained = false;
   for (const step of plan) {
     const outcome = await completeWithRetries({
       completion,
@@ -466,18 +467,11 @@ export async function executeCurvePoint(input: CurvePointExecutionInput): Promis
       cachePrompt: step.cachePrompt,
       log: input.log,
     });
-    grammarConstrained ||= outcome.grammarConstrained;
     samples.push({ ...outcome.sample, requestClass: step.requestClass });
   }
 
   const cold = samples.find((s) => s.requestClass === "cold_timed");
   const warm = samples.filter((s) => s.requestClass === "warm_repeat");
-  const caveats = curveCaveatFlags({
-    samples: samples.map((s) => ({ requestClass: s.requestClass, promptN: s.promptN })),
-    serverLog: input.serverLog,
-    supportsNoContextShift: input.supportsNoContextShift,
-  });
-  if (grammarConstrained) caveats.push("grammar_constrained");
 
   const results: IngestResultInput[] = [];
   const shared = {
@@ -498,7 +492,6 @@ export async function executeCurvePoint(input: CurvePointExecutionInput): Promis
     // when the filler prompt became a mixed-register passage, which moved
     // measured MoE prefill by 58%.
     method_version: CURVE_METHOD_VERSION,
-    caveat_flags: caveats,
     prompt_offset: input.promptOffset ?? 0,
     concurrency: 1,
   };
@@ -553,7 +546,147 @@ export async function executeCurvePoint(input: CurvePointExecutionInput): Promis
     samples,
     warning:
       evictedCount > 0
-        ? `${evictedCount} warm repeat(s) re-prefilled the prompt: the prefix cache did not hold, so this point is flagged cache_evicted and drops out of the curve`
+        ? `${evictedCount} warm repeat(s) re-prefilled the prompt: the prefix cache did not hold, so this point's generation numbers are not comparable to a cache-warm reading`
+        : undefined,
+  };
+}
+
+// --- Fill curve: prefill speed along one context's fill ---------------------
+
+export interface FillCurveExecutionInput {
+  /** The server's -c; the prompt stops at fillTarget(ctx). */
+  ctx: number;
+  steps: number;
+  repeats: number;
+  port: number;
+  /** The sweep item this curve belongs to -- stamped onto every row. */
+  item: SweepItem;
+  completion?: CompletionFn;
+  fillerBlocks?: FillerBlocks;
+  log?: BenchLogger;
+  /** Checked before every request; a true return ends the curve early. */
+  shouldStop?: () => boolean;
+  onProgress?: (progress: { repeat: number; filled: number; fill: number }) => void;
+}
+
+export interface FillCurveExecution {
+  results: IngestResultInput[];
+  warning?: string;
+  stopped: boolean;
+}
+
+// A slice reading counts only when the server prefilled (about) the slice
+// itself. Far more means the prompt cache did not hold and the request
+// re-prefilled from an earlier point, so its rate belongs to a different span
+// of the context. The slack absorbs a token or two of BOS/prefix-match
+// boundary handling.
+function sliceHeld(promptN: number, expected: number): boolean {
+  return Math.abs(promptN - expected) <= Math.max(2, Math.ceil(expected * 0.01));
+}
+
+// Each repeat walks the whole fill once with its own prompt (a different
+// nonce), so the first slice of repeat 2 cannot reuse repeat 1's cache. Within
+// a repeat, request i sends the first boundaries[i] tokens with the prompt
+// cache on -- only the newly appended slice is prefilled, and that request's
+// own prompt timings are the slice's rate. Every request asks for one token
+// under a plain-ASCII grammar: the output is thrown away, and the grammar
+// keeps llama-server's output validator (see LlamaServerOutputError) from
+// failing a request over a single generated byte.
+export async function executeFillCurve(input: FillCurveExecutionInput): Promise<FillCurveExecution> {
+  const completion = input.completion ?? streamedCompletion;
+  const blocks = input.fillerBlocks ?? (await fetchFillerBlocks(input.port));
+  const fill = fillTarget(input.ctx);
+  const boundaries = fillBoundaries(fill, input.steps);
+  const repeats = Math.max(1, input.repeats);
+
+  // rates[step] -> per-repeat { rate, held }
+  const rates: { rate: number; held: boolean }[][] = boundaries.map(() => []);
+  let stopped = false;
+
+  outer: for (let r = 0; r < repeats; r++) {
+    const tokens = buildPromptTokens(fill, 0, r + 1, blocks);
+    let prev = 0;
+    for (let s = 0; s < boundaries.length; s++) {
+      if (input.shouldStop?.()) {
+        stopped = true;
+        break outer;
+      }
+      const end = boundaries[s];
+      input.onProgress?.({ repeat: r, filled: end, fill });
+      const sample = await completion({
+        port: input.port,
+        promptTokens: tokens.slice(0, end),
+        nPredict: 1,
+        cachePrompt: true,
+        grammar: FALLBACK_GRAMMAR,
+      });
+      const expected = end - prev;
+      if (sample.promptMs != null && sample.promptMs > 0 && sample.promptN > 0) {
+        rates[s].push({
+          rate: (sample.promptN / sample.promptMs) * 1000,
+          held: sliceHeld(sample.promptN, expected),
+        });
+      } else {
+        rates[s].push({ rate: 0, held: false });
+      }
+      if (!sliceHeld(sample.promptN, expected)) {
+        input.log?.warn(
+          `fill curve: slice ${prev}..${end} prefilled ${sample.promptN} tokens (expected ${expected}) -- excluded`
+        );
+      }
+      prev = end;
+    }
+  }
+
+  const { item } = input;
+  const results: IngestResultInput[] = [];
+  let excluded = 0;
+  let prev = 0;
+  for (let s = 0; s < boundaries.length; s++) {
+    const end = boundaries[s];
+    const all = rates[s];
+    if (all.length === 0) break; // stopped before this slice was ever measured
+    const clean = all.filter((x) => x.held).map((x) => x.rate);
+    const suspect = all.filter((x) => !x.held).map((x) => x.rate);
+    excluded += suspect.length;
+    const mean = clean.length > 0 ? clean.reduce((a, b) => a + b, 0) / clean.length : 0;
+    const variance =
+      clean.length > 1 ? clean.reduce((acc, v) => acc + (v - mean) ** 2, 0) / (clean.length - 1) : 0;
+    results.push({
+      test_type: "pp",
+      n_prompt: end - prev,
+      n_gen: 0,
+      n_depth: prev,
+      n_threads: item.threads,
+      n_gpu_layers: item.n_gpu_layers,
+      batch_size: item.batch_size,
+      ubatch_size: item.ubatch_size,
+      cache_type_k: item.cache_type_k,
+      cache_type_v: item.cache_type_v,
+      flash_attn: item.flash_attn,
+      mtp: "off",
+      n_gpu_layers_draft: 0,
+      n_cpu_moe: item.n_cpu_moe,
+      avg_tps: mean,
+      stddev_tps: Math.sqrt(variance),
+      sample_count: all.length,
+      suspect_count: suspect.length,
+      suspect_samples: suspect,
+      repeat_samples: clean,
+      method_version: FILL_CURVE_METHOD_VERSION,
+      prompt_offset: 0,
+      concurrency: 1,
+    } as IngestResultInput);
+    prev = end;
+  }
+
+  return {
+    results,
+    stopped,
+    warning:
+      excluded > 0
+        ? `${excluded} slice reading(s) re-prefilled more than their own slice -- the prompt cache did not hold ` +
+          `(common on sliding-window models), so those readings were excluded from the curve`
         : undefined,
   };
 }
@@ -586,7 +719,6 @@ export async function executeKneeLadder(input: KneeExecutionInput): Promise<Inge
     // (same model, so the same blocks -- but this never assumes that).
     const fillerBlocks = input.fillerBlocks ?? (await fetchFillerBlocks(port));
     const batchSamples: StreamSample[] = [];
-    let grammarConstrained = false;
     for (let repeat = 0; repeat < Math.max(1, input.repeats); repeat++) {
       const plan = planConcurrentBatch({ slots, promptTokens: input.nPrompt, nGen: input.nGen });
       // Simultaneous, not sequential -- that is the whole measurement.
@@ -606,7 +738,6 @@ export async function executeKneeLadder(input: KneeExecutionInput): Promise<Inge
           })
         )
       );
-      if (batch.some((b) => b.grammarConstrained)) grammarConstrained = true;
       batchSamples.push(...batch.map((b) => b.sample));
     }
     const summary = summarizeStreams(batchSamples);
@@ -623,7 +754,6 @@ export async function executeKneeLadder(input: KneeExecutionInput): Promise<Inge
       n_gpu_layers_draft: 0,
       n_cpu_moe: 0,
       method_version: SERVER_METHOD_VERSION,
-      caveat_flags: grammarConstrained ? (["grammar_constrained"] as CaveatFlag[]) : undefined,
       concurrency: slots,
       ttft_ms_p50: summary.ttftP50Ms,
       ttft_ms_p95: summary.ttftP95Ms,

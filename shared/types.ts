@@ -136,7 +136,17 @@ export type SensorMeasurementSource = (typeof SENSOR_MEASUREMENT_SOURCES)[number
 // "curve-v1" is the throughput-vs-context/concurrency measurement (curve_point
 // and knee jobs). "probe-frontier-v1" is the context test's frontier MODE --
 // a different feature that happens to draw a curve too, hence the longer name.
-export const WORKER_CAPABILITIES = ["benchmark", "probe-v1", "quality-v1", "curve-v1", "probe-frontier-v1"] as const;
+// "fill-curve-v1" is the Benchmark chain's sweep stage measuring prefill speed
+// along one context's fill (see shared/fillCurve.ts) -- an older worker would
+// run that stage's sweep as ordinary llama-bench items instead.
+export const WORKER_CAPABILITIES = [
+  "benchmark",
+  "probe-v1",
+  "quality-v1",
+  "curve-v1",
+  "probe-frontier-v1",
+  "fill-curve-v1",
+] as const;
 export type WorkerCapability = (typeof WORKER_CAPABILITIES)[number];
 
 // BENCHMARKING_PLAN_V8.md §0.1 -- increments whenever measurement semantics
@@ -166,6 +176,11 @@ export const CURVE_METHOD_VERSION = 5;
 // shared constant would have falsely invalidated them.
 export const SERVER_METHOD_VERSION = 3;
 
+// Prefill speed per slice of one growing prompt (shared/fillCurve.ts): each
+// row's rate covers only the tokens appended on top of a cached prefix, so it
+// must never be averaged with a whole-prompt pp reading.
+export const FILL_CURVE_METHOD_VERSION = 6;
+
 // The curve vintage that shipped before the filler-prompt rewrite. Kept as a
 // named constant because stored rows still carry it and N7 bundles still have
 // to describe how they were measured.
@@ -188,37 +203,6 @@ export const MAX_REPEATS = 25;
 export const MAX_CHAIN_DEPTH = 3;
 export const MAX_ACTIVE_ROOTS_PER_USER = 3;
 export const CHAIN_WALL_CLOCK_MS = 48 * 60 * 60 * 1000;
-
-// §0.10 closed registry of caveat flags. Flagged rows are kept, never deleted;
-// consumers decide exclusions (e.g. scoring's TG reference-depth rule skips
-// `swa` rows).
-export const CAVEAT_FLAGS = [
-  "swa",
-  "context_unverified",
-  "kv_estimate_rough",
-  "spec_pair_prompt_mismatch",
-  "thermally_throttled",
-  "cache_evicted",
-  "context_shift",
-  // The reading only came back at all because generation was constrained by a
-  // grammar -- llama.cpp's chat-output parser rejects any response containing
-  // one invalid UTF-8 byte, and some models emit one unprompted. Constrained
-  // sampling carries its own overhead, so such a row is a usable signal but
-  // not directly comparable with an unconstrained one.
-  "grammar_constrained",
-] as const;
-export type CaveatFlag = (typeof CAVEAT_FLAGS)[number];
-
-export function parseCaveatFlags(text: string | null | undefined): CaveatFlag[] {
-  if (!text) return [];
-  try {
-    const parsed = JSON.parse(text) as unknown;
-    if (!Array.isArray(parsed)) return [];
-    return parsed.filter((f): f is CaveatFlag => typeof f === "string" && (CAVEAT_FLAGS as readonly string[]).includes(f));
-  } catch {
-    return [];
-  }
-}
 
 export const SPEEDUP_STATUSES = ["ok", "unverified", "unavailable"] as const;
 export type SpeedupStatus = (typeof SPEEDUP_STATUSES)[number];
@@ -451,6 +435,8 @@ export interface TestConfig {
   curve_point?: CurvePointSpec;
   // N5 -- the concurrency ladder this runtime run walks.
   knee?: KneeSpec;
+  // The context whose fill this sweep-stage run measures prefill along.
+  fill_curve?: FillCurveSpec;
   // §0.5 -- chain depth of this run under its root (roots are depth 1).
   chain_depth?: number;
 }
@@ -552,7 +538,6 @@ export interface ResultRow {
   spec_n_min?: number | null;
   speedup?: number | null;
   speedup_status?: SpeedupStatus | null;
-  caveat_flags?: CaveatFlag[];
   // N5 -- concurrent streaming slots this row measured (1 = solo). NULL on
   // ordinary rows.
   concurrency?: number | null;
@@ -887,8 +872,6 @@ export interface IngestResultInput {
   ttft_ms_p95?: number | null;
   ttft_n?: number | null;
   e2e_ms_mean?: number | null;
-  // §0.10 -- worker-derived caveat flags from the closed registry.
-  caveat_flags?: CaveatFlag[];
 }
 
 // --- Per-item live progress (one llama-bench process per sweep combo) ---
@@ -1062,6 +1045,9 @@ export interface TriggerPayload {
   // ordinary results with `concurrency` set; the knee is derived on read,
   // never a stored verdict.
   knee?: KneeSpec;
+  // Prefill speed along one context's fill (kind must be "sweep") -- one
+  // curve per sweep item. Refused unless the worker advertises `fill-curve-v1`.
+  fill_curve?: FillCurveSpec;
   // N3 -- groups comparison members created through this same route; the
   // caller supplies a stable id shared by every member.
   comparison_id?: string;
@@ -1112,6 +1098,15 @@ export interface CurvePointSpec {
   repeats?: number;
   placement?: { ngl: number; n_cpu_moe?: number };
   kv_pair?: [string, string];
+}
+
+// The Benchmark chain's sweep stage: one llama-server per sweep item started
+// with -c = ctx, one prompt grown in `steps` slices up to fillTarget(ctx), and
+// each slice's own prefill rate recorded against how full the context already
+// was. See shared/fillCurve.ts.
+export interface FillCurveSpec {
+  ctx: number;
+  steps?: number;
 }
 
 // --- llama.cpp build management ---
@@ -1638,9 +1633,11 @@ export interface BenchmarkJob {
   // Set on runtime-kind runs: "context_curve" executes N1's server-path
   // choreography for exactly one point; "knee" executes N5's load-driver
   // ladder. Absent = ordinary sweep execution.
-  mode?: "sweep" | "context_curve" | "knee";
+  // "fill_curve" measures prefill along one context's fill, one curve per item.
+  mode?: "sweep" | "context_curve" | "knee" | "fill_curve";
   curve_point?: CurvePointSpec;
   knee_spec?: KneeSpec;
+  fill_curve?: FillCurveSpec;
 }
 
 // N5 -- concurrency-knee ladder. Prompt/gen cells are fixed from the M2

@@ -315,10 +315,7 @@ export class MemorySampler {
   }
 
   get stats(): SampleStats {
-    // repeats only gates the throttle FLAG (derived at item end by the
-    // caller, which knows the repeat count) -- the aggregates and the series
-    // this getter returns are repeat-independent.
-    const sensorReport = this.sensors.report(0);
+    const sensorReport = this.sensors.report();
     const accuracy = this.vramMeasured ? this.vramWorstAccuracy : "unavailable";
     const source = this.vramMeasured ? this.vramWorstSource : null;
     const totalAccuracy = this.vramTotalMeasured ? this.vramTotalWorstAccuracy : "unavailable";

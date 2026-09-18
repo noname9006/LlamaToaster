@@ -69,6 +69,19 @@ function migrate(database: Database.Database): void {
   createHfGgufIndexDeletedAtIndex(database);
   createV8Indexes(database);
   raiseStoredProbeMaxLoads(database);
+  dropCaveatFlagsColumn(database);
+}
+
+// The caveat-flags mechanism (§0.10 registry, cache_evicted/context_shift/
+// thermally_throttled/etc. detection) was removed outright -- no replacement
+// column. better-sqlite3 bundles SQLite >= 3.35, which supports DROP COLUMN
+// directly; guarded by PRAGMA table_info so this is a no-op on every boot
+// after the first.
+function dropCaveatFlagsColumn(database: Database.Database): void {
+  const columns = database.prepare(`PRAGMA table_info(results)`).all() as { name: string }[];
+  if (!columns.some((c) => c.name === "caveat_flags")) return;
+  database.exec(`ALTER TABLE results DROP COLUMN caveat_flags`);
+  log.warn("[migrate] dropped results.caveat_flags -- the caveat-flags mechanism was removed");
 }
 
 // The context test's default load budget went from 24 to 40 when controls and
@@ -285,7 +298,6 @@ const COLUMN_MIGRATIONS: ColumnSpec[] = [
   { table: "results", column: "spec_n_min", ddlType: "INTEGER" },
   { table: "results", column: "speedup", ddlType: "REAL" },
   { table: "results", column: "speedup_status", ddlType: "TEXT" },
-  { table: "results", column: "caveat_flags", ddlType: "TEXT" },
   { table: "results", column: "concurrency", ddlType: "INTEGER" },
   { table: "results", column: "gpu_temp_c_max", ddlType: "INTEGER" },
   { table: "results", column: "gpu_clock_mhz_min", ddlType: "INTEGER" },
@@ -500,11 +512,29 @@ function backfillResultIdx(database: Database.Database): void {
 // it is never silent. The operational pre-migration backup
 // (scripts/pre-multiuser-backup.sh) still gives an operator a chance to
 // inspect duplicates BEFORE this ever runs against the live DB.
+//
+// The key also carries n_depth and concurrency: one item may legitimately
+// report several rows of the same test_type -- a fill curve's slices (one pp
+// row per depth, shared/fillCurve.ts) and the knee ladder's slot counts (one
+// row per concurrency). A retried report still repeats all five values, so
+// the guard above is unchanged. An index created before that widening is
+// dropped and recreated; widening a key can never introduce a conflict.
+const RESULTS_ITEM_KEY = "run_id, idx, test_type, COALESCE(n_depth, 0), COALESCE(concurrency, 1)";
+
 function createResultsItemUniqueIndex(database: Database.Database): void {
   const existing = database
-    .prepare(`SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_results_item'`)
-    .get();
-  if (existing) return;
+    .prepare(`SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_results_item'`)
+    .get() as { sql: string | null } | undefined;
+  if (existing) {
+    if (!existing.sql?.includes("n_depth")) {
+      database.transaction(() => {
+        database.exec(`DROP INDEX idx_results_item`);
+        database.exec(`CREATE UNIQUE INDEX idx_results_item ON results(${RESULTS_ITEM_KEY})`);
+      })();
+      log.info("[migrate] idx_results_item: widened to include n_depth and concurrency");
+    }
+    return;
+  }
 
   const dupeGroups = database
     .prepare(
@@ -533,7 +563,7 @@ function createResultsItemUniqueIndex(database: Database.Database): void {
     tx();
   }
 
-  database.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_results_item ON results(run_id, idx, test_type)`);
+  database.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_results_item ON results(${RESULTS_ITEM_KEY})`);
 }
 
 // Multi-user Stage 3 (MULTIUSER_PLAN.md §3.3): must run AFTER

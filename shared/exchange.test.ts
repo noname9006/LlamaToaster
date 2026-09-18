@@ -47,7 +47,6 @@ function bundleRow(over: Partial<BundleRow> = {}): BundleRow {
     e2e_ms_mean: null,
     gpu_temp_c_max: 78,
     gpu_clock_mhz_min: 2480,
-    caveat_flags: [],
     created_at: 1_000,
     ...over,
   });
@@ -101,10 +100,10 @@ describe("N7 export bundle", () => {
   it("embeds a methods section keyed to the method version", () => {
     expect(methodsFor(METHOD_VERSION).pipeline.join(" ")).toContain("stddev");
     expect(methodsFor(CURVE_METHOD_VERSION).summary).toContain("cold timed prefill");
-    expect(methodsFor(CURVE_METHOD_VERSION).pipeline.join(" ")).toContain("cache_evicted");
+    expect(methodsFor(CURVE_METHOD_VERSION).pipeline.join(" ")).toContain("warm repeats");
     // Server-measured rows say so, and say what the prompt was.
     expect(methodsFor(SERVER_METHOD_VERSION).pipeline.join(" ")).toContain("mixed-register");
-    expect(methodsFor(SERVER_METHOD_VERSION).pipeline.join(" ")).toContain("grammar_constrained");
+    expect(methodsFor(SERVER_METHOD_VERSION).pipeline.join(" ")).toContain("under a grammar");
     // A stored row from before the filler rewrite keeps its OWN description --
     // relabelling it with today's pipeline would misdescribe shared data.
     expect(methodsFor(LEGACY_CURVE_METHOD_VERSION).method_version).toBe(LEGACY_CURVE_METHOD_VERSION);

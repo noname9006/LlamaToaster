@@ -1,7 +1,7 @@
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { ProfileCards } from "../components/ProfileCards";
-import { SustainedState } from "../components/SustainedState";
 import { CurvesPanel, KneeChart } from "../components/CurvesPanel";
+import { FillCurveChart } from "../components/FillCurveChart";
 import { ProbeAttempts } from "../components/ProbeAttempts";
 import { ProbeFrontier } from "../components/ProbeFrontier";
 import { api as apiClient } from "../api/client";
@@ -157,15 +157,8 @@ const MERGED_COLUMN_DEFS: ColDef[] = [
   },
   {
     label: "temp max",
-    description:
-      "M6 — peak adapter temperature during this item. A thermally_throttled flag requires a real temperature reading, so a sensorless backend never produces one.",
+    description: "M6 — peak adapter temperature during this item. Blank where the platform exposes no sensor.",
     sortKey: "temp_max",
-  },
-  {
-    label: "flags",
-    description:
-      "BENCHMARKING_PLAN_V8.md §0.10 caveat flags. Flagged rows are KEPT, never deleted — consumers decide exclusions. thermally_throttled means the clock sagged between repeat halves while the adapter was hot: burst versus sustained, which is data, not garbage.",
-    sortKey: "flags",
   },
   { label: "free", description: "Free system RAM immediately before this test started.", sortKey: "ram_free", group: "ram" },
   {
@@ -261,25 +254,6 @@ const LEGACY_COLUMN_DESCRIPTIONS: Record<string, string> = {
   stddev: "Standard deviation of tokens/second across repeats — lower is more consistent.",
   "ram MiB": "Peak RAM used by the process during this test.",
   "vram MiB": "Peak GPU memory used during this test (best-effort — n/a if not measurable on this box).",
-};
-
-// BENCHMARKING_PLAN_V8.md §0.10 -- the closed registry, each rendered WITH
-// its reason. Flagged rows are kept, never deleted; consumers decide
-// exclusions.
-const CAVEAT_FLAG_REASON: Record<string, string> = {
-  swa: "depth exceeds the model's sliding window, so this reading is structurally misleading past that point -- excluded from the TG reference-depth comparison",
-  context_unverified: "the effective context could not be confirmed for this row",
-  kv_estimate_rough: "the KV memory estimate behind this row is rough rather than good",
-  spec_pair_prompt_mismatch:
-    "the speculative row and its baseline were measured at different prompt-content offsets, so their speedup is unverified",
-  thermally_throttled:
-    "the GPU clock sagged between the first and second halves of this item while the adapter was hot -- the row is KEPT, because burst versus sustained is exactly what this column exists to show",
-  cache_evicted:
-    "a warm repeat re-prefilled the prompt, so the prefix cache did not hold and this point drops out of the curve",
-  context_shift:
-    "a context shift appeared in the logs and this build has no --no-context-shift, which silently corrupts TTFT comparability",
-  grammar_constrained:
-    "llama-server rejected this model's unconstrained output as invalid UTF-8, so the reading only came back under a sampling grammar -- the row is KEPT as a usable signal, but constrained sampling has its own overhead and this rate is not comparable with an unconstrained one",
 };
 
 const TERMINAL_ITEM_STATUSES = new Set([
@@ -537,8 +511,6 @@ function mergedSortValue(item: TestItem, results: ResultRow[] | undefined, key: 
       return anyResult?.gpu_clock_mhz_min ?? -1;
     case "temp_max":
       return anyResult?.gpu_temp_c_max ?? -1;
-    case "flags":
-      return (anyResult?.caveat_flags ?? []).length;
     case "ram_free":
       return anyResult?.ram_free_before_mib ?? item.ram_free_before_mib ?? -1;
     case "ram_used_avg":
@@ -996,6 +968,9 @@ export function TestDetail() {
   // M2's stored answers travel with the run, so the curve can draw the
   // target marker without asking the user again.
   const runGoals = (run?.config as { goals?: { target_ctx?: number | null } } | undefined)?.goals;
+  // A Benchmark sweep stage that measured prefill along a context's fill --
+  // its rows are slices of one curve, not configurations to bar-chart or score.
+  const fillCurveCtx = run?.config.fill_curve?.ctx ?? null;
   const [measureMsg, setMeasureMsg] = useState("");
 
   // N1's trigger story: uncovered ladder cells are priced under §0.6, then
@@ -1149,7 +1124,7 @@ export function TestDetail() {
 
       {/* M3 -- the scored cards. Only once measuring has stopped: scoring a
           half-finished run would rank on a moving target. */}
-      {run && (run.status === "done" || run.status === "partial") && (
+      {run && (run.status === "done" || run.status === "partial") && fillCurveCtx == null && (
         <section className="mt-6">
           <h2 className="text-sm font-semibold uppercase tracking-wide text-muted">Scored profiles</h2>
           <div className="mt-3">
@@ -1176,18 +1151,8 @@ export function TestDetail() {
         </section>
       )}
 
-      {/* M6 measures, N6 decides -- both offered, never automatic. */}
       {run && (run.status === "done" || run.status === "partial" || run.status === "failed") && (
         <section className="mt-6">
-          <h2 className="text-sm font-semibold uppercase tracking-wide text-muted">Sustained state</h2>
-          <div className="mt-3">
-            <SustainedState testId={id} refreshKey={run.status} />
-          </div>
-          <p className="mt-3 text-xs leading-relaxed text-muted">
-            Provenance: rows are stamped with the methodology version that produced them; clock and temperature ride
-            the same sampler cadence as VRAM, with the same worst-source tracking. NULL wherever the platform exposes
-            no sensor — a machine that could never produce a flag says so on its own card first.
-          </p>
           {/* N7 -- the bundle carries its own methods section, so every
               shared number travels with the pipeline that produced it. */}
           <div className="mt-3 flex flex-wrap items-center gap-3">
@@ -1364,12 +1329,10 @@ export function TestDetail() {
                   // see buildItemRepeatUnits (queued = all grey, done = all
                   // solid, running = live per-repeat progress, etc.).
                   const statusUnits = buildItemRepeatUnits(it, repeats);
-                  // M6/§0.10 -- measured TTFT/E2E and the caveat registry.
+                  // M6 -- measured TTFT/E2E.
                   const measuredTtftMs = ppResult?.ttft_ms_p50 ?? tgResult?.ttft_ms_p50 ?? null;
                   const ttftSampleCount = ppResult?.ttft_n ?? tgResult?.ttft_n ?? null;
                   const e2eMs = tgResult?.e2e_ms_mean ?? ppResult?.e2e_ms_mean ?? null;
-                  const caveatFlags = anyResult?.caveat_flags ?? [];
-                  const throttled = caveatFlags.includes("thermally_throttled");
                   return (
                     <Fragment key={it.id}>
                     <tr className="!border-b-0">
@@ -1546,24 +1509,11 @@ export function TestDetail() {
                       <td className="px-1 py-1.5 text-muted">
                         {e2eMs != null ? `${(e2eMs / 1000).toFixed(1)}s` : "—"}
                       </td>
-                      <td className={`px-1 py-1.5 ${throttled ? "text-warning" : "text-muted"}`}>
+                      <td className="px-1 py-1.5 text-muted">
                         {anyResult?.gpu_clock_mhz_min != null ? `${anyResult.gpu_clock_mhz_min} MHz` : "—"}
                       </td>
-                      <td className={`px-1 py-1.5 ${throttled ? "text-warning" : "text-muted"}`}>
-                        {anyResult?.gpu_temp_c_max != null ? `${anyResult.gpu_temp_c_max} °C` : "—"}
-                      </td>
                       <td className="px-1 py-1.5 text-muted">
-                        {caveatFlags.length > 0
-                          ? caveatFlags.map((flag) => (
-                              <span
-                                key={flag}
-                                title={CAVEAT_FLAG_REASON[flag] ?? flag}
-                                className="mr-1 inline-block rounded-full bg-warning-bg px-1.5 py-0.5 text-[9px] font-bold text-warning"
-                              >
-                                {flag}
-                              </span>
-                            ))
-                          : "—"}
+                        {anyResult?.gpu_temp_c_max != null ? `${anyResult.gpu_temp_c_max} °C` : "—"}
                       </td>
                       <td className="px-1 py-1.5 text-muted">{mem.ramFree}</td>
                       <td className="px-1 py-1.5 text-muted">{mem.ramUsedAvg}</td>
@@ -1676,7 +1626,18 @@ export function TestDetail() {
         </section>
       )}
 
-      {results.length > 0 && (
+      {results.length > 0 && fillCurveCtx != null && (
+        <div className="mt-6 rounded-xl border border-border bg-surface p-4">
+          <span className="text-[11px] font-semibold uppercase tracking-wide text-muted">
+            Prefill along the context fill · -c {fillCurveCtx.toLocaleString()}
+          </span>
+          <div className="mt-2">
+            <FillCurveChart results={results} ctx={fillCurveCtx} />
+          </div>
+        </div>
+      )}
+
+      {results.length > 0 && fillCurveCtx == null && (
         <div className="relative mt-6 h-72 rounded-xl border border-border bg-surface p-4">
           {chartConfig && <Chart config={chartConfig} />}
         </div>

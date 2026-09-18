@@ -4,7 +4,7 @@
 // re-measurement moves it without anyone having to invalidate a cached
 // answer.
 
-import type { CaveatFlag, TestType } from "./types.js";
+import type { TestType } from "./types.js";
 
 export interface CurveSourceRow {
   id: string;
@@ -24,7 +24,6 @@ export interface CurveSourceRow {
   ttft_n?: number | null;
   e2e_ms_mean?: number | null;
   method_version?: number | null;
-  caveat_flags?: CaveatFlag[];
   concurrency?: number | null;
   engine?: string | null;
   created_at: number;
@@ -41,7 +40,6 @@ export interface CurvePoint {
   e2eMs: number | null;
   vramPeakMib: number | null;
   methodVersion: number | null;
-  caveatFlags: CaveatFlag[];
   /**
    * True when a later measurement of the same effective context exists. The
    * superseded point is rendered greyed -- never averaged with its successor.
@@ -52,9 +50,6 @@ export interface CurvePoint {
   idx: number;
   /** Stable identity used as the second key of the (created_at, id) total order. */
   pointId: string;
-  /** Dropped from the curve with an explanatory tooltip when the cache did not hold. */
-  excluded: boolean;
-  excludedReason: string | null;
   createdAt: number;
 }
 
@@ -85,13 +80,7 @@ export function buildCurve(rows: CurveSourceRow[]): CurvePoint[] {
   for (const cell of byCell.values()) {
     const pp = cell.rows.find((r) => r.test_type === "pp");
     const tg = cell.rows.find((r) => r.test_type === "tg");
-    const flags = [...new Set(cell.rows.flatMap((r) => r.caveat_flags ?? []))];
     const ttftRow = cell.rows.find((r) => r.ttft_ms_p50 != null) ?? pp ?? tg!;
-    // The eviction detector's verdict has already been written onto the row
-    // as a caveat flag by the worker; the curve honors it by dropping the
-    // point with its reason, never by silently keeping a fast repeat.
-    const evicted = flags.includes("cache_evicted");
-    const shifted = flags.includes("context_shift");
     points.push({
       effectiveCtx: cell.ctx,
       pp: pp?.avg_tps ?? null,
@@ -101,17 +90,10 @@ export function buildCurve(rows: CurveSourceRow[]): CurvePoint[] {
       e2eMs: (tg ?? pp)?.e2e_ms_mean ?? null,
       vramPeakMib: (tg ?? pp)?.vram_peak_mib ?? null,
       methodVersion: (pp ?? tg)!.method_version ?? null,
-      caveatFlags: flags,
       superseded: false,
       testId: cell.rows[0].run_id,
       idx: cell.rows[0].idx,
       pointId: cell.rows.map((r) => r.id).sort()[0],
-      excluded: evicted || shifted,
-      excludedReason: evicted
-        ? "the prefix cache did not hold: a warm repeat re-prefilled, so this point's generation numbers are not comparable"
-        : shifted
-          ? "a context shift appeared in the logs and this build has no --no-context-shift, which silently corrupts TTFT comparability"
-          : null,
       createdAt: Math.max(...cell.rows.map((r) => r.created_at)),
     });
   }

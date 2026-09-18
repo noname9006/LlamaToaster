@@ -857,3 +857,58 @@ describe("§0.5 chain quotas", () => {
     expect(repo.getTest(undefined, "v8-old-root")!.status).not.toBe("running");
   });
 });
+
+// The Benchmark chain's sweep stage -- prefill along one context's fill.
+describe("fill curve trigger", () => {
+  const fillSweep = { ...baseSweep, n_prompt: [4075], n_gen: [0], n_gpu_layers: [0, 20] };
+
+  it("refuses a fill curve on workers without fill-curve-v1", async () => {
+    drainActiveRuns();
+    await heartbeat("v8-fill-old", { capabilities: ["benchmark", "curve-v1"] });
+    const worker = repo.workerRepo.getByMachineId("v8-fill-old")!;
+    const res = await postJson("/api/runs/trigger", {
+      model_id: "v8-model",
+      worker_id: worker.id,
+      kind: "sweep",
+      fill_curve: { ctx: 4096 },
+      sweep: fillSweep,
+    });
+    expect(res.status).toBe(409);
+  });
+
+  it("requires kind sweep, a context within the trained one, and no depth axis", async () => {
+    drainActiveRuns();
+    await heartbeat("v8-fill-bad", { capabilities: ["benchmark", "fill-curve-v1"] });
+    const worker = repo.workerRepo.getByMachineId("v8-fill-bad")!;
+    const post = (extra: Record<string, unknown>) =>
+      postJson("/api/runs/trigger", { model_id: "v8-model", worker_id: worker.id, sweep: fillSweep, ...extra });
+
+    expect((await post({ kind: "runtime", fill_curve: { ctx: 4096 } })).status).toBe(400);
+    const beyond = await post({ kind: "sweep", model_id: "v8-trained", fill_curve: { ctx: 65536 } });
+    expect(beyond.status).toBe(400);
+    expect(((await beyond.json()) as { error: string }).error).toContain("trained context");
+    const depth = await post({ kind: "sweep", fill_curve: { ctx: 4096 }, sweep: { ...fillSweep, n_depth: [0, 1024] } });
+    expect(depth.status).toBe(400);
+  });
+
+  it("creates one item per sweep combination and queues a fill_curve job carrying the spec", async () => {
+    drainActiveRuns();
+    await heartbeat("v8-fill-ok", { capabilities: ["benchmark", "fill-curve-v1"] });
+    const worker = repo.workerRepo.getByMachineId("v8-fill-ok")!;
+    const res = await postJson("/api/runs/trigger", {
+      model_id: "v8-model",
+      worker_id: worker.id,
+      kind: "sweep",
+      fill_curve: { ctx: 4096, steps: 8 },
+      sweep: fillSweep,
+    });
+    expect(res.status).toBe(201);
+    const run = ((await res.json()) as { run: { id: string; config: { fill_curve?: unknown } } }).run;
+    expect(run.config.fill_curve).toEqual({ ctx: 4096, steps: 8 });
+    expect(repo.getTestItems(run.id).map((i) => i.n_gpu_layers)).toEqual([0, 20]);
+    const job = repo.queueRepo.claimNextJob(worker.id);
+    const payload = job?.payload as { mode?: string; fill_curve?: unknown };
+    expect(payload.mode).toBe("fill_curve");
+    expect(payload.fill_curve).toEqual({ ctx: 4096, steps: 8 });
+  });
+});

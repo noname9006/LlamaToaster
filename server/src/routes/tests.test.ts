@@ -650,42 +650,6 @@ describe("POST /api/runs/:id/items/:idx worker auth (§4.3 fix)", () => {
   });
 });
 
-// §0.12's observability convention: thermally_flagged_ratio fires "once per
-// completed run" (the plan's own words). It used to fire on every GET of
-// /api/runs/:id/sustained instead -- once per page view/poll, not once per
-// run -- so this covers the actual completion transition.
-describe("§0.12 thermally_flagged_ratio fires once, at run completion", () => {
-  it("logs exactly once from the item-terminal write that finalizes the run, never again on a later tick", async () => {
-    await heartbeat("thermal-log-machine", { backend: "cpu", installed: true });
-    const worker = repo.workerRepo.getByMachineId("thermal-log-machine")!;
-    const res = await postJson("/api/runs/trigger", { model_id: "model-1", worker_id: worker.id, sweep: baseSweep });
-    const { run } = (await res.json()) as { run: { id: string } };
-
-    const infoSpy = vi.spyOn(app.log, "info");
-    try {
-      const terminal = await fetch(`${baseUrl}/api/runs/${run.id}/items/0`, {
-        method: "POST",
-        headers: { "content-type": "application/json", authorization: "Bearer runs-test-secret" },
-        body: JSON.stringify({ status: "done" }),
-      });
-      expect(terminal.status).toBe(200);
-      const terminalBody = (await terminal.json()) as { run_status: string };
-      expect(terminalBody.run_status).toBe("done");
-
-      const ratioCalls = infoSpy.mock.calls.filter(([, msg]) => msg === "thermally_flagged_ratio");
-      expect(ratioCalls).toHaveLength(1);
-      expect(ratioCalls[0][0]).toMatchObject({
-        thermally_flagged_ratio: 0,
-        run_id: run.id,
-        flagged: 0,
-        denominator: 1,
-      });
-    } finally {
-      infoSpy.mockRestore();
-    }
-  });
-});
-
 function minimalResult(overrides: Record<string, unknown> = {}) {
   return {
     test_type: "tg",

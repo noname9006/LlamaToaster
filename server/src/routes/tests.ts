@@ -32,6 +32,7 @@ import {
 } from "../../../shared/types.js";
 import type { TestKind } from "../../../shared/types.js";
 import { expandSweep, validateDepthRule, validateConcurrencyRule } from "../../../shared/sweep.js";
+import { validateFillCurveSpec } from "../../../shared/fillCurve.js";
 import {
   MAX_SWEEP_ITEMS,
   WARN_SWEEP_ITEMS,
@@ -686,6 +687,9 @@ export async function testsRoutes(app: FastifyInstance): Promise<void> {
           error: "a runtime run measures either a curve point or a concurrency ladder, not both",
         });
       }
+      if (body.fill_curve && body.kind !== "sweep") {
+        return reply.code(400).send({ error: "the fill_curve block requires kind \"sweep\"" });
+      }
 
       const sweepError = validateSweep(body.sweep);
       if (sweepError) {
@@ -884,6 +888,11 @@ export async function testsRoutes(app: FastifyInstance): Promise<void> {
           "that machine runs an older worker build — update it to measure a concurrency knee on this model."
         );
       }
+      if (body.fill_curve && !capabilities.has("fill-curve-v1")) {
+        throw new ConflictError(
+          "that machine runs an older worker build — update it to measure prefill along the context fill on this model."
+        );
+      }
 
       // N2 payload bounds mirror the sweep-axis table -- out-of-bounds yields
       // 400, never a silent clamp.
@@ -965,6 +974,18 @@ export async function testsRoutes(app: FastifyInstance): Promise<void> {
         ) {
           return reply.code(400).send({
             error: `knee.repeats must be an integer between ${MIN_REPEATS} and ${MAX_REPEATS}`,
+          });
+        }
+      }
+      if (body.fill_curve) {
+        const trainedCtx = typeof model.metadata.trained_ctx === "number" ? model.metadata.trained_ctx : null;
+        const fillError = validateFillCurveSpec(body.fill_curve, trainedCtx);
+        if (fillError) return reply.code(400).send({ error: fillError });
+        // Every curve is one plain llama-server prefill: no speculation, no
+        // concurrent slots, no llama-bench KV prefill.
+        if (expanded.some((item) => item.mtp !== "off" || item.concurrency !== 1 || item.n_depth !== 0)) {
+          return reply.code(400).send({
+            error: "a fill curve runs with mtp off, concurrency 1 and n_depth 0 -- the fill itself is the depth axis",
           });
         }
       }
@@ -1145,6 +1166,7 @@ export async function testsRoutes(app: FastifyInstance): Promise<void> {
       if (body.quality) runConfig.quality = body.quality;
       if (body.curve_point) runConfig.curve_point = body.curve_point;
       if (body.knee) runConfig.knee = body.knee;
+      if (body.fill_curve) runConfig.fill_curve = body.fill_curve;
       const run: Test = {
         id: runId,
         // §0.5 -- denormalized at creation; points at the run itself for
@@ -1243,7 +1265,9 @@ export async function testsRoutes(app: FastifyInstance): Promise<void> {
             ? { mode: "context_curve" as const, curve_point: body.curve_point }
             : body.knee
               ? { mode: "knee" as const, knee_spec: body.knee }
-              : {}),
+              : body.fill_curve
+                ? { mode: "fill_curve" as const, fill_curve: body.fill_curve }
+                : {}),
         };
         repo.queueRepo.enqueueJob(worker.id, { type: "benchmark", payload: benchmarkPayload, runId: run.id });
       }
@@ -1330,15 +1354,6 @@ export async function testsRoutes(app: FastifyInstance): Promise<void> {
         if (!updatedRun) return reply.code(404).send({ error: "run not found" });
         const nowTerminal = updatedRun.status !== "running" && updatedRun.status !== "scheduled";
         if (!wasTerminal && nowTerminal) {
-          // §0.12's minimum event set -- fired exactly once, from the write
-          // that actually finalizes the run (not from GET /sustained, which
-          // the UI polls repeatedly and would otherwise re-log this every
-          // page view).
-          const { ratio, flagged, denominator } = repo.thermallyFlaggedRatio(id);
-          request.log.info(
-            { thermally_flagged_ratio: ratio, run_id: id, flagged, denominator },
-            "thermally_flagged_ratio"
-          );
           // N3 -- re-checked PER MEMBER at the moment its own results land,
           // not only when someone happens to open the comparison view: a
           // build swapped mid-group is exactly the silent confound this

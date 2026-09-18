@@ -90,6 +90,26 @@ function seedLegacyDatabase(dbPath: string): void {
   db.close();
 }
 
+describe("caveat_flags column removal", () => {
+  it("drops caveat_flags from an install that still has it, without touching other data", async () => {
+    const dbPath = makeTmpDbPath();
+    seedLegacyDatabase(dbPath);
+    // Simulate an install that ran a version with the column, before it was
+    // migrated forward -- open it directly and add + populate the column the
+    // way the old ADD-COLUMN migration used to.
+    const seeded = new Database(dbPath);
+    seeded.exec(`ALTER TABLE results ADD COLUMN caveat_flags TEXT`);
+    seeded.prepare(`UPDATE results SET caveat_flags = ? WHERE id = 'legacy-result'`).run('["thermally_throttled"]');
+    seeded.close();
+
+    const { getDb } = await freshMigrateModule(dbPath);
+    const db = getDb();
+    expect(columnsOf(db, "results")).not.toContain("caveat_flags");
+    const row = db.prepare(`SELECT avg_tps FROM results WHERE id = 'legacy-result'`).get() as { avg_tps: number };
+    expect(row.avg_tps).toBe(41);
+  });
+});
+
 describe("v8 schema evolution (§0.11)", () => {
   it("upgrades a pre-v8 database with every new column, and keeps its historical rows", async () => {
     const dbPath = makeTmpDbPath();
@@ -98,7 +118,7 @@ describe("v8 schema evolution (§0.11)", () => {
     const db = getDb();
 
     // §0.5 run identity, §0.1 methodology stamp, §0.2 depth, §0.8 twin join,
-    // §0.10 caveat flags, N5 concurrency, M6 thermal, N6 ISA, N7 import.
+    // N5 concurrency, M6 thermal, N6 ISA, N7 import.
     expect(columnsOf(db, "runs")).toEqual(expect.arrayContaining(["root_run_id", "kind", "comparison_id"]));
     expect(columnsOf(db, "results")).toEqual(
       expect.arrayContaining([
@@ -111,7 +131,6 @@ describe("v8 schema evolution (§0.11)", () => {
         "spec_n_min",
         "speedup",
         "speedup_status",
-        "caveat_flags",
         "concurrency",
         "gpu_temp_c_max",
         "gpu_clock_mhz_min",
@@ -139,7 +158,6 @@ describe("v8 schema evolution (§0.11)", () => {
     expect(legacy.avg_tps).toBe(41);
     expect(legacy.method_version).toBeNull();
     expect(legacy.config_hash).toBeNull();
-    expect(legacy.caveat_flags).toBeNull();
     expect(legacy.imported_bundle_id).toBeNull();
     // The two columns with an explicit DEFAULT fill in rather than reading NULL.
     expect(legacy.n_depth).toBe(0);
@@ -478,5 +496,33 @@ describe("v8 schema evolution (§0.11)", () => {
           Date.now()
         )
     ).not.toThrow();
+  });
+});
+
+describe("results item unique key", () => {
+  const insert = (db: Database.Database, id: string, depth: number) =>
+    db
+      .prepare(
+        `INSERT INTO results (id, run_id, idx, model_id, test_type, n_prompt, n_gen, n_depth, n_threads, n_gpu_layers,
+                              batch_size, ubatch_size, cache_type_k, cache_type_v, flash_attn, mtp, avg_tps,
+                              stddev_tps, ram_peak_mib, created_at)
+         VALUES (?, 'legacy-run', 1, 'legacy-model', 'pp', 1024, 0, ?, 4, 0, 512, 512, 'f16', 'f16', 'on', 'off',
+                 900, 0, 2000, 2)`
+      )
+      .run(id, depth);
+
+  it("widens an index created on (run_id, idx, test_type) so one item can hold a pp row per depth", async () => {
+    const dbPath = makeTmpDbPath();
+    seedLegacyDatabase(dbPath);
+    const seeded = new Database(dbPath);
+    seeded.exec(`CREATE UNIQUE INDEX idx_results_item ON results(run_id, idx, test_type)`);
+    seeded.close();
+
+    const { getDb } = await freshMigrateModule(dbPath);
+    const db = getDb();
+    insert(db, "slice-0", 0);
+    insert(db, "slice-1", 1024);
+    // A retried report repeats the whole key and is still refused.
+    expect(() => insert(db, "slice-1-again", 1024)).toThrow(/UNIQUE/);
   });
 });

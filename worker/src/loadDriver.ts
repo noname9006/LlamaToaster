@@ -7,11 +7,10 @@
 // must not grow into it ad hoc."
 //
 // The I/O-free parts (argument building, slot sizing, percentile summaries,
-// the eviction detector, the choreography sequencer) are exported separately
-// from the spawn/HTTP parts so they can be tested without a llama-server.
+// the choreography sequencer) are exported separately from the spawn/HTTP
+// parts so they can be tested without a llama-server.
 
 import type { SweepItem } from "../../shared/sweep.js";
-import type { CaveatFlag } from "../../shared/types.js";
 
 // Padding above the per-slot demand so llama-server's own context accounting
 // (special tokens, internal bookkeeping) never rejects a request sitting
@@ -65,6 +64,8 @@ export interface ServerArgsInput {
    * build lacks it. */
   supportsMlock?: boolean;
   contextSizeOverride?: number;
+  /** Already probed by the caller -- see spawnRuntimeServer. */
+  noMmap?: boolean;
 }
 
 // The {engine:"server", spec:"off"} argument set. No --spec-type here at all:
@@ -127,14 +128,14 @@ export function buildServerArgs(input: ServerArgsInput): string[] {
   // fitter -- not verified against real source, made moot instead.
   if (input.supportsFit) args.push("--fit", "off");
   // Probed, never assumed (§0.7): an unsupported flag disables its behavior
-  // rather than failing the item, and the row carries a context_shift flag if
-  // the logs then show a shift happened anyway.
+  // rather than failing the item.
   if (input.supportsNoContextShift) args.push("--no-context-shift");
   if (input.supportsMlock) args.push("--mlock");
-  // Deliberately no --no-mmap here, unlike the speed-benchmark paths
-  // (bench.ts's buildArgs, serverBench.ts's buildArgs): context tests measure
-  // spill/growth behavior a real deployment would see, and a real deployment
-  // runs with mmap at its default ON.
+  // No --no-mmap by default, unlike the speed-benchmark paths (bench.ts's
+  // buildArgs, serverBench.ts's buildArgs): context tests measure spill/growth
+  // behavior a real deployment would see, and a real deployment runs with mmap
+  // at its default ON. The fill curve IS a speed run, so it opts in.
+  if (input.noMmap) args.push("--no-mmap");
   return args;
 }
 
@@ -198,40 +199,9 @@ export function summarizeStreams(samples: StreamSample[]): StreamSummary {
   };
 }
 
-// --- N1: the eviction detector ----------------------------------------------
+// --- N1: request classes -----------------------------------------------------
 
 export type RequestClass = "cold_timed" | "warm_repeat";
-
-// "Any WARM REPEAT (class 3) whose response reports timings.prompt_n > 0
-// re-prefilled -- the cache did not hold." The cold request of class 2
-// legitimately reports the full prompt and is NEVER evaluated by this
-// detector; scoping it to warm repeats is the whole correctness of the rule.
-export function detectCacheEviction(
-  samples: { requestClass: RequestClass; promptN: number }[]
-): { evicted: boolean; offendingRepeats: number } {
-  const offenders = samples.filter((s) => s.requestClass === "warm_repeat" && s.promptN > 0);
-  return { evicted: offenders.length > 0, offendingRepeats: offenders.length };
-}
-
-// llama.cpp logs a context shift when it slides the KV window. If the binary
-// has no --no-context-shift to suppress it, the row is flagged: shifted
-// contexts silently corrupt TTFT comparability.
-const CONTEXT_SHIFT_LOG_RE = /context shift|shifting kv cache|slot context shift/i;
-
-export function sawContextShift(serverLog: string): boolean {
-  return CONTEXT_SHIFT_LOG_RE.test(serverLog);
-}
-
-export function curveCaveatFlags(input: {
-  samples: { requestClass: RequestClass; promptN: number }[];
-  serverLog: string;
-  supportsNoContextShift: boolean;
-}): CaveatFlag[] {
-  const flags: CaveatFlag[] = [];
-  if (detectCacheEviction(input.samples).evicted) flags.push("cache_evicted");
-  if (!input.supportsNoContextShift && sawContextShift(input.serverLog)) flags.push("context_shift");
-  return flags;
-}
 
 // --- N1: the choreography ---------------------------------------------------
 

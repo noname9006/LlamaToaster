@@ -49,6 +49,8 @@ import {
   type GoalsConfig,
 } from "../goals";
 import { expandSweep } from "../../../shared/sweep";
+import { DEFAULT_FILL_CURVE_STEPS, fillTarget } from "../../../shared/fillCurve";
+import { FillCurveChart } from "../components/FillCurveChart";
 import type { ProbeMode } from "../../../shared/probeLadder";
 import { priceMatrix, ETA_UNAVAILABLE } from "../../../shared/pricing";
 import type { ModelRatesResponse } from "../types";
@@ -200,6 +202,8 @@ interface PlacementVerifyState {
    * PlacementVerifyResult.curve for why a curve cannot be summarised by the
    * stored ceiling. Absent for every other mode. */
   curve?: { ctx: number; ngl: number }[];
+  /** The frontier mode's fits-VRAM points -- see PlacementVerifyResult.fitCurve. */
+  fitCurve?: { ctx: number; ngl: number }[];
 }
 
 // M5 -- a preset here carries INTENT (goals + repeats) and nothing machine-
@@ -242,6 +246,10 @@ interface StageInputs {
   /** Winning (batch, ubatch) from the previous stage; null until it lands. */
   tuned: { batch: number; ubatch: number } | null;
   noGpu: boolean;
+  /** The context the sweep stage fills; null until one is chosen. */
+  fillCtx: number | null;
+  /** The -ngl values the sweep stage runs a curve at (see sweepPlacements). */
+  placements: number[];
 }
 
 // Every stage is a full SweepConfig, because that is what the server
@@ -333,45 +341,67 @@ function refineSweep(input: StageInputs): Sweep {
   };
 }
 
-// Test C. The scored stage: KV x FA x ngl x depth at the tuned batch/ubatch,
-// with n_prompt AND n_gen both non-zero so llama-bench emits a pp row and a
-// tg row per configuration -- §0.3 rejects a tuple that has only one of the
-// two under `missing_pp_or_tg`.
+// Test C. Prefill speed along the fill of ONE context (shared/fillCurve.ts):
+// the worker starts llama-server with -c = fillCtx and grows one prompt to
+// fillCtx less 0.5 %, recording each slice's own rate. One curve per
+// placement x KV pair of the chosen preset, at the tuned batch/ubatch with
+// flash attention on (which every quantized pair requires anyway). n_prompt
+// is the fill the worker will reach -- what pricing and the item list show;
+// the worker itself takes the context from the trigger's fill_curve block.
 function sweepStageSweep(input: StageInputs): Sweep {
   const base = baseSweep(input);
-  // The preset IS the exact set of (K,V) pairs this stage runs -- no
-  // tolerance-pruning step needed, since these curated lists never contain a
-  // pair the grid has to filter back out. cache_type_pairs carries the
-  // coupling through expandSweep (shared/sweep.ts); cache_type_k/v stay
-  // populated with the pairs' own unique values for any caller that only
-  // reads the plain axis arrays (e.g. display labels).
+  if (input.fillCtx == null || input.placements.length === 0) {
+    return { ...base, n_prompt: [], n_gen: [0] };
+  }
+  // The preset IS the exact set of (K,V) pairs this stage runs.
+  // cache_type_pairs carries the coupling through expandSweep
+  // (shared/sweep.ts); cache_type_k/v stay populated with the pairs' own
+  // unique values for any caller that only reads the plain axis arrays.
   const pairs = kvPresetPairs(input.goals.kv_preset);
-  const cache_type_k = [...new Set(pairs.map(([k]) => k))];
-  const cache_type_v = [...new Set(pairs.map(([, v]) => v))];
-
-  // Two offload points, not one: -ngl is an axis in this stage per the
-  // mockup, and the second point is what a Low Memory card is scored from.
-  // A GPU-less worker keeps the single 0 the backend forces anyway.
-  const nglAxis = input.noGpu
-    ? [0]
-    : [...new Set([input.ngl, Math.floor((input.ngl * 2) / 3)])].filter((v) => v > 0).sort((a, b) => b - a);
-
-  // §0.2/M7 -- depth is anchored to Q2's stated target, never to a house
-  // number. Without a target there is nothing to take a percentage OF, so
-  // the axis stays at 0 rather than inventing a depth.
-  const target = input.goals.target_ctx;
-  const depthAxis = target != null && target > 0 ? [0, Math.round(target * 0.5)] : [0];
-
   return {
     ...base,
+    n_prompt: [fillTarget(input.fillCtx)],
+    n_gen: [0],
+    n_depth: [0],
     batch_size: [input.tuned?.batch ?? 2048],
     ubatch_size: [input.tuned?.ubatch ?? 512],
-    cache_type_k,
-    cache_type_v,
+    cache_type_k: [...new Set(pairs.map(([k]) => k))],
+    cache_type_v: [...new Set(pairs.map(([, v]) => v))],
     cache_type_pairs: [...pairs],
-    flash_attn: ["on", "off"],
-    n_gpu_layers: nglAxis.length > 0 ? nglAxis : [0],
-    n_depth: depthAxis,
+    flash_attn: ["on"],
+    n_gpu_layers: input.placements,
+  };
+}
+
+// Where Test C's -ngl values come from. The Wizard, when it has settled the
+// chosen context, gives up to two: its no-spill answer and its fits-VRAM
+// answer. Its curve is stepped, so the stop AT OR ABOVE the context is the one
+// whose layer count is known to hold there (more context never fits more
+// layers). Otherwise the offload slider's single value.
+function sweepPlacements(
+  wizard: PlacementVerifyState | undefined,
+  fillCtx: number | null,
+  sliderNgl: number
+): { ngl: number[]; source: "wizard" | "slider"; label: string } {
+  if (fillCtx != null && wizard) {
+    const at = (curve: { ctx: number; ngl: number }[] | undefined) =>
+      curve?.filter((p) => p.ctx >= fillCtx).sort((a, b) => a.ctx - b.ctx)[0]?.ngl;
+    const clean = wizard.status === "verified" ? at(wizard.curve) : undefined;
+    const fit = at(wizard.fitCurve);
+    const ngl = [...new Set([clean, fit].filter((v): v is number => v != null))].sort((a, b) => b - a);
+    if (ngl.length > 0) {
+      const parts = [
+        clean != null ? `${clean} layers (no spill)` : null,
+        fit != null && fit !== clean ? `${fit} layers (fits VRAM)` : null,
+      ].filter(Boolean);
+      const label = clean != null && clean === fit ? `${clean} layers (no spill and fits VRAM)` : parts.join(" and ");
+      return { ngl, source: "wizard", label: `${label} — the Wizard's answers at this context.` };
+    }
+  }
+  return {
+    ngl: [sliderNgl],
+    source: "slider",
+    label: `${sliderNgl} layers — the offload slider. Run the Wizard to test its no-spill and fits-VRAM answers instead.`,
   };
 }
 
@@ -402,6 +432,10 @@ function expandedKvPairs(sweep: Sweep): string[] {
   const pairs = new Set<string>();
   for (const item of expandSweep(sweep)) pairs.add(`${item.cache_type_k} / ${item.cache_type_v}`);
   return [...pairs];
+}
+
+function formatCtxShort(tokens: number): string {
+  return tokens >= 1024 && tokens % 1024 === 0 ? `${tokens / 1024}k` : tokens.toLocaleString();
 }
 
 // Compact facts-strip status word: offline reads as an error, busy as
@@ -786,13 +820,28 @@ export function Benchmark() {
     [chain, stageData, ppTokens]
   );
 
+  // Test C's context and placements: the context target from step 2, and the
+  // Wizard's answers at that context when it has them, the offload slider's
+  // value otherwise. Locked machines have only their one fixed point.
+  const fillCtx = goals.target_ctx != null && goals.target_ctx > 0 ? goals.target_ctx : null;
+  const sweepPlacement = useMemo(
+    () =>
+      noGpu || unifiedPool
+        ? {
+            ngl: [effectiveNgl],
+            source: "slider" as const,
+            label: `${effectiveNgl} layers — fixed on this machine (${noGpu ? "no GPU" : "unified memory"}).`,
+          }
+        : sweepPlacements(verifyStates.frontier, fillCtx, effectiveNgl),
+    [noGpu, unifiedPool, verifyStates.frontier, fillCtx, effectiveNgl]
+  );
+
   const stageInputs = useCallback(
     (stage: StageKind): StageInputs => ({
       ppTokens,
-      // Only the scored stage measures generation: the tuning stages exist
-      // to find batch/ubatch, which is a prompt-processing question, and
-      // paying for a tg phase in each of them buys nothing.
-      nGen: stage === "sweep" ? 128 : 0,
+      // No stage measures generation: the tuning stages find batch/ubatch and
+      // the sweep stage measures prefill along the context fill.
+      nGen: 0,
       threads,
       ngl: effectiveNgl,
       cpuMoe: 0,
@@ -800,8 +849,10 @@ export function Benchmark() {
       goals,
       tuned: stage === "sweep" ? tunedFrom("refine") ?? tunedFrom("tuning") : stage === "refine" ? tunedFrom("tuning") : null,
       noGpu,
+      fillCtx,
+      placements: sweepPlacement.ngl,
     }),
-    [ppTokens, threads, effectiveNgl, repeats, goals, tunedFrom, noGpu]
+    [ppTokens, threads, effectiveNgl, repeats, goals, tunedFrom, noGpu, fillCtx, sweepPlacement]
   );
 
   const stagePlans = useMemo(
@@ -883,6 +934,9 @@ export function Benchmark() {
         parent_run_id: parentRunId,
         main_gpu: selectedGpu ? selectedGpuRawIndex : undefined,
         sweep: plan.sweep,
+        ...(stage === "sweep" && fillCtx != null
+          ? { fill_curve: { ctx: fillCtx, steps: DEFAULT_FILL_CURVE_STEPS } }
+          : {}),
         // M2's "skippable by construction" -- an untouched questionnaire
         // sends no goals key at all, so the payload stays byte-identical to
         // what a chain with no stated intent would have sent.
@@ -1328,8 +1382,8 @@ export function Benchmark() {
       <div>
         <h1 className="text-2xl font-semibold text-fg">Benchmark</h1>
         <p className="mt-2 max-w-3xl text-sm text-muted">
-          State the goal; the console derives the chain — two tuning passes, then the sweep that produces scored
-          cards, each a real run linked to the last. Building a grid by hand instead lives on{" "}
+          State the goal; the console derives the chain — two tuning passes, then the sweep that measures prefill
+          speed along your context's fill, each a real run linked to the last. Building a grid by hand instead lives on{" "}
           <Link to="/custom-test" className="text-accent hover:underline">
             Custom Test
           </Link>
@@ -1444,11 +1498,10 @@ export function Benchmark() {
                               "neither available on this platform"
                             : "not reported by this worker"
                         }
-                        // M6/N6 -- declared UP FRONT so a missing
-                        // thermally_throttled flag later reads as "this
-                        // machine can't produce one", never as "nothing
-                        // throttled".
-                        hint="Whether this machine can report clock and temperature at all — a run that can't sample them never raises a thermal flag."
+                        // M6 -- declared UP FRONT so a missing sensor reading
+                        // reads as "this machine can't report clock/temp",
+                        // never as silence.
+                        hint="Whether this machine can report clock and temperature at all."
                       />
                     </dl>
                   </div>
@@ -1605,9 +1658,14 @@ export function Benchmark() {
           </Step>
 
           {/* Step 3 -- the chain ----------------------------------------------- */}
-          <Step n={3} title="Review the chain & run" desc="Two tuning passes feed the sweep — only the sweep scores cards." last>
+          <Step
+            n={3}
+            title="Review the chain & run"
+            desc="Two tuning passes pick batch/ubatch; the sweep then measures prefill along your context's fill."
+            last
+          >
             <div className="flex flex-wrap items-baseline justify-between gap-3">
-              <span className="text-sm font-medium text-fg">Chain — 3 stages, all llama-bench</span>
+              <span className="text-sm font-medium text-fg">Chain — 3 stages · tuning on llama-bench, sweep on llama-server</span>
               <span className="font-mono text-[11.5px] text-muted">
                 {totalItems} test{totalItems === 1 ? "" : "s"} · est. {totalPriced}
               </span>
@@ -1655,17 +1713,24 @@ export function Benchmark() {
                         {plan.itemCount > 0 ? (
                           <>
                             {plan.itemCount} test{plan.itemCount === 1 ? "" : "s"} ·{" "}
-                            {plan.stage === "sweep" ? "KV × FA × ngl × depth" : "PP only · batch/ubatch"}
+                            {plan.stage === "sweep"
+                              ? `PP along ${fillCtx != null ? formatCtxShort(fillCtx) : "ctx"} fill · ngl × KV`
+                              : "PP only · batch/ubatch"}
                           </>
                         ) : (
                           <>rules, not values yet</>
                         )}
                       </div>
                       {plan.itemCount > 0 && <div className="text-[10.5px] text-muted">est. {priceStage(plan.sweep)}</div>}
-                      {plan.itemCount === 0 && (
+                      {plan.itemCount === 0 && plan.stage === "refine" && (
                         <div className="text-[10.5px] leading-relaxed text-muted">
                           One octave either side of whatever {STAGE_TITLE.tuning} wins — there is nothing to centre on
                           until it has.
+                        </div>
+                      )}
+                      {plan.itemCount === 0 && plan.stage === "sweep" && (
+                        <div className="text-[10.5px] leading-relaxed text-muted">
+                          Set a context target in step 2 — the sweep fills exactly that context.
                         </div>
                       )}
 
@@ -1715,21 +1780,17 @@ export function Benchmark() {
               })}
 
               <div className="flex w-[180px] shrink-0 flex-col items-center justify-center gap-1 rounded-lg border border-dashed border-border p-3 text-center">
-                <b className="text-[12.5px] text-accent">Cards per goal</b>
+                <b className="text-[12.5px] text-accent">Prefill curve</b>
                 <div className="font-mono text-[10.5px] text-muted">
-                  {goals.goal === "max_context"
-                    ? "Max Context + Low Memory"
-                    : goals.goal === "max_speed"
-                      ? "Max Speed + Low Memory"
-                      : "Balanced + Low Memory"}
+                  {sweepPlacement.ngl.length} placement{sweepPlacement.ngl.length === 1 ? "" : "s"} × {kvPairs.length} KV
                 </div>
                 {cardsRunId ? (
                   <Link to={`/tests/${cardsRunId}`} className="mt-1 text-[11px] font-semibold text-accent hover:underline">
-                    Open scored cards →
+                    Open curves →
                   </Link>
                 ) : (
                   <div className="mt-1 text-[10.5px] leading-relaxed text-muted">
-                    Only the sweep stage scores — tuning stages feed it values, never cards.
+                    Prefill tok/s against how full the context is — one line per configuration.
                   </div>
                 )}
               </div>
@@ -1742,7 +1803,7 @@ export function Benchmark() {
                 aria-expanded={scoringDetailsOpen}
                 className="flex items-center gap-1 text-xs text-muted hover:text-fg"
               >
-                {scoringDetailsOpen ? "Hide scoring details ▴" : "Show scoring details ▾"}
+                {scoringDetailsOpen ? "Hide sweep details ▴" : "Show sweep details ▾"}
               </button>
               {scoringDetailsOpen && (
                 <div className="mt-2.5 rounded-lg border border-border bg-surface-raised p-3.5">
@@ -1763,6 +1824,10 @@ export function Benchmark() {
                     — the {sweepPlan.itemCount}-test count above already reflects it.
                   </p>
 
+                  <p className="mt-2.5 text-[11.5px] leading-relaxed text-muted">
+                    <b className="text-fg">Placements:</b> {sweepPlacement.label}
+                  </p>
+
                   {/* M7/M2 -- held fields keep their reasons ---------------- */}
                   <p className="mt-2.5 text-[11.5px] leading-relaxed text-muted">
                     <b className="text-fg">Held fields keep their reasons.</b> Threads are held at {threads} (one less
@@ -1770,19 +1835,18 @@ export function Benchmark() {
                     <span className="font-mono">-t</span> barely bites. On CPU-bound rows it is the dominant variable
                     and stays an axis on the Custom Test page, with the running build's own ISA provenance recorded
                     alongside those rows.{" "}
-                    {goals.target_ctx != null ? (
+                    {fillCtx != null ? (
                       <>
-                        Depth is anchored to your target:{" "}
-                        <span className="font-mono">
-                          {Math.round(goals.target_ctx * 0.5).toLocaleString()} = 50 % of your{" "}
-                          {goals.target_ctx.toLocaleString()}
-                        </span>
-                        .
+                        Each curve starts llama-server at{" "}
+                        <span className="font-mono">-c {fillCtx.toLocaleString()}</span> and grows one prompt to{" "}
+                        <span className="font-mono">{fillTarget(fillCtx).toLocaleString()}</span> tokens (0.5 % short,
+                        so it always fits) in {DEFAULT_FILL_CURVE_STEPS} slices, timing each slice on its own. Flash
+                        attention stays on.
                       </>
                     ) : (
                       <>
-                        Depth stays at 0 — without a target context in Q2 there is nothing for a percentage to be a
-                        percentage of, and a house number would not be your workload.
+                        The sweep needs a context target from step 2 — it measures prefill along exactly that context's
+                        fill.
                       </>
                     )}
                   </p>
@@ -1826,6 +1890,17 @@ export function Benchmark() {
               </span>
             </div>
 
+            {sweepPlan.results.length > 0 && (
+              <div className="rounded-lg border border-border bg-surface-raised p-3.5">
+                <span className="text-[11px] font-semibold uppercase tracking-wide text-muted">
+                  Prefill along the context fill
+                </span>
+                <div className="mt-2">
+                  <FillCurveChart results={sweepPlan.results} ctx={sweepPlan.run?.config.fill_curve?.ctx ?? fillCtx} />
+                </div>
+              </div>
+            )}
+
             {msg && <p className="text-xs text-muted">{msg}</p>}
           </Step>
         </div>
@@ -1854,7 +1929,7 @@ export function Benchmark() {
               wPP {WORKLOAD_WEIGHTS[goals.workload].wPP.toFixed(2)} · wTG {WORKLOAD_WEIGHTS[goals.workload].wTG.toFixed(2)}
             </div>
             <p className="mt-1.5 text-[10.5px] leading-relaxed text-muted">
-              Change the goal later — re-scoring is instant post-processing over stored results, never re-measurement.
+              The context target also sets how far the sweep fills.
             </p>
           </div>
 
@@ -1906,10 +1981,10 @@ export function Benchmark() {
           <div className="text-[11px] leading-relaxed text-muted">
             {cardsRunId ? (
               <Link to={`/tests/${cardsRunId}`} className="font-semibold text-accent hover:underline">
-                Open scored cards →
+                Open prefill curves →
               </Link>
             ) : (
-              <>Scored cards will appear here once the sweep stage runs.</>
+              <>The prefill curve appears in step 3 once the sweep stage runs.</>
             )}
           </div>
 

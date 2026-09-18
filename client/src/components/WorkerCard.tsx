@@ -421,9 +421,8 @@ export function WorkerCard({ worker, onRefresh }: { worker: Worker; onRefresh: (
         <div className="flex items-center gap-2">
           {worker.backend && <StatusPill label={worker.backend} tone="muted" />}
           {/* BENCHMARKING_PLAN_V8.md M6 -- sensor availability declared UP
-              FRONT, so a later thermally_throttled flag never surprises a
-              machine that could never have produced one, and its absence on a
-              sensorless box is stated rather than mysterious. */}
+              FRONT, so its absence on a sensorless box is stated rather than
+              mysterious. */}
           {worker.sensors ? (
             <StatusPill
               label={

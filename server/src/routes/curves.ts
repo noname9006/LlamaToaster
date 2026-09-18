@@ -10,7 +10,7 @@ import { resolveAuthUser } from "../auth-middleware.js";
 import { buildCurve, buildLadder, deriveKnee, type CurveSourceRow } from "../../../shared/curves.js";
 import { CURVE_METHOD_VERSION, type ResultRow, type TestConfig } from "../../../shared/types.js";
 import { maxAffordableContext, residentWeightsMibFromPeak } from "../../../shared/vramEstimate.js";
-import { priceMatrix, priceRate, type RateCandidate } from "../../../shared/pricing.js";
+import { priceRate, type RateCandidate } from "../../../shared/pricing.js";
 
 function toCurveRow(row: ResultRow): CurveSourceRow {
   return {
@@ -30,7 +30,6 @@ function toCurveRow(row: ResultRow): CurveSourceRow {
     ttft_n: row.ttft_n ?? null,
     e2e_ms_mean: row.e2e_ms_mean ?? null,
     method_version: row.method_version ?? null,
-    caveat_flags: row.caveat_flags ?? [],
     concurrency: row.concurrency ?? null,
     engine: row.engine ?? null,
     created_at: row.created_at,
@@ -107,7 +106,7 @@ export async function curveRoutes(app: FastifyInstance): Promise<void> {
     }
 
     const ladder = buildLadder(
-      points.filter((p) => !p.superseded && !p.excluded).map((p) => p.effectiveCtx),
+      points.filter((p) => !p.superseded).map((p) => p.effectiveCtx),
       { trainedCtx: model.metadata.trained_ctx ?? null, affordableTokens }
     );
 
@@ -169,80 +168,6 @@ export async function curveRoutes(app: FastifyInstance): Promise<void> {
       };
     }
   );
-
-  // N6 -- the throttle-aware follow-up. > 1/3 of a run's items flagged
-  // (denominator: ALL non-cancelled items, skipped included) offers a priced
-  // re-run of just those items after cooldown. NEVER automatic: this route
-  // reports, the user decides.
-  const getSustainedHandler = async (request: FastifyRequest<{ Params: { id: string } }>, reply: FastifyReply) => {
-    const authed = resolveAuthUser(request);
-    const userId = authed?.user.id;
-    const run = repo.getTest(userId, request.params.id);
-    if (!run) return reply.code(404).send({ error: "run not found" });
-
-    const items = repo.getTestItems(run.id);
-    const { ratio, denominator } = repo.thermallyFlaggedRatio(run.id);
-    const flaggedIdx = new Set(
-      repo
-        .getResultsForTest(run.id)
-        .filter((r) => (r.caveat_flags ?? []).includes("thermally_throttled"))
-        .map((r) => r.idx)
-    );
-
-    // §0.12's minimum event set fires once per completed run, from the item-
-    // terminal write that actually finalizes it (routes/runs.ts) -- not from
-    // this read-only GET, which the UI polls repeatedly and would otherwise
-    // multiply the same event by every page view.
-
-    const config = run.config as TestConfig;
-    const repeats = config?.sweep?.repeats ?? 1;
-    const rows = repo.listCurveRows(userId, run.model_id, { workerId: run.worker_id ?? undefined });
-    const candidates: RateCandidate[] = rows
-      .filter((r) => r.test_type === "pp" || r.test_type === "tg")
-      .map((r) => ({
-        tps: r.avg_tps,
-        engine: r.engine ?? (r.mtp === "on" ? "server" : "bench"),
-        spec: r.mtp === "on" ? "mtp" : "off",
-        test_type: r.test_type as "pp" | "tg",
-        model_id: run.model_id,
-        worker_id: r.worker_id ?? null,
-        llama_cpp_build: r.llama_cpp_build ?? null,
-        created_at: r.created_at,
-      }));
-    const rateQuery = { model_id: run.model_id, worker_id: run.worker_id ?? null };
-    const ppRate = priceRate(candidates, rateQuery, "pp");
-    const tgRate = priceRate(candidates, rateQuery, "tg");
-    const rerun = priceMatrix(
-      items
-        .filter((i) => flaggedIdx.has(i.idx))
-        .map((i) => ({ nPrompt: i.n_prompt, nGen: i.n_gen, repeats, ppRate, tgRate }))
-    );
-
-    // N6's steady-state option is only OFFERED where post-discard n still
-    // satisfies the n >= 3 gate; otherwise the control is disabled with that
-    // exact reason rather than silently missing.
-    const discardFirst = config?.discard_first_repeats ?? 0;
-    const discardAvailable = repeats >= 1 + 3;
-    return {
-      run_id: run.id,
-      flagged_items: [...flaggedIdx].sort((a, b) => a - b),
-      denominator,
-      ratio,
-      // Offered, never scheduled.
-      offer_rerun: ratio > 1 / 3 && flaggedIdx.size > 0,
-      rerun_estimate: rerun.display,
-      rerun_seconds: rerun.seconds,
-      steady_state: {
-        discard_first_repeats: discardFirst,
-        available: discardAvailable,
-        reason: discardAvailable
-          ? null
-          : `discarding from ${repeats} repeats would leave n = ${repeats - 1} and break the stability gate's n >= 3 floor`,
-      },
-    };
-  };
-  app.get("/api/tests/:id/sustained", getSustainedHandler);
-  app.get("/api/runs/:id/sustained", getSustainedHandler);
 
   // N5 -- the knee is a DERIVED read, not a stored verdict.
   const getKneeHandler = async (request: FastifyRequest<{ Params: { id: string } }>, reply: FastifyReply) => {
