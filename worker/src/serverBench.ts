@@ -287,6 +287,18 @@ async function buildArgs(input: ServerBenchRunInput): Promise<string[]> {
   if (await supportsFlag(input.llamaServerPath, "--fit").catch(() => false)) {
     args.push("--fit", "off");
   }
+  // Same §0.7 probe pattern -- keeps the model (and draft model, if any)
+  // locked in RAM for the run's duration instead of left swappable.
+  if (await supportsFlag(input.llamaServerPath, "--mlock").catch(() => false)) {
+    args.push("--mlock");
+  }
+  // Same rationale as bench.ts's --mmap probe: this is a speed benchmark
+  // (MTP tok/s), so mmap is forced off (paired with --mlock above) to keep a
+  // run's timing from depending on the OS page cache an earlier load left
+  // behind. loadDriver.ts's context-test path leaves mmap at its default ON.
+  if (await supportsFlag(input.llamaServerPath, "--no-mmap").catch(() => false)) {
+    args.push("--no-mmap");
+  }
   if (input.mtpModelPath) {
     args.push("--model-draft", input.mtpModelPath);
     // Confirmed live against the installed build's own --help: llama-server

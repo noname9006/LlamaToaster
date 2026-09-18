@@ -155,10 +155,10 @@ export async function fetchFillerBlocks(port: number): Promise<FillerBlocks> {
  *
  * `offset` and `nonce` both rotate each block WITHIN its own share, so the mix
  * is preserved while the sequence still differs. `nonce` gives N5's concurrent
- * streams (and N1's warm/discard request) prompts the prefix cache cannot
- * dedupe; `offset` is the retry knob -- a request that tripped the parser bug is
- * retried with a different offset rather than replayed byte-for-byte, which
- * under greedy decoding would fail identically.
+ * streams prompts the prefix cache cannot dedupe; `offset` is the retry knob --
+ * a request that tripped the parser bug is retried with a different offset
+ * rather than replayed byte-for-byte, which under greedy decoding would fail
+ * identically.
  */
 export function buildPromptTokens(
   tokenCount: number,

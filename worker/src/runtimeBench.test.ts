@@ -55,7 +55,7 @@ const BLOCKS = [
 ];
 
 describe("N1 curve-point execution", () => {
-  it("runs the three request classes in order and never averages them together", async () => {
+  it("runs the two request classes in order and never averages them together -- no warm-up request", async () => {
     const server = fakeServer();
     const execution = await executeCurvePoint({
       effectiveCtx: 8_192,
@@ -67,17 +67,14 @@ describe("N1 curve-point execution", () => {
       fillerBlocks: BLOCKS,
       completion: server.completion,
     });
-    expect(server.requests).toHaveLength(6); // 1 warm/discard + 1 cold + 4 warm
-    // The warm/discard request is short AND a different prompt, so it cannot
-    // seed the measured prefix into the cache.
-    expect(server.requests[0].promptLength).toBe(32);
-    expect(server.requests[0].promptTokens[0]).not.toBe(server.requests[1].promptTokens[0]);
-    // The cold prefill is the timed data point: full prompt, one token, no reuse.
-    expect(server.requests[1].promptLength).toBe(8_192);
-    expect(server.requests[1].nPredict).toBe(1);
-    expect(server.requests[1].cachePrompt).toBe(false);
+    expect(server.requests).toHaveLength(5); // 1 cold + 4 warm
+    // The cold prefill is the FIRST request against this server, and the
+    // timed data point: full prompt, one token, no reuse.
+    expect(server.requests[0].promptLength).toBe(8_192);
+    expect(server.requests[0].nPredict).toBe(1);
+    expect(server.requests[0].cachePrompt).toBe(false);
     // Warm repeats reuse the identical prompt.
-    expect(server.requests.slice(2).every((r) => r.cachePrompt && r.promptLength === 8_192)).toBe(true);
+    expect(server.requests.slice(1).every((r) => r.cachePrompt && r.promptLength === 8_192)).toBe(true);
 
     const pp = execution.results.find((r) => r.test_type === "pp")!;
     const tg = execution.results.find((r) => r.test_type === "tg")!;
