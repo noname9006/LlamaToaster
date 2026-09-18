@@ -3997,6 +3997,9 @@ async function executeMeasureQualityJob(payload: MeasureQualityJobPayload): Prom
       payload.kvPair[1],
     ];
     if (payload.main_gpu != null) args.push("-sm", "none", "-mg", String(payload.main_gpu));
+    // Same §0.7 probe pattern as the bench/server paths -- keeps the model
+    // locked in RAM for the run's duration instead of left swappable.
+    if (await supportsFlag(perplexityPath, "--mlock").catch(() => false)) args.push("--mlock");
     log.info(`${label}: llama-perplexity ${args.join(" ")}`);
     const output = await runPerplexity(perplexityPath, args);
     const ppl = parsePerplexity(output);

@@ -132,6 +132,21 @@ export function methodsFor(methodVersion: number): MethodsSection {
     return {
       method_version: CURVE_METHOD_VERSION,
       summary:
+        "Context-curve choreography: one cold timed prefill against a server that has not yet served a request, whose first streamed chunk is the TTFT reading, then warm repeats against the prefix cache for generation statistics. No throwaway warm-up request precedes it.",
+      pipeline: [
+        "cold timed prefill: full prompt, streamed, n_predict 1, ignore_eos, against a freshly started server -- first-chunk arrival is TTFT (single sample, labeled as such)",
+        "pp for the point comes from that same response's timings.prompt_ms / prompt_n",
+        "warm repeats: identical prompt with cache_prompt -- any repeat reporting prompt_n > 0 re-prefilled and flags cache_evicted",
+        "implausibility filter rejects physically impossible rates; wall-clock fallback readings are marked suspect",
+        "stability gate: stddev <= max(10 % of mean, 0.5 tok/s), n >= 3",
+        "filler prompt: a tokenized mixed-register passage (prose, code, equations, structured data, non-Latin scripts), every register holding an equal share of the prompt at every size and interleaved below the ubatch so each batch sees all of them",
+      ],
+    };
+  }
+  if (methodVersion === 4) {
+    return {
+      method_version: 4,
+      summary:
         "Context-curve choreography: a discarded warm-up on a nonce prompt, one cold timed prefill whose first streamed chunk is the TTFT reading, then warm repeats against the prefix cache for generation statistics.",
       pipeline: [
         "warm-up: a short nonce prompt, n_predict 8, excluded from statistics by construction",

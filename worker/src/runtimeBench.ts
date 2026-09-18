@@ -106,6 +106,9 @@ export async function spawnRuntimeServer(input: SpawnRuntimeServerInput): Promis
   // Same §0.7 probe pattern for --fit -- see buildServerArgs's own comment
   // for why this is forced off rather than left at llama-server's default.
   const supportsFit = await supportsFlag(input.llamaServerPath, "--fit").catch(() => false);
+  // Same §0.7 probe pattern for --mlock -- keeps the model locked in RAM for
+  // the run's duration instead of left swappable.
+  const supportsMlock = await supportsFlag(input.llamaServerPath, "--mlock").catch(() => false);
   const args = buildServerArgs({
     modelPath: input.modelPath,
     port: input.port,
@@ -114,6 +117,7 @@ export async function spawnRuntimeServer(input: SpawnRuntimeServerInput): Promis
     mainGpu: input.mainGpu,
     supportsNoContextShift,
     supportsFit,
+    supportsMlock,
     contextSizeOverride: input.contextSizeOverride,
   });
   input.log?.info(`llama-server ${args.join(" ")}`);

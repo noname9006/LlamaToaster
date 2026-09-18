@@ -81,6 +81,13 @@ describe("server arguments for the spec-off engine pair", () => {
     });
     expect(with_[with_.indexOf("--fit") + 1]).toBe("off");
   });
+
+  it("only passes --mlock when the binary probe says it exists (§0.7)", () => {
+    const without = buildServerArgs({ modelPath: "m.gguf", port: 8080, item, slots: 1 });
+    expect(without).not.toContain("--mlock");
+    const with_ = buildServerArgs({ modelPath: "m.gguf", port: 8080, item, slots: 1, supportsMlock: true });
+    expect(with_).toContain("--mlock");
+  });
 });
 
 describe("stream summaries (raw samples, never a server aggregate)", () => {
@@ -127,12 +134,11 @@ describe("stream summaries (raw samples, never a server aggregate)", () => {
 });
 
 describe("N1 choreography", () => {
-  it("issues warm/discard, then ONE cold timed prefill, then repeats-1 warm repeats", () => {
+  it("issues ONE cold timed prefill, then repeats-1 warm repeats -- no warm-up request", () => {
     const plan = planCurvePoint({ promptTokens: 8192, nGen: 512, repeats: 5 });
     // repeats = 5 means five MEASURED requests: the cold prefill is one of
     // them, so four warm repeats follow it.
     expect(plan.map((s) => s.requestClass)).toEqual([
-      "warm_discard",
       "cold_timed",
       "warm_repeat",
       "warm_repeat",
@@ -142,16 +148,8 @@ describe("N1 choreography", () => {
     expect(plan.filter((s) => s.countsTowardStatistics)).toHaveLength(5);
   });
 
-  it("gives the warm/discard request a SHORT NONCE prompt distinct from the measured one", () => {
-    const [warm, cold] = planCurvePoint({ promptTokens: 8192, nGen: 512, repeats: 3 });
-    expect(warm.promptTokens).toBeLessThan(cold.promptTokens);
-    expect(warm.nonce).not.toBe(cold.nonce);
-    expect(warm.cachePrompt).toBe(false);
-    expect(warm.countsTowardStatistics).toBe(false);
-  });
-
   it("makes the cold prefill timed DATA: one token, no cache reuse, and it counts", () => {
-    const cold = planCurvePoint({ promptTokens: 8192, nGen: 512, repeats: 3 })[1];
+    const cold = planCurvePoint({ promptTokens: 8192, nGen: 512, repeats: 3 })[0];
     expect(cold.nPredict).toBe(1);
     expect(cold.cachePrompt).toBe(false);
     expect(cold.countsTowardStatistics).toBe(true);
@@ -166,7 +164,7 @@ describe("N1 choreography", () => {
 
   it("still emits the cold point at repeats = 1", () => {
     const plan = planCurvePoint({ promptTokens: 4096, nGen: 128, repeats: 1 });
-    expect(plan.map((s) => s.requestClass)).toEqual(["warm_discard", "cold_timed"]);
+    expect(plan.map((s) => s.requestClass)).toEqual(["cold_timed"]);
   });
 });
 
@@ -190,14 +188,6 @@ describe("N1 eviction detector", () => {
     expect(detection.offendingRepeats).toBe(1);
   });
 
-  it("ignores the warm/discard request entirely", () => {
-    expect(
-      detectCacheEviction([
-        { requestClass: "warm_discard", promptN: 32 },
-        { requestClass: "warm_repeat", promptN: 0 },
-      ]).evicted
-    ).toBe(false);
-  });
 });
 
 describe("N1 context-shift flag", () => {

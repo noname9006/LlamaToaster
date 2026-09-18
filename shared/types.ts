@@ -150,7 +150,11 @@ export const METHOD_VERSION = 1;
 // statistics) are a real semantics change under §0.1, so they stamp this
 // instead -- which is also what keeps ordinary runtime rows' warm-biased TTFT
 // out of curves without a dedicated marker column.
-export const CURVE_METHOD_VERSION = 4;
+// v5 (2026-09-17): dropped the warm_discard throwaway request ahead of the
+// cold prefill (loadDriver.ts's planCurvePoint) -- the cold prefill now hits
+// a genuinely unwarmed server, so its TTFT/pp are colder than v4's and must
+// not be averaged with it.
+export const CURVE_METHOD_VERSION = 5;
 
 // Rows measured THROUGH llama-server (N5's concurrency ladder and the MTP
 // path). Split out from METHOD_VERSION when the synthetic filler prompt became

@@ -2,6 +2,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { readFileSync } from "node:fs";
 import type { IngestResultInput } from "../../shared/types.js";
 import { deriveTestType, type SweepItem } from "../../shared/sweep.js";
+import { supportsFlag } from "./binary-probe.js";
 
 export interface BenchLogger {
   debug: (...parts: unknown[]) => void;
@@ -177,6 +178,23 @@ export async function buildArgs(input: BenchRunInput): Promise<string[]> {
   // sibling offload-layer detail, see supportsVerboseFlag above.
   if (await supportsVerboseFlag(input.llamaBenchPath)) {
     args.push("-v");
+  }
+  // Keeps the model locked in RAM for the run's duration so the OS can't
+  // swap/compress it out from under a benchmark -- probed rather than
+  // assumed (§0.7), same as --fit/--no-context-shift elsewhere: an
+  // unsupported flag would fail argument parsing and break every run on
+  // that build.
+  if (await supportsFlag(input.llamaBenchPath, "--mlock").catch(() => false)) {
+    args.push("--mlock");
+  }
+  // Speed benchmarks force mmap off (paired with --mlock above): a
+  // page-cache-backed mapping lets a repeat's read latency depend on
+  // whatever an earlier load already faulted in, which is exactly the kind
+  // of run-to-run variance a tok/s reading can't afford. Context tests
+  // (loadDriver.ts's buildServerArgs) deliberately leave mmap at its default
+  // ON instead -- see that function's own comment.
+  if (await supportsFlag(input.llamaBenchPath, "--mmap").catch(() => false)) {
+    args.push("--mmap", "0");
   }
   return args;
 }

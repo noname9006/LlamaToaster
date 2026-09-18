@@ -59,6 +59,11 @@ export interface ServerArgsInput {
    * build that doesn't have --fit at all has no auto-adjustment behavior to
    * begin with, so there's nothing left to flag. */
   supportsFit?: boolean;
+  /** §0.7 probe result for --mlock -- keeps the model locked in RAM for the
+   * run's duration instead of left swappable. No row-level caveat needed:
+   * unlike --no-context-shift, there's no observable symptom to flag when a
+   * build lacks it. */
+  supportsMlock?: boolean;
   contextSizeOverride?: number;
 }
 
@@ -125,6 +130,11 @@ export function buildServerArgs(input: ServerArgsInput): string[] {
   // rather than failing the item, and the row carries a context_shift flag if
   // the logs then show a shift happened anyway.
   if (input.supportsNoContextShift) args.push("--no-context-shift");
+  if (input.supportsMlock) args.push("--mlock");
+  // Deliberately no --no-mmap here, unlike the speed-benchmark paths
+  // (bench.ts's buildArgs, serverBench.ts's buildArgs): context tests measure
+  // spill/growth behavior a real deployment would see, and a real deployment
+  // runs with mmap at its default ON.
   return args;
 }
 
@@ -190,7 +200,7 @@ export function summarizeStreams(samples: StreamSample[]): StreamSummary {
 
 // --- N1: the eviction detector ----------------------------------------------
 
-export type RequestClass = "warm_discard" | "cold_timed" | "warm_repeat";
+export type RequestClass = "cold_timed" | "warm_repeat";
 
 // "Any WARM REPEAT (class 3) whose response reports timings.prompt_n > 0
 // re-prefilled -- the cache did not hold." The cold request of class 2
@@ -232,32 +242,27 @@ export interface CurveRequestPlanStep {
   nPredict: number;
   /** Whether this request opts into prefix-cache reuse. */
   cachePrompt: boolean;
-  /** Distinct nonce -- the warm/discard prompt must not seed the measured prefix. */
+  /** Distinct per request class -- see planCurvePoint. */
   nonce: number;
   /** Excluded from statistics by construction. */
   countsTowardStatistics: boolean;
 }
 
-// Three request classes, never averaged together:
-//   1. warm/discard -- tiny n_predict on a SHORT NONCE PROMPT distinct from
-//      the measured one, absorbing CUDA-graph capture / pipeline compile
-//      without seeding the measured prefix into the cache.
-//   2. cold timed prefill, ONE per point -- full prompt, stream, n_predict 1,
-//      ignore_eos. First-chunk arrival IS the TTFT data point, and the same
-//      response's timings.prompt_ms / prompt_n is the point's pp value.
-//   3. warm repeats x (repeats - 1) -- identical prompt with cache_prompt,
+// Two request classes, never averaged together:
+//   1. cold timed prefill, ONE per point -- full prompt, stream, n_predict 1,
+//      ignore_eos, against a server that has not served a request yet.
+//      First-chunk arrival IS the TTFT data point, and the same response's
+//      timings.prompt_ms / prompt_n is the point's pp value. Deliberately no
+//      throwaway warmup request ahead of it (removed 2026-09-17, was
+//      "warm_discard"): a policy call to keep context tests consistent --
+//      N2's probe and N5's knee ladder never had a warmup step either, so
+//      every point measures its own server's genuinely first request rather
+//      than one whose CUDA-graph/pipeline-compile cost was pre-absorbed.
+//   2. warm repeats x (repeats - 1) -- identical prompt with cache_prompt,
 //      which is where generation/E2E statistics come from.
 export function planCurvePoint(input: { promptTokens: number; nGen: number; repeats: number }): CurveRequestPlanStep[] {
   const repeats = Math.max(1, input.repeats);
   const steps: CurveRequestPlanStep[] = [
-    {
-      requestClass: "warm_discard",
-      promptTokens: 32,
-      nPredict: 8,
-      cachePrompt: false,
-      nonce: 1,
-      countsTowardStatistics: false,
-    },
     {
       requestClass: "cold_timed",
       promptTokens: input.promptTokens,
