@@ -58,7 +58,6 @@ import { buildSpillAnchor, measureGrowthSpill, withAnchorControl, type SpillAnch
 import { readGpuMemory, readNvidiaDriverInfo, type NvidiaDriverInfo } from "./vram.js";
 import {
   estimateResidentGpuLayers,
-  isPrefillCliff,
   estimateResidentGpuLayersFromBufferSizes,
   estimateVramNeededMib,
   estimateSafeNgl,
@@ -3410,14 +3409,6 @@ async function executeRunProbeJob(payload: TestProbeJobPayload): Promise<void> {
           freeByDevice,
           ladderNglMax: nglMax,
           ladderMaxCtx: maxCtx,
-          // Best prefill rate from a rung that was NOT host-backed. Taking it
-          // from any rung would let a rung already over the cliff set the
-          // reference and hide every later one.
-          bestCleanPpTps: attempts.reduce<number | null>(
-            (best, a) =>
-              !a.vramDiscrepancy && a.ppTps != null && (best == null || a.ppTps > best) ? a.ppTps : best,
-            null
-          ),
         });
       let attempt = await loadThisRung();
       // A stop mid-load kills the child the same way an OOM would, so this
@@ -3617,10 +3608,6 @@ interface ProbeLoadInput {
   anchorRole?: "first" | "control" | null;
   /** The anchor as it stands before this load. */
   spillAnchor?: SpillAnchor | null;
-  /** Best prompt-processing rate this run has measured at a rung the
-   * host-backed check left alone -- the reference the prefill cliff is judged
-   * against. Null until one exists. */
-  bestCleanPpTps?: number | null;
   /** The probe's --list-devices free reading, carried onto every rung. */
   listDevicesFreeMib: number | null;
   /** The same reading per device name, for the per-device claim verdict. */
@@ -3767,15 +3754,8 @@ async function runOneProbeLoad(input: ProbeLoadInput): Promise<ProbeAttemptOutco
       sample.e2eMs > sample.ttftMs && sample.tokensPredicted > 0
         ? (sample.tokensPredicted / (sample.e2eMs - sample.ttftMs)) * 1000
         : null;
-    // llama-server's own prefill timing, not a derived one -- and TTFT as the
-    // streaming client actually observed it. Both exist because prefill has a
-    // separate, earlier placement cliff than generation does; a rung can be
-    // the fastest on tok/s while being 4x worse to first token.
-    const ppTps =
-      sample.promptMs != null && sample.promptMs > 0 && sample.promptN > 0
-        ? (sample.promptN / sample.promptMs) * 1000
-        : null;
-    const ttftMs = Number.isFinite(sample.ttftMs) ? sample.ttftMs : null;
+    // No prefill rate or TTFT: a PROBE_PROMPT_TOKENS prompt is timed almost
+    // entirely on first-request setup, so neither would describe the placement.
     const workToMs = Date.now();
     // Two readings taken now, whatever the tick cadence managed during a short
     // load: the fallback spill (no trace readings) needs at least one after
@@ -3863,9 +3843,8 @@ async function runOneProbeLoad(input: ProbeLoadInput): Promise<ProbeAttemptOutco
       vramSharedTotalPeakMib: stats.vram_total_shared_peak_mib,
       vramClaimedPeakMib: stats.vram_process_claimed_peak_mib,
       genTps,
-      ppTps,
-      ttftMs,
-      prefillCliff: isPrefillCliff(ppTps, input.bestCleanPpTps ?? null),
+      ppTps: null,
+      ttftMs: null,
       headroomFrac,
       ...memoryFields,
       error: verdict.reason ?? undefined,

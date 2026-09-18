@@ -14,7 +14,7 @@ import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { api } from "../api/client";
 import type { ProbeAttemptDto } from "../types";
-import { PROBE_EXERCISED_TOKENS, PROBE_GEN_TOKENS, PROBE_PROMPT_TOKENS } from "../../../shared/probeLadder";
+import { PROBE_GEN_TOKENS, PROBE_PROMPT_TOKENS } from "../../../shared/probeLadder";
 
 function mib(value: number | null): string {
   return value == null ? "—" : `${Math.round(value).toLocaleString()} MiB`;
@@ -311,9 +311,6 @@ export function ProbeAttempts({ testId, refreshKey }: ProbeAttemptsProps) {
   const cacheFailed = attempts
     .filter(failedForHostBackedCache)
     .reduce<ProbeAttemptDto | null>((best, a) => (best == null || a.candidate_ctx < best.candidate_ctx ? a : best), null);
-  const cliff = attempts
-    .filter((a) => a.prefill_cliff === 1 && a.ngl != null)
-    .reduce<ProbeAttemptDto | null>((best, a) => (best == null || a.ngl! < best.ngl! ? a : best), null);
 
   return (
     <div className="rounded-xl border border-border bg-surface p-4">
@@ -332,13 +329,6 @@ export function ProbeAttempts({ testId, refreshKey }: ProbeAttemptsProps) {
           {worstSpill.gpu_in_system_ram_mib != null ? "of llama.cpp's GPU memory in system RAM" : "in host memory"} on
           this probe. Layer counts above that boundary are not real GPU offload on this machine, so a maximum-offload
           result will not reflect its true GPU speed.
-          {cliff?.ngl != null && (
-            <>
-              {" "}
-              Prompt processing degrades earlier still, from{" "}
-              <span className="font-mono font-bold">{cliff.ngl}</span> layers.
-            </>
-          )}
         </div>
       )}
       {cacheFailed && (
@@ -356,9 +346,7 @@ export function ProbeAttempts({ testId, refreshKey }: ProbeAttemptsProps) {
               the memory that context added went to system RAM
             </>
           )}
-          , so the load failed and the search tried smaller contexts. Each load here only runs a {PROBE_PROMPT_TOKENS}
-          -token prompt and generates {PROBE_GEN_TOKENS} tokens, so that load can still look fast — memory in system RAM
-          only slows generation down once the context actually fills.
+          , so the load failed and the search tried smaller contexts.
         </div>
       )}
       <div className="flex flex-wrap items-baseline justify-between gap-2">
@@ -390,13 +378,6 @@ export function ProbeAttempts({ testId, refreshKey }: ProbeAttemptsProps) {
               <th className="px-2 py-1.5 text-center" colSpan={2}>Shared</th>
               <th className="px-2 py-1.5 text-right" rowSpan={2}>RAM free</th>
               <th className="px-2 py-1.5 text-center" colSpan={2}>RAM Peak</th>
-              <th
-                className="px-2 py-1.5 text-center"
-                colSpan={3}
-                title={`Every load runs the same ${PROBE_EXERCISED_TOKENS}-token workload whatever context it allocates, so these describe roughly ${PROBE_EXERCISED_TOKENS} tokens of context -- NOT the context in the row. A large context here is allocated and never read.`}
-              >
-                speed at ~{PROBE_EXERCISED_TOKENS} tok
-              </th>
               <th
                 className="px-2 py-1.5 text-right"
                 rowSpan={2}
@@ -434,16 +415,6 @@ export function ProbeAttempts({ testId, refreshKey }: ProbeAttemptsProps) {
               </th>
               <th className="px-2 py-1.5 text-right" title="llama-server's own process only">
                 llama
-              </th>
-              <th className="px-2 py-1.5 text-right">gen tok/s</th>
-              <th
-                className="px-2 py-1.5 text-right"
-                title="Prompt-processing rate. Prefill has its own placement cliff, several layers BELOW the one where weights start spilling -- a rung can have the best gen tok/s while being several times worse to first token."
-              >
-                pp tok/s
-              </th>
-              <th className="px-2 py-1.5 text-right" title="Time to first token, from request send to the first streamed chunk.">
-                TTFT
               </th>
             </tr>
           </thead>
@@ -510,23 +481,6 @@ export function ProbeAttempts({ testId, refreshKey }: ProbeAttemptsProps) {
                     {mib(a.ram_total_peak_mib)}
                   </td>
                   <td className="px-2 py-1.5 text-right font-mono text-muted">{mib(a.ram_peak_mib)}</td>
-                  <td className="px-2 py-1.5 text-right font-mono text-muted">
-                    {a.gen_tps != null ? a.gen_tps.toFixed(1) : "—"}
-                  </td>
-                  <td
-                    className={`px-2 py-1.5 text-right font-mono ${a.prefill_cliff === 1 ? "font-bold text-warning" : "text-muted"}`}
-                    title={
-                      a.prefill_cliff === 1
-                        ? "Prompt processing has collapsed at this placement -- the batch compute buffer is being served from system RAM. Generation can still look fine here; time to first token will not."
-                        : undefined
-                    }
-                  >
-                    {a.pp_tps != null ? a.pp_tps.toFixed(1) : "—"}
-                    {a.prefill_cliff === 1 ? " ⚠" : ""}
-                  </td>
-                  <td className="px-2 py-1.5 text-right font-mono text-muted">
-                    {a.ttft_ms != null ? `${(a.ttft_ms / 1000).toFixed(2)}s` : "—"}
-                  </td>
                   <td
                     className={`px-2 py-1.5 text-right font-mono ${spill.warn ? "font-bold text-warning" : "text-muted"}`}
                     title={spill.title}
@@ -670,10 +624,11 @@ export function ProbeAttempts({ testId, refreshKey }: ProbeAttemptsProps) {
         <b className="text-warning">layers in system RAM</b>, and the search backs off to fewer layers; anything less
         is <b className="text-warning">cache in system RAM</b>, and the search tries a smaller context. Rows from
         before the anchor existed were judged against zero instead. <b className="text-warning">⚠ possible VRAM fallback</b> appears only where this
-        could not be measured, as an inference from the estimate. <b className="text-fg">Speeds</b> come from the same
-        fixed {PROBE_EXERCISED_TOKENS}-token workload on every row, so they say whether a configuration runs — not how
-        fast it is at the context beside them. There is no minimum rate: a slow load is reported with its rate, and only
-        one that generates nothing at all fails.
+        could not be measured, as an inference from the estimate. Every load also runs a short request — a{" "}
+        {PROBE_PROMPT_TOKENS}-token prompt and {PROBE_GEN_TOKENS} generated tokens — so a configuration that loads but
+        generates nothing <b className="text-fg">fails</b>.
+        No speed is shown: a request that short says whether a configuration runs, not how fast it is at the context
+        beside it.
       </p>
     </div>
   );

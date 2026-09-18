@@ -86,6 +86,11 @@ describe("ProbeFrontier", () => {
     expect(cells(8)[2]).toBe("14");
   });
 
+  it("shows no generation rate", async () => {
+    const { table } = await renderCurve(wizardRows(200));
+    expect(table.queryByText(/tok\/s/i)).toBeNull();
+  });
+
   it("marks a confirmed answer, and the answer the budget left unconfirmed", async () => {
     const full = await renderCurve(wizardRows(200));
     expect(within(full.bodyRows[0]).getByTitle(/second time, clean again/)).toBeInTheDocument();
