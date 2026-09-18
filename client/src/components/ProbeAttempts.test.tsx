@@ -49,6 +49,17 @@ async function renderTable(rows: ProbeAttemptDto[]) {
   return { table: within(table), bodyRows };
 }
 
+describe("ProbeAttempts speeds", () => {
+  // The probe's request is too short to time anything at the row's context,
+  // so no rate -- not even a stored one -- is shown.
+  it("shows no generation, prompt or first-token figures", async () => {
+    const { table } = await renderTable([row({ gen_tps: 30.4, pp_tps: 412.7, ttft_ms: 7654, prefill_cliff: 1 })]);
+    expect(table.queryByText(/tok\/s/i)).toBeNull();
+    expect(table.queryByText(/TTFT/)).toBeNull();
+    expect(table.queryByText(/30\.4|412\.7|7\.65s/)).toBeNull();
+  });
+});
+
 describe("ProbeAttempts result badge", () => {
   it("labels an older worker's host-backed failures by what spilled, and only those", async () => {
     const { table } = await renderTable([

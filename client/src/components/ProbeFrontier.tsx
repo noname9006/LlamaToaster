@@ -15,7 +15,6 @@ import { api } from "../api/client";
 import type { ProbeAttemptDto } from "../types";
 import {
   claimFitsFree,
-  PROBE_EXERCISED_TOKENS,
   probeOutcome,
   type CurveStop,
   type LadderAttempt,
@@ -222,18 +221,11 @@ export function ProbeFrontier({ testId, refreshKey }: { testId: string; refreshK
               {hasFit && <th className="py-1 pr-3 font-medium">Claim fits</th>}
               <th className="py-1 pr-3 font-medium">How</th>
               <th className="py-1 pr-3 font-medium">VRAM peak (llama)</th>
-              <th
-                className="py-1 pr-3 font-medium"
-                title={`Generation rate at the no-spill answer and at one layer more. Every load generates the same ~${PROBE_EXERCISED_TOKENS} tokens whatever context it allocates, so these compare placements on a nearly empty cache -- never the speed at the context in the row.`}
-              >
-                gen tok/s: answer / +1 layer
-              </th>
             </tr>
           </thead>
           <tbody>
             {curve.map((stop) => {
               const at = loadsAt(stop.ctx, stop.clean.value)[0];
-              const above = stop.clean.value != null ? loadsAt(stop.ctx, stop.clean.value + 1)[0] : undefined;
               return (
                 <tr key={stop.ctx} className="border-t border-border/60">
                   <td className="py-1 pr-3 tabular-nums text-fg">{stop.ctx.toLocaleString()}</td>
@@ -263,9 +255,6 @@ export function ProbeFrontier({ testId, refreshKey }: { testId: string; refreshK
                   </td>
                   <td className="py-1 pr-3 tabular-nums text-muted">
                     {at?.vram_process_peak_mib != null ? `${Math.round(at.vram_process_peak_mib).toLocaleString()} MiB` : "—"}
-                  </td>
-                  <td className="py-1 pr-3 tabular-nums text-muted">
-                    {at?.gen_tps != null ? at.gen_tps.toFixed(1) : "—"} / {above?.gen_tps != null ? above.gen_tps.toFixed(1) : "—"}
                   </td>
                 </tr>
               );

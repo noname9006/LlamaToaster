@@ -278,8 +278,8 @@ describe("N2 probe success rule", () => {
   const base = { oom: false, vramPeakMib: 7000, gpuTotalMib: 8176, genTps: 11, estimatedVramMib: null };
 
   // The 1 tok/s floor is gone. It rejected a placement on a rate measured over
-  // PROBE_EXERCISED_TOKENS -- a number that describes ~512 tokens of context
-  // and not the configuration in the row -- while the thing it was proxying
+  // the probe's short fixed request -- a number that describes a nearly empty
+  // cache and not the configuration in the row -- while the thing it was proxying
   // for (GPU memory served from system RAM) is now measured directly.
   it("no longer fails a slow load: a rate is reported, not judged", () => {
     expect(probeSucceeded({ ...base, genTps: 0.4, ngl: 0 }).ok).toBe(true);

@@ -82,14 +82,24 @@ export const PROBE_MAX_LOADS = 40;
 export const PROBE_ANCHOR_NGL = 1;
 
 /**
- * What one full load actually exercises, regardless of the context it
- * allocates: every load runs this prompt and generates this many tokens, so
- * the speeds a rung reports describe roughly PROBE_EXERCISED_TOKENS of context
- * and NOT the context in its row.
+ * The request every full load runs, whatever context it allocates. It exists to
+ * prove the configuration generates at all (a load that generates nothing
+ * fails) and to put work on the GPU while its memory is traced -- not to
+ * measure speed, which it is far too short to do.
+ *
+ * Measured on an RX 6600 XT (27B, ngl 18, 64k context): generation length
+ * moved no memory reading at 10, 128 or 1024 tokens, and every prompt from 10
+ * to 512 tokens landed on the same level, about 25 MiB of GPU memory and
+ * 190 MiB of RAM over the idle load. From 1024 tokens up it was about 72 MiB
+ * and 390 MiB, flat all the way to 65000. So every load undercounts that
+ * difference; it buys a request of seconds instead of a minute. A longer
+ * prompt below 1024 tokens would buy nothing, since it lands on the same level.
+ *
+ * No prefill rate is kept: a 16-token prompt is timed almost entirely on
+ * first-request setup (measured 1.3 t/s against ~20 t/s at 128+ tokens).
  */
-export const PROBE_PROMPT_TOKENS = 256;
-export const PROBE_GEN_TOKENS = 256;
-export const PROBE_EXERCISED_TOKENS = PROBE_PROMPT_TOKENS + PROBE_GEN_TOKENS;
+export const PROBE_PROMPT_TOKENS = 16;
+export const PROBE_GEN_TOKENS = 16;
 
 export interface LadderRung {
   ctx: number;
