@@ -360,8 +360,6 @@ export function ProfileCards({ testId, refreshKey, modelId, workerId }: ProfileC
         {scoring.tallies.suspect_samples > 0 && ` · ${scoring.tallies.suspect_samples} carried suspect samples`}
         {scoring.tallies.missing_pp_or_tg > 0 &&
           ` · ${scoring.tallies.missing_pp_or_tg} never produced both a pp and a tg row`}
-        {scoring.tallies.caveat_flagged > 0 &&
-          ` · ${scoring.tallies.caveat_flagged} were removed by a caveat flag`}
         .
         {scoring.profiles.length === 0 &&
           " No card could be produced from this run — the tallies above are the reason, not an error."}

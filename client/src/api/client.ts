@@ -21,7 +21,6 @@ import {
   type ModelRatesResponse,
   type CurveResponse,
   type KneeResponse,
-  type SustainedResponse,
   type ComparisonResponse,
   type ImportResponse,
   type VerifiedLimitDto,
@@ -331,10 +330,6 @@ export const api = {
 
   // N5 -- derived on read, never a stored verdict.
   getKnee: (testId: string): Promise<KneeResponse> => request(`/api/tests/${encodeURIComponent(testId)}/knee`),
-
-  // N6 -- the throttle ratio and the PRICED re-run offer. Offered, never scheduled.
-  getSustained: (testId: string): Promise<SustainedResponse> =>
-    request(`/api/tests/${encodeURIComponent(testId)}/sustained`),
 
   // N3 -- the comparison table plus its blocking fairness verdicts.
   getComparison: (comparisonId: string): Promise<ComparisonResponse> =>

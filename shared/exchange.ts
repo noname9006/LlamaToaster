@@ -10,7 +10,6 @@ import {
   LEGACY_CURVE_METHOD_VERSION,
   METHOD_VERSION,
   SERVER_METHOD_VERSION,
-  type CaveatFlag,
   type TestType,
 } from "./types.js";
 import type { GoalsConfig } from "./goals.js";
@@ -71,7 +70,6 @@ export interface BundleRow {
   e2e_ms_mean: number | null;
   gpu_temp_c_max: number | null;
   gpu_clock_mhz_min: number | null;
-  caveat_flags: CaveatFlag[];
   created_at: number;
 }
 
@@ -136,7 +134,7 @@ export function methodsFor(methodVersion: number): MethodsSection {
       pipeline: [
         "cold timed prefill: full prompt, streamed, n_predict 1, ignore_eos, against a freshly started server -- first-chunk arrival is TTFT (single sample, labeled as such)",
         "pp for the point comes from that same response's timings.prompt_ms / prompt_n",
-        "warm repeats: identical prompt with cache_prompt -- any repeat reporting prompt_n > 0 re-prefilled and flags cache_evicted",
+        "warm repeats: identical prompt with cache_prompt, against the same still-running server",
         "implausibility filter rejects physically impossible rates; wall-clock fallback readings are marked suspect",
         "stability gate: stddev <= max(10 % of mean, 0.5 tok/s), n >= 3",
         "filler prompt: a tokenized mixed-register passage (prose, code, equations, structured data, non-Latin scripts), every register holding an equal share of the prompt at every size and interleaved below the ubatch so each batch sees all of them",
@@ -183,7 +181,7 @@ export function methodsFor(methodVersion: number): MethodsSection {
       pipeline: [
         "filler prompt: a tokenized mixed-register passage (prose, code, equations, structured data, non-Latin scripts), every register holding an equal share of the prompt at every size and interleaved below the ubatch so each batch sees all of them",
         "greedy decoding (temperature 0) with ignore_eos, so a repeat is reproducible and both engines decode the same number of tokens",
-        "a rejected generation is retried on a rotated prompt, then once under a grammar; a reading that needed the grammar is flagged grammar_constrained",
+        "a rejected generation is retried on a rotated prompt, then once under a grammar so this configuration still yields a reading",
         "implausibility filter rejects physically impossible rates; suspect readings are kept and flagged, never silently erased",
         "sample (n-1) standard deviation, matching llama-bench's own formula",
       ],

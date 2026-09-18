@@ -47,7 +47,6 @@ import type {
 import {
   isVramDiscrepancyPolicy,
   isValidProbeMaxLoads,
-  parseCaveatFlags,
   CHAIN_WALL_CLOCK_MS,
 } from "../../../shared/types.js";
 import type { SweepItem } from "../../../shared/sweep.js";
@@ -217,7 +216,6 @@ interface ResultRowRaw {
   spec_n_min: number | null;
   speedup: number | null;
   speedup_status: string | null;
-  caveat_flags: string | null;
   concurrency: number | null;
   gpu_temp_c_max: number | null;
   gpu_clock_mhz_min: number | null;
@@ -732,7 +730,6 @@ function mapResult(row: ResultRowRaw): ResultRow {
     spec_n_min: row.spec_n_min,
     speedup: row.speedup,
     speedup_status: (row.speedup_status as ResultRow["speedup_status"]) ?? null,
-    caveat_flags: parseCaveatFlags(row.caveat_flags),
     concurrency: row.concurrency,
     gpu_temp_c_max: row.gpu_temp_c_max,
     gpu_clock_mhz_min: row.gpu_clock_mhz_min,
@@ -1000,10 +997,10 @@ export const repo = {
           avg_tps, stddev_tps, ram_peak_mib, vram_peak_mib, ram_avg_mib, vram_avg_mib,
           gpu_memory_total_accuracy, gpu_memory_free_start_accuracy,
           gpu_memory_model_avg_accuracy, gpu_memory_model_peak_accuracy,
-          sample_count, suspect_count, method_version, config_hash, caveat_flags, concurrency,
+          sample_count, suspect_count, method_version, config_hash, concurrency,
           gpu_temp_c_max, gpu_clock_mhz_min, ttft_ms_p50, ttft_ms_p95, ttft_n, e2e_ms_mean,
           llama_cpp_build, engine, imported_bundle_id, import_opt_in, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
 
     const tx = database.transaction(() => {
@@ -1069,7 +1066,6 @@ export const repo = {
           // Stored verbatim: it was recomputed from the canonical form at
           // export time and re-verified on the way in.
           row.config_hash,
-          row.caveat_flags.length > 0 ? JSON.stringify(row.caveat_flags) : null,
           row.concurrency,
           row.gpu_temp_c_max,
           row.gpu_clock_mhz_min,
@@ -1336,28 +1332,12 @@ export const repo = {
     return rows.map(mapResult);
   },
 
-  // §0.12 / N6 -- the >1/3 thermally_throttled ratio, computed the same way
-  // for both the on-demand /sustained read and the once-per-completed-run
-  // observability event: denominator is every non-cancelled item, skipped
-  // included; numerator is items with >=1 result flagged thermally_throttled.
-  thermallyFlaggedRatio(runId: string): { ratio: number; flagged: number; denominator: number } {
-    const items = this.getTestItems(runId);
-    const results = this.getResultsForTest(runId);
-    const flaggedIdx = new Set(
-      results.filter((r) => (r.caveat_flags ?? []).includes("thermally_throttled")).map((r) => r.idx)
-    );
-    const denominator = items.filter((i) => i.status !== "cancelled").length;
-    const ratio = denominator > 0 ? flaggedIdx.size / denominator : 0;
-    return { ratio, flagged: flaggedIdx.size, denominator };
-  },
-
   // M6 -- "the sample series is this plan's first bulky column (~2 KB per
   // item). It may be pruned 30 days after ingest -- detection already ran at
-  // ingest time, and gpu_clock_mhz_min, gpu_temp_c_max and the caveat flag
-  // persist indefinitely, which is everything later readers (scoring, N6
-  // policy) consume." Nulls only the sample series; every other thermal
-  // column and caveat_flags are untouched. Called from reaper.ts's
-  // runMaintenanceSweep, same interval as the other retention prunes.
+  // ingest time, and gpu_clock_mhz_min and gpu_temp_c_max persist
+  // indefinitely." Nulls only the sample series; every other thermal column
+  // is untouched. Called from reaper.ts's runMaintenanceSweep, same interval
+  // as the other retention prunes.
   pruneOldGpuClockSamples(days: number): number {
     const cutoff = Date.now() - days * 24 * 3600 * 1000;
     return getDb()
@@ -1540,10 +1520,10 @@ export const repo = {
               gpu_layers_resident_est, gpu_layers_resident_est_draft,
               sample_count, suspect_count, suspect_samples, repeat_samples, spec_drafted, spec_accepted,
               method_version, prompt_offset, spec_type, spec_n_max, spec_n_min, config_hash,
-              caveat_flags, concurrency, gpu_temp_c_max, gpu_clock_mhz_min, gpu_clock_samples,
+              concurrency, gpu_temp_c_max, gpu_clock_mhz_min, gpu_clock_samples,
               cpu_isa, ttft_ms_p50, ttft_ms_p95, ttft_n, e2e_ms_mean,
               worker_id, llama_cpp_build, engine, raw_json_path, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         );
         // Up to two rows for one idx (a pp row and a tg row from the same
         // benchmark process) -- distinguished by test_type, see
@@ -1627,7 +1607,6 @@ export const repo = {
             row.spec_n_max ?? null,
             row.spec_n_min ?? null,
             hash,
-            row.caveat_flags && row.caveat_flags.length > 0 ? JSON.stringify(row.caveat_flags) : null,
             row.concurrency ?? null,
             row.gpu_temp_c_max ?? null,
             row.gpu_clock_mhz_min ?? null,
@@ -3780,7 +3759,6 @@ export interface ImportedResultRow {
   e2e_ms_mean: number | null;
   gpu_temp_c_max: number | null;
   gpu_clock_mhz_min: number | null;
-  caveat_flags: string[];
   created_at: number;
 }
 
@@ -3999,7 +3977,6 @@ function buildResultRow(
     spec_type: r.spec_type ?? null,
     spec_n_max: r.spec_n_max ?? null,
     spec_n_min: r.spec_n_min ?? null,
-    caveat_flags: r.caveat_flags ?? [],
     concurrency: r.concurrency ?? null,
     gpu_temp_c_max: r.gpu_temp_c_max ?? null,
     gpu_clock_mhz_min: r.gpu_clock_mhz_min ?? null,
@@ -4065,8 +4042,7 @@ interface TwinCandidateRow {
 // {server, off} baseline on (root_run_id, config_hash, test_type, n_depth),
 // where config_hash excludes the spec fields. Both sides must also match on
 // prompt_offset and method_version; any mismatch or unverifiable input makes
-// the pair `unverified` (an offset mismatch additionally writes
-// spec_pair_prompt_mismatch), no counterpart at all is `unavailable`.
+// the pair `unverified`, no counterpart at all is `unavailable`.
 function markSpeedupStatuses(
   database: ReturnType<typeof getDb>,
   insertedRowId: string,
@@ -4093,8 +4069,6 @@ function markSpeedupStatuses(
   if (!insertedIsSpec && !insertedIsServerBaseline) return;
 
   const update = database.prepare(`UPDATE results SET speedup = ?, speedup_status = ? WHERE id = ?`);
-  const writeFlags = database.prepare(`UPDATE results SET caveat_flags = ? WHERE id = ?`);
-  const readFlags = database.prepare(`SELECT caveat_flags FROM results WHERE id = ?`);
 
   const findTwin = (mtpFilter: string): TwinCandidateRow | undefined =>
     database
@@ -4118,17 +4092,13 @@ function markSpeedupStatuses(
   }
 
   let status: "ok" | "unverified" = "ok";
-  const flagsToWrite: string[] = [];
   const suspectOnly = (r: TwinCandidateRow): boolean =>
     r.sample_count != null && r.sample_count > 0 && (r.suspect_count ?? 0) >= (r.sample_count ?? 0);
   if (suspectOnly(spec) || suspectOnly(baseline)) status = "unverified";
   if ((spec.spec_drafted != null && spec.spec_drafted === 0) || (spec.spec_accepted != null && spec.spec_accepted === 0)) {
     status = "unverified";
   }
-  if (spec.prompt_offset !== baseline.prompt_offset) {
-    status = "unverified";
-    flagsToWrite.push("spec_pair_prompt_mismatch");
-  }
+  if (spec.prompt_offset !== baseline.prompt_offset) status = "unverified";
   if ((spec.method_version ?? null) !== (baseline.method_version ?? null)) status = "unverified";
   if (spec.speedup_status === "unverified" || baseline.speedup_status === "unverified" || wallClockFallback) {
     status = "unverified";
@@ -4140,10 +4110,5 @@ function markSpeedupStatuses(
       : null;
   for (const target of [spec.id, baseline.id]) {
     update.run(ratio, ratio == null ? "unavailable" : status, target);
-  }
-  if (flagsToWrite.length > 0) {
-    const current = (readFlags.get(spec.id) as { caveat_flags: string | null }).caveat_flags;
-    const merged = [...new Set([...parseCaveatFlags(current), ...flagsToWrite])];
-    writeFlags.run(JSON.stringify(merged), spec.id);
   }
 }

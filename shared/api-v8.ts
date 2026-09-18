@@ -260,22 +260,6 @@ export interface KneeResponse extends KneeResult {
   spec: { n_prompt: number; n_gen: number; slots?: number[]; repeats?: number } | null;
 }
 
-// N6 -- GET /api/runs/:id/sustained
-export interface SustainedResponse {
-  run_id: string;
-  flagged_items: number[];
-  denominator: number;
-  ratio: number;
-  offer_rerun: boolean;
-  rerun_estimate: string;
-  rerun_seconds: number | null;
-  steady_state: {
-    discard_first_repeats: number;
-    available: boolean;
-    reason: string | null;
-  };
-}
-
 // N3 -- GET /api/comparisons/:id
 export interface ComparisonResponse {
   comparison_id: string;

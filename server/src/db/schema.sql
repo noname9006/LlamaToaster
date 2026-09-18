@@ -53,8 +53,6 @@ CREATE TABLE IF NOT EXISTS results (
   spec_n_min INTEGER,
   speedup REAL,
   speedup_status TEXT,
-  -- §0.10 -- JSON string[] of caveat flags from the closed registry
-  caveat_flags TEXT,
   -- N5 -- concurrent streaming slots this row measured (1 = solo)
   concurrency INTEGER,
   -- M6 -- adapter peak °C, lowest sampled sclk, and the sample series

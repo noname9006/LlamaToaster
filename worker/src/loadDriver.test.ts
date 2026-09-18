@@ -2,13 +2,10 @@ import { describe, expect, it } from "vitest";
 import {
   buildServerArgs,
   contextSizeForSlots,
-  curveCaveatFlags,
-  detectCacheEviction,
   DEFAULT_KNEE_SLOTS,
   percentile,
   planConcurrentBatch,
   planCurvePoint,
-  sawContextShift,
   summarizeStreams,
   type StreamSample,
 } from "./loadDriver.js";
@@ -165,45 +162,6 @@ describe("N1 choreography", () => {
   it("still emits the cold point at repeats = 1", () => {
     const plan = planCurvePoint({ promptTokens: 4096, nGen: 128, repeats: 1 });
     expect(plan.map((s) => s.requestClass)).toEqual(["cold_timed"]);
-  });
-});
-
-describe("N1 eviction detector", () => {
-  it("never condemns the legitimate cold prefill for reporting its full prompt", () => {
-    const detection = detectCacheEviction([
-      { requestClass: "cold_timed", promptN: 8192 },
-      { requestClass: "warm_repeat", promptN: 0 },
-      { requestClass: "warm_repeat", promptN: 0 },
-    ]);
-    expect(detection.evicted).toBe(false);
-  });
-
-  it("flags a warm repeat that re-prefilled -- the silent fast-repeat failure mode", () => {
-    const detection = detectCacheEviction([
-      { requestClass: "cold_timed", promptN: 8192 },
-      { requestClass: "warm_repeat", promptN: 8192 },
-      { requestClass: "warm_repeat", promptN: 0 },
-    ]);
-    expect(detection.evicted).toBe(true);
-    expect(detection.offendingRepeats).toBe(1);
-  });
-
-});
-
-describe("N1 context-shift flag", () => {
-  it("flags only when the binary lacks --no-context-shift AND the logs show a shift", () => {
-    const log = "slot update_slots: id 0 | task 1 | slot context shift, n_keep = 0";
-    expect(sawContextShift(log)).toBe(true);
-    expect(
-      curveCaveatFlags({ samples: [], serverLog: log, supportsNoContextShift: false })
-    ).toContain("context_shift");
-    expect(
-      curveCaveatFlags({ samples: [], serverLog: log, supportsNoContextShift: true })
-    ).not.toContain("context_shift");
-  });
-
-  it("stays quiet on an ordinary log", () => {
-    expect(sawContextShift("slot launch_slot_: id 0 | processing task")).toBe(false);
   });
 });
 

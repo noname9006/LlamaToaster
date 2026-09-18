@@ -223,7 +223,6 @@ describe("§0.3 eligibility gates and rejection accounting", () => {
       stability: 1,
       suspect_samples: 1,
       missing_pp_or_tg: 1,
-      caveat_flagged: 0,
     });
     // Not "only stability", so no waived card is emitted.
     expect(result.profiles).toHaveLength(0);
@@ -273,16 +272,6 @@ describe("§0.3 eligibility gates and rejection accounting", () => {
       itemStatusByIdx: { 0: "failed_timeout" },
     });
     expect(timedOut.scoredCount).toBe(0);
-  });
-
-  it("excludes swa rows from the TG reference-depth comparison, tallying caveat_flagged when nothing is left", () => {
-    const rows = [
-      row({ idx: 0, test_type: "pp", avg_tps: 100, n_depth: 16384 }),
-      row({ idx: 0, test_type: "tg", avg_tps: 10, n_depth: 16384, caveat_flags: ["swa"] }),
-    ];
-    const result = scoreProfiles({ rows, repeats: 5, referenceDepthTokens: 16384 });
-    expect(result.tallies.caveat_flagged).toBe(1);
-    expect(result.scoredCount).toBe(0);
   });
 
   it("selects the tg row at the nearest available depth and records it", () => {

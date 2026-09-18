@@ -4,6 +4,7 @@ import {
   completeWithRetries,
   executeCurvePoint,
   executeKneeLadder,
+  executeFillCurve,
   probeSucceeded,
   failedForHostBackedLayers,
   pickDedupPoint,
@@ -15,7 +16,7 @@ import {
   type StreamedRequestInput,
 } from "./runtimeBench.js";
 import type { StreamSample } from "./loadDriver.js";
-import { CURVE_METHOD_VERSION } from "../../shared/types.js";
+import { CURVE_METHOD_VERSION, FILL_CURVE_METHOD_VERSION } from "../../shared/types.js";
 import type { SweepItem } from "../../shared/sweep.js";
 
 // A fake llama-server: every request is recorded, and the reply is shaped by
@@ -62,8 +63,6 @@ describe("N1 curve-point execution", () => {
       nGen: 512,
       repeats: 5,
       port: 1,
-      serverLog: "",
-      supportsNoContextShift: true,
       fillerBlocks: BLOCKS,
       completion: server.completion,
     });
@@ -100,8 +99,6 @@ describe("N1 curve-point execution", () => {
       nGen: 8,
       repeats: 2,
       port: 1,
-      serverLog: "",
-      supportsNoContextShift: true,
       fillerBlocks: BLOCKS,
       completion: server.completion,
     });
@@ -121,8 +118,6 @@ describe("N1 curve-point execution", () => {
         nGen: 8,
         repeats: 2,
         port: 1,
-        serverLog: "",
-        supportsNoContextShift: true,
         completion: server.completion,
       });
     } finally {
@@ -140,59 +135,36 @@ describe("N1 curve-point execution", () => {
       nGen: 128,
       repeats: 3,
       port: 1,
-      serverLog: "",
-      supportsNoContextShift: true,
       fillerBlocks: BLOCKS,
       completion: server.completion,
     });
     expect(execution.results.every((r) => r.method_version === CURVE_METHOD_VERSION)).toBe(true);
   });
 
-  it("flags cache_evicted when a warm repeat re-prefills, and says so in the warning", async () => {
+  it("warns when a warm repeat re-prefills the prompt", async () => {
     const server = fakeServer({ evictOnRepeat: 2 });
     const execution = await executeCurvePoint({
       effectiveCtx: 8_192,
       nGen: 512,
       repeats: 4,
       port: 1,
-      serverLog: "",
-      supportsNoContextShift: true,
       fillerBlocks: BLOCKS,
       completion: server.completion,
     });
-    expect(execution.results.every((r) => (r.caveat_flags ?? []).includes("cache_evicted"))).toBe(true);
     expect(execution.warning).toContain("prefix cache did not hold");
   });
 
-  it("does not flag the legitimate cold prefill as an eviction", async () => {
+  it("does not warn on the legitimate cold prefill", async () => {
     const server = fakeServer();
     const execution = await executeCurvePoint({
       effectiveCtx: 8_192,
       nGen: 512,
       repeats: 4,
       port: 1,
-      serverLog: "",
-      supportsNoContextShift: true,
       fillerBlocks: BLOCKS,
       completion: server.completion,
     });
-    expect(execution.results.every((r) => (r.caveat_flags ?? []).length === 0)).toBe(true);
     expect(execution.warning).toBeUndefined();
-  });
-
-  it("flags context_shift when the binary lacks the flag and the log shows a shift", async () => {
-    const server = fakeServer();
-    const execution = await executeCurvePoint({
-      effectiveCtx: 8_192,
-      nGen: 512,
-      repeats: 3,
-      port: 1,
-      serverLog: "slot update_slots: slot context shift, n_keep = 0",
-      supportsNoContextShift: false,
-      fillerBlocks: BLOCKS,
-      completion: server.completion,
-    });
-    expect(execution.results.every((r) => (r.caveat_flags ?? []).includes("context_shift"))).toBe(true);
   });
 
   it("marks the pp reading suspect rather than inventing a rate when the server reports no prefill timing", async () => {
@@ -209,8 +181,6 @@ describe("N1 curve-point execution", () => {
       nGen: 64,
       repeats: 2,
       port: 1,
-      serverLog: "",
-      supportsNoContextShift: true,
       fillerBlocks: BLOCKS,
       completion,
     });
@@ -640,11 +610,11 @@ describe("parser-failure recovery", () => {
     expect(calls).toBe(1);
   });
 
-  it("flags a curve point whose reading only came back under a grammar", async () => {
+  it("still yields a curve point whose reading only came back under a grammar", async () => {
     let calls = 0;
     const completion = async (input: StreamedRequestInput): Promise<StreamSample> => {
-      // Only the very first request needs the grammar; the flag must still
-      // reach the row, since that request is the cold TIMED prefill.
+      // Only the very first request needs the grammar -- that request is the
+      // cold TIMED prefill.
       if (!input.grammar && calls++ < 3) throw parserError();
       return { ...sample(), promptN: input.promptTokens.length };
     };
@@ -653,28 +623,10 @@ describe("parser-failure recovery", () => {
       nGen: 8,
       repeats: 2,
       port: 1,
-      serverLog: "",
-      supportsNoContextShift: true,
       fillerBlocks: BLOCKS,
       completion,
     });
     expect(execution.results.length).toBeGreaterThan(0);
-    expect(execution.results.every((r) => (r.caveat_flags ?? []).includes("grammar_constrained"))).toBe(true);
-  });
-
-  it("leaves the flag off when nothing needed constraining", async () => {
-    const server = fakeServer();
-    const execution = await executeCurvePoint({
-      effectiveCtx: 256,
-      nGen: 8,
-      repeats: 2,
-      port: 1,
-      serverLog: "",
-      supportsNoContextShift: true,
-      fillerBlocks: BLOCKS,
-      completion: server.completion,
-    });
-    expect(execution.results.every((r) => !(r.caveat_flags ?? []).includes("grammar_constrained"))).toBe(true);
   });
 });
 
@@ -848,5 +800,110 @@ describe("pickDedupPoint", () => {
     ];
     expect(pickDedupPoint(withClaimOnly, 2048, 17, 0)?.seq).toBe(2);
     expect(pickDedupPoint(withClaimOnly, 2048, 17, 0, false)?.seq).toBe(1);
+  });
+});
+
+// A fake llama-server that really behaves like a single-slot prompt cache:
+// it remembers the last prompt and prefills only what extends past the
+// longest common prefix. Prefill is slower the fuller the context already is,
+// so the curve has a shape to check.
+function prefixCachingServer(opts: { cacheHolds?: boolean } = {}) {
+  let cached: number[] = [];
+  const requests: StreamedRequestInput[] = [];
+  const completion = async (input: StreamedRequestInput): Promise<StreamSample> => {
+    requests.push(input);
+    const prompt = input.promptTokens;
+    let common = 0;
+    if (input.cachePrompt && opts.cacheHolds !== false) {
+      while (common < cached.length && common < prompt.length && cached[common] === prompt[common]) common++;
+    }
+    const promptN = prompt.length - common;
+    // 1000 tok/s on an empty context, falling linearly with depth.
+    const rate = 1000 / (1 + common / 10_000);
+    cached = [...prompt, 7];
+    return { ttftMs: 1, e2eMs: 2, tokensPredicted: 1, promptN, promptMs: (promptN / rate) * 1000, slot: 0 };
+  };
+  return { completion, requests };
+}
+
+describe("fill curve execution", () => {
+  const ITEM: SweepItem = {
+    idx: 0,
+    n_prompt: 8_151,
+    n_gen: 0,
+    n_depth: 0,
+    concurrency: 1,
+    threads: 4,
+    n_gpu_layers: 33,
+    batch_size: 2048,
+    ubatch_size: 512,
+    cache_type_k: "q8_0",
+    cache_type_v: "q8_0",
+    flash_attn: "on",
+    mtp: "off",
+    n_gpu_layers_draft: 0,
+    n_cpu_moe: 0,
+  };
+
+  it("grows one prompt to ctx - 0.5 % and records each slice at its own depth", async () => {
+    const server = prefixCachingServer();
+    const execution = await executeFillCurve({
+      ctx: 8_192,
+      steps: 4,
+      repeats: 3,
+      port: 1,
+      item: ITEM,
+      fillerBlocks: BLOCKS,
+      completion: server.completion,
+    });
+    expect(execution.stopped).toBe(false);
+    expect(execution.warning).toBeUndefined();
+    // 3 repeats x 4 slices, cache on, each a prefix of the full prompt.
+    expect(server.requests).toHaveLength(12);
+    expect(server.requests.every((r) => r.cachePrompt && r.nPredict === 1)).toBe(true);
+    expect(server.requests.slice(0, 4).map((r) => r.promptTokens.length)).toEqual([2_038, 4_076, 6_113, 8_151]);
+
+    const rows = execution.results;
+    expect(rows.map((r) => r.n_depth)).toEqual([0, 2_038, 4_076, 6_113]);
+    expect(rows.map((r) => (r.n_depth ?? 0) + r.n_prompt)).toEqual([2_038, 4_076, 6_113, 8_151]);
+    expect(rows.every((r) => r.test_type === "pp" && r.method_version === FILL_CURVE_METHOD_VERSION)).toBe(true);
+    expect(rows.every((r) => r.n_gpu_layers === 33 && r.cache_type_k === "q8_0" && r.sample_count === 3)).toBe(true);
+    expect(rows.every((r) => r.suspect_count === 0)).toBe(true);
+    // Prefill slows as the context fills.
+    for (let i = 1; i < rows.length; i++) expect(rows[i].avg_tps).toBeLessThan(rows[i - 1].avg_tps);
+    expect(rows[0].avg_tps).toBeCloseTo(1000, 0);
+  });
+
+  it("excludes slices that re-prefilled from the start because the cache did not hold", async () => {
+    const server = prefixCachingServer({ cacheHolds: false });
+    const execution = await executeFillCurve({
+      ctx: 8_192,
+      steps: 4,
+      repeats: 2,
+      port: 1,
+      item: ITEM,
+      fillerBlocks: BLOCKS,
+      completion: server.completion,
+    });
+    // The first slice starts from an empty context either way, so it holds.
+    expect(execution.results[0].suspect_count).toBe(0);
+    expect(execution.results.slice(1).every((r) => r.suspect_count === 2 && r.avg_tps === 0)).toBe(true);
+    expect(execution.warning).toMatch(/did not hold/);
+  });
+
+  it("stops between requests and reports only the slices it measured", async () => {
+    const server = prefixCachingServer();
+    const execution = await executeFillCurve({
+      ctx: 8_192,
+      steps: 4,
+      repeats: 1,
+      port: 1,
+      item: ITEM,
+      fillerBlocks: BLOCKS,
+      completion: server.completion,
+      shouldStop: () => server.requests.length >= 2,
+    });
+    expect(execution.stopped).toBe(true);
+    expect(execution.results).toHaveLength(2);
   });
 });

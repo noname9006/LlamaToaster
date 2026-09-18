@@ -50,7 +50,6 @@ function toBundleRow(row: ResultRow): BundleRow {
     e2e_ms_mean: row.e2e_ms_mean ?? null,
     gpu_temp_c_max: row.gpu_temp_c_max ?? null,
     gpu_clock_mhz_min: row.gpu_clock_mhz_min ?? null,
-    caveat_flags: row.caveat_flags ?? [],
     created_at: row.created_at,
   });
 }

@@ -29,6 +29,7 @@ import {
   completeWithRetries,
   executeCurvePoint,
   executeKneeLadder,
+  executeFillCurve,
   probeSucceeded,
   signedMib,
   toProbeAttemptReport,
@@ -121,9 +122,8 @@ import {
   isVramDiscrepancyPolicy,
   type VramDiscrepancyPolicy,
   isValidProbeMaxLoads,
-  // BENCHMARKING_PLAN_V8.md: §0.1 methodology stamp, §0.10 caveat registry,
-  // §0.7/N1/N2/N4 capability advertisement.
-  type CaveatFlag,
+  // BENCHMARKING_PLAN_V8.md: §0.1 methodology stamp, §0.7/N1/N2/N4 capability
+  // advertisement.
   METHOD_VERSION,
   WORKER_CAPABILITIES,
   type TestProbeJobPayload,
@@ -133,9 +133,11 @@ import {
   type QualityResultInput,
   type CurvePointSpec,
   type KneeSpec,
+  type FillCurveSpec,
 } from "../../shared/types.js";
+import { fillCurveSteps, fillTarget } from "../../shared/fillCurve.js";
 import type { ProbeDedupPoint } from "../../shared/api-v8.js";
-import { detectThermalThrottle, detectSensorAvailability, LHM_HTTP_PORT, type SensorAvailability } from "./sensors.js";
+import { detectSensorAvailability, LHM_HTTP_PORT, type SensorAvailability } from "./sensors.js";
 import { readCpuIsa } from "./binary-probe.js";
 import { resolveVramDiscrepancyAction } from "./vram-policy.js";
 import { ensureDefaultQualityCorpus } from "./qualityCorpus.js";
@@ -886,10 +888,9 @@ async function collectState(): Promise<WorkerStatePush> {
 // between two machines on the same build tag has an explanation attached.
 let detectedCpuIsa: string | null = null;
 // M6 -- declared on every heartbeat so a machine card can say "clock · temp
-// available" up front; a later thermally_throttled flag must never surprise a
-// machine that could never have produced one. See collectState() above: a
-// positive detection latches, a negative one is retried on this cadence --
-// bounded so each heartbeat doesn't pay a fresh probe cost indefinitely.
+// available" up front. See collectState() above: a positive detection
+// latches, a negative one is retried on this cadence -- bounded so each
+// heartbeat doesn't pay a fresh probe cost indefinitely.
 let sensorAvailability: SensorAvailability | null = null;
 let sensorProbedAtMs = 0;
 const SENSOR_PROBE_BACKOFF_MS = 10 * 60 * 1000;
@@ -1391,10 +1392,6 @@ async function finalizeSweepItemResult(
   modelSizeBytes: number,
   tensorBreakdown: TensorLayerBreakdown | null,
   attempt = 0,
-  // BENCHMARKING_PLAN_V8.md M6 -- the repeat count this item ran. The
-  // thermally_throttled flag needs >= 4 repeats to be eligible at all (each
-  // half of the split needs >= 2 samples), so the number has to reach the
-  // one place that derives the flag.
   repeats = 0,
   // N6 -- the running build's own ISA dispatch, parsed from llama.cpp's
   // startup banner once per binary identity. Recorded on CPU-bound rows so
@@ -1543,23 +1540,9 @@ async function finalizeSweepItemResult(
     // already collapse to null/"unavailable" on the cpu backend via
     // vram.ts's own readGpuMemory short-circuit, so no separate check is
     // needed here.
-    // M6's flag/aggregates are derived exactly once per item, here, from the
+    // M6's aggregates are derived exactly once per item, here, from the
     // sampler's own buffer -- the server stores them verbatim and never
     // re-derives (one writer per column).
-    const thermal = detectThermalThrottle({
-      samples: stats.gpu_clock_samples ?? [],
-      repeats,
-      gpuTempCMax: stats.gpu_temp_c_max,
-    });
-    if (thermal.throttled) {
-      log.warn(
-        `${label}: thermally_throttled -- adapter clock sagged from ~${Math.round(
-          thermal.firstHalfMean ?? 0
-        )}MHz across the first half of this item to ~${Math.round(
-          thermal.secondHalfMean ?? 0
-        )}MHz in the second, peaking at ${stats.gpu_temp_c_max}C. The row is KEPT, not failed -- burst vs sustained is data.`
-      );
-    }
     const results: IngestResultInput[] = bench.results.map((r) => ({
       ...r,
       // §0.1 -- every ingested row is stamped with the methodology that
@@ -1568,12 +1551,6 @@ async function finalizeSweepItemResult(
       method_version: r.method_version ?? METHOD_VERSION,
       n_depth: r.n_depth ?? item.n_depth ?? 0,
       concurrency: r.concurrency ?? item.concurrency ?? 1,
-      // §0.10 -- the closed caveat registry. Flags the worker derived plus
-      // whatever the engine path already attached (cache_evicted,
-      // context_shift, spec_pair_prompt_mismatch...).
-      caveat_flags: [
-        ...new Set<CaveatFlag>([...(r.caveat_flags ?? []), ...(thermal.throttled ? (["thermally_throttled"] as const) : [])]),
-      ],
       gpu_temp_c_max: stats.gpu_temp_c_max,
       gpu_clock_mhz_min: stats.gpu_clock_mhz_min,
       gpu_clock_samples: stats.gpu_clock_samples,
@@ -2333,16 +2310,11 @@ async function executeRuntimeBenchmarkJob(
         // The timed window opens at the first measured request, not at spawn.
         sampler.openSensorWindow();
         sendTick(payload.run_id, item.idx, { status: "processing", detail: `context ${nPrompt}` });
-        const supportsNoContextShift = await supportsFlag(resolvedBuild.server_path, "--no-context-shift").catch(
-          () => false
-        );
         const execution = await executeCurvePoint({
           effectiveCtx: nPrompt,
           nGen,
           repeats,
           port: server.port,
-          serverLog: server.stderr(),
-          supportsNoContextShift,
           log,
         });
 
@@ -2505,9 +2477,161 @@ async function executeRuntimeBenchmarkJob(
   }
 }
 
+// The Benchmark chain's sweep stage -- prefill speed along one context's fill
+// (shared/fillCurve.ts). One llama-server per sweep item, started with
+// -c = the spec's ctx at that item's placement/KV, so every curve is measured
+// in exactly the configuration it names; the item's own n_prompt/n_gen are
+// not used, the spec decides how far and in how many slices the prompt grows.
+async function executeFillCurveJob(payload: BenchmarkJob, spec: FillCurveSpec): Promise<void> {
+  const modelPath = await resolveModelPath(payload.model);
+  if (!existsSync(modelPath)) throw new Error(`model file not found at ${modelPath}`);
+  const resolvedBuild = getInstalledBuild(buildsDir, payload.llama_cpp_build);
+  if (!resolvedBuild) throw new Error(`build ${payload.llama_cpp_build} is not installed on this worker`);
+  if (!resolvedBuild.server_path) {
+    throw new Error("a fill curve needs llama-server, and this build has no llama-server binary");
+  }
+
+  pauseRequested = false;
+  stopRequested = false;
+  activeBenchProc = null;
+  const items = expandSweep(payload.sweep);
+  const fill = fillTarget(spec.ctx);
+  const steps = fillCurveSteps(spec);
+  setRunLogFile(runLogFilePath(payload.run_id));
+  detectedCpuIsa = await readCpuIsa(resolvedBuild.bench_path).catch(() => null);
+  log.info(
+    `run ${payload.run_id}: fill curve -- ${items.length} curve(s), -c ${spec.ctx}, prompt grown to ${fill} ` +
+      `tokens in ${steps} slices, ${payload.sweep.repeats} repeat(s)`
+  );
+
+  try {
+    for (const item of items) {
+      const label = `run ${payload.run_id} item ${item.idx} (fill_curve)`;
+      while (pauseRequested && !stopRequested) await sleep(500);
+      if (stopRequested) {
+        await safeItemTerminal(payload.run_id, item.idx, { status: "cancelled", error: "cancelled by user" });
+        continue;
+      }
+      updateJobReport({
+        phase: "benchmarking",
+        item_idx: item.idx,
+        items_total: items.length,
+        detail: formatItemParams(item),
+      });
+
+      const baseline = await captureFreeMemoryBaseline(payload.llama_cpp_backend);
+      sendTick(payload.run_id, item.idx, {
+        status: "loading",
+        ram_free_before_mib: baseline.ram_free_before_mib,
+        vram_free_before_mib: baseline.vram_free_before_mib,
+      });
+
+      const sampler = new MemorySampler();
+      let server: Awaited<ReturnType<typeof spawnRuntimeServer>> | null = null;
+      try {
+        server = await spawnRuntimeServer({
+          llamaServerPath: resolvedBuild.server_path,
+          modelPath,
+          port: config.mtp_server_port ?? DEFAULT_MTP_SERVER_PORT,
+          item,
+          slots: 1,
+          mainGpu: payload.main_gpu,
+          contextSizeOverride: spec.ctx,
+          noMmap: true,
+          log,
+          onSpawn: (proc) => {
+            activeBenchProc = proc;
+            sampler.start(proc.pid, payload.llama_cpp_backend, TICK_INTERVAL_MS);
+          },
+        });
+        sampler.openSensorWindow();
+        let lastTickAt = 0;
+        const execution = await executeFillCurve({
+          ctx: spec.ctx,
+          steps,
+          repeats: payload.sweep.repeats,
+          port: server.port,
+          item,
+          log,
+          shouldStop: () => stopRequested,
+          onProgress: ({ repeat, filled }) => {
+            const now = Date.now();
+            if (now - lastTickAt < TICK_INTERVAL_MS) return;
+            lastTickAt = now;
+            sendTick(payload.run_id, item.idx, {
+              status: "processing",
+              detail: `repeat ${repeat + 1}/${payload.sweep.repeats} · filled ${filled.toLocaleString()} / ${fill.toLocaleString()}`,
+            });
+          },
+        });
+
+        const stderr = server.stderr();
+        await server.stop();
+        activeBenchProc = null;
+        const stats = sampler.stop();
+        if (execution.stopped) {
+          await safeItemTerminal(payload.run_id, item.idx, { status: "cancelled", error: "cancelled by user" });
+          continue;
+        }
+        const bench = toBenchResult({
+          results: execution.results,
+          stderr,
+          code: 0,
+          signal: null,
+          warning: execution.warning,
+        });
+        await finalizeSweepItemResult(
+          payload.run_id,
+          item,
+          label,
+          "llama-server",
+          bench,
+          stats,
+          baseline,
+          payload.main_gpu,
+          payload.model.size_bytes,
+          payload.model.metadata.tensor_layer_bytes ?? null,
+          0,
+          payload.sweep.repeats,
+          detectedCpuIsa
+        );
+      } catch (err) {
+        activeBenchProc = null;
+        const stats = sampler.stop();
+        await server?.stop();
+        const message = err instanceof Error ? err.message : String(err);
+        // A context that does not fit dies at start-up -- keep that
+        // distinguishable from any other failure, same classification the
+        // llama-bench path uses.
+        const status =
+          err instanceof RuntimeServerStartupError
+            ? classifyFailure({ timedOut: false, signal: err.signal, stderr: err.stderr })
+            : "failed";
+        log.error(`${label}: TEST SUMMARY -- engine=llama-server status=${status}\n  error: ${message}`);
+        await safeItemTerminal(payload.run_id, item.idx, {
+          status: stopRequested ? "cancelled" : status,
+          error: stopRequested ? "cancelled by user" : message,
+          ram_peak_mib: stats.ram_peak_mib,
+          vram_peak_mib: stats.vram_peak_mib,
+          ram_avg_mib: stats.ram_avg_mib,
+          vram_avg_mib: stats.vram_avg_mib,
+        });
+      }
+    }
+  } finally {
+    setRunLogFile(null);
+    updateJobReport({ phase: "finalizing", detail: "pushing run log" });
+    await pushTestLogIfPresent(payload.run_id);
+  }
+}
+
 async function executeBenchmarkJob(payload: BenchmarkJob): Promise<void> {
   if (payload.mode === "context_curve" || payload.mode === "knee") {
     return executeRuntimeBenchmarkJob(payload, payload.mode);
+  }
+  if (payload.mode === "fill_curve") {
+    if (!payload.fill_curve) throw new Error("fill_curve job is missing its fill_curve spec");
+    return executeFillCurveJob(payload, payload.fill_curve);
   }
   const modelPath = await resolveModelPath(payload.model);
   if (!existsSync(modelPath)) {

@@ -74,8 +74,7 @@ export async function readGpuSensors(backend: Backend): Promise<SensorSample> {
 }
 
 // Declared on the heartbeat so a machine card can say "clock · temp
-// available" up front -- a later thermally_throttled flag must never
-// surprise a machine that could not have produced one.
+// available" up front.
 export async function detectSensorAvailability(backend: Backend): Promise<SensorAvailability> {
   const sample = await readGpuSensors(backend);
   return {
@@ -356,75 +355,6 @@ function wmiNumeric(raw: unknown): number | null {
   return typeof raw === "number" && Number.isFinite(raw) ? raw : null;
 }
 
-// --- M6 detection rule (computable, deterministic) --------------------------
-
-export interface ThrottleDetectionInput {
-  /** Clock samples in chronological order, sampled on the VRAM cadence. */
-  samples: number[];
-  /** Repeats the item ran -- the flag needs >= 4 so each half holds >= 2. */
-  repeats: number;
-  /** Adapter peak temperature; the flag requires a real temperature reading. */
-  gpuTempCMax: number | null;
-}
-
-export interface ThrottleDetection {
-  throttled: boolean;
-  /** Why the item was ineligible, when it was -- stated, never silent. */
-  ineligibleReason: string | null;
-  firstHalfMean: number | null;
-  secondHalfMean: number | null;
-}
-
-export const THROTTLE_MIN_REPEATS = 4;
-export const THROTTLE_MIN_SAMPLES = 4;
-export const THROTTLE_SAG_RATIO = 0.95;
-
-// Split the sample array chronologically in half -- with uniform cadence
-// this approximates repeat halves. An odd sample count puts the extras in
-// the FIRST half (floor split), stated so the rule stays exactly
-// reproducible. Flag when mean(secondHalf) <= 0.95 * mean(firstHalf) AND a
-// temperature reading exists. The flagged row is kept, not failed:
-// burst-vs-sustained is visible data.
-export function detectThermalThrottle(input: ThrottleDetectionInput): ThrottleDetection {
-  const { samples, repeats, gpuTempCMax } = input;
-  if (repeats < THROTTLE_MIN_REPEATS) {
-    return {
-      throttled: false,
-      ineligibleReason: `needs at least ${THROTTLE_MIN_REPEATS} repeats (this item ran ${repeats})`,
-      firstHalfMean: null,
-      secondHalfMean: null,
-    };
-  }
-  if (samples.length < THROTTLE_MIN_SAMPLES) {
-    return {
-      throttled: false,
-      ineligibleReason: `needs at least ${THROTTLE_MIN_SAMPLES} clock samples (this item produced ${samples.length})`,
-      firstHalfMean: null,
-      secondHalfMean: null,
-    };
-  }
-  const secondHalfLength = Math.floor(samples.length / 2);
-  const firstHalf = samples.slice(0, samples.length - secondHalfLength);
-  const secondHalf = samples.slice(samples.length - secondHalfLength);
-  const mean = (xs: number[]): number => xs.reduce((a, b) => a + b, 0) / xs.length;
-  const firstHalfMean = mean(firstHalf);
-  const secondHalfMean = mean(secondHalf);
-  if (gpuTempCMax == null) {
-    return {
-      throttled: false,
-      ineligibleReason: "no temperature sensor on this backend, so a clock sag cannot be attributed to heat",
-      firstHalfMean,
-      secondHalfMean,
-    };
-  }
-  return {
-    throttled: secondHalfMean <= THROTTLE_SAG_RATIO * firstHalfMean,
-    ineligibleReason: null,
-    firstHalfMean,
-    secondHalfMean,
-  };
-}
-
 // --- M6 sample buffer -------------------------------------------------------
 
 // The worker owns every M6 column: it derives the flag, gpu_clock_mhz_min and
@@ -470,24 +400,15 @@ export class SensorSampleBuffer {
     return this.worstSource;
   }
 
-  report(repeats: number): {
+  report(): {
     gpu_temp_c_max: number | null;
     gpu_clock_mhz_min: number | null;
     gpu_clock_samples: number[] | null;
-    throttled: boolean;
-    detection: ThrottleDetection;
   } {
-    const detection = detectThermalThrottle({
-      samples: this.clockSamples,
-      repeats,
-      gpuTempCMax: this.tempMax,
-    });
     return {
       gpu_temp_c_max: this.tempMax,
       gpu_clock_mhz_min: this.clockSamples.length > 0 ? Math.min(...this.clockSamples) : null,
       gpu_clock_samples: this.clockSamples.length > 0 ? [...this.clockSamples] : null,
-      throttled: detection.throttled,
-      detection,
     };
   }
 }

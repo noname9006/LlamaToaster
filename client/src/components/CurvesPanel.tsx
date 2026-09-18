@@ -125,7 +125,7 @@ export function CurvesPanel({ modelId, workerId, build, targetCtx, onMeasureMiss
             {curve.points.map((point) => (
               <tr
                 key={`${point.testId}:${point.idx}:${point.effectiveCtx}`}
-                className={point.superseded || point.excluded ? "border-b border-border/40 opacity-60" : "border-b border-border/40"}
+                className={point.superseded ? "border-b border-border/40 opacity-60" : "border-b border-border/40"}
               >
                 <td className="px-2 py-1.5 font-mono text-fg">{formatCtx(point.effectiveCtx)}</td>
                 <td className="px-2 py-1.5 text-right font-mono text-muted">
@@ -146,11 +146,7 @@ export function CurvesPanel({ modelId, workerId, build, targetCtx, onMeasureMiss
                   {point.vramPeakMib != null ? `${point.vramPeakMib} MiB` : "—"}
                 </td>
                 <td className="px-2 py-1.5 text-muted">
-                  {point.excluded ? (
-                    <span title={point.excludedReason ?? undefined} className="rounded-full bg-warning-bg px-2 py-0.5 text-[10px] font-bold text-warning">
-                      dropped — {point.caveatFlags.join(", ")}
-                    </span>
-                  ) : point.superseded ? (
+                  {point.superseded ? (
                     <span className="rounded-full border border-dashed border-border px-2 py-0.5 text-[10px]">
                       superseded — re-measured later
                     </span>
@@ -196,10 +192,8 @@ export function CurvesPanel({ modelId, workerId, build, targetCtx, onMeasureMiss
       <p className="mt-3 rounded-lg border border-accent/25 bg-accent/[0.06] px-3 py-2 text-[11px] leading-relaxed text-muted">
         Server-path points measure prefill cost once per point with a timed streamed request (that reading{" "}
         <b className="text-fg">is</b> the TTFT column), then run the remaining repeats against the warm cache for
-        clean generation numbers — the two clocks never average together. If the server evicts mid-run the row flags{" "}
-        <span className="font-mono">cache_evicted</span> and drops out of the curve; if a context shift appears in
-        the logs and the binary lacks <span className="font-mono">--no-context-shift</span>, the row flags too. No
-        new table: a curve is a deterministic grouping over <span className="font-mono">results</span>.
+        clean generation numbers — the two clocks never average together. No new table: a curve is a deterministic
+        grouping over <span className="font-mono">results</span>.
       </p>
     </div>
   );

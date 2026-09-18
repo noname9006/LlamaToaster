@@ -136,7 +136,7 @@ describe("§0.8 twin join and speedup statuses", () => {
     expect(results[0].prompt_offset).toBe(274);
   });
 
-  it("marks unverified when the pair's offsets mismatch and writes spec_pair_prompt_mismatch", () => {
+  it("marks unverified when the pair's offsets mismatch", () => {
     makeRun("twin-offset");
     terminal("twin-offset", 0, { method_version: 1, prompt_offset: 0 });
     terminal("twin-offset", 1, { avg_tps: 2000, method_version: 1, prompt_offset: 137 });
@@ -145,7 +145,6 @@ describe("§0.8 twin join and speedup statuses", () => {
     const baseline = results.find((r) => r.mtp !== "on")!;
     expect(spec.speedup_status).toBe("unverified");
     expect(baseline.speedup_status).toBe("unverified");
-    expect(spec.caveat_flags).toContain("spec_pair_prompt_mismatch");
   });
 
   it("marks unavailable when no baseline exists yet, then upgrades when the baseline lands later", () => {
@@ -268,12 +267,10 @@ describe("M6 thermal columns (storage)", () => {
       gpu_temp_c_max: 89,
       gpu_clock_mhz_min: 1971,
       gpu_clock_samples: [2480, 2479, 2100, 1971],
-      caveat_flags: ["thermally_throttled"],
     });
     const row = repo.getResultsForTest("thermal-store")[0];
     expect(row.gpu_temp_c_max).toBe(89);
     expect(row.gpu_clock_mhz_min).toBe(1971);
     expect(row.gpu_clock_samples).toEqual([2480, 2479, 2100, 1971]);
-    expect(row.caveat_flags).toEqual(["thermally_throttled"]);
   });
 });

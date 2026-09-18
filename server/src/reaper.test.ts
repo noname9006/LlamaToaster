@@ -145,10 +145,10 @@ describe("repo.pruneOldGpuClockSamples (M6)", () => {
       db
         .prepare(
           `INSERT INTO results
-             (id, gpu_temp_c_max, gpu_clock_mhz_min, gpu_clock_samples, caveat_flags, created_at)
-           VALUES (?, ?, ?, ?, ?, ?)`
+             (id, gpu_temp_c_max, gpu_clock_mhz_min, gpu_clock_samples, created_at)
+           VALUES (?, ?, ?, ?, ?)`
         )
-        .run(id, 89, 1200, JSON.stringify([1400, 1350, 1300, 1200]), JSON.stringify(["thermally_throttled"]), createdAt);
+        .run(id, 89, 1200, JSON.stringify([1400, 1350, 1300, 1200]), createdAt);
 
     insertResult("result-old-thermal", Date.now() - 31 * DAY_MS);
     insertResult("result-recent-thermal", Date.now() - 1 * DAY_MS);
@@ -157,19 +157,17 @@ describe("repo.pruneOldGpuClockSamples (M6)", () => {
     expect(changed).toBe(1);
 
     const old = db
-      .prepare(`SELECT gpu_temp_c_max, gpu_clock_mhz_min, gpu_clock_samples, caveat_flags FROM results WHERE id = ?`)
+      .prepare(`SELECT gpu_temp_c_max, gpu_clock_mhz_min, gpu_clock_samples FROM results WHERE id = ?`)
       .get("result-old-thermal") as {
       gpu_temp_c_max: number | null;
       gpu_clock_mhz_min: number | null;
       gpu_clock_samples: string | null;
-      caveat_flags: string | null;
     };
-    // The bulky sample series is gone -- everything a later reader (scoring,
-    // N6 policy) actually consumes persists indefinitely.
+    // The bulky sample series is gone -- everything a later reader actually
+    // consumes persists indefinitely.
     expect(old.gpu_clock_samples).toBeNull();
     expect(old.gpu_temp_c_max).toBe(89);
     expect(old.gpu_clock_mhz_min).toBe(1200);
-    expect(JSON.parse(old.caveat_flags!)).toEqual(["thermally_throttled"]);
 
     const recent = db.prepare(`SELECT gpu_clock_samples FROM results WHERE id = ?`).get("result-recent-thermal") as {
       gpu_clock_samples: string | null;

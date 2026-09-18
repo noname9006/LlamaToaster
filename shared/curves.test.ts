@@ -14,7 +14,6 @@ function row(over: Partial<CurveSourceRow> & { test_type: "pp" | "tg"; n_prompt:
     vram_peak_mib: 4000,
     ram_peak_mib: 2000,
     method_version: 2,
-    caveat_flags: [],
     created_at: 1_000,
     ...over,
   };
@@ -76,17 +75,6 @@ describe("N1 context curves", () => {
     expect(curve.every((p) => p.effectiveCtx === 8_192)).toBe(true);
   });
 
-  it("drops a cache-evicted row from the curve with an explanatory reason", () => {
-    const curve = buildCurve(point(32_768, 300, 38, { caveat_flags: ["cache_evicted"] }));
-    expect(curve[0].excluded).toBe(true);
-    expect(curve[0].excludedReason).toContain("prefix cache did not hold");
-  });
-
-  it("flags a context-shifted row too -- shifted contexts corrupt TTFT comparability", () => {
-    const curve = buildCurve(point(32_768, 300, 38, { caveat_flags: ["context_shift"] }));
-    expect(curve[0].excluded).toBe(true);
-    expect(curve[0].excludedReason).toContain("--no-context-shift");
-  });
 });
 
 describe("N1 sizing ladder", () => {
