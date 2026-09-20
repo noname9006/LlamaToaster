@@ -34,9 +34,12 @@ import { buildPromptTokens, fetchFillerBlocks, type FillerBlocks } from "./fille
 import {
   buildServerArgs,
   contextSizeForSlots,
+  generationRate,
   planConcurrentBatch,
   planCurvePoint,
+  prefillRate,
   summarizeStreams,
+  type RateReading,
   type RequestClass,
   type StreamSample,
 } from "./loadDriver.js";
@@ -340,6 +343,8 @@ export async function streamedCompletion(input: StreamedRequestInput): Promise<S
   let tokensPredicted = 0;
   let promptN = 0;
   let promptMs: number | null = null;
+  let predictedN: number | null = null;
+  let predictedMs: number | null = null;
 
   const res = await fetch(`http://127.0.0.1:${input.port}/completion`, {
     method: "POST",
@@ -376,7 +381,7 @@ export async function streamedCompletion(input: StreamedRequestInput): Promise<S
       const payload = line.slice("data:".length).trim();
       if (!payload || payload === "[DONE]") continue;
       let parsed: {
-        timings?: { prompt_n?: number; prompt_ms?: number; predicted_n?: number };
+        timings?: { prompt_n?: number; prompt_ms?: number; predicted_n?: number; predicted_ms?: number };
         tokens_predicted?: number;
         error?: { message?: string; code?: number; type?: string };
       };
@@ -397,6 +402,13 @@ export async function streamedCompletion(input: StreamedRequestInput): Promise<S
       if (parsed.timings) {
         if (typeof parsed.timings.prompt_n === "number") promptN = parsed.timings.prompt_n;
         if (typeof parsed.timings.prompt_ms === "number") promptMs = parsed.timings.prompt_ms;
+        // The decode-only span, carried on the final frame. Declared in this
+        // parse type since the streaming path was written, and until v7 read
+        // by nobody -- every caller instead divided tokens by the wall-clock
+        // window after the first chunk, which is a different (and, at one
+        // token, empty) span.
+        if (typeof parsed.timings.predicted_n === "number") predictedN = parsed.timings.predicted_n;
+        if (typeof parsed.timings.predicted_ms === "number") predictedMs = parsed.timings.predicted_ms;
       }
       if (typeof parsed.tokens_predicted === "number") tokensPredicted = parsed.tokens_predicted;
     }
@@ -408,6 +420,8 @@ export async function streamedCompletion(input: StreamedRequestInput): Promise<S
     tokensPredicted,
     promptN,
     promptMs,
+    predictedN,
+    predictedMs,
     slot: input.slot ?? 0,
   };
 }
@@ -439,12 +453,17 @@ export interface CurvePointExecution {
   warning?: string;
 }
 
-// The choreography itself. Three request classes, never averaged together --
-// planCurvePoint owns the sequencing, this owns the arithmetic that turns
-// each class into the columns it is allowed to write:
-//   * cold_timed  -> ttft_ms_p50/p95 (ttft_n = 1) AND the pp row, since
-//                    timings.prompt_ms / prompt_n IS the point's pp value.
-//   * warm_repeat -> the tg row's rate, stddev and e2e mean.
+// The point itself. planCurvePoint owns the sequencing (v7: `repeats`
+// cache-free requests, each with its own nonce); this owns the arithmetic
+// that turns them into rows. Every repeat contributes to BOTH rows, because
+// every repeat prefills the whole prompt and then generates from it:
+//   * pp  <- each request's own timings.prompt_ms / prompt_n
+//   * tg  <- each request's own timings.predicted_ms / predicted_n
+//   * ttft/e2e <- this side's clock, one sample per repeat
+// Readings that fail a cross-check are kept and flagged (suspect_count and
+// suspect_samples), never silently averaged in and never silently erased --
+// the same contract executeFillCurve already applies to a slice whose cache
+// did not hold.
 export async function executeCurvePoint(input: CurvePointExecutionInput): Promise<CurvePointExecution> {
   const completion = input.completion ?? streamedCompletion;
   const fillerBlocks = input.fillerBlocks ?? (await fetchFillerBlocks(input.port));
@@ -470,8 +489,9 @@ export async function executeCurvePoint(input: CurvePointExecutionInput): Promis
     samples.push({ ...outcome.sample, requestClass: step.requestClass });
   }
 
-  const cold = samples.find((s) => s.requestClass === "cold_timed");
-  const warm = samples.filter((s) => s.requestClass === "warm_repeat");
+  const pp = samples.map(prefillRate);
+  const tg = samples.map(generationRate);
+  const summary = summarizeStreams(samples);
 
   const results: IngestResultInput[] = [];
   const shared = {
@@ -486,68 +506,85 @@ export async function executeCurvePoint(input: CurvePointExecutionInput): Promis
     mtp: "off",
     n_gpu_layers_draft: 0,
     n_cpu_moe: 0,
-    // Choreographed points stamp their own vintage -- cold-timed prefill plus
-    // warm-repeat statistics is a real semantics change under §0.1, and that
-    // stamp is what keeps ordinary runtime rows out of curves. Bumped again
-    // when the filler prompt became a mixed-register passage, which moved
-    // measured MoE prefill by 58%.
+    // Choreographed points stamp their own vintage -- §0.1. Bumped to 7 when
+    // every repeat became cache-free and tg moved to the server's own decode
+    // timer; v5's tg readings were measured over a window that held no
+    // generation whenever the prefix cache did not hold, so the two vintages
+    // must never be averaged.
     method_version: CURVE_METHOD_VERSION,
     prompt_offset: input.promptOffset ?? 0,
     concurrency: 1,
   };
 
-  if (cold) {
-    // pp from the cold request's OWN timings, which is how the curve keeps a
-    // pp column while §0.2 keeps n_depth = 0 on server rows.
-    const ppTps = cold.promptMs != null && cold.promptMs > 0 ? (cold.promptN / cold.promptMs) * 1000 : null;
+  const reasons: string[] = [];
+  const row = (
+    testType: "pp" | "tg",
+    readings: (RateReading | null)[],
+    extra: Partial<IngestResultInput>
+  ): void => {
+    const usable = readings.filter((r): r is RateReading => r != null);
+    if (usable.length === 0) return;
+    const clean = usable.filter((r) => !r.suspect).map((r) => r.value);
+    const suspect = usable.filter((r) => r.suspect).map((r) => r.value);
+    // Grouped by cause, with one example's own numbers: five repeats failing
+    // the same cross-check are one counted sentence, not five near-identical
+    // ones stacked into an unreadable warning.
+    for (const kind of new Set(usable.filter((r) => r.suspect).map((r) => r.kind))) {
+      const hits = usable.filter((r) => r.suspect && r.kind === kind);
+      reasons.push(
+        `${testType}: ${hits.length} of ${readings.length} repeat(s) flagged -- ${hits[0].reason}` +
+          (hits.length > 1 ? " (and others)" : "")
+      );
+    }
+    // An all-suspect row still reports a number rather than a silent gap, and
+    // says so through suspect_count -- see serverBench.ts's buildPhaseSummary
+    // for the same decision and the incident that drove it.
+    const basis = clean.length > 0 ? clean : suspect;
+    const mean = basis.reduce((a, b) => a + b, 0) / basis.length;
+    const variance = basis.length > 1 ? basis.reduce((acc, v) => acc + (v - mean) ** 2, 0) / (basis.length - 1) : 0;
     results.push({
       ...shared,
-      test_type: "pp",
+      test_type: testType,
       n_prompt: input.effectiveCtx,
-      n_gen: 0,
-      avg_tps: ppTps ?? 0,
-      stddev_tps: 0,
-      sample_count: 1,
-      suspect_count: ppTps == null ? 1 : 0,
-      // Single-sample by construction; the UI labels it as such rather than
-      // implying a p50/p95 over repeats that never happened.
-      ttft_ms_p50: cold.ttftMs,
-      ttft_ms_p95: cold.ttftMs,
-      ttft_n: 1,
-      e2e_ms_mean: cold.e2eMs,
-    } as IngestResultInput);
-  }
-
-  if (warm.length > 0) {
-    const summary = summarizeStreams(warm);
-    const rates = warm
-      .filter((s) => s.e2eMs > s.ttftMs && s.tokensPredicted > 0)
-      .map((s) => (s.tokensPredicted / (s.e2eMs - s.ttftMs)) * 1000);
-    const mean = rates.length > 0 ? rates.reduce((a, b) => a + b, 0) / rates.length : 0;
-    const variance =
-      rates.length > 1 ? rates.reduce((acc, v) => acc + (v - mean) ** 2, 0) / (rates.length - 1) : 0;
-    results.push({
-      ...shared,
-      test_type: "tg",
-      n_prompt: input.effectiveCtx,
-      n_gen: input.nGen,
       avg_tps: mean,
       stddev_tps: Math.sqrt(variance),
-      sample_count: rates.length,
-      suspect_count: 0,
-      repeat_samples: rates,
-      e2e_ms_mean: summary.e2eMeanMs ?? undefined,
+      sample_count: basis.length,
+      suspect_count: suspect.length,
+      repeat_samples: clean,
+      suspect_samples: suspect,
+      ...extra,
     } as IngestResultInput);
+  };
+
+  row("pp", pp, {
+    n_gen: 0,
+    ttft_ms_p50: summary.ttftP50Ms ?? undefined,
+    ttft_ms_p95: summary.ttftP95Ms ?? undefined,
+    ttft_n: summary.ttftN,
+    e2e_ms_mean: summary.e2eMeanMs ?? undefined,
+  });
+  // e2e is the WHOLE request on both rows -- prefill and generation together,
+  // since that is what a cache-free repeat actually costs. Under v5 the tg
+  // row's e2e was meant to be decode-only (a warm repeat skipping prefill),
+  // which is another reason v5 and v7 rows must not be compared.
+  row("tg", tg, { n_gen: input.nGen, e2e_ms_mean: summary.e2eMeanMs ?? undefined });
+
+  // A repeat that reported no decode timing at all yields no tg reading --
+  // distinct from one that yielded a flagged reading, and worth saying so
+  // rather than quietly shrinking sample_count.
+  const untimed = tg.filter((r) => r == null).length;
+  if (untimed > 0) {
+    reasons.push(`${untimed} of ${samples.length} repeat(s) reported no generation timing at all`);
+  }
+  const unprefilled = pp.filter((r) => r == null).length;
+  if (unprefilled > 0) {
+    reasons.push(`${unprefilled} of ${samples.length} repeat(s) reported no prefill timing at all`);
   }
 
-  const evictedCount = samples.filter((s) => s.requestClass === "warm_repeat" && s.promptN > 0).length;
   return {
     results,
     samples,
-    warning:
-      evictedCount > 0
-        ? `${evictedCount} warm repeat(s) re-prefilled the prompt: the prefix cache did not hold, so this point's generation numbers are not comparable to a cache-warm reading`
-        : undefined,
+    warning: reasons.length > 0 ? reasons.join("; ") : undefined,
   };
 }
 
@@ -820,6 +857,17 @@ export interface ProbeAttemptOutcome {
    * VRAM and system RAM. Null when no per-process dedicated reading was taken. */
   vramClaimedPeakMib?: number | null;
   genTps: number | null;
+  /**
+   * Whether this load produced any tokens at all -- the rung's liveness
+   * proof, deliberately SEPARATE from genTps. A rate is a measurement and can
+   * legitimately be unavailable (no decode timing reported, a reading that
+   * failed its cross-check); "it generated" is a fact about whether the
+   * placement works, and the ladder's fitsFree reasoning depends on it. They
+   * were the same field until v7, which meant any future tightening of what
+   * counts as a usable RATE would silently start classifying working rungs
+   * as failed loads. Undefined on an outcome that never ran a request.
+   */
+  generated?: boolean;
   /** Fraction of the adapter total still free at this candidate. */
   headroomFrac?: number | null;
   /** The placement this rung loaded at -- the ladder moves ngl too. */
@@ -994,6 +1042,15 @@ export function probeSucceeded(input: {
   // adapter-total rule below, which is a statement about the device.
   vramPeakMib: number | null;
   gpuTotalMib: number | null;
+  /**
+   * Whether the load produced any tokens. This, not genTps, is what the
+   * "generated nothing" rule below asks: a rung that generated tokens worked,
+   * even if no usable RATE could be computed for it (an older build reporting
+   * no decode timing, or a reading that failed its cross-check). Conflating
+   * the two is how a tightened rate check could start failing working rungs.
+   */
+  generated: boolean;
+  /** Telemetry only -- no rule below reads it. */
   genTps: number | null;
   // The rung's requested layer count and computeDualPoolFit's predicted GPU
   // need for it: the inference's inputs, consulted only when the spill could
@@ -1068,16 +1125,16 @@ export function probeSucceeded(input: {
       input.estimatedVramMib != null &&
       observedMib != null &&
       isVramDiscrepancy(input.estimatedVramMib, observedMib);
-  // "Generated nothing measurable" is still a failure -- that is not a slow
-  // configuration, it is one that did not work. Any positive rate passes.
-  if (input.genTps == null) {
+  // "Generated nothing" is still a failure -- that is not a slow
+  // configuration, it is one that did not work. Any token at all passes.
+  if (!input.generated) {
     return {
       ok: false,
       spill: false,
       vramDiscrepancy,
       gpuSpill,
       failCause: null,
-      reason: "the model loaded but produced no measurable generation",
+      reason: "the model loaded but generated nothing",
     };
   }
   if (gpuSpill.spilled && gpuSpill.inSystemRamMib != null && input.gpuBuffers) {

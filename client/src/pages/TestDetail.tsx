@@ -6,6 +6,7 @@ import { ProbeAttempts } from "../components/ProbeAttempts";
 import { ProbeFrontier } from "../components/ProbeFrontier";
 import { api as apiClient } from "../api/client";
 import { priceMatrix, ETA_UNAVAILABLE } from "../../../shared/pricing";
+import { CURVE_DEFAULT_N_GEN } from "../../../shared/types";
 import { useParams, Link } from "react-router-dom";
 import type { ChartConfiguration } from "chart.js";
 import { api } from "../api/client";
@@ -988,6 +989,12 @@ export function TestDetail() {
       return;
     }
 
+    // A curve measures decode at each context, so it cannot inherit a
+    // prompt-only grid's n_gen of 0 -- the server rejects that outright. The
+    // ETA below is priced from the SAME number that gets sent, so the
+    // estimate describes the run that will actually happen.
+    const curveNGen = config.sweep.n_gen?.find((n) => n > 0) ?? CURVE_DEFAULT_N_GEN;
+
     setMeasureMsg("Pricing uncovered ladder cells…");
     let priceLabel = "";
     try {
@@ -995,7 +1002,7 @@ export function TestDetail() {
       const priced = priceMatrix(
         contexts.map((ctx) => ({
           nPrompt: ctx,
-          nGen: config.sweep!.n_gen?.[0] ?? 128,
+          nGen: curveNGen,
           repeats: config.sweep!.repeats ?? 1,
           ppRate: rates.pp,
           tgRate: rates.tg,
@@ -1012,7 +1019,7 @@ export function TestDetail() {
         model_id: run.model_id,
         worker_id: run.worker_id,
         kind: "runtime",
-        curve_point: { effective_ctx: contexts },
+        curve_point: { effective_ctx: contexts, n_gen: curveNGen },
         sweep: config.sweep as never,
       });
       setMeasureMsg(

@@ -11,6 +11,7 @@ import {
 } from "./exchange.js";
 import {
   CURVE_METHOD_VERSION,
+  WALL_CLOCK_CURVE_METHOD_VERSION,
   LEGACY_CURVE_METHOD_VERSION,
   METHOD_VERSION,
   SERVER_METHOD_VERSION,
@@ -99,8 +100,16 @@ describe("N7 export bundle", () => {
 
   it("embeds a methods section keyed to the method version", () => {
     expect(methodsFor(METHOD_VERSION).pipeline.join(" ")).toContain("stddev");
-    expect(methodsFor(CURVE_METHOD_VERSION).summary).toContain("cold timed prefill");
-    expect(methodsFor(CURVE_METHOD_VERSION).pipeline.join(" ")).toContain("warm repeats");
+    expect(methodsFor(CURVE_METHOD_VERSION).summary).toContain("cache-free");
+    expect(methodsFor(CURVE_METHOD_VERSION).pipeline.join(" ")).toContain("cache_prompt off");
+    // The vintage whose generation rate came from the post-first-chunk
+    // window keeps its own section, and states the caveat: relabelling those
+    // stored rows with today's pipeline would misdescribe shared data, and
+    // silently dropping the caveat would leave a reader trusting a number
+    // that was measured over a window holding no generation.
+    expect(methodsFor(WALL_CLOCK_CURVE_METHOD_VERSION).method_version).toBe(WALL_CLOCK_CURVE_METHOD_VERSION);
+    expect(methodsFor(WALL_CLOCK_CURVE_METHOD_VERSION).summary).toContain("warm repeats");
+    expect(methodsFor(WALL_CLOCK_CURVE_METHOD_VERSION).pipeline.join(" ")).toContain("measurement noise");
     // Server-measured rows say so, and say what the prompt was.
     expect(methodsFor(SERVER_METHOD_VERSION).pipeline.join(" ")).toContain("mixed-register");
     expect(methodsFor(SERVER_METHOD_VERSION).pipeline.join(" ")).toContain("under a grammar");

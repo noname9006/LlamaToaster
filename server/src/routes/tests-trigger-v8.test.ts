@@ -481,6 +481,51 @@ describe("§0.7/N2 capability gates", () => {
     expect(res.status).toBe(409);
   });
 
+  // The production incident: "Measure missing points" inherited a
+  // prompt-only grid's n_gen of 0, and the worker spent five hours storing
+  // generation rows for a generation that never happened.
+  it("refuses a curve point that would generate nothing", async () => {
+    await heartbeat("v8-curve-zero-gen", { capabilities: ["benchmark", "curve-v1"] });
+    const worker = repo.workerRepo.getByMachineId("v8-curve-zero-gen")!;
+    const res = await postJson("/api/runs/trigger", {
+      model_id: "v8-model",
+      worker_id: worker.id,
+      kind: "runtime",
+      curve_point: { effective_ctx: 4096 },
+      sweep: { ...baseSweep, n_gen: [0] },
+    });
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { error: string }).error).toContain("curve_point.n_gen");
+  });
+
+  // ...while an ordinary sweep's prompt-only grid is untouched: n_gen 0 is a
+  // legitimate llama-bench prefill row.
+  it("still accepts a prompt-only grid for an ordinary sweep", async () => {
+    drainActiveRuns();
+    await heartbeat("v8-sweep-zero-gen");
+    const worker = repo.workerRepo.getByMachineId("v8-sweep-zero-gen")!;
+    const res = await postJson("/api/runs/trigger", {
+      model_id: "v8-model",
+      worker_id: worker.id,
+      sweep: { ...baseSweep, n_gen: [0] },
+    });
+    expect(res.status).toBe(201);
+  });
+
+  it("takes an explicit curve n_gen over the grid's", async () => {
+    drainActiveRuns();
+    await heartbeat("v8-curve-explicit-gen", { capabilities: ["benchmark", "curve-v1"] });
+    const worker = repo.workerRepo.getByMachineId("v8-curve-explicit-gen")!;
+    const res = await postJson("/api/runs/trigger", {
+      model_id: "v8-model",
+      worker_id: worker.id,
+      kind: "runtime",
+      curve_point: { effective_ctx: 4096, n_gen: 128 },
+      sweep: { ...baseSweep, n_gen: [0] },
+    });
+    expect(res.status).toBe(201);
+  });
+
   it("refuses curve points beyond trained ctx -- nothing beyond it can appear as measured", async () => {
     repo.registerModel({
       id: "v8-trained",

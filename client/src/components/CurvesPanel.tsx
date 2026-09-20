@@ -4,6 +4,8 @@
 // A curve is NOT a new table: it is a deterministic grouping over `results`,
 // computed on read. Choreographed server-path points stamp METHOD_VERSION 2,
 // which is what keeps ordinary runtime rows' warm-biased TTFT out of curves.
+// Points are cache-free as of that vintage: see shared/types.ts's
+// CURVE_METHOD_VERSION for why the warm repeats were removed.
 //
 // Accessibility: the concurrency chart pairs its bars with an sr-only summary
 // sentence, and "Measure missing points" renders aria-disabled with its reason
@@ -190,10 +192,10 @@ export function CurvesPanel({ modelId, workerId, build, targetCtx, onMeasureMiss
       </div>
 
       <p className="mt-3 rounded-lg border border-accent/25 bg-accent/[0.06] px-3 py-2 text-[11px] leading-relaxed text-muted">
-        Server-path points measure prefill cost once per point with a timed streamed request (that reading{" "}
-        <b className="text-fg">is</b> the TTFT column), then run the remaining repeats against the warm cache for
-        clean generation numbers — the two clocks never average together. No new table: a curve is a deterministic
-        grouping over <span className="font-mono">results</span>.
+        Server-path points run every repeat cold, on its own prompt, with the prefix cache off: each one is a
+        streamed request whose first chunk is a TTFT sample, and whose prefill and generation rates both come from
+        that same request&rsquo;s own timers. No repeat depends on another&rsquo;s cache. No new table: a curve is a
+        deterministic grouping over <span className="font-mono">results</span>.
       </p>
     </div>
   );

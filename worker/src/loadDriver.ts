@@ -152,6 +152,16 @@ export interface StreamSample {
   promptN: number;
   /** llama-server's own prefill timing, when it reported one. */
   promptMs: number | null;
+  /**
+   * Tokens the server's own decode timer counted, and the ms it says they
+   * took -- the generation-only span, which is NOT derivable on this side of
+   * the connection: the wall clock can only see "after the first chunk
+   * arrived", a window that holds tokensPredicted - 1 tokens at best and
+   * nothing at all when only one token was generated. Null when the server
+   * reported no such timing (older builds, or a stream that ended early).
+   */
+  predictedN: number | null;
+  predictedMs: number | null;
   /** Which slot/stream produced this sample (N5). */
   slot: number;
 }
@@ -199,9 +209,135 @@ export function summarizeStreams(samples: StreamSample[]): StreamSummary {
   };
 }
 
+// --- N1: one request's two rates -------------------------------------------
+
+// An absolute ceiling on either side of a pair. Same role and the same
+// reasoning as serverBench.ts's constants (the ~1e6 tok/s timer-bug class):
+// generous enough that no real load on the hardware this tool targets could
+// reach it. Note what it does NOT catch on its own -- the production failure
+// that motivated v7 reported 1000 tok/s, three orders of magnitude under the
+// tg ceiling, and every reading looked individually "possible". The
+// cross-checks below are what catch that class; the ceiling is the backstop.
+export const MAX_PLAUSIBLE_PP_TOKENS_PER_SECOND = 200_000;
+export const MAX_PLAUSIBLE_TG_TOKENS_PER_SECOND = 5_000;
+
+// Below this many prompt tokens, a prefill reading mostly times first-request
+// setup rather than prefill itself -- measured on an RX 6600 XT at 1.3 tok/s
+// for a 16-token prompt against ~20 tok/s from 128 tokens up (see the probe's
+// PROBE_PROMPT_TOKENS and its commit). Such a pp value is real for what it
+// measures but useless as a comparison bound, so the pp-vs-tg cross-check
+// below stays out of its way.
+export const MIN_PROMPT_TOKENS_FOR_PP_CROSSCHECK = 128;
+
+// How far the server's own decode timer may run ahead of what this side's
+// wall clock can corroborate before the reading is called suspect. The wall
+// clock sees the span after the FIRST streamed chunk, which holds at most
+// tokensPredicted - 1 tokens and may hold fewer still if the transport
+// coalesced several frames into that first chunk -- so it is a soft bound,
+// not an equality, and the factor is deliberately loose.
+const WALL_CLOCK_DISAGREEMENT_FACTOR = 2;
+
+/** Which cross-check a suspect reading failed -- the grouping key for a
+ * point's warning, so five flagged repeats read as one counted sentence
+ * rather than five near-identical ones. */
+export type SuspectKind = "ceiling" | "faster_than_prefill" | "wall_clock";
+
+export interface RateReading {
+  value: number;
+  /** Kept and reported rather than discarded -- §"suspect readings are kept and flagged". */
+  suspect: boolean;
+  /** Set together with `reason` whenever suspect; both null when not. */
+  kind: SuspectKind | null;
+  /** Why it is suspect, with this reading's own numbers in it. */
+  reason: string | null;
+}
+
+/**
+ * Prefill rate from ONE request's own timings. Null when the server reported
+ * no usable prefill (a cache hit prefilling nothing, or no timings at all).
+ */
+export function prefillRate(sample: StreamSample): RateReading | null {
+  if (sample.promptMs == null || sample.promptMs <= 0 || sample.promptN <= 0) return null;
+  const value = (sample.promptN / sample.promptMs) * 1000;
+  if (!Number.isFinite(value)) return null;
+  return value > MAX_PLAUSIBLE_PP_TOKENS_PER_SECOND
+    ? {
+        value,
+        suspect: true,
+        kind: "ceiling",
+        reason: `prefill rate above the ${MAX_PLAUSIBLE_PP_TOKENS_PER_SECOND} tok/s ceiling`,
+      }
+    : { value, suspect: false, kind: null, reason: null };
+}
+
+/**
+ * Generation rate from ONE request's own decode timer, cross-checked against
+ * that same request's prefill rate and against this side's wall clock.
+ *
+ * Deliberately NOT computed from (e2eMs - ttftMs): that window starts at the
+ * first streamed chunk, so it excludes the first token entirely and is empty
+ * when only one token was generated. v5 divided the FULL token count by it
+ * and published the result, which is how a CPU load whose prefill ran at 15
+ * tok/s came to report 1000 tok/s generation -- one token over a 1 ms window
+ * that contained no decoding at all.
+ *
+ * A single token IS a legitimate sample here, unlike under the old formula:
+ * the server's timer measures that token's own decode, not a leftover span.
+ */
+export function generationRate(sample: StreamSample): RateReading | null {
+  if (sample.predictedN == null || sample.predictedMs == null) return null;
+  if (sample.predictedN <= 0 || sample.predictedMs <= 0) return null;
+  const value = (sample.predictedN / sample.predictedMs) * 1000;
+  if (!Number.isFinite(value)) return null;
+
+  if (value > MAX_PLAUSIBLE_TG_TOKENS_PER_SECOND) {
+    return {
+      value,
+      suspect: true,
+      kind: "ceiling",
+      reason: `generation rate above the ${MAX_PLAUSIBLE_TG_TOKENS_PER_SECOND} tok/s ceiling`,
+    };
+  }
+
+  // Batched prefill reads the whole prompt in ubatch-sized chunks; decode
+  // walks one token at a time through the same weights. Decode faster than
+  // prefill, on the same request and the same hardware, means one of the two
+  // timers is lying.
+  const pp = prefillRate(sample);
+  if (pp != null && !pp.suspect && sample.promptN >= MIN_PROMPT_TOKENS_FOR_PP_CROSSCHECK && value > pp.value) {
+    return {
+      value,
+      suspect: true,
+      kind: "faster_than_prefill",
+      reason: `generation (${value.toFixed(2)} tok/s) read faster than this request's own prefill (${pp.value.toFixed(2)} tok/s)`,
+    };
+  }
+
+  // Independent corroboration: the span after the first chunk holds at most
+  // predictedN - 1 tokens, so the rate it implies is an upper bound the
+  // server's own timer should not wildly exceed.
+  if (sample.predictedN >= 2 && sample.e2eMs > sample.ttftMs) {
+    const wallClock = ((sample.predictedN - 1) / (sample.e2eMs - sample.ttftMs)) * 1000;
+    if (wallClock > 0 && value > wallClock * WALL_CLOCK_DISAGREEMENT_FACTOR) {
+      return {
+        value,
+        suspect: true,
+        kind: "wall_clock",
+        reason: `the server's decode timer (${value.toFixed(2)} tok/s) disagrees with this side's wall clock (at most ${wallClock.toFixed(2)} tok/s)`,
+      };
+    }
+  }
+
+  return { value, suspect: false, kind: null, reason: null };
+}
+
 // --- N1: request classes -----------------------------------------------------
 
-export type RequestClass = "cold_timed" | "warm_repeat";
+// One class only, since v7: every curve request is a cold, cache-free
+// measurement of its own. "cold_timed" is kept as the name (rather than
+// dropped entirely) because stored samples and the worker's own logs refer to
+// it, and because a future class would need to be distinguished FROM it.
+export type RequestClass = "cold_timed";
 
 // --- N1: the choreography ---------------------------------------------------
 
@@ -212,47 +348,41 @@ export interface CurveRequestPlanStep {
   nPredict: number;
   /** Whether this request opts into prefix-cache reuse. */
   cachePrompt: boolean;
-  /** Distinct per request class -- see planCurvePoint. */
+  /** Distinct per repeat, so no two requests share a prefix -- see planCurvePoint. */
   nonce: number;
   /** Excluded from statistics by construction. */
   countsTowardStatistics: boolean;
 }
 
-// Two request classes, never averaged together:
-//   1. cold timed prefill, ONE per point -- full prompt, stream, n_predict 1,
-//      ignore_eos, against a server that has not served a request yet.
-//      First-chunk arrival IS the TTFT data point, and the same response's
-//      timings.prompt_ms / prompt_n is the point's pp value. Deliberately no
-//      throwaway warmup request ahead of it (removed 2026-09-17, was
-//      "warm_discard"): a policy call to keep context tests consistent --
-//      N2's probe and N5's knee ladder never had a warmup step either, so
-//      every point measures its own server's genuinely first request rather
-//      than one whose CUDA-graph/pipeline-compile cost was pre-absorbed.
-//   2. warm repeats x (repeats - 1) -- identical prompt with cache_prompt,
-//      which is where generation/E2E statistics come from.
+// `repeats` identical-shape requests, every one of them cold:
+//   * full prompt, streamed, ignore_eos, n_predict = nGen.
+//   * cache_prompt OFF, and a DIFFERENT nonce per repeat, so no request can
+//     reuse another's prefix even if llama-server decided to ignore the flag.
+//     Belt and braces on purpose: the warm-repeat design this replaced relied
+//     on a cache hit it could only detect after the fact (prompt_n > 0), and
+//     in production it silently never held -- every repeat re-prefilled while
+//     the code went on reporting a "cache-warm" generation rate measured over
+//     a window that contained no generation at all.
+//   * every repeat therefore yields BOTH rates from its own response timings
+//     (pp from prompt_ms/prompt_n, tg from predicted_ms/predicted_n) plus its
+//     own TTFT, instead of one pp sample and repeats-1 tg samples.
+// Deliberately no throwaway warmup request ahead of the first (removed
+// 2026-09-17, was "warm_discard"): a policy call to keep context tests
+// consistent -- N2's probe and N5's knee ladder never had a warmup step
+// either. Note this makes repeats genuinely expensive at wide contexts: each
+// one pays a full prefill. That is what the ETA has always priced
+// (pricing.ts prices nPrompt/ppRate * repeats), so estimates get MORE
+// accurate here, not less.
 export function planCurvePoint(input: { promptTokens: number; nGen: number; repeats: number }): CurveRequestPlanStep[] {
   const repeats = Math.max(1, input.repeats);
-  const steps: CurveRequestPlanStep[] = [
-    {
-      requestClass: "cold_timed",
-      promptTokens: input.promptTokens,
-      nPredict: 1,
-      cachePrompt: false,
-      nonce: 0,
-      countsTowardStatistics: true,
-    },
-  ];
-  for (let i = 0; i < repeats - 1; i++) {
-    steps.push({
-      requestClass: "warm_repeat",
-      promptTokens: input.promptTokens,
-      nPredict: input.nGen,
-      cachePrompt: true,
-      nonce: 0,
-      countsTowardStatistics: true,
-    });
-  }
-  return steps;
+  return Array.from({ length: repeats }, (_, i) => ({
+    requestClass: "cold_timed" as const,
+    promptTokens: input.promptTokens,
+    nPredict: input.nGen,
+    cachePrompt: false,
+    nonce: i,
+    countsTowardStatistics: true,
+  }));
 }
 
 // --- N5: the knee ladder ----------------------------------------------------

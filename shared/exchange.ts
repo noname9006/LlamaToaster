@@ -7,9 +7,11 @@
 import { configHash, type ConfigHashInput } from "./configHash.js";
 import {
   CURVE_METHOD_VERSION,
+  FILL_CURVE_METHOD_VERSION,
   LEGACY_CURVE_METHOD_VERSION,
   METHOD_VERSION,
   SERVER_METHOD_VERSION,
+  WALL_CLOCK_CURVE_METHOD_VERSION,
   type TestType,
 } from "./types.js";
 import type { GoalsConfig } from "./goals.js";
@@ -130,11 +132,28 @@ export function methodsFor(methodVersion: number): MethodsSection {
     return {
       method_version: CURVE_METHOD_VERSION,
       summary:
-        "Context-curve choreography: one cold timed prefill against a server that has not yet served a request, whose first streamed chunk is the TTFT reading, then warm repeats against the prefix cache for generation statistics. No throwaway warm-up request precedes it.",
+        "Context-curve points measured cache-free: every repeat is a cold, self-contained request with its own prompt, and both rates come from llama-server's own timers for that one request. No repeat reuses another's prefix cache, so no reading depends on a cache hit that may or may not have happened.",
+      pipeline: [
+        "every repeat: full prompt, streamed, ignore_eos, cache_prompt off, and a per-repeat nonce so no prefix can match even by accident",
+        "pp comes from that request's own timings.prompt_ms / prompt_n; tg from its timings.predicted_ms / predicted_n",
+        "TTFT is first-chunk arrival, one sample per repeat (p50/p95 over all of them)",
+        "cross-check: a tg reading is flagged suspect when it exceeds its own request's prefill rate, or when the server's decode timer disagrees with this side's wall clock -- batched prefill is never slower than token-by-token decode",
+        "implausibility filter rejects physically impossible rates; suspect readings are kept and flagged, never silently erased",
+        "stability gate: stddev <= max(10 % of mean, 0.5 tok/s), n >= 3",
+        "filler prompt: a tokenized mixed-register passage (prose, code, equations, structured data, non-Latin scripts), every register holding an equal share of the prompt at every size and interleaved below the ubatch so each batch sees all of them",
+      ],
+    };
+  }
+  if (methodVersion === WALL_CLOCK_CURVE_METHOD_VERSION) {
+    return {
+      method_version: WALL_CLOCK_CURVE_METHOD_VERSION,
+      summary:
+        "Context-curve choreography: one cold timed prefill against a server that has not yet served a request, whose first streamed chunk is the TTFT reading, then warm repeats against the prefix cache for generation statistics. No throwaway warm-up request precedes it. Generation rate from this vintage is unreliable -- see the caveat below.",
       pipeline: [
         "cold timed prefill: full prompt, streamed, n_predict 1, ignore_eos, against a freshly started server -- first-chunk arrival is TTFT (single sample, labeled as such)",
         "pp for the point comes from that same response's timings.prompt_ms / prompt_n",
         "warm repeats: identical prompt with cache_prompt, against the same still-running server",
+        "CAVEAT: the generation rate was computed as tokens / (end - first chunk). When the prefix cache did not hold, that window held no generation at all and the rate is measurement noise, not speed -- any tg row of this vintage carrying a cache-evicted warning should be read as unmeasured. Prompt-processing rates and TTFT are unaffected.",
         "implausibility filter rejects physically impossible rates; wall-clock fallback readings are marked suspect",
         "stability gate: stddev <= max(10 % of mean, 0.5 tok/s), n >= 3",
         "filler prompt: a tokenized mixed-register passage (prose, code, equations, structured data, non-Latin scripts), every register holding an equal share of the prompt at every size and interleaved below the ubatch so each batch sees all of them",
@@ -151,6 +170,7 @@ export function methodsFor(methodVersion: number): MethodsSection {
         "cold timed prefill: full prompt, streamed, n_predict 1, ignore_eos -- first-chunk arrival is TTFT (single sample, labeled as such)",
         "pp for the point comes from that same response's timings.prompt_ms / prompt_n",
         "warm repeats: identical prompt with cache_prompt -- any repeat reporting prompt_n > 0 re-prefilled and flags cache_evicted",
+        "CAVEAT: the generation rate was computed as tokens / (end - first chunk). When the prefix cache did not hold, that window held no generation at all and the rate is measurement noise, not speed -- any tg row of this vintage carrying a cache-evicted warning should be read as unmeasured. Prompt-processing rates and TTFT are unaffected.",
         "implausibility filter rejects physically impossible rates; wall-clock fallback readings are marked suspect",
         "stability gate: stddev <= max(10 % of mean, 0.5 tok/s), n >= 3",
         "filler prompt: a tokenized mixed-register passage (prose, code, equations, structured data, non-Latin scripts), every register holding an equal share of the prompt at every size and interleaved below the ubatch so each batch sees all of them",
@@ -167,9 +187,24 @@ export function methodsFor(methodVersion: number): MethodsSection {
         "cold timed prefill: full prompt, streamed, n_predict 1, ignore_eos -- first-chunk arrival is TTFT (single sample, labeled as such)",
         "pp for the point comes from that same response's timings.prompt_ms / prompt_n",
         "warm repeats: identical prompt with cache_prompt -- any repeat reporting prompt_n > 0 re-prefilled and flags cache_evicted",
+        "CAVEAT: the generation rate was computed as tokens / (end - first chunk). When the prefix cache did not hold, that window held no generation at all and the rate is measurement noise, not speed -- any tg row of this vintage carrying a cache-evicted warning should be read as unmeasured. Prompt-processing rates and TTFT are unaffected.",
         "implausibility filter rejects physically impossible rates; wall-clock fallback readings are marked suspect",
         "stability gate: stddev <= max(10 % of mean, 0.5 tok/s), n >= 3",
         "filler prompt: a low-entropy synthetic token range -- on a mixture-of-experts model with experts on CPU this reads well above a realistic prompt, so prefill from this vintage is not comparable with later rows",
+      ],
+    };
+  }
+  if (methodVersion === FILL_CURVE_METHOD_VERSION) {
+    return {
+      method_version: FILL_CURVE_METHOD_VERSION,
+      summary:
+        "Prefill speed along one context's fill: a single prompt grown in slices, each slice's own prefill rate recorded against how full the context already was. A row's rate covers ONLY the tokens appended on top of a cached prefix, so it must never be averaged with a whole-prompt pp reading.",
+      pipeline: [
+        "one llama-server per sweep item, started with -c = the context under test",
+        "each repeat walks the whole fill once on its own prompt; within a repeat, each request extends the previous one with cache_prompt on",
+        "a slice's rate is that request's own timings.prompt_ms / prompt_n",
+        "a request that prefilled materially more than its own slice re-prefilled from an earlier point -- excluded from the slice's statistics and counted in suspect_count",
+        "sample (n-1) standard deviation, matching llama-bench's own formula",
       ],
     };
   }

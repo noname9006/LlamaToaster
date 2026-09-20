@@ -992,6 +992,31 @@ export async function testsRoutes(app: FastifyInstance): Promise<void> {
       let curveContexts: number[] = [];
       if (body.curve_point) {
         const c = body.curve_point;
+        // A curve point that generates nothing measures nothing: the worker
+        // would start a server per context, ask for zero tokens and store
+        // whatever the server reported for a generation that never happened.
+        // Observed in production -- "Measure missing points" inherits its
+        // grid from the run it was launched from, and a prompt-only grid
+        // carries n_gen 0, which produced a five-hour run of unusable
+        // generation rows. The knee block above has enforced n_gen >= 1 all
+        // along; same rule, same reason. NOT applied to ordinary sweeps,
+        // where n_gen 0 is a legitimate prefill-only llama-bench row.
+        const effectiveNGen = c.n_gen ?? expanded[0].n_gen;
+        if (!Number.isInteger(effectiveNGen) || effectiveNGen < 1 || effectiveNGen > 1_048_576) {
+          return reply.code(400).send({
+            error:
+              "curve_point.n_gen must be an integer in [1, 1048576] -- a context curve measures generation, so it " +
+              "cannot inherit a prompt-only grid's n_gen of 0; set curve_point.n_gen explicitly",
+          });
+        }
+        if (
+          c.repeats !== undefined &&
+          (!Number.isInteger(c.repeats) || c.repeats < MIN_REPEATS || c.repeats > MAX_REPEATS)
+        ) {
+          return reply.code(400).send({
+            error: `curve_point.repeats must be an integer between ${MIN_REPEATS} and ${MAX_REPEATS}`,
+          });
+        }
         curveContexts = Array.isArray(c.effective_ctx) ? c.effective_ctx : [c.effective_ctx];
         if (curveContexts.length === 0) {
           return reply.code(400).send({ error: "curve_point.effective_ctx must list at least one context" });

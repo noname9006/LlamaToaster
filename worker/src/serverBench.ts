@@ -21,6 +21,10 @@ import { estimateResidentGpuLayersFromBufferSizes } from "../../shared/vramEstim
 import { buildPromptTokens, fetchFillerBlocks, type FillerBlocks } from "./fillerPrompt.js";
 import { supportsFlag } from "./binary-probe.js";
 import { SERVER_METHOD_VERSION } from "../../shared/types.js";
+import {
+  MAX_PLAUSIBLE_PP_TOKENS_PER_SECOND,
+  MAX_PLAUSIBLE_TG_TOKENS_PER_SECOND,
+} from "./loadDriver.js";
 
 // Drives llama-server over HTTP to benchmark MTP (multi-token-prediction)
 // speculative decoding -- llama-bench itself has no --spec-type/--model-draft
@@ -396,8 +400,9 @@ interface CompletionOutcome {
 // yet nowhere near the ~1e6 garbage value seen live -- catches whatever's
 // left uncaught by that (e.g. a corrupted *_ms field itself) instead of
 // silently averaging garbage into the reported result.
-const MAX_PLAUSIBLE_PP_TOKENS_PER_SECOND = 200_000;
-const MAX_PLAUSIBLE_TG_TOKENS_PER_SECOND = 5_000;
+// The two ceilings live in loadDriver.ts (imported above): the curve path
+// applies the same numbers, and two copies of a constant like this drift the
+// moment one of them is tuned.
 
 interface RateReading {
   value: number;

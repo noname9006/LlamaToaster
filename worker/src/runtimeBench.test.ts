@@ -19,28 +19,29 @@ import type { StreamSample } from "./loadDriver.js";
 import { CURVE_METHOD_VERSION, FILL_CURVE_METHOD_VERSION } from "../../shared/types.js";
 import type { SweepItem } from "../../shared/sweep.js";
 
-// A fake llama-server: every request is recorded, and the reply is shaped by
-// whether the caller opted into prefix-cache reuse.
-function fakeServer(opts: { evictOnRepeat?: number; coldPromptMs?: number } = {}) {
+// A fake llama-server. Every request is recorded, and the reply carries the
+// same four timings a real one does: its own prefill pair and its own decode
+// pair. Rates here are deliberately realistic in SHAPE -- prefill (batched)
+// faster than decode (token by token) -- because v7's cross-checks compare
+// the two against each other.
+function fakeServer(opts: { ppTps?: number; tgTps?: number } = {}) {
   const requests: (StreamedRequestInput & { promptLength: number })[] = [];
-  let warmRepeatCount = 0;
+  const ppTps = opts.ppTps ?? 310;
+  const tgTps = opts.tgTps ?? 40;
   const completion = async (input: StreamedRequestInput): Promise<StreamSample> => {
     requests.push({ ...input, promptLength: input.promptTokens.length });
-    const isWarm = input.cachePrompt;
-    let promptN = isWarm ? 0 : input.promptTokens.length;
-    if (isWarm) {
-      warmRepeatCount++;
-      if (opts.evictOnRepeat != null && warmRepeatCount === opts.evictOnRepeat) {
-        promptN = input.promptTokens.length; // the cache did not hold
-      }
-    }
-    const ttftMs = isWarm ? 40 : (opts.coldPromptMs ?? 26_400);
+    const promptN = input.promptTokens.length;
+    const promptMs = (promptN / ppTps) * 1000;
+    const predictedN = input.nPredict;
+    const predictedMs = (predictedN / tgTps) * 1000;
     return {
-      ttftMs,
-      e2eMs: ttftMs + input.nPredict * 25,
-      tokensPredicted: input.nPredict,
+      ttftMs: promptMs,
+      e2eMs: promptMs + predictedMs,
+      tokensPredicted: predictedN,
       promptN,
-      promptMs: promptN > 0 ? (opts.coldPromptMs ?? 26_400) : null,
+      promptMs,
+      predictedN,
+      predictedMs,
       slot: input.slot ?? 0,
     };
   };
@@ -56,7 +57,7 @@ const BLOCKS = [
 ];
 
 describe("N1 curve-point execution", () => {
-  it("runs the two request classes in order and never averages them together -- no warm-up request", async () => {
+  it("runs every repeat cache-free, on its own prompt, and measures both rates from each one", async () => {
     const server = fakeServer();
     const execution = await executeCurvePoint({
       effectiveCtx: 8_192,
@@ -66,25 +67,123 @@ describe("N1 curve-point execution", () => {
       fillerBlocks: BLOCKS,
       completion: server.completion,
     });
-    expect(server.requests).toHaveLength(5); // 1 cold + 4 warm
-    // The cold prefill is the FIRST request against this server, and the
-    // timed data point: full prompt, one token, no reuse.
-    expect(server.requests[0].promptLength).toBe(8_192);
-    expect(server.requests[0].nPredict).toBe(1);
-    expect(server.requests[0].cachePrompt).toBe(false);
-    // Warm repeats reuse the identical prompt.
-    expect(server.requests.slice(1).every((r) => r.cachePrompt && r.promptLength === 8_192)).toBe(true);
+    expect(server.requests).toHaveLength(5);
+    // No request opts into the prefix cache, every one sends the full prompt
+    // and asks for the full generation, and no two prompts are identical --
+    // so no repeat can reuse another's prefix even if the flag were ignored.
+    expect(server.requests.every((r) => r.cachePrompt === false)).toBe(true);
+    expect(server.requests.every((r) => r.promptLength === 8_192)).toBe(true);
+    expect(server.requests.every((r) => r.nPredict === 512)).toBe(true);
+    expect(new Set(server.requests.map((r) => r.promptTokens.join(","))).size).toBe(5);
 
     const pp = execution.results.find((r) => r.test_type === "pp")!;
     const tg = execution.results.find((r) => r.test_type === "tg")!;
-    // pp comes from the cold response's OWN timings -- prompt_n / prompt_ms.
-    expect(pp.avg_tps).toBeCloseTo((8192 / 26_400) * 1000, 6);
-    expect(pp.ttft_n).toBe(1);
-    expect(pp.ttft_ms_p50).toBe(26_400);
-    expect(pp.ttft_ms_p50).toBe(pp.ttft_ms_p95);
-    // tg statistics come only from the warm repeats.
-    expect(tg.sample_count).toBe(4);
-    expect(tg.repeat_samples).toHaveLength(4);
+    // Both rows now draw on EVERY repeat, where v5 had one pp sample and
+    // repeats-1 tg samples.
+    expect(pp.sample_count).toBe(5);
+    expect(tg.sample_count).toBe(5);
+    expect(pp.avg_tps).toBeCloseTo(310, 6);
+    expect(tg.avg_tps).toBeCloseTo(40, 6);
+    expect(pp.suspect_count).toBe(0);
+    expect(tg.suspect_count).toBe(0);
+    expect(pp.ttft_n).toBe(5);
+    expect(execution.warning).toBeUndefined();
+  });
+
+  // The production failure this vintage exists for: a CPU load whose prefill
+  // ran at ~15 tok/s reported 1000 tok/s of generation, because the rate was
+  // computed as tokens / (end - first chunk) and that window held a single
+  // token's worth of teardown latency. The same server shape must now produce
+  // the server's own decode rate instead.
+  it("does not turn a one-token generation's teardown latency into a generation rate", async () => {
+    const completion = async (input: StreamedRequestInput): Promise<StreamSample> => {
+      const promptMs = (input.promptTokens.length / 15) * 1000; // 15 tok/s prefill
+      return {
+        ttftMs: promptMs,
+        e2eMs: promptMs + 1, // 1 ms after the first chunk -- the v5 numerator's whole basis
+        tokensPredicted: 1,
+        promptN: input.promptTokens.length,
+        promptMs,
+        predictedN: 1,
+        predictedMs: 1000 / 12, // the server's own decode timer: 12 tok/s
+        slot: 0,
+      };
+    };
+    const execution = await executeCurvePoint({
+      effectiveCtx: 2_048,
+      nGen: 1,
+      repeats: 2,
+      port: 1,
+      fillerBlocks: BLOCKS,
+      completion,
+    });
+    const tg = execution.results.find((r) => r.test_type === "tg")!;
+    expect(tg.avg_tps).toBeCloseTo(12, 6);
+    expect(tg.avg_tps).toBeLessThan(execution.results.find((r) => r.test_type === "pp")!.avg_tps);
+    expect(tg.suspect_count).toBe(0);
+  });
+
+  it("flags a generation rate that reads faster than its own request's prefill", async () => {
+    const server = fakeServer({ ppTps: 15, tgTps: 1_000 });
+    const execution = await executeCurvePoint({
+      effectiveCtx: 2_048,
+      nGen: 16,
+      repeats: 2,
+      port: 1,
+      fillerBlocks: BLOCKS,
+      completion: server.completion,
+    });
+    const tg = execution.results.find((r) => r.test_type === "tg")!;
+    expect(tg.suspect_count).toBe(2);
+    expect(tg.avg_tps).toBeCloseTo(1_000, 6); // kept and reported, never erased
+    expect(execution.warning).toContain("faster than this request's own prefill");
+  });
+
+  it("flags a decode timer this side's wall clock cannot corroborate", async () => {
+    const completion = async (input: StreamedRequestInput): Promise<StreamSample> => ({
+      ttftMs: 1_000,
+      e2eMs: 2_000, // 64 tokens can't have been decoded in the 1000 ms after the first chunk...
+      tokensPredicted: input.nPredict,
+      promptN: input.promptTokens.length,
+      promptMs: 1_000,
+      predictedN: input.nPredict,
+      predictedMs: 100, // ...yet the server claims 100 ms for all 64 of them (640 tok/s)
+      slot: 0,
+    });
+    const execution = await executeCurvePoint({
+      effectiveCtx: 4_096,
+      nGen: 64,
+      repeats: 2,
+      port: 1,
+      fillerBlocks: BLOCKS,
+      completion,
+    });
+    const tg = execution.results.find((r) => r.test_type === "tg")!;
+    expect(tg.suspect_count).toBe(2);
+    expect(execution.warning).toContain("wall clock");
+  });
+
+  it("says so when a repeat reports no generation timing at all, instead of shrinking the sample", async () => {
+    const completion = async (input: StreamedRequestInput): Promise<StreamSample> => ({
+      ttftMs: 100,
+      e2eMs: 200,
+      tokensPredicted: input.nPredict,
+      promptN: input.promptTokens.length,
+      promptMs: 100,
+      predictedN: null,
+      predictedMs: null,
+      slot: 0,
+    });
+    const execution = await executeCurvePoint({
+      effectiveCtx: 2_048,
+      nGen: 64,
+      repeats: 2,
+      port: 1,
+      fillerBlocks: BLOCKS,
+      completion,
+    });
+    expect(execution.results.some((r) => r.test_type === "tg")).toBe(false);
+    expect(execution.warning).toContain("no generation timing");
   });
 
   // The filler prompt has to be built from ids that decode to valid UTF-8 in
@@ -128,7 +227,7 @@ describe("N1 curve-point execution", () => {
     expect(server.requests.every((r) => r.promptTokens.every((t) => t >= 9000))).toBe(true);
   });
 
-  it("stamps METHOD_VERSION 2 so ordinary runtime rows can never land in a curve", async () => {
+  it("stamps the curve vintage so ordinary runtime rows can never land in a curve", async () => {
     const server = fakeServer();
     const execution = await executeCurvePoint({
       effectiveCtx: 4_096,
@@ -139,41 +238,21 @@ describe("N1 curve-point execution", () => {
       completion: server.completion,
     });
     expect(execution.results.every((r) => r.method_version === CURVE_METHOD_VERSION)).toBe(true);
+    // Must not collide with the fill curve's vintage: those rows share this
+    // column AND engine "server", so an equal number would let prefill slices
+    // be read as context-curve points.
+    expect(CURVE_METHOD_VERSION).not.toBe(FILL_CURVE_METHOD_VERSION);
   });
 
-  it("warns when a warm repeat re-prefills the prompt", async () => {
-    const server = fakeServer({ evictOnRepeat: 2 });
-    const execution = await executeCurvePoint({
-      effectiveCtx: 8_192,
-      nGen: 512,
-      repeats: 4,
-      port: 1,
-      fillerBlocks: BLOCKS,
-      completion: server.completion,
-    });
-    expect(execution.warning).toContain("prefix cache did not hold");
-  });
-
-  it("does not warn on the legitimate cold prefill", async () => {
-    const server = fakeServer();
-    const execution = await executeCurvePoint({
-      effectiveCtx: 8_192,
-      nGen: 512,
-      repeats: 4,
-      port: 1,
-      fillerBlocks: BLOCKS,
-      completion: server.completion,
-    });
-    expect(execution.warning).toBeUndefined();
-  });
-
-  it("marks the pp reading suspect rather than inventing a rate when the server reports no prefill timing", async () => {
+  it("writes no prefill row at all when the server reports no prefill timing", async () => {
     const completion = async (input: StreamedRequestInput): Promise<StreamSample> => ({
       ttftMs: 100,
       e2eMs: 200,
       tokensPredicted: input.nPredict,
       promptN: 0,
       promptMs: null,
+      predictedN: input.nPredict,
+      predictedMs: 100,
       slot: 0,
     });
     const execution = await executeCurvePoint({
@@ -184,9 +263,7 @@ describe("N1 curve-point execution", () => {
       fillerBlocks: BLOCKS,
       completion,
     });
-    const pp = execution.results.find((r) => r.test_type === "pp")!;
-    expect(pp.avg_tps).toBe(0);
-    expect(pp.suspect_count).toBe(1);
+    expect(execution.results.some((r) => r.test_type === "pp")).toBe(false);
   });
 });
 
@@ -203,6 +280,8 @@ describe("N5 knee ladder execution", () => {
         ttftMs: 100 * (input.slot ?? 0) + 100,
         e2eMs: 100 * (input.slot ?? 0) + 1_100,
         tokensPredicted: 100,
+        predictedN: 100,
+        predictedMs: 1_000,
         promptN: input.promptTokens.length,
         promptMs: 90,
         slot: input.slot ?? 0,
@@ -231,6 +310,8 @@ describe("N5 knee ladder execution", () => {
         ttftMs: 10,
         e2eMs: 20,
         tokensPredicted: 8,
+        predictedN: 8,
+        predictedMs: 10,
         promptN: input.promptTokens.length,
         promptMs: 5,
         slot: input.slot ?? 0,
@@ -245,7 +326,7 @@ describe("N5 knee ladder execution", () => {
 // shared/probeLadder.test.ts); what stays here is the per-rung verdict, which
 // is about one load rather than about the search.
 describe("N2 probe success rule", () => {
-  const base = { oom: false, vramPeakMib: 7000, gpuTotalMib: 8176, genTps: 11, estimatedVramMib: null };
+  const base = { oom: false, vramPeakMib: 7000, gpuTotalMib: 8176, generated: true, genTps: 11, estimatedVramMib: null };
 
   // The 1 tok/s floor is gone. It rejected a placement on a rate measured over
   // the probe's short fixed request -- a number that describes a nearly empty
@@ -255,10 +336,18 @@ describe("N2 probe success rule", () => {
     expect(probeSucceeded({ ...base, genTps: 0.4, ngl: 0 }).ok).toBe(true);
   });
 
-  it("still fails a load that generated nothing measurable", () => {
-    const dead = probeSucceeded({ ...base, genTps: null, ngl: 0 });
+  it("still fails a load that generated nothing", () => {
+    const dead = probeSucceeded({ ...base, generated: false, genTps: null, ngl: 0 });
     expect(dead.ok).toBe(false);
-    expect(dead.reason).toContain("no measurable generation");
+    expect(dead.reason).toContain("generated nothing");
+  });
+
+  // Liveness and speed are separate signals since v7: a rung whose rate could
+  // not be computed (an older build reporting no decode timing, or a reading
+  // that failed its cross-check) still LOADED, and the ladder must not read
+  // the missing number as a dead placement.
+  it("passes a load that generated tokens but yielded no usable rate", () => {
+    expect(probeSucceeded({ ...base, generated: true, genTps: null, ngl: 0 }).ok).toBe(true);
   });
 
   it("treats a spill past the adapter total as failure", () => {
@@ -349,10 +438,17 @@ describe("N2 probe success rule", () => {
 
     // Rule order: "generated nothing" wins, so a spill failure always generated.
     it("reports no generation, not a spill, when a spilled load also generated nothing", () => {
-      const result = probeSucceeded({ ...base, genTps: null, ngl: 8, ...eightLayers, loadedDedicatedJitterMib: 0 });
+      const result = probeSucceeded({
+        ...base,
+        generated: false,
+        genTps: null,
+        ngl: 8,
+        ...eightLayers,
+        loadedDedicatedJitterMib: 0,
+      });
       expect(result.gpuSpill.spilled).toBe(true);
       expect(result).toMatchObject({ ok: false, failCause: null });
-      expect(result.reason).toContain("no measurable generation");
+      expect(result.reason).toContain("generated nothing");
     });
   });
 
@@ -379,7 +475,7 @@ describe("N2 probe success rule", () => {
     // 3736/11577 = 0.32 (flagged) against the whole-adapter 5872/11577 = 0.507
     // (not flagged): the difference is the ~2100MiB the desktop held.
     it("infers against this process's VRAM, not every process on the adapter", () => {
-      const shared = { oom: false, gpuTotalMib: 8176, genTps: 3.54, ngl: 26, estimatedVramMib: 11577 };
+      const shared = { oom: false, gpuTotalMib: 8176, generated: true, genTps: 3.54, ngl: 26, estimatedVramMib: 11577 };
       expect(probeSucceeded({ ...shared, vramPeakMib: 5872, vramProcessPeakMib: 3736 }).vramDiscrepancy).toBe(true);
       expect(probeSucceeded({ ...shared, vramPeakMib: 5872, vramProcessPeakMib: null }).vramDiscrepancy).toBe(false);
     });
@@ -402,7 +498,7 @@ describe("failedForHostBackedLayers", () => {
 
   it("agrees with probeSucceeded on the rung it failed", () => {
     const result = probeSucceeded({
-      oom: false, vramPeakMib: 4322, gpuTotalMib: 8176, genTps: 11.8, ngl: 8, estimatedVramMib: null,
+      oom: false, vramPeakMib: 4322, gpuTotalMib: 8176, generated: true, genTps: 11.8, ngl: 8, estimatedVramMib: null,
       gpuBuffers: { deviceMib: 3634.7, contextMib: 215.51 }, loadedDedicatedMib: 2806.27, loadedDedicatedJitterMib: 0,
     });
     expect(failedForHostBackedLayers({ ok: result.ok, hostBackedFailCause: result.failCause })).toBe(true);
@@ -541,6 +637,8 @@ describe("parser-failure recovery", () => {
     ttftMs: 10,
     e2eMs: 20,
     tokensPredicted: 8,
+    predictedN: 8,
+    predictedMs: 10,
     promptN: 64,
     promptMs: 5,
     slot: 0,
@@ -821,7 +919,16 @@ function prefixCachingServer(opts: { cacheHolds?: boolean } = {}) {
     // 1000 tok/s on an empty context, falling linearly with depth.
     const rate = 1000 / (1 + common / 10_000);
     cached = [...prompt, 7];
-    return { ttftMs: 1, e2eMs: 2, tokensPredicted: 1, promptN, promptMs: (promptN / rate) * 1000, slot: 0 };
+    return {
+      ttftMs: 1,
+      e2eMs: 2,
+      tokensPredicted: 1,
+      promptN,
+      promptMs: (promptN / rate) * 1000,
+      predictedN: 1,
+      predictedMs: 25,
+      slot: 0,
+    };
   };
   return { completion, requests };
 }

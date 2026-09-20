@@ -3,6 +3,8 @@ import {
   buildServerArgs,
   contextSizeForSlots,
   DEFAULT_KNEE_SLOTS,
+  generationRate,
+  prefillRate,
   percentile,
   planConcurrentBatch,
   planCurvePoint,
@@ -88,10 +90,22 @@ describe("server arguments for the spec-off engine pair", () => {
 });
 
 describe("stream summaries (raw samples, never a server aggregate)", () => {
+  const sample = (over: Partial<StreamSample>): StreamSample => ({
+    ttftMs: 107_000,
+    e2eMs: 120_000,
+    tokensPredicted: 512,
+    promptN: 8192,
+    promptMs: 106_000,
+    predictedN: 512,
+    predictedMs: 13_000,
+    slot: 0,
+    ...over,
+  });
+
   const samples: StreamSample[] = [
-    { ttftMs: 107_000, e2eMs: 120_000, tokensPredicted: 512, promptN: 8192, promptMs: 106_000, slot: 0 },
-    { ttftMs: 108_000, e2eMs: 121_000, tokensPredicted: 512, promptN: 0, promptMs: null, slot: 0 },
-    { ttftMs: 250_000, e2eMs: 270_000, tokensPredicted: 512, promptN: 0, promptMs: null, slot: 0 },
+    sample({}),
+    sample({ ttftMs: 108_000, e2eMs: 121_000, promptN: 0, promptMs: null }),
+    sample({ ttftMs: 250_000, e2eMs: 270_000, promptN: 0, promptMs: null }),
   ];
 
   it("computes nearest-rank p50/p95 over the raw TTFT samples", () => {
@@ -106,11 +120,12 @@ describe("stream summaries (raw samples, never a server aggregate)", () => {
   });
 
   it("sums per-stream rates into the aggregate -- the streams ran simultaneously", () => {
-    const batch: StreamSample[] = [0, 1, 2, 3].map((slot) => ({
+    const batch: StreamSample[] = [0, 1, 2, 3].map((slot) => sample({
       ttftMs: 1_000,
       e2eMs: 11_000,
       tokensPredicted: 250,
-      promptN: 8192,
+      predictedN: 250,
+      predictedMs: 10_000,
       promptMs: 900,
       slot,
     }));
@@ -131,37 +146,116 @@ describe("stream summaries (raw samples, never a server aggregate)", () => {
 });
 
 describe("N1 choreography", () => {
-  it("issues ONE cold timed prefill, then repeats-1 warm repeats -- no warm-up request", () => {
+  // v7: no request classes to interleave any more. The warm repeats this
+  // replaced depended on a prefix-cache hit that production never actually
+  // got -- and the code could only detect the miss after the fact, while
+  // still publishing a generation rate measured over a window that held no
+  // generation.
+  it("issues one cache-free request per repeat, all identical in shape", () => {
     const plan = planCurvePoint({ promptTokens: 8192, nGen: 512, repeats: 5 });
-    // repeats = 5 means five MEASURED requests: the cold prefill is one of
-    // them, so four warm repeats follow it.
-    expect(plan.map((s) => s.requestClass)).toEqual([
-      "cold_timed",
-      "warm_repeat",
-      "warm_repeat",
-      "warm_repeat",
-      "warm_repeat",
-    ]);
+    expect(plan).toHaveLength(5);
+    expect(plan.every((s) => s.requestClass === "cold_timed")).toBe(true);
+    expect(plan.every((s) => s.cachePrompt === false)).toBe(true);
+    expect(plan.every((s) => s.promptTokens === 8192 && s.nPredict === 512)).toBe(true);
     expect(plan.filter((s) => s.countsTowardStatistics)).toHaveLength(5);
   });
 
-  it("makes the cold prefill timed DATA: one token, no cache reuse, and it counts", () => {
-    const cold = planCurvePoint({ promptTokens: 8192, nGen: 512, repeats: 3 })[0];
-    expect(cold.nPredict).toBe(1);
-    expect(cold.cachePrompt).toBe(false);
-    expect(cold.countsTowardStatistics).toBe(true);
-  });
-
-  it("runs the warm repeats against the cache with the identical prompt", () => {
+  it("gives every repeat its own nonce, so none can reuse another's prefix", () => {
     const plan = planCurvePoint({ promptTokens: 8192, nGen: 512, repeats: 4 });
-    const warmRepeats = plan.filter((s) => s.requestClass === "warm_repeat");
-    expect(warmRepeats).toHaveLength(3);
-    expect(warmRepeats.every((s) => s.cachePrompt && s.promptTokens === 8192 && s.nPredict === 512)).toBe(true);
+    expect(new Set(plan.map((s) => s.nonce)).size).toBe(4);
   });
 
-  it("still emits the cold point at repeats = 1", () => {
+  // Every repeat generates: a curve point that asked for zero tokens is what
+  // produced the five-hour run of unusable tg rows (the server now refuses
+  // that payload, and the worker refuses the job).
+  it("asks for the point's full generation on every repeat, never one token", () => {
+    const plan = planCurvePoint({ promptTokens: 8192, nGen: 512, repeats: 3 });
+    expect(plan.every((s) => s.nPredict === 512)).toBe(true);
+  });
+
+  it("still emits one measured request at repeats = 1", () => {
     const plan = planCurvePoint({ promptTokens: 4096, nGen: 128, repeats: 1 });
     expect(plan.map((s) => s.requestClass)).toEqual(["cold_timed"]);
+  });
+});
+
+describe("one request's two rates", () => {
+  const base: StreamSample = {
+    ttftMs: 2_000,
+    e2eMs: 6_000,
+    tokensPredicted: 128,
+    promptN: 8_192,
+    promptMs: 2_000,
+    predictedN: 128,
+    predictedMs: 4_000,
+    slot: 0,
+  };
+
+  it("reads each rate from that request's own timings", () => {
+    expect(prefillRate(base)!.value).toBeCloseTo(4_096, 6);
+    expect(generationRate(base)!.value).toBeCloseTo(32, 6);
+    expect(generationRate(base)!.suspect).toBe(false);
+  });
+
+  // The production failure in one assertion: one token, a 1 ms wall-clock
+  // window after the first chunk, and a decode timer that says 12 tok/s. The
+  // old formula divided the token count by that window and published 1000.
+  it("takes a one-token generation from the decode timer, not the teardown window", () => {
+    const reading = generationRate({
+      ...base,
+      ttftMs: 136_000,
+      e2eMs: 136_001,
+      tokensPredicted: 1,
+      predictedN: 1,
+      predictedMs: 1000 / 12,
+    })!;
+    expect(reading.value).toBeCloseTo(12, 6);
+    expect(reading.suspect).toBe(false);
+  });
+
+  it("flags decode that reads faster than the same request's prefill", () => {
+    // 8192 tokens in 546 s = 15 tok/s prefill; 128 tokens in 1 s = 128 tok/s
+    // decode, corroborated by the wall clock, and still not believable.
+    const reading = generationRate({
+      ...base,
+      promptMs: 546_000,
+      ttftMs: 546_000,
+      e2eMs: 547_000,
+      predictedMs: 1_000,
+    })!;
+    expect(reading.suspect).toBe(true);
+    expect(reading.reason).toContain("prefill");
+  });
+
+  // A 16-token prompt times first-request setup rather than prefill, so its
+  // pp is real but useless as a bound -- the cross-check must stay out of the
+  // probe's way.
+  it("does not hold a tiny prompt's prefill rate against a generation reading", () => {
+    const reading = generationRate({
+      ...base,
+      promptN: 16,
+      promptMs: 12_000, // 1.3 tok/s -- setup cost, not prefill
+      ttftMs: 12_000,
+      e2eMs: 12_500,
+      tokensPredicted: 16,
+      predictedN: 16,
+      predictedMs: 500, // 32 tok/s
+    })!;
+    expect(reading.suspect).toBe(false);
+  });
+
+  it("flags a decode timer the wall clock cannot corroborate", () => {
+    // 128 tokens in 100 ms (1280 tok/s) against a wall clock that saw 4 s
+    // pass after the first chunk -- under the ceiling, and still impossible.
+    const reading = generationRate({ ...base, predictedMs: 100 })!;
+    expect(reading.suspect).toBe(true);
+    expect(reading.reason).toContain("wall clock");
+  });
+
+  it("returns nothing at all when the server reported no decode timing", () => {
+    expect(generationRate({ ...base, predictedN: null, predictedMs: null })).toBeNull();
+    expect(prefillRate({ ...base, promptMs: null })).toBeNull();
+    expect(prefillRate({ ...base, promptN: 0 })).toBeNull();
   });
 });
 

@@ -265,7 +265,7 @@ three platforms:
 | Command | What it does |
 | --- | --- |
 | `toaster` | Start the worker (`toaster restart` is the same thing) |
-| `toaster update` | Pull the latest code + dependencies, then start |
+| `toaster update` | Pull the latest code + dependencies, then start — stops with the real error (and doesn't start old code) if any step fails |
 | `toaster reconnect` | Re-approve this machine after its session was revoked |
 | `toaster logs` | Open (Windows) or list (macOS/Linux) the worker log folder |
 | `toaster where` | Print the install folder |

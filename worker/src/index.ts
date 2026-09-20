@@ -50,7 +50,7 @@ import {
   PROBE_MAX_LOADS,
   type LadderAttempt,
 } from "../../shared/probeLadder.js";
-import { DEFAULT_KNEE_SLOTS } from "./loadDriver.js";
+import { DEFAULT_KNEE_SLOTS, generationRate } from "./loadDriver.js";
 import { fetchFillerBlocks } from "./fillerPrompt.js";
 import { supportsFlag, readListDevices, usedListedDevices } from "./binary-probe.js";
 import { MemorySampler, captureFreeMemoryBaseline, type SampleStats, type FreeMemoryBaseline } from "./sampler.js";
@@ -2269,6 +2269,17 @@ async function executeRuntimeBenchmarkJob(
     const contexts = raw == null ? [template.n_prompt] : Array.isArray(raw) ? raw : [raw];
     const repeats = curvePoint?.repeats ?? payload.sweep.repeats;
     const nGen = curvePoint?.n_gen ?? template.n_gen;
+    // The server refuses this at trigger time, but an older server (or a
+    // stored config replayed through one) can still hand a curve job an
+    // n_gen of 0 inherited from a prompt-only grid. Failing the job here
+    // costs seconds; running it costs hours and stores generation rows for a
+    // generation that never happened.
+    if (!Number.isInteger(nGen) || nGen < 1) {
+      throw new Error(
+        `a context curve measures generation, so it needs n_gen >= 1 -- this job carries n_gen ${nGen} ` +
+          `(inherited from a prompt-only grid). Re-trigger the points from an updated server.`
+      );
+    }
 
     for (let i = 0; i < contexts.length; i++) {
       const nPrompt = contexts[i];
@@ -2322,6 +2333,16 @@ async function executeRuntimeBenchmarkJob(
         await server.stop();
         activeBenchProc = null;
         const stats = sampler.stop();
+        // No rows at all means every repeat came back without a timing this
+        // point could use -- a failed measurement, not a finished one. Raised
+        // here rather than left to finalizeSweepItemResult's generic "produced
+        // no parseable result", which would drop the execution's own account
+        // of WHICH timings were missing.
+        if (execution.results.length === 0) {
+          throw new Error(
+            `the server answered every repeat but reported no usable timing: ${execution.warning ?? "no readings at all"}`
+          );
+        }
         const bench = toBenchResult({
           results: execution.results,
           stderr,
@@ -3708,7 +3729,10 @@ function toLadderAttempt(attempt: ProbeAttemptOutcome): LadderAttempt {
         : claimFitsFree({
             claimedMib: attempt.gpuBuffersMib,
             freeMib: attempt.listDevicesFreeMib,
-            loaded: attempt.genTps != null || attempt.loadKind === "claim_stop" || attempt.loadKind === "claim_only",
+            loaded:
+              (attempt.generated ?? attempt.genTps != null) ||
+              attempt.loadKind === "claim_stop" ||
+              attempt.loadKind === "claim_only",
           }),
   };
 }
@@ -3874,10 +3898,17 @@ async function runOneProbeLoad(input: ProbeLoadInput): Promise<ProbeAttemptOutco
           `treating it as usable, but its ${PROBE_GEN_TOKENS}-token rate is not comparable`
       );
     }
-    const genTps =
-      sample.e2eMs > sample.ttftMs && sample.tokensPredicted > 0
-        ? (sample.tokensPredicted / (sample.e2eMs - sample.ttftMs)) * 1000
-        : null;
+    // The rate comes from llama-server's own decode timer, cross-checked --
+    // NOT from the wall-clock span after the first streamed chunk, which
+    // excludes the first token and is empty for a one-token generation.
+    const genReading = generationRate(sample);
+    const genTps = genReading?.value ?? null;
+    if (genReading?.suspect) {
+      log.warn(`${input.label}: generation reading flagged -- ${genReading.reason}`);
+    }
+    // Liveness, not speed: a rung that produced tokens loaded, whatever the
+    // rate reading did (see ProbeAttemptOutcome.generated).
+    const generated = sample.tokensPredicted > 0;
     // No prefill rate or TTFT: a PROBE_PROMPT_TOKENS prompt is timed almost
     // entirely on first-request setup, so neither would describe the placement.
     const workToMs = Date.now();
@@ -3920,6 +3951,7 @@ async function runOneProbeLoad(input: ProbeLoadInput): Promise<ProbeAttemptOutco
       oom: false,
       vramPeakMib: stats.vram_peak_mib,
       gpuTotalMib: payload.gpu_total_mib ?? null,
+      generated,
       genTps,
       ngl,
       estimatedVramMib: estimate?.vramMib ?? null,
@@ -3967,6 +3999,7 @@ async function runOneProbeLoad(input: ProbeLoadInput): Promise<ProbeAttemptOutco
       vramSharedTotalPeakMib: stats.vram_total_shared_peak_mib,
       vramClaimedPeakMib: stats.vram_process_claimed_peak_mib,
       genTps,
+      generated,
       ppTps: null,
       ttftMs: null,
       headroomFrac,

@@ -264,16 +264,10 @@ case "${1:-start}" in
     exec "$TOASTER_HOME/worker/setup-worker.sh"
     ;;
   update)
-    # Pull the latest code, refresh dependencies, then start -- the same thing
-    # re-running the install command does, without re-fetching the bootstrap
-    # script.
-    cd "$TOASTER_HOME"
-    if [ -d .git ]; then
-      git fetch origin main && git reset --hard FETCH_HEAD
-    else
-      echo "Update skipped -- this install is not a git checkout." >&2
-    fi
-    npm install --ignore-scripts
+    # Pull the latest code and refresh dependencies, then start -- but only if
+    # that succeeded (set -e above exits on failure). update-worker.sh prints
+    # the real reason; starting anyway would silently run the old code.
+    bash "$TOASTER_HOME/worker/update-worker.sh"
     exec "$TOASTER_HOME/worker/setup-worker.sh"
     ;;
   reconnect)
@@ -293,7 +287,7 @@ case "${1:-start}" in
   help|-h|--help)
     cat <<'USAGE'
   toaster             start the worker (same as: toaster start)
-  toaster update      pull latest code + dependencies, then start
+  toaster update      pull latest code + dependencies, then start (stops on any error)
   toaster restart     start again after stopping with Ctrl+C
   toaster reconnect   re-approve this machine after its session was revoked
   toaster logs        list the most recent worker log files

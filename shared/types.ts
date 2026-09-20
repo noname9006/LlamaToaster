@@ -156,15 +156,28 @@ export type WorkerCapability = (typeof WORKER_CAPABILITIES)[number];
 // in scoring or curves.
 export const METHOD_VERSION = 1;
 
-// N1's choreographed context-curve points (cold timed prefill + warm-repeat
-// statistics) are a real semantics change under §0.1, so they stamp this
-// instead -- which is also what keeps ordinary runtime rows' warm-biased TTFT
-// out of curves without a dedicated marker column.
+// N1's context-curve points are a real semantics change under §0.1, so they
+// stamp this instead -- which is also what keeps ordinary runtime rows'
+// warm-biased TTFT out of curves without a dedicated marker column.
 // v5 (2026-09-17): dropped the warm_discard throwaway request ahead of the
 // cold prefill (loadDriver.ts's planCurvePoint) -- the cold prefill now hits
 // a genuinely unwarmed server, so its TTFT/pp are colder than v4's and must
 // not be averaged with it.
-export const CURVE_METHOD_VERSION = 5;
+// v7 (2026-09-20): every repeat is now a cold, cache-free request, and tg
+// comes from llama-server's own decode timer instead of the wall-clock span
+// after the first streamed chunk. The old warm repeats measured generation
+// over a window that contained no generation whenever the prefix cache did
+// not hold -- observed live producing 1 token / 1 ms = 1000 tok/s on a CPU
+// load whose prefill ran at 15 tok/s. v5 rows carry those readings and must
+// never be averaged with v7. Skips 6: FILL_CURVE_METHOD_VERSION already
+// holds it, and fill-curve rows share this column AND engine "server", so
+// reusing 6 here would let prefill slices leak into context curves.
+export const CURVE_METHOD_VERSION = 7;
+
+// The curve vintage that measured generation from the post-first-chunk
+// wall-clock window. Named because stored rows still carry it and N7 bundles
+// still have to describe -- honestly -- how they were measured.
+export const WALL_CLOCK_CURVE_METHOD_VERSION = 5;
 
 // Rows measured THROUGH llama-server (N5's concurrency ladder and the MTP
 // path). Split out from METHOD_VERSION when the synthetic filler prompt became
@@ -1088,12 +1101,24 @@ export interface QualityTriggerSpec {
   dataset_license?: string | null;
 }
 
+// What a curve point generates when the run it was launched from carries no
+// usable n_gen of its own. A curve measures decode at a context, so zero is
+// never a valid answer here -- see the trigger route's rejection.
+export const CURVE_DEFAULT_N_GEN = 128;
+
 export interface CurvePointSpec {
   // A single number for one point (kept for back-compat with stored
   // configs); an array measures every listed context within this ONE run,
   // one run_item per context, so pricing/enqueueing "missing points" never
   // has to split across runs.
   effective_ctx: number | number[];
+  /**
+   * Tokens each repeat generates. Optional on the wire for back-compat with
+   * stored configs, but the trigger route rejects an effective value below 1
+   * (a curve whose repeats generate nothing measures nothing), so callers
+   * should send CURVE_DEFAULT_N_GEN rather than let a prompt-only grid's 0
+   * through.
+   */
   n_gen?: number;
   repeats?: number;
   placement?: { ngl: number; n_cpu_moe?: number };
