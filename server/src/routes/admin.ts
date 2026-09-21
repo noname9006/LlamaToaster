@@ -1,9 +1,14 @@
 import type { FastifyInstance, FastifyRequest } from "fastify";
 import { repo } from "../db/repo.js";
-import { resolveAuthUser } from "../auth-middleware.js";
-import type { AuthenticatedRequest } from "../auth-middleware.js";
+import { resolveAuthUser, allUsersScope } from "../auth-middleware.js";
+import type { AuthenticatedRequest, UserScope } from "../auth-middleware.js";
 import { NotFoundError, ForbiddenError } from "../errors.js";
 import { loadExportRows, formatResultsExport } from "./results.js";
+import { getTestByIdHandler, getTestLogHandler, getBatchMembersHandler } from "./tests.js";
+import { getProfilesHandler } from "./profiles.js";
+import { getCurveHandler, getKneeHandler } from "./curves.js";
+import { getProbeAttemptsHandler } from "./measurements.js";
+import { exportTestHandler } from "./exchange.js";
 import {
   isVramDiscrepancyPolicy,
   isValidProbeMaxLoads,
@@ -69,6 +74,50 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
   );
 
   app.get("/api/admin/users", async () => ({ users: repo.adminRepo.listUsers() }));
+
+  // --- Per-test observation ---------------------------------------------------
+  // Read-only mirrors of every endpoint the main site's TestDetail page reads
+  // (client/src/pages/TestDetail.tsx and the components it embeds), so the
+  // console can render ANY user's test with that very page. Each is the main
+  // route's own handler (a `(scope) => handler` factory, see UserScope in
+  // auth-middleware.ts) built with allUsersScope, so the payloads are
+  // identical to what the owner's browser receives -- there is no second
+  // implementation to drift. Deliberately GET-only: nothing here can pause,
+  // stop, trigger or delete another tenant's work.
+  app.get("/api/admin/tests/:id", { logLevel: "silent" }, getTestByIdHandler(allUsersScope));
+  app.get("/api/admin/tests/:id/batch-members", getBatchMembersHandler(allUsersScope));
+  app.get("/api/admin/tests/:id/probe-attempts", getProbeAttemptsHandler(allUsersScope));
+  app.get("/api/admin/tests/:id/profiles", getProfilesHandler(allUsersScope));
+  app.get("/api/admin/tests/:id/knee", getKneeHandler(allUsersScope));
+  app.get("/api/admin/tests/:id/log", getTestLogHandler(allUsersScope));
+  app.get("/api/admin/tests/:id/export", exportTestHandler(allUsersScope));
+
+  // Who owns the test and which machine ran it -- the page header's
+  // "supervising X's test" line. Same row shape as the table's.
+  app.get<{ Params: { id: string } }>("/api/admin/tests/:id/summary", async (req, reply) => {
+    const summary = repo.adminRepo.getTestSummary(req.params.id);
+    if (!summary) return reply.code(404).send({ error: "run not found" });
+    return summary;
+  });
+
+  // The curve is keyed by model, not by test, so "all users" would fold every
+  // tenant's measurements of that model together -- not what the test's owner
+  // sees, and a real divergence for a test whose machine was later removed
+  // (runs.worker_id goes NULL, so the panel can't narrow by worker). The
+  // console passes the test's owner as ?user=, which scopes the curve exactly
+  // as that user's own request would be; omitted (an owner-less legacy test)
+  // it falls back to every user, the single-tenant behaviour.
+  const curveOwnerScope: UserScope = (req) => {
+    const user = (req.query as { user?: unknown }).user;
+    return typeof user === "string" && user ? user : undefined;
+  };
+  app.get("/api/admin/models/:id/curve", getCurveHandler(curveOwnerScope));
+
+  // The two lists TestDetail resolves labels from (the machine's hardware line
+  // by run.worker_id; the MTP draft model's filename by id). The main site's
+  // own GET /api/workers is caller-scoped; the console needs every tenant's.
+  app.get("/api/admin/workers", async () => ({ workers: repo.workerRepo.listWorkers() }));
+  app.get("/api/admin/models", async () => ({ models: repo.listModels() }));
 
   // The supervise dashboard's own platform-wide toggles (see shared/
   // types.ts's AppSettings doc comment) -- community benchmark sharing (and

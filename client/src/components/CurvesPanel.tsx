@@ -12,7 +12,7 @@
 // when no ladder cell is uncovered.
 
 import { useEffect, useMemo, useState } from "react";
-import { api } from "../api/client";
+import { useTestView } from "../api/testView";
 import type { CurveResponse, KneeResponse } from "../types";
 
 function formatCtx(tokens: number): string {
@@ -30,6 +30,7 @@ export interface CurvesPanelProps {
 }
 
 export function CurvesPanel({ modelId, workerId, build, targetCtx, onMeasureMissing }: CurvesPanelProps) {
+  const { api, readOnly } = useTestView();
   const [curve, setCurve] = useState<CurveResponse | null>(null);
   const [engine, setEngine] = useState<"server" | "bench">("server");
   const [error, setError] = useState("");
@@ -91,23 +92,26 @@ export function CurvesPanel({ modelId, workerId, build, targetCtx, onMeasureMiss
               </button>
             ))}
           </div>
-          <button
-            type="button"
-            aria-disabled={uncovered.length === 0}
-            title={
-              uncovered.length === 0
-                ? "Every ladder cell this placement can reach is already measured — nothing left to enqueue"
-                : `Prices and enqueues ${uncovered.length} uncovered ladder cell(s) as ordinary runtime runs`
-            }
-            onClick={() => uncovered.length > 0 && onMeasureMissing?.(uncovered)}
-            className={
-              uncovered.length === 0
-                ? "cursor-not-allowed rounded-lg border border-border px-3 py-1 text-[11px] font-semibold text-muted opacity-50"
-                : "rounded-lg border border-border px-3 py-1 text-[11px] font-semibold text-fg hover:border-accent/40 hover:text-accent"
-            }
-          >
-            Measure missing points
-          </button>
+          {/* Enqueues work on the owner's machine -- never offered to an observer. */}
+          {!readOnly && (
+            <button
+              type="button"
+              aria-disabled={uncovered.length === 0}
+              title={
+                uncovered.length === 0
+                  ? "Every ladder cell this placement can reach is already measured — nothing left to enqueue"
+                  : `Prices and enqueues ${uncovered.length} uncovered ladder cell(s) as ordinary runtime runs`
+              }
+              onClick={() => uncovered.length > 0 && onMeasureMissing?.(uncovered)}
+              className={
+                uncovered.length === 0
+                  ? "cursor-not-allowed rounded-lg border border-border px-3 py-1 text-[11px] font-semibold text-muted opacity-50"
+                  : "rounded-lg border border-border px-3 py-1 text-[11px] font-semibold text-fg hover:border-accent/40 hover:text-accent"
+              }
+            >
+              Measure missing points
+            </button>
+          )}
         </div>
       </div>
 
@@ -204,6 +208,7 @@ export function CurvesPanel({ modelId, workerId, build, targetCtx, onMeasureMiss
 // N5 -- the knee: the smallest slot count whose TTFT p95 exceeds 2× its
 // slots=1 value. Derived on read, never a stored verdict.
 export function KneeChart({ testId }: { testId: string }) {
+  const { api } = useTestView();
   const [knee, setKnee] = useState<KneeResponse | null>(null);
 
   useEffect(() => {

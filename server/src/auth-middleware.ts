@@ -151,6 +151,24 @@ export function assertOwnsWorker(userId: string | undefined, workerId: string): 
   }
 }
 
+// Which tenant's rows a READ handler may see, resolved per request. Handlers
+// that the main site and the supervise console (routes/admin.ts) both serve
+// are exported as `(scope: UserScope) => handler` factories, so the admin
+// origin runs byte-for-byte the same code -- same response shape, same
+// derivations -- and differs only in this one function. `undefined` means
+// "every user's rows", the same convention every repo.* function already
+// uses for single-tenant mode.
+export type UserScope = (req: FastifyRequest) => string | undefined;
+
+// The main site's own scope: the caller's session (undefined when AUTH_ENABLED
+// is off, i.e. single-tenant mode).
+export const sessionScope: UserScope = (req) => resolveAuthUser(req)?.user.id;
+
+// Cross-tenant, for routes/admin.ts ONLY. It ignores the request entirely, so
+// it is only safe behind that plugin's onRequest hook (admin hostname +
+// superadmin) -- never register a handler built with it anywhere else.
+export const allUsersScope: UserScope = () => undefined;
+
 export async function authMiddleware(req: FastifyRequest): Promise<void> {
   const routeUrl = req.routeOptions?.url;
   // FAIL CLOSED. An unmatched route (routeUrl undefined) is never treated as

@@ -5,7 +5,8 @@ import { join } from "node:path";
 import { repo } from "../db/repo.js";
 import { queueEvents } from "../queue-events.js";
 import { safeEqual, hashToken } from "../session.js";
-import { userOrIpKeyGenerator, resolveAuthUser, assertOwnsWorker } from "../auth-middleware.js";
+import { userOrIpKeyGenerator, resolveAuthUser, assertOwnsWorker, sessionScope } from "../auth-middleware.js";
+import type { UserScope } from "../auth-middleware.js";
 import { BadRequestError, ConflictError, ForbiddenError, NotFoundError, UnauthorizedError } from "../errors.js";
 import type {
   TriggerPayload,
@@ -522,6 +523,61 @@ function runLogPath(runId: string): string {
   return join(LOG_DIR, `run-${runId}.log.gz`);
 }
 
+// The read handlers below are shared with the supervise console
+// (routes/admin.ts mounts them again under /api/admin/tests/... with
+// allUsersScope), so what an operator sees on a test is exactly what its
+// owner sees -- same payload, computed by the same code. See UserScope's doc
+// comment in auth-middleware.ts.
+
+// Polled every ~1-2s by every open Tests/TestDetail tab while any run is
+// active -- registered with logLevel: "silent" (see below); index.ts's
+// polling-summary hook counts these instead and reports volume once a minute.
+export const getTestByIdHandler =
+  (scope: UserScope) => async (request: FastifyRequest<{ Params: { id: string } }>, reply: FastifyReply) => {
+    const data = repo.getTestWithResults(scope(request), request.params.id);
+    if (!data) return reply.code(404).send({ error: "run not found" });
+    // No live worker probe anymore -- liveness/staleness are handled
+    // server-side now: a dead worker's claimed job is caught by the lease
+    // reaper (index.ts's reapExpiredLeases), not by this route reaching
+    // out on every poll. `paused` reflects the same per-worker flag the
+    // heartbeat handler delivers control from (MULTIUSER_PLAN.md §1.6/§1.7/§1.14).
+    const paused =
+      data.run.status === "running" && data.run.worker_id
+        ? repo.workerRepo.getPauseRequested(data.run.worker_id)
+        : undefined;
+    return { ...data, paused };
+  };
+
+// Reads the log the worker pushed on job completion (POST below) -- no
+// outbound call to any worker. 404 both when the run doesn't exist and
+// when it exists but never got a log pushed (a run that failed before
+// producing one, or predates this feature).
+export const getTestLogHandler =
+  (scope: UserScope) => async (request: FastifyRequest<{ Params: { id: string } }>, reply: FastifyReply) => {
+    const run = repo.getTest(scope(request), request.params.id);
+    if (!run) return reply.code(404).send({ error: "run not found" });
+    const path = runLogPath(run.id);
+    if (!existsSync(path)) return reply.code(404).send({ error: "no log file for this run" });
+    const gzipped = readFileSync(path);
+    reply.header("content-type", "text/plain; charset=utf-8");
+    reply.header("content-encoding", "gzip");
+    reply.header("content-disposition", `attachment; filename="run-${run.id}.log"`);
+    return reply.send(gzipped);
+  };
+
+// N2 batching -- every run sharing this run's root (itself included), so a
+// multi-mode probe batch (see TriggerPayload.probe_batch_root_id) can be
+// rendered as one Tests-list row / one TestDetail view instead of the caller
+// having to separately discover and fetch each sibling. Ownership-scoped
+// the same way the log handler above is.
+export const getBatchMembersHandler =
+  (scope: UserScope) => async (request: FastifyRequest<{ Params: { id: string } }>, reply: FastifyReply) => {
+    const userId = scope(request);
+    const run = repo.getTest(userId, request.params.id);
+    if (!run) return reply.code(404).send({ error: "run not found" });
+    return { members: repo.listTestsUnderRoot(userId, run.root_run_id ?? run.id) };
+  };
+
 export async function testsRoutes(app: FastifyInstance): Promise<void> {
   // Raw gzip bytes, not JSON -- Fastify has no built-in parser for this
   // content type. Scoped to this plugin's own routes only (Fastify's
@@ -540,64 +596,18 @@ export async function testsRoutes(app: FastifyInstance): Promise<void> {
   app.get("/api/tests", listTestsHandler);
   app.get("/api/runs", listTestsHandler);
 
-  // Polled every ~1-2s by every open Tests/TestDetail tab while any run is
-  // active -- logLevel: "silent" suppresses Fastify's default per-request
-  // log pair for just this route; index.ts's polling-summary hook counts
-  // these instead and reports volume once a minute.
-  const getTestByIdHandler = async (request: FastifyRequest<{ Params: { id: string } }>, reply: FastifyReply) => {
-    const authed = resolveAuthUser(request);
-    const data = repo.getTestWithResults(authed?.user.id, request.params.id);
-    if (!data) return reply.code(404).send({ error: "run not found" });
-    // No live worker probe anymore -- liveness/staleness are handled
-    // server-side now: a dead worker's claimed job is caught by the lease
-    // reaper (index.ts's reapExpiredLeases), not by this route reaching
-    // out on every poll. `paused` reflects the same per-worker flag the
-    // heartbeat handler delivers control from (MULTIUSER_PLAN.md §1.6/§1.7/§1.14).
-    const paused =
-      data.run.status === "running" && data.run.worker_id
-        ? repo.workerRepo.getPauseRequested(data.run.worker_id)
-        : undefined;
-    return { ...data, paused };
-  };
   // Registered under both the current path and the legacy /api/runs/... one
   // it replaces -- an already-deployed worker binary or open browser tab may
   // still be calling the old path during the rollout. Drop the legacy
   // registration once every worker is confirmed updated.
-  app.get("/api/tests/:id", { logLevel: "silent" }, getTestByIdHandler);
-  app.get("/api/runs/:id", { logLevel: "silent" }, getTestByIdHandler);
+  app.get("/api/tests/:id", { logLevel: "silent" }, getTestByIdHandler(sessionScope));
+  app.get("/api/runs/:id", { logLevel: "silent" }, getTestByIdHandler(sessionScope));
 
-  // Reads the log the worker pushed on job completion (POST below) -- no
-  // outbound call to any worker. 404 both when the run doesn't exist and
-  // when it exists but never got a log pushed (a run that failed before
-  // producing one, or predates this feature).
-  const getTestLogHandler = async (request: FastifyRequest<{ Params: { id: string } }>, reply: FastifyReply) => {
-    const authed = resolveAuthUser(request);
-    const run = repo.getTest(authed?.user.id, request.params.id);
-    if (!run) return reply.code(404).send({ error: "run not found" });
-    const path = runLogPath(run.id);
-    if (!existsSync(path)) return reply.code(404).send({ error: "no log file for this run" });
-    const gzipped = readFileSync(path);
-    reply.header("content-type", "text/plain; charset=utf-8");
-    reply.header("content-encoding", "gzip");
-    reply.header("content-disposition", `attachment; filename="run-${run.id}.log"`);
-    return reply.send(gzipped);
-  };
-  app.get("/api/tests/:id/log", getTestLogHandler);
-  app.get("/api/runs/:id/log", getTestLogHandler);
+  app.get("/api/tests/:id/log", getTestLogHandler(sessionScope));
+  app.get("/api/runs/:id/log", getTestLogHandler(sessionScope));
 
-  // N2 batching -- every run sharing this run's root (itself included), so a
-  // multi-mode probe batch (see TriggerPayload.probe_batch_root_id) can be
-  // rendered as one Tests-list row / one TestDetail view instead of the caller
-  // having to separately discover and fetch each sibling. Ownership-scoped
-  // the same way GET /api/tests/:id/log is.
-  const getBatchMembersHandler = async (request: FastifyRequest<{ Params: { id: string } }>, reply: FastifyReply) => {
-    const authed = resolveAuthUser(request);
-    const run = repo.getTest(authed?.user.id, request.params.id);
-    if (!run) return reply.code(404).send({ error: "run not found" });
-    return { members: repo.listTestsUnderRoot(authed?.user.id, run.root_run_id ?? run.id) };
-  };
-  app.get("/api/tests/:id/batch-members", getBatchMembersHandler);
-  app.get("/api/runs/:id/batch-members", getBatchMembersHandler);
+  app.get("/api/tests/:id/batch-members", getBatchMembersHandler(sessionScope));
+  app.get("/api/runs/:id/batch-members", getBatchMembersHandler(sessionScope));
 
   // Worker -> server push of a completed run's log file (MULTIUSER_PLAN.md
   // §1.10). Dual-mode worker auth (Stage 3 session first, Stage 1 shared

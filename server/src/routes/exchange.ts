@@ -4,7 +4,8 @@
 import type { FastifyInstance, FastifyRequest, FastifyReply } from "fastify";
 import { v4 as uuid } from "uuid";
 import { repo } from "../db/repo.js";
-import { resolveAuthUser } from "../auth-middleware.js";
+import { resolveAuthUser, sessionScope } from "../auth-middleware.js";
+import type { UserScope } from "../auth-middleware.js";
 import type { ResultRow, Test, TestConfig } from "../../../shared/types.js";
 import {
   BUNDLE_FORMAT,
@@ -103,13 +104,16 @@ function buildBundle(run: Test, rows: ResultRow[]): Bundle {
   };
 }
 
-export async function exchangeRoutes(app: FastifyInstance): Promise<void> {
-  const exportTestHandler = async (
+// Shared with the supervise console (routes/admin.ts mounts it again under
+// /api/admin/tests/:id/export with allUsersScope) -- see UserScope's doc
+// comment in auth-middleware.ts.
+export const exportTestHandler =
+  (scope: UserScope) =>
+  async (
     request: FastifyRequest<{ Params: { id: string }; Querystring: { scope?: string } }>,
     reply: FastifyReply
   ) => {
-      const authed = resolveAuthUser(request);
-      const userId = authed?.user.id;
+      const userId = scope(request);
       const run = repo.getTest(userId, request.params.id);
       if (!run) return reply.code(404).send({ error: "run not found" });
 
@@ -127,8 +131,10 @@ export async function exchangeRoutes(app: FastifyInstance): Promise<void> {
       reply.header("content-disposition", `attachment; filename="llamatoaster-${run.id}.json"`);
       return reply.send(JSON.stringify(bundle, null, 2));
   };
-  app.get("/api/tests/:id/export", exportTestHandler);
-  app.get("/api/runs/:id/export", exportTestHandler);
+
+export async function exchangeRoutes(app: FastifyInstance): Promise<void> {
+  app.get("/api/tests/:id/export", exportTestHandler(sessionScope));
+  app.get("/api/runs/:id/export", exportTestHandler(sessionScope));
 
   app.post<{ Body: { bundle?: unknown; opt_in_scoring?: boolean } }>(
     "/api/import",

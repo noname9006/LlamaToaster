@@ -6,7 +6,8 @@
 
 import type { FastifyInstance, FastifyRequest, FastifyReply } from "fastify";
 import { repo } from "../db/repo.js";
-import { resolveAuthUser } from "../auth-middleware.js";
+import { resolveAuthUser, sessionScope } from "../auth-middleware.js";
+import type { UserScope } from "../auth-middleware.js";
 import { buildCurve, buildLadder, deriveKnee, type CurveSourceRow } from "../../../shared/curves.js";
 import { CURVE_METHOD_VERSION, type ResultRow, type TestConfig } from "../../../shared/types.js";
 import { maxAffordableContext, residentWeightsMibFromPeak } from "../../../shared/vramEstimate.js";
@@ -36,13 +37,17 @@ function toCurveRow(row: ResultRow): CurveSourceRow {
   };
 }
 
-export async function curveRoutes(app: FastifyInstance): Promise<void> {
-  app.get<{
-    Params: { id: string };
-    Querystring: { worker?: string; build?: string; engine?: string; method_version?: string };
-  }>("/api/models/:id/curve", async (request, reply) => {
-    const authed = resolveAuthUser(request);
-    const userId = authed?.user.id;
+type CurveRequest = FastifyRequest<{
+  Params: { id: string };
+  Querystring: { worker?: string; build?: string; engine?: string; method_version?: string };
+}>;
+
+// Shared with the supervise console (routes/admin.ts mounts it again under
+// /api/admin/models/:id/curve with allUsersScope) -- see UserScope's doc
+// comment in auth-middleware.ts.
+export const getCurveHandler =
+  (scope: UserScope) => async (request: CurveRequest, reply: FastifyReply) => {
+    const userId = scope(request);
     const model = repo.getModel(request.params.id);
     if (!model) return reply.code(404).send({ error: "model not found" });
 
@@ -123,7 +128,31 @@ export async function curveRoutes(app: FastifyInstance): Promise<void> {
       /** True when no ladder cell is still uncovered -- "Measure missing points" renders aria-disabled with this reason. */
       all_points_covered: ladder.every((cell) => !cell.available || cell.measured),
     };
-  });
+  };
+
+// N5 -- the knee is a DERIVED read, not a stored verdict. Shared with the
+// supervise console the same way getCurveHandler is.
+export const getKneeHandler =
+  (scope: UserScope) => async (request: FastifyRequest<{ Params: { id: string } }>, reply: FastifyReply) => {
+    const userId = scope(request);
+    const run = repo.getTest(userId, request.params.id);
+    if (!run) return reply.code(404).send({ error: "run not found" });
+    const rootRunId = run.root_run_id ?? run.id;
+    const rows: ResultRow[] = [];
+    for (const member of repo.listTestsUnderRoot(userId, rootRunId)) {
+      rows.push(...repo.getResultsForTest(member.id));
+    }
+    const knee = deriveKnee(rows.map(toCurveRow));
+    return {
+      run_id: run.id,
+      root_run_id: rootRunId,
+      spec: (run.config as TestConfig).knee ?? null,
+      ...knee,
+    };
+  };
+
+export async function curveRoutes(app: FastifyInstance): Promise<void> {
+  app.get("/api/models/:id/curve", getCurveHandler(sessionScope));
 
   // §0.6 -- the rate table every ETA prices from. The ORDER is the rule:
   // a {server, spec:"off"} rate first, then a llama-bench rate carrying the
@@ -169,25 +198,6 @@ export async function curveRoutes(app: FastifyInstance): Promise<void> {
     }
   );
 
-  // N5 -- the knee is a DERIVED read, not a stored verdict.
-  const getKneeHandler = async (request: FastifyRequest<{ Params: { id: string } }>, reply: FastifyReply) => {
-    const authed = resolveAuthUser(request);
-    const userId = authed?.user.id;
-    const run = repo.getTest(userId, request.params.id);
-    if (!run) return reply.code(404).send({ error: "run not found" });
-    const rootRunId = run.root_run_id ?? run.id;
-    const rows: ResultRow[] = [];
-    for (const member of repo.listTestsUnderRoot(userId, rootRunId)) {
-      rows.push(...repo.getResultsForTest(member.id));
-    }
-    const knee = deriveKnee(rows.map(toCurveRow));
-    return {
-      run_id: run.id,
-      root_run_id: rootRunId,
-      spec: (run.config as TestConfig).knee ?? null,
-      ...knee,
-    };
-  };
-  app.get("/api/tests/:id/knee", getKneeHandler);
-  app.get("/api/runs/:id/knee", getKneeHandler);
+  app.get("/api/tests/:id/knee", getKneeHandler(sessionScope));
+  app.get("/api/runs/:id/knee", getKneeHandler(sessionScope));
 }

@@ -1,4 +1,17 @@
-import type { AdminStats, AdminTestSummary, AdminTestFilters, AdminUserSummary, AppSettings } from "./types";
+import type {
+  AdminStats,
+  AdminTestSummary,
+  AdminTestFilters,
+  AdminUserSummary,
+  AppSettings,
+  Model,
+  Worker,
+} from "./types";
+import type { TestViewApi } from "../../client/src/api/testView";
+// The main site's own query-string builders -- the console must send the same
+// parameters the owner's browser would, so it reuses them rather than
+// re-deriving them.
+import { curveQuery, profilesQuery } from "../../client/src/api/client";
 
 export class ApiError extends Error {
   status: number;
@@ -47,11 +60,42 @@ function filtersToQuery(filters: AdminTestFilters): string {
   return qs ? `?${qs}` : "";
 }
 
+const seg = encodeURIComponent;
+
+// What the shared TestDetail page reads, pointed at the console's read-only,
+// cross-tenant mirrors (server/src/routes/admin.ts). Same payload shapes as the
+// main site's own routes -- the server builds them with the same handlers.
+//
+// `ownerUserId` is the test's owner: the curve is keyed by MODEL, not by test,
+// so without it the panel would fold every tenant's measurements of that model
+// together instead of showing the owner's (see admin.ts's curveOwnerScope).
+export function createAdminTestViewApi(ownerUserId: string | null): TestViewApi {
+  return {
+    getTest: (id) => request(`/api/admin/tests/${seg(id)}`),
+    getBatchMembers: (id) => request(`/api/admin/tests/${seg(id)}/batch-members`),
+    getProbeAttempts: (id) => request(`/api/admin/tests/${seg(id)}/probe-attempts`),
+    getProfiles: (id, goals) => request(`/api/admin/tests/${seg(id)}/profiles${profilesQuery(goals)}`),
+    getCurve: (modelId, opts) =>
+      request(`/api/admin/models/${seg(modelId)}/curve${curveQuery(opts, ownerUserId ? { user: ownerUserId } : {})}`),
+    getKnee: (id) => request(`/api/admin/tests/${seg(id)}/knee`),
+    listWorkers: () => request<{ workers: Worker[] }>("/api/admin/workers").then((d) => d.workers),
+    listModels: () => request<{ models: Model[] }>("/api/admin/models").then((d) => d.models),
+    csvExportUrl: (id) => `/api/admin/results/export?format=csv&tests=${seg(id)}`,
+    bundleExportUrl: (id, scope = "test") => `/api/admin/tests/${seg(id)}/export?scope=${scope}`,
+    testLogUrl: (id) => `/api/admin/tests/${seg(id)}/log`,
+  };
+}
+
 export const api = {
   getStats: (): Promise<AdminStats> => request("/api/admin/stats"),
 
   listTests: (filters: AdminTestFilters = {}): Promise<{ runs: AdminTestSummary[] }> =>
     request(`/api/admin/tests${filtersToQuery(filters)}`),
+
+  // Owner / machine / model for one test -- the per-test page's header, and
+  // (a 200 vs 403/404) its own sign-in / not-found check, since TestDetail
+  // itself doesn't surface a failed load.
+  getTestSummary: (id: string): Promise<AdminTestSummary> => request(`/api/admin/tests/${seg(id)}/summary`),
 
   listUsers: (): Promise<{ users: AdminUserSummary[] }> => request("/api/admin/users"),
 

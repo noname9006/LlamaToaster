@@ -100,7 +100,8 @@ No username, no account id, no hostname, and never your own rows back to you.
 ```
 server/   Fastify API + SQLite (better-sqlite3), serves client/dist and admin/dist
 client/   React + Vite + Tailwind SPA (the main dashboard every user sees)
-admin/    React + Vite + Tailwind SPA (superadmin-only cross-tenant view, served from a separate origin)
+admin/    React + Vite + Tailwind SPA (superadmin-only cross-tenant view, served from a separate origin;
+          bundles client/'s own test-detail page, so a test looks the same to an operator as to its owner)
 worker/   runs on each benchmark box: long-polls the server, spawns llama-bench/llama-server
 shared/   TypeScript types shared by server, worker, and client
 ```
@@ -203,9 +204,12 @@ a single opted-in machine may be summarised — labelled as such).
 more than one) and `ADMIN_PUBLIC_URL` (e.g. `https://supervise.llamatoaster.com`
 — must resolve to the same server, see "Deploying publicly" below). A
 superadmin-listed account gets a read-only, cross-tenant view (every user's
-machines/runs, an export, basic stats) at that separate origin — nothing
-about their experience on the *main* site changes; there's no admin link or
-special mode there. Revoking access is just removing the entry and
+tests, an export, basic stats) at that separate origin. Any test — including
+one still running, which updates live — opens in the same test page its owner
+sees (results, charts, scored profiles, probe ladders), just without the
+controls that would change it (pause/stop/trigger/delete). Nothing about their
+experience on the *main* site changes; there's no admin link or special mode
+there. Revoking access is just removing the entry and
 restarting the process, no DB write needed.
 
 ## Running a worker (GPU or CPU box)

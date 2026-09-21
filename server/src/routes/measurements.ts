@@ -17,7 +17,8 @@ import type { FastifyInstance, FastifyRequest, FastifyReply } from "fastify";
 import { repo } from "../db/repo.js";
 import { hashToken } from "../session.js";
 import { BadRequestError, ForbiddenError, NotFoundError, UnauthorizedError } from "../errors.js";
-import { resolveAuthUser, assertOwnsWorker } from "../auth-middleware.js";
+import { assertOwnsWorker, sessionScope } from "../auth-middleware.js";
+import type { UserScope } from "../auth-middleware.js";
 import type {
   ProbeAttemptReport,
   ProbeResultInput,
@@ -210,6 +211,22 @@ function validateProbeAttempts(attempts: unknown): ProbeAttemptReport[] {
   return attempts.map((raw, i) => validateOneProbeAttempt(raw, `attempts[${i}]`));
 }
 
+// The ladder behind a run's verified ceiling. Read-side authorization
+// mirrors /api/models/:id/verified-limits: the caller must own the machine
+// the run was dispatched to, since these rows describe that machine's
+// memory. Worker sessions never read this -- it exists for the UI. Shared
+// with the supervise console (routes/admin.ts, allUsersScope: assertOwnsWorker
+// is a no-op without a user id) -- see UserScope's doc comment in
+// auth-middleware.ts.
+export const getProbeAttemptsHandler =
+  (scope: UserScope) => async (request: FastifyRequest<{ Params: { id: string } }>, reply: FastifyReply) => {
+    const run = repo.getTest(undefined, request.params.id);
+    if (!run) throw new NotFoundError("run not found");
+    if (!run.worker_id) throw new NotFoundError("that run has no machine attached");
+    assertOwnsWorker(scope(request), run.worker_id);
+    return reply.send({ attempts: repo.probeAttemptsRepo.listForTest(run.id) });
+  };
+
 export async function measurementRoutes(app: FastifyInstance): Promise<void> {
   // --- N2: probe result -----------------------------------------------------
   const postProbeResultHandler = async (
@@ -370,19 +387,8 @@ export async function measurementRoutes(app: FastifyInstance): Promise<void> {
   app.post("/api/tests/:id/probe-attempt", postProbeAttemptHandler);
   app.post("/api/runs/:id/probe-attempt", postProbeAttemptHandler);
 
-  // The ladder behind a run's verified ceiling. Read-side authorization
-  // mirrors /api/models/:id/verified-limits: the caller must own the machine
-  // the run was dispatched to, since these rows describe that machine's
-  // memory. Worker sessions never read this -- it exists for the UI.
-  const getProbeAttemptsHandler = async (request: FastifyRequest<{ Params: { id: string } }>, reply: FastifyReply) => {
-    const run = repo.getTest(undefined, request.params.id);
-    if (!run) throw new NotFoundError("run not found");
-    if (!run.worker_id) throw new NotFoundError("that run has no machine attached");
-    assertOwnsWorker(resolveAuthUser(request)?.user.id, run.worker_id);
-    return reply.send({ attempts: repo.probeAttemptsRepo.listForTest(run.id) });
-  };
-  app.get("/api/tests/:id/probe-attempts", getProbeAttemptsHandler);
-  app.get("/api/runs/:id/probe-attempts", getProbeAttemptsHandler);
+  app.get("/api/tests/:id/probe-attempts", getProbeAttemptsHandler(sessionScope));
+  app.get("/api/runs/:id/probe-attempts", getProbeAttemptsHandler(sessionScope));
 
   // N2 batch dedup -- lets a later scenario in the same batch skip a
   // (candidate_ctx, ngl) point an earlier sibling already measured, rather

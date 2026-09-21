@@ -11,7 +11,7 @@
 // disagree about what was established.
 
 import { useEffect, useMemo, useState } from "react";
-import { api } from "../api/client";
+import { useTestView } from "../api/testView";
 import type { ProbeAttemptDto } from "../types";
 import {
   claimFitsFree,
@@ -93,6 +93,7 @@ function answer(value: number | null, resolved: boolean): string {
 }
 
 export function ProbeFrontier({ testId, refreshKey }: { testId: string; refreshKey?: unknown }) {
+  const { api } = useTestView();
   const [rows, setRows] = useState<ProbeAttemptDto[] | null>(null);
 
   useEffect(() => {

@@ -14,6 +14,7 @@
 
 import { useEffect, useState } from "react";
 import { api } from "../api/client";
+import { useTestView } from "../api/testView";
 import type { GoalsConfig, ProfileCard, ProfilesResponse, ScoredConfig, VerifiedLimitDto, QualityRowDto } from "../types";
 import { QUALITY_NOT_MEASURED_DISCLAIMER } from "../../../shared/scoring";
 import { WORKLOAD_WEIGHTS } from "../goals";
@@ -95,6 +96,10 @@ export interface ProfileCardsProps {
 }
 
 export function ProfileCards({ testId, refreshKey, modelId, workerId }: ProfileCardsProps) {
+  // `api` above still serves the writes (probe / quality trigger, delete a
+  // verified ceiling); reads go through the view so the supervise console can
+  // point them at its own read-only mirror -- and readOnly hides the writes.
+  const { api: viewApi, readOnly } = useTestView();
   const [data, setData] = useState<ProfilesResponse | null>(null);
   const [error, setError] = useState("");
   const [override, setOverride] = useState<Partial<GoalsConfig> | null>(null);
@@ -239,7 +244,7 @@ export function ProfileCards({ testId, refreshKey, modelId, workerId }: ProfileC
 
   useEffect(() => {
     let cancelled = false;
-    api
+    viewApi
       .getProfiles(testId, override ? { ...override } : undefined)
       .then((res) => {
         if (!cancelled) {
@@ -322,9 +327,9 @@ export function ProfileCards({ testId, refreshKey, modelId, workerId }: ProfileC
               goals={goals}
               limits={data.verified_limits}
               qualityResults={data.quality_results}
-              onVerify={modelId && workerId ? verifyWithProbe : undefined}
-              onMeasureQuality={modelId && workerId ? measureQuality : undefined}
-              onDeleteVerified={deleteVerifiedLimit}
+              onVerify={!readOnly && modelId && workerId ? verifyWithProbe : undefined}
+              onMeasureQuality={!readOnly && modelId && workerId ? measureQuality : undefined}
+              onDeleteVerified={readOnly ? undefined : deleteVerifiedLimit}
               deletingLimitId={deletingLimitId}
             />
           ))}
@@ -384,7 +389,8 @@ function Card({
   qualityResults: QualityRowDto[];
   onVerify?: (config: ScoredConfig) => void;
   onMeasureQuality?: (config: ScoredConfig) => void;
-  onDeleteVerified: (id: string) => void;
+  /** Absent for a read-only viewer -- the ceiling is shown but can't be deleted. */
+  onDeleteVerified?: (id: string) => void;
   deletingLimitId: string | null;
 }) {
   const verified = verifiedFor(card.config, limits);
@@ -455,14 +461,16 @@ function Card({
           {verified.margin_observed_frac != null &&
             ` · margin ${(verified.margin_observed_frac * 100).toFixed(0)} %`}
           . Verification is per machine + build + KV pair + placement — changing any of them needs a fresh probe.{" "}
-          <button
-            type="button"
-            onClick={() => onDeleteVerified(verified.id)}
-            disabled={deletingLimitId === verified.id}
-            className="font-semibold text-danger underline decoration-dotted hover:decoration-solid disabled:opacity-40"
-          >
-            {deletingLimitId === verified.id ? "Deleting…" : "Delete & test again"}
-          </button>
+          {onDeleteVerified && (
+            <button
+              type="button"
+              onClick={() => onDeleteVerified(verified.id)}
+              disabled={deletingLimitId === verified.id}
+              className="font-semibold text-danger underline decoration-dotted hover:decoration-solid disabled:opacity-40"
+            >
+              {deletingLimitId === verified.id ? "Deleting…" : "Delete & test again"}
+            </button>
+          )}
         </p>
       )}
 

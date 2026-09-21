@@ -10,6 +10,7 @@ import { CURVE_DEFAULT_N_GEN } from "../../../shared/types";
 import { useParams, Link } from "react-router-dom";
 import type { ChartConfiguration } from "chart.js";
 import { api } from "../api/client";
+import { useTestView } from "../api/testView";
 import {
   TestStatusPill,
   StatusCircle,
@@ -541,6 +542,11 @@ function mergedSortValue(item: TestItem, results: ResultRow[] | undefined, key: 
 
 export function TestDetail() {
   const { id = "" } = useParams();
+  // Reads go through the view so the supervise console can render this same
+  // page against its read-only /api/admin mirrors; `api` (module import) is
+  // only used for the writes below -- pause/resume/stop, trigger -- which a
+  // read-only viewer never reaches (their controls aren't rendered).
+  const { api: view, readOnly, testPath } = useTestView();
   const [run, setRun] = useState<Test | null>(null);
   const [results, setResults] = useState<ResultRow[]>([]);
   const [items, setItems] = useState<TestItem[]>([]);
@@ -598,7 +604,7 @@ export function TestDetail() {
   useEffect(() => {
     let cancelled = false;
     async function poll() {
-      const data = await api.getTest(id);
+      const data = await view.getTest(id);
       if (cancelled) return;
       setRun(data.run);
       setResults(data.results ?? []);
@@ -632,7 +638,7 @@ export function TestDetail() {
       return;
     }
     let cancelled = false;
-    api
+    view
       .getBatchMembers(id)
       .then((res) => {
         if (!cancelled) setBatchMembers(res.members);
@@ -648,7 +654,7 @@ export function TestDetail() {
   useEffect(() => {
     if (!run?.worker_id) return;
     let cancelled = false;
-    api
+    view
       .listWorkers()
       .then((list) => {
         if (!cancelled) setWorkerInfo(list.find((w) => w.id === run.worker_id));
@@ -662,7 +668,7 @@ export function TestDetail() {
   useEffect(() => {
     if (!run?.config.mtp_model_id) return;
     let cancelled = false;
-    api
+    view
       .listModels()
       .then((list) => {
         if (!cancelled) setModels(list);
@@ -1055,7 +1061,7 @@ export function TestDetail() {
         </div>
       )}
 
-      {run?.status === "running" && (
+      {run?.status === "running" && !readOnly && (
         <div className="mt-3 flex flex-wrap items-center gap-3">
           <button
             type="button"
@@ -1102,7 +1108,7 @@ export function TestDetail() {
                       <span className="text-[12.5px] font-semibold text-fg">{memberChipLabel(m)}</span>
                       <TestStatusPill status={m.status} />
                       {m.id !== id && (
-                        <Link to={`/tests/${m.id}`} className="text-xs text-accent hover:underline">
+                        <Link to={testPath(m.id)} className="text-xs text-accent hover:underline">
                           Open ↗
                         </Link>
                       )}
@@ -1150,7 +1156,7 @@ export function TestDetail() {
               workerId={run.worker_id ?? null}
               build={run.llama_cpp_build}
               targetCtx={runGoals?.target_ctx ?? null}
-              onMeasureMissing={handleMeasureMissingPoints}
+              onMeasureMissing={readOnly ? undefined : handleMeasureMissingPoints}
             />
             <KneeChart testId={id} />
             {measureMsg && <p className="text-xs text-muted">{measureMsg}</p>}
@@ -1164,13 +1170,13 @@ export function TestDetail() {
               shared number travels with the pipeline that produced it. */}
           <div className="mt-3 flex flex-wrap items-center gap-3">
             <a
-              href={apiClient.bundleExportUrl(id, "test")}
+              href={view.bundleExportUrl(id, "test")}
               className="rounded-lg border border-border px-3 py-1.5 text-xs font-semibold text-fg hover:border-accent/40 hover:text-accent"
             >
               Export bundle ⤓
             </a>
             <a
-              href={apiClient.bundleExportUrl(id, "root")}
+              href={view.bundleExportUrl(id, "root")}
               className="rounded-lg border border-border px-3 py-1.5 text-xs font-semibold text-muted hover:border-accent/40 hover:text-accent"
             >
               Export whole chain ⤓
@@ -1653,7 +1659,7 @@ export function TestDetail() {
       {(results.length > 0 || statusCounts.failed > 0) && (
         <p className="mt-3 space-x-4 text-sm">
           {results.length > 0 && (
-            <a href={api.exportUrl("csv", [id])} download className="text-accent hover:underline">
+            <a href={view.csvExportUrl(id)} download className="text-accent hover:underline">
               Export test CSV
             </a>
           )}
@@ -1662,7 +1668,7 @@ export function TestDetail() {
               fully clean run's per-run log has nothing more to add beyond
               the results table above. */}
           {(statusCounts.failed > 0 || hasFlaggedItems) && (
-            <a href={api.testLogUrl(id)} download className="text-accent hover:underline">
+            <a href={view.testLogUrl(id)} download className="text-accent hover:underline">
               Download logs
             </a>
           )}

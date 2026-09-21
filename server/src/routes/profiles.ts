@@ -5,7 +5,8 @@
 
 import type { FastifyInstance, FastifyRequest, FastifyReply } from "fastify";
 import { repo } from "../db/repo.js";
-import { resolveAuthUser, assertOwnsWorker } from "../auth-middleware.js";
+import { resolveAuthUser, assertOwnsWorker, sessionScope } from "../auth-middleware.js";
+import type { UserScope } from "../auth-middleware.js";
 import type { Model, ResultRow, TestConfig } from "../../../shared/types.js";
 import { scoreProfiles, tupleKey, type ScoringRow, type ScoringResult } from "../../../shared/scoring.js";
 import type { ConfigHashInput } from "../../../shared/configHash.js";
@@ -223,13 +224,16 @@ function toScoringRow(row: ResultRow, idxOffset: number): ScoringRow {
   };
 }
 
-export async function profilesRoutes(app: FastifyInstance): Promise<void> {
-  const getProfilesHandler = async (
+// Shared with the supervise console (routes/admin.ts mounts it again under
+// /api/admin/tests/:id/profiles with allUsersScope) -- see UserScope's doc
+// comment in auth-middleware.ts.
+export const getProfilesHandler =
+  (scope: UserScope) =>
+  async (
     request: FastifyRequest<{ Params: { id: string }; Querystring: Record<string, string | undefined> }>,
     reply: FastifyReply
   ) => {
-      const authed = resolveAuthUser(request);
-      const userId = authed?.user.id;
+      const userId = scope(request);
       const run = repo.getTest(userId, request.params.id);
       if (!run) return reply.code(404).send({ error: "run not found" });
 
@@ -320,8 +324,10 @@ export async function profilesRoutes(app: FastifyInstance): Promise<void> {
       };
       return body;
   };
-  app.get("/api/tests/:id/profiles", getProfilesHandler);
-  app.get("/api/runs/:id/profiles", getProfilesHandler);
+
+export async function profilesRoutes(app: FastifyInstance): Promise<void> {
+  app.get("/api/tests/:id/profiles", getProfilesHandler(sessionScope));
+  app.get("/api/runs/:id/profiles", getProfilesHandler(sessionScope));
 
   // N2's verified ceilings, readable WITHOUT an existing sweep run -- the
   // Benchmark page's live fit matrix needs this before any chain run exists,

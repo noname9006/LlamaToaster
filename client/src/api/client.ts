@@ -81,6 +81,41 @@ function postJson(body: unknown): RequestInit {
   };
 }
 
+// Query-string builders for the two reads whose parameters aren't trivial.
+// Exported (not inlined in `api` below) because the supervise console
+// (admin/src/api.ts) calls the same reads at its own /api/admin/... paths and
+// must send byte-identical parameters -- one builder, so the two can't drift.
+export type ProfilesGoals = {
+  goal?: string;
+  target_ctx?: number | null;
+  workload?: string;
+  speed_floor_frac?: number;
+  kv_preset?: string;
+};
+
+export function profilesQuery(goals?: ProfilesGoals): string {
+  const params = new URLSearchParams();
+  if (goals?.goal) params.set("goal", goals.goal);
+  if (goals?.workload) params.set("workload", goals.workload);
+  if (goals?.kv_preset) params.set("kv_preset", goals.kv_preset);
+  if (goals?.speed_floor_frac != null) params.set("speed_floor_frac", String(goals.speed_floor_frac));
+  if (goals && "target_ctx" in goals) params.set("target_ctx", goals.target_ctx == null ? "" : String(goals.target_ctx));
+  const query = params.toString();
+  return query ? `?${query}` : "";
+}
+
+export type CurveOpts = { worker?: string; build?: string; engine?: "bench" | "server" };
+
+export function curveQuery(opts: CurveOpts = {}, extra: Record<string, string> = {}): string {
+  const params = new URLSearchParams();
+  if (opts.worker) params.set("worker", opts.worker);
+  if (opts.build) params.set("build", opts.build);
+  if (opts.engine) params.set("engine", opts.engine);
+  for (const [key, value] of Object.entries(extra)) params.set(key, value);
+  const query = params.toString();
+  return query ? `?${query}` : "";
+}
+
 export const api = {
   listModels: (): Promise<Model[]> => request<{ models: Model[] }>("/api/models").then((d) => d.models),
 
@@ -265,19 +300,8 @@ export const api = {
 
   // M3 -- scored profile cards. Changing the goal is a query string over the
   // SAME stored rows; nothing is re-measured.
-  getProfiles: (
-    testId: string,
-    goals?: { goal?: string; target_ctx?: number | null; workload?: string; speed_floor_frac?: number; kv_preset?: string }
-  ): Promise<ProfilesResponse> => {
-    const params = new URLSearchParams();
-    if (goals?.goal) params.set("goal", goals.goal);
-    if (goals?.workload) params.set("workload", goals.workload);
-    if (goals?.kv_preset) params.set("kv_preset", goals.kv_preset);
-    if (goals?.speed_floor_frac != null) params.set("speed_floor_frac", String(goals.speed_floor_frac));
-    if (goals && "target_ctx" in goals) params.set("target_ctx", goals.target_ctx == null ? "" : String(goals.target_ctx));
-    const query = params.toString();
-    return request(`/api/tests/${encodeURIComponent(testId)}/profiles${query ? `?${query}` : ""}`);
-  },
+  getProfiles: (testId: string, goals?: ProfilesGoals): Promise<ProfilesResponse> =>
+    request(`/api/tests/${encodeURIComponent(testId)}/profiles${profilesQuery(goals)}`),
 
   // §0.6 -- the rate table an ETA prices from, with the provenance label that
   // must be shown beside any number derived from it.
@@ -316,17 +340,8 @@ export const api = {
     request(`/api/verified-limits/${encodeURIComponent(id)}`, { method: "DELETE" }),
 
   // N1 -- a curve is a deterministic grouping over results, computed on read.
-  getCurve: (
-    modelId: string,
-    opts: { worker?: string; build?: string; engine?: "bench" | "server" } = {}
-  ): Promise<CurveResponse> => {
-    const params = new URLSearchParams();
-    if (opts.worker) params.set("worker", opts.worker);
-    if (opts.build) params.set("build", opts.build);
-    if (opts.engine) params.set("engine", opts.engine);
-    const query = params.toString();
-    return request(`/api/models/${encodeURIComponent(modelId)}/curve${query ? `?${query}` : ""}`);
-  },
+  getCurve: (modelId: string, opts: CurveOpts = {}): Promise<CurveResponse> =>
+    request(`/api/models/${encodeURIComponent(modelId)}/curve${curveQuery(opts)}`),
 
   // N5 -- derived on read, never a stored verdict.
   getKnee: (testId: string): Promise<KneeResponse> => request(`/api/tests/${encodeURIComponent(testId)}/knee`),

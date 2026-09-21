@@ -12,7 +12,7 @@
 
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { api } from "../api/client";
+import { useTestView } from "../api/testView";
 import type { ProbeAttemptDto } from "../types";
 import { PROBE_GEN_TOKENS, PROBE_PROMPT_TOKENS } from "../../../shared/probeLadder";
 
@@ -267,6 +267,7 @@ export interface ProbeAttemptsProps {
 }
 
 export function ProbeAttempts({ testId, refreshKey }: ProbeAttemptsProps) {
+  const { api, testPath } = useTestView();
   const [attempts, setAttempts] = useState<ProbeAttemptDto[] | null>(null);
   const [error, setError] = useState("");
 
@@ -567,7 +568,7 @@ export function ProbeAttempts({ testId, refreshKey }: ProbeAttemptsProps) {
                       )}
                       {a.reused_from_run_id && (
                         <Link
-                          to={`/tests/${a.reused_from_run_id}`}
+                          to={testPath(a.reused_from_run_id)}
                           title="Reused from an earlier batch sibling's own measurement of this exact point -- not reloaded for this run"
                           className="rounded-full bg-accent/10 px-2 py-0.5 text-[10px] font-semibold text-accent hover:underline"
                         >

@@ -94,6 +94,42 @@ interface TestRow {
   items_cancelled?: number;
 }
 
+// adminRepo's per-test summary row: a TestRow plus the owner/machine display
+// names joined in. Shared by adminRepo.listTests and adminRepo.getTestSummary
+// so the table and the per-test page header can never disagree about a test.
+type AdminTestSummaryRow = TestRow & { user_display_name: string | null; worker_display_name: string | null };
+
+// Everything up to (not including) the WHERE clause -- callers append their own.
+const ADMIN_TEST_SUMMARY_SELECT = `SELECT runs.*, u.display_name AS user_display_name, w.display_name AS worker_display_name,
+                  m.filename AS model_filename,
+                  (SELECT COUNT(*) FROM run_items WHERE run_items.run_id = runs.id) AS items_total,
+                  (SELECT COUNT(*) FROM run_items WHERE run_items.run_id = runs.id AND status = 'done') AS items_done,
+                  (SELECT COUNT(*) FROM run_items WHERE run_items.run_id = runs.id AND status IN ('failed','failed_oom','failed_timeout')) AS items_failed
+           FROM runs
+           LEFT JOIN users u ON u.id = runs.user_id
+           LEFT JOIN workers w ON w.id = runs.worker_id
+           LEFT JOIN models m ON m.id = runs.model_id`;
+
+function toAdminTestSummary(row: AdminTestSummaryRow): AdminTestSummary {
+  return {
+    id: row.id,
+    userId: row.user_id ?? null,
+    userDisplayName: row.user_display_name,
+    workerId: row.worker_id,
+    workerDisplayName: row.worker_display_name,
+    modelId: row.model_id,
+    modelFilename: row.model_filename ?? null,
+    llamaCppBackend: row.llama_cpp_backend,
+    status: row.status,
+    error: row.error,
+    startedAt: row.started_at,
+    completedAt: row.completed_at,
+    itemsTotal: row.items_total ?? 0,
+    itemsDone: row.items_done ?? 0,
+    itemsFailed: row.items_failed ?? 0,
+  };
+}
+
 interface TestItemRow {
   id: string;
   run_id: string;
@@ -3001,15 +3037,7 @@ export const repo = {
     listTests(filters: AdminTestFilters): AdminTestSummary[] {
       const rows = getDb()
         .prepare(
-          `SELECT runs.*, u.display_name AS user_display_name, w.display_name AS worker_display_name,
-                  m.filename AS model_filename,
-                  (SELECT COUNT(*) FROM run_items WHERE run_items.run_id = runs.id) AS items_total,
-                  (SELECT COUNT(*) FROM run_items WHERE run_items.run_id = runs.id AND status = 'done') AS items_done,
-                  (SELECT COUNT(*) FROM run_items WHERE run_items.run_id = runs.id AND status IN ('failed','failed_oom','failed_timeout')) AS items_failed
-           FROM runs
-           LEFT JOIN users u ON u.id = runs.user_id
-           LEFT JOIN workers w ON w.id = runs.worker_id
-           LEFT JOIN models m ON m.id = runs.model_id
+          `${ADMIN_TEST_SUMMARY_SELECT}
            WHERE (? IS NULL OR runs.user_id = ?)
              AND (? IS NULL OR runs.worker_id = ?)
              AND (? IS NULL OR runs.llama_cpp_backend = ?)
@@ -3026,24 +3054,17 @@ export const repo = {
           filters.backend ?? null,
           filters.status ?? null,
           filters.status ?? null
-        ) as (TestRow & { user_display_name: string | null; worker_display_name: string | null })[];
-      return rows.map((row) => ({
-        id: row.id,
-        userId: row.user_id ?? null,
-        userDisplayName: row.user_display_name,
-        workerId: row.worker_id,
-        workerDisplayName: row.worker_display_name,
-        modelId: row.model_id,
-        modelFilename: row.model_filename ?? null,
-        llamaCppBackend: row.llama_cpp_backend,
-        status: row.status,
-        error: row.error,
-        startedAt: row.started_at,
-        completedAt: row.completed_at,
-        itemsTotal: row.items_total ?? 0,
-        itemsDone: row.items_done ?? 0,
-        itemsFailed: row.items_failed ?? 0,
-      }));
+        ) as AdminTestSummaryRow[];
+      return rows.map(toAdminTestSummary);
+    },
+
+    // One row of the same shape, for the console's per-test page header
+    // ("whose test is this, on which machine") -- undefined for an unknown id.
+    getTestSummary(id: string): AdminTestSummary | undefined {
+      const row = getDb()
+        .prepare(`${ADMIN_TEST_SUMMARY_SELECT} WHERE runs.id = ?`)
+        .get(id) as AdminTestSummaryRow | undefined;
+      return row ? toAdminTestSummary(row) : undefined;
     },
 
     // Global user list -- id/display name/superadmin-relevant identity info
