@@ -151,6 +151,7 @@ the assistant reports it as one machine rather than a consensus.
 `BENCHMARKING_PLAN_V8.md` §0.9 originally mandated 5; that floor suppressed
 essentially every group until the database is very large, which defeated the
 purpose of having a shared base at all. Set the variable to `5` to restore it.
+(`BENCHMARKING_PLAN_V8.md` is a local design document, not part of the repo.)
 
 ## Retention
 
@@ -162,17 +163,16 @@ are collected rather than accumulating forever.
 ## Design documents
 
 The source cites two specs by section number (`§2.3`, `§0.9`, …). They are the
-historical design documents this implementation was built against, kept in the
-repo so those citations resolve:
+historical design documents this implementation was built against. They are
+kept **locally only** and are not part of this repository:
 
-- [`plans/MULTIUSER_PLAN.md`](plans/MULTIUSER_PLAN.md) — auth, sessions, the
-  pull-queue protocol, device enrolment, multi-tenancy, the admin surface,
-  deployment, and the security checklist.
-- [`plans/BENCHMARKING_PLAN_V8.md`](plans/BENCHMARKING_PLAN_V8.md) — the
-  measurement layer: normative definitions (§0), goal-parameterized scoring,
-  thermal telemetry, context curves, the verify-by-probe advisor,
-  model-vs-model comparison, quality measurement, and reproducible
-  export/import.
+- `plans/MULTIUSER_PLAN.md` — auth, sessions, the pull-queue protocol, device
+  enrolment, multi-tenancy, the admin surface, deployment, and the security
+  checklist.
+- `plans/BENCHMARKING_PLAN_V8.md` — the measurement layer: normative
+  definitions (§0), goal-parameterized scoring, thermal telemetry, context
+  curves, the verify-by-probe advisor, model-vs-model comparison, quality
+  measurement, and reproducible export/import.
 
 They are **plans, not current documentation**. Where they disagree with the
 code, the code wins — most visibly, the `Run` entity was later renamed to

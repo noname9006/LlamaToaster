@@ -35,7 +35,8 @@ refuses those same probes, so a job queued by an old server fails with a clear
 error rather than running a different search. After deploying the server, open
 the admin settings and check the probe load budget: the migration raises a
 stored value of exactly 24 to 40 and leaves any other value alone. See
-docs/CONTEXT_TEST_REDESIGN.md §10.
+`docs/CONTEXT_TEST_REDESIGN.md` §10 — a local design document, not part of
+the repository.
 
 ## Deploying a CPU worker on the server's own box
 

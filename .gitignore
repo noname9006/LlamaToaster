@@ -1,11 +1,18 @@
 node_modules/
 
-# Local working drafts of planning documents. The design specs the source
-# actually cites (MULTIUSER_PLAN.md, BENCHMARKING_PLAN_V8.md) live in
-# docs/plans/ and are tracked -- see docs/ARCHITECTURE.md.
+# Local working drafts of planning documents. The docs/plans/ specs
+# (MULTIUSER_PLAN.md, BENCHMARKING_PLAN_V8.md) are local-only now --
+# see the docs/* block below.
 /plans/
 *PLAN*.md
-!docs/plans/*PLAN*.md
+
+# docs/: only the public documentation is tracked (API.md, ARCHITECTURE.md,
+# DEPLOYMENT.md). Plans, research and internal notes stay local. We ignore
+# docs/* (not docs/ itself) so the re-include exceptions below work.
+docs/*
+!docs/API.md
+!docs/ARCHITECTURE.md
+!docs/DEPLOYMENT.md
 
 # Claude Code session runtime state (e.g. launch.json, scheduled_tasks.lock)
 # -- created by the Claude Code app itself when used against this folder,
