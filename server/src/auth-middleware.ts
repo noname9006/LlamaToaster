@@ -30,6 +30,8 @@ export const PUBLIC_PATHS = new Set([
   // deviceApprovalRoutes).
   "/api/device/start",
   "/api/device/token",
+  // Security finding C1: the nonce a reconnecting worker signs with its key.
+  "/api/device/challenge",
 ]);
 
 // Routes outside the /api/worker/ prefix that are STILL worker-authenticated
@@ -67,6 +69,17 @@ const WORKER_AUTHENTICATED_ROUTES = new Set([
   "POST /api/runs/:id/probe-result",
   "POST /api/tests/:id/quality-result",
   "POST /api/runs/:id/quality-result",
+  // Live probe progress + batch dedup (routes/measurements.ts) -- both
+  // handlers call requireEnrolledWorkerSession themselves. They used to pass
+  // this middleware only because a worker session also counted as a user
+  // session (C1); once that stopped, they have to be listed here.
+  "POST /api/tests/:id/probe-attempt",
+  "POST /api/runs/:id/probe-attempt",
+  "GET /api/tests/:id/probe-dedup",
+  "GET /api/runs/:id/probe-dedup",
+  // Called by both the browser and the worker's model scanner, so its handler
+  // (routes/models.ts) accepts either a user session or a worker session.
+  "POST /api/models/hash-lookup",
 ]);
 
 // Cast target for req.user/req.session once authMiddleware (or a route that
@@ -102,6 +115,11 @@ export function resolveAuthUser(req: FastifyRequest): { user: AuthUser; session:
 
   const session = repo.sessionRepo.getByTokenHash(hashToken(token));
   if (!session || session.expiresAt < Date.now()) return null;
+  // A worker session speaks the worker protocol only (worker-auth.ts and the
+  // WORKER_AUTHENTICATED_ROUTES handlers) -- never a login as its owner.
+  // Accepting it here let anyone holding a machine's token manage the
+  // owner's account, sessions and admin console (security finding C1).
+  if (session.isWorker) return null;
 
   const userRecord = repo.userRepo.getUser(session.userId);
   if (!userRecord) return null;

@@ -5,7 +5,8 @@ import { lookupHfGgufHashes, verifyRepoInBackground, HF_INDEX_REFRESH_INTERVAL_M
 import { isMtpDraftModel } from "../../../shared/types.js";
 import type { RegisterModelInput } from "../../../shared/types.js";
 import { userOrIpKeyGenerator, resolveAuthUser, assertOwnsWorker } from "../auth-middleware.js";
-import { ForbiddenError } from "../errors.js";
+import { ForbiddenError, UnauthorizedError } from "../errors.js";
+import { resolveWorkerSession } from "../worker-auth.js";
 
 const HF_META_TIMEOUT_MS = 15_000;
 
@@ -308,6 +309,11 @@ export async function modelsRoutes(app: FastifyInstance): Promise<void> {
     "/api/models/hash-lookup",
     { config: { rateLimit: HASH_LOOKUP_RATE_LIMIT } },
     async (request, reply) => {
+      // Listed in WORKER_AUTHENTICATED_ROUTES so the middleware lets a worker
+      // session through; that makes this handler the gate for both callers.
+      if (process.env.AUTH_ENABLED === "true" && !resolveAuthUser(request) && !resolveWorkerSession(request)) {
+        throw new UnauthorizedError("no session");
+      }
       const hashes = request.body?.hashes;
       if (!Array.isArray(hashes) || hashes.length === 0) {
         return reply.code(400).send({ error: "hashes array is required" });

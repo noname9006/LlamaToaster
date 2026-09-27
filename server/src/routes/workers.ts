@@ -233,6 +233,9 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
     if (worker.status === "busy") {
       throw new ConflictError("that machine is busy -- wait for it to finish, or cancel the run first");
     }
+    // Ends its worker sessions too (rows in `sessions` don't cascade from
+    // workers), so a removed machine's token stops working at once.
+    repo.workerRepo.revokeTrust(worker.id);
     repo.workerRepo.deleteWorker(worker.id);
     return reply.code(200).send({ ok: true });
   });

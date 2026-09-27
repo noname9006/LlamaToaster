@@ -11,9 +11,11 @@ process.env.DB_PATH = join(tmpDir, "test.db");
 let app: FastifyInstance;
 let baseUrl: string;
 let repo: typeof import("../db/repo.js")["repo"];
+let hashToken: (t: string) => string;
 
 beforeAll(async () => {
   ({ repo } = await import("../db/repo.js"));
+  ({ hashToken } = await import("../session.js"));
   const { sessionRoutes } = await import("./sessions.js");
   const { authMiddleware } = await import("../auth-middleware.js");
 
@@ -66,9 +68,13 @@ describe("POST /api/auth/refresh", () => {
     expect(body.session_token).not.toBe(created.token);
     expect(body.refresh_token).not.toBe(created.refresh);
 
-    // The new session_token actually works for an authenticated call.
+    // The new session_token is a live worker session...
+    const rotated = repo.sessionRepo.getByTokenHash(hashToken(body.session_token));
+    expect(rotated?.isWorker).toBe(true);
+    expect(rotated?.workerId).toBe("w-1");
+    // ...and, like any worker session, never a login as its owner (C1).
     const sessionsRes = await fetch(`${baseUrl}/api/sessions`, { headers: authed(body.session_token) });
-    expect(sessionsRes.status).toBe(200);
+    expect(sessionsRes.status).toBe(401);
   });
 
   it("detects refresh-token replay (presenting the OLD refresh after rotation) and revokes the session", async () => {

@@ -38,6 +38,10 @@ export async function sessionRoutes(app: FastifyInstance): Promise<void> {
     // is holding the stale one.
     const replayed = repo.sessionRepo.getByPrevRefreshHash(hash);
     if (replayed) {
+      // For a worker, a replayed refresh token means its config.json may be
+      // in someone else's hands -- forget the machine key too, so neither
+      // copy can reconnect without the owner's approval.
+      if (replayed.isWorker && replayed.workerId) repo.workerRepo.revokeTrust(replayed.workerId);
       repo.sessionRepo.revokeById(replayed.id);
       req.log.warn({ session: replayed.id, worker: replayed.workerId }, "refresh token replay -- session revoked");
       throw new UnauthorizedError("refresh token reuse detected");
@@ -82,12 +86,18 @@ export async function sessionRoutes(app: FastifyInstance): Promise<void> {
     // any authenticated caller revoke ANY session by guessing its uuid.
     const owned = repo.sessionRepo.listForUser(user.id).find((s) => s.id === req.params.id);
     if (!owned) throw new NotFoundError("session not found");
+    // Revoking a machine means it has to be approved again: its key is
+    // forgotten along with the session (workerRepo.revokeTrust).
+    if (owned.isWorker && owned.workerId) repo.workerRepo.revokeTrust(owned.workerId);
     repo.sessionRepo.revokeById(owned.id);
     return { ok: true };
   });
 
   app.post("/api/sessions/revoke-all", async (req) => {
     const { user, session } = req as AuthenticatedRequest;
+    for (const s of repo.sessionRepo.listForUser(user.id)) {
+      if (s.isWorker && s.workerId) repo.workerRepo.revokeTrust(s.workerId);
+    }
     repo.sessionRepo.revokeAllExcept(user.id, session.id);
     return { ok: true };
   });

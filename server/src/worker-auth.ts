@@ -19,6 +19,22 @@ import type { Worker } from "../../shared/types.js";
 // means a Stage-3-only deployment (no WORKER_SHARED_TOKEN configured at all)
 // works fine -- the env var is only consulted inside the fallback branch,
 // never up front.
+// The enrolled-worker half of authenticateWorker on its own: a live worker
+// session's machine, or null. For routes that accept a worker OR a browser
+// user (POST /api/models/hash-lookup) and have no machine_id to feed the
+// shared-token fallback.
+export function resolveWorkerSession(req: FastifyRequest): Worker | null {
+  const auth = req.headers.authorization;
+  const token = auth?.startsWith("Bearer ") ? auth.slice("Bearer ".length) : undefined;
+  if (!token) return null;
+  const session = repo.sessionRepo.getByTokenHash(hashToken(token));
+  if (!session || session.expiresAt < Date.now() || !session.isWorker || !session.workerId) return null;
+  const worker = repo.workerRepo.getWorker(session.workerId);
+  if (!worker) return null;
+  repo.sessionRepo.touch(session);
+  return worker;
+}
+
 export async function authenticateWorker(req: FastifyRequest): Promise<Worker> {
   const auth = req.headers.authorization;
   const token = auth?.startsWith("Bearer ") ? auth.slice("Bearer ".length) : undefined;
@@ -47,5 +63,18 @@ export async function authenticateWorker(req: FastifyRequest): Promise<Worker> {
   const hostname =
     typeof body?.hostname === "string" && body.hostname.trim() ? body.hostname.trim().slice(0, 256) : machineId;
 
-  return repo.workerRepo.getOrCreateByMachineId(machineId, hostname);
+  const worker = repo.workerRepo.getOrCreateByMachineId(machineId, hostname);
+  assertSharedTokenMayActAs(worker.id);
+  return worker;
+}
+
+// The shared deployment secret only ever speaks for machines nobody owns
+// (Stage 1 self-announced rows). Anyone holding it could otherwise claim an
+// enrolled machine just by naming its machine_id or a run it executed --
+// the same impersonation C1 was about, minus the user session.
+export function assertSharedTokenMayActAs(workerId: string): void {
+  const enrolment = repo.workerRepo.getEnrolmentById(workerId);
+  if (enrolment?.userId) {
+    throw new UnauthorizedError("this machine is enrolled -- the shared deployment secret can't act for it");
+  }
 }

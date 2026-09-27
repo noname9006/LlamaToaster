@@ -8,6 +8,7 @@ import type {
   HeartbeatResponse,
   QueueJob,
   DeviceStartResponse,
+  DeviceChallengeResponse,
   DeviceTokenSuccess,
   DeviceTokenError,
   RefreshResponse,
@@ -288,9 +289,53 @@ export async function pushTestLog(
 // --- Device enrolment (MULTIUSER_PLAN.md §3.1/§3.5) -- unauthenticated,
 // called before this worker holds any credential at all. ---
 
+// A one-time nonce to sign with this machine's key (worker/src/machine-key.ts)
+// before startDeviceEnrolment, so an owned machine can reconnect without a
+// human re-approving it.
+export async function requestDeviceChallenge(url: string, machineId: string, timeoutMs = 10_000): Promise<DeviceChallengeResponse> {
+  const res = await fetch(`${url}/api/device/challenge`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ machine_id: machineId }),
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  if (!res.ok) throw new HttpError(res.status, `device challenge failed (${res.status}): ${await res.text()}`);
+  return (await res.json()) as DeviceChallengeResponse;
+}
+
+// Trust-on-first-use key registration for a machine enrolled before machine
+// keys existed. "registered" = the server stored it now, "already" = this
+// same key was already on file, "conflict" = a different key is on file
+// (only the owner approving a reconnect can change it).
+export async function registerMachineKey(
+  url: string,
+  token: string,
+  publicKeyPem: string,
+  timeoutMs = 10_000
+): Promise<"registered" | "already" | "conflict"> {
+  const res = await fetch(`${url}/api/worker/register-key`, {
+    method: "POST",
+    headers: { "content-type": "application/json", ...authHeader(token) },
+    body: JSON.stringify({ public_key: publicKeyPem }),
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  if (res.status === 409) return "conflict";
+  if (!res.ok) throw new HttpError(res.status, `machine key registration failed (${res.status}): ${await res.text()}`);
+  return ((await res.json()) as { registered: boolean }).registered ? "registered" : "already";
+}
+
 export async function startDeviceEnrolment(
   url: string,
-  info: { machine_id: string; hostname: string; platform: string; arch: string; hardware: HardwareInfo },
+  info: {
+    machine_id: string;
+    hostname: string;
+    platform: string;
+    arch: string;
+    hardware: HardwareInfo;
+    public_key?: string;
+    nonce?: string;
+    signature?: string;
+  },
   timeoutMs = 10_000
 ): Promise<DeviceStartResponse> {
   const res = await fetch(`${url}/api/device/start`, {

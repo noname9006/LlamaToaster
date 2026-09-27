@@ -75,7 +75,7 @@ describe("POST /api/device/start", () => {
     expect(body.expires_in).toBe(900);
   });
 
-  it("re-calling with the SAME machine_id reuses the row and revokes any prior worker session", async () => {
+  it("re-calling with the SAME machine_id of an OWNED machine needs approval again and leaves the machine alone (security finding C1)", async () => {
     const first = await startDevice("start-machine-reenroll");
     // Simulate the machine having completed enrolment once already.
     const worker = repo.workerRepo.getByEnrolmentCodeHash(hashToken(first.device_code))!;
@@ -86,13 +86,14 @@ describe("POST /api/device/start", () => {
     const second = await startDevice("start-machine-reenroll");
     expect(second.device_code).not.toBe(first.device_code);
 
-    // Old worker session is gone.
-    expect(repo.sessionRepo.getByTokenHash(hashToken(oldSession.token))).toBeUndefined();
-    // Ownership is untouched -- re-enrolling an owned machine needs no re-approval.
-    const reissued = repo.workerRepo.getByEnrolmentCodeHash(hashToken(second.device_code))!;
-    expect(reissued.id).toBe(worker.id);
-    expect(reissued.userId).toBe(user.id);
-    expect(reissued.approvedAt).not.toBeNull();
+    // The old worker session survives an unapproved attempt...
+    expect(repo.sessionRepo.getByTokenHash(hashToken(oldSession.token))).toBeDefined();
+    // ...and the attempt can't be redeemed until the owner approves it.
+    const poll = await postJson("/api/device/token", { device_code: second.device_code });
+    expect(poll.status).toBe(400);
+    expect((await poll.json()) as { error: string }).toEqual({ error: "authorization_pending" });
+    // Ownership untouched. More cases: device-reenrol.test.ts.
+    expect(repo.workerRepo.getEnrolmentById(worker.id)?.userId).toBe(user.id);
   });
 
   it("400s on a malformed body (missing required fields)", async () => {

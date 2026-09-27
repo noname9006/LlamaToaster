@@ -1490,7 +1490,10 @@ export interface ModelDownloadCallbackInput {
 
 export interface Worker {
   id: string;
-  machineId: string;
+  // No machineId here on purpose: it is the lookup key a worker enrols
+  // with, and every API response carrying it (GET /api/workers, the admin
+  // listing) helped leak it (security finding C1). Server code that needs
+  // it reads WorkerEnrolment.machineId instead.
   displayName: string;
   hostname: string | null;
   backend: Backend | null;
@@ -1604,6 +1607,17 @@ export interface DeviceStartResponse {
   user_code: string;
   verification_uri: string;
   interval: number;
+  expires_in: number;
+  // True when the request proved it holds the machine's key (a valid
+  // signature over a POST /api/device/challenge nonce): the code is already
+  // approved, so the worker can redeem it without showing it to anyone.
+  approved?: boolean;
+}
+
+// POST /api/device/challenge -- a one-time nonce (60s) for the worker to
+// sign with its machine key (shared/machineKey.ts's reenrolMessage).
+export interface DeviceChallengeResponse {
+  nonce: string;
   expires_in: number;
 }
 
@@ -2124,6 +2138,9 @@ export type DeviceStatusResponse =
       state: "pending";
       machine: { hostname: string | null; platform: string | null; arch: string | null; gpu: string | null };
       possibleDuplicate: PossibleDuplicateWorker | null;
+      // Set when this code is a reconnect of a machine the caller already
+      // owns (it lost or had its credentials revoked), not a new machine.
+      reconnectOf?: { id: string; displayName: string } | null;
     };
 
 // POST /api/device/approve -- normally approves outright. If the candidate

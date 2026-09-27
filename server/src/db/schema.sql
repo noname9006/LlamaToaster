@@ -223,6 +223,43 @@ CREATE TABLE IF NOT EXISTS workers (
   updated_at INTEGER NOT NULL
 );
 
+-- Re-enrolment attempts for an already-OWNED machine (security finding C1).
+-- Kept apart from the workers row on purpose: an attempt nobody has approved
+-- must not be able to change anything about the live machine (its approval,
+-- its codes, its sessions). Several can be pending at once; a signed attempt
+-- (valid Ed25519 signature over a device challenge, see shared/machineKey.ts)
+-- is created already approved.
+CREATE TABLE IF NOT EXISTS worker_reenrolments (
+  id TEXT PRIMARY KEY,
+  worker_id TEXT NOT NULL REFERENCES workers(id) ON DELETE CASCADE,
+  public_key TEXT,                           -- key the connecting install presented, adopted on human approval
+  hostname TEXT,
+  platform TEXT,
+  arch TEXT,
+  hardware_json TEXT,
+  enrolment_code_hash TEXT NOT NULL,         -- sha256(device_code)
+  user_code TEXT NOT NULL,
+  expires_at INTEGER NOT NULL,
+  approved_by TEXT,                          -- user id; always the machine's owner
+  approved_at INTEGER,
+  signed INTEGER NOT NULL DEFAULT 0,         -- 1 = approved by key proof, not by a human
+  created_at INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_reenrol_code ON worker_reenrolments(enrolment_code_hash);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_reenrol_user_code ON worker_reenrolments(user_code);
+CREATE INDEX IF NOT EXISTS idx_reenrol_worker ON worker_reenrolments(worker_id);
+
+-- One-time nonces a worker signs to prove it holds its machine key. Several
+-- may be live per machine at once, so requesting a new one never invalidates
+-- another caller's; each is consumed by deleting it.
+CREATE TABLE IF NOT EXISTS device_challenges (
+  nonce_hash TEXT PRIMARY KEY,
+  machine_id TEXT NOT NULL,
+  expires_at INTEGER NOT NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_device_challenges_expires ON device_challenges(expires_at);
+
 -- Persistent queue. Leases and attempts are what make a crashed worker
 -- recoverable.
 CREATE TABLE IF NOT EXISTS worker_jobs (

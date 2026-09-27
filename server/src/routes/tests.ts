@@ -7,6 +7,7 @@ import { queueEvents } from "../queue-events.js";
 import { safeEqual, hashToken } from "../session.js";
 import { userOrIpKeyGenerator, resolveAuthUser, assertOwnsWorker, sessionScope } from "../auth-middleware.js";
 import type { UserScope } from "../auth-middleware.js";
+import { assertSharedTokenMayActAs } from "../worker-auth.js";
 import { BadRequestError, ConflictError, ForbiddenError, NotFoundError, UnauthorizedError } from "../errors.js";
 import type {
   TriggerPayload,
@@ -635,6 +636,7 @@ export async function testsRoutes(app: FastifyInstance): Promise<void> {
       }
       worker = repo.workerRepo.getByMachineId(machineId);
       if (!worker) throw new UnauthorizedError("unknown machine");
+      assertSharedTokenMayActAs(worker.id);
     }
 
     const run = repo.getTest(undefined, request.params.id);
@@ -1364,6 +1366,7 @@ export async function testsRoutes(app: FastifyInstance): Promise<void> {
         const expected = process.env.WORKER_SHARED_TOKEN;
         if (!expected || !safeEqual(token, expected)) throw new UnauthorizedError("invalid worker token");
         authorizedAsWorkerId = run.worker_id;
+        if (run.worker_id) assertSharedTokenMayActAs(run.worker_id);
       }
       if (!run.worker_id || authorizedAsWorkerId !== run.worker_id) {
         throw new ForbiddenError("this machine did not execute this run");

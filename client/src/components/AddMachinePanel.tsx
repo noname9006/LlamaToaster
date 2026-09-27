@@ -184,6 +184,15 @@ export function AddMachinePanel({
                     separate one.
                   </span>
                 </div>
+              ) : status.reconnectOf ? (
+                <div className="mt-3 flex items-start gap-2 rounded-md bg-warning-bg px-2.5 py-2 text-xs text-warning">
+                  <IconInfo width={14} height={14} className="mt-0.5 flex-none" />
+                  <span>
+                    This reconnects your existing machine "{status.reconnectOf.displayName}". Approving it ends
+                    that machine's current connection and hands its identity to the install showing this code, so
+                    only approve a code you just saw on that machine yourself.
+                  </span>
+                </div>
               ) : (
                 <div className="mt-3 flex items-start gap-2 rounded-md bg-warning-bg px-2.5 py-2 text-xs text-warning">
                   <IconInfo width={14} height={14} className="mt-0.5 flex-none" />

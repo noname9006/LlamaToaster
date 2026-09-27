@@ -15,6 +15,7 @@ import {
   chmodSync,
 } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
+import { generateMachineKey, signReenrol } from "./machine-key.js";
 import { gzipSync } from "node:zlib";
 import { hostname as osHostname } from "node:os";
 import { pipeline } from "node:stream/promises";
@@ -77,6 +78,8 @@ import {
   startDeviceEnrolment,
   pollDeviceToken,
   refreshWorkerSession,
+  requestDeviceChallenge,
+  registerMachineKey,
   HttpError,
   postProbeResult,
   postProbeAttempt,
@@ -187,6 +190,12 @@ interface WorkerConfig {
   // Rotates alongside session_token (see refreshWorkerSession) -- presented
   // only to POST /api/auth/refresh, never to any other route.
   refresh_token?: string;
+  // Ed25519 machine identity (worker/src/machine-key.ts), generated once on
+  // first boot. The server learns the public half at enrolment; signing a
+  // server nonce with the private half is what lets this machine re-enrol
+  // without a human re-approving it. Never logged.
+  machine_public_key?: string;
+  machine_private_key?: string;
   raw_json_dir?: string;
   bench_timeout_ms?: number;
   llama_cpp_builds_dir?: string;
@@ -268,7 +277,14 @@ secureConfigFile(); // lock down permissions even if this run never calls persis
 if (!config.machine_id) {
   const generated = randomUUID();
   persistConfig({ machine_id: generated });
-  log.info(`generated new machine_id: ${generated}`);
+  // The id itself is not logged: worker logs get pasted into public bug
+  // reports, and machine_id is a lookup key into the server (C1).
+  log.info("generated new machine_id");
+}
+if (!config.machine_public_key || !config.machine_private_key) {
+  const key = generateMachineKey();
+  persistConfig({ machine_public_key: key.publicKeyPem, machine_private_key: key.privateKeyPem });
+  log.info("generated new machine key");
 }
 // No hard requirement on worker_shared_token/session_token here anymore --
 // see ensureAuthCredential below, called once hardware detection has run
@@ -334,7 +350,7 @@ function formatGpuEntry(g: { model: string; vendor: string; vram_mb?: number | n
 }
 
 log.info(
-  `[worker ${config.worker_name}] starting (machine_id=${config.machine_id}, backend=${backend}, build=${config.llama_cpp_build}, log level=${
+  `[worker ${config.worker_name}] starting (backend=${backend}, build=${config.llama_cpp_build}, log level=${
     process.env.LOG_LEVEL ?? "info"
   })`
 );
@@ -4306,15 +4322,96 @@ let sessionAuth = false;
 // secret, i.e. a genuinely fresh install. Blocks until a human approves the
 // printed code (or it expires), since there is nothing useful this worker
 // can do before it has a credential.
-async function enrolDevice(): Promise<void> {
-  log.info(`[worker ${config.worker_name}] no credential configured -- starting device enrolment`);
-  const start = await startDeviceEnrolment(config.url, {
+// Starts a device enrolment, signing a fresh server challenge with this
+// machine's key so an owned machine is approved without a human (security
+// finding C1). A machine the server doesn't know yet, or whose key the owner
+// revoked, simply gets a normal code to approve. A challenge failure (e.g. an
+// older server without the route) falls back to an unsigned start.
+async function startSignedEnrolment() {
+  let proof: { nonce: string; signature: string } | undefined;
+  try {
+    const { nonce } = await requestDeviceChallenge(config.url, config.machine_id!);
+    proof = { nonce, signature: signReenrol(config.machine_private_key!, nonce, config.machine_id!) };
+  } catch (err) {
+    log.warn(`[worker ${config.worker_name}] could not get a reconnect challenge (${err instanceof Error ? err.message : String(err)}) -- asking for approval instead`);
+  }
+  return startDeviceEnrolment(config.url, {
     machine_id: config.machine_id!,
     hostname: osHostname(),
     platform: detectedHardware.platform,
     arch: detectedHardware.arch,
     hardware: detectedHardware,
+    public_key: config.machine_public_key,
+    ...proof,
   });
+}
+
+function adoptSession(sessionToken: string, refresh: string): void {
+  persistConfig({ session_token: sessionToken, refresh_token: refresh });
+  authToken = sessionToken;
+  refreshToken = refresh;
+  sessionAuth = true;
+}
+
+// Called when the refresh token itself is dead (long offline, or revoked).
+// Reconnects with the machine key when the server still trusts it, so a
+// machine that sat offline past its refresh window comes back on its own.
+// When it doesn't (the owner revoked the machine), this shows THAT attempt's
+// code and waits for the owner, exactly like a first enrolment -- rather than
+// returning and letting the heartbeat/queue loops retry every 10s, which
+// would mint a fresh, never-shown code each time. Both loops await the same
+// refreshInFlight promise, so they pause together while it waits.
+async function reconnectAfterLostSession(): Promise<void> {
+  const start = await startSignedEnrolment();
+  if (start.approved) {
+    const poll = await pollDeviceToken(config.url, start.device_code);
+    if (poll.state === "approved") {
+      adoptSession(poll.session_token, poll.refresh_token);
+      log.info(`[worker ${config.worker_name}] reconnected with this machine's key`);
+      return;
+    }
+  }
+  log.warn(`[worker ${config.worker_name}] this machine's session was revoked -- its owner has to approve it again`);
+  await awaitHumanApproval(start);
+}
+
+// Registers this machine's key with the server once, for a machine enrolled
+// before keys existed (trust on first use). Harmless to repeat: the server
+// keeps the first key it gets and reports anything else as a conflict.
+async function ensureMachineKeyRegistered(): Promise<void> {
+  if (!sessionAuth || !config.machine_public_key) return;
+  try {
+    const result = await withAuth((token) => registerMachineKey(config.url, token, config.machine_public_key!));
+    if (result === "registered") log.info(`[worker ${config.worker_name}] machine key registered with the server`);
+    if (result === "conflict") {
+      log.warn(
+        `[worker ${config.worker_name}] the server has a different key on file for this machine -- ` +
+          `if it ever needs to reconnect, its owner will be asked to approve it`
+      );
+    }
+  } catch (err) {
+    // An older server (404) or a transient failure -- retried next start.
+    log.warn(`[worker ${config.worker_name}] could not register machine key: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+async function enrolDevice(): Promise<void> {
+  log.info(`[worker ${config.worker_name}] no credential configured -- starting device enrolment`);
+  const start = await startSignedEnrolment();
+  if (start.approved) {
+    const poll = await pollDeviceToken(config.url, start.device_code);
+    if (poll.state === "approved") {
+      adoptSession(poll.session_token, poll.refresh_token);
+      log.info(`[worker ${config.worker_name}] reconnected with this machine's key -- no approval needed`);
+      return;
+    }
+  }
+  await awaitHumanApproval(start);
+}
+
+// Shows the code from an enrolment start and polls until a human approves it
+// (or it expires).
+async function awaitHumanApproval(start: Awaited<ReturnType<typeof startDeviceEnrolment>>): Promise<void> {
   log.info(
     `[worker ${config.worker_name}] to connect this machine, open the LlamaToaster site -> Workers page -> "Add a machine" (${config.url}${start.verification_uri})`
   );
@@ -4346,10 +4443,7 @@ async function enrolDevice(): Promise<void> {
     await sleep(start.interval * 1000);
     const poll = await pollDeviceToken(config.url, start.device_code);
     if (poll.state === "approved") {
-      persistConfig({ session_token: poll.session_token, refresh_token: poll.refresh_token });
-      authToken = poll.session_token;
-      refreshToken = poll.refresh_token;
-      sessionAuth = true;
+      adoptSession(poll.session_token, poll.refresh_token);
       log.info(`[worker ${config.worker_name}] device approved -- connected`);
       return;
     }
@@ -4406,7 +4500,16 @@ async function refreshAuth(): Promise<void> {
   if (!sessionAuth || !refreshToken) throw new Error("session expired and no refresh token is available");
   if (refreshInFlight) return refreshInFlight;
   refreshInFlight = (async () => {
-    const rotated = await refreshWorkerSession(config.url, refreshToken!);
+    let rotated;
+    try {
+      rotated = await refreshWorkerSession(config.url, refreshToken!);
+    } catch (err) {
+      // The refresh token itself is dead (expired after a long time offline,
+      // or revoked): reconnect with the machine key, or -- if the owner
+      // revoked this machine -- show a code and wait for their approval.
+      if (err instanceof HttpError && err.status === 401) return reconnectAfterLostSession();
+      throw err;
+    }
     persistConfig({ session_token: rotated.session_token, refresh_token: rotated.refresh_token });
     authToken = rotated.session_token;
     refreshToken = rotated.refresh_token;
@@ -4692,7 +4795,8 @@ if (config.debug_port) {
       res.end(
         JSON.stringify({
           ok: true,
-          machine_id: config.machine_id,
+          // No machine_id: it is the key a machine enrols with, and anything
+          // that can reach this port could read it (security finding C1).
           busy,
           backend,
           active_build: activeBuild?.tag ?? null,
@@ -4722,6 +4826,7 @@ setInterval(pruneRawJson, RAW_JSON_PRUNE_INTERVAL_MS).unref();
 // Run startup reconciliation after authentication is established
 // This runs in the background and doesn't block startup
 await ensureAuthCredential();
+await ensureMachineKeyRegistered();
 
 // Now start the reconciliation with the auth token
 void runStartupReconciliation(

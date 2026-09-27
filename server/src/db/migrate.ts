@@ -229,6 +229,12 @@ const COLUMN_MIGRATIONS: ColumnSpec[] = [
   { table: "workers", column: "user_code", ddlType: "TEXT" },
   { table: "workers", column: "enrolment_expires_at", ddlType: "INTEGER" },
   { table: "workers", column: "approved_at", ddlType: "INTEGER" },
+  // Ed25519 machine identity (security finding C1, shared/machineKey.ts) --
+  // PEM public key. Set when a human approves the machine (from the key its
+  // /api/device/start presented) or once, by the worker itself, via
+  // POST /api/worker/register-key for a machine enrolled before keys existed.
+  { table: "workers", column: "public_key", ddlType: "TEXT" },
+  { table: "workers", column: "key_registered_at", ddlType: "INTEGER" },
   // Multi-user Stage 4 (MULTIUSER_PLAN.md §4.1) -- nullable: a run/result/
   // item predating auth (or created while AUTH_ENABLED is off) simply has no
   // owner, same "no migration forces a value" posture as runs.worker_id

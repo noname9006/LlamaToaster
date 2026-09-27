@@ -125,6 +125,18 @@ approval binds the machine to the account that clicked it. If the hardware
 fingerprint matches a machine you already have, approving *merges* into that
 row instead of creating a duplicate.
 
+**Reconnecting** an owned machine needs proof, not just its `machine_id`.
+Each worker creates an Ed25519 key on first start and keeps it in
+`config.json`; the server stores the public half when the machine is
+approved (machines enrolled before keys existed register theirs once over
+their own session). To reconnect after its session is lost, the worker
+signs a one-time nonce from `/api/device/challenge` and is approved at once.
+Without a valid signature the attempt waits in its own row until the owner
+approves it, and the live machine is left alone. Revoking a machine in
+Settings forgets its key, so it needs the owner's approval to come back. A
+worker token only works for the worker protocol; it is never accepted as a
+browser login.
+
 **Tenancy** is enforced in SQL, not in the UI: every read is scoped by
 `user_id` inside `repo.ts`. Route handlers cannot forget to scope, because
 they never write the query.

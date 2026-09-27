@@ -309,6 +309,8 @@ interface WorkerRow {
   user_code: string | null;
   enrolment_expires_at: number | null;
   approved_at: number | null;
+  public_key: string | null;
+  key_registered_at: number | null;
 }
 
 // Server-internal shape for the device-flow routes (routes/device.ts) --
@@ -325,7 +327,66 @@ export interface WorkerEnrolment {
   gpuModel: string | null; // first reported GPU, for the §3.1 confirm card
   enrolmentExpiresAt: number | null;
   approvedAt: number | null;
+  machineId: string;
+  // Ed25519 PEM (shared/machineKey.ts) -- null until the machine has one.
+  publicKey: string | null;
 }
+
+// A re-enrolment attempt for an already-owned machine (worker_reenrolments,
+// schema.sql) -- see workerRepo.createReenrolment.
+export interface WorkerReenrolment {
+  id: string;
+  workerId: string;
+  publicKey: string | null;
+  hostname: string | null;
+  platform: string | null;
+  arch: string | null;
+  hardwareJson: string | null;
+  userCode: string;
+  expiresAt: number;
+  approvedBy: string | null;
+  approvedAt: number | null;
+  signed: boolean;
+}
+
+interface WorkerReenrolmentRow {
+  id: string;
+  worker_id: string;
+  public_key: string | null;
+  hostname: string | null;
+  platform: string | null;
+  arch: string | null;
+  hardware_json: string | null;
+  enrolment_code_hash: string;
+  user_code: string;
+  expires_at: number;
+  approved_by: string | null;
+  approved_at: number | null;
+  signed: number;
+  created_at: number;
+}
+
+function mapWorkerReenrolment(row: WorkerReenrolmentRow): WorkerReenrolment {
+  return {
+    id: row.id,
+    workerId: row.worker_id,
+    publicKey: row.public_key,
+    hostname: row.hostname,
+    platform: row.platform,
+    arch: row.arch,
+    hardwareJson: row.hardware_json,
+    userCode: row.user_code,
+    expiresAt: row.expires_at,
+    approvedBy: row.approved_by,
+    approvedAt: row.approved_at,
+    signed: row.signed === 1,
+  };
+}
+
+// How many unapproved re-enrolment attempts one machine may have queued.
+// Anyone who knows a machine_id can add one, so this bounds the table; the
+// oldest is dropped first, so the owner's own attempt (the newest) survives.
+export const MAX_PENDING_REENROLMENTS = 5;
 
 // The richer shape actually stored in workers.model_files_json (see
 // WorkerStatePush.model_files) -- ModelDirFile plus the optional GGUF
@@ -610,7 +671,6 @@ function mapWorker(row: WorkerRow): Worker {
   const activeDownloads = getActiveDownloadReports(row.id);
   return {
     id: row.id,
-    machineId: row.machine_id,
     displayName: row.display_name,
     hostname: row.hostname,
     backend: row.backend,
@@ -648,6 +708,8 @@ function mapWorkerEnrolment(row: WorkerRow): WorkerEnrolment {
     gpuModel: hardware?.gpu?.[0]?.model ?? null,
     enrolmentExpiresAt: row.enrolment_expires_at,
     approvedAt: row.approved_at,
+    machineId: row.machine_id,
+    publicKey: row.public_key,
   };
 }
 
@@ -2071,6 +2133,9 @@ export const repo = {
       // before this machine is even approved. Optional purely for a
       // not-yet-updated worker binary; a normal fresh install always sends it.
       hardware?: HardwareInfo;
+      // The install's Ed25519 public key -- becomes the machine's key when a
+      // human approves this row. Absent from a pre-key worker binary.
+      publicKey?: string;
     }): WorkerEnrolment {
       const now = Date.now();
       const id = uuid();
@@ -2078,8 +2143,8 @@ export const repo = {
         .prepare(
           `INSERT INTO workers
              (id, machine_id, display_name, hostname, platform, arch, hardware_json,
-              enrolment_code_hash, user_code, enrolment_expires_at, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+              enrolment_code_hash, user_code, enrolment_expires_at, public_key, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         )
         .run(
           id,
@@ -2092,20 +2157,22 @@ export const repo = {
           hashToken(opts.deviceCode),
           opts.userCode,
           opts.expiresAt,
+          opts.publicKey ?? null,
           now,
           now
         );
       return this.getEnrolmentById(id)!;
     },
 
-    // Re-enrolment of an ALREADY-KNOWN machine (§3.4) -- an owned machine
-    // reconnecting (expired session, revoked from Settings, rebuilt disk) or
-    // a still-pending one retrying after an abandoned attempt. Deliberately
-    // does NOT touch display_name (preserves a user's rename across
-    // reconnects) or user_id/approved_at (preserves existing ownership
-    // exactly as-is; only a FIRST enrolment ever sets those, via approve()
-    // below) -- only the self-reported hostname/platform/arch and the fresh
-    // enrolment code/expiry are refreshed.
+    // Re-enrolment of a known machine that NOBODY OWNS yet -- a pending
+    // first enrolment retrying after an abandoned attempt, or a Stage 1
+    // shared-token machine moving to device enrolment. It still needs a
+    // human's approval afterwards. An OWNED machine never comes through
+    // here: before security finding C1, reusing its row kept approved_at and
+    // let anyone who knew the machine_id mint a session for the owner.
+    // Owned machines go through createReenrolment below instead, which
+    // leaves the live row alone; the WHERE clause enforces that even if a
+    // caller gets it wrong. Deliberately does NOT touch display_name.
     reissueEnrolment(
       workerId: string,
       opts: {
@@ -2116,14 +2183,18 @@ export const repo = {
         userCode: string;
         expiresAt: number;
         hardware?: HardwareInfo;
+        publicKey?: string;
       }
     ): WorkerEnrolment {
+      // public_key is replaced, not COALESCEd: it belongs to whichever
+      // install holds the code a human is about to approve, and code + key
+      // are always written together.
       getDb()
         .prepare(
           `UPDATE workers SET
              hostname = ?, platform = ?, arch = ?, hardware_json = COALESCE(?, hardware_json),
-             enrolment_code_hash = ?, user_code = ?, enrolment_expires_at = ?, updated_at = ?
-           WHERE id = ?`
+             enrolment_code_hash = ?, user_code = ?, enrolment_expires_at = ?, public_key = ?, updated_at = ?
+           WHERE id = ? AND user_id IS NULL`
         )
         .run(
           opts.hostname,
@@ -2133,6 +2204,7 @@ export const repo = {
           hashToken(opts.deviceCode),
           opts.userCode,
           opts.expiresAt,
+          opts.publicKey ?? null,
           Date.now(),
           workerId
         );
@@ -2216,7 +2288,7 @@ export const repo = {
         const pending = database
           .prepare(
             `SELECT machine_id, hostname, platform, arch, hardware_json,
-                    enrolment_code_hash, user_code, enrolment_expires_at
+                    enrolment_code_hash, user_code, enrolment_expires_at, public_key
              FROM workers WHERE id = ?`
           )
           .get(pendingWorkerId) as {
@@ -2228,13 +2300,20 @@ export const repo = {
           enrolment_code_hash: string | null;
           user_code: string | null;
           enrolment_expires_at: number | null;
+          public_key: string | null;
         };
         database.prepare(`DELETE FROM workers WHERE id = ?`).run(pendingWorkerId);
+        // The target's old key belonged to the install being merged away
+        // from; it's replaced by the connecting install's key (or cleared if
+        // that install has none), and re-enrolment attempts queued against
+        // the old identity are dropped.
+        database.prepare(`DELETE FROM worker_reenrolments WHERE worker_id = ?`).run(targetWorkerId);
         database
           .prepare(
             `UPDATE workers SET
                machine_id = ?, hostname = ?, platform = ?, arch = ?, hardware_json = ?,
-               enrolment_code_hash = ?, user_code = ?, enrolment_expires_at = ?, updated_at = ?
+               enrolment_code_hash = ?, user_code = ?, enrolment_expires_at = ?,
+               public_key = ?, key_registered_at = ?, updated_at = ?
              WHERE id = ?`
           )
           .run(
@@ -2246,6 +2325,8 @@ export const repo = {
             pending.enrolment_code_hash,
             pending.user_code,
             pending.enrolment_expires_at,
+            pending.public_key,
+            pending.public_key ? Date.now() : null,
             Date.now(),
             targetWorkerId
           );
@@ -2263,8 +2344,12 @@ export const repo = {
     // consumption point, called once that redemption succeeds, not here.
     approve(workerId: string, userId: string): void {
       getDb()
-        .prepare(`UPDATE workers SET user_id = ?, approved_at = ?, updated_at = ? WHERE id = ?`)
-        .run(userId, Date.now(), Date.now(), workerId);
+        .prepare(
+          `UPDATE workers SET user_id = ?, approved_at = ?, updated_at = ?,
+             key_registered_at = CASE WHEN public_key IS NOT NULL THEN ? ELSE key_registered_at END
+           WHERE id = ?`
+        )
+        .run(userId, Date.now(), Date.now(), Date.now(), workerId);
     },
 
     // Called once POST /api/device/token successfully issues a session for
@@ -2302,6 +2387,197 @@ export const repo = {
            WHERE approved_at IS NULL AND enrolment_expires_at IS NOT NULL AND enrolment_expires_at < ?`
         )
         .run(Date.now()).changes;
+    },
+
+    // --- Security finding C1: machine keys, re-enrolment, revocation ---
+
+    // A user_code must be unique across first enrolments AND re-enrolments,
+    // since GET /api/device/status and POST /api/device/approve look it up
+    // in both.
+    isUserCodeTaken(userCode: string): boolean {
+      const db = getDb();
+      return (
+        db.prepare(`SELECT 1 FROM workers WHERE user_code = ?`).get(userCode) !== undefined ||
+        db.prepare(`SELECT 1 FROM worker_reenrolments WHERE user_code = ?`).get(userCode) !== undefined
+      );
+    },
+
+    // Trust-on-first-use for a machine enrolled before keys existed: its
+    // worker registers a key over its own session, once. Never replaces an
+    // existing key -- after that, only a human approval can.
+    registerKey(workerId: string, publicKeyPem: string): boolean {
+      return (
+        getDb()
+          .prepare(
+            `UPDATE workers SET public_key = ?, key_registered_at = ?, updated_at = ? WHERE id = ? AND public_key IS NULL`
+          )
+          .run(publicKeyPem, Date.now(), Date.now(), workerId).changes === 1
+      );
+    },
+
+    // An attempt to reconnect an OWNED machine. Nothing about the live
+    // workers row changes here -- an attempt only takes effect when it is
+    // redeemed (redeemReenrolment), and only once approved: either right
+    // away by a valid key signature (`signed`) or later by the owner.
+    createReenrolment(opts: {
+      workerId: string;
+      ownerId: string;
+      publicKey?: string;
+      hostname: string;
+      platform: string;
+      arch: string;
+      hardware?: HardwareInfo;
+      deviceCode: string;
+      userCode: string;
+      expiresAt: number;
+      signed: boolean;
+    }): WorkerReenrolment {
+      const database = getDb();
+      const id = uuid();
+      const now = Date.now();
+      database.transaction(() => {
+        if (!opts.signed) {
+          // Bound the unapproved queue per machine (MAX_PENDING_REENROLMENTS).
+          const stale = database
+            .prepare(
+              `SELECT id FROM worker_reenrolments WHERE worker_id = ? AND approved_at IS NULL
+               ORDER BY created_at DESC, rowid DESC LIMIT -1 OFFSET ?`
+            )
+            .all(opts.workerId, MAX_PENDING_REENROLMENTS - 1) as { id: string }[];
+          for (const row of stale) database.prepare(`DELETE FROM worker_reenrolments WHERE id = ?`).run(row.id);
+        }
+        database
+          .prepare(
+            `INSERT INTO worker_reenrolments
+               (id, worker_id, public_key, hostname, platform, arch, hardware_json,
+                enrolment_code_hash, user_code, expires_at, approved_by, approved_at, signed, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          )
+          .run(
+            id,
+            opts.workerId,
+            opts.publicKey ?? null,
+            opts.hostname,
+            opts.platform,
+            opts.arch,
+            opts.hardware ? JSON.stringify(opts.hardware) : null,
+            hashToken(opts.deviceCode),
+            opts.userCode,
+            opts.expiresAt,
+            opts.signed ? opts.ownerId : null,
+            opts.signed ? now : null,
+            opts.signed ? 1 : 0,
+            now
+          );
+      })();
+      return this.getReenrolmentById(id)!;
+    },
+
+    getReenrolmentById(id: string): WorkerReenrolment | undefined {
+      const row = getDb().prepare(`SELECT * FROM worker_reenrolments WHERE id = ?`).get(id) as
+        | WorkerReenrolmentRow
+        | undefined;
+      return row ? mapWorkerReenrolment(row) : undefined;
+    },
+
+    getReenrolmentByUserCode(userCode: string): WorkerReenrolment | undefined {
+      const row = getDb().prepare(`SELECT * FROM worker_reenrolments WHERE user_code = ?`).get(userCode) as
+        | WorkerReenrolmentRow
+        | undefined;
+      return row ? mapWorkerReenrolment(row) : undefined;
+    },
+
+    getReenrolmentByCodeHash(hash: string): WorkerReenrolment | undefined {
+      const row = getDb().prepare(`SELECT * FROM worker_reenrolments WHERE enrolment_code_hash = ?`).get(hash) as
+        | WorkerReenrolmentRow
+        | undefined;
+      return row ? mapWorkerReenrolment(row) : undefined;
+    },
+
+    // The owner's click. The caller (routes/device.ts) has already checked
+    // that approverId owns the machine; the WHERE clause keeps a
+    // double-approve from rewriting who approved it.
+    approveReenrolment(id: string, approverId: string): boolean {
+      return (
+        getDb()
+          .prepare(`UPDATE worker_reenrolments SET approved_by = ?, approved_at = ? WHERE id = ? AND approved_at IS NULL`)
+          .run(approverId, Date.now(), id).changes === 1
+      );
+    },
+
+    // Redeems an approved attempt in one transaction: the machine's old
+    // worker sessions end, its self-reported details refresh, and -- for a
+    // HUMAN-approved attempt -- the connecting install's key becomes the
+    // machine's key (a signed attempt proved it already holds the current
+    // one). The attempt row is consumed; a human-approved redemption also
+    // drops every other queued attempt for the machine. Returns false if the
+    // attempt is gone or unapproved (e.g. a concurrent redemption won).
+    redeemReenrolment(id: string): boolean {
+      const database = getDb();
+      return database.transaction((): boolean => {
+        const row = database.prepare(`SELECT * FROM worker_reenrolments WHERE id = ?`).get(id) as
+          | WorkerReenrolmentRow
+          | undefined;
+        if (!row || row.approved_at == null) return false;
+        const now = Date.now();
+        database.prepare(`DELETE FROM sessions WHERE worker_id = ? AND is_worker = 1`).run(row.worker_id);
+        database
+          .prepare(
+            `UPDATE workers SET hostname = ?, platform = ?, arch = ?, hardware_json = COALESCE(?, hardware_json),
+               updated_at = ? WHERE id = ?`
+          )
+          .run(row.hostname, row.platform, row.arch, row.hardware_json, now, row.worker_id);
+        if (row.signed === 1) {
+          database.prepare(`DELETE FROM worker_reenrolments WHERE id = ?`).run(id);
+        } else {
+          database
+            .prepare(`UPDATE workers SET public_key = ?, key_registered_at = ? WHERE id = ?`)
+            .run(row.public_key, row.public_key ? now : null, row.worker_id);
+          database.prepare(`DELETE FROM worker_reenrolments WHERE worker_id = ?`).run(row.worker_id);
+        }
+        return true;
+      })();
+    },
+
+    // The single revocation rule: the machine's worker sessions end, its key
+    // is forgotten, and queued re-enrolment attempts are dropped -- so the
+    // only way back is the owner approving it again. Every place that
+    // revokes a worker goes through here (routes/sessions.ts,
+    // routes/workers.ts).
+    revokeTrust(workerId: string): void {
+      const database = getDb();
+      database.transaction(() => {
+        database.prepare(`DELETE FROM sessions WHERE worker_id = ? AND is_worker = 1`).run(workerId);
+        database.prepare(`DELETE FROM worker_reenrolments WHERE worker_id = ?`).run(workerId);
+        database
+          .prepare(`UPDATE workers SET public_key = NULL, key_registered_at = NULL, updated_at = ? WHERE id = ?`)
+          .run(Date.now(), workerId);
+      })();
+    },
+
+    // Reaper sweep: expired, unredeemed attempts.
+    pruneExpiredReenrolments(): number {
+      return getDb().prepare(`DELETE FROM worker_reenrolments WHERE expires_at < ?`).run(Date.now()).changes;
+    },
+
+    createChallenge(machineId: string, nonce: string, expiresAt: number): void {
+      getDb()
+        .prepare(`INSERT INTO device_challenges (nonce_hash, machine_id, expires_at, created_at) VALUES (?, ?, ?, ?)`)
+        .run(hashToken(nonce), machineId, expiresAt, Date.now());
+    },
+
+    // Single use: consuming deletes the row, so a nonce can never verify
+    // twice. False for an unknown, expired, or other-machine nonce.
+    consumeChallenge(machineId: string, nonce: string): boolean {
+      return (
+        getDb()
+          .prepare(`DELETE FROM device_challenges WHERE nonce_hash = ? AND machine_id = ? AND expires_at >= ?`)
+          .run(hashToken(nonce), machineId, Date.now()).changes === 1
+      );
+    },
+
+    pruneExpiredChallenges(): number {
+      return getDb().prepare(`DELETE FROM device_challenges WHERE expires_at < ?`).run(Date.now()).changes;
     },
   },
 

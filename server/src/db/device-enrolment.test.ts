@@ -327,7 +327,7 @@ describe("workerRepo.mergeEnrolment", () => {
     expect(merged.id).toBe(target.id);
     expect(merged.displayName).toBe("My Renamed Box");
     // Transplanted from the pending row: the target now IS this machine.
-    expect(merged.machineId).toBe("m-merge-pending");
+    expect(repo.workerRepo.getEnrolmentById(merged.id)?.machineId).toBe("m-merge-pending");
     expect(merged.hostname).toBe("new-box");
     expect(merged.hardware).toMatchObject({ cpu: { brand: hw().cpu.brand } });
 

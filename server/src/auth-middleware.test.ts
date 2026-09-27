@@ -41,6 +41,8 @@ beforeAll(async () => {
   app.get<{ Params: { id: string } }>("/api/runs/:id/log", async () => ({ ok: true, via: "GET (user-authed)" }));
   app.post<{ Params: { id: string } }>("/api/runs/:id/log", async () => ({ ok: true, via: "POST (worker-authed)" }));
   app.post("/api/models/download-callback", async () => ({ ok: true }));
+  app.post<{ Params: { id: string } }>("/api/tests/:id/probe-attempt", async () => ({ ok: true }));
+  app.get<{ Params: { id: string } }>("/api/tests/:id/probe-dedup", async () => ({ ok: true }));
 
   await app.listen({ port: 0, host: "127.0.0.1" });
   const address = app.server.address();
@@ -155,6 +157,24 @@ describe("authMiddleware", () => {
     // 200, i.e. the middleware never let an unmatched route through as if it
     // were authenticated or public.
     expect(res.status).not.toBe(200);
+  });
+});
+
+describe("worker sessions are not user sessions (security finding C1)", () => {
+  it("a worker session token gets 401 on a user route and a null resolveAuthUser", async () => {
+    const user = repo.userRepo.upsertByIdentity("github", { providerUserId: "mw-c1", login: "mw-c1", avatarUrl: null });
+    const worker = repo.workerRepo.getOrCreateByMachineId("mw-c1-machine", "mw-c1-box");
+    const { token } = repo.sessionRepo.create(user.id, { isWorker: true, workerId: worker.id });
+
+    const res = await fetch(`${baseUrl}/api/protected`, { headers: { authorization: `Bearer ${token}` } });
+    expect(res.status).toBe(401);
+    const status = await fetch(`${baseUrl}/api/auth/status`, { headers: { authorization: `Bearer ${token}` } });
+    expect(((await status.json()) as { user: unknown }).user).toBeNull();
+  });
+
+  it("the worker-called probe routes still pass the middleware (their handlers do the worker check)", async () => {
+    expect((await fetch(`${baseUrl}/api/tests/x/probe-attempt`, { method: "POST" })).status).toBe(200);
+    expect((await fetch(`${baseUrl}/api/tests/x/probe-dedup`)).status).toBe(200);
   });
 });
 

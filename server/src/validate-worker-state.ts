@@ -1,3 +1,4 @@
+import { createPublicKey } from "node:crypto";
 import { BadRequestError } from "./errors.js";
 import type {
   WorkerStatePush,
@@ -424,6 +425,28 @@ export interface DeviceStartInput {
   // validator the heartbeat path (parseWorkerState below) already applies to
   // this exact shape, since a worker reports it identically in both places.
   hardware?: HardwareInfo;
+  // Security finding C1 -- all optional so a pre-key worker binary can still
+  // enrol (it just always needs a human approval). public_key is the
+  // install's Ed25519 key (PEM); nonce + signature prove it holds the key
+  // already on file for this machine.
+  public_key?: string;
+  nonce?: string;
+  signature?: string;
+}
+
+// An Ed25519 public key in SPKI PEM -- anything else is rejected rather than
+// stored, since it is later handed to crypto.verify.
+function optionalEd25519PublicKey(value: unknown): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "string" || value.length > 512) throw new BadRequestError("public_key must be a PEM string");
+  let key;
+  try {
+    key = createPublicKey(value);
+  } catch {
+    throw new BadRequestError("public_key is not a valid public key");
+  }
+  if (key.asymmetricKeyType !== "ed25519") throw new BadRequestError("public_key must be an Ed25519 key");
+  return value;
 }
 
 export function parseDeviceStart(body: unknown): DeviceStartInput {
@@ -435,7 +458,24 @@ export function parseDeviceStart(body: unknown): DeviceStartInput {
     platform: sanitizeString(b.platform, "platform"),
     arch: sanitizeString(b.arch, "arch"),
     hardware: b.hardware !== undefined ? parseHardware(b.hardware) : undefined,
+    public_key: optionalEd25519PublicKey(b.public_key),
+    nonce: optionalString(b.nonce, "nonce", 128),
+    signature: optionalString(b.signature, "signature", 256),
   };
+}
+
+// POST /api/device/challenge's body -- just the machine asking.
+export function parseDeviceChallenge(body: unknown): { machine_id: string } {
+  if (typeof body !== "object" || body === null) throw new BadRequestError("request body must be an object");
+  return { machine_id: sanitizeString((body as Record<string, unknown>).machine_id, "machine_id") };
+}
+
+// POST /api/worker/register-key's body.
+export function parseRegisterKey(body: unknown): { public_key: string } {
+  if (typeof body !== "object" || body === null) throw new BadRequestError("request body must be an object");
+  const key = optionalEd25519PublicKey((body as Record<string, unknown>).public_key);
+  if (!key) throw new BadRequestError("public_key is required");
+  return { public_key: key };
 }
 
 // POST /api/device/token's own body -- just the one opaque code.

@@ -55,7 +55,7 @@ describe("authenticateWorker", () => {
     const worker = await authenticateWorker(
       fakeRequest({ authHeader: "Bearer test-shared-secret", body: { machine_id: "m-auth-1", hostname: "box-1" } })
     );
-    expect(worker.machineId).toBe("m-auth-1");
+    expect(repo.workerRepo.getEnrolmentById(worker.id)?.machineId).toBe("m-auth-1");
     expect(worker.displayName).toBe("box-1");
   });
 
@@ -123,5 +123,16 @@ describe("authenticateWorker with no WORKER_SHARED_TOKEN configured", () => {
       authenticateWorker(fakeRequest({ authHeader: "Bearer anything", body: { machine_id: "m1" } }))
     ).rejects.toBeInstanceOf(UnauthorizedError);
     process.env.WORKER_SHARED_TOKEN = "test-shared-secret"; // restore for any later test file ordering
+  });
+});
+
+describe("shared-token fallback never speaks for an enrolled machine", () => {
+  it("401s when the named machine_id belongs to a user", async () => {
+    const worker = repo.workerRepo.getOrCreateByMachineId("m-owned-1", "owned-box");
+    const user = repo.userRepo.upsertByIdentity("github", { providerUserId: "shared-owner", login: "o", avatarUrl: null });
+    repo.workerRepo.approve(worker.id, user.id);
+    await expect(
+      authenticateWorker(fakeRequest({ authHeader: "Bearer test-shared-secret", body: { machine_id: "m-owned-1" } }))
+    ).rejects.toBeInstanceOf(UnauthorizedError);
   });
 });
