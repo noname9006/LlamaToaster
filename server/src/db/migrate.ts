@@ -250,6 +250,17 @@ const COLUMN_MIGRATIONS: ColumnSpec[] = [
   // catalog row. No user-deletion feature exists yet, so this is currently
   // untested in practice, just faithful to the plan.
   { table: "models", column: "created_by", ddlType: "TEXT REFERENCES users(id)" },
+  // True once an actual in-app download has established this model's
+  // hf_repo/hf_file (workers.ts's download-callback route only) -- see
+  // shared/types.ts's Model.hf_identity_locked and repo.ts's registerModel
+  // for what this protects against: a hash-lookup-driven scan (a
+  // hand-dropped-file heartbeat reconciliation, queue.ts's
+  // registerHashVerifiedModelFiles) guessing the wrong repo for a hash a
+  // fork/mirror also shares, and silently overwriting a correctly-attributed
+  // download. DEFAULT 0 so every pre-existing row (all attributed the old
+  // way, correctly or not) reads as unlocked -- still freely correctable by
+  // a scan, same as before this migration.
+  { table: "models", column: "hf_identity_locked", ddlType: "INTEGER NOT NULL DEFAULT 0" },
   // --n-cpu-moe -- see shared/sweep.ts's SweepItem.n_cpu_moe. Same DEFAULT 0
   // reasoning as n_gpu_layers_draft above.
   { table: "run_items", column: "n_cpu_moe", ddlType: "INTEGER DEFAULT 0" },

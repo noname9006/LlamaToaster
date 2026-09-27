@@ -299,6 +299,15 @@ export interface Model {
   hf_file?: string;
   metadata: ModelMetadata;
   created_at: number;
+  // True once an actual in-app download has recorded hf_repo/hf_file for
+  // this model (RegisterModelInput.lock_hf_identity, set only by
+  // workers.ts's download-callback route). See registerModel's own doc
+  // comment for what this protects against: a hash-lookup-driven scan (e.g.
+  // a hand-dropped-file heartbeat reconciliation) guessing the wrong repo
+  // for a hash shared with a fork/mirror and silently overwriting a
+  // correctly-attributed download. Once true it can only ever be
+  // re-affirmed by another real download, never cleared by a scan.
+  hf_identity_locked?: boolean;
 }
 
 // Real-world unsloth convention for a standalone MTP/drafter file: either at
@@ -348,6 +357,16 @@ export interface RegisterModelInput {
   // requirement (§4.3: "listModels/getModel/registerModel keep their
   // current signatures -- the catalog is global").
   created_by?: string;
+  // True ONLY from workers.ts's download-callback route (the worker just
+  // downloaded this exact hf_repo/hf_file because a user asked it to) --
+  // never set by queue.ts's registerHashVerifiedModelFiles, which derives
+  // hf_repo/hf_file from a hash-lookup guess instead of an explicit user
+  // choice. See Model.hf_identity_locked and registerModel's own doc
+  // comment: once a row is locked this way, registerModel's ON CONFLICT
+  // refuses to change its identity fields unless the caller is itself
+  // asserting the lock again (i.e. another real download) -- a scan can
+  // never claw a locked row's hf_repo/hf_file back to a wrong guess.
+  lock_hf_identity?: boolean;
 }
 
 export interface SweepConfig {

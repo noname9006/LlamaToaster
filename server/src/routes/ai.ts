@@ -36,6 +36,15 @@ const HF_TOOL_TIMEOUT_MS = 15_000;
 // request forever -- cut it off and surface whatever it's found so far.
 const MAX_TOOL_ROUNDS = 4;
 
+// `??` only falls back on null/undefined, not on "" -- and a blank
+// `AI_GLOBAL_DAILY_CAP=` line in a .env file parses to "", not undefined,
+// which previously coerced to Number("") === 0 and silently capped the
+// assistant at zero requests/day. Treat blank the same as unset.
+export function envIntOrDefault(raw: string | undefined, fallback: number): number {
+  if (raw === undefined || raw.trim() === "") return fallback;
+  return Number(raw);
+}
+
 // §2.6: an unmetered proxy to a paid LLM, with a client-controlled message
 // array and up to MAX_TOOL_ROUNDS tool rounds per request, is the
 // highest-probability launch-day incident this app has -- one signed-up user
@@ -46,7 +55,7 @@ const MAX_TOOL_ROUNDS = 4;
 const AI_LIMITS = {
   perUserPerHour: 30,
   perUserPerDay: 150,
-  globalPerDay: Number(process.env.AI_GLOBAL_DAILY_CAP ?? 2000), // circuit breaker
+  globalPerDay: envIntOrDefault(process.env.AI_GLOBAL_DAILY_CAP, 2000), // circuit breaker
   maxMessages: 40,
   maxTotalChars: 60_000, // whole conversation, enforced server-side
 };

@@ -1,7 +1,12 @@
 import type { FastifyInstance } from "fastify";
 import { repo } from "../db/repo.js";
 import { getHfGgufMeta } from "../hf.js";
-import { lookupHfGgufHashes, verifyRepoInBackground, HF_INDEX_REFRESH_INTERVAL_MS } from "../hf-index.js";
+import {
+  lookupHfGgufHashes,
+  verifyRepoInBackground,
+  triggerDuplicateFactResolutionForCollisions,
+  HF_INDEX_REFRESH_INTERVAL_MS,
+} from "../hf-index.js";
 import { isMtpDraftModel } from "../../../shared/types.js";
 import type { RegisterModelInput } from "../../../shared/types.js";
 import { userOrIpKeyGenerator, resolveAuthUser, assertOwnsWorker } from "../auth-middleware.js";
@@ -336,6 +341,13 @@ export async function modelsRoutes(app: FastifyInstance): Promise<void> {
           verifyRepoInBackground(r.repo_id);
         }
       }
+      // Same fire-and-forget posture as verifyRepoInBackground above, for a
+      // different gap: a hash genuinely live under more than one repo needs
+      // to know which one is the real source vs. a fork/mirror (see
+      // hf-index.ts's isBetterMatch) -- resolved here, once, the first time a
+      // real worker's hash actually collides, rather than eagerly for every
+      // scanned repo.
+      triggerDuplicateFactResolutionForCollisions(hashes);
       return { results };
     }
   );

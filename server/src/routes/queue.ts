@@ -83,7 +83,14 @@ function registerHashVerifiedModelFiles(files: WorkerStatePush["model_files"]): 
       }
       const identityOk =
         existing && existing.hf_repo === f.hf_match.repo_id && existing.hf_file === f.hf_match.filename;
-      if (!identityOk) {
+      // A row locked by an actual in-app download (existing.hf_identity_locked
+      // -- see repo.ts's registerModel doc comment) never gets its identity
+      // touched by this scan path: registerModel's own ON CONFLICT WHERE
+      // would silently no-op the call anyway (lock_hf_identity is never
+      // passed here), but skipping it client-side keeps the intent readable
+      // and avoids a pointless write on every heartbeat for a file whose
+      // hash happens to also match a fork/mirror.
+      if (!identityOk && !existing?.hf_identity_locked) {
         repo.registerModel({
           id: f.sha256,
           filename: f.hf_match.filename,
@@ -111,7 +118,13 @@ function registerHashVerifiedModelFiles(files: WorkerStatePush["model_files"]): 
       // repo-level API in the background for any row (fresh or pre-existing)
       // still missing it. Skipped when the worker supplied its own count.
       if (typeof merged.param_count !== "number") {
-        backfillParamCountInBackground(f.sha256, f.hf_match.repo_id);
+        // A locked row's own hf_repo is the authoritative one (the repo the
+        // user actually downloaded from); f.hf_match.repo_id is only this
+        // beat's hash-lookup guess and, for a locked row, is exactly the
+        // value we must NOT trust (see the identityOk skip above).
+        const paramLookupRepo =
+          existing?.hf_identity_locked && existing.hf_repo ? existing.hf_repo : f.hf_match.repo_id;
+        backfillParamCountInBackground(f.sha256, paramLookupRepo);
       }
     } catch {
       // duplicate registration race or a transient DB hiccup -- the next

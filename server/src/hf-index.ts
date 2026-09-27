@@ -1,5 +1,5 @@
 import { getDb } from "./db/migrate.js";
-import { getHfRepoDefaultRevision, listHfGgufFiles, type HfFileEntry } from "./hf.js";
+import { getHfRepoDefaultRevision, listHfGgufFiles, resolveHfRepoDuplicateFact, type HfFileEntry } from "./hf.js";
 import type { HfGgufIndexEntry } from "../../shared/types.js";
 import { log } from "./log.js";
 import { isHfTokenConfigured, getRateLimitStatus } from "./hf-rate-limit.js";
@@ -388,53 +388,140 @@ export function markSupersededEntries(repoId: string, filename: string, currentS
 // models.ts) can tell "matched, but since removed from HF" apart from "never
 // matched at all", and surface that to the client instead of the match
 // silently vanishing.
-export function lookupHfGgufHashes(hashes: string[]): HfGgufIndexEntry[] {
+function fetchHfIndexRowsByHash(hashes: string[]): HfIndexRow[] {
   if (hashes.length === 0) return [];
   const placeholders = hashes.map(() => "?").join(",");
-  const rows = getDb()
+  return getDb()
     .prepare(`SELECT sha256, repo_id, filename, revision, file_size, last_seen, deleted_at, replaced_by_sha256
                FROM hf_gguf_index
                WHERE sha256 IN (${placeholders})`)
     .all(...hashes) as HfIndexRow[];
-  return dedupeBestPerHash(rows).map(mapHfIndexRow);
+}
+
+// Pure, synchronous, side-effect-free: reads whatever duplicate facts are
+// ALREADY cached (a plain indexed SELECT, no network) and answers with
+// today's best-available guess. Deliberately does not itself trigger
+// resolution of a missing fact -- see
+// triggerDuplicateFactResolutionForCollisions below for why that's a
+// separate, route-only opt-in rather than baked in here.
+export function lookupHfGgufHashes(hashes: string[]): HfGgufIndexEntry[] {
+  const rows = fetchHfIndexRowsByHash(hashes);
+  const collisionRepoIds = repoIdsWithLiveHashCollision(rows);
+  const facts = getRepoDuplicateFacts(collisionRepoIds);
+  return dedupeBestPerHash(rows, facts).map(mapHfIndexRow);
+}
+
+// Fires resolveDuplicateFactInBackground for any repo genuinely competing
+// for one of `hashes` whose fact isn't cached yet. Called by
+// POST /api/models/hash-lookup (routes/models.ts) right alongside that
+// route's existing verifyRepoInBackground loop -- NOT from inside
+// lookupHfGgufHashes itself, on purpose: that function is called directly by
+// every test in this file (and conceivably other server-internal code)
+// with no network available and no wish to trigger a real outbound HF
+// request as a side effect of a plain DB read. Keeping the two concerns
+// separate mirrors verifyRepoInBackground's own placement -- it too lives
+// only in the route, never inside lookupHfGgufHashes.
+export function triggerDuplicateFactResolutionForCollisions(hashes: string[]): void {
+  const rows = fetchHfIndexRowsByHash(hashes);
+  const collisionRepoIds = repoIdsWithLiveHashCollision(rows);
+  if (collisionRepoIds.length === 0) return;
+  const facts = getRepoDuplicateFacts(collisionRepoIds);
+  for (const repoId of collisionRepoIds) {
+    if (!facts.has(repoId)) resolveDuplicateFactInBackground(repoId);
+  }
+}
+
+// repo_ids that share a sha256 with at least one other *live* repo_id --
+// exactly (and only) the set isBetterMatch might need a duplicate fact for.
+// A hash with a single live row (plus any number of soft-deleted ones) never
+// reaches the duplicate-fact tiebreak at all (isBetterMatch's live-beats-dead
+// rule resolves it first), so those repos are deliberately excluded here --
+// no point spending an HF round-trip resolving a fact nothing will consult.
+function repoIdsWithLiveHashCollision(rows: HfIndexRow[]): string[] {
+  const reposBySha = new Map<string, Set<string>>();
+  for (const row of rows) {
+    if (row.deleted_at != null) continue;
+    let set = reposBySha.get(row.sha256);
+    if (!set) {
+      set = new Set();
+      reposBySha.set(row.sha256, set);
+    }
+    set.add(row.repo_id);
+  }
+  const ids = new Set<string>();
+  for (const set of reposBySha.values()) {
+    if (set.size > 1) for (const id of set) ids.add(id);
+  }
+  return [...ids];
 }
 
 // Content-addressed matching means the same sha256 can legitimately have
 // multiple rows -- e.g. two different repos hosting byte-identical GGUF
 // files (a genuine mirror, or a spam/reupload account that copied a popular
-// quant under its own name). Without this, lookupHfGgufHashes returned every
-// row for a hash and callers (worker/src/model-scanner.ts's lookupHashes)
-// picked whichever one happened to come back last from this unordered SQL
-// scan -- a coin flip that could just as easily land on a since-deleted spam
-// mirror as the real, still-live source (live-confirmed 2026-09-05: a
-// "pleasen/model" mirror repo, already 404 on HF, was winning over the real
-// "unsloth/..." repo for an identical file).
-//
-// Picks, per sha256: a live (deleted_at IS NULL) row over a soft-deleted one
-// -- unless every row for that hash is deleted, in which case a deleted
-// match is still strictly better than none (see this function's doc comment
-// on why deleted rows must still surface). Among same-liveness rows, the one
-// with the most recent last_seen wins -- a repo HF's index sweeps keep
-// re-confirming is far more likely to still be the real, live source than
-// one that hasn't been touched in a while (an abandoned/deleted mirror stops
-// getting last_seen bumps the moment it drops out of HF's own listings).
-// Final tiebreak on repo_id makes the result fully deterministic even when
-// two rows share both deleted_at and last_seen exactly.
-function dedupeBestPerHash(rows: HfIndexRow[]): HfIndexRow[] {
+// quant under its own name, or an HF-native "Duplicate this repository").
+// Without this, lookupHfGgufHashes returned every row for a hash and callers
+// (worker/src/model-scanner.ts's lookupHashes) picked whichever one happened
+// to come back last from this unordered SQL scan -- a coin flip that could
+// just as easily land on a since-deleted spam mirror as the real, still-live
+// source (live-confirmed 2026-09-05: a "pleasen/model" mirror repo, already
+// 404 on HF, was winning over the real "unsloth/..." repo for an identical
+// file), or, after that fix, on a same-hash fork/mirror that was simply
+// scanned more recently than the real source (live-confirmed 2026-09-27:
+// "mingxianderen/Qwen3.8-27B-GGUF", an HF-native duplicate of
+// "unsloth/Qwen3.8-27B-GGUF", was winning purely because it had a newer
+// last_seen).
+function dedupeBestPerHash(rows: HfIndexRow[], facts: Map<string, RepoDuplicateFactRow>): HfIndexRow[] {
   const bestBySha = new Map<string, HfIndexRow>();
   for (const row of rows) {
     const current = bestBySha.get(row.sha256);
-    if (!current || isBetterMatch(row, current)) {
+    if (!current || isBetterMatch(row, current, facts)) {
       bestBySha.set(row.sha256, row);
     }
   }
   return [...bestBySha.values()];
 }
 
-function isBetterMatch(candidate: HfIndexRow, current: HfIndexRow): boolean {
+// Picks, per sha256, in order:
+//   1) a live (deleted_at IS NULL) row over a soft-deleted one -- unless
+//      every row for that hash is deleted, in which case a deleted match is
+//      still strictly better than none (see lookupHfGgufHashes' doc comment
+//      on why deleted rows must still surface).
+//   2) ground truth: if either row is known (via a cached
+//      hf_repo_duplicate_fact) to be an HF-native duplicate of the other,
+//      the non-duplicate wins outright, full stop -- this is a fact, not a
+//      heuristic. Direct/pairwise only, not transitively resolved through a
+//      chain: if C was duplicated from B which was duplicated from A (a
+//      duplicate of a duplicate), comparing C against A finds no direct link
+//      either way and falls through to (3)/(4) for that pair -- acceptable
+//      since a chained duplicate is rare and (3) (createdAt) still almost
+//      always orders it correctly (C exists after A), just without the
+//      certainty (2) would otherwise give.
+//   3) heuristic fallback, for the common case where neither side has (or
+//      needs) a duplicate marker -- e.g. an independent manual re-upload HF
+//      itself has no record linking to the original: whichever repo was
+//      *created* first. A fork or re-upload is created after the original
+//      it copies, so this is a far better guess than (4) below, though still
+//      only a guess -- there's no ground truth for this case.
+//   4) newer last_seen wins -- the ORIGINAL (buggy) rule, now demoted to a
+//      last resort for when neither side's createdAt is known either
+//      (nothing has triggered a fact resolution for this pair yet).
+//   5) repo_id ascending -- final deterministic tiebreak.
+function isBetterMatch(candidate: HfIndexRow, current: HfIndexRow, facts: Map<string, RepoDuplicateFactRow>): boolean {
   const candidateLive = candidate.deleted_at == null;
   const currentLive = current.deleted_at == null;
   if (candidateLive !== currentLive) return candidateLive;
+
+  const candidateFact = facts.get(candidate.repo_id);
+  const currentFact = facts.get(current.repo_id);
+  if (candidateFact?.duplicated_from === current.repo_id) return false;
+  if (currentFact?.duplicated_from === candidate.repo_id) return true;
+
+  const candidateCreated = candidateFact?.created_at ?? null;
+  const currentCreated = currentFact?.created_at ?? null;
+  if (candidateCreated != null && currentCreated != null && candidateCreated !== currentCreated) {
+    return candidateCreated < currentCreated;
+  }
+
   if (candidate.last_seen !== current.last_seen) return candidate.last_seen > current.last_seen;
   return candidate.repo_id < current.repo_id;
 }
@@ -532,6 +619,48 @@ function mapHfIndexRow(r: HfIndexRow): HfGgufIndexEntry {
   };
 }
 
+interface RepoDuplicateFactRow {
+  repo_id: string;
+  duplicated_from: string | null;
+  created_at: number | null;
+  checked_at: number;
+}
+
+// Both fields are immutable once resolved (see schema.sql's own comment on
+// hf_repo_duplicate_fact), so this is a permanent cache -- no staleness
+// window, no re-check schedule. Exported for resolveDuplicateFactInBackground
+// and for tests to seed a fact directly without going through a real HF call.
+export function upsertRepoDuplicateFact(fact: {
+  repo_id: string;
+  duplicated_from: string | null;
+  created_at: number | null;
+  checked_at: number;
+}): void {
+  getDb()
+    .prepare(
+      `INSERT INTO hf_repo_duplicate_fact (repo_id, duplicated_from, created_at, checked_at)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(repo_id) DO UPDATE SET
+         duplicated_from = excluded.duplicated_from,
+         created_at = excluded.created_at,
+         checked_at = excluded.checked_at`
+    )
+    .run(fact.repo_id, fact.duplicated_from, fact.created_at, fact.checked_at);
+}
+
+function getRepoDuplicateFacts(repoIds: string[]): Map<string, RepoDuplicateFactRow> {
+  if (repoIds.length === 0) return new Map();
+  const placeholders = repoIds.map(() => "?").join(",");
+  const rows = getDb()
+    .prepare(
+      `SELECT repo_id, duplicated_from, created_at, checked_at
+       FROM hf_repo_duplicate_fact
+       WHERE repo_id IN (${placeholders})`
+    )
+    .all(...repoIds) as RepoDuplicateFactRow[];
+  return new Map(rows.map((r) => [r.repo_id, r]));
+}
+
 // In-flight guard for verifyRepoInBackground -- a burst of hash-lookup hits
 // against the same stale repo (many workers, or one worker's whole model dir)
 // would otherwise trigger duplicate concurrent HF calls for it.
@@ -552,6 +681,60 @@ export function verifyRepoInBackground(repoId: string): void {
     })
     .finally(() => {
       verifyingRepos.delete(repoId);
+    });
+}
+
+// In-flight guard for resolveDuplicateFactInBackground -- same reasoning as
+// verifyingRepos above (a burst of hash-lookup hits against the same
+// colliding hash would otherwise trigger duplicate concurrent HF calls).
+const resolvingDuplicateFacts = new Set<string>();
+
+// Fire-and-forget resolution of a single repo's duplicate fact, triggered by
+// lookupHfGgufHashes for a repo genuinely competing with another live repo
+// for the same hash and not yet in hf_repo_duplicate_fact. Never throws or
+// blocks the caller -- the current lookup has already answered with
+// whatever isBetterMatch could determine without this; the resolved fact
+// lands in the DB for the *next* lookup to see (and, per repo.registerModel/
+// queue.ts's registerHashVerifiedModelFiles self-heal, corrects any
+// mislabeled models.hf_repo within one worker heartbeat after that).
+//
+// Reuses whatever revision this repo is already indexed under (a non-"main"
+// default branch -- see scanHfRepo) rather than assuming "main", since the
+// commits endpoint 404s on a revision that isn't real.
+export function resolveDuplicateFactInBackground(repoId: string): void {
+  if (resolvingDuplicateFacts.has(repoId)) return;
+  resolvingDuplicateFacts.add(repoId);
+  (async () => {
+    const row = getDb()
+      .prepare(`SELECT revision FROM hf_gguf_index WHERE repo_id = ? AND revision IS NOT NULL LIMIT 1`)
+      .get(repoId) as { revision: string } | undefined;
+    const revision = row?.revision || "main";
+    const fact = await resolveHfRepoDuplicateFact(repoId, revision, HF_INDEX_TIMEOUT_MS, "duplicate-fact-resolve");
+    // Both sub-fetches fail soft to null on ANY error (network, timeout,
+    // non-2xx -- see resolveHfRepoDuplicateFact's doc comment), so
+    // duplicated_from === null && created_at === null is overwhelmingly a
+    // failed round trip, not a genuine "checked, found nothing": every real
+    // repo has a creation date, so a null created_at essentially always means
+    // that fetch didn't succeed. Since this table has no re-check/expiry
+    // policy (immutable-once-known, per schema.sql), caching a failure here
+    // would freeze the repo as "resolved" forever on one bad network blip --
+    // skip the write so the next collision-triggering lookup retries it
+    // instead (same lazy-retry posture as verifyRepoInBackground elsewhere in
+    // this file, just via "no row yet" instead of an explicit staleness
+    // window).
+    if (fact.duplicated_from == null && fact.created_at == null) return;
+    upsertRepoDuplicateFact({
+      repo_id: repoId,
+      duplicated_from: fact.duplicated_from,
+      created_at: fact.created_at ? Date.parse(fact.created_at) || null : null,
+      checked_at: Date.now(),
+    });
+  })()
+    .catch((err) => {
+      log.warn(`[hf-index] duplicate-fact resolve failed for ${repoId}: ${err instanceof Error ? err.message : String(err)}`);
+    })
+    .finally(() => {
+      resolvingDuplicateFacts.delete(repoId);
     });
 }
 
