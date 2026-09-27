@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseNextLink, parseNextCursor, parseQuant } from "./hf.js";
+import { parseNextLink, parseNextCursor, parseQuant, parseDuplicatedFromCommitTitle } from "./hf.js";
 
 describe("parseQuant", () => {
   it("extracts a plain quant code", () => {
@@ -42,6 +42,26 @@ describe("parseNextLink", () => {
 
   it("returns null for a malformed/unparseable URL", () => {
     expect(parseNextLink("<not a url>; rel=\"next\"")).toBeNull();
+  });
+});
+
+describe("parseDuplicatedFromCommitTitle", () => {
+  it("extracts the source repo id from a real HF duplicate-marker commit title", () => {
+    // The exact title captured live 2026-09-27 from
+    // huggingface.co/mingxianderen/Qwen3.8-27B-GGUF's oldest commit.
+    expect(parseDuplicatedFromCommitTitle("Duplicate from unsloth/Qwen3.8-27B-GGUF")).toBe(
+      "unsloth/Qwen3.8-27B-GGUF"
+    );
+  });
+
+  it("returns null for an ordinary commit title", () => {
+    // The exact title captured live from the real source repo's own history
+    // -- confirms no false positive on the repo being duplicated FROM.
+    expect(parseDuplicatedFromCommitTitle("Upload Meta-Llama-3.1-8B-Instruct-IQ4_NL.gguf with huggingface_hub")).toBeNull();
+  });
+
+  it("returns null for an unrelated 'Duplicate' mention that isn't the marker format", () => {
+    expect(parseDuplicatedFromCommitTitle("Duplicate check: fixed a typo")).toBeNull();
   });
 });
 

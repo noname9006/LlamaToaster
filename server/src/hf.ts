@@ -114,6 +114,18 @@ export function parseNextCursor(linkHeader: string | null): string | null {
   }
 }
 
+// Extracts the source repo id out of an HF "Duplicate this repository"
+// marker commit's title (always that repo's OLDEST commit -- see
+// resolveHfRepoDuplicateFact). Exported for its own unit test (see
+// hf.test.ts) -- live-confirmed 2026-09-27 against a real duplicate
+// (huggingface.co/mingxianderen/Qwen3.8-27B-GGUF, whose oldest commit's
+// title is exactly "Duplicate from unsloth/Qwen3.8-27B-GGUF") and against
+// the real source repo's own commit list, which has no such commit at all.
+export function parseDuplicatedFromCommitTitle(title: string): string | null {
+  const m = title.match(/^Duplicate from (.+)$/);
+  return m ? m[1] : null;
+}
+
 // --- centralized fetch with auth + 5-minute window throttling ----------------
 
 function sleep(ms: number): Promise<void> {
@@ -342,6 +354,92 @@ export async function getHfGgufMeta(repoId: string, timeoutMs: number, reason: s
   } catch {
     return { param_count: null, last_modified: null };
   }
+}
+
+export interface HfRepoDuplicateFact {
+  // Source repo_id this repo was made from via HF's own "Duplicate this
+  // repository" feature -- null if its oldest commit carries no such marker
+  // (an independent upload/quantization, or a manual re-upload of someone
+  // else's file, which HF has no record of either way).
+  duplicated_from: string | null;
+  // Repo creation date (ISO string), null on fetch failure. Immutable once
+  // set -- callers may cache this forever, same as duplicated_from.
+  created_at: string | null;
+}
+
+const HF_COMMITS_PAGE_SIZE = 100;
+
+async function fetchRepoCreatedAt(repoId: string, timeoutMs: number, reason: string): Promise<string | null> {
+  try {
+    const url = `https://huggingface.co/api/models/${repoId}?expand=createdAt`;
+    const res = await hfFetch(url, undefined, { bucket: "api", timeoutMs, reason });
+    if (!res.ok) return null;
+    const data = (await res.json()) as { createdAt?: string };
+    return typeof data.createdAt === "string" ? data.createdAt : null;
+  } catch {
+    return null;
+  }
+}
+
+// The duplicate marker, when present, is always the repo's OLDEST commit
+// (made at duplication time, carrying the literal title "Duplicate from
+// <source repo>" -- see parseDuplicatedFromCommitTitle). commits/{revision}
+// paginates newest-first with no way to ask for oldest-first, and its
+// `path=` filter is silently ignored (live-confirmed 2026-09-27 -- identical
+// response with and without it), so there is no cheaper server-side way to
+// isolate that one commit. Getting to it means either it's already on the
+// first page (a repo with <= HF_COMMITS_PAGE_SIZE commits total) or jumping
+// straight to the last page via the `X-Total-Count` header instead of
+// walking the whole history one page at a time.
+async function fetchDuplicatedFrom(
+  repoId: string,
+  revision: string,
+  timeoutMs: number,
+  reason: string
+): Promise<string | null> {
+  try {
+    const encRepo = repoId.split("/").map(encodeURIComponent).join("/");
+    const encRev = encodeURIComponent(revision);
+    const firstUrl = `https://huggingface.co/api/models/${encRepo}/commits/${encRev}?limit=${HF_COMMITS_PAGE_SIZE}`;
+    const firstRes = await hfFetch(firstUrl, undefined, { bucket: "api", timeoutMs, reason });
+    if (!firstRes.ok) return null;
+    const firstPage = (await firstRes.json()) as { title?: string }[];
+    if (firstPage.length === 0) return null;
+
+    const totalHeader = firstRes.headers.get("x-total-count");
+    const total = totalHeader ? Number(totalHeader) : firstPage.length;
+    let oldestPage = firstPage;
+    if (Number.isFinite(total) && total > firstPage.length) {
+      const lastPage = Math.ceil(total / HF_COMMITS_PAGE_SIZE) - 1;
+      const url = `https://huggingface.co/api/models/${encRepo}/commits/${encRev}?limit=${HF_COMMITS_PAGE_SIZE}&p=${lastPage}`;
+      const res = await hfFetch(url, undefined, { bucket: "api", timeoutMs, reason });
+      if (!res.ok) return null;
+      oldestPage = (await res.json()) as { title?: string }[];
+      if (oldestPage.length === 0) return null;
+    }
+    const oldestCommit = oldestPage[oldestPage.length - 1];
+    return typeof oldestCommit?.title === "string" ? parseDuplicatedFromCommitTitle(oldestCommit.title) : null;
+  } catch {
+    return null;
+  }
+}
+
+// Resolves the two facts server/src/hf-index.ts's isBetterMatch needs to
+// correctly break a hash shared by more than one live repo -- see that
+// function's doc comment for the "pleasen/model" and
+// "mingxianderen/Qwen3.8-27B-GGUF" incidents this replaces. Never throws --
+// both sub-fetches fail soft to null, same posture as getHfGgufMeta.
+export async function resolveHfRepoDuplicateFact(
+  repoId: string,
+  revision: string,
+  timeoutMs: number,
+  reason: string
+): Promise<HfRepoDuplicateFact> {
+  const [created_at, duplicated_from] = await Promise.all([
+    fetchRepoCreatedAt(repoId, timeoutMs, reason),
+    fetchDuplicatedFrom(repoId, revision, timeoutMs, reason),
+  ]);
+  return { duplicated_from, created_at };
 }
 
 /**

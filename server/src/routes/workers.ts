@@ -549,6 +549,11 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
           hf_repo,
           hf_file,
           metadata,
+          // This route only ever runs because a user explicitly queued this
+          // exact hf_repo/hf_file for download -- see repo.ts's registerModel
+          // doc comment for why this locks the row against a later scan
+          // re-attributing it to a fork/mirror sharing the same hash.
+          lock_hf_identity: true,
         });
         return reply.code(200).send({ ok: true });
       } catch (err) {

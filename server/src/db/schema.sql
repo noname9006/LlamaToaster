@@ -378,6 +378,23 @@ CREATE TABLE IF NOT EXISTS hf_gguf_index (
 CREATE INDEX IF NOT EXISTS idx_hf_gguf_index_sha256 ON hf_gguf_index(sha256);
 CREATE INDEX IF NOT EXISTS idx_hf_gguf_index_repo ON hf_gguf_index(repo_id);
 CREATE INDEX IF NOT EXISTS idx_hf_gguf_index_last_seen ON hf_gguf_index(last_seen);
+
+-- Per-repo facts used to break a sha256 shared by more than one live repo in
+-- hf_gguf_index -- see server/src/hf-index.ts's isBetterMatch. Populated
+-- lazily (resolveDuplicateFactInBackground), only for repos actually
+-- involved in a collision, never eagerly for every scanned repo. Both
+-- duplicated_from and created_at are immutable once known (a repo's
+-- creation date and its one-time "Duplicated from" origin commit never
+-- change), so a row here is cached forever once resolved; checked_at exists
+-- only to distinguish "never checked" (no row) from "checked, found
+-- nothing" (a row with duplicated_from NULL) and to allow a future re-check
+-- policy without a schema change.
+CREATE TABLE IF NOT EXISTS hf_repo_duplicate_fact (
+  repo_id TEXT PRIMARY KEY,
+  duplicated_from TEXT,
+  created_at INTEGER,
+  checked_at INTEGER NOT NULL
+);
 -- idx_hf_gguf_index_deleted_at is created in migrate.ts's
 -- createHfGgufIndexDeletedAtIndex, not here -- deleted_at is added via
 -- COLUMN_MIGRATIONS' ALTER TABLE on an already-existing DB (this

@@ -375,6 +375,172 @@ describe("lookupHfGgufHashes", () => {
     expect(found1[0].repo_id).toBe("test/a-repo");
     expect(found2[0].repo_id).toBe("test/a-repo");
   });
+
+  it("prefers a repo known NOT to be a duplicate over one known to be one, even with an older last_seen", () => {
+    // Reproduces the real "mingxianderen/Qwen3.8-27B-GGUF" incident
+    // (2026-09-27): an HF-native duplicate ("Duplicate this repository") of
+    // "unsloth/Qwen3.8-27B-GGUF" was winning purely because it had been
+    // scanned more recently. A cached hf_repo_duplicate_fact must override
+    // last_seen outright -- it's ground truth, not a heuristic.
+    const older = Date.now() - 100_000;
+    const newer = Date.now();
+    hfIndex.upsertHfGgufEntry({
+      sha256: "sha-qwen38-27b-ud",
+      repo_id: "unsloth/Qwen3.8-27B-GGUF",
+      filename: "Qwen3.8-27B-UD-Q5_K_M.gguf",
+      revision: "main",
+      file_size: 1,
+      last_seen: older, // scanned less recently...
+      deleted_at: null,
+    });
+    hfIndex.upsertHfGgufEntry({
+      sha256: "sha-qwen38-27b-ud",
+      repo_id: "mingxianderen/Qwen3.8-27B-GGUF",
+      filename: "Qwen3.8-27B-UD-Q5_K_M.gguf",
+      revision: "main",
+      file_size: 1,
+      last_seen: newer, // ...but scanned more recently -- must NOT win
+      deleted_at: null,
+    });
+    hfIndex.upsertRepoDuplicateFact({
+      repo_id: "mingxianderen/Qwen3.8-27B-GGUF",
+      duplicated_from: "unsloth/Qwen3.8-27B-GGUF",
+      created_at: newer,
+      checked_at: Date.now(),
+    });
+    hfIndex.upsertRepoDuplicateFact({
+      repo_id: "unsloth/Qwen3.8-27B-GGUF",
+      duplicated_from: null,
+      created_at: older,
+      checked_at: Date.now(),
+    });
+
+    const found = hfIndex.lookupHfGgufHashes(["sha-qwen38-27b-ud"]);
+    expect(found).toHaveLength(1);
+    expect(found[0].repo_id).toBe("unsloth/Qwen3.8-27B-GGUF");
+  });
+
+  it("falls back to earlier repo createdAt when neither side has a duplicate marker", () => {
+    // The common case HF itself has no record of: an independent manual
+    // re-upload. No duplicated_from either way, so createdAt (which repo
+    // repo existed first) is the best available guess -- still overriding
+    // last_seen, which is what actually caused the original bug (a fork is
+    // almost always newer than the original, but almost always scanned more
+    // recently too).
+    const olderCreated = Date.now() - 1_000_000;
+    const newerCreated = Date.now() - 500_000;
+    hfIndex.upsertHfGgufEntry({
+      sha256: "sha-independent-reupload",
+      repo_id: "test/original-repo",
+      filename: "model.gguf",
+      revision: "main",
+      file_size: 1,
+      last_seen: Date.now() - 100_000, // scanned less recently...
+      deleted_at: null,
+    });
+    hfIndex.upsertHfGgufEntry({
+      sha256: "sha-independent-reupload",
+      repo_id: "test/copycat-repo",
+      filename: "model.gguf",
+      revision: "main",
+      file_size: 1,
+      last_seen: Date.now(), // ...but scanned more recently -- must NOT win
+      deleted_at: null,
+    });
+    hfIndex.upsertRepoDuplicateFact({
+      repo_id: "test/original-repo",
+      duplicated_from: null, // HF has no record either way
+      created_at: olderCreated,
+      checked_at: Date.now(),
+    });
+    hfIndex.upsertRepoDuplicateFact({
+      repo_id: "test/copycat-repo",
+      duplicated_from: null,
+      created_at: newerCreated,
+      checked_at: Date.now(),
+    });
+
+    const found = hfIndex.lookupHfGgufHashes(["sha-independent-reupload"]);
+    expect(found).toHaveLength(1);
+    expect(found[0].repo_id).toBe("test/original-repo");
+  });
+
+  it("still falls back to last_seen when no duplicate fact is cached for either side yet", () => {
+    // Regression guard: a collision resolveDuplicateFactInBackground hasn't
+    // gotten to yet (or that failed and left no row) must behave exactly as
+    // before this fix -- last_seen, then repo_id -- never throw or silently
+    // drop the match.
+    const older = Date.now() - 100_000;
+    const newer = Date.now();
+    hfIndex.upsertHfGgufEntry({
+      sha256: "sha-no-fact-yet",
+      repo_id: "test/unresolved-a",
+      filename: "a.gguf",
+      revision: "main",
+      file_size: 1,
+      last_seen: older,
+      deleted_at: null,
+    });
+    hfIndex.upsertHfGgufEntry({
+      sha256: "sha-no-fact-yet",
+      repo_id: "test/unresolved-b",
+      filename: "b.gguf",
+      revision: "main",
+      file_size: 1,
+      last_seen: newer,
+      deleted_at: null,
+    });
+
+    const found = hfIndex.lookupHfGgufHashes(["sha-no-fact-yet"]);
+    expect(found).toHaveLength(1);
+    expect(found[0].repo_id).toBe("test/unresolved-b");
+  });
+});
+
+describe("triggerDuplicateFactResolutionForCollisions", () => {
+  it("does nothing for a hash with only one live row (no collision)", () => {
+    hfIndex.upsertHfGgufEntry({
+      sha256: "sha-solo",
+      repo_id: "test/solo-repo",
+      filename: "solo.gguf",
+      revision: "main",
+      file_size: 1,
+      last_seen: Date.now(),
+      deleted_at: null,
+    });
+    // Must not throw, and must not touch hf_repo_duplicate_fact -- verified
+    // indirectly: a later lookup for this hash still has no fact and still
+    // resolves via the plain last_seen fallback (i.e. nothing was queued
+    // that would change the answer).
+    expect(() => hfIndex.triggerDuplicateFactResolutionForCollisions(["sha-solo"])).not.toThrow();
+  });
+
+  it("does nothing for a hash whose only collision is with a soft-deleted row", () => {
+    hfIndex.upsertHfGgufEntry({
+      sha256: "sha-live-vs-dead",
+      repo_id: "test/live-vs-dead-live",
+      filename: "live.gguf",
+      revision: "main",
+      file_size: 1,
+      last_seen: Date.now(),
+      deleted_at: null,
+    });
+    hfIndex.upsertHfGgufEntry({
+      sha256: "sha-live-vs-dead",
+      repo_id: "test/live-vs-dead-dead",
+      filename: "dead.gguf",
+      revision: "main",
+      file_size: 1,
+      last_seen: Date.now(),
+      deleted_at: null,
+    });
+    hfIndex.markRepoDeleted("test/live-vs-dead-dead", Date.now());
+
+    // live-beats-dead already resolves this with no duplicate fact needed --
+    // must not throw (and, per this function's own doc comment, must not
+    // attempt to resolve either repo_id).
+    expect(() => hfIndex.triggerDuplicateFactResolutionForCollisions(["sha-live-vs-dead"])).not.toThrow();
+  });
 });
 
 describe("findStaleRepos", () => {

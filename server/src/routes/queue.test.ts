@@ -232,6 +232,84 @@ describe("POST /api/worker/heartbeat", () => {
     expect(healed?.metadata.param_count).toBe(8_000_000_000);
   });
 
+  it("never lets a heartbeat's hash-lookup guess overwrite a model whose identity was locked by an actual in-app download", async () => {
+    // Reproduces the real bug this locks against: a hash the HF index's
+    // dedup (hf-index.ts's isBetterMatch) currently -- or could in the
+    // future -- misattribute to a fork/mirror sharing the same content must
+    // never clobber a row a real user download already correctly attributed.
+    // See shared/types.ts's Model.hf_identity_locked and repo.ts's
+    // registerModel doc comment.
+    const sha = "1".repeat(64);
+    repo.registerModel({
+      id: sha,
+      filename: "Qwen3.8-27B-UD-Q5_K_M.gguf",
+      size_bytes: 999,
+      source: "huggingface",
+      hf_repo: "unsloth/Qwen3.8-27B-GGUF",
+      hf_file: "Qwen3.8-27B-UD-Q5_K_M.gguf",
+      metadata: { param_count: 27_000_000_000 },
+      lock_hf_identity: true, // exactly what workers.ts's download-callback route sets
+    });
+
+    // A heartbeat now reports this exact hash matching a DIFFERENT repo --
+    // e.g. a fork the (possibly still-buggy) index dedup picked.
+    await postJson("/api/worker/heartbeat", {
+      ...hardwareState("hb-locked-identity", "idle"),
+      model_files: [
+        {
+          path: "Qwen3.8-27B-UD-Q5_K_M.gguf",
+          size_bytes: 999,
+          sha256: sha,
+          state: "verified",
+          hf_match: {
+            repo_id: "mingxianderen/Qwen3.8-27B-GGUF",
+            filename: "Qwen3.8-27B-UD-Q5_K_M.gguf",
+            revision: "main",
+            deleted: false,
+          },
+        },
+      ],
+    });
+
+    const model = repo.getModel(sha);
+    expect(model?.hf_repo).toBe("unsloth/Qwen3.8-27B-GGUF");
+    expect(model?.hf_file).toBe("Qwen3.8-27B-UD-Q5_K_M.gguf");
+    expect(model?.hf_identity_locked).toBe(true);
+  });
+
+  it("a locked model's identity can still be changed by another real download (lock_hf_identity asserted again)", async () => {
+    // Not just permanently frozen at whatever the first download said -- a
+    // second real download (same file, e.g. the user explicitly re-picks a
+    // different repo hosting identical bytes) must still win, exactly like
+    // an unlocked row always could.
+    const sha = "2".repeat(64);
+    repo.registerModel({
+      id: sha,
+      filename: "first.gguf",
+      size_bytes: 1,
+      source: "huggingface",
+      hf_repo: "repo-a/first",
+      hf_file: "first.gguf",
+      metadata: {},
+      lock_hf_identity: true,
+    });
+    expect(repo.getModel(sha)?.hf_repo).toBe("repo-a/first");
+
+    repo.registerModel({
+      id: sha,
+      filename: "second.gguf",
+      size_bytes: 1,
+      source: "huggingface",
+      hf_repo: "repo-b/second",
+      hf_file: "second.gguf",
+      metadata: {},
+      lock_hf_identity: true,
+    });
+    const model = repo.getModel(sha);
+    expect(model?.hf_repo).toBe("repo-b/second");
+    expect(model?.hf_identity_locked).toBe(true);
+  });
+
   it("adopts per-file GGUF metadata (quant/param_count/n_layer) into a hash-verified model's catalog row", async () => {
     const sha = "f".repeat(64);
     // Simulate the user's real-world row: a hand-dropped file whose

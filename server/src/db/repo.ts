@@ -63,6 +63,7 @@ interface ModelRow {
   hf_file: string | null;
   metadata: string;
   created_at: number;
+  hf_identity_locked: number;
 }
 
 interface TestRow {
@@ -498,6 +499,7 @@ function mapModel(row: ModelRow): Model {
     hf_file: row.hf_file ?? undefined,
     metadata: JSON.parse(row.metadata || "{}"),
     created_at: row.created_at,
+    hf_identity_locked: row.hf_identity_locked === 1,
   };
 }
 
@@ -912,22 +914,34 @@ export const repo = {
   // backfilling n_layer, which isn't an identity field). `IS` rather than
   // `=` throughout so two NULLs (single-tenant mode on both sides) compare
   // equal -- plain `=` never does for NULL in SQL.
+  //
+  // Second WHERE clause, same shape: once hf_identity_locked is set (an
+  // actual in-app download, never a hash-lookup-driven scan -- see
+  // RegisterModelInput.lock_hf_identity), the row's identity fields can only
+  // be changed by a call that's itself asserting the lock again (another
+  // real download), never by queue.ts's registerHashVerifiedModelFiles
+  // re-guessing the repo from a hash a fork/mirror also shares. An unlocked
+  // row (the common case -- a hand-dropped file, or any row predating this
+  // migration) stays freely correctable by a scan exactly as before.
   registerModel(input: RegisterModelInput): Model {
     const id = input.id ?? deriveModelId(input);
     const now = Date.now();
     const metadata = JSON.stringify(input.metadata ?? {});
+    const lockHfIdentity = input.lock_hf_identity ? 1 : 0;
     getDb()
       .prepare(
-        `INSERT INTO models (id, filename, size_bytes, source, hf_repo, hf_file, metadata, created_by, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO models (id, filename, size_bytes, source, hf_repo, hf_file, metadata, created_by, created_at, hf_identity_locked)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
            filename = excluded.filename,
            size_bytes = excluded.size_bytes,
            source = excluded.source,
            hf_repo = excluded.hf_repo,
            hf_file = excluded.hf_file,
-           metadata = excluded.metadata
-         WHERE models.created_by IS NULL OR models.created_by IS excluded.created_by`
+           metadata = excluded.metadata,
+           hf_identity_locked = excluded.hf_identity_locked
+         WHERE (models.created_by IS NULL OR models.created_by IS excluded.created_by)
+           AND (models.hf_identity_locked = 0 OR excluded.hf_identity_locked = 1)`
       )
       .run(
         id,
@@ -938,7 +952,8 @@ export const repo = {
         input.hf_file ?? null,
         metadata,
         input.created_by ?? null,
-        now
+        now,
+        lockHfIdentity
       );
     return this.getModel(id)!;
   },
