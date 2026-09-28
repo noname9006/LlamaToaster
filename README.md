@@ -216,8 +216,10 @@ restarting the process, no DB write needed.
 
 **Brand-new machine, nothing downloaded yet?** One command fetches the
 repo, installs dependencies, registers the `toaster` command, and starts the
-worker (needs PowerShell/bash + Node.js 22+; uses `git` if present, otherwise
-falls back to a zip/tarball download). It asks which drive/volume to use —
+worker (needs only PowerShell or bash + curl; Node.js 22+ is installed for you
+if missing — via winget on Windows, or a checksum-verified download from
+nodejs.org into the install folder's `.node/` on macOS/Linux, no sudo; uses
+`git` if present, otherwise falls back to a zip/tarball download). It asks which drive/volume to use —
 showing free space, since models are often tens of GB each — and a folder
 name, then creates it:
 

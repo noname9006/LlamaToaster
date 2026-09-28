@@ -32,6 +32,10 @@ main() {
   local repo_root
   repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
   local repo_url="https://github.com/noname9006/LlamaToaster.git"
+  # Private Node.js downloaded by bootstrap.sh, if this machine needed one.
+  if [ -x "$repo_root/.node/bin/node" ]; then
+    export PATH="$repo_root/.node/bin:$PATH"
+  fi
 
   fail() {
     echo "" >&2

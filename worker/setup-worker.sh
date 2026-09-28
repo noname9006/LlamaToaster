@@ -114,6 +114,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 CONFIG_PATH="$REPO_ROOT/worker/config.json"
 
+# bootstrap.sh downloads a private Node.js into <install>/.node when the
+# machine has none (or one older than 22). Prefer it here so running this
+# script directly finds the same node/npm the installer used.
+if [ -x "$REPO_ROOT/.node/bin/node" ]; then
+  export PATH="$REPO_ROOT/.node/bin:$PATH"
+fi
+
 select_install_dir() {
   if { exec 3</dev/tty; } 2>/dev/null; then
     exec 3<&-
@@ -256,6 +263,12 @@ TOASTER_SHIM
   # must reach the generated file literally -- \$1, \$TOASTER_HOME and the
   # rest are the SHIM's own runtime variables, not this script's.
   cat >> "$shim_path" <<'TOASTER_SHIM'
+
+# Use the private Node.js the installer downloaded, if there is one (machines
+# that had no Node 22+ of their own) -- a plain shell wouldn't find it.
+if [ -x "$TOASTER_HOME/.node/bin/node" ]; then
+  export PATH="$TOASTER_HOME/.node/bin:$PATH"
+fi
 
 case "${1:-start}" in
   start|restart)

@@ -4,8 +4,9 @@
 # You only supply a base folder: it becomes both the code checkout and (via
 # setup-worker.sh) the home for the "llama" and "models" subfolders.
 #
-# Usage from a totally fresh machine (only bash + Node.js 22+ needed; git is
-# used if present, otherwise falls back to a plain tarball download):
+# Usage from a totally fresh machine (only bash + curl needed; Node.js 22+ is
+# downloaded into the install folder if missing, and git is used if present,
+# otherwise falls back to a plain tarball download):
 #
 #   curl -fsSL https://llamatoaster.com/install.sh | bash
 #
@@ -89,7 +90,7 @@ fi
 echo ""
 echo "LlamaToaster worker setup"
 echo "  1. download this repo (no sudo, nothing installed system-wide)"
-echo "  2. install npm dependencies (Node.js must already be present)"
+echo "  2. install Node.js 22 into the install folder if it's missing, then npm dependencies"
 echo "  3. ask where to keep code, llama.cpp builds and models"
 echo "  4. install a 'toaster' command for your user (undo: toaster uninstall)"
 echo "  5. start the worker -- it prints a code to approve this machine at $URL/device"
@@ -105,11 +106,6 @@ case "$(uname -s 2>/dev/null)" in
     exit 1
     ;;
 esac
-
-if ! command -v node >/dev/null 2>&1; then
-  echo "Node.js not found on PATH. Install Node.js 22+ (e.g. via nvm or your package manager) first, then re-run this script." >&2
-  exit 1
-fi
 
 select_install_dir() {
   if { exec 3</dev/tty; } 2>/dev/null; then
@@ -147,6 +143,95 @@ fi
 mkdir -p "$DIR"
 DIR="$(cd "$DIR" && pwd)"
 echo "Using $DIR"
+
+# Node.js 22+ is required (the worker runs on it, and so does npm below). If
+# it's missing or too old, download the official prebuilt tarball from
+# nodejs.org into $DIR/.node -- no sudo, no package manager, nothing
+# system-wide, same spirit as bootstrap.ps1's winget step. The tarball is
+# checked against nodejs.org's published SHASUMS256.txt before it's unpacked.
+# setup-worker.sh and the generated `toaster` command put $DIR/.node/bin first
+# on PATH whenever that folder exists, so the private copy is what later runs
+# use; a system Node that is already 22+ is left alone and preferred.
+node_ok() {
+  command -v node >/dev/null 2>&1 && node -e 'process.exit(Number(process.versions.node.split(".")[0]) >= 22 ? 0 : 1)' >/dev/null 2>&1
+}
+
+ensure_node() {
+  local dir="$1"
+  if [ -x "$dir/.node/bin/node" ]; then
+    export PATH="$dir/.node/bin:$PATH"
+  fi
+  if node_ok; then
+    return
+  fi
+  if command -v node >/dev/null 2>&1; then
+    echo "Found Node.js $(node --version 2>/dev/null), but 22+ is required."
+  else
+    echo "Node.js not found."
+  fi
+
+  local os arch
+  case "$(uname -s)" in
+    Darwin) os="darwin" ;;
+    Linux)  os="linux" ;;
+    *) echo "Can't auto-install Node.js on $(uname -s). Install Node.js 22+ from https://nodejs.org and re-run this script." >&2; exit 1 ;;
+  esac
+  case "$(uname -m)" in
+    x86_64|amd64) arch="x64" ;;
+    arm64|aarch64) arch="arm64" ;;
+    *) echo "Can't auto-install Node.js for CPU type $(uname -m). Install Node.js 22+ from https://nodejs.org and re-run this script." >&2; exit 1 ;;
+  esac
+  # nodejs.org's Linux builds need glibc; Alpine and other musl distros can't
+  # run them, and unpacking one would just fail later with a cryptic error.
+  if [ "$os" = "linux" ] && ls /lib/ld-musl-* >/dev/null 2>&1; then
+    echo "This looks like a musl-based Linux (e.g. Alpine); nodejs.org's builds won't run here. Install Node.js 22+ with your package manager (apk add nodejs npm) and re-run." >&2
+    exit 1
+  fi
+
+  local base="https://nodejs.org/dist/latest-v22.x"
+  echo "Downloading Node.js 22 (LTS line) from nodejs.org into $dir/.node ..."
+  local sums file want
+  if ! sums="$(curl -fsSL "$base/SHASUMS256.txt")"; then
+    echo "Couldn't reach $base -- check your network, or install Node.js 22+ yourself from https://nodejs.org and re-run." >&2
+    exit 1
+  fi
+  file="$(printf '%s\n' "$sums" | awk -v suffix="-$os-$arch.tar.gz" 'length($2) > length(suffix) && substr($2, length($2) - length(suffix) + 1) == suffix && $2 ~ /^node-v[0-9.]+-/ {print $2; exit}')"
+  want="$(printf '%s\n' "$sums" | awk -v f="$file" '$2 == f {print $1; exit}')"
+  if [ -z "$file" ] || [ -z "$want" ]; then
+    echo "No Node.js $os-$arch build listed in $base/SHASUMS256.txt. Install Node.js 22+ yourself from https://nodejs.org and re-run." >&2
+    exit 1
+  fi
+
+  local tmp got
+  tmp="$(mktemp -t llamatoaster-node-XXXXXX)"
+  if ! curl -fSL --progress-bar "$base/$file" -o "$tmp"; then
+    rm -f "$tmp"
+    echo "Node.js download failed." >&2
+    exit 1
+  fi
+  if command -v sha256sum >/dev/null 2>&1; then
+    got="$(sha256sum "$tmp" | awk '{print $1}')"
+  else
+    got="$(shasum -a 256 "$tmp" | awk '{print $1}')"
+  fi
+  if [ "$got" != "$want" ]; then
+    rm -f "$tmp"
+    echo "Node.js download failed its checksum (expected $want, got $got). Not installing it." >&2
+    exit 1
+  fi
+  rm -rf "$dir/.node"
+  mkdir -p "$dir/.node"
+  tar -xzf "$tmp" -C "$dir/.node" --strip-components=1
+  rm -f "$tmp"
+  export PATH="$dir/.node/bin:$PATH"
+  if ! node_ok; then
+    echo "Node.js was unpacked to $dir/.node but doesn't run here. Install Node.js 22+ yourself from https://nodejs.org and re-run." >&2
+    exit 1
+  fi
+  echo "Node.js $(node --version) installed to $dir/.node (private to LlamaToaster; your system is untouched)."
+}
+
+ensure_node "$DIR"
 
 # Trims a git checkout down to worker/ + shared/ -- everything directly in
 # the repo root (package.json, README, ...) is kept automatically by git's
