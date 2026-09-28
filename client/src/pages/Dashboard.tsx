@@ -4,7 +4,7 @@ import { api } from "../api/client";
 import { StatCard } from "../components/StatCard";
 import { TestStatusPill, StatusPill, type PillTone } from "../components/StatusPill";
 import { TokSpeedDemo } from "../components/TokSpeedDemo";
-import { SETUP_OS_LABELS, platformToSetupOS } from "../components/WorkerCard";
+import { platformLabel } from "../components/WorkerCard";
 import { IconX } from "../components/icons";
 import type { AdminStats, Test, Worker } from "../types";
 import { shortId, formatGpuLabel, formatBytes } from "../utils";
@@ -77,7 +77,7 @@ function MachineCard({
   onUnhide: () => void;
 }) {
   const gpu = worker.hardware?.gpu[0];
-  const osLabel = SETUP_OS_LABELS.find((o) => o.key === platformToSetupOS(worker.platform))?.label ?? worker.platform ?? "unknown OS";
+  const osLabel = platformLabel(worker.platform);
   const hardwareBits = [
     worker.hardware?.cpu.brand || worker.hardware?.cpu.manufacturer,
     worker.hardware?.mem_total_bytes ? formatBytes(worker.hardware.mem_total_bytes) : null,

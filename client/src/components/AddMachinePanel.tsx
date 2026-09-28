@@ -29,7 +29,7 @@ export function AddMachinePanel({
 }) {
   // Pre-selected from the browser's own OS (§1 of the Settings/Device
   // rework) so the right setup command is already showing on first paint --
-  // still just the tab's initial value, so a click on WIN/MACOS/LINUX above
+  // still just the tab's initial value, so a click on WIN / LINUX / MACOS above
   // freely overrides it same as before.
   const [os, setOs] = useState<SetupOS>(() => detectOS());
   const ownEnrolment = useDeviceEnrolment();

@@ -7,13 +7,25 @@ import { IconCheck, IconChevronDown, IconDownload, IconPencil, IconTrash } from 
 import { Tooltip } from "./Tooltip";
 import { copyToClipboard, formatBytes, formatDate, formatGpuLabel } from "../utils";
 
-export type SetupOS = "windows" | "macos" | "linux";
+// Two setup families, not three: macOS and Linux run the byte-identical
+// bootstrap.sh / setup-worker.sh and the same commands, so a separate tab for
+// each only duplicated the block. "unix" covers both.
+export type SetupOS = "windows" | "unix";
 
 export const SETUP_OS_LABELS: Array<{ key: SetupOS; label: string; badgeClass: string }> = [
   { key: "windows", label: "WIN", badgeClass: "text-[#8fc6e8] bg-[#8fc6e8]/15" },
-  { key: "macos", label: "MACOS", badgeClass: "text-[#c9a6e8] bg-[#c9a6e8]/15" },
-  { key: "linux", label: "LINUX", badgeClass: "text-[#f0b86e] bg-[#f0b86e]/15" },
+  { key: "unix", label: "LINUX / MACOS", badgeClass: "text-[#f0b86e] bg-[#f0b86e]/15" },
 ];
+
+// A machine's OWN OS label (Dashboard machine cards) -- unlike the setup tabs
+// above this does tell macOS and Linux apart, since it describes hardware, not
+// which command to run. Falls back to the raw platform string.
+export function platformLabel(platform: string | null | undefined): string {
+  if (platform === "win32") return "WIN";
+  if (platform === "darwin") return "MACOS";
+  if (platform === "linux") return "LINUX";
+  return platform ?? "unknown OS";
+}
 
 // The Windows INSTALL command is PowerShell syntax (irm ... | iex) -- pasting
 // it into cmd.exe just errors. (The "toaster" commands after it are a .cmd
@@ -30,19 +42,16 @@ export function PowerShellNotice() {
 
 // Best-effort guess at the OS of the machine viewing the page -- used to
 // pre-select client/src/pages/Device.tsx's OS tab so the right setup command
-// is already showing on first paint instead of defaulting to "linux"
+// is already showing on first paint instead of defaulting to one OS
 // regardless of who's looking. navigator.userAgentData (Chromium) is
 // preferred where present since it's a plain platform string rather than a
 // UA string to pattern-match; every other browser falls back to
-// navigator.userAgent. Genuinely ambiguous/unrecognized cases fall back to
-// "linux" -- the same default this always had, just now only reached when
-// detection can't tell.
+// navigator.userAgent. Anything that isn't Windows (macOS, Linux, or
+// unrecognized) gets the Unix commands -- the same default this always had.
 export function detectOS(): SetupOS {
   const uaData = (navigator as Navigator & { userAgentData?: { platform?: string } }).userAgentData;
   const platform = (uaData?.platform || navigator.userAgent || "").toLowerCase();
-  if (platform.includes("win")) return "windows";
-  if (platform.includes("mac")) return "macos";
-  return "linux";
+  return platform.includes("win") ? "windows" : "unix";
 }
 
 // worker.platform is Node's raw os.platform() value (see worker/src/
@@ -53,8 +62,7 @@ export function detectOS(): SetupOS {
 // to the browser-viewer-guessing detectOS() + a manual OS switcher instead.
 export function platformToSetupOS(platform: string | null | undefined): SetupOS | null {
   if (platform === "win32") return "windows";
-  if (platform === "darwin") return "macos";
-  if (platform === "linux") return "linux";
+  if (platform === "darwin" || platform === "linux") return "unix";
   return null;
 }
 
@@ -101,29 +109,27 @@ export function buildSetupScenarios(url: string): SetupScenario[] {
       desc: "Brand-new machine, nothing downloaded yet (no repo, no config, no llama.cpp) -- one command fetches the repo, installs dependencies, registers a 'toaster' command for your user, and starts the worker. It'll ask which drive/volume to use (showing free space -- models are often tens of GB each) and a folder name, then create it.",
       cmd: {
         windows: `irm ${url}/install.ps1 | iex`,
-        macos: `curl -fsSL ${url}/install.sh | bash`,
-        linux: `curl -fsSL ${url}/install.sh | bash`,
+        unix: `curl -fsSL ${url}/install.sh | bash`,
       },
       sourceUrl: {
         windows: `${RAW_BOOTSTRAP}/bootstrap.ps1`,
-        macos: `${RAW_BOOTSTRAP}/bootstrap.sh`,
-        linux: `${RAW_BOOTSTRAP}/bootstrap.sh`,
+        unix: `${RAW_BOOTSTRAP}/bootstrap.sh`,
       },
     },
     {
       title: "Start or restart",
       desc: "Once it's installed, this is the only command you need -- run it from any folder. Stop a running worker with Ctrl+C (or by closing its window) and run it again to start over. 'toaster help' lists the rest.",
-      cmd: { windows: "toaster", macos: "toaster", linux: "toaster" },
+      cmd: { windows: "toaster", unix: "toaster" },
     },
     {
       title: "Update",
       desc: "Pull the latest code and dependencies into the existing install, then start -- config.json, models, llama.cpp builds and every other local file are left exactly as they are.",
-      cmd: { windows: "toaster update", macos: "toaster update", linux: "toaster update" },
+      cmd: { windows: "toaster update", unix: "toaster update" },
     },
     {
       title: "Reconnect",
       desc: "Only if this machine's session was revoked from Settings (or its token expired) -- clears the saved session and asks for a fresh code, keeping the same machine identity and all its history. Normal restarts never need this.",
-      cmd: { windows: "toaster reconnect", macos: "toaster reconnect", linux: "toaster reconnect" },
+      cmd: { windows: "toaster reconnect", unix: "toaster reconnect" },
     },
   ];
 }

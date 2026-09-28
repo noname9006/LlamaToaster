@@ -229,10 +229,10 @@ fi
 # than "run a script in a folder": one executable file in ~/.local/bin (the
 # XDG user-binary location every modern distro and Homebrew-era macOS setup
 # already expects), and nothing else. No sudo, nothing in /usr/local, no
-# launchd/systemd unit, and no shell-rc edits -- if ~/.local/bin isn't on
-# PATH this says so and prints the exact line to add, rather than silently
-# rewriting a dotfile it doesn't own. `toaster uninstall` removes the one
-# file it created.
+# launchd/systemd unit. If ~/.local/bin isn't on PATH (the default on macOS)
+# it ASKS before appending one export line to the login shell's rc file
+# (add_local_bin_to_path) -- never silently. `toaster uninstall` removes the
+# shim file; the rc line, if you accepted it, is harmless and marked.
 #
 # The checkout path is baked in rather than looked up at run time, and the
 # file is regenerated on every setup run -- so moving the install and
@@ -282,7 +282,7 @@ case "${1:-start}" in
     ;;
   uninstall)
     rm -f "$HOME/.local/bin/toaster"
-    echo "Removed $HOME/.local/bin/toaster. Your LlamaToaster folder, config and models were left alone."
+    echo "Removed $HOME/.local/bin/toaster. Your LlamaToaster folder, config and models were left alone. (If setup added a PATH line to your shell rc file, it is marked 'Added by LlamaToaster' and harmless to leave.)"
     ;;
   help|-h|--help)
     cat <<'USAGE'
@@ -313,16 +313,67 @@ TOASTER_SHIM
       echo "From now on, just run: toaster        (toaster help for the rest)"
       ;;
     *)
-      # No dotfile is edited here on purpose -- which rc file is "the" one
-      # varies by shell and by how the user set their machine up, and
-      # appending to the wrong one silently does nothing.
-      echo "$bin_dir is not on your PATH yet. Add this to your shell rc file:"
-      echo "  export PATH=\"\$HOME/.local/bin:\$PATH\""
-      echo "Until then, run it as: $shim_path"
+      # macOS does NOT put ~/.local/bin on PATH by default (many Linux distros
+      # do), so on a fresh Mac this branch is the normal case, not an edge case.
+      # A printed hint alone gets lost: the worker starts right after and
+      # scrolls it away. So offer to add the one PATH line ourselves, only
+      # with an explicit yes, only to the rc file of the user's login shell.
+      add_local_bin_to_path "$bin_dir" "$shim_path"
       ;;
   esac
   echo "Undo any time with: toaster uninstall"
   echo ""
+}
+
+# Appends `export PATH="$HOME/.local/bin:$PATH"` to the login shell's rc file
+# after asking. Idempotent (skips if the line is already there), and falls back
+# to printing the exact line for shells it doesn't know (fish, etc.) or when
+# there's no terminal to ask on (unattended runs never touch dotfiles).
+add_local_bin_to_path() {
+  local bin_dir="$1" shim_path="$2"
+  local path_line='export PATH="$HOME/.local/bin:$PATH"'
+  local rc_file=""
+  case "$(basename "${SHELL:-}")" in
+    zsh)  rc_file="$HOME/.zshrc" ;;
+    bash)
+      # macOS Terminal starts bash as a login shell, which reads
+      # .bash_profile and not .bashrc.
+      if [ "$(uname -s)" = "Darwin" ]; then rc_file="$HOME/.bash_profile"; else rc_file="$HOME/.bashrc"; fi
+      ;;
+  esac
+
+  echo "$bin_dir is not on your PATH, so typing 'toaster' would say \"command not found\"."
+
+  if [ -n "$rc_file" ] && [ -f "$rc_file" ] && grep -qF '.local/bin' "$rc_file" 2>/dev/null; then
+    echo "$rc_file already mentions .local/bin -- open a NEW terminal window and 'toaster' should work."
+    echo "Until then, run it as: $shim_path"
+    return
+  fi
+
+  local answer=""
+  if [ -n "$rc_file" ] && { exec 3</dev/tty; } 2>/dev/null; then
+    printf 'Add it to %s now? (one line: %s) [Y/n]: ' "$rc_file" "$path_line" >&2
+    read -r answer <&3 || answer=""
+    exec 3<&-
+    case "$answer" in
+      n|N|no|No|NO) rc_file="" ;;
+    esac
+  else
+    rc_file=""
+  fi
+
+  if [ -n "$rc_file" ]; then
+    {
+      echo ""
+      echo "# Added by LlamaToaster setup (undo: delete this line and the one below)"
+      echo "$path_line"
+    } >> "$rc_file"
+    echo "Added to $rc_file. Open a NEW terminal window (or run: source $rc_file) and 'toaster' will work."
+  else
+    echo "To enable it, add this line to your shell rc file (~/.zshrc on macOS) and open a new terminal:"
+    echo "  $path_line"
+  fi
+  echo "Until then, run it as: $shim_path"
 }
 
 cd "$REPO_ROOT"
