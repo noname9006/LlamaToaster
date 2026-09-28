@@ -263,4 +263,19 @@ describe("POST /api/import (N7)", () => {
     expect(after.filename).toBe(before.filename);
     expect(after.metadata.quant).toBe(before.metadata.quant);
   });
+
+  it("never squats an unknown hash: the stand-in is keyed by the bundle, not the claimed sha256", async () => {
+    const squat = "e".repeat(64);
+    const bundle = await exportBundle();
+    bundle.run.model_sha256 = squat;
+    const res = await fetch(`${baseUrl}/api/import`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ bundle }),
+    });
+    expect(res.status).toBe(201);
+    expect(repo.getModel(squat)).toBeUndefined();
+    const standIn = repo.listModels().find((m) => m.metadata.imported_claimed_sha256 === squat);
+    expect(standIn?.id.startsWith("imported:")).toBe(true);
+  });
 });

@@ -260,6 +260,19 @@ CREATE TABLE IF NOT EXISTS device_challenges (
 );
 CREATE INDEX IF NOT EXISTS idx_device_challenges_expires ON device_challenges(expires_at);
 
+-- "Connect another account" intent, keyed by the OAuth state it was started
+-- with. Server-side so the callback can't be told which account to link to:
+-- the old unsigned oauth_link_user cookie let anyone link their identity to
+-- any user id. Bound to the starting session -- revoking it drops the intent.
+CREATE TABLE IF NOT EXISTS oauth_link_intents (
+  state_hash TEXT PRIMARY KEY,               -- sha256(state)
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  expires_at INTEGER NOT NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_oauth_link_intents_expires ON oauth_link_intents(expires_at);
+
 -- Persistent queue. Leases and attempts are what make a crashed worker
 -- recoverable.
 CREATE TABLE IF NOT EXISTS worker_jobs (
@@ -346,6 +359,49 @@ CREATE TABLE IF NOT EXISTS ai_usage (
   PRIMARY KEY (user_id, day, hour)
 );
 CREATE INDEX IF NOT EXISTS idx_ai_usage_day ON ai_usage(day);
+
+-- Hourly budget for NEW rows in the shared models catalog, so no tenant can
+-- flood it (see repo.takeCatalogRowBudget). scope is a user id, or
+-- 'worker:<id>' for an ownerless worker, or 'global' for the instance-wide
+-- ceiling. hour = floor(epoch ms / 3600000). Old hours are pruned by the
+-- maintenance sweep.
+-- One GGUF-header reading per (model, reporter) -- reporter is the owning
+-- user id, or 'worker:<id>' for an ownerless worker. Each user always sees
+-- their own reading on top of the shared record (listModelsVisibleTo), and
+-- jobs use the target machine's own reading (getModelForWorker). The shared
+-- record only falls back to the earliest of these for files the server
+-- couldn't read from Hugging Face itself (model_hf_headers).
+CREATE TABLE IF NOT EXISTS model_header_reports (
+  model_id TEXT NOT NULL,
+  scope TEXT NOT NULL,
+  header_hash TEXT NOT NULL,
+  fields_json TEXT NOT NULL,
+  reported_at INTEGER NOT NULL,
+  PRIMARY KEY (model_id, scope)
+);
+
+-- The server's own read of a catalog file's GGUF header from Hugging Face
+-- (server/src/hf-header.ts) -- the authoritative source for the shared
+-- record's header fields. Keyed by sha256, so read once per file ever.
+-- status: 'ok' (fields_json set) | 'unavailable' (permanent: gated, missing,
+-- not LFS, sha mismatch, unparseable) | 'failed' (transient; retried with
+-- backoff until attempts runs out).
+CREATE TABLE IF NOT EXISTS model_hf_headers (
+  sha256 TEXT PRIMARY KEY,
+  status TEXT NOT NULL,
+  fields_json TEXT,
+  reason TEXT,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at INTEGER,
+  fetched_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS catalog_row_budget (
+  scope TEXT NOT NULL,
+  hour INTEGER NOT NULL,
+  count INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (scope, hour)
+);
 
 -- Multi-user Stage 4 (MULTIUSER_PLAN.md §4.2): tiny key-value store for
 -- one-shot migration flags -- currently just "has the pre-auth legacy

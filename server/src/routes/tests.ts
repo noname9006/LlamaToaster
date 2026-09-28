@@ -766,7 +766,9 @@ export async function testsRoutes(app: FastifyInstance): Promise<void> {
       ) {
         return reply.code(400).send({ error: "comparison_id must be a short non-empty string" });
       }
-      const model = repo.getModel(body.model_id);
+      // As the target machine sees it (its own reading of its own file), not
+      // the shared catalog copy -- see repo.getModelForWorker.
+      const model = repo.getModelForWorker(body.model_id, body.worker_id);
       if (!model) {
         return reply.code(400).send({ error: "unknown model_id" });
       }
@@ -800,7 +802,7 @@ export async function testsRoutes(app: FastifyInstance): Promise<void> {
                 'sweep includes mtp:"on" but this model has no built-in MTP head -- pick an MTP/draft companion model first',
             });
           }
-          mtpModel = repo.getModel(body.mtp_model_id);
+          mtpModel = repo.getModelForWorker(body.mtp_model_id, body.worker_id);
           if (!mtpModel) {
             return reply.code(400).send({ error: "unknown mtp_model_id" });
           }

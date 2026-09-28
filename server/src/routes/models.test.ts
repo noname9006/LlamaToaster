@@ -14,6 +14,7 @@ import Fastify, { type FastifyInstance } from "fastify";
 // AUTH_ENABLED off vs on.
 const tmpDir = mkdtempSync(join(tmpdir(), "llamatoaster-models-route-test-"));
 process.env.DB_PATH = join(tmpDir, "test.db");
+process.env.SUPERADMIN_IDENTITIES = "github:model-deleter-admin";
 
 let app: FastifyInstance;
 let baseUrl: string;
@@ -120,6 +121,32 @@ describe("POST /api/models ownership", () => {
   });
 });
 
+describe("GET /api/models visibility", () => {
+  it("shows a signed-in user only their own models; single-tenant sees everything", async () => {
+    const tokenA = await sessionFor("vis-owner-a");
+    const tokenB = await sessionFor("vis-owner-b");
+    await registerModel({ id: "m-vis-a", filename: "a.gguf", size_bytes: 1, source: "local" }, authed(tokenA));
+    // Unowned shared row that user B has on one of their machines.
+    repo.registerModel({ id: "b".repeat(64), filename: "b.gguf", size_bytes: 1, source: "local" });
+    const userB = repo.userRepo.upsertByIdentity("github", { providerUserId: "vis-owner-b", login: "vis-owner-b", avatarUrl: null });
+    const w = repo.workerRepo.getOrCreateByMachineId("vis-machine-b", "vis-machine-b");
+    const db = (await import("../db/migrate.js")).getDb();
+    db.prepare(`UPDATE workers SET user_id = ?, model_files_json = ? WHERE id = ?`).run(
+      userB.id, JSON.stringify([{ path: "b.gguf", size_bytes: 1, sha256: "b".repeat(64) }]), w.id);
+
+    const ids = async (headers: Record<string, string>) =>
+      ((await (await fetch(`${baseUrl}/api/models`, { headers })).json()) as { models: { id: string }[] }).models.map((m) => m.id);
+    const a = await ids(authed(tokenA));
+    expect(a).toContain("m-vis-a");
+    expect(a).not.toContain("b".repeat(64));
+    const b = await ids(authed(tokenB));
+    expect(b).toContain("b".repeat(64));
+    expect(b).not.toContain("m-vis-a");
+    const all = await ids({});
+    expect(all).toEqual(expect.arrayContaining(["m-vis-a", "b".repeat(64)]));
+  });
+});
+
 describe("DELETE /api/models/:id ownership", () => {
   it("the creator can delete their own model", async () => {
     const token = await sessionFor("model-deleter-1");
@@ -146,10 +173,18 @@ describe("DELETE /api/models/:id ownership", () => {
     expect(repo.getModel("m-del-protected")).toBeDefined();
   });
 
-  it("an unclaimed model can be deleted by any authenticated caller", async () => {
+  it("an unclaimed (shared catalog) model can't be deleted by an ordinary authenticated caller", async () => {
     await registerModel({ id: "m-del-unclaimed", filename: "x.gguf", size_bytes: 1, source: "local" });
     const token = await sessionFor("model-deleter-anyone");
     const res = await fetch(`${baseUrl}/api/models/m-del-unclaimed`, { method: "DELETE", headers: authed(token) });
+    expect(res.status).toBe(403);
+    expect(repo.getModel("m-del-unclaimed")).toBeDefined();
+  });
+
+  it("a superadmin can delete an unclaimed model", async () => {
+    await registerModel({ id: "m-del-unclaimed-admin", filename: "x.gguf", size_bytes: 1, source: "local" });
+    const token = await sessionFor("model-deleter-admin");
+    const res = await fetch(`${baseUrl}/api/models/m-del-unclaimed-admin`, { method: "DELETE", headers: authed(token) });
     expect(res.status).toBe(200);
   });
 

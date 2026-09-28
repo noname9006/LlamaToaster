@@ -33,8 +33,8 @@ const REGISTRY_WRITE_RATE_LIMIT = { max: 60, timeWindow: "1 hour", keyGenerator:
 const HASH_LOOKUP_RATE_LIMIT = { max: 120, timeWindow: "1 hour", keyGenerator: userOrIpKeyGenerator } as const;
 
 export async function modelsRoutes(app: FastifyInstance): Promise<void> {
-  app.get("/api/models", async () => {
-    return { models: repo.listModels() };
+  app.get("/api/models", async (request) => {
+    return { models: repo.listModelsVisibleTo(resolveAuthUser(request)?.user.id) };
   });
 
   // Trigger a full model refresh on a specific worker
@@ -92,13 +92,17 @@ export async function modelsRoutes(app: FastifyInstance): Promise<void> {
     if (!existing) return reply.code(404).send({ error: "model not found" });
 
     // Multi-user Stage 4 (MULTIUSER_PLAN.md §4.4): only the creator may
-    // delete -- an unclaimed model (created_by NULL, single-tenant mode or a
-    // legacy row) stays deletable by anyone, same rule registerModel's own
-    // conflict guard uses.
+    // delete. An unclaimed model (created_by NULL: worker-driven
+    // registrations, imports, legacy rows) is a shared, content-addressed
+    // catalog entry other tenants may depend on, so with auth on only a
+    // superadmin may delete it. Single-tenant mode (no session) is unchanged.
     const authed = resolveAuthUser(request);
     const createdBy = repo.getModelCreatedBy(existing.id);
     if (authed && createdBy && createdBy !== authed.user.id) {
       throw new ForbiddenError("you don't own this model");
+    }
+    if (authed && !createdBy && !authed.user.isSuperadmin) {
+      throw new ForbiddenError("shared catalog models can only be deleted by an admin");
     }
 
     const resultCount = repo.countResultsForModel(existing.id);
@@ -275,8 +279,8 @@ export async function modelsRoutes(app: FastifyInstance): Promise<void> {
   // are checked; local models have nothing to compare against. Requests are
   // deduped by repo since several registered models (different quants) often
   // share one -- no reason to ask HF the same question twice.
-  app.get("/api/models/hf-updates", async () => {
-    const withRepo = repo.listModels().filter((m): m is typeof m & { hf_repo: string } => Boolean(m.hf_repo));
+  app.get("/api/models/hf-updates", async (request) => {
+    const withRepo = repo.listModelsVisibleTo(resolveAuthUser(request)?.user.id).filter((m): m is typeof m & { hf_repo: string } => Boolean(m.hf_repo));
     const byRepo = new Map<string, Promise<string | null>>();
     for (const m of withRepo) {
       if (byRepo.has(m.hf_repo)) continue;

@@ -109,8 +109,10 @@ export function runMaintenanceSweep(log: ReaperLogger): void {
   const prunedEnrolments =
     repo.workerRepo.pruneExpiredEnrolments() +
     repo.workerRepo.pruneExpiredReenrolments() +
-    repo.workerRepo.pruneExpiredChallenges();
+    repo.workerRepo.pruneExpiredChallenges() +
+    repo.sessionRepo.pruneExpiredLinkIntents();
   const prunedGpuClockSamples = repo.pruneOldGpuClockSamples(GPU_CLOCK_SAMPLE_RETENTION_DAYS);
+  repo.pruneOldCatalogRowBudget();
   if (prunedSessions || prunedJobs || prunedEnrolments || prunedGpuClockSamples) {
     log.warn(
       { prunedSessions, prunedJobs, prunedEnrolments, prunedGpuClockSamples },

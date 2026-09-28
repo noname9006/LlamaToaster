@@ -98,6 +98,7 @@ import {
 } from "./llama-builds.js";
 import { detectHardware, detectBackend } from "./hardware.js";
 import { readGgufInfo } from "./gguf.js";
+import { applyLocalHeader } from "./local-header.js";
 import { LocalModelCache, createLocalModelCache } from "./local-cache.js";
 import { runStartupReconciliation, refreshModels, getModelFilesWithState, HashingQueue, lookupHashes } from "./model-scanner.js";
 import {
@@ -2257,6 +2258,8 @@ async function executeRuntimeBenchmarkJob(
 ): Promise<void> {
   const modelPath = await resolveModelPath(payload.model);
   if (!existsSync(modelPath)) throw new Error(`model file not found at ${modelPath}`);
+  // This machine's own read of the file beats the server's shared copy.
+  payload.model = await applyLocalHeader(payload.model, modelPath);
   const resolvedBuild = getInstalledBuild(buildsDir, payload.llama_cpp_build);
   if (!resolvedBuild) throw new Error(`build ${payload.llama_cpp_build} is not installed on this worker`);
   if (!resolvedBuild.server_path) {
@@ -2522,6 +2525,8 @@ async function executeRuntimeBenchmarkJob(
 async function executeFillCurveJob(payload: BenchmarkJob, spec: FillCurveSpec): Promise<void> {
   const modelPath = await resolveModelPath(payload.model);
   if (!existsSync(modelPath)) throw new Error(`model file not found at ${modelPath}`);
+  // This machine's own read of the file beats the server's shared copy.
+  payload.model = await applyLocalHeader(payload.model, modelPath);
   const resolvedBuild = getInstalledBuild(buildsDir, payload.llama_cpp_build);
   if (!resolvedBuild) throw new Error(`build ${payload.llama_cpp_build} is not installed on this worker`);
   if (!resolvedBuild.server_path) {
@@ -2674,12 +2679,15 @@ async function executeBenchmarkJob(payload: BenchmarkJob): Promise<void> {
   if (!existsSync(modelPath)) {
     throw new Error(`model file not found at ${modelPath} (source=${payload.model.source})`);
   }
+  // This machine's own read of the file beats the server's shared copy.
+  payload.model = await applyLocalHeader(payload.model, modelPath);
   let mtpModelPath: string | undefined;
   if (payload.mtp_model) {
     mtpModelPath = await resolveModelPath(payload.mtp_model);
     if (!existsSync(mtpModelPath)) {
       throw new Error(`mtp model file not found at ${mtpModelPath} (source=${payload.mtp_model.source})`);
     }
+    payload.mtp_model = await applyLocalHeader(payload.mtp_model, mtpModelPath);
   }
 
   // The server always resolves the exact tag this run should execute
@@ -2908,7 +2916,9 @@ async function executeDownloadModelJob(
   // Obtain expected SHA256 BEFORE download (spec: Before download obtain expected SHA256)
   let expectedSha256: string | null = null;
   try {
-    expectedSha256 = await fetchExpectedSha256(payload.hf_repo, payload.hf_file);
+    // The server resolves it at enqueue time (and enforces it on the
+    // callback); an older server doesn't, so fall back to asking HF.
+    expectedSha256 = payload.expected_sha256 ?? (await fetchExpectedSha256(payload.hf_repo, payload.hf_file));
     if (expectedSha256) log.info(`expected SHA256 for ${progressKey}: ${expectedSha256}`);
     else log.info(`no expected SHA256 available for ${progressKey} (non-LFS or HF lookup failed)`);
   } catch {
@@ -3341,6 +3351,11 @@ function describeProbeVramDiscrepancy(
 async function executeRunProbeJob(payload: TestProbeJobPayload): Promise<void> {
   const modelPath = await resolveModelPath(payload.model);
   if (!existsSync(modelPath)) throw new Error(`model file not found at ${modelPath}`);
+  // This machine's own read of the file beats the server's shared copy.
+  payload.model = await applyLocalHeader(payload.model, modelPath);
+  // The probe's context ceiling rides separately (the server copied it out of
+  // the shared metadata when it built the job) -- same rule applies.
+  if (typeof payload.model.metadata.trained_ctx === "number") payload.trained_ctx = payload.model.metadata.trained_ctx;
   const resolvedBuild = getInstalledBuild(buildsDir, payload.llama_cpp_build);
   if (!resolvedBuild) throw new Error(`build ${payload.llama_cpp_build} is not installed on this worker`);
   if (!resolvedBuild.server_path) {
@@ -4122,6 +4137,8 @@ async function runOneProbeLoad(input: ProbeLoadInput): Promise<ProbeAttemptOutco
 async function executeMeasureQualityJob(payload: MeasureQualityJobPayload): Promise<void> {
   const modelPath = await resolveModelPath(payload.model);
   if (!existsSync(modelPath)) throw new Error(`model file not found at ${modelPath}`);
+  // This machine's own read of the file beats the server's shared copy.
+  payload.model = await applyLocalHeader(payload.model, modelPath);
   const resolvedBuild = getInstalledBuild(buildsDir, payload.llama_cpp_build);
   if (!resolvedBuild) throw new Error(`build ${payload.llama_cpp_build} is not installed on this worker`);
   const perplexityPath = derivePerplexityPath(resolvedBuild.bench_path);

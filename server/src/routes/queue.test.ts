@@ -25,6 +25,13 @@ function hardwareState(machineId: string, status: "idle" | "busy") {
   };
 }
 
+// Heartbeat registration only trusts hf_match pairs present in the
+// server's own HF index -- seed one the way the index crawler would.
+async function indexed(sha256: string, repoId: string, filename: string) {
+  const { upsertHfGgufEntry } = await import("../hf-index.js");
+  upsertHfGgufEntry({ sha256, repo_id: repoId, filename, revision: "main", file_size: 1, last_seen: Date.now(), deleted_at: null });
+}
+
 async function postJson(path: string, body: unknown, token = "route-test-secret") {
   return fetch(`${baseUrl}${path}`, {
     method: "POST",
@@ -167,6 +174,7 @@ describe("POST /api/worker/heartbeat", () => {
 
   it("registers a hash-verified model file into the catalog on heartbeat (manual-drop flow)", async () => {
     const sha = "c".repeat(64);
+    await indexed(sha, "org/repo", "dropped.gguf");
     const files = [
       {
         path: "dropped.gguf",
@@ -212,6 +220,7 @@ describe("POST /api/worker/heartbeat", () => {
       hf_file: "repo-name-GGUF/model.Q4_K_M.gguf",
       metadata: { param_count: 8_000_000_000 },
     });
+    await indexed(sha, "org/repo-name-GGUF", "model.Q4_K_M.gguf");
 
     await postJson("/api/worker/heartbeat", {
       ...hardwareState("hb-hash-selfheal", "idle"),
@@ -250,6 +259,8 @@ describe("POST /api/worker/heartbeat", () => {
       metadata: { param_count: 27_000_000_000 },
       lock_hf_identity: true, // exactly what workers.ts's download-callback route sets
     });
+    // Genuinely indexed, so it's the lock (not the index check) under test.
+    await indexed(sha, "mingxianderen/Qwen3.8-27B-GGUF", "Qwen3.8-27B-UD-Q5_K_M.gguf");
 
     // A heartbeat now reports this exact hash matching a DIFFERENT repo --
     // e.g. a fork the (possibly still-buggy) index dedup picked.
@@ -374,6 +385,138 @@ describe("POST /api/worker/heartbeat", () => {
       ],
     });
     expect(repo.getModel(sha)?.metadata.param_count).toBe(8_953_803_264);
+  });
+
+  it("never registers or re-points a catalog row from an hf_match the server's HF index doesn't have", async () => {
+    const fake = "3".repeat(64);
+    const beat = (sha: string, repoId: string, filename: string) =>
+      postJson("/api/worker/heartbeat", {
+        ...hardwareState("hb-fake-match", "idle"),
+        model_files: [
+          { path: "x.gguf", size_bytes: 1, sha256: sha, state: "verified", hf_match: { repo_id: repoId, filename, revision: "main", deleted: false } },
+        ],
+      });
+
+    // Fabricated hash entirely: no row.
+    await beat(fake, "evil/repo", "x.gguf");
+    expect(repo.getModel(fake)).toBeUndefined();
+
+    // Real, indexed row -- a worker claiming a different, un-indexed repo for
+    // that hash can't re-point it.
+    const real = "4".repeat(64);
+    await indexed(real, "good/repo", "real.gguf");
+    await beat(real, "good/repo", "real.gguf");
+    expect(repo.getModel(real)?.hf_repo).toBe("good/repo");
+    await beat(real, "evil/repo", "real.gguf");
+    expect(repo.getModel(real)?.hf_repo).toBe("good/repo");
+
+    // A soft-deleted index row doesn't count either.
+    const gone = "5".repeat(64);
+    await indexed(gone, "org/gone", "g.gguf");
+    const { pruneRepoEntries } = await import("../hf-index.js");
+    pruneRepoEntries("org/gone", []); // soft-deletes it, as a vanished HF file would be
+    await beat(gone, "org/gone", "g.gguf");
+    expect(repo.getModel(gone)).toBeUndefined();
+  });
+
+  it("later user reports -- however many agree -- never rewrite the shared row; the server's own HF read beats them all", async () => {
+    const sha = "6".repeat(64);
+    await indexed(sha, "org/hdr", "hdr.gguf");
+    const beat = (machine: string, extra: Record<string, unknown>) =>
+      postJson("/api/worker/heartbeat", {
+        ...hardwareState(machine, "idle"),
+        model_files: [
+          { path: "hdr.gguf", size_bytes: 1, sha256: sha, state: "verified", hf_match: { repo_id: "org/hdr", filename: "hdr.gguf", revision: "main", deleted: false }, ...extra },
+        ],
+      });
+
+    // Earliest report sets it (no HF read yet).
+    await beat("hb-hdr-first", { n_layer: 32, quant: "Q4_K_M" });
+    expect(repo.getModel(sha)?.metadata).toMatchObject({ n_layer: 32, quant: "Q4_K_M" });
+
+    // Any number of later, agreeing liars: no effect.
+    await beat("hb-hdr-liar", { n_layer: 1, quant: "F32" });
+    await beat("hb-hdr-liar-2", { n_layer: 1, quant: "F32" });
+    await beat("hb-hdr-liar-3", { n_layer: 1, quant: "F32" });
+    expect(repo.getModel(sha)?.metadata).toMatchObject({ n_layer: 32, quant: "Q4_K_M" });
+
+    // The server's own read from HF overrides even the earliest report.
+    repo.recordHfHeader(sha, { status: "ok", fields: { n_layer: 40, quant: "Q4_K_M" } });
+    await beat("hb-hdr-first", { n_layer: 32, quant: "Q4_K_M" });
+    expect(repo.getModel(sha)?.metadata.n_layer).toBe(40);
+  });
+
+  it("a signed-in owner always sees their own machine's header reading, whatever the shared row says", async () => {
+    const sha = "7".repeat(64);
+    const user = repo.userRepo.upsertByIdentity("github", { providerUserId: "hdr-owner", login: "hdr-owner", avatarUrl: null });
+    repo.registerModel({ id: sha, filename: "x.gguf", size_bytes: 1, source: "local", metadata: { n_layer: 1 } });
+    repo.recordHeaderReport(sha, "worker:someone-else", { n_layer: 1 });
+    repo.recordHeaderReport(sha, user.id, { n_layer: 40 });
+    const w = repo.workerRepo.getOrCreateByMachineId("hdr-owner-machine", "hdr-owner-machine");
+    const { getDb } = await import("../db/migrate.js");
+    getDb().prepare(`UPDATE workers SET user_id = ?, model_files_json = ? WHERE id = ?`).run(
+      user.id, JSON.stringify([{ path: "x.gguf", size_bytes: 1, sha256: sha }]), w.id);
+    expect(repo.listModelsVisibleTo(user.id).find((m) => m.id === sha)?.metadata.n_layer).toBe(40);
+    expect(repo.getModel(sha)?.metadata.n_layer).toBe(1);
+  });
+
+  it("caps new catalog rows per worker per window, deferring (not dropping) the rest", async () => {
+    const files: { path: string; size_bytes: number; sha256: string; state: string; hf_match: object }[] = [];
+    for (let i = 0; i < 105; i++) {
+      const sha = (0x100 + i).toString(16).padEnd(64, "b");
+      await indexed(sha, "org/cap", `cap-${i}.gguf`);
+      files.push({ path: `cap-${i}.gguf`, size_bytes: 1, sha256: sha, state: "verified", hf_match: { repo_id: "org/cap", filename: `cap-${i}.gguf`, revision: "main", deleted: false } });
+    }
+    await postJson("/api/worker/heartbeat", { ...hardwareState("hb-row-cap", "idle"), model_files: files });
+    const registered = () => files.filter((f) => repo.getModel(f.sha256)).length;
+    expect(registered()).toBe(100);
+    // Same worker, same window: still capped.
+    await postJson("/api/worker/heartbeat", { ...hardwareState("hb-row-cap", "idle"), model_files: files });
+    expect(registered()).toBe(100);
+    // An ownerless worker is its own budget scope -- another one fills the gap.
+    await postJson("/api/worker/heartbeat", { ...hardwareState("hb-row-cap-2", "idle"), model_files: files });
+    expect(registered()).toBe(105);
+  });
+
+  it("shares the new-row budget across every machine the same user owns", async () => {
+    const { getDb } = await import("../db/migrate.js");
+    const user = repo.userRepo.upsertByIdentity("github", { providerUserId: "cap-owner", login: "cap-owner", avatarUrl: null });
+    const w1 = repo.workerRepo.getOrCreateByMachineId("hb-user-cap-1", "hb-user-cap-1");
+    const w2 = repo.workerRepo.getOrCreateByMachineId("hb-user-cap-2", "hb-user-cap-2");
+    getDb().prepare(`UPDATE workers SET user_id = ? WHERE id IN (?, ?)`).run(user.id, w1.id, w2.id);
+
+    const files: { path: string; size_bytes: number; sha256: string; state: string; hf_match: object }[] = [];
+    for (let i = 0; i < 120; i++) {
+      const sha = (0x400 + i).toString(16).padEnd(64, "c");
+      await indexed(sha, "org/usercap", `u-${i}.gguf`);
+      files.push({ path: `u-${i}.gguf`, size_bytes: 1, sha256: sha, state: "verified", hf_match: { repo_id: "org/usercap", filename: `u-${i}.gguf`, revision: "main", deleted: false } });
+    }
+    const registered = () => files.filter((f) => repo.getModel(f.sha256)).length;
+    const t1 = repo.sessionRepo.create(user.id, { isWorker: true, workerId: w1.id }).token;
+    const t2 = repo.sessionRepo.create(user.id, { isWorker: true, workerId: w2.id }).token;
+    expect((await postJson("/api/worker/heartbeat", { ...hardwareState("hb-user-cap-1", "idle"), model_files: files.slice(0, 60) }, t1)).status).toBe(200);
+    expect((await postJson("/api/worker/heartbeat", { ...hardwareState("hb-user-cap-2", "idle"), model_files: files.slice(60) }, t2)).status).toBe(200);
+    expect(registered()).toBe(100);
+  });
+});
+
+describe("repo.getModelForWorker", () => {
+  it("overlays the target machine's own reading of its file; falls back to the shared row otherwise", async () => {
+    const { getDb } = await import("../db/migrate.js");
+    const sha = "d".repeat(63) + "1";
+    repo.registerModel({ id: sha, filename: "p.gguf", size_bytes: 1, source: "local", metadata: { n_layer: 2, trained_ctx: 512 } });
+    const own = repo.workerRepo.getOrCreateByMachineId("mfw-own", "mfw-own");
+    const gone = repo.workerRepo.getOrCreateByMachineId("mfw-gone", "mfw-gone");
+    getDb().prepare(`UPDATE workers SET model_files_json = ? WHERE id = ?`).run(
+      JSON.stringify([{ path: "p.gguf", size_bytes: 1, sha256: sha, n_layer: 16, trained_ctx: 131072 }]), own.id);
+    getDb().prepare(`UPDATE workers SET model_files_json = ? WHERE id = ?`).run(
+      JSON.stringify([{ path: "p.gguf", size_bytes: 1, sha256: sha, n_layer: 16, state: "missing" }]), gone.id);
+
+    expect(repo.getModelForWorker(sha, own.id)?.metadata).toMatchObject({ n_layer: 16, trained_ctx: 131072 });
+    expect(repo.getModelForWorker(sha, gone.id)?.metadata.n_layer).toBe(2); // file deleted locally
+    expect(repo.getModelForWorker(sha, "no-such-worker")?.metadata.n_layer).toBe(2);
+    expect(repo.getModelForWorker(sha, undefined)?.metadata.n_layer).toBe(2);
+    expect(repo.getModel(sha)?.metadata.n_layer).toBe(2); // shared row untouched
   });
 });
 

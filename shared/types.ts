@@ -263,6 +263,9 @@ export interface ModelMetadata {
   // this existed, local models with no hf_repo, or repos HF hasn't computed
   // gguf metadata for.
   param_count?: number;
+  // An imported bundle's stand-in row (id "imported:<bundle>"): the model
+  // hash the bundle claimed. Unverified -- display only, never used as an id.
+  imported_claimed_sha256?: string;
   // Nextn/MTP (multi-token-prediction) layer count, GGUF's
   // <architecture>.nextn_predict_layers, read at the same time as n_layer --
   // see worker/src/gguf.ts. >0 means this file has a usable MTP head:
@@ -1677,6 +1680,10 @@ export interface InstallBuildJobPayload {
 export interface DownloadModelJobPayload {
   hf_repo: string;
   hf_file: string;
+  // Resolved by the server when the download is queued (HF index, else HF's
+  // tree API). The download callback must report exactly this hash; the
+  // worker verifies against it too. Absent on jobs queued before this existed.
+  expected_sha256?: string | null;
 }
 
 export interface BenchmarkJob {

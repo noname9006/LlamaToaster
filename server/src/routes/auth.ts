@@ -149,14 +149,10 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       // alone, since an admin-origin session visiting this URL with ?link=1
       // would otherwise still have a real `authed` to carry through.
       const authed = ADMIN_HOSTNAME && req.hostname === ADMIN_HOSTNAME ? null : resolveAuthUser(req);
+      // Stored server-side, keyed by this state and bound to this session --
+      // never in a cookie, which the client could forge to name any user.
       if (req.query.link === "1" && authed) {
-        reply.setCookie("oauth_link_user", authed.user.id, {
-          httpOnly: true,
-          secure,
-          sameSite: "lax",
-          path: "/",
-          maxAge: 600,
-        });
+        repo.sessionRepo.createLinkIntent(state, authed.user.id, authed.session.id, Date.now() + 600_000);
       }
 
       const params = new URLSearchParams({
@@ -187,12 +183,28 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
 
       const { code, state } = req.query;
       const cookieState = req.cookies?.oauth_state;
-      const linkUserId = req.cookies?.oauth_link_user ?? null;
       reply.clearCookie("oauth_state", { path: "/" });
+      // Pre-fix builds carried the link intent in this cookie; it is no
+      // longer read, only cleared so stale copies don't linger.
       reply.clearCookie("oauth_link_user", { path: "/" });
 
       if (!code || !state || !cookieState || !safeEqual(state, cookieState)) {
         return reply.redirect("/login?error=oauth_state");
+      }
+
+      // A link must finish in the very session that started it. Checked
+      // before the code exchange, and fails closed: a mismatched intent
+      // never falls through to a plain login. This is what stops a state
+      // planted in a victim's browser (whose session never asked to link)
+      // from attaching an attacker's identity to the victim's account.
+      const linkIntent = repo.sessionRepo.consumeLinkIntent(state);
+      let linkUserId: string | null = null;
+      if (linkIntent) {
+        const current = resolveAuthUser(req);
+        if (!current || current.session.id !== linkIntent.sessionId || current.user.id !== linkIntent.userId) {
+          return reply.redirect("/settings?error=link_session");
+        }
+        linkUserId = linkIntent.userId;
       }
 
       let tokenJson: { access_token?: string; error?: string };
@@ -314,6 +326,10 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
         req.log.info({ user_id: user.id, provider: provider.id }, "legacy pre-auth history claimed");
       }
 
+      // Linking happened inside the session that asked for it -- keep it
+      // rather than minting a second one.
+      if (linkUserId) return reply.redirect("/settings?linked=1");
+
       // One independent session per device/browser -- see the admin-origin
       // branch above for why the previous single-session-reuse behavior was
       // removed (it logged out every other machine on each new login).
@@ -325,7 +341,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
         path: "/",
         maxAge: 30 * 24 * 3600,
       });
-      return reply.redirect(linkUserId ? "/settings?linked=1" : "/");
+      return reply.redirect("/");
     }
   );
 

@@ -3,8 +3,9 @@ import { repo } from "../db/repo.js";
 import { queueEvents } from "../queue-events.js";
 import { getReleases, filterReleasesForWorker, buildInstallPayload } from "../github-releases.js";
 import { BadRequestError, ConflictError, NotFoundError } from "../errors.js";
-import { resolveAuthUser, assertOwnsWorker } from "../auth-middleware.js";
+import { resolveAuthUser, assertOwnsWorker, userOrIpKeyGenerator } from "../auth-middleware.js";
 import { authenticateWorker } from "../worker-auth.js";
+import { withHeaderFields } from "../model-header.js";
 import { isMtpDraftModel } from "../../../shared/types.js";
 import type {
   HfRepoSearchResult,
@@ -331,12 +332,34 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
   // outcome via POST /api/models/download-callback below, same as before.
   app.post<{ Params: { id: string }; Body: { hf_repo?: string; hf_file?: string } }>(
     "/api/workers/:id/models/download",
+    // Queuing now asks HF for the file's expected hash (below), which spends
+    // the instance-wide HF budget -- so it gets a per-user limit.
+    { config: { rateLimit: { max: 120, timeWindow: "1 hour", keyGenerator: userOrIpKeyGenerator } } },
     async (request, reply) => {
       const worker = requireOnlineWorker(resolveAuthUser(request)?.user.id, request.params.id);
       const { hf_repo, hf_file } = request.body ?? {};
       if (!hf_repo || !hf_file) throw new BadRequestError("hf_repo and hf_file are required");
+      if (!HF_REPO_PATTERN.test(hf_repo)) throw new BadRequestError("invalid hf_repo");
+      // The server, not the worker, decides which bytes this download is
+      // allowed to register: the callback must report exactly this hash
+      // (see /api/models/download-callback). Index first (free), HF second.
+      let expected_sha256 = repo.hfIndexLiveShaFor(hf_repo, hf_file);
+      if (!expected_sha256) {
+        let files: Awaited<ReturnType<typeof listHfGgufFiles>>;
+        try {
+          files = await listHfGgufFiles(hf_repo, WORKER_READ_TIMEOUT_MS * 3, "download-expected-sha");
+        } catch (err) {
+          request.log.warn({ hf_repo, err: err instanceof Error ? err.message : String(err) }, "download expected-sha lookup failed");
+          return reply.code(502).send({ error: "couldn't reach Hugging Face to verify that file -- try again" });
+        }
+        expected_sha256 = files.find((f) => f.path === hf_file)?.sha256 ?? null;
+        if (!expected_sha256) throw new NotFoundError("that file isn't a downloadable GGUF in this repo");
+      }
       request.log.info({ worker: worker.id, hf_repo, hf_file }, "model download queued");
-      const jobId = repo.queueRepo.enqueueJob(worker.id, { type: "download_model", payload: { hf_repo, hf_file } });
+      const jobId = repo.queueRepo.enqueueJob(worker.id, {
+        type: "download_model",
+        payload: { hf_repo, hf_file, expected_sha256 },
+      });
       queueEvents.emit(worker.id);
       // job_id lets the client target this specific download with the pause
       // route below -- multiple downloads for the same worker can be queued
@@ -454,7 +477,7 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
       // (not the Stage 1 WORKER_SHARED_TOKEN+machine_id fallback) -- fine,
       // since every worker that can reach this point already authenticated
       // the same way for its heartbeat/queue-poll calls.
-      await authenticateWorker(request);
+      const caller = await authenticateWorker(request);
       const validationError = validateModelDownloadCallback(request.body);
       if (validationError) {
         app.log.warn({ error: validationError }, "model download callback rejected: invalid payload");
@@ -481,6 +504,23 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
         sliding_window,
         tensor_layer_bytes,
       } = request.body;
+      // Registration below locks the row's identity (lock_hf_identity) and
+      // replaces its metadata wholesale, so it must be backed by a real
+      // download a user queued for this worker -- never by the worker's own
+      // say-so (the body's `worker` field is self-reported; caller.id isn't).
+      const expectedShas = repo.queueRepo.downloadJobExpectedShas(caller.id, hf_repo, hf_file);
+      if (!expectedShas) {
+        app.log.warn({ worker: caller.id, hf_repo, hf_file }, "model download callback rejected: no matching download job");
+        return reply.code(404).send({ error: "no matching download job" });
+      }
+      // ...and it must be the file that was queued, not some other hash
+      // (which would lock that other file's row under this repo). A job
+      // queued before expected_sha256 existed (null) is let through once
+      // for the rollout; every new job carries one.
+      if (ok && !expectedShas.some((e) => e === null || e.toLowerCase() === sha256!.toLowerCase())) {
+        app.log.warn({ worker: caller.id, hf_repo, hf_file, sha256 }, "model download callback rejected: sha256 mismatch");
+        return reply.code(409).send({ error: "sha256 doesn't match the file that was queued" });
+      }
       if (!ok) {
         app.log.error({ worker, hf_repo, hf_file, error }, "model download failed");
         return reply.code(200).send({ ok: true });
@@ -502,7 +542,7 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
         const { param_count: hfParamCount } =
           typeof param_count === "number" ? { param_count: null } : await getHfGgufMeta(hf_repo, WORKER_READ_TIMEOUT_MS, "register-fallback-metadata");
         const resolvedParamCount = typeof param_count === "number" ? param_count : hfParamCount;
-        const metadata: ModelMetadata = {
+        let metadata: ModelMetadata = {
           ...(typeof n_layer === "number" ? { n_layer } : {}),
           ...(typeof resolvedParamCount === "number" ? { param_count: resolvedParamCount } : {}),
           ...(typeof mtp_layers === "number" && mtp_layers > 0 ? { mtp_layers } : {}),
@@ -521,6 +561,15 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
           // read -- see ModelMetadata.tensor_layer_bytes.
           ...(tensor_layer_bytes ? { tensor_layer_bytes } : {}),
         };
+        // Record this owner's header reading and let the shared catalog take
+        // whatever the independent readings resolve to (repo.resolveHeaderFields,
+        // same as the heartbeat path in routes/queue.ts). param_count only
+        // counts as a header reading when the worker actually read it -- an
+        // HF repo-level fallback is not a per-file fact.
+        const headerReading: Partial<ModelMetadata> = { ...metadata };
+        if (typeof param_count !== "number") delete headerReading.param_count;
+        repo.recordHeaderReport(sha256!, repo.catalogBudgetScopeForWorker(caller.id), headerReading);
+        metadata = withHeaderFields(metadata, repo.resolveHeaderFields(sha256!));
         if (isMtpDraftModel({ metadata, hf_file, filename: hf_file })) {
           metadata.mtp_role = "draft";
         }

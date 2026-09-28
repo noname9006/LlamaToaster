@@ -4,7 +4,8 @@
 import type { FastifyInstance, FastifyRequest, FastifyReply } from "fastify";
 import { v4 as uuid } from "uuid";
 import { repo } from "../db/repo.js";
-import { resolveAuthUser, sessionScope } from "../auth-middleware.js";
+import { resolveAuthUser, sessionScope, userOrIpKeyGenerator } from "../auth-middleware.js";
+import { MAX_NEW_CATALOG_ROWS_PER_USER_HOUR, MAX_NEW_CATALOG_ROWS_GLOBAL_HOUR } from "./queue.js";
 import type { UserScope } from "../auth-middleware.js";
 import type { ResultRow, Test, TestConfig } from "../../../shared/types.js";
 import {
@@ -138,7 +139,12 @@ export async function exchangeRoutes(app: FastifyInstance): Promise<void> {
 
   app.post<{ Body: { bundle?: unknown; opt_in_scoring?: boolean } }>(
     "/api/import",
-    { bodyLimit: MAX_IMPORT_BYTES },
+    {
+      bodyLimit: MAX_IMPORT_BYTES,
+      // Each import can add a stand-in row to the global model catalog
+      // (repo.importBundleRows), so it gets the same budget as registry writes.
+      config: { rateLimit: { max: 60, timeWindow: "1 hour", keyGenerator: userOrIpKeyGenerator } },
+    },
     async (request, reply) => {
       const authed = resolveAuthUser(request);
       const userId = authed?.user.id;
@@ -160,6 +166,18 @@ export async function exchangeRoutes(app: FastifyInstance): Promise<void> {
       }
 
       const bundle = request.body!.bundle as Bundle;
+      // A stand-in catalog row is only created when the bundle's model isn't
+      // already known here; those count against the importer's hourly
+      // new-catalog-row budget (shared with worker registrations).
+      const claimed = bundle.run.model_sha256 ?? null;
+      const needsStandIn = !(claimed && repo.getModel(claimed));
+      if (
+        needsStandIn &&
+        userId &&
+        !repo.takeCatalogRowBudget(userId, MAX_NEW_CATALOG_ROWS_PER_USER_HOUR, MAX_NEW_CATALOG_ROWS_GLOBAL_HOUR)
+      ) {
+        return reply.code(429).send({ error: "too many new models this hour -- try again later", rows: [] });
+      }
       // Imported rows are badged and never merge into local profile scoring
       // unless opted in for THIS import.
       const optIn = request.body?.opt_in_scoring === true;

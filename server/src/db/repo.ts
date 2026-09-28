@@ -7,8 +7,10 @@ import { generateSessionId, generateRefreshToken, hashToken } from "../session.j
 // quant card needs it and it must match what the client's model picker shows
 // (client/src/modelGrouping.ts's extractQuant mirrors this same pattern).
 import { parseQuant } from "../hf.js";
+import { ggufMetadataPatch } from "../model-header.js";
 import type {
   Model,
+  ModelDirFile,
   ModelMetadata,
   RegisterModelInput,
   Test,
@@ -388,6 +390,8 @@ function mapWorkerReenrolment(row: WorkerReenrolmentRow): WorkerReenrolment {
 // Anyone who knows a machine_id can add one, so this bounds the table; the
 // oldest is dropped first, so the owner's own attempt (the newest) survives.
 export const MAX_PENDING_REENROLMENTS = 5;
+// Transient HF header-read failures are retried this many times, then left.
+export const HF_HEADER_MAX_ATTEMPTS = 6;
 
 // The richer shape actually stored in workers.model_files_json (see
 // WorkerStatePush.model_files) -- ModelDirFile plus the optional GGUF
@@ -894,6 +898,62 @@ export const repo = {
     return rows.map(mapModel);
   },
 
+  // The catalog stays global internally (content-addressed dedup, identity
+  // locks), but what a signed-in user SEES is only the models that are
+  // theirs: ones they registered, have results for (incl. imports), or have
+  // on one of their own machines. Stops the catalog telling every tenant
+  // what everyone else downloads. userId undefined = single-tenant/admin view.
+  listModelsVisibleTo(userId: string | undefined): Model[] {
+    if (userId === undefined) return this.listModels();
+    const rows = getDb()
+      .prepare(
+        `SELECT m.* FROM models m
+         WHERE m.created_by = ?
+            OR EXISTS (SELECT 1 FROM results r WHERE r.model_id = m.id AND r.user_id = ?)
+            OR m.id IN (
+              SELECT json_extract(f.value, '$.sha256')
+              FROM workers w, json_each(COALESCE(w.model_files_json, '[]')) f
+              WHERE w.user_id = ?
+            )
+         ORDER BY m.created_at DESC`
+      )
+      .all(userId, userId, userId) as ModelRow[];
+    // The caller's own header reading (from their own machine's file) wins
+    // over the shared consensus -- what they see about their own file can't
+    // be poisoned by another tenant at all.
+    const own = new Map(
+      (
+        getDb()
+          .prepare(`SELECT model_id, fields_json FROM model_header_reports WHERE scope = ?`)
+          .all(userId) as { model_id: string; fields_json: string }[]
+      ).map((r) => [r.model_id, safeParseJson<Partial<ModelMetadata>>(r.fields_json, {})])
+    );
+    return rows.map((row) => {
+      const model = mapModel(row);
+      const mine = own.get(model.id);
+      return mine ? { ...model, metadata: { ...model.metadata, ...mine } } : model;
+    });
+  },
+
+  // A model as one specific machine should see it: the shared catalog row
+  // with that machine's own reading of its own copy of the file (last
+  // heartbeat's model_files_json entry for this hash) on top. Anything the
+  // server decides for a job on that machine -- MTP capability, context
+  // ceilings, the payload the worker receives -- goes through this, so no
+  // other tenant's report can steer it (docs/PLAN_MODEL_METADATA_TRUST.md).
+  // Falls back to the plain catalog row when the machine has no reading.
+  getModelForWorker(id: string, workerId: string | null | undefined): Model | undefined {
+    const model = this.getModel(id);
+    if (!model || !workerId) return model;
+    const row = getDb().prepare(`SELECT model_files_json FROM workers WHERE id = ?`).get(workerId) as
+      | { model_files_json: string | null }
+      | undefined;
+    const files = safeParseJson<ModelDirFile[]>(row?.model_files_json ?? null, []);
+    const own = files.find((f) => f.sha256 === id && f.state !== "missing");
+    if (!own) return model;
+    return { ...model, metadata: { ...model.metadata, ...ggufMetadataPatch(own) } };
+  },
+
   getModel(id: string): Model | undefined {
     const row = getDb().prepare("SELECT * FROM models WHERE id = ?").get(id) as
       | ModelRow
@@ -958,6 +1018,37 @@ export const repo = {
     return this.getModel(id)!;
   },
 
+  // The live index hash for a repo/file path, if the index has one.
+  hfIndexLiveShaFor(repoId: string, filename: string): string | null {
+    const row = getDb()
+      .prepare(
+        `SELECT sha256 FROM hf_gguf_index
+         WHERE repo_id = ? AND filename = ? AND deleted_at IS NULL
+         ORDER BY last_seen DESC LIMIT 1`
+      )
+      .get(repoId, filename) as { sha256: string } | undefined;
+    return row?.sha256 ?? null;
+  },
+
+  // True when (sha256, repo_id, filename) is a live row of the server's own
+  // HF index -- the server-side check that a worker's heartbeat hf_match is
+  // real rather than self-asserted (routes/queue.ts).
+  hfIndexHasLivePair(sha256: string, repoId: string, filename: string): boolean {
+    return !!getDb()
+      .prepare(
+        `SELECT 1 FROM hf_gguf_index
+         WHERE sha256 = ? AND repo_id = ? AND filename = ? AND deleted_at IS NULL`
+      )
+      .get(sha256, repoId, filename);
+  },
+
+  // Writes a model's whole metadata object as given (no merge) -- for callers
+  // that already built the complete intended shape, e.g. hf-header.ts
+  // replacing every header field with the server's own HF read.
+  setModelMetadata(id: string, metadata: ModelMetadata): void {
+    getDb().prepare("UPDATE models SET metadata = ? WHERE id = ?").run(JSON.stringify(metadata), id);
+  },
+
   // Merges into a model's existing metadata rather than replacing it
   // wholesale like registerModel's upsert does -- used to backfill a single
   // derived field (e.g. n_layer) onto a model that predates it without
@@ -1012,6 +1103,7 @@ export const repo = {
     const model = this.getModel(id);
     if (!model) return undefined;
     getDb().prepare("DELETE FROM models WHERE id = ?").run(id);
+    getDb().prepare("DELETE FROM model_header_reports WHERE model_id = ?").run(id);
     return model;
   },
 
@@ -1092,14 +1184,24 @@ export const repo = {
     const runId = uuid();
     // Never overwrite a local model record from an import: link to it when the
     // content hash already exists here, register a minimal stand-in otherwise.
-    const modelId = input.run.model_sha256 ?? `imported:${input.bundleId}`;
+    // The stand-in is keyed by the bundle, never by the bundle's own claimed
+    // hash -- that hash is attacker-controlled, and using it as the row id
+    // would let an import squat a real file's catalog row. The claim is kept
+    // in metadata for display only. Owned by the importer, so it only shows
+    // up for them (repo.listModelsVisibleTo).
+    const claimed = input.run.model_sha256 ?? null;
+    const modelId = claimed && this.getModel(claimed) ? claimed : `imported:${input.bundleId}`;
     if (!this.getModel(modelId)) {
       this.registerModel({
         id: modelId,
         filename: input.run.model_filename,
         size_bytes: 0,
         source: "local",
-        metadata: input.run.model_quant ? { quant: input.run.model_quant } : {},
+        created_by: userId,
+        metadata: {
+          ...(input.run.model_quant ? { quant: input.run.model_quant } : {}),
+          ...(claimed ? { imported_claimed_sha256: claimed } : {}),
+        },
       });
     }
 
@@ -1451,6 +1553,139 @@ export const repo = {
   // indefinitely." Nulls only the sample series; every other thermal column
   // is untouched. Called from reaper.ts's runMaintenanceSweep, same interval
   // as the other retention prunes.
+  // Spends one unit of the hourly new-catalog-row budget for `scope` (and
+  // the global ceiling) -- false when either is exhausted, in which case
+  // nothing is spent. DB-backed so a restart doesn't reset it; per-user
+  // rather than per-worker so enrolling more machines doesn't multiply it.
+  takeCatalogRowBudget(scope: string, perScopeLimit: number, globalLimit: number): boolean {
+    const database = getDb();
+    const hour = Math.floor(Date.now() / 3600_000);
+    return database.transaction(() => {
+      const used = (s: string) =>
+        (database.prepare(`SELECT count FROM catalog_row_budget WHERE scope = ? AND hour = ?`).get(s, hour) as
+          | { count: number }
+          | undefined)?.count ?? 0;
+      if (used(scope) >= perScopeLimit || used("global") >= globalLimit) return false;
+      const bump = database.prepare(
+        `INSERT INTO catalog_row_budget (scope, hour, count) VALUES (?, ?, 1)
+         ON CONFLICT (scope, hour) DO UPDATE SET count = count + 1`
+      );
+      bump.run(scope, hour);
+      bump.run("global", hour);
+      return true;
+    })();
+  },
+
+  // Records one reporter's GGUF header reading for a model (see
+  // model_header_reports in schema.sql). reported_at only moves when the
+  // reading actually changes, so "earliest report" stays stable across beats.
+  recordHeaderReport(modelId: string, scope: string, fields: Partial<ModelMetadata>): void {
+    if (Object.keys(fields).length === 0) return;
+    const sorted = Object.fromEntries(Object.entries(fields).sort(([a], [b]) => a.localeCompare(b)));
+    const json = JSON.stringify(sorted);
+    const hash = createHash("sha256").update(json).digest("hex");
+    getDb()
+      .prepare(
+        `INSERT INTO model_header_reports (model_id, scope, header_hash, fields_json, reported_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT (model_id, scope) DO UPDATE SET
+           header_hash = excluded.header_hash,
+           fields_json = excluded.fields_json,
+           reported_at = excluded.reported_at
+         WHERE model_header_reports.header_hash != excluded.header_hash`
+      )
+      .run(modelId, scope, hash, json, Date.now());
+  },
+
+  // The header fields the SHARED catalog should carry: the server's own read
+  // of the file from Hugging Face when it has one (hf-header.ts), otherwise
+  // the earliest user report. No voting -- nobody else is steered by these
+  // values anyway: jobs use the target machine's own reading
+  // (getModelForWorker) and each user's pages their own (listModelsVisibleTo).
+  // {} when nothing is known.
+  resolveHeaderFields(modelId: string): Partial<ModelMetadata> {
+    const hf = getDb()
+      .prepare(`SELECT fields_json FROM model_hf_headers WHERE sha256 = ? AND status = 'ok'`)
+      .get(modelId) as { fields_json: string } | undefined;
+    if (hf) return safeParseJson(hf.fields_json, {});
+    const first = getDb()
+      .prepare(
+        `SELECT fields_json FROM model_header_reports
+         WHERE model_id = ? ORDER BY reported_at ASC, scope ASC LIMIT 1`
+      )
+      .get(modelId) as { fields_json: string } | undefined;
+    return first ? safeParseJson(first.fields_json, {}) : {};
+  },
+
+  // Catalog files still lacking the server's own HF header read: never tried,
+  // or a transient failure now due for retry. Only real content-addressed
+  // rows (64-hex id) with an HF identity; the revision comes from the index
+  // row when there is one (hf-header.ts checks the served sha256 either way).
+  listModelsNeedingHfHeader(
+    limit: number,
+    now: number
+  ): { id: string; hf_repo: string; hf_file: string; revision: string | null }[] {
+    return getDb()
+      .prepare(
+        `SELECT m.id, m.hf_repo, m.hf_file,
+                (SELECT i.revision FROM hf_gguf_index i
+                  WHERE i.sha256 = m.id AND i.repo_id = m.hf_repo AND i.filename = m.hf_file
+                    AND i.deleted_at IS NULL LIMIT 1) AS revision
+         FROM models m
+         LEFT JOIN model_hf_headers h ON h.sha256 = m.id
+         WHERE m.hf_repo IS NOT NULL AND m.hf_file IS NOT NULL
+           AND length(m.id) = 64
+           AND (h.sha256 IS NULL OR (h.status = 'failed' AND h.attempts < ? AND h.next_attempt_at <= ?))
+         ORDER BY m.created_at DESC
+         LIMIT ?`
+      )
+      .all(HF_HEADER_MAX_ATTEMPTS, now, limit) as { id: string; hf_repo: string; hf_file: string; revision: string | null }[];
+  },
+
+  recordHfHeader(
+    sha256: string,
+    outcome: { status: "ok"; fields: Partial<ModelMetadata> } | { status: "unavailable" | "failed"; reason: string }
+  ): void {
+    const now = Date.now();
+    const database = getDb();
+    const prev = database.prepare(`SELECT attempts FROM model_hf_headers WHERE sha256 = ?`).get(sha256) as
+      | { attempts: number }
+      | undefined;
+    const attempts = (prev?.attempts ?? 0) + 1;
+    // 10 min, 20, 40, 80, ... between transient retries.
+    const nextAttemptAt = outcome.status === "failed" ? now + 10 * 60_000 * 2 ** (attempts - 1) : null;
+    database
+      .prepare(
+        `INSERT INTO model_hf_headers (sha256, status, fields_json, reason, attempts, next_attempt_at, fetched_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (sha256) DO UPDATE SET
+           status = excluded.status, fields_json = excluded.fields_json, reason = excluded.reason,
+           attempts = excluded.attempts, next_attempt_at = excluded.next_attempt_at, fetched_at = excluded.fetched_at`
+      )
+      .run(
+        sha256,
+        outcome.status,
+        outcome.status === "ok" ? JSON.stringify(outcome.fields) : null,
+        outcome.status === "ok" ? null : outcome.reason,
+        attempts,
+        nextAttemptAt,
+        now
+      );
+  },
+
+  // Budget scope for rows a worker adds: its owning user, else the worker.
+  catalogBudgetScopeForWorker(workerId: string): string {
+    const row = getDb().prepare(`SELECT user_id FROM workers WHERE id = ?`).get(workerId) as
+      | { user_id: string | null }
+      | undefined;
+    return row?.user_id ?? `worker:${workerId}`;
+  },
+
+  pruneOldCatalogRowBudget(): number {
+    const hour = Math.floor(Date.now() / 3600_000);
+    return getDb().prepare(`DELETE FROM catalog_row_budget WHERE hour < ?`).run(hour - 1).changes;
+  },
+
   pruneOldGpuClockSamples(days: number): number {
     const cutoff = Date.now() - days * 24 * 3600 * 1000;
     return getDb()
@@ -2813,6 +3048,24 @@ export const repo = {
       }[];
     },
 
+    // Download-callback gate (routes/workers.ts): a worker may only register
+    // a model it was actually asked to download -- a user queued this exact
+    // hf_repo/hf_file for THIS worker. Any status, since the callback is
+    // retried and can land after the job was already marked done. Returns the
+    // hashes the server resolved at enqueue time (null for a legacy job that
+    // predates expected_sha256), or undefined when no such job exists.
+    downloadJobExpectedShas(workerId: string, hfRepo: string, hfFile: string): (string | null)[] | undefined {
+      const rows = getDb()
+        .prepare(
+          `SELECT json_extract(payload_json, '$.expected_sha256') AS sha FROM worker_jobs
+           WHERE worker_id = ? AND job_type = 'download_model'
+             AND json_extract(payload_json, '$.hf_repo') = ?
+             AND json_extract(payload_json, '$.hf_file') = ?`
+        )
+        .all(workerId, hfRepo, hfFile) as { sha: string | null }[];
+      return rows.length ? rows.map((r) => r.sha) : undefined;
+    },
+
     // Looked up by the job-completion endpoint (routes/queue.ts) to verify
     // the reporting worker actually owns this job before trusting its
     // done/failed report -- one worker must never be able to complete or
@@ -3005,6 +3258,10 @@ export const repo = {
       const database = getDb();
       const tx = database.transaction(() => {
         database.prepare(`UPDATE models SET created_by = NULL WHERE created_by = ?`).run(userId);
+        // Keyed by scope (a user id), not FK'd -- cleared by hand. A deleted
+        // account's header readings must stop counting as votes.
+        database.prepare(`DELETE FROM model_header_reports WHERE scope = ?`).run(userId);
+        database.prepare(`DELETE FROM catalog_row_budget WHERE scope = ?`).run(userId);
         database.prepare(`DELETE FROM users WHERE id = ?`).run(userId);
       });
       tx();
@@ -3163,6 +3420,29 @@ export const repo = {
     // logging -- callers don't otherwise need it.
     pruneExpired(): number {
       return getDb().prepare(`DELETE FROM sessions WHERE expires_at < ?`).run(Date.now()).changes;
+    },
+
+    createLinkIntent(state: string, userId: string, sessionId: string, expiresAt: number): void {
+      getDb()
+        .prepare(
+          `INSERT INTO oauth_link_intents (state_hash, user_id, session_id, expires_at, created_at) VALUES (?, ?, ?, ?, ?)`
+        )
+        .run(hashToken(state), userId, sessionId, expiresAt, Date.now());
+    },
+
+    // Single use: consuming deletes the row whether or not it is still valid,
+    // so a state can never carry a link intent twice. Null when there is no
+    // intent for this state or it has expired.
+    consumeLinkIntent(state: string): { userId: string; sessionId: string } | null {
+      const row = getDb()
+        .prepare(`DELETE FROM oauth_link_intents WHERE state_hash = ? RETURNING user_id, session_id, expires_at`)
+        .get(hashToken(state)) as { user_id: string; session_id: string; expires_at: number } | undefined;
+      if (!row || row.expires_at < Date.now()) return null;
+      return { userId: row.user_id, sessionId: row.session_id };
+    },
+
+    pruneExpiredLinkIntents(): number {
+      return getDb().prepare(`DELETE FROM oauth_link_intents WHERE expires_at < ?`).run(Date.now()).changes;
     },
   },
 

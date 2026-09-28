@@ -380,6 +380,7 @@ describe("POST /api/models/download-callback (worker credential, not a user sess
     const id = await heartbeatWorker("download-callback-worker");
     const { userId } = await sessionFor("download-callback-owner");
     const { token } = repo.sessionRepo.create(userId, { isWorker: true, workerId: id });
+    repo.queueRepo.enqueueJob(id, { type: "download_model", payload: { hf_repo: "org/repo", hf_file: "model.gguf" } });
 
     const res = await fetch(`${baseUrl}/api/models/download-callback`, {
       method: "POST",
@@ -391,6 +392,69 @@ describe("POST /api/models/download-callback (worker credential, not a user sess
       body: JSON.stringify({ worker: "w", hf_repo: "org/repo", hf_file: "model.gguf", ok: false, error: "boom" }),
     });
     expect(res.status).toBe(200);
+  });
+
+  it("rejects a callback no queued download backs -- a worker can't lock/re-point a catalog row on its own say-so", async () => {
+    const victim = "7".repeat(64);
+    repo.registerModel({
+      id: victim, filename: "real.gguf", size_bytes: 1, source: "huggingface",
+      hf_repo: "good/repo", hf_file: "real.gguf", metadata: { n_layer: 40 }, lock_hf_identity: true,
+    });
+    const id = await heartbeatWorker("download-callback-forger");
+    const { userId } = await sessionFor("download-callback-forger-owner");
+    const { token } = repo.sessionRepo.create(userId, { isWorker: true, workerId: id });
+    // A job for a DIFFERENT file doesn't count, nor does one on another worker.
+    repo.queueRepo.enqueueJob(id, { type: "download_model", payload: { hf_repo: "evil/repo", hf_file: "other.gguf" } });
+
+    const res = await fetch(`${baseUrl}/api/models/download-callback`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...authed(token) },
+      body: JSON.stringify({ worker: "w", hf_repo: "evil/repo", hf_file: "real.gguf", ok: true, sha256: victim, n_layer: 1, param_count: 1 }),
+    });
+    expect(res.status).toBe(404);
+    const m = repo.getModel(victim);
+    expect(m?.hf_repo).toBe("good/repo");
+    expect(m?.metadata.n_layer).toBe(40);
+  });
+});
+
+describe("download expected_sha256 (server-resolved, callback-enforced)", () => {
+  it("stamps the index's hash onto the queued job", async () => {
+    const id = await heartbeatWorker("dl-expected-enqueue");
+    const { upsertHfGgufEntry } = await import("../hf-index.js");
+    upsertHfGgufEntry({ sha256: "8".repeat(64), repo_id: "org/idx", filename: "f.gguf", revision: "main", file_size: 1, last_seen: Date.now(), deleted_at: null });
+    const res = await fetch(`${baseUrl}/api/workers/${id}/models/download`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ hf_repo: "org/idx", hf_file: "f.gguf" }),
+    });
+    expect(res.status).toBe(202);
+    const { job_id } = (await res.json()) as { job_id: string };
+    const row = getDb().prepare(`SELECT payload_json FROM worker_jobs WHERE id = ?`).get(job_id) as { payload_json: string };
+    expect(JSON.parse(row.payload_json).expected_sha256).toBe("8".repeat(64));
+  });
+
+  it("rejects a callback whose sha256 isn't the one the server resolved for that download", async () => {
+    const victim = "9".repeat(64);
+    repo.registerModel({ id: victim, filename: "v.gguf", size_bytes: 1, source: "huggingface", hf_repo: "good/v", hf_file: "v.gguf", metadata: {} });
+    const id = await heartbeatWorker("dl-expected-mismatch");
+    const { userId } = await sessionFor("dl-expected-mismatch-owner");
+    const { token } = repo.sessionRepo.create(userId, { isWorker: true, workerId: id });
+    repo.queueRepo.enqueueJob(id, { type: "download_model", payload: { hf_repo: "mine/r", hf_file: "m.gguf", expected_sha256: "a".repeat(64) } });
+
+    const post = (sha256: string) =>
+      fetch(`${baseUrl}/api/models/download-callback`, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...authed(token) },
+        body: JSON.stringify({ worker: "w", hf_repo: "mine/r", hf_file: "m.gguf", ok: true, sha256, param_count: 1, n_layer: 2 }),
+      });
+    expect((await post(victim)).status).toBe(409);
+    expect(repo.getModel(victim)?.hf_repo).toBe("good/v");
+    expect(repo.getModel(victim)?.hf_identity_locked).toBe(false);
+
+    // The genuine file registers normally.
+    expect((await post("A".repeat(64))).status).toBe(200);
+    expect(repo.getModel("A".repeat(64))?.hf_repo).toBe("mine/r");
   });
 });
 

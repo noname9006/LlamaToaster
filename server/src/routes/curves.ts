@@ -86,16 +86,18 @@ export const getCurveHandler =
       .filter((r) => r.vram_peak_mib != null && r.gpu_memory_total_mb != null)
       .sort((a, b) => (b.n_depth ?? 0) + b.n_prompt - ((a.n_depth ?? 0) + a.n_prompt))[0];
     if (widest) {
+      // Geometry as the machine that measured this row read its own file.
+      const meta = (repo.getModelForWorker(model.id, widest.worker_id) ?? model).metadata;
       const geometry = {
-        nLayer: model.metadata.n_layer ?? 0,
-        nHeadKv: model.metadata.n_head_kv ?? 0,
-        headDimK: model.metadata.head_dim_k,
-        headDimV: model.metadata.head_dim_v,
-        nEmbd: model.metadata.n_embd,
-        nHead: model.metadata.n_head,
+        nLayer: meta.n_layer ?? 0,
+        nHeadKv: meta.n_head_kv ?? 0,
+        headDimK: meta.head_dim_k,
+        headDimV: meta.head_dim_v,
+        nEmbd: meta.n_embd,
+        nHead: meta.n_head,
         cacheTypeK: widest.cache_type_k,
         cacheTypeV: widest.cache_type_v,
-        slidingWindow: model.metadata.sliding_window,
+        slidingWindow: meta.sliding_window,
       };
       const estimate = maxAffordableContext({
         ...geometry,

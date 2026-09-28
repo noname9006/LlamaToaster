@@ -480,8 +480,8 @@ function hardwareSummary(userId: string | undefined): string {
     .join("\n");
 }
 
-function modelsSummary(): { text: string; count: number } {
-  const models = repo.listModels();
+function modelsSummary(userId: string | undefined): { text: string; count: number } {
+  const models = repo.listModelsVisibleTo(userId);
   if (models.length === 0) return { text: "(none registered)", count: 0 };
   const text = models
     .map((m) => {
@@ -517,11 +517,12 @@ function resultsSummary(userId: string | undefined): string {
 // Server-side port of client/src/api/aiContext.ts's buildContextSnapshot
 // (§2.7) -- same output shape, but reads the DB directly instead of an HTTP
 // round-trip to this server's own API. userId now genuinely scopes hardware/
-// results to the caller (§4.6) -- modelsSummary stays unscoped, since the
-// model catalog is global (§4.3). Exported for ai.test.ts's own isolation
+// results to the caller (§4.6), and modelsSummary to the models the caller
+// can see (repo.listModelsVisibleTo) -- the catalog is global internally but
+// never shows one tenant another's models. Exported for ai.test.ts's own isolation
 // coverage -- otherwise unused outside this module.
 export function buildContextSnapshot(userId: string | undefined): string {
-  const { text: models, count: modelCount } = modelsSummary();
+  const { text: models, count: modelCount } = modelsSummary(userId);
   return [
     "## Hardware",
     hardwareSummary(userId),

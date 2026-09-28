@@ -10,6 +10,7 @@ import { getHfGgufMeta } from "../hf.js";
 import { log } from "../log.js";
 import type { QueueJob, HeartbeatResponse, WorkerStatePush, ModelMetadata, ModelDirFile } from "../../../shared/types.js";
 import { isMtpDraftModel } from "../../../shared/types.js";
+import { ggufMetadataPatch, withHeaderFields } from "../model-header.js";
 
 // 25s keeps the hanging long-poll comfortably under Caddy's/any intermediary's
 // 30s idle default. 10s heartbeat (worker/src/index.ts) gives cancel/pause a
@@ -30,9 +31,14 @@ const HF_META_TIMEOUT_MS = 15_000;
 // handlers that call this) since HF can take up to HF_META_TIMEOUT_MS and a
 // heartbeat response must stay fast; deduped per model id so a slow lookup
 // isn't re-fired every ~10s until it resolves.
+// Globally capped too: every lookup spends the instance-wide HF rate budget
+// (hf-rate-limit.ts), so a heartbeat reporting many new files must not fan
+// out unboundedly. Anything skipped simply retries on a later beat.
+const MAX_PARAM_LOOKUPS_IN_FLIGHT = 4;
 const paramLookupInFlight = new Set<string>();
 function backfillParamCountInBackground(modelId: string, hfRepo: string): void {
   if (paramLookupInFlight.has(modelId)) return;
+  if (paramLookupInFlight.size >= MAX_PARAM_LOOKUPS_IN_FLIGHT) return;
   paramLookupInFlight.add(modelId);
   getHfGgufMeta(hfRepo, HF_META_TIMEOUT_MS, "register-fallback-metadata")
     .then(({ param_count }) => {
@@ -62,11 +68,40 @@ function backfillParamCountInBackground(modelId: string, hfRepo: string): void {
 // worker code fix self-heals previously-corrupted catalog rows on their next
 // scan instead of leaving them wrong forever. Never throws -- catalog
 // bookkeeping must not break heartbeat ingestion.
-function registerHashVerifiedModelFiles(files: WorkerStatePush["model_files"]): void {
+//
+// Nothing here is trusted just because a worker said it (any GitHub account
+// can enrol one): hf_match must exist as a live pair in the server's own
+// hf_gguf_index, new catalog rows are capped per owning user per hour (plus
+// an instance-wide ceiling -- repo.takeCatalogRowBudget), and header
+// metadata can only fill gaps once a row has adopted it
+// (ModelMetadata.gguf_header_adopted).
+export const MAX_NEW_CATALOG_ROWS_PER_USER_HOUR = 100;
+export const MAX_NEW_CATALOG_ROWS_GLOBAL_HOUR = 2_000;
+
+function registerHashVerifiedModelFiles(workerId: string, files: WorkerStatePush["model_files"]): void {
+  const ownerScope = repo.catalogBudgetScopeForWorker(workerId);
   for (const f of files) {
     if (!f.sha256 || f.state !== "verified" || !f.hf_match || f.hf_match.deleted) continue;
     try {
       const existing = repo.getModel(f.sha256);
+      const identityOk =
+        existing && existing.hf_repo === f.hf_match.repo_id && existing.hf_file === f.hf_match.filename;
+      // A row already carrying this exact identity was verified when it was
+      // written; anything else (new row, or a re-point) must be backed by the
+      // index. Checked only in that case so a steady-state beat stays cheap.
+      if (!identityOk && !repo.hfIndexHasLivePair(f.sha256, f.hf_match.repo_id, f.hf_match.filename)) continue;
+      // Over budget: skip this beat; the file is re-reported every ~10s, so it
+      // registers in a later window instead of being dropped.
+      if (
+        !existing &&
+        !repo.takeCatalogRowBudget(
+          ownerScope,
+          MAX_NEW_CATALOG_ROWS_PER_USER_HOUR,
+          MAX_NEW_CATALOG_ROWS_GLOBAL_HOUR
+        )
+      ) {
+        continue;
+      }
 
       // The file's own GGUF header metadata rides along on the heartbeat (see
       // ModelDirFile's doc comments and worker/src/model-scanner.ts's
@@ -76,13 +111,16 @@ function registerHashVerifiedModelFiles(files: WorkerStatePush["model_files"]): 
       // Without this, a hand-dropped file would keep its "?" quant and a
       // filename/HF-derived (often wrong -- see getHfGgufMeta's repo-level
       // total) param count forever.
-      const patch = ggufMetadataPatch(f);
-      const merged = { ...(existing?.metadata ?? {}), ...patch };
+      //
+      // Never adopted straight from this one worker, though: it's recorded as
+      // this owner's reading, and the catalog takes whatever the independent
+      // readings resolve to (repo.resolveHeaderFields) -- one tenant can't
+      // rewrite a shared row's n_layer for everyone else.
+      repo.recordHeaderReport(f.sha256, ownerScope, ggufMetadataPatch(f));
+      const merged: ModelMetadata = withHeaderFields(existing?.metadata ?? {}, repo.resolveHeaderFields(f.sha256));
       if (isMtpDraftModel({ metadata: merged, hf_file: f.hf_match.filename, filename: f.hf_match.filename })) {
         merged.mtp_role = "draft";
       }
-      const identityOk =
-        existing && existing.hf_repo === f.hf_match.repo_id && existing.hf_file === f.hf_match.filename;
       // A row locked by an actual in-app download (existing.hf_identity_locked
       // -- see repo.ts's registerModel doc comment) never gets its identity
       // touched by this scan path: registerModel's own ON CONFLICT WHERE
@@ -133,28 +171,6 @@ function registerHashVerifiedModelFiles(files: WorkerStatePush["model_files"]): 
   }
 }
 
-// Maps a verified model file's heartbeat-reported GGUF header fields onto the
-// ModelMetadata shape (see ModelDirFile / worker/src/gguf.ts). Only fields
-// with a real value are included, so calling it with a file whose header
-// couldn't be parsed produces an empty patch (a no-op for the caller).
-function ggufMetadataPatch(f: ModelDirFile): Partial<ModelMetadata> {
-  const patch: Partial<ModelMetadata> = {};
-  if (typeof f.n_layer === "number") patch.n_layer = f.n_layer;
-  if (typeof f.mtp_layers === "number" && f.mtp_layers > 0) patch.mtp_layers = f.mtp_layers;
-  if (typeof f.param_count === "number") patch.param_count = f.param_count;
-  if (typeof f.quant === "string" && f.quant) patch.quant = f.quant;
-  // Trained context + KV geometry -- adopted like the fields above so a
-  // hand-dropped file gets the same catalog metadata as an in-app download.
-  if (typeof f.trained_ctx === "number" && f.trained_ctx > 0) patch.trained_ctx = f.trained_ctx;
-  if (typeof f.n_head_kv === "number" && f.n_head_kv > 0) patch.n_head_kv = f.n_head_kv;
-  if (typeof f.head_dim_k === "number" && f.head_dim_k > 0) patch.head_dim_k = f.head_dim_k;
-  if (typeof f.head_dim_v === "number" && f.head_dim_v > 0) patch.head_dim_v = f.head_dim_v;
-  if (typeof f.n_embd === "number" && f.n_embd > 0) patch.n_embd = f.n_embd;
-  if (typeof f.n_head === "number" && f.n_head > 0) patch.n_head = f.n_head;
-  if (typeof f.sliding_window === "number" && f.sliding_window > 0) patch.sliding_window = f.sliding_window;
-  if (f.tensor_layer_bytes) patch.tensor_layer_bytes = f.tensor_layer_bytes;
-  return patch;
-}
 
 // Resolves as soon as a job is claimable for this worker (woken by
 // queueEvents) or LONG_POLL_MS elapses, whichever comes first. Resolves
@@ -194,7 +210,7 @@ export async function queueRoutes(app: FastifyInstance): Promise<void> {
     const worker = await authenticateWorker(req);
     const state = parseWorkerState(req.body);
     repo.workerRepo.recordHeartbeat(worker.id, state, null);
-    registerHashVerifiedModelFiles(state.model_files);
+    registerHashVerifiedModelFiles(worker.id, state.model_files);
 
     // A worker that says it is busy must never be handed a second job --
     // it should be heartbeating, not queue-polling, while active.
@@ -221,7 +237,7 @@ export async function queueRoutes(app: FastifyInstance): Promise<void> {
       const activeDownloads = parseActiveDownloads(req.body);
 
       repo.workerRepo.recordHeartbeat(worker.id, state, active?.job_id ?? null);
-      registerHashVerifiedModelFiles(state.model_files);
+      registerHashVerifiedModelFiles(worker.id, state.model_files);
 
       const control: HeartbeatResponse["control"] = {
         cancel_job_ids: [],

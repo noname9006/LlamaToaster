@@ -106,6 +106,18 @@ async function startLogin(
   return { state, stateCookie, linkCookie };
 }
 
+async function callback(s: { state: string; stateCookie: string }, sessionToken?: string): Promise<Response> {
+  const cookie = `oauth_state=${s.stateCookie}` + (sessionToken ? `; lt_session=${sessionToken}` : "");
+  return fetch(`${baseUrl}/auth/github/callback?code=c&state=${s.state}`, { redirect: "manual", headers: { cookie } });
+}
+
+async function loginAs(id: number, login: string): Promise<{ token: string; userId: string }> {
+  mockProfileBody = { id, login, avatar_url: null };
+  const res = await callback(await startLogin());
+  const token = cookieValue(res, "lt_session")!;
+  return { token, userId: repo.sessionRepo.getByTokenHash(hashToken(token))!.userId };
+}
+
 describe("GET /api/auth/status", () => {
   it("returns {user: null} with no session", async () => {
     const res = await fetch(`${baseUrl}/api/auth/status`);
@@ -127,7 +139,7 @@ describe("GET /auth/:provider", () => {
     expect(stateCookie).toBe(state);
   });
 
-  it("does NOT set oauth_link_user when unauthenticated, even with ?link=1", async () => {
+  it("never sets the legacy oauth_link_user cookie, even with ?link=1", async () => {
     const res = await fetch(`${baseUrl}/auth/github?link=1`, { redirect: "manual" });
     expect(cookieValue(res, "oauth_link_user")).toBeUndefined();
   });
@@ -204,63 +216,126 @@ describe("GET /auth/:provider/callback", () => {
   });
 
   it("account linking: an authenticated user connecting a second provider attaches it to their own account", async () => {
-    // Establish an existing logged-in account first.
-    mockProfileBody = { id: 9003, login: "link-primary", avatar_url: null };
-    const primaryLogin = await startLogin();
-    const primaryRes = await fetch(`${baseUrl}/auth/github/callback?code=p&state=${primaryLogin.state}`, {
-      redirect: "manual",
-      headers: { cookie: `oauth_state=${primaryLogin.stateCookie}` },
-    });
-    const primaryToken = cookieValue(primaryRes, "lt_session")!;
-    const primaryUserId = repo.userRepo.getUser(repo.sessionRepo.getByTokenHash(hashToken(primaryToken))!.userId)!.id;
+    const primary = await loginAs(9003, "link-primary");
 
-    // Start the link flow WHILE authenticated -- oauth_link_user should be set.
-    const linkStart = await startLogin({ cookie: `lt_session=${primaryToken}` }, "?link=1");
-    expect(linkStart.linkCookie).toBe(primaryUserId);
+    // Start the link flow WHILE authenticated -- the intent lives server-side,
+    // never in a cookie.
+    const linkStart = await startLogin({ cookie: `lt_session=${primary.token}` }, "?link=1");
+    expect(linkStart.linkCookie).toBeUndefined();
 
-    // A DIFFERENT provider identity completes the callback with both cookies present.
     mockProfileBody = { id: 9004, login: "link-secondary", avatar_url: null };
-    const linkRes = await fetch(`${baseUrl}/auth/github/callback?code=l&state=${linkStart.state}`, {
-      redirect: "manual",
-      headers: { cookie: `oauth_state=${linkStart.stateCookie}; oauth_link_user=${linkStart.linkCookie}` },
-    });
+    const linkRes = await callback(linkStart, primary.token);
     expect(linkRes.headers.get("location")).toBe("/settings?linked=1");
+    // The session that asked to link is kept -- no second session minted.
+    expect(cookieValue(linkRes, "lt_session")).toBeUndefined();
 
-    const identities = repo.userRepo.getIdentities(primaryUserId);
+    const identities = repo.userRepo.getIdentities(primary.userId);
     expect(identities.some((i) => i.providerUserId === "9004")).toBe(true);
     expect(identities).toHaveLength(1 + 1); // primary (9003) + newly linked (9004)
   });
 
   it("account linking rejects an identity that's already someone else's account", async () => {
-    // Account A owns identity 9005.
-    mockProfileBody = { id: 9005, login: "owner-a", avatar_url: null };
-    const aLogin = await startLogin();
-    await fetch(`${baseUrl}/auth/github/callback?code=a&state=${aLogin.state}`, {
-      redirect: "manual",
-      headers: { cookie: `oauth_state=${aLogin.stateCookie}` },
-    });
+    await loginAs(9005, "owner-a");
+    const b = await loginAs(9006, "owner-b");
 
-    // Account B tries to link that SAME identity (9005) to itself.
-    mockProfileBody = { id: 9006, login: "owner-b", avatar_url: null };
-    const bLogin = await startLogin();
-    const bRes = await fetch(`${baseUrl}/auth/github/callback?code=b&state=${bLogin.state}`, {
-      redirect: "manual",
-      headers: { cookie: `oauth_state=${bLogin.stateCookie}` },
-    });
-    const bToken = cookieValue(bRes, "lt_session")!;
-    const bUserId = repo.userRepo.getUser(repo.sessionRepo.getByTokenHash(hashToken(bToken))!.userId)!.id;
-
-    const linkStart = await startLogin({ cookie: `lt_session=${bToken}` }, "?link=1");
+    const linkStart = await startLogin({ cookie: `lt_session=${b.token}` }, "?link=1");
     mockProfileBody = { id: 9005, login: "owner-a-again", avatar_url: null }; // same id as account A
-    const linkRes = await fetch(`${baseUrl}/auth/github/callback?code=steal&state=${linkStart.state}`, {
-      redirect: "manual",
-      headers: { cookie: `oauth_state=${linkStart.stateCookie}; oauth_link_user=${linkStart.linkCookie}` },
-    });
+    const linkRes = await callback(linkStart, b.token);
     expect(linkRes.headers.get("location")).toBe("/settings?error=already_linked");
 
-    // Identity 9005 must still belong to account A, not B.
     const owner = repo.userRepo.findByIdentity("github", "9005");
-    expect(owner?.id).not.toBe(bUserId);
+    expect(owner?.id).not.toBe(b.userId);
+  });
+
+  // The reported takeover: an unsigned oauth_link_user cookie named the
+  // account to link to, so an attacker could attach their own identity to
+  // any user id and then log in as that user.
+  it("a forged oauth_link_user cookie (no session) is ignored -- plain login, victim untouched", async () => {
+    const victim = await loginAs(9010, "victim-1");
+    const s = await startLogin();
+    mockProfileBody = { id: 9011, login: "attacker-1", avatar_url: null };
+    const res = await fetch(`${baseUrl}/auth/github/callback?code=x&state=${s.state}`, {
+      redirect: "manual",
+      headers: { cookie: `oauth_state=${s.stateCookie}; oauth_link_user=${victim.userId}` },
+    });
+    expect(res.headers.get("location")).toBe("/");
+    expect(repo.userRepo.findByIdentity("github", "9011")?.id).not.toBe(victim.userId);
+    expect(repo.userRepo.getIdentities(victim.userId)).toHaveLength(1);
+  });
+
+  it("a forged oauth_link_user cookie alongside the attacker's own session links nothing to the victim", async () => {
+    const victim = await loginAs(9012, "victim-2");
+    const attacker = await loginAs(9013, "attacker-2");
+    const s = await startLogin({ cookie: `lt_session=${attacker.token}` }, "?link=1");
+    mockProfileBody = { id: 9014, login: "attacker-2-alt", avatar_url: null };
+    const res = await fetch(`${baseUrl}/auth/github/callback?code=x&state=${s.state}`, {
+      redirect: "manual",
+      headers: { cookie: `oauth_state=${s.stateCookie}; oauth_link_user=${victim.userId}; lt_session=${attacker.token}` },
+    });
+    expect(res.headers.get("location")).toBe("/settings?linked=1");
+    expect(repo.userRepo.findByIdentity("github", "9014")?.id).toBe(attacker.userId);
+    expect(repo.userRepo.getIdentities(victim.userId)).toHaveLength(1);
+  });
+
+  it("a link state completed in a DIFFERENT session (e.g. planted in a victim's browser) is rejected", async () => {
+    const attacker = await loginAs(9015, "attacker-3");
+    const victim = await loginAs(9016, "victim-3");
+    const s = await startLogin({ cookie: `lt_session=${attacker.token}` }, "?link=1");
+    mockProfileBody = { id: 9017, login: "attacker-3-alt", avatar_url: null };
+    const res = await callback(s, victim.token);
+    expect(res.headers.get("location")).toBe("/settings?error=link_session");
+    expect(repo.userRepo.findByIdentity("github", "9017")).toBeFalsy();
+    expect(repo.userRepo.getIdentities(victim.userId)).toHaveLength(1);
+  });
+
+  it("a link state completed with NO session fails closed -- never falls back to a plain login", async () => {
+    const owner = await loginAs(9018, "owner-4");
+    const s = await startLogin({ cookie: `lt_session=${owner.token}` }, "?link=1");
+    mockProfileBody = { id: 9019, login: "someone", avatar_url: null };
+    const res = await callback(s);
+    expect(res.headers.get("location")).toBe("/settings?error=link_session");
+    expect(cookieValue(res, "lt_session")).toBeUndefined();
+    expect(repo.userRepo.findByIdentity("github", "9019")).toBeFalsy();
+  });
+
+  it("a link state whose session was revoked in between is rejected", async () => {
+    const owner = await loginAs(9020, "owner-5");
+    const s = await startLogin({ cookie: `lt_session=${owner.token}` }, "?link=1");
+    await fetch(`${baseUrl}/auth/logout`, { redirect: "manual", headers: { cookie: `lt_session=${owner.token}` } });
+    mockProfileBody = { id: 9021, login: "late", avatar_url: null };
+    const res = await callback(s, owner.token);
+    // Revoking the session cascades the intent away, so this is just a login
+    // of identity 9021 as its own account -- never a link to owner's.
+    expect(res.headers.get("location")).toBe("/");
+    expect(repo.userRepo.findByIdentity("github", "9021")?.id).not.toBe(owner.userId);
+    expect(repo.userRepo.getIdentities(owner.userId)).toHaveLength(1);
+  });
+
+  it("a link state is single-use -- replaying it does not link a second identity", async () => {
+    const owner = await loginAs(9022, "owner-6");
+    const s = await startLogin({ cookie: `lt_session=${owner.token}` }, "?link=1");
+    mockProfileBody = { id: 9023, login: "first", avatar_url: null };
+    expect((await callback(s, owner.token)).headers.get("location")).toBe("/settings?linked=1");
+
+    mockProfileBody = { id: 9024, login: "replay", avatar_url: null };
+    const replay = await callback(s, owner.token);
+    // No intent left, so this is an ordinary login of a brand-new identity.
+    expect(replay.headers.get("location")).toBe("/");
+    expect(repo.userRepo.findByIdentity("github", "9024")?.id).not.toBe(owner.userId);
+    expect(repo.userRepo.getIdentities(owner.userId)).toHaveLength(2);
+  });
+
+  it("an expired link intent is ignored and pruned", async () => {
+    const owner = await loginAs(9025, "owner-7");
+    const s = await startLogin({ cookie: `lt_session=${owner.token}` }, "?link=1");
+    // Nothing else can age the row -- expire it directly.
+    const { getDb } = await import("../db/migrate.js");
+    getDb().prepare(`UPDATE oauth_link_intents SET expires_at = ?`).run(Date.now() - 1);
+    expect(repo.sessionRepo.pruneExpiredLinkIntents()).toBeGreaterThanOrEqual(1);
+    mockProfileBody = { id: 9026, login: "stale", avatar_url: null };
+    const res = await callback(s, owner.token);
+    expect(res.headers.get("location")).toBe("/");
+    expect(repo.userRepo.getIdentities(owner.userId)).toHaveLength(1);
   });
 });
 
@@ -303,6 +378,9 @@ describe("admin origin OAuth branch (§5.1)", () => {
       headers: { cookie: `lt_session=${adminSessionToken}`, "x-forwarded-host": ADMIN_HOST },
     });
     expect(cookieValue(res, "oauth_link_user")).toBeUndefined();
+    const { getDb } = await import("../db/migrate.js");
+    const state = new URL(res.headers.get("location")!).searchParams.get("state")!;
+    expect(getDb().prepare(`SELECT 1 FROM oauth_link_intents WHERE state_hash = ?`).get(hashToken(state))).toBeUndefined();
   });
 
   it("a superadmin-listed identity WITH an existing account gets a session and lands on the admin SPA's own root", async () => {
