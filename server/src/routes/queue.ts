@@ -3,7 +3,7 @@ import type { IncomingMessage } from "node:http";
 import { repo } from "../db/repo.js";
 import { queueEvents } from "../queue-events.js";
 import { authenticateWorker } from "../worker-auth.js";
-import { parseWorkerState, parseActiveJobReport, parseActiveDownloads } from "../validate-worker-state.js";
+import { parseWorkerState, parseActiveJobReport, parseActiveDownloads, parseMemorySpeedResult } from "../validate-worker-state.js";
 import { LEASE_MS } from "../liveness.js";
 import { NotFoundError } from "../errors.js";
 import { getHfGgufMeta } from "../hf.js";
@@ -322,6 +322,23 @@ export async function queueRoutes(app: FastifyInstance): Promise<void> {
       } else {
         repo.queueRepo.markJobCompleted(job.id);
       }
+      return { ok: true };
+    }
+  );
+
+  // Workers page "Measure memory speed" result (worker/src/memSpeed.ts) --
+  // posted once after a measure_memory_speed job finishes, separately from
+  // that job's own POST .../complete above: this is cached state on the
+  // workers row (repo.ts's setMemSpeedResult), not job bookkeeping, so it
+  // gets its own call rather than riding the completion report's small
+  // {ok,error} body.
+  app.post(
+    "/api/worker/mem-speed",
+    { bodyLimit: 50_000 },
+    async (req) => {
+      const worker = await authenticateWorker(req);
+      const result = parseMemorySpeedResult(req.body);
+      repo.workerRepo.setMemSpeedResult(worker.id, result);
       return { ok: true };
     }
   );

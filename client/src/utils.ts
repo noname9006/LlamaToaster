@@ -1,4 +1,14 @@
 import type { Model } from "./types";
+import { isSharedMemoryGpu } from "./types";
+
+type GpuEntry = {
+  model: string;
+  vendor: string;
+  vram_mb?: number | null;
+  vram_dynamic?: boolean;
+  vram_usable_mb?: number | null;
+  vram_listed_total_mb?: number | null;
+};
 
 // One-time carry-over for browser storage keys written under this app's old
 // "llama-bench:" name (pre-rename to LlamaToaster) so existing users don't
@@ -35,19 +45,30 @@ export function formatBytes(bytes: number): string {
   return `${n.toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
 }
 
-// "model (4 GB)" / "model (1 GB shared)" for a HardwareInfo.gpu entry.
-// vram_dynamic (see shared/types.ts's HardwareInfo) means shared/unified
-// memory, typically an iGPU -- labeled "shared" rather than presented with
-// the same confidence as a discrete GPU's fixed VRAM pool, since the
-// reported number there is an estimate/allocation, not a dedicated
-// capacity. Falls back to just the model name when vram_mb is
-// null/undefined (driver didn't report it, or this is from a worker running
-// old code that predates the field).
-export function formatGpuLabel(g: { model: string; vendor: string; vram_mb?: number | null; vram_dynamic?: boolean }): string {
+// One GPU's VRAM as "7.2 / 8.0 GB" (max usable / total), or just "8.0 GB" when
+// only the total is known. Null for a GPU that has no memory of its own to
+// quote: an integrated GPU or unified-memory machine borrows system RAM (which
+// is already shown as RAM), and a driver that reported nothing gives us no
+// number. "Max usable" is llama.cpp's --list-devices free figure (see
+// shared/types.ts's HardwareInfo.gpu); the total prefers llama.cpp's own
+// listing over systeminformation's, since that is what a load is checked
+// against.
+export function formatGpuVram(g: GpuEntry, unifiedMemory?: boolean): string | null {
+  if (isSharedMemoryGpu(g, unifiedMemory)) return null;
+  const totalMib = g.vram_listed_total_mb ?? g.vram_mb ?? null;
+  if (totalMib == null) return null;
+  const gb = (mib: number) => (mib / 1024).toFixed(1);
+  if (g.vram_usable_mb == null) return `${gb(totalMib)} GB`;
+  return `${gb(Math.min(g.vram_usable_mb, totalMib))} / ${gb(totalMib)} GB`;
+}
+
+// "model (7.2 / 8.0 GB)" for a HardwareInfo.gpu entry -- plain-text form for
+// places that can't render the hover explanation (a <select> option). The bare
+// model name when there is no VRAM figure to give (see formatGpuVram).
+export function formatGpuLabel(g: GpuEntry, unifiedMemory?: boolean): string {
   const name = g.model || g.vendor || "unknown";
-  if (g.vram_mb == null) return name;
-  const vram = formatBytes(g.vram_mb * 1024 * 1024);
-  return `${name} (${vram}${g.vram_dynamic ? " shared" : ""})`;
+  const vram = formatGpuVram(g, unifiedMemory);
+  return vram ? `${name} (${vram})` : name;
 }
 
 export function formatDate(ms: number): string {

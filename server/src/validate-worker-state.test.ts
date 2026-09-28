@@ -23,6 +23,31 @@ function validBody(overrides: Record<string, unknown> = {}) {
 }
 
 describe("parseWorkerState", () => {
+  it("passes through the OS, RAM type, unified flag and per-GPU usable/total VRAM", () => {
+    const body = validBody();
+    const hw = body.hardware as Record<string, unknown>;
+    const state = parseWorkerState({
+      ...body,
+      hardware: {
+        ...hw,
+        gpu: [{ vendor: "NVIDIA", model: "RTX 4090", vram_mb: 24576, vram_usable_mb: 22000, vram_listed_total_mb: 24564 }],
+        os: { family: "Windows", name: "Windows 10 Pro N (10.0.19045)" },
+        mem_type: "DDR4-3200",
+        unified_memory: false,
+      },
+    });
+    expect(state.hardware.gpu[0]).toMatchObject({ vram_usable_mb: 22000, vram_listed_total_mb: 24564 });
+    expect(state.hardware.os).toEqual({ family: "Windows", name: "Windows 10 Pro N (10.0.19045)" });
+    expect(state.hardware.mem_type).toBe("DDR4-3200");
+    expect(state.hardware.unified_memory).toBe(false);
+  });
+
+  it("accepts a body from an older worker without the new fields", () => {
+    const state = parseWorkerState(validBody());
+    expect(state.hardware.os).toBeUndefined();
+    expect(state.hardware.gpu[0]?.vram_usable_mb).toBeNull();
+  });
+
   it("accepts a well-formed body and passes values through", () => {
     const state = parseWorkerState(validBody());
     expect(state.machine_id).toBe("machine-1");

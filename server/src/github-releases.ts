@@ -202,6 +202,15 @@ export function assetMatchesWorker(
   arch: string,
   backend: Backend
 ): boolean {
+  if (!matchesPlatformAndArch(assetName, platform, arch)) return false;
+  const name = assetName.toLowerCase();
+  if (backend === "cpu") {
+    return !KNOWN_NON_CPU_ASSET_TOKENS.some((t) => name.includes(t));
+  }
+  return name.includes(backendToken(backend));
+}
+
+function matchesPlatformAndArch(assetName: string, platform: string, arch: string): boolean {
   const name = assetName.toLowerCase();
   const platformOk =
     platform === "win32"
@@ -219,11 +228,7 @@ export function assetMatchesWorker(
   // penalized for it.
   if (name.includes("arm64") && arch !== "arm64") return false;
   if (name.includes("x64") && arch !== "x64") return false;
-
-  if (backend === "cpu") {
-    return !KNOWN_NON_CPU_ASSET_TOKENS.some((t) => name.includes(t));
-  }
-  return name.includes(backendToken(backend));
+  return true;
 }
 
 export function filterReleasesForWorker(
@@ -240,6 +245,47 @@ export function filterReleasesForWorker(
       driverCudaVersion
     ),
   }));
+}
+
+// The "not recommended" complement of filterReleasesForWorker: assets that fit
+// this machine's OS + arch but NOT its backend (e.g. a Vulkan/CPU zip on a
+// CUDA box). Offered behind an explicit "other builds" disclosure so the user
+// can still install one on purpose (comparing backends, working around a bad
+// driver) without it competing with the recommended list. Releases arrive
+// newest-first and every release repeats every variant, so only the newest
+// release carrying each variant is kept -- otherwise this would be ~15 rows
+// per variant.
+export function filterOtherBuildsForWorker(
+  releases: LlamaCppRelease[],
+  platform: string,
+  arch: string,
+  backend: Backend
+): LlamaCppRelease[] {
+  const seenVariants = new Set<string>();
+  const out: LlamaCppRelease[] = [];
+  for (const r of releases) {
+    const assets = r.assets.filter((a) => {
+      if (assetMatchesWorker(a.name, platform, arch, backend)) return false;
+      if (!matchesPlatformAndArch(a.name, platform, arch)) return false;
+      const variant = assetBinSuffix(a.name) ?? a.name;
+      if (seenVariants.has(variant)) return false;
+      seenVariants.add(variant);
+      return true;
+    });
+    if (assets.length === 0) continue;
+    const cudart: Record<string, LlamaCppAsset> = {};
+    for (const a of assets) {
+      const c = r.cudart_assets?.[a.name];
+      if (c) cudart[a.name] = c;
+    }
+    out.push({
+      tag: r.tag,
+      published_at: r.published_at,
+      assets,
+      ...(Object.keys(cudart).length > 0 ? { cudart_assets: cudart } : {}),
+    });
+  }
+  return out;
 }
 
 // The single place an installable asset becomes an install_build job payload,

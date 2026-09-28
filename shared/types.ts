@@ -8,6 +8,8 @@ export const WORKER_INACCESSIBLE_MESSAGE = "worker is inaccessible";
 import type { EngineKind } from "./engineSpec.js";
 import type { TensorLayerBreakdown } from "./vramEstimate.js";
 import type { ProbeGranularity, ProbeMode } from "./probeLadder.js";
+import { isRocmSupportedGpu, gpuNameInList, COMMUNITY_ROCM_GPUS, type RocmSupportList } from "./rocmSupport.js";
+export type { RocmSupportList, RocmSupportSnapshot } from "./rocmSupport.js";
 
 // Well-known values used for auto-detection's own guess (see
 // worker/src/hardware.ts's detectBackend) and as UI suggestions -- NOT an
@@ -26,32 +28,6 @@ export const KNOWN_BACKENDS = [
 ] as const;
 
 export type Backend = string;
-
-// Manually-maintained snapshot of AMD GPU model tokens ROCm officially
-// supports, checked live against AMD's own docs this session (Aug 2026):
-// rocm.docs.amd.com's Windows "system requirements" page (HIP SDK 7.2) and
-// Linux "compatibility matrix" (ROCm 7.0) -- these two lists actually differ
-// (ROCm-on-Windows supports a narrower set than Linux), but this app doesn't
-// know a worker's exact driver/ROCm version, so the two are merged into one
-// permissive union rather than trying to be precise per-platform. This WILL
-// go stale as AMD updates support -- re-check those two pages if a "should
-// this default to rocm" question comes up for a model not listed here.
-const ROCM_SUPPORTED_AMD_GPU_MARKERS = [
-  // RDNA3 / RDNA4 consumer (Radeon RX)
-  "7600", "7650 gre", "7700 xt", "7800 xt", "7900 xt", "7900 xtx",
-  "9060", "9070",
-  // Radeon PRO / workstation
-  "w6800", "w7700", "w7800", "w7900", "v620", "v710", "r9700", "r9600",
-  // Instinct (data center)
-  "mi100", "mi200", "mi300", "mi325x", "mi350x", "mi355x",
-  // Ryzen AI Max APUs
-  "ryzen ai max",
-];
-
-function isRocmSupportedAmdGpu(model: string): boolean {
-  const lower = model.toLowerCase();
-  return ROCM_SUPPORTED_AMD_GPU_MARKERS.some((marker) => lower.includes(marker));
-}
 
 // Best-effort default when a worker's config.json doesn't pin a `backend`.
 // Only a guess -- an explicit value in config.json always overrides this,
@@ -76,10 +52,12 @@ function isRocmSupportedAmdGpu(model: string): boolean {
 // -- note current ubuntu releases ship no cuda asset at all, so this guess
 // can come up empty on a Linux+NVIDIA worker specifically until upstream
 // adds one back). AMD gets `rocm` only when the specific detected model is
-// one ROCm actually supports (see isRocmSupportedAmdGpu above); otherwise
-// `vulkan`, same as any other detected GPU (Intel, unrecognized AMD, ...) --
-// the broadest cross-vendor option that reliably works. No GPU at all falls
-// back to `cpu`.
+// one ROCm actually supports (see shared/rocmSupport.ts -- checked per
+// platform against AMD's own support tables, which the server re-fetches daily
+// and callers pass in as `rocmSupport`; omitted, a built-in snapshot is used);
+// otherwise `vulkan`, same as any other detected GPU (Intel, unrecognized
+// AMD, ...) -- the broadest cross-vendor option that reliably works. No GPU
+// at all falls back to `cpu`.
 //
 // Originally worker-only (worker/src/hardware.ts, still re-exported from
 // there for that file's own callers) -- moved here so client/src/pages/
@@ -88,14 +66,36 @@ function isRocmSupportedAmdGpu(model: string): boolean {
 // inverse operation (given a backend, which already-detected GPUs can it
 // see) and shared/types.ts's own TriggerPayload.main_gpu_backend for how a
 // mismatch between the two gets resolved into an install+run override.
-export function detectBackend(platform: string, gpu: { vendor: string; model: string }[]): Backend {
+export function detectBackend(
+  platform: string,
+  gpu: { vendor: string; model: string }[],
+  rocmSupport?: RocmSupportList
+): Backend {
   if (platform === "darwin") return "cpu";
   const text = gpu.map((g) => `${g.vendor} ${g.model}`.toLowerCase()).join(" ");
   if (text.includes("nvidia")) return "cuda";
   const amdGpu = gpu.find((g) => /amd|advanced micro devices/i.test(g.vendor));
-  if (amdGpu && isRocmSupportedAmdGpu(amdGpu.model)) return "rocm";
+  if (amdGpu && isRocmSupportedGpu(amdGpu.model, platform, rocmSupport)) return "rocm";
   if (gpu.length > 0) return "vulkan";
   return "cpu";
+}
+
+// A llama.cpp release asset that is a ROCm/HIP build ("...-win-rocm-7.14-x64.zip",
+// "...-bin-win-hip-radeon-x64.zip", older "hipblas" naming). Token-matched so a
+// stray "hip" inside another word can't trip it.
+export function isRocmAssetName(assetName: string): boolean {
+  return /(?:^|[-_.])(?:rocm|hip|hipblas)(?:[-_.]|$)/i.test(assetName);
+}
+
+// The first AMD GPU on a machine that is on the curated "not officially
+// supported, community reports ROCm works" list for its platform
+// (COMMUNITY_ROCM_GPUS) -- what the notice on the Workers page names. Only
+// those cards; any other AMD GPU (or a platform with no ROCm builds, i.e.
+// macOS) gets no notice.
+export function findCommunityRocmGpu<T extends { vendor: string; model: string }>(gpu: T[], platform: string): T | null {
+  if (platform !== "win32" && platform !== "linux") return null;
+  const markers = COMMUNITY_ROCM_GPUS[platform];
+  return gpu.find((g) => /amd|advanced micro devices/i.test(g.vendor) && gpuNameInList(g.model, markers)) ?? null;
 }
 
 // How a GPU memory figure was obtained, and how much to trust it -- see
@@ -139,6 +139,9 @@ export type SensorMeasurementSource = (typeof SENSOR_MEASUREMENT_SOURCES)[number
 // "fill-curve-v1" is the Benchmark chain's sweep stage measuring prefill speed
 // along one context's fill (see shared/fillCurve.ts) -- an older worker would
 // run that stage's sweep as ordinary llama-bench items instead.
+// "mem-speed-v1" is the Workers-page "Measure memory speed" button (see
+// worker/src/memSpeed.ts) -- an older worker has no measure_memory_speed
+// handler, so the button is hidden rather than queuing a job that just fails.
 export const WORKER_CAPABILITIES = [
   "benchmark",
   "probe-v1",
@@ -146,6 +149,7 @@ export const WORKER_CAPABILITIES = [
   "curve-v1",
   "probe-frontier-v1",
   "fill-curve-v1",
+  "mem-speed-v1",
 ] as const;
 export type WorkerCapability = (typeof WORKER_CAPABILITIES)[number];
 
@@ -1268,7 +1272,35 @@ export interface HardwareInfo {
   // vram_mb/vram_dynamic -- see worker/src/hardware.ts's detectHardware
   // (si.graphics().controllers[].vram/vramDynamic) for what these mean.
   // Optional for the same cross-version reason as mem_total_bytes below.
-  gpu: { vendor: string; model: string; vram_mb?: number | null; vram_dynamic?: boolean }[];
+  //
+  // vram_usable_mb / vram_listed_total_mb come from llama.cpp's own
+  // `--list-devices` (worker/src/binary-probe.ts), matched to this entry by
+  // device description: "max usable VRAM" = what that device reports FREE
+  // (after the OS/desktop/other apps took their share), and the listed total
+  // is the same device's total as llama.cpp sees it (preferred over vram_mb
+  // when present -- it is the number a load is actually checked against).
+  // Both absent when no build is installed / lists devices / no device
+  // matched this GPU, and for shared-memory GPUs (vram_dynamic).
+  gpu: {
+    vendor: string;
+    model: string;
+    vram_mb?: number | null;
+    vram_dynamic?: boolean;
+    vram_usable_mb?: number | null;
+    vram_listed_total_mb?: number | null;
+  }[];
+  // Operating system as a person would name it: `family` is "Windows" /
+  // "macOS" / "Linux" (or the raw platform string when unrecognised), `name`
+  // the exact edition/version, e.g. "Windows 10 Pro N (10.0.19045)" or
+  // "Ubuntu 22.04". Optional -- older workers only report `platform`.
+  os?: { family: string; name: string } | null;
+  // System RAM type + speed when the platform reports it, e.g. "DDR4-3200".
+  // Null/absent when unknown (common on Linux without root, VMs).
+  mem_type?: string | null;
+  // True when the CPU and GPU share one memory pool (Apple Silicon, typically)
+  // -- the client then shows "unified memory" rather than a RAM type and no
+  // separate VRAM figure.
+  unified_memory?: boolean;
   // Total system RAM in bytes (on Apple Silicon, total *unified* memory --
   // shared with the GPU, not a separate pool) -- see worker/src/hardware.ts's
   // detectHardware, si.mem().total. Optional so a worker process still
@@ -1395,6 +1427,25 @@ export function backendVisibleGpus<T extends { vendor: string; model: string }>(
   return filtered.length > 0 ? filtered : gpu;
 }
 
+// True when a GPU has no memory of its own -- an integrated GPU (or Apple
+// Silicon's unified pool) whose "VRAM" is carved out of system RAM, so quoting
+// a VRAM size next to it would double-count RAM and mislead. Decided from
+// what the worker reported (vram_dynamic, unified_memory) plus the adapter
+// name, since systeminformation's vram figure for an iGPU is only the small
+// fixed BIOS carve-out (e.g. 512 MB on a Ryzen APU) or nothing at all, and its
+// dynamic flag isn't reliable on every OS. Discrete cards -- including Intel
+// Arc -- never match the name patterns.
+const INTEGRATED_GPU_NAME_RE =
+  /\b(?:uhd|hd)\s+graphics\b|\biris\b|\bxe\s+graphics\b|\bintel\(r\)\s+graphics\b|\bradeon(?:\(tm\))?\s+graphics\b|\bradeon\s+(?:vega\s+)?\d+\s*m\b|\bvega\s+\d+\s+graphics\b|\bapple\s+m\d/i;
+
+export function isSharedMemoryGpu(
+  g: { vendor?: string; model?: string; vram_dynamic?: boolean },
+  unifiedMemory?: boolean
+): boolean {
+  if (unifiedMemory || g.vram_dynamic === true) return true;
+  return INTEGRATED_GPU_NAME_RE.test(`${g.vendor ?? ""} ${g.model ?? ""}`);
+}
+
 // Cached free-VRAM reading -- worker/src/index.ts's collectState() computes
 // this on every heartbeat/queue poll while idle (skipped while busy: not
 // meaningful for pre-flight fit-checking, and avoids a second concurrent
@@ -1419,6 +1470,50 @@ export interface WorkerVramInfo {
   gpu_memory_total_mib: number | null;
   gpu_memory_total_accuracy: GpuMemoryAccuracyLevel;
   gpu_memory_total_source: GpuMemoryMeasurementSource | null;
+}
+
+// One thread-count row of the RAM sweep below -- read/write/copy are each
+// the best of several timed trials at that thread count (see
+// worker/src/memSpeed.ts), not a single sample.
+export interface MemorySpeedThreadPoint {
+  threads: number;
+  readGBs: number;
+  writeGBs: number;
+  // Counts bytes read + bytes written (the two halves of a copy), like
+  // llama.cpp's own convention for reporting a memcpy-shaped op -- so this
+  // number is NOT directly comparable to readGBs/writeGBs above, which each
+  // count only their own single direction.
+  copyGBs: number;
+}
+
+// Result of a worker's on-demand raw memory-bandwidth measurement (Workers
+// page "Measure memory speed" button) -- distinct from the benchmark-derived
+// tok/s numbers elsewhere in this app: this is the hardware ceiling (how
+// fast RAM/VRAM can move bytes), not any particular model's achieved speed.
+// Cached on the workers row (Worker.memSpeed) until the button is clicked
+// again; never sampled automatically.
+export interface MemorySpeedResult {
+  measuredAt: number;
+  ram: {
+    // From systeminformation's si.cpu() (worker/src/hardware.ts already
+    // uses the same library) -- null when the platform doesn't report a
+    // physical-core count distinct from logical (rare; logicalCores always
+    // reflects the real thread ceiling either way).
+    physicalCores: number | null;
+    logicalCores: number;
+    points: MemorySpeedThreadPoint[];
+  };
+  vram: {
+    deviceName: string;
+    globalMemMiB: number;
+    readGBs: number;
+    writeGBs: number;
+    copyGBs: number;
+  } | null;
+  // Set whenever vram above is null -- e.g. no GPU, no OpenCL runtime on
+  // this platform/backend, or the measurement itself failed -- so the UI can
+  // say why instead of just omitting the VRAM table silently.
+  vramUnavailableReason?: string;
 }
 
 // --- Hugging Face model search ---
@@ -1532,6 +1627,12 @@ export interface Worker {
   // the worker's first idle heartbeat, or if it's currently busy (not
   // recomputed while running a benchmark).
   vram: WorkerVramInfo | null;
+  // Result of the last "Measure memory speed" run (Workers page button) --
+  // see MemorySpeedResult below. Cached indefinitely (unlike vram above,
+  // which is refreshed every idle heartbeat): this is an on-demand,
+  // several-second measurement, not something to re-run automatically. Null
+  // until the button has been clicked at least once on this machine.
+  memSpeed?: MemorySpeedResult | null;
   // M6 -- sensor availability declared up front.
   sensors?: { clock: boolean; temp: boolean; source: SensorMeasurementSource | null } | null;
   // N6 -- llama.cpp startup-banner ISA provenance.
@@ -1995,7 +2096,13 @@ export type QueueJob =
   // running instead of yanking the process mid-benchmark.
   | { job_id: string; type: "shutdown_worker"; payload: Record<string, never> }
   | { job_id: string; type: "run_probe"; payload: TestProbeJobPayload }
-  | { job_id: string; type: "measure_quality"; payload: MeasureQualityJobPayload };
+  | { job_id: string; type: "measure_quality"; payload: MeasureQualityJobPayload }
+  // Workers page "Measure memory speed" button -- no payload, just a signal.
+  // Result is POSTed back separately (POST /api/worker/mem-speed, see
+  // shared/types.ts's MemorySpeedResult) rather than riding this job's
+  // completion report, so it's cached on the workers row like `vram` instead
+  // of living only in transient job-progress state.
+  | { job_id: string; type: "measure_memory_speed"; payload: Record<string, never> };
 
 // --- Multi-user Stage 2: auth (MULTIUSER_PLAN.md §2) ---
 

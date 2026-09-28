@@ -107,6 +107,13 @@ generating and persisting the session credentials.
   card showing hostname/GPU/platform, a warning line, and per-user rate
   limiting on the approve endpoint — the blast radius is mis-attributed
   compute, not exposed secrets or data.
+- **Outbound: AMD's docs, once a day.** The server re-reads the ROCm support
+  tables on rocm.docs.amd.com (Windows HIP SDK + Linux ROCm system
+  requirements) to decide which AMD GPUs get the `rocm` backend by default.
+  It is a plain read-only page fetch, a refresh that fails or looks malformed
+  is discarded (the previous list stays), and `ROCM_SUPPORT_REFRESH=false`
+  turns it off for hosts with no outbound access. The result is public at
+  `GET /api/rocm-support` (a worker reads it before it has a credential).
 - **The AI assistant's system prompt is server-owned** — a client-supplied
   `system` message is discarded outright, so `curl`ing the chat endpoint
   directly can't override its instructions or its per-user data scoping.

@@ -39,6 +39,7 @@ import { IconArrowRight, IconChevronDown, IconInfo } from "../components/icons";
 import { backendVisibleGpus } from "../types";
 import type { Model, Test, TestItem, ResultRow, TestKind, SweepConfig } from "../types";
 import { formatBytes, formatGpuLabel } from "../utils";
+import { HardwareSummary } from "../components/HardwareSummary";
 import { estimateSafeNgl, estimateVramNeededMib, maxAffordableContext } from "../vramEstimate";
 import {
   defaultGoals,
@@ -1429,7 +1430,7 @@ export function Benchmark() {
                       <option value="">Auto (split across all GPUs)</option>
                       {visibleGpus.map((g, i) => (
                         <option key={i} value={i}>
-                          {i}: {formatGpuLabel(g)}
+                          {i}: {formatGpuLabel(g, workerHardware?.unified_memory)}
                         </option>
                       ))}
                     </select>
@@ -1447,28 +1448,31 @@ export function Benchmark() {
             </div>
 
             {selectedModel && selectedWorker ? (
-              <div className="flex flex-wrap items-center gap-x-2 gap-y-1.5 rounded-lg border border-border bg-surface-raised px-3.5 py-2.5 text-[11.5px] text-muted">
-                <span className="font-mono text-fg">{formatBytes(selectedModel.size_bytes)}</span>
-                <span aria-hidden="true">·</span>
-                <span>{modelLayerCount != null ? `${modelLayerCount} layers` : "layers not read"}</span>
-                <span aria-hidden="true">·</span>
-                <span>{trainedCtx != null ? `${trainedCtx.toLocaleString()} ctx` : "ctx not read"}</span>
-                <span className="mx-1 hidden h-4 w-px self-stretch bg-border sm:block" aria-hidden="true" />
-                <span>{gpuList.length > 0 ? gpuList.map((g) => formatGpuLabel(g)).join(" · ") : "no GPU detected"}</span>
-                <span aria-hidden="true">·</span>
-                <span>{selectedWorker.backend ?? "unknown"}</span>
-                <span aria-hidden="true">·</span>
-                <span className={workerStatusTone(selectedWorker.status)}>{selectedWorker.status}</span>
-                <button
-                  type="button"
-                  onClick={() => setDetailsOpen((open) => !open)}
-                  aria-expanded={detailsOpen}
-                  className="ml-auto flex items-center gap-1 whitespace-nowrap text-[11.5px] font-semibold text-accent"
-                >
-                  {detailsOpen ? "Hide details" : "Show details"}
-                  <IconChevronDown width={13} height={13} className={`transition-transform ${detailsOpen ? "rotate-180" : ""}`} />
-                </button>
-              </div>
+              <>
+                <div className="flex flex-wrap items-center gap-x-2 gap-y-1.5 rounded-lg border border-border bg-surface-raised px-3.5 py-2.5 text-[11.5px] text-muted">
+                  <span className="font-mono text-fg">{formatBytes(selectedModel.size_bytes)}</span>
+                  <span aria-hidden="true">·</span>
+                  <span>{modelLayerCount != null ? `${modelLayerCount} layers` : "layers not read"}</span>
+                  <span aria-hidden="true">·</span>
+                  <span>{trainedCtx != null ? `${trainedCtx.toLocaleString()} ctx` : "ctx not read"}</span>
+                  <span className="mx-1 hidden h-4 w-px self-stretch bg-border sm:block" aria-hidden="true" />
+                  <span>{selectedWorker.backend ?? "unknown"}</span>
+                  <span aria-hidden="true">·</span>
+                  <span className={workerStatusTone(selectedWorker.status)}>{selectedWorker.status}</span>
+                  <button
+                    type="button"
+                    onClick={() => setDetailsOpen((open) => !open)}
+                    aria-expanded={detailsOpen}
+                    className="ml-auto flex items-center gap-1 whitespace-nowrap text-[11.5px] font-semibold text-accent"
+                  >
+                    {detailsOpen ? "Hide details" : "Show details"}
+                    <IconChevronDown width={13} height={13} className={`transition-transform ${detailsOpen ? "rotate-180" : ""}`} />
+                  </button>
+                </div>
+                <div className="rounded-lg border border-border bg-surface-raised px-3.5 py-2.5 text-[12.5px]">
+                  <HardwareSummary hardware={workerHardware} platform={selectedWorker.platform} layout="lines" />
+                </div>
+              </>
             ) : (
               <p className="text-sm text-muted">Pick a machine and a model to see what their headers actually reported.</p>
             )}
@@ -1482,10 +1486,6 @@ export function Benchmark() {
                   <div className="rounded-lg border border-border bg-surface-raised p-3.5">
                     <span className="text-[11px] font-semibold uppercase tracking-wide text-muted">Machine</span>
                     <dl className="mt-2 flex flex-col gap-1.5 text-[12.5px]">
-                      <Kv
-                        label="GPU"
-                        value={gpuList.length > 0 ? gpuList.map((g) => formatGpuLabel(g)).join(" · ") : "none detected"}
-                      />
                       <Kv
                         label="Backend · build"
                         value={`${selectedWorker.backend ?? "unknown"} · ${activeBuild ?? "no build activated"}`}
@@ -2085,7 +2085,7 @@ function Step({
   );
 }
 
-function Kv({ label, value, read, hint }: { label: string; value: string; read?: boolean; hint?: string }) {
+function Kv({ label, value, read, hint }: { label: string; value: ReactNode; read?: boolean; hint?: string }) {
   return (
     <div className="flex items-baseline justify-between gap-3" title={hint}>
       <dt className="shrink-0 text-muted">{label}</dt>

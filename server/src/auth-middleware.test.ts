@@ -63,6 +63,8 @@ describe("PUBLIC_PATHS", () => {
   it("lists exactly the routes the plan names as reachable with no session", () => {
     expect(PUBLIC_PATHS.has("/health")).toBe(true);
     expect(PUBLIC_PATHS.has("/api/auth/status")).toBe(true);
+    // A worker reads this at startup, before it holds any credential.
+    expect(PUBLIC_PATHS.has("/api/rocm-support")).toBe(true);
     expect(PUBLIC_PATHS.has("/api/protected")).toBe(false);
   });
 });

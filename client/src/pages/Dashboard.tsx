@@ -7,7 +7,8 @@ import { TokSpeedDemo } from "../components/TokSpeedDemo";
 import { platformLabel } from "../components/WorkerCard";
 import { IconX } from "../components/icons";
 import type { AdminStats, Test, Worker } from "../types";
-import { shortId, formatGpuLabel, formatBytes } from "../utils";
+import { shortId } from "../utils";
+import { HardwareSummary } from "../components/HardwareSummary";
 
 // Multi-user Stage 5 (MULTIUSER_PLAN.md §5.2) originally made this page
 // "machines, not users": every stat card except "Users" derived from the
@@ -76,14 +77,6 @@ function MachineCard({
   onHide: () => void;
   onUnhide: () => void;
 }) {
-  const gpu = worker.hardware?.gpu[0];
-  const osLabel = platformLabel(worker.platform);
-  const hardwareBits = [
-    worker.hardware?.cpu.brand || worker.hardware?.cpu.manufacturer,
-    worker.hardware?.mem_total_bytes ? formatBytes(worker.hardware.mem_total_bytes) : null,
-    gpu ? formatGpuLabel(gpu) : worker.hardware ? "no GPU" : null,
-  ].filter(Boolean);
-
   return (
     <div
       role="button"
@@ -128,9 +121,18 @@ function MachineCard({
           )}
         </span>
       </div>
-      <div className="truncate text-xs text-muted">
-        {osLabel}
-        {hardwareBits.length ? ` · ${hardwareBits.join(" · ")}` : ""}
+      <div className="text-xs text-muted">
+        {/* One row per piece, every GPU with max usable / total VRAM -- see HardwareSummary. */}
+        {worker.hardware ? (
+          <HardwareSummary
+            hardware={worker.hardware}
+            platform={worker.platform}
+            layout="lines"
+            className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-0.5 text-xs"
+          />
+        ) : (
+          platformLabel(worker.platform)
+        )}
       </div>
       <div className="mt-1 flex items-center gap-4 text-xs">
         <span className="text-fg">

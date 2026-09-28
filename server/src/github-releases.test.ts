@@ -120,3 +120,41 @@ describe("filterReleasesForWorker driver-aware ordering", () => {
     expect(vulkan.map((a) => a.name)).toEqual(["llama-b10612-bin-win-vulkan-x64.zip"]);
   });
 });
+
+describe("filterOtherBuildsForWorker", () => {
+  const a = (name: string) => ({ name, download_url: `https://x/${name}`, size_bytes: 1 });
+  const newer = {
+    tag: "b2",
+    published_at: "2026-08-21T00:00:00Z",
+    assets: [
+      a("llama-b2-bin-win-cpu-x64.zip"),
+      a("llama-b2-bin-win-cuda-12.4-x64.zip"),
+      a("llama-b2-bin-win-vulkan-x64.zip"),
+      a("llama-b2-bin-ubuntu-x64.tar.gz"),
+      a("llama-b2-bin-win-cpu-arm64.zip"),
+    ],
+    cudart_assets: { "llama-b2-bin-win-cuda-12.4-x64.zip": a("cudart-llama-bin-win-cuda-12.4-x64.zip") },
+  };
+  const older = {
+    tag: "b1",
+    published_at: "2026-08-20T00:00:00Z",
+    assets: [a("llama-b1-bin-win-vulkan-x64.zip"), a("llama-b1-bin-win-sycl-x64.zip")],
+  };
+
+  it("returns same-OS/arch builds of other backends, newest release per variant only", async () => {
+    const { filterOtherBuildsForWorker } = await import("./github-releases.js");
+    const other = filterOtherBuildsForWorker([newer, older], "win32", "x64", "cuda");
+    const rows = other.flatMap((r) => r.assets.map((x) => x.name));
+    // cuda (the worker's own backend), linux and arm64 are excluded; the older
+    // vulkan zip is a duplicate variant of the newer one and is dropped.
+    expect(rows).toEqual(["llama-b2-bin-win-cpu-x64.zip", "llama-b2-bin-win-vulkan-x64.zip", "llama-b1-bin-win-sycl-x64.zip"]);
+  });
+
+  it("carries cudart pairings for CUDA builds offered on a non-CUDA worker", async () => {
+    const { filterOtherBuildsForWorker } = await import("./github-releases.js");
+    const other = filterOtherBuildsForWorker([newer], "win32", "x64", "vulkan");
+    expect(other[0]!.cudart_assets?.["llama-b2-bin-win-cuda-12.4-x64.zip"]?.name).toBe(
+      "cudart-llama-bin-win-cuda-12.4-x64.zip"
+    );
+  });
+});

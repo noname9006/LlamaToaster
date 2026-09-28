@@ -21,12 +21,14 @@ import { sessionRoutes } from "./routes/sessions.js";
 import { deviceRoutes, deviceApprovalRoutes } from "./routes/device.js";
 import { adminRoutes } from "./routes/admin.js";
 import { statsRoutes } from "./routes/stats.js";
+import { rocmSupportRoutes } from "./routes/rocm-support.js";
 import { installRoutes } from "./routes/install.js";
 import { getDb } from "./db/migrate.js";
 import { runMaintenanceSweep, REAP_INTERVAL_MS } from "./reaper.js";
 import { authMiddleware } from "./auth-middleware.js";
 import { startHfIndexService, stopHfIndexService } from "./hf-index.js";
 import { startHfHeaderService, stopHfHeaderService } from "./hf-header.js";
+import { startRocmSupportService, stopRocmSupportService } from "./rocm-support.js";
 
 // Backs the AI assistant's server-side config only (AI_API_KEY/AI_BASE_URL/
 // AI_MODEL, see routes/ai.ts) -- every other env var here (PORT,
@@ -139,6 +141,8 @@ app.register(workersRoutes);
 app.register(aiRoutes);
 app.register(queueRoutes);
 app.register(statsRoutes);
+// AMD ROCm GPU-support list -- public, see routes/rocm-support.ts.
+app.register(rocmSupportRoutes);
 // The short /install.ps1 + /install.sh entry points a fresh worker machine
 // is told to run -- redirects to the bootstrap scripts in the public repo.
 app.register(installRoutes);
@@ -233,11 +237,14 @@ startHfIndexService();
 // Reads catalog files' GGUF headers from Hugging Face in the background --
 // see server/src/hf-header.ts.
 startHfHeaderService();
+// Re-reads AMD's ROCm support tables once a day -- see server/src/rocm-support.ts.
+startRocmSupportService();
 
 app.addHook("onClose", async () => {
   clearInterval(reapInterval);
   stopHfIndexService();
   stopHfHeaderService();
+  stopRocmSupportService();
 });
 
 // Public (MULTIUSER_PLAN.md §6.2): a bare {ok, db} only -- this used to also

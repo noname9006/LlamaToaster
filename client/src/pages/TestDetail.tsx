@@ -25,6 +25,7 @@ import {
 import { Chart } from "../components/Chart";
 import { Th, toggleSort, type SortState } from "../components/Th";
 import { Tooltip } from "../components/Tooltip";
+import { HardwareSummary } from "../components/HardwareSummary";
 import { IconInfo } from "../components/icons";
 import type {
   Test,
@@ -1045,8 +1046,13 @@ export function TestDetail() {
         <div className="mt-2 flex flex-col gap-1 text-sm text-muted">
           <p>
             Worker: <b className="text-fg">{run.worker_name}</b>
-            {hardwareBits.length > 0 && ` · ${hardwareBits.join(", ")}`}
+            {hw
+              ? run.llama_cpp_backend
+                ? ` · ${run.llama_cpp_backend} backend`
+                : ""
+              : hardwareBits.length > 0 && ` · ${hardwareBits.join(", ")}`}
           </p>
+          {hw && <HardwareSummary hardware={hw} platform={workerInfo?.platform} layout="lines" />}
           <p>Llama.cpp version: {run.llama_cpp_build}</p>
           <p>
             Model: <span className="text-fg">{run.model_filename || `${shortId(run.model_id)}…`}</span>

@@ -26,6 +26,7 @@ import {
   type VerifiedLimitDto,
   type ProbeAttemptDto,
   type AdminStats,
+  type RocmSupportSnapshot,
 } from "../types";
 
 export class ApiError extends Error {
@@ -186,7 +187,7 @@ export const api = {
   // a newer one than what it has exists -- the one piece of per-worker
   // "live" info that's a GitHub lookup, not something the worker itself
   // reports (see server/src/routes/workers.ts).
-  getAvailableBuilds: (workerId: string): Promise<{ available: LlamaCppRelease[]; update_available: boolean }> =>
+  getAvailableBuilds: (workerId: string): Promise<{ available: LlamaCppRelease[]; other_available: LlamaCppRelease[]; update_available: boolean }> =>
     request(`/api/workers/${encodeURIComponent(workerId)}/available-builds`),
 
   // Fire-and-forget: queues the install/activate/delete on the machine,
@@ -216,6 +217,12 @@ export const api = {
   // currently running (or immediately if it's idle), not instantly.
   shutdownWorker: (workerId: string): Promise<{ ok: true; queued: true }> =>
     request(`/api/workers/${encodeURIComponent(workerId)}/shutdown`, postJson({})),
+
+  // Queues the RAM/VRAM bandwidth sweep -- result lands asynchronously on
+  // this worker's `memSpeed` field once the job finishes (poll via the
+  // existing useWorkerStatuses hook, same as every other worker field).
+  measureMemorySpeed: (workerId: string): Promise<{ ok: true; queued: true }> =>
+    request(`/api/workers/${encodeURIComponent(workerId)}/measure-memory-speed`, postJson({})),
 
   // sort/direction map to HF's own search API params (server/src/hf.ts);
   // cursor comes from a previous call's nextCursor -- HF paginates via a
@@ -374,6 +381,9 @@ export const api = {
   // of AUTH_ENABLED (see routes/auth.ts's own doc comment); `authEnabled`
   // lets the SPA decide whether to gate on `user` at all.
   getAuthStatus: (): Promise<AuthStatus> => request("/api/auth/status"),
+
+  // Public, daily-refreshed list of AMD GPUs ROCm supports -- see useRocmSupport.ts.
+  getRocmSupport: (): Promise<RocmSupportSnapshot> => request("/api/rocm-support"),
 
   listSessions: (): Promise<SessionInfo[]> => request<{ sessions: SessionInfo[] }>("/api/sessions").then((d) => d.sessions),
 

@@ -15,6 +15,9 @@ import type { AuthUser } from "../../shared/types.js";
 export const PUBLIC_PATHS = new Set([
   "/health",
   "/api/auth/status",
+  // AMD's published ROCm support list. A worker reads it at startup to pick its
+  // default backend, before it has any credential; it holds nothing private.
+  "/api/rocm-support",
   // Verifies its own bearer REFRESH token directly (routes/sessions.ts) --
   // a different token space than a normal session's access token, so the
   // generic session check below would always reject it first.

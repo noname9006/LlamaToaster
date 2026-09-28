@@ -58,11 +58,26 @@ describe("formatGpuLabel", () => {
     expect(formatGpuLabel({ model: "RTX 4090", vendor: "NVIDIA", vram_mb: null })).toBe("RTX 4090");
   });
 
-  it("marks unified/shared memory so it is not read as dedicated VRAM", () => {
+  it("shows total VRAM alone when no usable figure has been read", () => {
     expect(formatGpuLabel({ model: "RTX 4090", vendor: "NVIDIA", vram_mb: 24_576 })).toBe("RTX 4090 (24.0 GB)");
-    expect(formatGpuLabel({ model: "Iris Xe", vendor: "Intel", vram_mb: 1024, vram_dynamic: true })).toBe(
-      "Iris Xe (1.0 GB shared)"
+  });
+
+  it("shows max usable / total VRAM, preferring llama.cpp's own total", () => {
+    expect(
+      formatGpuLabel({ model: "RX 6600 XT", vendor: "AMD", vram_mb: 8192, vram_usable_mb: 7378, vram_listed_total_mb: 8176 })
+    ).toBe("RX 6600 XT (7.2 / 8.0 GB)");
+  });
+
+  it("never quotes usable above total", () => {
+    expect(formatGpuLabel({ model: "X", vendor: "V", vram_mb: 4096, vram_usable_mb: 9000 })).toBe("X (4.0 / 4.0 GB)");
+  });
+
+  it("drops the memory figure for GPUs that borrow system RAM", () => {
+    expect(formatGpuLabel({ model: "Iris Xe", vendor: "Intel", vram_mb: 1024, vram_dynamic: true })).toBe("Iris Xe");
+    expect(formatGpuLabel({ model: "Intel(R) UHD Graphics 620", vendor: "Intel", vram_mb: 1024 })).toBe(
+      "Intel(R) UHD Graphics 620"
     );
+    expect(formatGpuLabel({ model: "Apple M2 Pro", vendor: "Apple", vram_mb: 16_384 }, true)).toBe("Apple M2 Pro");
   });
 });
 

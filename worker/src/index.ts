@@ -85,7 +85,10 @@ import {
   postProbeAttempt,
   getProbeDedup,
   postQualityResult,
+  getRocmSupport,
+  reportMemorySpeed,
 } from "./vps-client.js";
+import { measureMemorySpeed } from "./memSpeed.js";
 import { log, configureLogging, setRunLogFile, ansi, paint, colorsEnabled } from "./log.js";
 import {
   detectPlatform,
@@ -96,7 +99,7 @@ import {
   validateTag,
   reconcileBuildsDir,
 } from "./llama-builds.js";
-import { detectHardware, detectBackend } from "./hardware.js";
+import { detectHardware, detectBackend, mergeListedDevices } from "./hardware.js";
 import { readGgufInfo } from "./gguf.js";
 import { applyLocalHeader } from "./local-header.js";
 import { LocalModelCache, createLocalModelCache } from "./local-cache.js";
@@ -334,7 +337,16 @@ const detectedHardware = await detectHardware();
 // this machine's actual GPU rather than requiring it be hardcoded. An
 // explicit value in config.json always wins (e.g. to force `cpu` on a box
 // that does have a GPU).
-const backend: Backend = config.backend ?? detectBackend(detectedHardware.platform, detectedHardware.gpu);
+//
+// Whether an AMD GPU gets `rocm` or `vulkan` depends on AMD's support list,
+// which the server refreshes daily from AMD's docs -- fetched here only when it
+// can matter (no pinned backend, an AMD GPU present). If the server can't be
+// reached, detectBackend falls back to its built-in snapshot of that list.
+const needsRocmList =
+  !config.backend && detectedHardware.gpu.some((g) => /amd|advanced micro devices/i.test(g.vendor));
+const rocmSupport = needsRocmList ? await getRocmSupport(config.url) : null;
+const backend: Backend =
+  config.backend ?? detectBackend(detectedHardware.platform, detectedHardware.gpu, rocmSupport ?? undefined);
 if (!config.backend) {
   log.info(`no backend set in config.json -- auto-detected "${backend}" from hardware`);
 }
@@ -356,7 +368,7 @@ log.info(
   })`
 );
 log.info(
-  `[worker ${config.worker_name}] OS: ${detectedHardware.platform} (${detectedHardware.arch})`
+  `[worker ${config.worker_name}] OS: ${detectedHardware.os?.name ?? detectedHardware.platform} (${detectedHardware.arch})`
 );
 log.info(
   `[worker ${config.worker_name}] CPU: ${
@@ -366,7 +378,9 @@ log.info(
 log.info(
   `[worker ${config.worker_name}] RAM: ${
     detectedHardware.mem_total_bytes != null
-      ? `${Math.round(detectedHardware.mem_total_bytes / (1024 * 1024))}MiB`
+      ? `${Math.round(detectedHardware.mem_total_bytes / (1024 * 1024))}MiB${
+          detectedHardware.unified_memory ? " (unified memory)" : detectedHardware.mem_type ? ` ${detectedHardware.mem_type}` : ""
+        }`
       : "unavailable (systeminformation reported no usable total)"
   }`
 );
@@ -828,6 +842,42 @@ function requestDownloadDiscard(jobId: string): void {
   requestDownloadStop(jobId);
 }
 
+// "Max usable VRAM" per GPU: what the active llama.cpp build's own
+// `--list-devices` reports free. Free memory is a property of the moment, so it
+// is re-read at most every LISTED_DEVICES_REFRESH_MS, only while idle (a running
+// job's own buffers would read as "used"), and again straight away when a
+// different build becomes active. A failed/empty read keeps the previous
+// figures rather than blanking a value the UI was already showing.
+const LISTED_DEVICES_REFRESH_MS = 5 * 60 * 1000;
+let listedDevices: Awaited<ReturnType<typeof readListDevices>> | null = null;
+let listedDevicesAtMs = 0;
+let listedDevicesBuildTag: string | null = null;
+
+async function refreshListedDevices(): Promise<void> {
+  const binary = activeBuild?.serverPath ?? activeBuild?.path;
+  if (!activeBuild || !binary) return;
+  const fresh = listedDevicesBuildTag === activeBuild.tag && Date.now() - listedDevicesAtMs < LISTED_DEVICES_REFRESH_MS;
+  if (fresh) return;
+  listedDevicesAtMs = Date.now();
+  listedDevicesBuildTag = activeBuild.tag;
+  const devices = await readListDevices(binary).catch(() => []);
+  if (devices.length === 0) return;
+  const first = listedDevices === null;
+  listedDevices = devices;
+  if (first) {
+    log.info(
+      `[worker ${config.worker_name}] llama.cpp devices: ${devices
+        .map((d) => `${d.name} ${d.description} (${d.freeMib} MiB usable of ${d.totalMib} MiB)`)
+        .join("; ")}`
+    );
+  }
+}
+
+// detectedHardware plus the latest --list-devices figures, when there are any.
+function currentHardware(): typeof detectedHardware {
+  return listedDevices ? mergeListedDevices(detectedHardware, listedDevices) : detectedHardware;
+}
+
 function toInstalledBuildList(): InstalledBuild[] {
   return listInstalledBuilds(buildsDir).map((b) => ({
     tag: b.tag,
@@ -858,6 +908,7 @@ function toInstalledBuildList(): InstalledBuild[] {
 // already running something, and avoids a second concurrent readGpuMemory
 // call alongside MemorySampler's own (see captureFreeMemoryBaseline).
 async function collectState(): Promise<WorkerStatePush> {
+  if (!busy) await refreshListedDevices();
   const vram = busy
     ? undefined
     : await captureFreeMemoryBaseline(backend)
@@ -891,7 +942,7 @@ async function collectState(): Promise<WorkerStatePush> {
     cpu_isa: detectedCpuIsa,
     hostname: osHostname(),
     backend,
-    hardware: detectedHardware,
+    hardware: currentHardware(),
     installed_builds: toInstalledBuildList(),
     model_files: await getModelFilesWithState(localModelCache, config.model_dir),
     status: busy ? "busy" : "idle",
@@ -4277,6 +4328,25 @@ async function executeRefreshModelsJob(): Promise<void> {
   log.info("Model directory refresh completed");
 }
 
+// Workers page "Measure memory speed" button. updateJobReport's detail
+// string rides the existing serial-job progress channel (BusyPhaseCard on
+// the Workers card reads it directly), so the sweep's per-thread-count
+// rows show up as live status text exactly like a benchmark item would.
+// The result is posted BEFORE this returns (not left for executeJob's
+// caller to bundle into the completion report) -- see reportMemorySpeed's
+// own doc comment for why: it must be durably saved even if the completion
+// report itself has to retry.
+async function executeMeasureMemorySpeedJob(): Promise<void> {
+  log.info("Starting memory speed measurement");
+  const result = await measureMemorySpeed((detail) => updateJobReport({ detail }));
+  await withAuth((token) => reportMemorySpeed(config.url, token, config.machine_id!, result));
+  log.info(
+    `Memory speed measurement completed: RAM ${result.ram.points.length} row(s), VRAM ${
+      result.vram ? `${result.vram.readGBs.toFixed(0)} GB/s read` : `unavailable (${result.vramUnavailableReason ?? "unknown reason"})`
+    }`
+  );
+}
+
 // download_model is deliberately NOT handled here -- workerMain's
 // downloadJobPool intercepts and dispatches it before a job ever reaches
 // this function (see the loop below), so the type excludes it: a stray call
@@ -4303,11 +4373,17 @@ async function executeJob(job: SerialQueueJob): Promise<void> {
       return executeRefreshModelsJob();
     case "shutdown_worker":
       return executeShutdownWorkerJob();
+    case "measure_memory_speed":
+      return executeMeasureMemorySpeedJob();
   }
 }
 
 function jobInitialPhase(type: QueueJob["type"]): ActiveJobReport["phase"] {
-  return type === "download_model" ? "downloading" : type === "refresh_models" ? "loading" : "loading";
+  return type === "download_model"
+    ? "downloading"
+    : type === "measure_memory_speed"
+      ? "benchmarking"
+      : "loading";
 }
 
 // Delivered on the heartbeat's control.cancel_job_ids -- ignored unless it

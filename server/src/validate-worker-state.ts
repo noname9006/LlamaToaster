@@ -7,6 +7,7 @@ import type {
   ModelDirFile,
   ActiveJobReport,
   WorkerVramInfo,
+  MemorySpeedResult,
 } from "../../shared/types.js";
 import type { TensorLayerBreakdown } from "../../shared/vramEstimate.js";
 import {
@@ -132,6 +133,9 @@ function parseHardware(value: unknown): HardwareInfo {
       model: sanitizeString(row.model, `hardware.gpu[${i}].model`),
       vram_mb: optionalNumber(row.vram_mb, `hardware.gpu[${i}].vram_mb`) ?? null,
       vram_dynamic: optionalBoolean(row.vram_dynamic, `hardware.gpu[${i}].vram_dynamic`),
+      vram_usable_mb: optionalNumber(row.vram_usable_mb, `hardware.gpu[${i}].vram_usable_mb`) ?? null,
+      vram_listed_total_mb:
+        optionalNumber(row.vram_listed_total_mb, `hardware.gpu[${i}].vram_listed_total_mb`) ?? null,
     };
   });
 
@@ -152,6 +156,17 @@ function parseHardware(value: unknown): HardwareInfo {
     };
   }
 
+  // OS name / RAM type / unified-memory flag -- display-only, all optional.
+  let os: HardwareInfo["os"];
+  if (h.os !== undefined && h.os !== null) {
+    if (typeof h.os !== "object") throw new BadRequestError("hardware.os must be an object");
+    const o = h.os as Record<string, unknown>;
+    os = {
+      family: sanitizeString(o.family, "hardware.os.family", 64),
+      name: sanitizeString(o.name, "hardware.os.name", 128),
+    };
+  }
+
   return {
     platform: sanitizeString(h.platform, "hardware.platform"),
     arch: sanitizeString(h.arch, "hardware.arch"),
@@ -162,6 +177,9 @@ function parseHardware(value: unknown): HardwareInfo {
       cores: requireNumber(cpu.cores, "hardware.cpu.cores"),
     },
     gpu,
+    os,
+    mem_type: optionalString(h.mem_type, "hardware.mem_type", 64),
+    unified_memory: optionalBoolean(h.unified_memory, "hardware.unified_memory"),
     mem_total_bytes: optionalNumber(h.mem_total_bytes, "hardware.mem_total_bytes"),
     nvidia_driver: nvidiaDriver,
   };
@@ -432,6 +450,70 @@ export interface DeviceStartInput {
   public_key?: string;
   nonce?: string;
   signature?: string;
+}
+
+// POST /api/worker/mem-speed's body -- the Workers page "Measure memory
+// speed" result (see shared/types.ts's MemorySpeedResult). Same semi-trusted
+// posture as the rest of this file: every number is checked finite and
+// non-negative before it's ever persisted, since it's rendered straight into
+// a table (client/src/components/WorkerCard.tsx).
+const MAX_RAM_POINTS = 64; // generous upper bound on thread-count rows, not a real limit
+
+function requireNonNegNumber(value: unknown, field: string): number {
+  const n = requireNumber(value, field);
+  if (n < 0) throw new BadRequestError(`${field} must not be negative`);
+  return n;
+}
+
+export function parseMemorySpeedResult(body: unknown): MemorySpeedResult {
+  if (typeof body !== "object" || body === null) throw new BadRequestError("body must be an object");
+  const raw = (body as Record<string, unknown>).result;
+  if (typeof raw !== "object" || raw === null) throw new BadRequestError("result is required");
+  const r = raw as Record<string, unknown>;
+
+  const ramRaw = r.ram;
+  if (typeof ramRaw !== "object" || ramRaw === null) throw new BadRequestError("result.ram is required");
+  const ram = ramRaw as Record<string, unknown>;
+  const pointsRaw = ram.points;
+  if (!Array.isArray(pointsRaw)) throw new BadRequestError("result.ram.points must be an array");
+  const points = pointsRaw.slice(0, MAX_RAM_POINTS).map((p, i) => {
+    if (typeof p !== "object" || p === null) throw new BadRequestError(`result.ram.points[${i}] must be an object`);
+    const pt = p as Record<string, unknown>;
+    return {
+      threads: Math.trunc(requireNonNegNumber(pt.threads, `result.ram.points[${i}].threads`)),
+      readGBs: requireNonNegNumber(pt.readGBs, `result.ram.points[${i}].readGBs`),
+      writeGBs: requireNonNegNumber(pt.writeGBs, `result.ram.points[${i}].writeGBs`),
+      copyGBs: requireNonNegNumber(pt.copyGBs, `result.ram.points[${i}].copyGBs`),
+    };
+  });
+
+  const vramRaw = r.vram;
+  let vram: MemorySpeedResult["vram"] = null;
+  if (vramRaw !== null && vramRaw !== undefined) {
+    if (typeof vramRaw !== "object") throw new BadRequestError("result.vram must be an object or null");
+    const v = vramRaw as Record<string, unknown>;
+    vram = {
+      deviceName: sanitizeString(v.deviceName, "result.vram.deviceName"),
+      globalMemMiB: requireNonNegNumber(v.globalMemMiB, "result.vram.globalMemMiB"),
+      readGBs: requireNonNegNumber(v.readGBs, "result.vram.readGBs"),
+      writeGBs: requireNonNegNumber(v.writeGBs, "result.vram.writeGBs"),
+      copyGBs: requireNonNegNumber(v.copyGBs, "result.vram.copyGBs"),
+    };
+  }
+
+  return {
+    measuredAt: Date.now(), // server clock, not whatever the worker reported -- same posture as other timestamps in this file
+    ram: {
+      physicalCores:
+        ram.physicalCores === null || ram.physicalCores === undefined
+          ? null
+          : Math.trunc(requireNonNegNumber(ram.physicalCores, "result.ram.physicalCores")),
+      logicalCores: Math.trunc(requireNonNegNumber(ram.logicalCores, "result.ram.logicalCores")),
+      points,
+    },
+    vram,
+    vramUnavailableReason: optionalString(r.vramUnavailableReason, "result.vramUnavailableReason", 500),
+  };
 }
 
 // An Ed25519 public key in SPKI PEM -- anything else is rejected rather than

@@ -4,6 +4,7 @@ import { repo } from "../db/repo.js";
 import { resolveAuthUser } from "../auth-middleware.js";
 import { loadExportRows, type ResultExportRow } from "./results.js";
 import type { CommunityAggregateFilters } from "../../../shared/types.js";
+import { isSharedMemoryGpu } from "../../../shared/types.js";
 
 // extra_content.google.thought_signature is Gemini-specific (see the
 // thought-signature comment in the /api/ai/chat route's stream loop below)
@@ -473,7 +474,21 @@ function hardwareSummary(userId: string | undefined): string {
     .map((w) => {
       const hw = w.hardware;
       const cpu = hw ? hw.cpu.brand || hw.cpu.manufacturer || "unknown CPU" : "unknown CPU";
-      const gpu = hw && hw.gpu.length > 0 ? hw.gpu.map((g) => g.model).join(", ") : "no discrete GPU reported";
+      const gpu =
+        hw && hw.gpu.length > 0
+          ? hw.gpu
+              .map((g) => {
+                // Shared-memory GPUs have no VRAM of their own to quote.
+                if (isSharedMemoryGpu(g, hw.unified_memory)) return g.model;
+                const total = g.vram_listed_total_mb ?? g.vram_mb;
+                if (total == null) return g.model;
+                const gb = (mib: number) => (mib / 1024).toFixed(1);
+                return g.vram_usable_mb != null
+                  ? `${g.model} (max usable ${gb(g.vram_usable_mb)} / total ${gb(total)} GB VRAM)`
+                  : `${g.model} (${gb(total)} GB VRAM)`;
+              })
+              .join(", ")
+          : "no discrete GPU reported";
       const activeBuild = w.installedBuilds.find((b) => b.active)?.tag;
       return `- ${w.displayName} — ${w.backend ?? "unknown"} backend, ${w.platform ?? "?"}/${w.arch ?? "?"}, CPU: ${cpu}, GPU: ${gpu}, build ${activeBuild ?? "none"} (${w.status})`;
     })

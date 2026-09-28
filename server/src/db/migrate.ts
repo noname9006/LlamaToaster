@@ -443,6 +443,11 @@ const COLUMN_MIGRATIONS: ColumnSpec[] = [
   { table: "probe_attempts", column: "spill_method", ddlType: "TEXT" },
   { table: "probe_attempts", column: "spill_shared_growth_mib", ddlType: "REAL" },
   { table: "probe_attempts", column: "spill_unlanded_growth_mib", ddlType: "REAL" },
+  // Cached worker.memSpeed -- see shared/types.ts's MemorySpeedResult doc
+  // comment. Set once by POST /api/worker/mem-speed after a "Measure memory
+  // speed" job completes; NULL until that button has been clicked at least
+  // once on this machine.
+  { table: "workers", column: "mem_speed_json", ddlType: "TEXT" },
 ];
 
 function applyColumnMigrations(database: Database.Database): void {

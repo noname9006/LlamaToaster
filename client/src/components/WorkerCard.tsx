@@ -1,11 +1,13 @@
 import { useEffect, useRef, useState } from "react";
 import { api } from "../api/client";
 import type { Worker, Test, LlamaCppRelease, ActiveJobReport } from "../types";
-import { extractCudaVariant, cudaDriverSupports } from "../types";
+import { extractCudaVariant, cudaDriverSupports, isRocmAssetName, findCommunityRocmGpu } from "../types";
 import { StatusPill, WorkerStatusPill, ElapsedSince } from "./StatusPill";
 import { IconCheck, IconChevronDown, IconDownload, IconPencil, IconTrash } from "./icons";
 import { Tooltip } from "./Tooltip";
-import { copyToClipboard, formatBytes, formatDate, formatGpuLabel } from "../utils";
+import { copyToClipboard, formatBytes, formatDate } from "../utils";
+import { HardwareSummary } from "./HardwareSummary";
+import { MemorySpeedPanel } from "./MemorySpeedPanel";
 
 // Two setup families, not three: macOS and Linux run the byte-identical
 // bootstrap.sh / setup-worker.sh and the same commands, so a separate tab for
@@ -239,10 +241,27 @@ function BusyPhaseCard({ phase, detail }: { phase?: string; detail?: string }) {
   );
 }
 
+const ROCM_COMMUNITY_TIP =
+  "Not on AMD's official ROCm support list, but llama.cpp's ROCm (HIP) builds are widely reported to work on this card. Support is community-driven -- check llama.cpp GitHub issues & discussions, r/LocalLLaMA and ROCm forums for setup tips and known issues on your exact GPU. Vulkan is the safer choice.";
+
+// Shown next to a ROCm/HIP build when this machine has one of the curated
+// COMMUNITY_ROCM_GPUS cards. Informational, not a block.
+function RocmUnofficialNotice({ gpuModel, platform }: { gpuModel: string; platform: string | null }) {
+  return (
+    <div className="mt-1 text-xs leading-relaxed text-warning">
+      <b>{gpuModel}</b> isn't officially supported by AMD's {platform === "win32" ? "HIP SDK" : "ROCm"}, but ROCm builds of llama.cpp are widely reported
+      to work on it. For setup tips and known issues, check the community — llama.cpp GitHub discussions,
+      r/LocalLLaMA, ROCm forums. Since it's unofficial, Vulkan builds are the safer choice.
+    </div>
+  );
+}
+
 export function WorkerCard({ worker, onRefresh }: { worker: Worker; onRefresh: () => void }) {
   const [busyTag, setBusyTag] = useState<string | null>(null);
   const [msg, setMsg] = useState("");
   const [available, setAvailable] = useState<LlamaCppRelease[]>([]);
+  // Same OS/arch but a backend other than this machine's -- offered collapsed.
+  const [otherAvailable, setOtherAvailable] = useState<LlamaCppRelease[]>([]);
   const [updateAvailable, setUpdateAvailable] = useState(false);
   // Bumped after every queued action (install/activate/delete/...) so the
   // available-builds fetch below re-runs immediately instead of waiting for
@@ -278,6 +297,7 @@ export function WorkerCard({ worker, onRefresh }: { worker: Worker; onRefresh: (
         .then((d) => {
           if (cancelled) return;
           setAvailable(d.available);
+          setOtherAvailable(d.other_available ?? []);
           setUpdateAvailable(d.update_available);
         })
         .catch(() => {})
@@ -330,6 +350,14 @@ export function WorkerCard({ worker, onRefresh }: { worker: Worker; onRefresh: (
     await withBusy("shutdown", () => api.shutdownWorker(worker.id).then(() => undefined), "Shutdown queued");
   }
 
+  async function handleMeasureMemorySpeed() {
+    await withBusy(
+      "measure-memory-speed",
+      () => api.measureMemorySpeed(worker.id).then(() => undefined),
+      "Memory speed measurement queued"
+    );
+  }
+
   async function handleRemove() {
     if (
       !window.confirm(
@@ -372,10 +400,80 @@ export function WorkerCard({ worker, onRefresh }: { worker: Worker; onRefresh: (
 
   const installedTags = new Set(worker.installedBuilds.map((b) => b.tag));
   const availableToInstall = available.filter((rel) => !installedTags.has(rel.tag) && rel.assets.length > 0);
+  // Flattened to (release, asset) rows, minus anything already on disk (same
+  // tag AND same asset -- a different backend of an installed tag is fair game).
+  const installedAssets = new Set(worker.installedBuilds.map((b) => `${b.tag}\0${b.asset_name}`));
+  const otherToInstall = otherAvailable.flatMap((rel) =>
+    rel.assets.filter((a) => !installedAssets.has(`${rel.tag}\0${a.name}`)).map((asset) => ({ rel, asset }))
+  );
 
   // This worker's own reported NVIDIA driver capability -- decides whether a
   // cuda-13.x variant is installable here or would fail to load at all.
   const driverCudaVersion = worker.hardware?.nvidia_driver?.cuda_version ?? null;
+
+  // This machine's AMD GPU (if it's one of the community-ROCm cards) --
+  // drives the notice on ROCm/HIP install rows and downloaded builds.
+  const unofficialRocmGpu = worker.hardware ? findCommunityRocmGpu(worker.hardware.gpu, worker.platform ?? "") : null;
+
+  // One install row, shared by the recommended and "other builds" lists.
+  // A variant newer than this machine's NVIDIA driver will install fine but
+  // fail the moment a benchmark tries to use the GPU (cuInit dies with an
+  // unsupported-driver error) -- that's allowed, just loudly flagged here and
+  // on the Downloaded list below rather than blocked.
+  function renderInstallRow(rel: LlamaCppRelease, asset: LlamaCppRelease["assets"][number], busyKey: string) {
+    const variant = extractCudaVariant(asset.name);
+    const needsDriverUpdate = variant != null && !cudaDriverSupports(driverCudaVersion, variant);
+    const cudart = rel.cudart_assets?.[asset.name];
+    const totalSize = asset.size_bytes + (cudart?.size_bytes ?? 0);
+    return (
+      <li
+        key={busyKey}
+        className={`flex flex-wrap items-center justify-between gap-2 rounded-lg border px-3 py-2 ${
+          needsDriverUpdate ? "border-warning/40 bg-warning/5" : "border-border"
+        }`}
+      >
+        <div className="text-sm">
+          <span className="text-fg">{rel.tag}</span>{" "}
+          <span className="text-xs text-muted">
+            {asset.name} · {formatBytes(totalSize)}
+            {cudart ? " (incl. CUDA runtime DLLs)" : ""}
+          </span>
+          {needsDriverUpdate && (
+            <div className="text-xs text-warning">
+              NVIDIA driver update needed: this build runs CUDA up to{" "}
+              <b>
+                {variant!.major}.{variant!.minor}
+              </b>
+              {driverCudaVersion ? (
+                <>
+                  , machine supports <b>{driverCudaVersion}</b>
+                </>
+              ) : null}{" "}
+              — GPU tests may fail until it's updated
+            </div>
+          )}
+          {unofficialRocmGpu && isRocmAssetName(asset.name) && (
+            <RocmUnofficialNotice gpuModel={unofficialRocmGpu.model} platform={worker.platform} />
+          )}
+        </div>
+        <button
+          type="button"
+          disabled={busyTag === busyKey}
+          onClick={() =>
+            withBusy(
+              busyKey,
+              () => api.installBuild(worker.id, rel.tag, asset.name).then(() => undefined),
+              `Queued: install ${rel.tag} (${asset.name})`
+            )
+          }
+          className="flex items-center gap-1.5 rounded-md border border-border px-2.5 py-1 text-xs font-semibold text-fg hover:border-accent/40 hover:text-accent disabled:opacity-50"
+        >
+          <IconDownload width={14} height={14} />
+          {busyTag === busyKey ? "Queuing…" : "Install"}
+        </button>
+      </li>
+    );
+  }
 
   // A serial job in its downloading/extracting phase with no run attached is
   // a build install in flight (benchmark jobs always carry activeTestId) --
@@ -576,41 +674,11 @@ export function WorkerCard({ worker, onRefresh }: { worker: Worker; onRefresh: (
         <>
           <div className="mt-4">
             <h4 className="text-xs font-semibold uppercase tracking-wide text-muted">Hardware &amp; OS</h4>
+            {/* One row per piece: OS, CPU, RAM, and every GPU (max usable / total VRAM). */}
+            <div className="mt-1.5">
+              <HardwareSummary hardware={worker.hardware} platform={`${worker.platform} (${worker.arch})`} layout="lines" />
+            </div>
             <dl className="mt-1.5 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-sm">
-              <dt className="text-muted">OS</dt>
-              <dd className="text-fg">
-                {worker.platform} ({worker.arch})
-              </dd>
-              <dt className="text-muted">CPU</dt>
-              <dd className="text-fg">
-                {worker.hardware?.cpu.brand || worker.hardware?.cpu.manufacturer || "unknown"}
-                {worker.hardware?.cpu.cores ? (
-                  <span className="text-muted"> · {worker.hardware.cpu.cores} threads</span>
-                ) : null}
-              </dd>
-              <dt className="text-muted">RAM</dt>
-              <dd className="text-fg">
-                {worker.hardware?.mem_total_bytes ? (
-                  formatBytes(worker.hardware.mem_total_bytes)
-                ) : (
-                  <span className="text-muted">unknown</span>
-                )}
-              </dd>
-              <dt className="text-muted">GPU</dt>
-              <dd className="text-fg">
-                {worker.hardware ? (
-                  worker.hardware.gpu.length > 0 ? (
-                    // systeminformation's GPU model strings already include the
-                    // vendor name (e.g. "AMD Radeon RX 6600 XT") -- prefixing
-                    // g.vendor too would just repeat it.
-                    worker.hardware.gpu.map((g) => formatGpuLabel(g)).join(", ")
-                  ) : (
-                    <span className="text-muted">none detected</span>
-                  )
-                ) : (
-                  <span className="text-muted">unknown</span>
-                )}
-              </dd>
               {worker.hardware?.nvidia_driver && (
                 <>
                   <dt className="text-muted">NVIDIA driver</dt>
@@ -630,6 +698,14 @@ export function WorkerCard({ worker, onRefresh }: { worker: Worker; onRefresh: (
               )}
             </dl>
           </div>
+          {worker.capabilities.includes("mem-speed-v1") && (
+            <MemorySpeedPanel
+              result={worker.memSpeed}
+              onMeasure={() => void handleMeasureMemorySpeed()}
+              queuing={busyTag === "measure-memory-speed"}
+              disabled={busyTag !== null || worker.status === "busy"}
+            />
+          )}
           {updateAvailable && (
             <div className="mt-2">
               <StatusPill label="update available" tone="warning" />
@@ -669,6 +745,13 @@ export function WorkerCard({ worker, onRefresh }: { worker: Worker; onRefresh: (
                         {b.asset_name} · installed {formatDate(b.installed_at)}
                         {b.cudart_name ? " · CUDA runtime DLLs included" : ""}
                       </span>
+                      {unofficialRocmGpu && isRocmAssetName(b.asset_name) && (
+                        <Tooltip
+                          text={ROCM_COMMUNITY_TIP}
+                        >
+                          <StatusPill label="unofficial ROCm" tone="warning" />
+                        </Tooltip>
+                      )}
                     </div>
                     <div className="flex items-center gap-2">
                       {needsDriverUpdate && (
@@ -726,69 +809,27 @@ export function WorkerCard({ worker, onRefresh }: { worker: Worker; onRefresh: (
               <p className="mt-1.5 text-sm text-muted">Nothing new for this platform/backend.</p>
             ) : (
               <ul className="mt-1.5 flex max-h-64 flex-col gap-1.5 overflow-y-auto">
-                {availableToInstall.map((rel) => {
-                  const asset = rel.assets[0];
-                  // CUDA variants are ordered best-first by the server (see
-                  // sortAssetsForWorker), so assets[0] is the one to offer.
-                  // A variant newer than this machine's NVIDIA driver will
-                  // install fine but fail the moment a benchmark tries to use
-                  // the GPU (cuInit dies with an unsupported-driver error) --
-                  // that's allowed, just loudly flagged here and on the
-                  // Downloaded list below rather than blocked.
-                  const variant = extractCudaVariant(asset.name);
-                  const needsDriverUpdate = variant != null && !cudaDriverSupports(driverCudaVersion, variant);
-                  const cudart = rel.cudart_assets?.[asset.name];
-                  const totalSize = asset.size_bytes + (cudart?.size_bytes ?? 0);
-                  return (
-                    <li
-                      key={rel.tag}
-                      className={`flex flex-wrap items-center justify-between gap-2 rounded-lg border px-3 py-2 ${
-                        needsDriverUpdate ? "border-warning/40 bg-warning/5" : "border-border"
-                      }`}
-                    >
-                      <div className="text-sm">
-                        <span className="text-fg">{rel.tag}</span>{" "}
-                        <span className="text-xs text-muted">
-                          {asset.name} · {formatBytes(totalSize)}
-                          {cudart ? " (incl. CUDA runtime DLLs)" : ""}
-                        </span>
-                        {needsDriverUpdate && (
-                          <div className="text-xs text-warning">
-                            NVIDIA driver update needed: this build runs CUDA up to{" "}
-                            <b>
-                              {variant!.major}.{variant!.minor}
-                            </b>
-                            {driverCudaVersion ? (
-                              <>
-                                , machine supports{" "}
-                                <b>{driverCudaVersion}</b>
-                              </>
-                            ) : null}{" "}
-                            — GPU tests may fail until it's updated
-                          </div>
-                        )}
-                      </div>
-                      <button
-                        type="button"
-                        disabled={busyTag === rel.tag}
-                        onClick={() =>
-                          withBusy(
-                            rel.tag,
-                            () => api.installBuild(worker.id, rel.tag, asset.name).then(() => undefined),
-                            `Queued: install ${rel.tag}`
-                          )
-                        }
-                        className="flex items-center gap-1.5 rounded-md border border-border px-2.5 py-1 text-xs font-semibold text-fg hover:border-accent/40 hover:text-accent disabled:opacity-50"
-                      >
-                        <IconDownload width={14} height={14} />
-                        {busyTag === rel.tag ? "Queuing…" : "Install"}
-                      </button>
-                    </li>
-                  );
-                })}
+                {/* CUDA variants are ordered best-first by the server (see
+                    sortAssetsForWorker), so assets[0] is the one to offer. */}
+                {availableToInstall.map((rel) => renderInstallRow(rel, rel.assets[0], rel.tag))}
               </ul>
             )}
           </div>
+
+          {otherToInstall.length > 0 && (
+            <details className="group mt-4">
+              <summary className="cursor-pointer select-none text-xs font-semibold uppercase tracking-wide text-muted hover:text-fg">
+                Other builds for this OS ({otherToInstall.length}) — not recommended
+              </summary>
+              <p className="mt-1.5 text-xs text-muted">
+                These match this machine's OS and CPU architecture but not its detected backend ({worker.backend}), so
+                they may run slowly or fail to use the GPU. Only the newest release of each variant is listed.
+              </p>
+              <ul className="mt-1.5 flex max-h-64 flex-col gap-1.5 overflow-y-auto">
+                {otherToInstall.map(({ rel, asset }) => renderInstallRow(rel, asset, `${rel.tag}:${asset.name}`))}
+              </ul>
+            </details>
+          )}
         </>
       )}
 

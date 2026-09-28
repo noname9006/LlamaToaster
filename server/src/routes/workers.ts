@@ -1,7 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import { repo } from "../db/repo.js";
 import { queueEvents } from "../queue-events.js";
-import { getReleases, filterReleasesForWorker, buildInstallPayload } from "../github-releases.js";
+import { getReleases, filterReleasesForWorker, filterOtherBuildsForWorker, buildInstallPayload } from "../github-releases.js";
 import { BadRequestError, ConflictError, NotFoundError } from "../errors.js";
 import { resolveAuthUser, assertOwnsWorker, userOrIpKeyGenerator } from "../auth-middleware.js";
 import { authenticateWorker } from "../worker-auth.js";
@@ -127,9 +127,11 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
     if (!worker) return reply.code(404).send({ error: "unknown machine" });
     assertOwnsWorker(resolveAuthUser(request)?.user.id, worker.id);
     if (!worker.platform || !worker.arch || !worker.backend) {
-      return { available: [] as LlamaCppRelease[], update_available: false };
+      return { available: [] as LlamaCppRelease[], other_available: [] as LlamaCppRelease[], update_available: false };
     }
     let available: LlamaCppRelease[] = [];
+    // Same OS/arch, different backend -- shown collapsed as "not recommended".
+    let otherAvailable: LlamaCppRelease[] = [];
     try {
       const releases = await getReleases();
       // The worker's own nvidia-smi-reported max CUDA version (see
@@ -143,6 +145,7 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
         worker.backend,
         worker.hardware?.nvidia_driver?.cuda_version ?? null
       );
+      otherAvailable = filterOtherBuildsForWorker(releases, worker.platform, worker.arch, worker.backend);
     } catch (err) {
       // GitHub being unreachable shouldn't block viewing installed builds --
       // just report an empty "installable" list.
@@ -153,7 +156,7 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
     const updateAvailable = Boolean(
       latestTag && latestTag !== activeTag && !worker.installedBuilds.some((b) => b.tag === latestTag)
     );
-    return { available, update_available: updateAvailable };
+    return { available, other_available: otherAvailable, update_available: updateAvailable };
   });
 
   app.post<{ Params: { id: string }; Body: { tag?: string; asset_name?: string; download_url?: string } }>(
@@ -216,6 +219,19 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
     const worker = requireOnlineWorker(resolveAuthUser(request)?.user.id, request.params.id);
     request.log.info({ worker: worker.id }, "shutdown queued");
     repo.queueRepo.enqueueJob(worker.id, { type: "shutdown_worker", payload: {} });
+    queueEvents.emit(worker.id);
+    return reply.code(202).send({ ok: true, queued: true });
+  });
+
+  // Workers page "Measure memory speed" button -- queued like shutdown above
+  // (takes its place behind whatever's already running rather than
+  // interrupting it). The client hides the button on a worker whose
+  // capabilities lack "mem-speed-v1"; this route doesn't re-check that
+  // (an older worker just ignores the unrecognised job type, same as any
+  // other capability-gated job -- see shared/types.ts's WORKER_CAPABILITIES).
+  app.post<{ Params: { id: string } }>("/api/workers/:id/measure-memory-speed", async (request, reply) => {
+    const worker = requireOnlineWorker(resolveAuthUser(request)?.user.id, request.params.id);
+    repo.queueRepo.enqueueJob(worker.id, { type: "measure_memory_speed", payload: {} });
     queueEvents.emit(worker.id);
     return reply.code(202).send({ ok: true, queued: true });
   });

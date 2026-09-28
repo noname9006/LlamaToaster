@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { Link } from "react-router-dom";
 import { api } from "../api/client";
 import { useWorkerStatuses } from "../api/useWorkerStatus";
+import { useRocmSupport } from "../api/useRocmSupport";
 import { ChipInput } from "../components/ChipInput";
 import { ModelPicker } from "../components/ModelPicker";
 import { SliderChipInput } from "../components/SliderChipInput";
@@ -275,6 +276,7 @@ export function CustomTest() {
   const [mtpModelId, setMtpModelId] = useState("");
   const [workerId, setWorkerId] = useState("");
   const { order: workerOrder, status: workerStatus } = useWorkerStatuses();
+  const rocmSupport = useRocmSupport();
   // Raw index into the selected worker's hardware.gpu array (the picker's
   // own display order) -- undefined means "Auto" (let llama.cpp use its own
   // default, split across every visible GPU). Distinct from the mainGpu
@@ -991,7 +993,7 @@ export function CustomTest() {
                     return;
                   }
                   const gpu = gpuList[raw];
-                  const required = workerPlatform ? detectBackend(workerPlatform, [gpu]) : workerDefaultBackend;
+                  const required = workerPlatform ? detectBackend(workerPlatform, [gpu], rocmSupport) : workerDefaultBackend;
                   // Only a real mismatch (both known, and different) needs
                   // confirming -- an unreachable/unknown worker backend
                   // falls back to "assume it matches," same as noGpu above,
@@ -1026,7 +1028,7 @@ export function CustomTest() {
                 <option value="">Auto (split across all GPUs)</option>
                 {gpuList.map((g, i) => (
                   <option key={i} value={i}>
-                    {i}: {formatGpuLabel(g)}
+                    {i}: {formatGpuLabel(g, workerHardware?.unified_memory)}
                   </option>
                 ))}
               </select>
