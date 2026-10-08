@@ -115,7 +115,7 @@ export function Settings() {
   if (!authEnabled) {
     return (
       <div>
-        <h1 className="text-2xl font-semibold text-fg">Settings</h1>
+        <h1 className="m-0 font-display text-[32px] font-semibold leading-tight text-fg">Settings</h1>
         <p className="mt-4 text-sm text-muted">
           Account settings aren't available on this deployment — it isn't running with user
           accounts enabled.
@@ -127,7 +127,7 @@ export function Settings() {
   return (
     <div>
       <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-semibold text-fg">Settings</h1>
+        <h1 className="m-0 font-display text-[32px] font-semibold leading-tight text-fg">Settings</h1>
         <a
           href="/auth/logout"
           className="rounded-lg border border-border px-3 py-1.5 text-sm font-semibold text-fg hover:border-danger/40 hover:text-danger"

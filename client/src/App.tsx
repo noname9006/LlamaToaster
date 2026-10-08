@@ -1,6 +1,9 @@
 import { useEffect, useState } from "react";
 import { Routes, Route, useLocation, useNavigate } from "react-router-dom";
-import { Sidebar } from "./components/Sidebar";
+import { NavList, Sidebar } from "./components/Sidebar";
+import { StatusBar } from "./components/StatusBar";
+import { LtIcon } from "./components/ltIcons";
+import { useWorkerStatuses } from "./api/useWorkerStatus";
 import { ChatPanel } from "./components/ChatPanel";
 import { Dashboard } from "./pages/Dashboard";
 import { Models } from "./pages/Models";
@@ -71,15 +74,72 @@ export default function App() {
     );
   }
 
+  return <Shell authStatus={authStatus} />;
+}
+
+// Narrow layouts (< 760px) swap the sidebar for a top bar with a menu drawer,
+// as in the v2 design.
+function useNarrow(): boolean {
+  const query = "(max-width: 759px)";
+  const [narrow, setNarrow] = useState(() => typeof window !== "undefined" && window.matchMedia?.(query).matches === true);
+  useEffect(() => {
+    const mq = window.matchMedia?.(query);
+    if (!mq) return;
+    const onChange = () => setNarrow(mq.matches);
+    mq.addEventListener("change", onChange);
+    return () => mq.removeEventListener("change", onChange);
+  }, []);
+  return narrow;
+}
+
+function Shell({ authStatus }: { authStatus: AuthStatus }) {
+  const narrow = useNarrow();
+  const [drawer, setDrawer] = useState(false);
+  const location = useLocation();
+  const { workers } = useWorkerStatuses();
+  useEffect(() => setDrawer(false), [location.pathname]);
+  const footer = authStatus.user?.displayName ?? null;
+
   return (
-    <div className="flex min-h-screen bg-bg">
-      <Sidebar authEnabled={authStatus.authEnabled} />
-      <main className="h-screen flex-1 overflow-y-auto">
-        <div className="w-full px-8 py-8">
+    <div className="flex min-h-screen flex-wrap bg-bg">
+      <a
+        href="#lt-main"
+        className="absolute -top-12 left-2 z-20 bg-accent px-3.5 py-2.5 font-semibold text-accent-fg focus:top-2"
+      >
+        Skip to content
+      </a>
+      {!narrow && <Sidebar authEnabled={authStatus.authEnabled} footer={footer} />}
+      {narrow && (
+        <>
+          <header className="sticky top-0 z-[8] flex flex-[1_0_100%] items-center gap-2.5 border-b border-border bg-surface px-4 py-1.5">
+            <img src="/toaster_favicon.png" alt="" className="h-7 w-7 object-contain" />
+            <span className="font-display text-lg font-semibold">LlamaToaster</span>
+            <button
+              type="button"
+              onClick={() => setDrawer((d) => !d)}
+              aria-expanded={drawer}
+              aria-controls="lt-drawer"
+              className="ml-auto inline-flex min-h-11 items-center gap-2 border border-border-strong bg-transparent px-3 text-sm text-fg"
+            >
+              <LtIcon name="menu" />
+              Menu
+            </button>
+          </header>
+          {drawer && (
+            <nav id="lt-drawer" aria-label="Main" className="flex flex-[1_0_100%] flex-col gap-0.5 border-b border-border bg-surface p-2">
+              <NavList authEnabled={authStatus.authEnabled} large onNavigate={() => setDrawer(false)} />
+            </nav>
+          )}
+        </>
+      )}
+      <main id="lt-main" className={`min-w-0 flex-[1_1_320px] ${narrow ? "" : "h-screen overflow-y-auto"}`}>
+        <StatusBar workers={workers} sticky={!narrow} />
+        <div className="w-full px-[clamp(16px,4vw,32px)] pb-10 pt-7">
           <Routes>
             <Route path="/" element={<Dashboard />} />
             <Route path="/models" element={<Models />} />
             <Route path="/benchmark" element={<Benchmark />} />
+            <Route path="/new" element={<Benchmark />} />
             <Route path="/custom-test" element={<CustomTest />} />
             <Route path="/tests" element={<Tests />} />
             <Route path="/tests/:id" element={<TestDetail />} />
@@ -90,7 +150,7 @@ export default function App() {
           </Routes>
         </div>
       </main>
-      <ChatPanel />
+      <ChatPanel narrow={narrow} />
     </div>
   );
 }

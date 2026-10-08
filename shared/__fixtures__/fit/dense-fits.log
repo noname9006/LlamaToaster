@@ -1,0 +1,16 @@
+0.00.066.889 I common_params_fit_impl: getting device memory data for initial parameters:
+0.00.330.908 I print_info: n_ctx_train           = 32768
+0.00.330.910 I print_info: n_layer               = 48
+0.00.330.953 I print_info: n_expert              = 0
+0.00.330.954 I print_info: n_expert_used         = 0
+0.00.359.605 I llama_kv_cache: size =  768.00 MiB ( 32768 cells,  48 layers,  1/1 seqs), K (f16):  384.00 MiB, V (f16):  384.00 MiB
+0.00.377.461 I sched_reserve:    Vulkan0 compute buffer size =   300.25 MiB
+0.00.377.464 I sched_reserve: Vulkan_Host compute buffer size =    35.51 MiB
+0.00.377.467 I sched_reserve: graph: nodes = 1638, splits = 2, input objects = 4, input tensors = 6
+0.00.378.540 I common_memory_breakdown_print: | memory breakdown [MiB]   | total   free    self   model   context   compute    unaccounted |
+0.00.378.542 I common_memory_breakdown_print: |   - Vulkan0 (RX 6600 XT) |  8176 = 7378 + (1931 =   863 +     768 +     300) +       -1134 |
+0.00.378.542 I common_memory_breakdown_print: |   - Host                 |                  173 =   137 +       0 +      35                |
+0.00.403.108 I common_params_fit_impl: projected to use 1931 MiB of device memory vs. 7378 MiB of free device memory
+0.00.403.111 I common_params_fit_impl: will leave 5446 >= 1024 MiB of free device memory, no changes needed
+0.00.403.113 I common_fit_params: successfully fit params to free device memory
+0.00.403.119 I common_fit_params: fitting params to free memory took 0.34 seconds

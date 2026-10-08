@@ -87,7 +87,20 @@ import {
   postQualityResult,
   getRocmSupport,
   reportMemorySpeed,
+  postFitPoints,
+  postKvSupport,
 } from "./vps-client.js";
+import { makeFitCaller, runFitMap } from "./fitMap.js";
+import { detectMoe, toArgs as toPlacementArgs } from "../../shared/moePlacement.js";
+import type { FitPoint } from "../../shared/fitParams.js";
+import {
+  candidateExtraServerArgs,
+  threadSweepBenchArgs,
+  THREAD_PP_TOKENS,
+  THREAD_TG_TOKENS,
+  type SpeedRunSpec,
+  type ThreadSweepSpec,
+} from "../../shared/speedRun.js";
 import { measureMemorySpeed } from "./memSpeed.js";
 import { log, configureLogging, setRunLogFile, ansi, paint, colorsEnabled } from "./log.js";
 import {
@@ -133,7 +146,9 @@ import {
   // advertisement.
   METHOD_VERSION,
   WORKER_CAPABILITIES,
+  SPEED_RUN_METHOD_VERSION,
   type TestProbeJobPayload,
+  type FitMapJobPayload,
   type ProbeResultInput,
   type ProbeAttemptReport,
   type MeasureQualityJobPayload,
@@ -886,6 +901,7 @@ function toInstalledBuildList(): InstalledBuild[] {
     active: activeBuild?.tag === b.tag,
     bench_path: b.bench_path,
     server_path: b.server_path,
+    fit_params_path: b.fit_params_path,
   }));
 }
 
@@ -1081,6 +1097,8 @@ interface TestSweepItemInput {
   // filename so the retried attempt's transcript doesn't overwrite the
   // first one's, and gates the retry decision in finalization.
   attempt?: number;
+  /** Appended to llama-bench's args (the thread sweep's -ot/-C/--cpu-strict). */
+  extraArgs?: string[];
 }
 
 // Marker lines llama-bench prints to stderr when run with --progress (see
@@ -1657,6 +1675,7 @@ async function finalizeSweepItemResult(
       gpu_memory_process_peak_source: stats.vram_process_source,
       ram_total_used_avg_mib: stats.ram_total_avg_mib,
       ram_total_used_peak_mib: stats.ram_total_peak_mib,
+      gpu_memory_shared_peak_mib: stats.vram_process_shared_peak_mib,
       gpu_layers_loaded: offload.main?.gpu_layers_loaded ?? null,
       total_model_layers: offload.main?.total_model_layers ?? null,
       gpu_layers_loaded_draft: offload.draft?.gpu_layers_loaded ?? null,
@@ -1972,6 +1991,7 @@ async function runSweepItem(input: TestSweepItemInput): Promise<SweepItemOutcome
       backend,
       mainGpu: input.mainGpu,
       timeoutMs: input.timeoutMs,
+      extraArgs: input.extraArgs,
       onSpawn: (proc) => {
         activeBenchProc = proc;
         sampler.start(proc.pid, backend, TICK_INTERVAL_MS);
@@ -2718,7 +2738,383 @@ async function executeFillCurveJob(payload: BenchmarkJob, spec: FillCurveSpec): 
   }
 }
 
+// --- Optimization flow (docs/plans/OPTIMIZATION_FLOW_REDESIGN.md) ------------
+
+// Steps 0 and 6: one llama-server per candidate, started at the user's target
+// context, then `repeats` cache-free requests of prompt_tokens + n_gen. Every
+// candidate -- the baseline included -- is measured by the same harness, so
+// the numbers compare directly.
+async function executeSpeedRunJob(payload: BenchmarkJob, spec: SpeedRunSpec): Promise<void> {
+  const modelPath = await resolveModelPath(payload.model);
+  if (!existsSync(modelPath)) throw new Error(`model file not found at ${modelPath}`);
+  payload.model = await applyLocalHeader(payload.model, modelPath);
+  const resolvedBuild = getInstalledBuild(buildsDir, payload.llama_cpp_build);
+  if (!resolvedBuild) throw new Error(`build ${payload.llama_cpp_build} is not installed on this worker`);
+  if (!resolvedBuild.server_path) throw new Error("a speed run needs llama-server, and this build has no llama-server binary");
+  const serverPath = resolvedBuild.server_path;
+
+  pauseRequested = false;
+  stopRequested = false;
+  activeBenchProc = null;
+  const template = expandSweep(payload.sweep)[0];
+  setRunLogFile(runLogFilePath(payload.run_id));
+  detectedCpuIsa = await readCpuIsa(resolvedBuild.bench_path).catch(() => null);
+  log.info(
+    `run ${payload.run_id}: speed run -- ${spec.candidates.length} candidate(s) at -c ${spec.target_ctx}, ` +
+      `${spec.prompt_tokens}-token prompt + ${spec.n_gen} generated, ${spec.repeats} repeat(s)`
+  );
+  try {
+    for (let i = 0; i < spec.candidates.length; i++) {
+      const c = spec.candidates[i];
+      const item: SweepItem = {
+        ...template,
+        idx: i,
+        n_prompt: spec.prompt_tokens,
+        n_gen: spec.n_gen,
+        n_depth: 0,
+        concurrency: 1,
+        mtp: "off",
+        n_cpu_moe: 0,
+        n_gpu_layers: c.ngl,
+        cache_type_k: c.ctk,
+        cache_type_v: c.ctv,
+        flash_attn: c.fa,
+        threads: c.threads?.t ?? -1,
+        batch_size: 2048,
+        ubatch_size: 512,
+      };
+      const label = `run ${payload.run_id} item ${i} (speed run: ${c.label})`;
+      while (pauseRequested && !stopRequested) await sleep(500);
+      if (stopRequested) {
+        await safeItemTerminal(payload.run_id, i, { status: "cancelled", error: "cancelled by user" });
+        continue;
+      }
+      updateJobReport({ phase: "benchmarking", item_idx: i, items_total: spec.candidates.length, detail: c.label });
+      const baseline = await captureFreeMemoryBaseline(payload.llama_cpp_backend);
+      sendTick(payload.run_id, i, {
+        status: "loading",
+        ram_free_before_mib: baseline.ram_free_before_mib,
+        vram_free_before_mib: baseline.vram_free_before_mib,
+      });
+      const sampler = new MemorySampler();
+      let server: Awaited<ReturnType<typeof spawnRuntimeServer>> | null = null;
+      try {
+        server = await spawnRuntimeServer({
+          llamaServerPath: serverPath,
+          modelPath,
+          port: config.mtp_server_port ?? DEFAULT_MTP_SERVER_PORT,
+          item,
+          slots: 1,
+          mainGpu: payload.main_gpu,
+          contextSizeOverride: spec.target_ctx,
+          noMmap: true,
+          extraArgs: candidateExtraServerArgs(c),
+          log,
+          onSpawn: (proc) => {
+            activeBenchProc = proc;
+            sampler.start(proc.pid, payload.llama_cpp_backend, TICK_INTERVAL_MS);
+          },
+        });
+        sampler.openSensorWindow();
+        // One short request first, discarded: the first prompt a fresh server
+        // processes runs cold (measured 1,701 +/- 343 pp tok/s vs 1,898 +/- 1
+        // for the same config once warm), which would both widen the spread
+        // and handicap whichever candidate happens to run first.
+        sendTick(payload.run_id, i, { status: "processing", detail: "warm-up request" });
+        await executeCurvePoint({ effectiveCtx: 256, nGen: 16, repeats: 1, port: server.port, log }).catch((err) =>
+          log.warn(`${label}: warm-up request failed (measuring anyway): ${err instanceof Error ? err.message : String(err)}`)
+        );
+        sendTick(payload.run_id, i, { status: "processing", detail: `${spec.prompt_tokens}-token prompt · ${spec.repeats} repeat(s)` });
+        const execution = await executeCurvePoint({
+          effectiveCtx: spec.prompt_tokens,
+          nGen: spec.n_gen,
+          repeats: spec.repeats,
+          port: server.port,
+          log,
+        });
+        const stderr = server.stderr();
+        await server.stop();
+        activeBenchProc = null;
+        const stats = sampler.stop();
+        if (stopRequested) {
+          await safeItemTerminal(payload.run_id, i, { status: "cancelled", error: "cancelled by user" });
+          continue;
+        }
+        if (execution.results.length === 0) {
+          throw new Error(`the server answered every repeat but reported no usable timing: ${execution.warning ?? "no readings at all"}`);
+        }
+        // The curve harness leaves the placement columns blank; a speed-run
+        // row is only interpretable alongside the config it measured.
+        const results = execution.results.map((r) => ({
+          ...r,
+          method_version: SPEED_RUN_METHOD_VERSION,
+          n_threads: item.threads,
+          n_gpu_layers: item.n_gpu_layers,
+          batch_size: item.batch_size,
+          ubatch_size: item.ubatch_size,
+          cache_type_k: item.cache_type_k,
+          cache_type_v: item.cache_type_v,
+          flash_attn: item.flash_attn,
+        }));
+        const bench = toBenchResult({ results, stderr, code: 0, signal: null, warning: execution.warning });
+        await finalizeSweepItemResult(
+          payload.run_id,
+          item,
+          label,
+          "llama-server",
+          bench,
+          stats,
+          baseline,
+          payload.main_gpu,
+          payload.model.size_bytes,
+          payload.model.metadata.tensor_layer_bytes ?? null,
+          0,
+          spec.repeats,
+          detectedCpuIsa
+        );
+      } catch (err) {
+        activeBenchProc = null;
+        const stats = sampler.stop();
+        await server?.stop();
+        const message = err instanceof Error ? err.message : String(err);
+        const status =
+          err instanceof RuntimeServerStartupError
+            ? classifyFailure({ timedOut: false, signal: err.signal, stderr: err.stderr })
+            : "failed";
+        log.error(`${label}: TEST SUMMARY -- engine=llama-server status=${status}\n  error: ${message}`);
+        await safeItemTerminal(payload.run_id, i, {
+          status: stopRequested ? "cancelled" : status,
+          error: stopRequested ? "cancelled by user" : message,
+          ram_peak_mib: stats.ram_peak_mib,
+          vram_peak_mib: stats.vram_peak_mib,
+          ram_avg_mib: stats.ram_avg_mib,
+          vram_avg_mib: stats.vram_avg_mib,
+        });
+      }
+    }
+  } finally {
+    setRunLogFile(null);
+    updateJobReport({ phase: "finalizing", detail: "pushing run log" });
+    await pushTestLogIfPresent(payload.run_id);
+  }
+}
+
+// Step T: the chosen placement measured with llama-bench per thread
+// candidate -- "t" items are generation-only (-p 0 -n 128), "tb" items
+// prompt-only (-p 512 -n 0), where llama-bench's -t is the batch thread count.
+// One process per candidate with its own affinity mask.
+async function executeThreadSweepJob(payload: BenchmarkJob, spec: ThreadSweepSpec): Promise<void> {
+  const modelPath = await resolveModelPath(payload.model);
+  if (!existsSync(modelPath)) throw new Error(`model file not found at ${modelPath}`);
+  payload.model = await applyLocalHeader(payload.model, modelPath);
+  const resolvedBuild = getInstalledBuild(buildsDir, payload.llama_cpp_build);
+  if (!resolvedBuild) throw new Error(`build ${payload.llama_cpp_build} is not installed on this worker`);
+
+  pauseRequested = false;
+  stopRequested = false;
+  activeBenchProc = null;
+  const template = expandSweep(payload.sweep)[0];
+  const rawDir = config.raw_json_dir ?? join(config.model_dir, "raw");
+  setRunLogFile(runLogFilePath(payload.run_id));
+  detectedCpuIsa = await readCpuIsa(resolvedBuild.bench_path).catch(() => null);
+  log.info(`run ${payload.run_id}: thread sweep -- ${spec.items.length} candidate(s), ${spec.repeats} repeat(s)`);
+  try {
+    for (let i = 0; i < spec.items.length; i++) {
+      const t = spec.items[i];
+      while (pauseRequested && !stopRequested) await sleep(500);
+      if (stopRequested) {
+        await safeItemTerminal(payload.run_id, i, { status: "cancelled", error: "cancelled by user" });
+        continue;
+      }
+      const item: SweepItem = {
+        ...template,
+        idx: i,
+        n_prompt: t.role === "tb" ? THREAD_PP_TOKENS : 0,
+        n_gen: t.role === "t" ? THREAD_TG_TOKENS : 0,
+        n_depth: 0,
+        concurrency: 1,
+        mtp: "off",
+        n_cpu_moe: 0,
+        threads: t.threads,
+        n_gpu_layers: spec.placement.ngl,
+        cache_type_k: spec.placement.ctk,
+        cache_type_v: spec.placement.ctv,
+        flash_attn: spec.placement.fa,
+      };
+      updateJobReport({
+        phase: "benchmarking",
+        item_idx: i,
+        items_total: spec.items.length,
+        detail: `${t.role === "t" ? "-t" : "-tb"} ${t.threads} (${t.label})`,
+      });
+      const benchArgs = {
+        runId: payload.run_id,
+        item,
+        repeats: spec.repeats,
+        modelPath,
+        llamaBenchPath: resolvedBuild.bench_path,
+        backend: payload.llama_cpp_backend,
+        mainGpu: payload.main_gpu,
+        timeoutMs: config.bench_timeout_ms,
+        url: config.url,
+        rawJsonDir: rawDir,
+        modelSizeBytes: payload.model.size_bytes,
+        tensorBreakdown: payload.model.metadata.tensor_layer_bytes ?? null,
+        extraArgs: threadSweepBenchArgs(spec.placement.ot, t),
+      };
+      const outcome = await runSweepItem({ ...benchArgs, attempt: 0 });
+      if (outcome.retryForVramFallback) await runSweepItem({ ...benchArgs, attempt: 1 });
+    }
+  } finally {
+    setRunLogFile(null);
+    updateJobReport({ phase: "finalizing", detail: "pushing run log" });
+    await pushTestLogIfPresent(payload.run_id);
+  }
+}
+
+// Steps 1 / 1' / 4 / 5: llama-fit-params only, no model load. Points stream
+// to the server in small batches as they come in; the run's single item
+// carries progress and the final outcome.
+async function executeFitMapJob(payload: FitMapJobPayload): Promise<void> {
+  const modelPath = await resolveModelPath(payload.model);
+  if (!existsSync(modelPath)) throw new Error(`model file not found at ${modelPath}`);
+  const resolvedBuild = getInstalledBuild(buildsDir, payload.llama_cpp_build);
+  if (!resolvedBuild) throw new Error(`build ${payload.llama_cpp_build} is not installed on this worker`);
+  const runId = payload.run_id;
+  const fitPath = resolvedBuild.fit_params_path;
+  if (!fitPath || !(await supportsFlag(fitPath, "--fit-target").catch(() => false))) {
+    await safeItemTerminal(runId, 0, {
+      status: "failed_unsupported",
+      error: `llama.cpp build ${resolvedBuild.tag} has no llama-fit-params with --fit-target -- install a newer build to map context against layers`,
+    });
+    return;
+  }
+
+  pauseRequested = false;
+  stopRequested = false;
+  activeBenchProc = null;
+  setRunLogFile(runLogFilePath(runId));
+  const spec = payload.spec;
+  const deviceArgs =
+    spec.machine === "cpu" ? ["-dev", "none"] : payload.main_gpu != null ? ["-sm", "none", "-mg", String(payload.main_gpu)] : [];
+  log.info(
+    `run ${runId}: fit map -- ${spec.machine}, margin ${spec.margin_mib} MiB, contexts ${spec.ctx_stops.join("/")}, ` +
+      `KV detection ${spec.kv_detect ? "on" : "off"}, KV map ${spec.kv_fit ? "on" : "off"}`
+  );
+  sendTick(runId, 0, { status: "processing", detail: "starting llama-fit-params" });
+
+  // Batched so a few hundred calls don't become a few hundred requests; a
+  // failed post is retried with the next batch rather than lost.
+  const FIT_POINTS_PER_POST = 200;
+  let pending: FitPoint[] = [];
+  let lastFlush = 0;
+  const flush = async (force: boolean) => {
+    if (pending.length === 0) return;
+    if (!force && pending.length < 8 && Date.now() - lastFlush < 3000) return;
+    lastFlush = Date.now();
+    // Chunked: after an outage the backlog can pass the server's per-post cap,
+    // and one oversized post would then be refused forever.
+    while (pending.length > 0) {
+      const batch = pending.slice(0, FIT_POINTS_PER_POST);
+      try {
+        await withAuth((token) => postFitPoints(config.url, token, runId, { machine_id: config.machine_id, points: batch }));
+        pending = pending.slice(batch.length);
+      } catch (err) {
+        const status = err instanceof HttpError ? err.status : null;
+        // 4xx other than timeout/rate-limit won't change on retry (closed run,
+        // invalid point): drop the batch instead of resending it every flush.
+        if (status !== null && status >= 400 && status < 500 && status !== 408 && status !== 429) {
+          log.warn(`fit points refused, dropping ${batch.length}: ${err instanceof Error ? err.message : String(err)}`);
+          pending = pending.slice(batch.length);
+          continue;
+        }
+        log.warn(`fit points post failed (will retry): ${err instanceof Error ? err.message : String(err)}`);
+        return;
+      }
+    }
+  };
+  let lastTick = 0;
+  try {
+    const outcome = await runFitMap({
+      spec,
+      modelPath,
+      backend: payload.llama_cpp_backend,
+      deviceArgs,
+      kvKnown: payload.kv_known,
+      ramBudgetMib: payload.ram_budget_mib ?? null,
+      call: makeFitCaller(fitPath, {
+        onSpawn: (proc) => (activeBenchProc = proc),
+        onExit: () => (activeBenchProc = null),
+      }),
+      report: {
+        point: async (p) => {
+          pending.push(p);
+          await flush(false);
+        },
+        kvRows: async (rows) => {
+          await flush(true);
+          // Losing the KV rows costs the support list, not the map: the
+          // per-size points that follow are posted regardless.
+          for (let attempt = 0; attempt < 3; attempt++) {
+            try {
+              await withAuth((token) => postKvSupport(config.url, token, runId, { machine_id: config.machine_id, rows }));
+              return;
+            } catch (err) {
+              log.warn(`KV support post failed (attempt ${attempt + 1}/3): ${err instanceof Error ? err.message : String(err)}`);
+              await sleep(1000 * (attempt + 1));
+            }
+          }
+        },
+        progress: (done, total, detail) => {
+          updateJobReport({ phase: "benchmarking", item_idx: 0, items_total: 1, detail: `${detail} (${done}/${total})` });
+          const now = Date.now();
+          if (now - lastTick < TICK_INTERVAL_MS) return;
+          lastTick = now;
+          sendTick(runId, 0, { status: "processing", detail: `${detail} · ${done} of ~${total} calls` });
+        },
+      },
+      shouldStop: () => stopRequested,
+      waitWhilePaused: async () => {
+        while (pauseRequested && !stopRequested) await sleep(500);
+      },
+      log,
+    });
+    for (let attempt = 0; attempt < 3 && pending.length > 0; attempt++) await flush(true);
+    const answered = outcome.points.filter((p) => p.verdict !== "error").length;
+    log.info(`run ${runId}: fit map finished -- ${outcome.calls} calls, ${answered}/${outcome.points.length} points answered`);
+    if (outcome.stopped) {
+      await safeItemTerminal(runId, 0, { status: "cancelled", error: "cancelled by user" });
+    } else if (answered === 0) {
+      const firstError = outcome.points.find((p) => p.error)?.error ?? "no answers";
+      await safeItemTerminal(runId, 0, { status: "failed", error: `llama-fit-params produced no usable answer: ${firstError}` });
+    } else {
+      await safeItemTerminal(runId, 0, { status: "done" });
+    }
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    log.error(`run ${runId}: fit map failed: ${message}`);
+    await flush(true);
+    await safeItemTerminal(runId, 0, {
+      status: stopRequested ? "cancelled" : "failed",
+      error: stopRequested ? "cancelled by user" : message,
+    });
+  } finally {
+    activeBenchProc = null;
+    setRunLogFile(null);
+    updateJobReport({ phase: "finalizing", detail: "pushing run log" });
+    await pushTestLogIfPresent(runId);
+  }
+}
+
 async function executeBenchmarkJob(payload: BenchmarkJob): Promise<void> {
+  if (payload.mode === "speed_run") {
+    if (!payload.speed_run) throw new Error("speed_run job is missing its speed_run spec");
+    return executeSpeedRunJob(payload, payload.speed_run);
+  }
+  if (payload.mode === "thread_sweep") {
+    if (!payload.thread_sweep) throw new Error("thread_sweep job is missing its thread_sweep spec");
+    return executeThreadSweepJob(payload, payload.thread_sweep);
+  }
   if (payload.mode === "context_curve" || payload.mode === "knee") {
     return executeRuntimeBenchmarkJob(payload, payload.mode);
   }
@@ -3453,10 +3849,12 @@ async function executeRunProbeJob(payload: TestProbeJobPayload): Promise<void> {
   const maxCtx = payload.trained_ctx ?? payload.candidateCtx;
   // ngl's ceiling is llama.cpp's own "+1" convention (n_layer plus the output
   // pseudo-layer), the same total_model_layers the rest of the app uses.
-  const nglMax =
+  const layerNglMax =
     payload.model.metadata.n_layer != null && payload.model.metadata.n_layer > 0
       ? payload.model.metadata.n_layer + 1
       : payload.placement.ngl;
+  // With a placement ladder the search axis is the ladder's index.
+  const nglMax = payload.ladder && payload.ladder.length > 0 ? payload.ladder.length - 1 : layerNglMax;
 
   // Captured ONCE, before any load -- the ladder's "calculated" anchors are a
   // pre-flight heuristic, not a live-updated one; what's free right before
@@ -3477,7 +3875,11 @@ async function executeRunProbeJob(payload: TestProbeJobPayload): Promise<void> {
 
   // Only ever the first load's layer count (probeOutcome's opener), never a
   // verdict. estimateSafeNgl sizes weights only, so it does not vary with context.
-  function calculateNgl(): number {
+  // The optimization flow seeds every stop with fit's own answer instead.
+  function calculateNgl(ctx: number): number {
+    const seeded = payload.seed?.[String(ctx)];
+    if (typeof seeded === "number") return seeded;
+    if (payload.ladder && payload.ladder.length > 0) return Math.floor(nglMax / 2);
     return estimateSafeNgl(payload.model.size_bytes, nglMax, freeVramMib, payload.model.metadata.tensor_layer_bytes ?? null);
   }
 
@@ -3497,6 +3899,8 @@ async function executeRunProbeJob(payload: TestProbeJobPayload): Promise<void> {
     // Every spill verdict is growth over the anchor load (shared/gpuSpill.ts), so
     // the ladder loads it twice before any search.
     anchored: true,
+    stops: payload.ctx_stops,
+    capNgl: payload.cap ? (ctx: number) => payload.cap?.[String(ctx)] ?? null : undefined,
   };
   log.info(
     `${label}: ${mode} ladder -- context within [${PROBE_LADDER_MIN_CTX}, ${maxCtx}], ` +
@@ -3855,8 +4259,22 @@ const PROBE_READY_HOLD_MS = 3500;
 // After the last token, long enough for the reading covering it to arrive.
 const PROBE_TRAILING_READING_MS = 1200;
 
+// The optimization flow's real-load search runs over a placement ladder
+// (shared/moePlacement.ts): the rung's ngl is then an index into it, and the
+// load's real -ngl / -ot come from the ladder state. Without a ladder the
+// index IS -ngl.
+function probePlacementFor(payload: TestProbeJobPayload, index: number): { ngl: number; ot: string | null } {
+  const ladder = payload.ladder;
+  if (!ladder || ladder.length === 0) return { ngl: index, ot: null };
+  const state = ladder[Math.max(0, Math.min(ladder.length - 1, index))];
+  return toPlacementArgs(state, detectMoe(payload.model.metadata.tensor_layer_bytes ?? null));
+}
+
 async function runOneProbeLoad(input: ProbeLoadInput): Promise<ProbeAttemptOutcome> {
-  const { payload, candidateCtx, ngl, estimate } = input;
+  const { payload, candidateCtx, estimate } = input;
+  // ngl stays the ladder coordinate on the stored row; placed is what loads.
+  const ngl = input.ngl;
+  const placed = probePlacementFor(payload, ngl);
   const sampler = new MemorySampler();
   const trace = new MemoryTrace();
   // Taken BEFORE the spawn, same as every sweep path: "free" has to mean
@@ -3879,13 +4297,13 @@ async function runOneProbeLoad(input: ProbeLoadInput): Promise<ProbeAttemptOutco
     n_depth: 0,
     concurrency: payload.placement.slots,
     threads: 0,
-    // This rung's ngl, not the payload's -- the ladder moves placement too.
-    n_gpu_layers: ngl,
+    // This rung's placement, not the payload's -- the ladder moves it too.
+    n_gpu_layers: placed.ngl,
     batch_size: 2048,
     ubatch_size: 512,
     cache_type_k: payload.kvPair[0],
     cache_type_v: payload.kvPair[1],
-    flash_attn: "on",
+    flash_attn: payload.fa ?? "on",
     mtp: "off",
     n_gpu_layers_draft: 0,
     n_cpu_moe: payload.placement.nCpuMoe ?? 0,
@@ -3901,6 +4319,7 @@ async function runOneProbeLoad(input: ProbeLoadInput): Promise<ProbeAttemptOutco
       slots: payload.placement.slots,
       mainGpu: payload.main_gpu,
       contextSizeOverride: candidateCtx,
+      extraArgs: placed.ot ? ["-ot", placed.ot] : undefined,
       log,
       onSpawn: (proc) => {
         activeBenchProc = proc;
@@ -4035,7 +4454,7 @@ async function runOneProbeLoad(input: ProbeLoadInput): Promise<ProbeAttemptOutco
       gpuTotalMib: payload.gpu_total_mib ?? null,
       generated,
       genTps,
-      ngl,
+      ngl: placed.ngl,
       estimatedVramMib: estimate?.vramMib ?? null,
       vramProcessPeakMib: stats.vram_process_peak_mib,
       gpuBuffers,
@@ -4064,7 +4483,7 @@ async function runOneProbeLoad(input: ProbeLoadInput): Promise<ProbeAttemptOutco
         : null;
     const modelBufferSizes = parseModelBufferSizes(serverOutput)?.main ?? null;
     const resident = computeResidentLayers(
-      ngl > 0 && totalModelLayers != null ? { gpu_layers_loaded: ngl, total_model_layers: totalModelLayers } : null,
+      placed.ngl > 0 && totalModelLayers != null ? { gpu_layers_loaded: placed.ngl, total_model_layers: totalModelLayers } : null,
       modelBufferSizes,
       /* exactOnly */ true
     );
@@ -4369,6 +4788,8 @@ async function executeJob(job: SerialQueueJob): Promise<void> {
       return executeRunProbeJob(job.payload);
     case "measure_quality":
       return executeMeasureQualityJob(job.payload);
+    case "fit_map":
+      return executeFitMapJob(job.payload);
     case "refresh_models":
       return executeRefreshModelsJob();
     case "shutdown_worker":

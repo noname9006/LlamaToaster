@@ -49,6 +49,8 @@ export interface BenchRunInput {
   // phases itself.
   onStderrLine?: (line: string) => void;
   log?: BenchLogger;
+  /** Appended verbatim: -ot, -C, --cpu-strict (optimization flow). */
+  extraArgs?: string[];
 }
 
 // Idle-activity budget, not a total-runtime cap -- see runBench's timer
@@ -196,6 +198,7 @@ export async function buildArgs(input: BenchRunInput): Promise<string[]> {
   if (await supportsFlag(input.llamaBenchPath, "--mmap").catch(() => false)) {
     args.push("--mmap", "0");
   }
+  if (input.extraArgs?.length) args.push(...input.extraArgs);
   return args;
 }
 

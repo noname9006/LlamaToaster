@@ -6,7 +6,9 @@ are meant to be driven by the SPA, not called directly).
 
 | Method | Path | Purpose |
 |---|---|---|
-| POST | `/api/tests/trigger` | Queue a sweep against one of your own machines |
+| POST | `/api/tests/trigger` | Queue a sweep against one of your own machines (also the optimization flow's `fit`, speed-run and thread-sweep runs) |
+| GET | `/api/flows/:flowId` | every run of one New test optimization session |
+| GET | `/api/tests/:id/fit-points` | a fit run's llama-fit-params answers plus the machine's K/V cache support rows |
 | GET | `/api/tests` | list your own tests |
 | GET | `/api/tests/:id` | test detail + results |
 | POST | `/api/tests/:id/pause` \| `/resume` \| `/stop` | control a running sweep |

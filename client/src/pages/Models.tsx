@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { api, ApiError } from "../api/client";
+import { ModelFitTable } from "../components/optimize/ModelFitTable";
 import { StatusPill } from "../components/StatusPill";
 import {
   IconAlertTriangle,
@@ -1507,12 +1508,16 @@ export function Models() {
 
   return (
     <div>
-      <h1 className="text-2xl font-semibold text-fg">Models</h1>
+      <h1 className="m-0 font-display text-[32px] font-semibold leading-tight text-fg">Models</h1>
       <p className="mt-1 text-sm text-muted">
         The model catalog (filenames and metadata) is shared across every user, so downloads can be
         deduplicated — a filename you register or download may be visible to others. Benchmark
         results themselves are never shared unless you opt in (Settings).
       </p>
+
+      <div className="mt-6">
+        <ModelFitTable />
+      </div>
 
       <section className="mt-6">
         <h2 className="text-sm font-semibold uppercase tracking-wide text-muted">My models</h2>

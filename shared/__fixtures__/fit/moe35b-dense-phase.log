@@ -1,0 +1,116 @@
+0.00.070.309 I common_params_fit_impl: getting device memory data for initial parameters:
+0.00.509.135 I print_info: n_ctx_train           = 262144
+0.00.509.137 I print_info: n_layer               = 40
+0.00.509.186 I print_info: n_expert              = 256
+0.00.509.186 I print_info: n_expert_used         = 8
+0.00.543.870 I llama_kv_cache: size = 5120.00 MiB (262144 cells,  10 layers,  1/1 seqs), K (f16): 2560.00 MiB, V (f16): 2560.00 MiB
+0.00.585.647 I sched_reserve:    Vulkan0 compute buffer size =   494.00 MiB
+0.00.585.650 I sched_reserve: Vulkan_Host compute buffer size =   264.02 MiB
+0.00.585.651 I sched_reserve: graph: nodes = 3787, splits = 2, input objects = 4, input tensors = 7
+0.00.586.810 I common_memory_breakdown_print: | memory breakdown [MiB]   | total   free     self   model   context   compute    unaccounted |
+0.00.586.811 I common_memory_breakdown_print: |   - Vulkan0 (RX 6600 XT) |  8176 = 7315 + (22356 = 16679 +    5182 +     494) +      -21495 |
+0.00.586.812 I common_memory_breakdown_print: |   - Host                 |                   779 =   515 +       0 +     264                |
+0.00.638.270 I common_params_fit_impl: projected to use 22356 MiB of device memory vs. 7315 MiB of free device memory
+0.00.638.273 I common_params_fit_impl: cannot meet free memory target of 4500 MiB, need to reduce device memory by 19540 MiB
+0.00.638.274 I common_params_fit_impl: context size set by user to 262144 -> no change
+0.00.638.279 I common_params_fit_impl: getting device memory data with all MoE tensors moved to system memory:
+0.01.077.638 I print_info: n_ctx_train           = 262144
+0.01.077.639 I print_info: n_layer               = 40
+0.01.077.662 I print_info: n_expert              = 256
+0.01.077.662 I print_info: n_expert_used         = 8
+0.01.104.041 I llama_kv_cache: size = 5120.00 MiB (262144 cells,  10 layers,  1/1 seqs), K (f16): 2560.00 MiB, V (f16): 2560.00 MiB
+0.01.145.227 I sched_reserve:    Vulkan0 compute buffer size =   628.00 MiB
+0.01.145.229 I sched_reserve: Vulkan_Host compute buffer size =   264.02 MiB
+0.01.145.236 I sched_reserve: graph (pp bs=512, tg bs=1): nodes = 3787 / 3787, splits = 122 / 82, input objects = 4 / 4, input tensors = 7 / 7
+0.01.146.650 I common_memory_breakdown_print: | memory breakdown [MiB]   | total   free     self   model   context   compute    unaccounted |
+0.01.146.652 I common_memory_breakdown_print: |   - Vulkan0 (RX 6600 XT) |  8176 = 7315 + ( 7732 =  1921 +    5182 +     628) +       -6871 |
+0.01.146.653 I common_memory_breakdown_print: |   - Host                 |                 15537 = 15273 +       0 +     264                |
+0.01.198.762 I common_params_fit_impl: with only dense weights in device memory there is still a total deficit of 4916 MiB
+0.01.198.766 I common_params_fit_impl: id=0, target=2815 MiB
+0.01.632.725 I print_info: n_ctx_train           = 262144
+0.01.632.727 I print_info: n_layer               = 40
+0.01.632.752 I print_info: n_expert              = 256
+0.01.632.752 I print_info: n_expert_used         = 8
+0.01.660.660 I llama_kv_cache: size = 5120.00 MiB (262144 cells,  10 layers,  1/1 seqs), K (f16): 2560.00 MiB, V (f16): 2560.00 MiB
+0.01.677.032 I sched_reserve:    Vulkan0 compute buffer size =  1138.85 MiB
+0.01.677.035 I sched_reserve: Vulkan_Host compute buffer size =   276.11 MiB
+0.01.677.038 I sched_reserve: graph (pp bs=512, tg bs=1): nodes = 3787 / 3787, splits = 844 / 61, input objects = 4 / 4, input tensors = 7 / 7
+0.01.678.187 I common_memory_breakdown_print: | memory breakdown [MiB]   | total   free     self   model   context   compute    unaccounted |
+0.01.678.189 I common_memory_breakdown_print: |   - Vulkan0 (RX 6600 XT) |  8176 = 7378 + ( 1138 =     0 +       0 +    1138) +        -341 |
+0.01.678.189 I common_memory_breakdown_print: |   - Host                 |                 22653 = 17194 +    5182 +     276                |
+0.01.729.884 I common_params_fit_impl: memory for test allocation by device:
+0.01.729.890 I common_params_fit_impl: id=0, n_layer= 0, n_part= 0, overflow_type=4, mem=  1138 MiB
+0.01.729.942 I common_params_fit_impl: filling dense-only layers back-to-front:
+0.02.127.386 I print_info: n_ctx_train           = 262144
+0.02.127.388 I print_info: n_layer               = 40
+0.02.127.415 I print_info: n_expert              = 256
+0.02.127.415 I print_info: n_expert_used         = 8
+0.02.208.350 I llama_kv_cache: size = 5120.00 MiB (262144 cells,  10 layers,  1/1 seqs), K (f16): 2560.00 MiB, V (f16): 2560.00 MiB
+0.02.256.299 I sched_reserve:    Vulkan0 compute buffer size =   635.00 MiB
+0.02.256.301 I sched_reserve: Vulkan_Host compute buffer size =   264.02 MiB
+0.02.256.305 I sched_reserve: graph (pp bs=512, tg bs=1): nodes = 3787 / 3787, splits = 119 / 80, input objects = 4 / 4, input tensors = 7 / 7
+0.02.257.535 I common_memory_breakdown_print: | memory breakdown [MiB]   | total   free     self   model   context   compute    unaccounted |
+0.02.257.537 I common_memory_breakdown_print: |   - Vulkan0 (RX 6600 XT) |  8176 = 7315 + ( 8103 =  2285 +    5182 +     635) +       -7242 |
+0.02.257.538 I common_memory_breakdown_print: |   - Host                 |                 15173 = 14909 +       0 +     264                |
+0.02.308.400 I common_params_fit_impl: memory for test allocation by device:
+0.02.308.405 I common_params_fit_impl: id=0, n_layer=41, n_part=40, overflow_type=4, mem=  8103 MiB
+0.02.308.407 I common_params_fit_impl: start filling device 0, delta=41
+0.02.717.306 I print_info: n_ctx_train           = 262144
+0.02.717.308 I print_info: n_layer               = 40
+0.02.717.342 I print_info: n_expert              = 256
+0.02.717.343 I print_info: n_expert_used         = 8
+0.02.765.711 I llama_kv_cache: size = 5120.00 MiB (262144 cells,  10 layers,  1/1 seqs), K (f16): 2560.00 MiB, V (f16): 2560.00 MiB
+0.02.788.271 I sched_reserve:    Vulkan0 compute buffer size =  1069.00 MiB
+0.02.788.274 I sched_reserve: Vulkan_Host compute buffer size =   276.11 MiB
+0.02.788.277 I sched_reserve: graph (pp bs=512, tg bs=1): nodes = 3787 / 3787, splits = 695 / 64, input objects = 4 / 4, input tensors = 7 / 7
+0.02.789.521 I common_memory_breakdown_print: | memory breakdown [MiB]   | total   free     self   model   context   compute    unaccounted |
+0.02.789.524 I common_memory_breakdown_print: |   - Vulkan0 (RX 6600 XT) |  8176 = 7365 + ( 3172 =  1066 +    1036 +    1069) +       -2362 |
+0.02.789.524 I common_memory_breakdown_print: |   - Host                 |                 20550 = 16128 +    4146 +     276                |
+0.02.844.514 I common_params_fit_impl: memory for test allocation by device:
+0.02.844.520 I common_params_fit_impl: id=0, n_layer= 9, n_part= 8, overflow_type=4, mem=  3172 MiB
+0.02.844.527 I common_params_fit_impl: set ngl_per_device_high[0].n_layer=9
+0.03.248.226 I print_info: n_ctx_train           = 262144
+0.03.248.228 I print_info: n_layer               = 40
+0.03.248.252 I print_info: n_expert              = 256
+0.03.248.252 I print_info: n_expert_used         = 8
+0.03.280.856 I llama_kv_cache: size = 5120.00 MiB (262144 cells,  10 layers,  1/1 seqs), K (f16): 2560.00 MiB, V (f16): 2560.00 MiB
+0.03.301.182 I sched_reserve:    Vulkan0 compute buffer size =  1069.00 MiB
+0.03.301.184 I sched_reserve: Vulkan_Host compute buffer size =   276.11 MiB
+0.03.301.187 I sched_reserve: graph (pp bs=512, tg bs=1): nodes = 3787 / 3787, splits = 733 / 64, input objects = 4 / 4, input tensors = 7 / 7
+0.03.302.321 I common_memory_breakdown_print: | memory breakdown [MiB]   | total   free     self   model   context   compute    unaccounted |
+0.03.302.323 I common_memory_breakdown_print: |   - Vulkan0 (RX 6600 XT) |  8176 = 7370 + ( 3154 =  1052 +    1032 +    1069) +       -2348 |
+0.03.302.324 I common_memory_breakdown_print: |   - Host                 |                 20568 = 16141 +    4150 +     276                |
+0.03.368.164 I common_params_fit_impl: memory for test allocation by device:
+0.03.368.169 I common_params_fit_impl: id=0, n_layer= 7, n_part= 6, overflow_type=4, mem=  3154 MiB
+0.03.368.171 I common_params_fit_impl: set ngl_per_device_high[0].n_layer=7
+0.03.786.368 I print_info: n_ctx_train           = 262144
+0.03.786.370 I print_info: n_layer               = 40
+0.03.786.394 I print_info: n_expert              = 256
+0.03.786.394 I print_info: n_expert_used         = 8
+0.03.817.083 I llama_kv_cache: size = 5120.00 MiB (262144 cells,  10 layers,  1/1 seqs), K (f16): 2560.00 MiB, V (f16): 2560.00 MiB
+0.03.840.048 I sched_reserve:    Vulkan0 compute buffer size =  1069.00 MiB
+0.03.840.052 I sched_reserve: Vulkan_Host compute buffer size =   276.11 MiB
+0.03.840.059 I sched_reserve: graph (pp bs=512, tg bs=1): nodes = 3787 / 3787, splits = 767 / 62, input objects = 4 / 4, input tensors = 7 / 7
+0.03.841.540 I common_memory_breakdown_print: | memory breakdown [MiB]   | total   free     self   model   context   compute    unaccounted |
+0.03.841.542 I common_memory_breakdown_print: |   - Vulkan0 (RX 6600 XT) |  8176 = 7372 + ( 2501 =   914 +     518 +    1069) +       -1697 |
+0.03.841.543 I common_memory_breakdown_print: |   - Host                 |                 21221 = 16280 +    4664 +     276                |
+0.03.897.056 I common_params_fit_impl: memory for test allocation by device:
+0.03.897.061 I common_params_fit_impl: id=0, n_layer= 5, n_part= 4, overflow_type=4, mem=  2501 MiB
+0.03.897.063 I common_params_fit_impl: set ngl_per_device[0].n_layer=5
+0.04.303.186 I print_info: n_ctx_train           = 262144
+0.04.303.188 I print_info: n_layer               = 40
+0.04.303.210 I print_info: n_expert              = 256
+0.04.303.211 I print_info: n_expert_used         = 8
+0.04.334.239 I llama_kv_cache: size = 5120.00 MiB (262144 cells,  10 layers,  1/1 seqs), K (f16): 2560.00 MiB, V (f16): 2560.00 MiB
+0.04.353.603 I sched_reserve:    Vulkan0 compute buffer size =  1069.00 MiB
+0.04.353.605 I sched_reserve: Vulkan_Host compute buffer size =   276.11 MiB
+0.04.353.609 I sched_reserve: graph (pp bs=512, tg bs=1): nodes = 3787 / 3787, splits = 752 / 64, input objects = 4 / 4, input tensors = 7 / 7
+0.04.354.771 I common_memory_breakdown_print: | memory breakdown [MiB]   | total   free     self   model   context   compute    unaccounted |
+0.04.354.773 I common_memory_breakdown_print: |   - Vulkan0 (RX 6600 XT) |  8176 = 7372 + ( 3046 =   947 +    1030 +    1069) +       -2242 |
+0.04.354.773 I common_memory_breakdown_print: |   - Host                 |                 20676 = 16247 +    4152 +     276                |
+0.04.406.832 I common_params_fit_impl: memory for test allocation by device:
+0.04.406.837 I common_params_fit_impl: id=0, n_layer= 6, n_part= 5, overflow_type=4, mem=  3046 MiB
+0.04.406.840 I common_params_fit_impl: set ngl_per_device_high[0].n_layer=6
+0.04.406.841 I common_params_fit_impl:   - Vulkan0 (AMD Radeon RX 6600 XT):  5 layers,   2501 MiB used,   4814 MiB free
+0.04.406.843 I common_fit_params: successfully fit params to free device memory
+0.04.406.847 I common_fit_params: fitting params to free memory took 4.34 seconds

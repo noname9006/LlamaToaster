@@ -3,6 +3,7 @@ import { ProfileCards } from "../components/ProfileCards";
 import { CurvesPanel, KneeChart } from "../components/CurvesPanel";
 import { FillCurveChart } from "../components/FillCurveChart";
 import { ProbeAttempts } from "../components/ProbeAttempts";
+import { FlowRunPanels, isFlowRun } from "../components/optimize/FlowRunPanels";
 import { ProbeFrontier } from "../components/ProbeFrontier";
 import { api as apiClient } from "../api/client";
 import { priceMatrix, ETA_UNAVAILABLE } from "../../../shared/pricing";
@@ -1039,7 +1040,7 @@ export function TestDetail() {
 
   return (
     <div>
-      <h1 className="text-2xl font-semibold text-fg">
+      <h1 className="m-0 font-display text-[32px] font-semibold leading-tight text-fg">
         Test <code className="text-lg text-muted">{shortId(id)}</code>
       </h1>
       {run && (
@@ -1094,6 +1095,17 @@ export function TestDetail() {
         </div>
       )}
 
+      {/* Optimization flow runs (fit map, speed tests, thread sweep). */}
+      {run && isFlowRun(run) && (
+        <FlowRunPanels
+          run={run}
+          items={items}
+          results={results}
+          model={models.find((m) => m.id === run.model_id) ?? null}
+          refreshKey={pollTick}
+        />
+      )}
+
       {/* N2 -- a probe's own ladder(s). First, because a probe produces no
           scored cards, curve or sustained-state content: those sections all
           render empty for it, so its real results belong at the top. A batch
@@ -1143,7 +1155,7 @@ export function TestDetail() {
 
       {/* M3 -- the scored cards. Only once measuring has stopped: scoring a
           half-finished run would rank on a moving target. */}
-      {run && (run.status === "done" || run.status === "partial") && fillCurveCtx == null && (
+      {run && !isFlowRun(run) && (run.status === "done" || run.status === "partial") && fillCurveCtx == null && (
         <section className="mt-6">
           <h2 className="text-sm font-semibold uppercase tracking-wide text-muted">Scored profiles</h2>
           <div className="mt-3">
@@ -1153,7 +1165,7 @@ export function TestDetail() {
       )}
 
       {/* N1 + N5 -- the curve and the knee, both derived on read. */}
-      {run && (
+      {run && !isFlowRun(run) && (
         <section className="mt-6">
           <h2 className="text-sm font-semibold uppercase tracking-wide text-muted">Context curve &amp; concurrency</h2>
           <div className="mt-3 flex flex-col gap-3">

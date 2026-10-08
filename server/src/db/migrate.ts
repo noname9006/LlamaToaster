@@ -180,6 +180,10 @@ const COLUMN_MIGRATIONS: ColumnSpec[] = [
   { table: "results", column: "gpu_memory_process_peak_source", ddlType: "TEXT" },
   { table: "results", column: "ram_total_used_avg_mib", ddlType: "INTEGER" },
   { table: "results", column: "ram_total_used_peak_mib", ddlType: "INTEGER" },
+  // Peak system-RAM-backed GPU allocation of the benchmark process (Windows
+  // WDDM "Shared Usage", Linux amdgpu GTT) -- the optimization flow's "ran,
+  // but X GB lived in system RAM" reading.
+  { table: "results", column: "gpu_memory_shared_peak_mib", ddlType: "INTEGER" },
   { table: "results", column: "gpu_layers_loaded", ddlType: "INTEGER" },
   { table: "results", column: "total_model_layers", ddlType: "INTEGER" },
   // The MTP/draft companion model's own actual offload -- see

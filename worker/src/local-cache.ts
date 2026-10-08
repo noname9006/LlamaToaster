@@ -271,6 +271,14 @@ export class LocalModelCache {
       this.db.exec(`UPDATE local_model_cache SET gguf_checked_at = NULL`);
       this.db.pragma("user_version = 2");
     }
+
+    // tensor_layer_bytes' expert bucket now also matches the fused
+    // ffn_gate_up_exps / _chexps names (shared/gguf.ts's MOE_EXPERT_TENSOR):
+    // rows read before that counted those experts as dense weights.
+    if (cacheSchemaVersion < 3) {
+      this.db.exec(`UPDATE local_model_cache SET gguf_checked_at = NULL`);
+      this.db.pragma("user_version = 3");
+    }
   }
 
   // Every column, shared by all three SELECT sites (get/getAll/getBySha256)

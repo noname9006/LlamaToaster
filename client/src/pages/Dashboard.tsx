@@ -1,35 +1,18 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import { api } from "../api/client";
-import { StatCard } from "../components/StatCard";
-import { TestStatusPill, StatusPill, type PillTone } from "../components/StatusPill";
 import { TokSpeedDemo } from "../components/TokSpeedDemo";
 import { platformLabel } from "../components/WorkerCard";
-import { IconX } from "../components/icons";
+import { LtIcon } from "../components/ltIcons";
+import { Btn, PageHeader } from "../components/optimize/ui";
 import type { AdminStats, Test, Worker } from "../types";
-import { shortId } from "../utils";
-import { HardwareSummary } from "../components/HardwareSummary";
+import { jobPercent } from "../jobProgress";
+import { kindLabel, testStatusView } from "../testLabels";
 
-// Multi-user Stage 5 (MULTIUSER_PLAN.md §5.2) originally made this page
-// "machines, not users": every stat card except "Users" derived from the
-// caller's own api.listWorkers()/api.listTests() (Stage 4's §4.3/§4.5
-// scoping), with only a total account count shown platform-wide. Later
-// operator request reversed that for the stat-card row specifically: all six
-// cards now come from one GET /api/stats call (server/src/routes/stats.ts),
-// which is the same unscoped repo.adminRepo.stats() query the admin surface
-// uses -- aggregate counts only, no per-user breakdown, so it carries the
-// same "just a count" reasoning that already justified exposing the users
-// total here. Every signed-in user sees the same platform-wide numbers, not
-// just a superadmin. The machine list and "Recent tests" section BELOW the
-// stat cards are still the caller's own, via listWorkers()/listTests() --
-// only the headline totals went platform-wide. The full cross-tenant *table*
-// view (every user's own machines/runs, filterable) still lives entirely on
-// the separate admin origin (§5.1).
-const WORKER_STATUS_TONE: Record<Worker["status"], PillTone> = {
-  offline: "danger",
-  idle: "muted",
-  busy: "accent",
-};
+// The v2 dashboard (docs/plans/app-v2.dc.html): your machines as cards --
+// what each one is doing right now, its memory, one action -- then recent
+// tests. Platform-wide totals (GET /api/stats, an operator request) stay as
+// one quiet line at the bottom; the machine and test lists are the caller's own.
 
 const HIDDEN_WORKERS_STORAGE_KEY = "llamatoaster:dashboard:hidden-workers";
 
@@ -46,106 +29,120 @@ function writeHiddenWorkers(ids: string[]): void {
   try {
     localStorage.setItem(HIDDEN_WORKERS_STORAGE_KEY, JSON.stringify(ids));
   } catch {
-    /* localStorage unavailable (private browsing, quota) -- hiding just won't survive a reload */
+    /* localStorage unavailable -- hiding just won't survive a reload */
   }
 }
 
-// worker_id is the real FK (MULTIUSER_PLAN.md §1.2); worker_name is only a
-// point-in-time snapshot taken when the test ran, so a run predating that
-// column (or a since-renamed worker) falls back to matching the name that
-// was true back then.
+// worker_id is the real FK; worker_name is only a point-in-time snapshot, so
+// a run predating that column falls back to matching the name.
 function testMatchesWorker(r: Test, worker: Worker): boolean {
   return r.worker_id ? r.worker_id === worker.id : r.worker_name === worker.displayName;
 }
 
+function modelLabel(t: Test): string {
+  return (t.model_filename ?? t.model_id).replace(/\.gguf$/i, "").split(/[\\/]/).pop() ?? t.model_id;
+}
+
 function MachineCard({
   worker,
-  modelsTested,
-  testsPerformed,
-  selected,
+  runs,
   hidden,
-  onSelect,
   onHide,
   onUnhide,
 }: {
   worker: Worker;
-  modelsTested: number;
-  testsPerformed: number;
-  selected: boolean;
+  runs: Test[];
   hidden: boolean;
-  onSelect: () => void;
   onHide: () => void;
   onUnhide: () => void;
 }) {
+  const navigate = useNavigate();
+  const testing = worker.status === "busy";
+  const offline = worker.status === "offline";
+  const mine = runs.filter((r) => testMatchesWorker(r, worker));
+  const active = mine.find((r) => r.status === "running");
+  const queued = mine.filter((r) => r.status === "scheduled").length;
+  const last = mine.find((r) => r.status !== "running" && r.status !== "scheduled");
+  const gpu = worker.hardware?.gpu[0];
+  const vramTotal = worker.vram?.ok ? worker.vram.gpu_memory_total_mib : gpu?.vram_listed_total_mb ?? gpu?.vram_mb ?? null;
+  const vramFree = worker.vram?.ok ? worker.vram.vram_free_before_mib : null;
+  const ramTotal = worker.hardware?.mem_total_bytes ? worker.hardware.mem_total_bytes / 1048576 : null;
+  const ramFree = worker.vram?.ram_free_before_mib ?? null;
+  const memLabel = vramTotal ? "VRAM" : "RAM";
+  const total = vramTotal ?? ramTotal;
+  const free = vramTotal ? vramFree : ramFree;
+  const used = total != null && free != null ? Math.max(0, total - free) : null;
+  const pct = total && used != null ? Math.round((used / total) * 100) : 0;
+  const progress = worker.activeJobProgress;
+  const progressPct = jobPercent(progress?.detail, progress?.item_idx, progress?.items_total ?? active?.items_total);
+  const stateLabel = testing ? "Testing" : offline ? "Offline" : queued ? `Online · ${queued} queued` : "Online · idle";
+
   return (
-    <div
-      role="button"
-      tabIndex={0}
-      onClick={onSelect}
-      onKeyDown={(e) => {
-        if (e.key === "Enter" || e.key === " ") {
-          e.preventDefault();
-          onSelect();
-        }
-      }}
-      className={`flex cursor-pointer flex-col gap-2 rounded-lg border px-4 py-3 text-left transition-colors ${
-        selected ? "border-accent/50 bg-accent/10" : "border-border bg-surface hover:border-accent/30"
-      } ${hidden ? "border-dashed opacity-60" : ""}`}
-    >
-      <div className="flex items-center gap-2">
-        <span className="truncate text-sm font-medium text-fg">{worker.displayName}</span>
-        <StatusPill label={worker.status} tone={WORKER_STATUS_TONE[worker.status]} />
-        <span className="ml-auto flex-none">
-          {hidden ? (
-            <button
-              type="button"
-              onClick={(e) => {
-                e.stopPropagation();
-                onUnhide();
-              }}
-              className="text-xs font-semibold text-muted hover:text-accent"
-            >
-              Unhide
-            </button>
-          ) : (
-            <button
-              type="button"
-              onClick={(e) => {
-                e.stopPropagation();
-                onHide();
-              }}
-              className="text-xs font-semibold text-muted hover:text-danger"
-            >
-              Hide
-            </button>
-          )}
+    <article className={`relative flex flex-col gap-3 border bg-surface p-4 ${testing ? "border-accent" : "border-border"} ${hidden ? "border-dashed opacity-60" : ""}`}>
+      {testing && (
+        <span aria-hidden="true" className="absolute -top-3.5 right-6 flex gap-1.5">
+          <span className="lt-steam block h-3 w-0.5 bg-muted" />
+          <span className="lt-steam block h-3 w-0.5 bg-muted [animation-delay:1.1s]" />
         </span>
-      </div>
-      <div className="text-xs text-muted">
-        {/* One row per piece, every GPU with max usable / total VRAM -- see HardwareSummary. */}
-        {worker.hardware ? (
-          <HardwareSummary
-            hardware={worker.hardware}
-            platform={worker.platform}
-            layout="lines"
-            className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-0.5 text-xs"
-          />
-        ) : (
-          platformLabel(worker.platform)
-        )}
-      </div>
-      <div className="mt-1 flex items-center gap-4 text-xs">
-        <span className="text-fg">
-          {modelsTested} <span className="text-muted">models tested</span>
-        </span>
-        <span className="text-fg">
-          {testsPerformed} <span className="text-muted">tests performed</span>
-        </span>
-      </div>
-      {worker.status === "busy" && worker.activeJobProgress && (
-        <span className="text-xs text-muted">{worker.activeJobProgress.detail ?? worker.activeJobProgress.phase}</span>
       )}
-    </div>
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <h3 className="m-0 truncate font-mono text-sm font-medium">{worker.displayName}</h3>
+        <span className="inline-flex items-center gap-1.5 font-mono text-xs text-fg-2">
+          <span
+            aria-hidden="true"
+            className={`h-2 w-2 rounded-full border ${offline ? "border-muted bg-transparent" : testing ? "lt-pulse border-accent bg-accent" : "border-online bg-online"}`}
+          />
+          {stateLabel}
+        </span>
+      </div>
+      <p className="m-0 font-mono text-xs leading-relaxed text-muted">
+        {gpu ? `${gpu.model}${vramTotal ? ` · ${(vramTotal / 1024).toFixed(0)} GB` : ""} · ${worker.backend ?? "?"}` : `No GPU · ${worker.backend ?? "cpu"} backend`}
+        <br />
+        {worker.hardware?.os?.name ?? platformLabel(worker.platform)}
+        {worker.hardware?.cpu.brand ? ` · ${worker.hardware.cpu.brand.replace(/\s+\d+-Core Processor$/, "")}` : ""}
+        {ramTotal ? ` · ${Math.round(ramTotal / 1024)} GB` : ""}
+      </p>
+      <div>
+        <div className="flex justify-between font-mono text-xs text-muted">
+          <span>{memLabel}</span>
+          <span>{offline || used == null || total == null ? `— / ${total ? (total / 1024).toFixed(1) : "?"} GB` : `${(used / 1024).toFixed(1)} / ${(total / 1024).toFixed(1)} GB`}</span>
+        </div>
+        <div aria-hidden="true" className="mt-1 h-3 border border-border-strong bg-well p-0.5 shadow-[inset_0_2px_0_var(--color-bg)]">
+          <span className="block h-full bg-muted" style={{ width: `${offline ? 0 : pct}%` }} />
+        </div>
+      </div>
+      {testing ? (
+        <div>
+          <p className="m-0 text-sm text-fg">{active ? `${modelLabel(active)} · ${kindLabel(active)}` : progress?.phase ?? "working"}</p>
+          <div className="mt-1.5 h-2 border border-border-strong bg-well">
+            <span className="lt-progress-fill block h-full" style={{ width: `${Math.max(5, progressPct)}%` }} />
+          </div>
+          {progress?.detail && <p className="mt-1.5 truncate font-mono text-xs text-fg-2">{progress.detail}</p>}
+        </div>
+      ) : (
+        <p className="m-0 text-sm text-fg-2">
+          {offline
+            ? "Start the worker on the machine; queued tests wait for it."
+            : last
+              ? `Last: ${modelLabel(last)} · ${kindLabel(last)} · ${testStatusView(last).label.toLowerCase()}`
+              : "No tests on this machine yet."}
+        </p>
+      )}
+      <div className="mt-auto flex flex-wrap items-center gap-2">
+        <Btn
+          onClick={() => {
+            if (testing && active) navigate(`/tests/${active.id}`);
+            else if (offline) navigate("/workers");
+            else navigate("/benchmark");
+          }}
+        >
+          {testing ? "View test" : offline ? "Reconnect steps" : "Start test here"}
+        </Btn>
+        <Btn kind="ghost" onClick={hidden ? onUnhide : onHide}>
+          {hidden ? "Unhide" : "Hide"}
+        </Btn>
+      </div>
+    </article>
   );
 }
 
@@ -154,33 +151,22 @@ export function Dashboard() {
   const [workers, setWorkers] = useState<Worker[]>([]);
   const [stats, setStats] = useState<AdminStats | null>(null);
   const [loaded, setLoaded] = useState(false);
-  const [selectedWorkerId, setSelectedWorkerId] = useState<string | null>(null);
   const [hiddenWorkerIds, setHiddenWorkerIds] = useState<string[]>(() => readHiddenWorkers());
   const [showHidden, setShowHidden] = useState(false);
-  const [hideFailed, setHideFailed] = useState(false);
-  const [hideCancelled, setHideCancelled] = useState(false);
   const timerRef = useRef<number | undefined>(undefined);
 
-  // Self-rescheduling poll (same shape as Workers page's useWorkerStatuses)
-  // rather than a one-shot fetch -- a worker's build install/activate here
-  // used to look permanently stuck at its pre-job state since nothing ever
-  // refetched after the initial mount.
   useEffect(() => {
     let cancelled = false;
     async function poll() {
       try {
-        const [r, w, s] = await Promise.all([api.listTests(), api.listWorkers(), api.getStats()]);
+        const [r, w, s] = await Promise.all([api.listTests(), api.listWorkers(), api.getStats().catch(() => null)]);
         if (cancelled) return;
         setRuns(r);
         setWorkers(w);
         setStats(s);
         setLoaded(true);
       } catch {
-        // Same rationale as useWorkerStatus.ts's poll: the finally below
-        // reschedules either way, so a failed tick just leaves the last good
-        // data on screen. Without this catch the un-awaited poll() leaks an
-        // "Uncaught (in promise)" every 5s while any ONE of the three calls
-        // above is failing -- Promise.all rejects if any single one does.
+        // The finally reschedules either way; a failed tick keeps the last good data.
       } finally {
         if (!cancelled) timerRef.current = window.setTimeout(poll, 5000);
       }
@@ -192,191 +178,138 @@ export function Dashboard() {
     };
   }, []);
 
-  function hideWorker(id: string): void {
-    setHiddenWorkerIds((prev) => {
-      if (prev.includes(id)) return prev;
-      const next = [...prev, id];
-      writeHiddenWorkers(next);
-      return next;
-    });
-  }
-
-  function unhideWorker(id: string): void {
-    setHiddenWorkerIds((prev) => {
-      const next = prev.filter((x) => x !== id);
-      writeHiddenWorkers(next);
-      return next;
-    });
+  function setHidden(next: string[]) {
+    setHiddenWorkerIds(next);
+    writeHiddenWorkers(next);
   }
 
   const visibleWorkers = showHidden ? workers : workers.filter((w) => !hiddenWorkerIds.includes(w.id));
-
-  // Per-machine "models tested" / "tests performed" -- the app-wide stat
-  // cards above went platform-wide (see this file's own header comment), but
-  // a rig card still needs its OWN counts, which only this page's already-
-  // scoped runs/workers can answer.
-  const workerStats = useMemo(() => {
-    const map = new Map<string, { models: Set<string>; tests: number }>();
-    for (const w of workers) map.set(w.id, { models: new Set(), tests: 0 });
-    for (const r of runs) {
-      for (const w of workers) {
-        if (!testMatchesWorker(r, w)) continue;
-        const entry = map.get(w.id)!;
-        entry.models.add(r.model_id);
-        entry.tests += (r.items_done ?? 0) + (r.items_failed ?? 0) + (r.items_cancelled ?? 0);
-      }
-    }
-    return map;
-  }, [workers, runs]);
-
-  const selectedWorker = selectedWorkerId ? workers.find((w) => w.id === selectedWorkerId) : undefined;
-
-  const filteredRuns = useMemo(() => {
-    return runs.filter((r) => {
-      if (selectedWorker && !testMatchesWorker(r, selectedWorker)) return false;
-      if (hideFailed && r.status === "failed") return false;
-      if (hideCancelled && r.status === "cancelled") return false;
-      return true;
-    });
-  }, [runs, selectedWorker, hideFailed, hideCancelled]);
-
-  const recent = filteredRuns.slice(0, 8);
+  const counts = useMemo(() => {
+    const testing = workers.filter((w) => w.status === "busy").length;
+    const online = workers.filter((w) => w.status === "idle").length;
+    const offline = workers.filter((w) => w.status === "offline").length;
+    return { testing, online, offline };
+  }, [workers]);
+  const allOffline = workers.length > 0 && counts.offline === workers.length;
+  const queuedTotal = runs.filter((r) => r.status === "scheduled").length;
+  const recent = runs.slice(0, 8);
 
   return (
     <div>
-      <h1 className="text-2xl font-semibold text-fg">Dashboard</h1>
+      <PageHeader
+        title="Dashboard"
+        sub={
+          workers.length === 0
+            ? "No machines yet."
+            : allOffline
+              ? "No machine online right now."
+              : [counts.testing && `${counts.testing} testing`, counts.online && `${counts.online} online`, counts.offline && `${counts.offline} offline`].filter(Boolean).join(" · ")
+        }
+        actions={
+          <Link
+            to="/benchmark"
+            className="inline-flex min-h-11 items-center gap-2 border border-accent bg-accent px-5 font-display text-lg font-semibold text-accent-fg hover:bg-accent-hover"
+          >
+            <LtIcon name="plus" />
+            New test
+          </Link>
+        }
+      />
 
-      <section className="grid grid-cols-2 gap-4 md:grid-cols-3 lg:grid-cols-6">
-        <StatCard label="Users" value={stats?.users ?? "—"} />
-        <StatCard label="Machines" value={stats?.machines ?? "—"} />
-        <StatCard label="Models tested" value={stats?.modelsTested ?? "—"} />
-        <StatCard label="Quants options" value={stats?.quants ?? "—"} />
-        <StatCard label="Tests performed" value={stats?.tests ?? "—"} />
-        <StatCard label="Total runs" value={stats?.runs ?? "—"} />
-      </section>
+      {allOffline && (
+        <div role="alert" className="mb-5 flex flex-wrap items-center gap-x-5 gap-y-3 border border-border-strong bg-surface px-[18px] py-4">
+          <LtIcon name="offline" size={22} className="text-fg-2" />
+          <div className="flex-[1_1_280px]">
+            <h2 className="m-0 font-display text-lg font-semibold">Every bay is cold</h2>
+            <p className="m-0 mt-0.5 text-fg-2">
+              No machine is checking in.{queuedTotal ? ` Your ${queuedTotal} queued test${queuedTotal === 1 ? "" : "s"} start as soon as one comes back online.` : ""}
+            </p>
+          </div>
+          <Link to="/workers" className="border border-border-strong px-3.5 py-2 text-sm font-medium hover:border-accent hover:text-accent">
+            Reconnect a machine
+          </Link>
+        </div>
+      )}
 
-      <section className="mt-6">
-        {workers.length > 0 && hiddenWorkerIds.length > 0 && (
-          <div className="mb-2 flex justify-end">
+      <section aria-labelledby="h-machines">
+        <div className="mb-3 flex flex-wrap items-baseline justify-between gap-2">
+          <h2 id="h-machines" className="m-0 font-display text-lg font-semibold">My machines</h2>
+          {hiddenWorkerIds.length > 0 && (
             <label className="flex items-center gap-1.5 text-xs text-muted">
-              <input
-                type="checkbox"
-                checked={showHidden}
-                onChange={(e) => setShowHidden(e.target.checked)}
-                className="h-3.5 w-3.5 accent-accent"
-              />
+              <input type="checkbox" checked={showHidden} onChange={(e) => setShowHidden(e.target.checked)} className="h-3.5 w-3.5 accent-[var(--color-accent)]" />
               Show hidden ({hiddenWorkerIds.length})
             </label>
-          </div>
-        )}
-        {loaded && workers.length === 0 ? (
-          <div className="rounded-xl border border-border bg-surface px-6 py-8 text-center">
-            <p className="text-sm font-semibold text-fg">No machines yet.</p>
-            <p className="mt-1 text-sm text-muted">LlamaToaster runs benchmarks on your own hardware.</p>
-            <Link
-              to="/device"
-              className="mt-4 inline-block rounded-lg bg-accent px-4 py-2 text-sm font-semibold text-accent-fg hover:bg-accent/90"
-            >
-              Connect your first machine
+          )}
+        </div>
+        <div className="grid grid-cols-[repeat(auto-fill,minmax(min(100%,260px),1fr))] gap-4">
+          {visibleWorkers.map((w) => (
+            <MachineCard
+              key={w.id}
+              worker={w}
+              runs={runs}
+              hidden={hiddenWorkerIds.includes(w.id)}
+              onHide={() => setHidden([...new Set([...hiddenWorkerIds, w.id])])}
+              onUnhide={() => setHidden(hiddenWorkerIds.filter((x) => x !== w.id))}
+            />
+          ))}
+          <article className="flex flex-col justify-center gap-2 border border-dashed border-border-strong p-4">
+            <h3 className="m-0 font-display text-lg font-semibold">{loaded && workers.length === 0 ? "No machines yet" : "Empty bay"}</h3>
+            <p className="m-0 text-fg-2">
+              {loaded && workers.length === 0 ? "LlamaToaster runs benchmarks on your own hardware — connecting one takes a minute." : "Add another machine with a one-time enrolment code."}
+            </p>
+            <Link to="/device" className="self-start border border-border-strong px-3.5 py-2 text-sm font-medium hover:border-accent hover:text-accent">
+              Add machine
             </Link>
-            <p className="mt-2 text-xs text-muted">Takes about a minute.</p>
-          </div>
-        ) : visibleWorkers.length === 0 ? (
-          <div className="rounded-xl border border-border bg-surface px-6 py-8 text-center">
-            <p className="text-sm font-semibold text-fg">All machines are hidden.</p>
-            <button
-              type="button"
-              onClick={() => setShowHidden(true)}
-              className="mt-2 text-sm text-accent hover:underline"
-            >
-              Show hidden machines
-            </button>
-          </div>
-        ) : (
-          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-            {visibleWorkers.map((w) => {
-              const s = workerStats.get(w.id);
-              return (
-                <MachineCard
-                  key={w.id}
-                  worker={w}
-                  modelsTested={s?.models.size ?? 0}
-                  testsPerformed={s?.tests ?? 0}
-                  selected={selectedWorkerId === w.id}
-                  hidden={hiddenWorkerIds.includes(w.id)}
-                  onSelect={() => setSelectedWorkerId((cur) => (cur === w.id ? null : w.id))}
-                  onHide={() => hideWorker(w.id)}
-                  onUnhide={() => unhideWorker(w.id)}
-                />
-              );
-            })}
-          </div>
-        )}
+          </article>
+        </div>
       </section>
 
-      <section className="mt-8">
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <h2 className="text-sm font-semibold uppercase tracking-wide text-muted">Recent tests</h2>
-          <div className="flex flex-wrap items-center gap-4">
-            {selectedWorker && (
-              <button
-                type="button"
-                onClick={() => setSelectedWorkerId(null)}
-                className="flex items-center gap-1 rounded-lg border border-accent/40 bg-accent/10 px-2.5 py-1 text-xs font-medium text-accent hover:bg-accent/20"
-              >
-                {selectedWorker.displayName}
-                <IconX width={12} height={12} />
-              </button>
-            )}
-            <label className="flex items-center gap-1.5 text-xs text-muted">
-              <input
-                type="checkbox"
-                checked={hideFailed}
-                onChange={(e) => setHideFailed(e.target.checked)}
-                className="h-3.5 w-3.5 accent-accent"
-              />
-              Hide failed
-            </label>
-            <label className="flex items-center gap-1.5 text-xs text-muted">
-              <input
-                type="checkbox"
-                checked={hideCancelled}
-                onChange={(e) => setHideCancelled(e.target.checked)}
-                className="h-3.5 w-3.5 accent-accent"
-              />
-              Hide cancelled
-            </label>
-          </div>
+      <section aria-labelledby="h-recent" className="mt-7 border border-border bg-surface">
+        <div className="flex items-center justify-between gap-3 border-b border-border px-4 py-3">
+          <h2 id="h-recent" className="m-0 font-display text-lg font-semibold">Recent tests</h2>
+          <Link to="/tests" className="text-sm font-medium text-accent">
+            All tests
+          </Link>
         </div>
-        {loaded && recent.length === 0 && (
-          <p className="mt-2 text-sm text-muted">{runs.length === 0 ? "No tests yet." : "No tests match the current filters."}</p>
-        )}
-        <div className="mt-2 flex flex-col divide-y divide-border overflow-hidden rounded-xl border border-border bg-surface">
-          {recent.map((r) => (
-            <Link
-              key={r.id}
-              to={`/tests/${r.id}`}
-              className="flex items-center gap-3 px-4 py-3 text-sm transition-colors hover:bg-white/5"
-            >
-              <code className="text-muted">{shortId(r.id)}</code>
-              <span className="text-fg">{r.worker_name}</span>
-              <span className="text-muted">{r.llama_cpp_backend}</span>
-              <span className="ml-auto flex items-center gap-2">
-                {r.items_total ? (
-                  <span className="text-xs text-muted">
-                    {r.items_done}/{r.items_total}
+        {loaded && recent.length === 0 && <p className="px-4 py-3 text-sm text-muted">No tests yet.</p>}
+        <ul className="m-0 list-none p-0">
+          {recent.map((t) => {
+            const st = testStatusView(t);
+            return (
+              <li key={t.id} className="flex flex-wrap items-center gap-x-4 gap-y-1 border-b border-border px-4 py-2.5 last:border-b-0">
+                <div className="min-w-0 flex-[1_1_200px]">
+                  <Link to={`/tests/${t.id}`} className="text-sm font-medium text-fg hover:text-accent">
+                    {modelLabel(t)}
+                  </Link>
+                  <div className="font-mono text-xs text-muted">
+                    {t.worker_name} · {kindLabel(t)}
+                  </div>
+                </div>
+                <span className={`inline-flex items-center gap-1.5 font-mono text-xs tracking-[0.04em] ${st.tone}`}>
+                  {st.icon && <LtIcon name={st.icon} size={14} />}
+                  {st.label}
+                </span>
+                {t.items_total ? (
+                  <span className="flex-[1_0_100%] font-mono text-xs text-fg-2">
+                    {(t.items_done ?? 0)} of {t.items_total} done{t.items_failed ? ` · ${t.items_failed} failed` : ""}
                   </span>
                 ) : null}
-                <TestStatusPill status={r.status} />
-              </span>
-            </Link>
-          ))}
-        </div>
+              </li>
+            );
+          })}
+        </ul>
       </section>
 
-      <section className="mt-8">
+      <section className="mt-7">
         <TokSpeedDemo />
       </section>
+
+      {stats && (
+        <p className="mt-6 font-mono text-xs text-muted">
+          Platform: {stats.users} users · {stats.machines} machines · {stats.modelsTested} models tested · {stats.quants} quants · {stats.tests} tests ·{" "}
+          {stats.runs} runs
+        </p>
+      )}
     </div>
   );
 }

@@ -222,6 +222,13 @@ export interface LadderInput {
   /** The estimator's safe layer count at a context -- only ever the first load's
    * layer count, never a verdict. Absent where only display is wanted. */
   calculateNgl?: (ctx: number) => number;
+  /** Frontier: the contexts to settle, instead of ctxLadderStops(maxCtx). With
+   * explicit stops every stop opens at calculateNgl (fit's answer there), not
+   * only the first. */
+  stops?: readonly number[];
+  /** Frontier: an upper bound per context (fit's answer at the smallest
+   * margin) -- the search never loads above it. */
+  capNgl?: (ctx: number) => number | null;
 }
 
 /** One context stop of the Wizard's result. */
@@ -688,6 +695,20 @@ function fixedOffloadOutcome(
  * every layer: after two loads the claim prediction takes over, and a
  * full-offload load of a model larger than VRAM is the slowest load there is.
  */
+function frontierStops(input: LadderInput, maxCtx: number): number[] {
+  if (!input.stops || input.stops.length === 0) return ctxLadderStops(maxCtx);
+  const s = [...new Set(input.stops.map((c) => Math.floor(c)))]
+    .filter((c) => c >= PROBE_LADDER_MIN_CTX && c <= maxCtx)
+    .sort((a, b) => a - b);
+  return s.length > 0 ? s : ctxLadderStops(maxCtx);
+}
+
+function minOf(a: number | null, b: number | null): number | null {
+  if (a == null) return b;
+  if (b == null) return a;
+  return Math.min(a, b);
+}
+
 function frontierOutcome(
   history: readonly LadderAttempt[],
   input: LadderInput,
@@ -695,7 +716,12 @@ function frontierOutcome(
   maxCtx: number,
   free: number | null
 ): ProbeOutcome {
-  const stops = ctxLadderStops(maxCtx);
+  const stops = frontierStops(input, maxCtx);
+  const explicitStops = !!input.stops && input.stops.length > 0;
+  const capAt = (ctx: number): number | null => {
+    const c = input.capNgl?.(ctx);
+    return c == null ? null : clamp(Math.floor(c), 0, nglMax);
+  };
   const curve: CurveStop[] = [];
   const unmeasured = (ctx: number): CurveStop => ({
     ctx,
@@ -718,14 +744,15 @@ function frontierOutcome(
     let fitState: BoundaryState | null = null;
 
     if (free != null) {
-      const ceiling = below?.fit?.value ?? null;
+      const ceiling = minOf(below?.fit?.value ?? null, capAt(ctx));
+      const seeded = explicitStops ? estimate(ctx) : null;
       const step = fitStep({
         history,
         ctx,
         nglMax,
         free,
         ceiling,
-        opener: i === 0 ? estimate(ctx) : ceiling,
+        opener: i === 0 ? estimate(ctx) : seeded != null ? minOf(seeded, ceiling) : ceiling,
       });
       if (!step.state.resolved) {
         curve.push({ ctx, fit: step.state, clean: unmeasured(ctx).clean });
@@ -759,11 +786,17 @@ function frontierOutcome(
       return summarise(curve, null, ctx);
     }
 
-    const cap = below ? (below.clean.value == null ? null : Math.min(below.clean.value, fitState?.value ?? nglMax)) : (fitState?.value ?? nglMax);
+    const capHere = capAt(ctx);
+    const baseCap = below
+      ? below.clean.value == null
+        ? null
+        : Math.min(below.clean.value, fitState?.value ?? nglMax)
+      : (fitState?.value ?? nglMax);
+    const cap = baseCap == null ? null : capHere == null ? baseCap : Math.min(baseCap, capHere);
     const clean = cleanStep({
       cap,
       cleanOf: (n) => cleanAt(history, ctx, n),
-      opener: i === 0 && free == null ? estimate(ctx) : null,
+      opener: (i === 0 || explicitStops) && free == null ? estimate(ctx) : null,
     });
     if (!clean.resolved) {
       curve.push({

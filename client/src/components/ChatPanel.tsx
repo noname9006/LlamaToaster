@@ -50,7 +50,9 @@ function TypingDots() {
   );
 }
 
-export function ChatPanel() {
+// narrow: phone layouts get a floating button and a full-screen panel instead
+// of a side rail that would eat a third of the screen.
+export function ChatPanel({ narrow = false }: { narrow?: boolean } = {}) {
   const [open, setOpen] = useState(() => localStorage.getItem(OPEN_KEY) === "1");
   const [width, setWidth] = useState(loadWidth);
   const [resizing, setResizing] = useState(false);
@@ -313,12 +315,16 @@ export function ChatPanel() {
 
   return (
     <aside
-      className={`relative flex h-screen shrink-0 flex-col border-l border-border bg-surface ${
-        resizing ? "" : "transition-[width] duration-150"
-      } ${open ? "" : "w-11"}`}
-      style={open ? { width } : undefined}
+      className={
+        narrow
+          ? open
+            ? "fixed inset-0 z-30 flex flex-col bg-surface"
+            : "fixed bottom-4 right-4 z-30 h-12 w-12 border border-border-strong bg-surface"
+          : `relative flex h-screen shrink-0 flex-col border-l border-border bg-surface ${resizing ? "" : "transition-[width] duration-150"} ${open ? "" : "w-11"}`
+      }
+      style={open && !narrow ? { width } : undefined}
     >
-      {open && (
+      {open && !narrow && (
         <div
           onMouseDown={handleResizeStart}
           role="separator"
@@ -335,7 +341,7 @@ export function ChatPanel() {
           aria-label="Open AI assistant"
         >
           <IconMessageCircle width={18} height={18} />
-          <span className="text-xs font-medium tracking-wide [writing-mode:vertical-rl]">AI Assistant</span>
+          {!narrow && <span className="text-xs font-medium tracking-wide [writing-mode:vertical-rl]">AI Assistant</span>}
         </button>
       ) : (
         <>

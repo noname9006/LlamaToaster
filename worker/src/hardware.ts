@@ -3,6 +3,7 @@ import { platform as osPlatform, arch as osArch } from "node:os";
 import { detectBackend, isSharedMemoryGpu } from "../../shared/types.js";
 import type { ListedDevice } from "./binary-probe.js";
 import { readNvidiaDriverInfo } from "./vram.js";
+import { detectCpuTopology } from "./cpuTopology.js";
 
 // Re-exported for this file's existing callers (worker/src/index.ts imports
 // both detectHardware and detectBackend from here) -- the implementation
@@ -97,6 +98,9 @@ export async function detectHardware(): Promise<HardwareInfo> {
   // as unknown and just orders variants conservatively instead.
   const hasNvidia = gpu.some((g) => /nvidia/i.test(g.vendor));
   const nvidiaDriverInfo = hasNvidia ? await readNvidiaDriverInfo().catch(() => null) : null;
+  // Per-core topology for the optimization flow's thread defaults -- best
+  // effort, reuses the si.cpu() reading above on Windows (see cpuTopology.ts).
+  const cpuTopology = await detectCpuTopology(process.platform, cpu).catch(() => null);
   return {
     platform: osPlatform(),
     arch: osArch(),
@@ -110,7 +114,9 @@ export async function detectHardware(): Promise<HardwareInfo> {
       // Logical processor count (si.cpu().cores falls back to os.cpus().length) --
       // the real ceiling for llama-bench's -t, including SMT/hyperthreads.
       cores: typeof cpu.cores === "number" && cpu.cores > 0 ? cpu.cores : 0,
+      ...(typeof cpu.physicalCores === "number" && cpu.physicalCores > 0 ? { physical_cores: cpu.physicalCores } : {}),
     },
+    ...(cpuTopology ? { cpu_topology: cpuTopology } : {}),
     gpu,
     os: describeOs(osPlatform(), osInfo),
     mem_type: describeMemType(memLayout),

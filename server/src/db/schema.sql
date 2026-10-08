@@ -134,6 +134,7 @@ CREATE TABLE IF NOT EXISTS results (
   gpu_memory_process_peak_source TEXT,
   ram_total_used_avg_mib INTEGER,
   ram_total_used_peak_mib INTEGER,
+  gpu_memory_shared_peak_mib INTEGER,  -- process's system-RAM-backed GPU memory peak (spill)
   -- Read from llama.cpp's own runtime output, never inferred -- see
   -- worker/src/index.ts's parseOffloadLayers. n_gpu_layers above is already
   -- the *requested* value; these are what actually happened. Always the
@@ -590,3 +591,57 @@ CREATE TABLE IF NOT EXISTS probe_attempts (
   UNIQUE(run_id, seq)
 );
 CREATE INDEX IF NOT EXISTS idx_probe_attempts_run ON probe_attempts(run_id);
+
+-- Optimization flow step 1 / 1' / 5 (docs/plans/OPTIMIZATION_FLOW_REDESIGN.md):
+-- one llama-fit-params answer per (context, cache setup) of a fit-kind run.
+-- A prediction, not a measurement -- no model is loaded to produce it. The
+-- margin is stored with every point so maps at different margins never mix.
+CREATE TABLE IF NOT EXISTS fit_points (
+  run_id    TEXT NOT NULL REFERENCES runs(id)    ON DELETE CASCADE,
+  worker_id TEXT REFERENCES workers(id) ON DELETE SET NULL,
+  model_id  TEXT REFERENCES models(id)  ON DELETE CASCADE,
+  ctx INTEGER NOT NULL,
+  fa TEXT NOT NULL,
+  ctk TEXT NOT NULL,
+  ctv TEXT NOT NULL,
+  margin_mib INTEGER NOT NULL,
+  verdict TEXT NOT NULL,          -- full | partial | cpu_only | doesnt_fit | error
+  reason TEXT,                    -- vram | ram
+  ngl INTEGER,                    -- fitted -ngl; -1 = every layer
+  layers_gpu INTEGER,
+  layers_total INTEGER,
+  overflow_layers INTEGER,        -- MoE: layers with experts (partly) on CPU
+  ot TEXT,                        -- fit's own -ot, comma form
+  dev_used_mib REAL, dev_free_mib REAL, host_used_mib REAL, total_mib REAL,
+  kv_mib REAL, compute_mib REAL, need_all_gpu_mib REAL,
+  splits INTEGER,
+  fa_disabled INTEGER,
+  n_expert INTEGER, n_expert_used INTEGER,
+  inferred INTEGER,
+  raw_args TEXT,
+  error TEXT,
+  llama_cpp_build TEXT,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (run_id, ctx, fa, ctk, ctv)
+);
+
+-- Optimization flow step 4: which K/V cache pairs run on the GPU for this
+-- (machine, build, model). Cached across runs, so a repeat fit map skips the
+-- 128-call detection.
+CREATE TABLE IF NOT EXISTS kv_support (
+  worker_id TEXT NOT NULL REFERENCES workers(id) ON DELETE CASCADE,
+  llama_cpp_build TEXT NOT NULL,
+  backend TEXT NOT NULL,
+  model_id TEXT NOT NULL REFERENCES models(id) ON DELETE CASCADE,
+  ctk TEXT NOT NULL,
+  ctv TEXT NOT NULL,
+  fa TEXT NOT NULL,
+  status TEXT NOT NULL,           -- ok | cpu_fallback | invalid | fa_disabled | cuda_slow
+  splits INTEGER,
+  baseline_splits INTEGER,
+  detail TEXT,
+  run_id TEXT REFERENCES runs(id) ON DELETE SET NULL,
+  checked_at INTEGER NOT NULL,
+  PRIMARY KEY (worker_id, llama_cpp_build, backend, model_id, ctk, ctv, fa)
+);
+CREATE INDEX IF NOT EXISTS idx_kv_support_run ON kv_support(run_id);

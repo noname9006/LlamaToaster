@@ -16,6 +16,11 @@ vi.mock("./vram.js", () => ({
   readNvidiaDriverInfo: vi.fn().mockResolvedValue(null),
 }));
 
+// The real detector spawns powershell.exe / reads sysfs.
+vi.mock("./cpuTopology.js", () => ({
+  detectCpuTopology: vi.fn().mockResolvedValue(null),
+}));
+
 import siModule from "systeminformation";
 import { detectHardware, describeOs, describeMemType, mergeListedDevices, type HardwareInfo } from "./hardware.js";
 

@@ -142,6 +142,11 @@ export type SensorMeasurementSource = (typeof SENSOR_MEASUREMENT_SOURCES)[number
 // "mem-speed-v1" is the Workers-page "Measure memory speed" button (see
 // worker/src/memSpeed.ts) -- an older worker has no measure_memory_speed
 // handler, so the button is hidden rather than queuing a job that just fails.
+// "fit-map-v1" is the optimization flow's llama-fit-params job (fit map + KV
+// support detection), "speed-run-v1" its baseline/confirm llama-server runs
+// at the user's context, and "thread-sweep-v1" its -t/-tb sweep -- see
+// docs/plans/OPTIMIZATION_FLOW_REDESIGN.md. Whether the active BUILD ships
+// llama-fit-params is separate: InstalledBuild.fit_params_path.
 export const WORKER_CAPABILITIES = [
   "benchmark",
   "probe-v1",
@@ -150,6 +155,9 @@ export const WORKER_CAPABILITIES = [
   "probe-frontier-v1",
   "fill-curve-v1",
   "mem-speed-v1",
+  "fit-map-v1",
+  "speed-run-v1",
+  "thread-sweep-v1",
 ] as const;
 export type WorkerCapability = (typeof WORKER_CAPABILITIES)[number];
 
@@ -177,6 +185,12 @@ export const METHOD_VERSION = 1;
 // holds it, and fill-curve rows share this column AND engine "server", so
 // reusing 6 here would let prefill slices leak into context curves.
 export const CURVE_METHOD_VERSION = 7;
+
+// The optimization flow's baseline/confirm speed runs: the curve harness, but
+// at a -c larger than the prompt, after a discarded warm-up request, and with
+// whatever placement the candidate names. Their own vintage so they never
+// surface as context-curve points (rows share engine "server" with curves).
+export const SPEED_RUN_METHOD_VERSION = 8;
 
 // The curve vintage that measured generation from the post-first-chunk
 // wall-clock window. Named because stored rows still carry it and N7 bundles
@@ -208,7 +222,8 @@ export const LEGACY_CURVE_METHOD_VERSION = 2;
 // it into the 'standalone' (NULL) bucket would make it collide with the
 // duplicate-trigger guard against unrelated standalone runs on the same
 // (user, model, worker) triple.
-export const TEST_KINDS = ["tuning", "refine", "sweep", "runtime", "probe", "quality"] as const;
+// "fit" is the optimization flow's llama-fit-params map (no model load).
+export const TEST_KINDS = ["tuning", "refine", "sweep", "runtime", "probe", "quality", "fit"] as const;
 export type TestKind = (typeof TEST_KINDS)[number];
 
 // §0.5 budgets.
@@ -478,6 +493,12 @@ export interface TestConfig {
   fill_curve?: FillCurveSpec;
   // §0.5 -- chain depth of this run under its root (roots are depth 1).
   chain_depth?: number;
+  // Optimization flow -- see TriggerPayload.
+  fit_map?: import("./optimizeFlow.js").FitMapSpec;
+  speed_run?: import("./speedRun.js").SpeedRunSpec;
+  thread_sweep?: import("./speedRun.js").ThreadSweepSpec;
+  flow_id?: string;
+  flow_step?: FlowStep;
 }
 
 // "partial" -- some sweep items succeeded and some failed, distinct from a
@@ -705,6 +726,9 @@ export interface ResultRow {
   // accuracy/source metadata, same as every other RAM figure on this row.
   ram_total_used_avg_mib?: number | null;
   ram_total_used_peak_mib?: number | null;
+  // The benchmark process's peak system-RAM-backed GPU allocation (WDDM
+  // "Shared Usage" / amdgpu GTT): what silently spilled out of VRAM.
+  gpu_memory_shared_peak_mib?: number | null;
   // Actual GPU layers loaded and the model's real total layer count, both
   // read from llama.cpp's own runtime output (worker/src/index.ts's
   // parseOffloadLayers, scraping "load_tensors: offloaded X/Y layers to
@@ -857,6 +881,9 @@ export interface IngestResultInput {
   gpu_memory_process_peak_source?: GpuMemoryMeasurementSource | null;
   ram_total_used_avg_mib?: number | null;
   ram_total_used_peak_mib?: number | null;
+  // The benchmark process's peak system-RAM-backed GPU allocation (WDDM
+  // "Shared Usage" / amdgpu GTT): what silently spilled out of VRAM.
+  gpu_memory_shared_peak_mib?: number | null;
   gpu_layers_loaded: number | null;
   total_model_layers: number | null;
   // See the matching fields on ResultRow above -- the MTP/draft companion
@@ -1102,7 +1129,20 @@ export interface TriggerPayload {
   // path's chain_depth bookkeeping or its MAX_CHAIN_DEPTH limit -- a 5-mode
   // batch would otherwise hit that cap on its 4th member.
   probe_batch_root_id?: string;
+  // Optimization flow (docs/plans/OPTIMIZATION_FLOW_REDESIGN.md). fit_map
+  // rides kind "fit"; speed_run (steps 0/6) and thread_sweep (step T) ride
+  // kind "runtime". flow_id ties the runs of one optimization session
+  // together so the page can restore it from any device.
+  fit_map?: import("./optimizeFlow.js").FitMapSpec;
+  speed_run?: import("./speedRun.js").SpeedRunSpec;
+  thread_sweep?: import("./speedRun.js").ThreadSweepSpec;
+  flow_id?: string;
+  flow_step?: FlowStep;
 }
+
+// Which step of the optimization flow a run is (docs/plans/OPTIMIZATION_FLOW_REDESIGN.md).
+export const FLOW_STEPS = ["baseline", "fit", "real_load", "threads", "confirm"] as const;
+export type FlowStep = (typeof FLOW_STEPS)[number];
 
 export interface ProbeTriggerSpec {
   candidate_ctx: number;
@@ -1113,6 +1153,16 @@ export interface ProbeTriggerSpec {
   // over slider stops, which is what a probe did before modes existed.
   mode?: ProbeMode;
   granularity?: ProbeGranularity;
+  // Optimization flow step 2 (frontier only). With ladder set the search
+  // walks shared/moePlacement.ts's placement states and every rung's / stored
+  // attempt's ngl is an INDEX into it; the worker loads that state's -ngl
+  // and -ot. ctx_stops replaces the default 1k-doubling stops, seed opens
+  // each stop at fit's answer and cap bounds it (both keyed by context).
+  ladder?: import("./moePlacement.js").PlacementState[];
+  ctx_stops?: number[];
+  seed?: Record<string, number>;
+  cap?: Record<string, number>;
+  fa?: "on" | "off";
 }
 
 // N4 -- what a quality run was triggered to measure, echoed onto the run's
@@ -1202,6 +1252,9 @@ export interface InstalledBuild {
   // assetMatchesWorker), never by a stored backend string.
   bench_path?: string;
   server_path?: string;
+  // llama-fit-params next to llama-server, present only when its --help lists
+  // --fit-target (b7xxx+). Absent = the fit map can't run on this build.
+  fit_params_path?: string;
   // Set when this build was installed together with its matching CUDA
   // runtime redistributable (cudart-*.zip extracted alongside the binaries) --
   // informational only, see InstallBuildJobPayload.cudart_name.
@@ -1268,7 +1321,11 @@ export interface ModelDirFile {
 export interface HardwareInfo {
   platform: string;
   arch: string;
-  cpu: { manufacturer: string; brand: string; flags: string[]; cores: number };
+  cpu: { manufacturer: string; brand: string; flags: string[]; cores: number; physical_cores?: number };
+  // Per-core topology for the optimization flow's thread step (shared/
+  // threadPlan.ts). Absent on workers predating detection or when the OS
+  // query failed.
+  cpu_topology?: import("./threadPlan.js").CpuTopology;
   // vram_mb/vram_dynamic -- see worker/src/hardware.ts's detectHardware
   // (si.graphics().controllers[].vram/vramDynamic) for what these mean.
   // Optional for the same cross-version reason as mem_total_bytes below.
@@ -1800,10 +1857,26 @@ export interface BenchmarkJob {
   // choreography for exactly one point; "knee" executes N5's load-driver
   // ladder. Absent = ordinary sweep execution.
   // "fill_curve" measures prefill along one context's fill, one curve per item.
-  mode?: "sweep" | "context_curve" | "knee" | "fill_curve";
+  mode?: "sweep" | "context_curve" | "knee" | "fill_curve" | "speed_run" | "thread_sweep";
   curve_point?: CurvePointSpec;
   knee_spec?: KneeSpec;
   fill_curve?: FillCurveSpec;
+  speed_run?: import("./speedRun.js").SpeedRunSpec;
+  thread_sweep?: import("./speedRun.js").ThreadSweepSpec;
+}
+
+// Optimization flow steps 1 / 1' / 4 / 5 -- one llama-fit-params job.
+export interface FitMapJobPayload {
+  run_id: string;
+  model: Model;
+  llama_cpp_build: string;
+  llama_cpp_backend: Backend;
+  main_gpu?: number;
+  spec: import("./optimizeFlow.js").FitMapSpec;
+  /** KV support rows already known for this (machine, build, model). */
+  kv_known?: import("./kvSupport.js").KvSupportRow[];
+  /** System RAM the host side may use, MiB. */
+  ram_budget_mib?: number | null;
 }
 
 // N5 -- concurrency-knee ladder. Prompt/gen cells are fixed from the M2
@@ -1836,6 +1909,12 @@ export interface TestProbeJobPayload {
   // Absent means the pre-modes behavior -- see ProbeTriggerSpec.
   mode?: ProbeMode;
   granularity?: ProbeGranularity;
+  // See ProbeTriggerSpec.ladder and friends.
+  ladder?: import("./moePlacement.js").PlacementState[];
+  ctx_stops?: number[];
+  seed?: Record<string, number>;
+  cap?: Record<string, number>;
+  fa?: "on" | "off";
 }
 
 // One rung of the ladder, as reported by the worker and persisted verbatim
@@ -2097,6 +2176,7 @@ export type QueueJob =
   | { job_id: string; type: "shutdown_worker"; payload: Record<string, never> }
   | { job_id: string; type: "run_probe"; payload: TestProbeJobPayload }
   | { job_id: string; type: "measure_quality"; payload: MeasureQualityJobPayload }
+  | { job_id: string; type: "fit_map"; payload: FitMapJobPayload }
   // Workers page "Measure memory speed" button -- no payload, just a signal.
   // Result is POSTed back separately (POST /api/worker/mem-speed, see
   // shared/types.ts's MemorySpeedResult) rather than riding this job's

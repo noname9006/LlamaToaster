@@ -78,6 +78,10 @@ const WORKER_AUTHENTICATED_ROUTES = new Set([
   // session (C1); once that stopped, they have to be listed here.
   "POST /api/tests/:id/probe-attempt",
   "POST /api/runs/:id/probe-attempt",
+  // Optimization flow fit map (routes/optimize.ts) -- dual-mode worker auth
+  // inside the handler (authenticateWorker).
+  "POST /api/tests/:id/fit-points",
+  "POST /api/tests/:id/kv-support",
   "GET /api/tests/:id/probe-dedup",
   "GET /api/runs/:id/probe-dedup",
   // Called by both the browser and the worker's model scanner, so its handler

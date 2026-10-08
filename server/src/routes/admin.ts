@@ -8,6 +8,7 @@ import { getTestByIdHandler, getTestLogHandler, getBatchMembersHandler } from ".
 import { getProfilesHandler } from "./profiles.js";
 import { getCurveHandler, getKneeHandler } from "./curves.js";
 import { getProbeAttemptsHandler } from "./measurements.js";
+import { getFitPointsHandler } from "./optimize.js";
 import { exportTestHandler } from "./exchange.js";
 import {
   isVramDiscrepancyPolicy,
@@ -87,6 +88,7 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
   app.get("/api/admin/tests/:id", { logLevel: "silent" }, getTestByIdHandler(allUsersScope));
   app.get("/api/admin/tests/:id/batch-members", getBatchMembersHandler(allUsersScope));
   app.get("/api/admin/tests/:id/probe-attempts", getProbeAttemptsHandler(allUsersScope));
+  app.get("/api/admin/tests/:id/fit-points", getFitPointsHandler(allUsersScope));
   app.get("/api/admin/tests/:id/profiles", getProfilesHandler(allUsersScope));
   app.get("/api/admin/tests/:id/knee", getKneeHandler(allUsersScope));
   app.get("/api/admin/tests/:id/log", getTestLogHandler(allUsersScope));

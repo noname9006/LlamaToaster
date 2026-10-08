@@ -60,9 +60,36 @@ Consequences the code has to handle, and does:
 - **Worker-reported state is validated** before it is trusted
   ([`validate-worker-state.ts`](../server/src/validate-worker-state.ts)).
 
-Job types are `benchmark`, `install_build`, `download_model` and
-`delete_model_file` — installing a llama.cpp build or downloading a GGUF from
-the Workers page goes through the same queue as a benchmark.
+Job types are `benchmark`, `install_build`, `download_model`,
+`delete_model_file`, `run_probe`, `measure_quality` and `fit_map` — installing
+a llama.cpp build or downloading a GGUF from the Machines page goes through the
+same queue as a benchmark.
+
+## The optimization flow (New test)
+
+The New test page runs four steps against one (machine, model, target
+context), each its own run tied together by a `flow_id`:
+
+1. **Baseline** — a `runtime` run with a `speed_run` spec: llama-server at the
+   target context, `-ngl 999`, llama.cpp defaults, one cache-free request per
+   repeat (4096-token prompt, 512 generated).
+2. **Fit map** — a `fit` run, job type `fit_map`: `llama-fit-params` (no model
+   load) over context stops from 4096 up, FA on and off, then K/V cache support
+   detection (64 non-f32 pairs × FA on/off, judged by scheduler graph splits)
+   and one more map per supported cache size. Answers land in `fit_points`;
+   detection rows in `kv_support`, cached per machine/build/model. An optional
+   real-load check reuses the context-test probe, seeded with fit's answers and,
+   on MoE models, walking fit's own expert placement order
+   ([`shared/moePlacement.ts`](../shared/moePlacement.ts)).
+3. **CPU threads** — defaults from the reported CPU topology
+   ([`shared/threadPlan.ts`](../shared/threadPlan.ts)); an optional `runtime` run
+   with a `thread_sweep` spec measures other `-t`/`-tb` settings with llama-bench.
+4. **Confirm** — another speed run: the chosen configs next to the defaults,
+   same harness as the baseline.
+
+The pure logic lives in `shared/fitParams.ts`, `kvSupport.ts`, `moePlacement.ts`,
+`threadPlan.ts`, `speedRun.ts` and `optimizeFlow.ts`; the worker side in
+`worker/src/fitMap.ts` and `cpuTopology.ts`.
 
 ## Data model
 
@@ -86,6 +113,11 @@ through [`repo.ts`](../server/src/db/repo.ts) — no route builds SQL itself.
   result.
 - `quality_results` — perplexity / quality measurements, kept apart from
   throughput.
+- `fit_points` — one llama-fit-params answer per (fit run, context, cache
+  setup): layers on the GPU, MoE expert overflow, device and host MiB, verdict.
+  Predictions, not measurements.
+- `kv_support` — which K/V cache pairs run on the GPU for a (machine, build,
+  model), with the graph-split evidence.
 
 **Models**
 

@@ -74,6 +74,7 @@ export function createAdminTestViewApi(ownerUserId: string | null): TestViewApi 
     getTest: (id) => request(`/api/admin/tests/${seg(id)}`),
     getBatchMembers: (id) => request(`/api/admin/tests/${seg(id)}/batch-members`),
     getProbeAttempts: (id) => request(`/api/admin/tests/${seg(id)}/probe-attempts`),
+    getFitPoints: (id) => request(`/api/admin/tests/${seg(id)}/fit-points`),
     getProfiles: (id, goals) => request(`/api/admin/tests/${seg(id)}/profiles${profilesQuery(goals)}`),
     getCurve: (modelId, opts) =>
       request(`/api/admin/models/${seg(modelId)}/curve${curveQuery(opts, ownerUserId ? { user: ownerUserId } : {})}`),

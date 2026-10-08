@@ -29,7 +29,7 @@ export function Device() {
   if (!authEnabled) {
     return (
       <div>
-        <h1 className="text-2xl font-semibold text-fg">Add a machine</h1>
+        <h1 className="m-0 font-display text-[32px] font-semibold leading-tight text-fg">Add a machine</h1>
         <p className="mt-4 max-w-lg text-sm text-muted">
           Device enrolment needs user accounts to be enabled on this deployment. Set up a new
           worker with the shared worker token instead — see the setup commands on the Workers
@@ -41,7 +41,7 @@ export function Device() {
 
   return (
     <div>
-      <h1 className="text-2xl font-semibold text-fg">Add a machine</h1>
+      <h1 className="m-0 font-display text-[32px] font-semibold leading-tight text-fg">Add a machine</h1>
       <div className="mt-4">
         <AddMachinePanel />
       </div>

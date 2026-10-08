@@ -28,6 +28,9 @@ import {
   type AdminStats,
   type RocmSupportSnapshot,
 } from "../types";
+import type { FitPoint } from "../../../shared/fitParams.js";
+import type { KvSupportRow } from "../../../shared/kvSupport.js";
+import type { FitMapSpec } from "../../../shared/optimizeFlow.js";
 
 export class ApiError extends Error {
   status: number;
@@ -332,6 +335,10 @@ export const api = {
   },
 
   // N2 -- every rung of a probe's ladder, not just the ceiling it verified.
+  // Optimization flow (docs/plans/OPTIMIZATION_FLOW_REDESIGN.md).
+  getFitPoints: (testId: string): Promise<{ points: FitPoint[]; kv: KvSupportRow[]; spec: FitMapSpec | null }> =>
+    request(`/api/tests/${encodeURIComponent(testId)}/fit-points`),
+  getFlow: (flowId: string): Promise<{ tests: Test[] }> => request(`/api/flows/${encodeURIComponent(flowId)}`),
   getProbeAttempts: (testId: string): Promise<{ attempts: ProbeAttemptDto[] }> =>
     request(`/api/tests/${encodeURIComponent(testId)}/probe-attempts`),
 

@@ -8,6 +8,7 @@ import { readFileSync, existsSync } from "node:fs";
 import { testsRoutes } from "./routes/tests.js";
 import { profilesRoutes } from "./routes/profiles.js";
 import { measurementRoutes } from "./routes/measurements.js";
+import { optimizeRoutes } from "./routes/optimize.js";
 import { curveRoutes } from "./routes/curves.js";
 import { comparisonRoutes } from "./routes/comparisons.js";
 import { exchangeRoutes } from "./routes/exchange.js";
@@ -128,6 +129,7 @@ app.register(testsRoutes);
 app.register(profilesRoutes);
 // N2/N4 -- worker-authed, idempotent probe and quality ingestion.
 app.register(measurementRoutes);
+app.register(optimizeRoutes);
 // N1/N5 -- context curves and the concurrency knee, both derived on read.
 app.register(curveRoutes);
 // N3 -- model-vs-model comparison view with its blocking fairness checks.

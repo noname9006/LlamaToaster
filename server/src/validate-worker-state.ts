@@ -10,6 +10,7 @@ import type {
   MemorySpeedResult,
 } from "../../shared/types.js";
 import type { TensorLayerBreakdown } from "../../shared/vramEstimate.js";
+import type { CpuCore, CpuTopology } from "../../shared/threadPlan.js";
 import {
   LOCAL_MODEL_STATES,
   SENSOR_MEASUREMENT_SOURCES,
@@ -114,6 +115,65 @@ function requireArray(value: unknown, field: string): unknown[] {
   return value;
 }
 
+// Per-core topology (worker/src/cpuTopology.ts) -- bounded so a hostile
+// payload can't drive unbounded allocation. Anything malformed drops the whole
+// field rather than failing the heartbeat: the thread step falls back to the
+// plain core count.
+const MAX_TOPOLOGY_CORES = 1024;
+const MAX_LOGICAL_PER_CORE = 8;
+const MAX_LOGICAL_CPU = 4096;
+
+function smallInt(v: unknown, max: number): number | null {
+  return typeof v === "number" && Number.isInteger(v) && v >= 0 && v <= max ? v : null;
+}
+
+export function parseCpuTopology(value: unknown): CpuTopology | undefined {
+  if (value === undefined || value === null || typeof value !== "object") return undefined;
+  const t = value as Record<string, unknown>;
+  const source = t.source;
+  if (source !== "windows" && source !== "linux" && source !== "macos" && source !== "fallback") return undefined;
+  if (!Array.isArray(t.cores) || t.cores.length === 0 || t.cores.length > MAX_TOPOLOGY_CORES) return undefined;
+  const cores: CpuCore[] = [];
+  for (const raw of t.cores) {
+    if (!raw || typeof raw !== "object") return undefined;
+    const c = raw as Record<string, unknown>;
+    const id = smallInt(c.id, MAX_TOPOLOGY_CORES);
+    if (id == null || !Array.isArray(c.logical) || c.logical.length === 0 || c.logical.length > MAX_LOGICAL_PER_CORE) return undefined;
+    const logical = c.logical.map((l) => smallInt(l, MAX_LOGICAL_CPU));
+    if (logical.some((l) => l == null)) return undefined;
+    const effClass = smallInt(c.effClass, 1_000_000);
+    if (effClass == null) return undefined;
+    cores.push({
+      id,
+      logical: logical as number[],
+      l3: c.l3 == null ? null : smallInt(c.l3, MAX_TOPOLOGY_CORES),
+      die: c.die == null ? null : smallInt(c.die, 1_000_000),
+      effClass,
+      ...(c.group != null && smallInt(c.group, 64) != null ? { group: c.group as number } : {}),
+    });
+  }
+  const logicalCount = smallInt(t.logicalCount, MAX_LOGICAL_CPU);
+  if (logicalCount == null) return undefined;
+  let l3SizesKib: Record<string, number> | undefined;
+  if (t.l3SizesKib && typeof t.l3SizesKib === "object") {
+    l3SizesKib = {};
+    for (const [k, v] of Object.entries(t.l3SizesKib as Record<string, unknown>).slice(0, MAX_TOPOLOGY_CORES)) {
+      const n = smallInt(v, 64 * 1024 * 1024);
+      if (/^\d{1,4}$/.test(k) && n != null) l3SizesKib[k] = n;
+    }
+  }
+  return {
+    source,
+    cores,
+    logicalCount,
+    ...(l3SizesKib ? { l3SizesKib } : {}),
+    masksSupported: t.masksSupported === true,
+    ...(t.estimated === true ? { estimated: true } : {}),
+    ...(smallInt(t.perfCores, MAX_TOPOLOGY_CORES) != null ? { perfCores: t.perfCores as number } : {}),
+    ...(smallInt(t.effCores, MAX_TOPOLOGY_CORES) != null ? { effCores: t.effCores as number } : {}),
+  };
+}
+
 function parseHardware(value: unknown): HardwareInfo {
   if (typeof value !== "object" || value === null) throw new BadRequestError("hardware is required");
   const h = value as Record<string, unknown>;
@@ -175,7 +235,11 @@ function parseHardware(value: unknown): HardwareInfo {
       brand: sanitizeString(cpu.brand, "hardware.cpu.brand"),
       flags,
       cores: requireNumber(cpu.cores, "hardware.cpu.cores"),
+      ...(optionalNumber(cpu.physical_cores, "hardware.cpu.physical_cores") !== undefined
+        ? { physical_cores: optionalNumber(cpu.physical_cores, "hardware.cpu.physical_cores") }
+        : {}),
     },
+    cpu_topology: parseCpuTopology(h.cpu_topology),
     gpu,
     os,
     mem_type: optionalString(h.mem_type, "hardware.mem_type", 64),
@@ -198,6 +262,7 @@ function parseInstalledBuilds(value: unknown): InstalledBuild[] {
         active: row.active === true,
         bench_path: optionalString(row.bench_path, `installed_builds[${i}].bench_path`),
         server_path: optionalString(row.server_path, `installed_builds[${i}].server_path`),
+        fit_params_path: optionalString(row.fit_params_path, `installed_builds[${i}].fit_params_path`),
         cudart_name: optionalString(row.cudart_name, `installed_builds[${i}].cudart_name`),
       };
     });

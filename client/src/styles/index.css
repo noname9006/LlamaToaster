@@ -1,22 +1,47 @@
 @import "tailwindcss";
 
 @theme {
-  --color-bg: #0b0d12;
-  --color-surface: #12151c;
-  --color-surface-raised: #171b24;
-  --color-border: #262b36;
-  --color-fg: #e8e9ec;
-  --color-muted: #8b92a3;
-  --color-accent: #6ea8fe;
-  --color-accent-fg: #0b0e14;
-  --color-success: #86ef9e;
-  --color-success-bg: #143323;
-  --color-danger: #ff9b9b;
-  --color-danger-bg: #3a1f1f;
-  --color-warning: #ffd479;
-  --color-warning-bg: #3a2f13;
-  --font-sans:
-    system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  /* LlamaToaster v2 palette (docs/plans/app-v2.dc.html): warm dark
+     surfaces, one amber accent, a cool blue-grey for "online", and a
+     toast ramp (raw -> golden) for result ranks. */
+  --color-bg: #13100c;
+  --color-surface: #1b1611;
+  --color-surface-raised: #262019;
+  --color-well: #0b0907;
+  --color-border: #3d3329;
+  --color-border-strong: #64554a;
+  --color-fg: #f4efe6;
+  --color-fg-2: #d2c8b9;
+  --color-muted: #ab9f8d;
+  --color-accent: #f5a623;
+  --color-accent-hover: #ffbb4d;
+  --color-accent-fg: #1a1305;
+  --color-accent-tint: #35260f;
+  --color-online: #9fb6cc;
+  --color-success: #9fb6cc;
+  --color-success-bg: #1c2630;
+  --color-danger: #ff7a6b;
+  --color-danger-bg: #3b1a15;
+  --color-warning: #ffbb4d;
+  --color-warning-bg: #35260f;
+  --color-rank-1: #efe4cf;
+  --color-rank-2: #e6cfa0;
+  --color-rank-3: #dbb574;
+  --color-rank-4: #cf9a48;
+  --color-rank-5: #b97a26;
+  --font-sans: "Barlow", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-display: "Barlow Condensed", "Barlow", system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  /* Square corners everywhere -- the design has none. Dots keep
+     rounded-full (9999px), which is not overridden. */
+  --radius-xs: 0;
+  --radius-sm: 0;
+  --radius-md: 0;
+  --radius-lg: 0;
+  --radius-xl: 0;
+  --radius-2xl: 0;
+  --radius-3xl: 0;
+  --radius-4xl: 0;
 }
 
 html {
@@ -26,6 +51,83 @@ html {
 body {
   @apply bg-bg text-fg antialiased;
   font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.5;
+  font-variant-numeric: tabular-nums;
+}
+
+h1,
+h2,
+h3 {
+  font-family: var(--font-display);
+  font-weight: 600;
+  letter-spacing: 0;
+}
+
+::selection {
+  background: var(--color-accent-tint);
+}
+
+:focus {
+  outline: none;
+}
+:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+
+button:disabled {
+  cursor: not-allowed;
+}
+
+@keyframes lt-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+@keyframes lt-steam {
+  0% {
+    opacity: 0;
+    transform: translateY(3px);
+  }
+  45% {
+    opacity: 0.8;
+  }
+  100% {
+    opacity: 0;
+    transform: translateY(-12px);
+  }
+}
+@keyframes lt-progress {
+  from {
+    background-position: 0 0;
+  }
+  to {
+    background-position: 24px 0;
+  }
+}
+.lt-pulse {
+  animation: lt-pulse 1.6s ease-in-out infinite;
+}
+.lt-steam {
+  animation: lt-steam 2.4s ease-out infinite;
+}
+.lt-progress-fill {
+  background: repeating-linear-gradient(90deg, var(--color-accent) 0 10px, var(--color-accent-hover) 10px 12px);
+  background-size: 24px 100%;
+  animation: lt-progress 1.2s linear infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation: none !important;
+    transition: none !important;
+  }
 }
 
 #root {

@@ -66,6 +66,8 @@ export interface ServerArgsInput {
   contextSizeOverride?: number;
   /** Already probed by the caller -- see spawnRuntimeServer. */
   noMmap?: boolean;
+  /** Appended verbatim: -ot, -tb, -C/-Cb, --cpu-strict (optimization flow). */
+  extraArgs?: string[];
 }
 
 // The {engine:"server", spec:"off"} argument set. No --spec-type here at all:
@@ -136,6 +138,7 @@ export function buildServerArgs(input: ServerArgsInput): string[] {
   // behavior a real deployment would see, and a real deployment runs with mmap
   // at its default ON. The fill curve IS a speed run, so it opts in.
   if (input.noMmap) args.push("--no-mmap");
+  if (input.extraArgs?.length) args.push(...input.extraArgs);
   return args;
 }
 

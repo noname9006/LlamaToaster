@@ -1,0 +1,18 @@
+0.00.067.862 I common_params_fit_impl: getting device memory data for initial parameters:
+0.00.332.203 I print_info: n_ctx_train           = 32768
+0.00.332.205 I print_info: n_layer               = 48
+0.00.332.250 I print_info: n_expert              = 0
+0.00.332.250 I print_info: n_expert_used         = 0
+0.00.360.979 I llama_kv_cache: size =   96.00 MiB (  4096 cells,  48 layers,  1/1 seqs), K (bf16):   48.00 MiB, V (f16):   48.00 MiB
+0.00.363.885 W resolve_fused_ops: layer 0 is assigned to device Vulkan0 but Flash Attention is assigned to device CPU (usually due to missing support)
+0.00.363.886 W resolve_fused_ops: Flash Attention not supported, set to disabled
+0.00.385.020 I sched_reserve:    Vulkan0 compute buffer size =   300.25 MiB
+0.00.385.023 I sched_reserve: Vulkan_Host compute buffer size =    11.51 MiB
+0.00.385.026 I sched_reserve: graph: nodes = 1878, splits = 2, input objects = 4, input tensors = 6
+0.00.386.429 I common_memory_breakdown_print: | memory breakdown [MiB]   | total   free    self   model   context   compute    unaccounted |
+0.00.386.431 I common_memory_breakdown_print: |   - Vulkan0 (RX 6600 XT) |  8176 = 7378 + (1259 =   863 +      96 +     300) +        -462 |
+0.00.386.432 I common_memory_breakdown_print: |   - Host                 |                  149 =   137 +       0 +      11                |
+0.00.410.965 I common_params_fit_impl: projected to use 1259 MiB of device memory vs. 7378 MiB of free device memory
+0.00.410.968 I common_params_fit_impl: will leave 6118 >= 1024 MiB of free device memory, no changes needed
+0.00.410.969 I common_fit_params: successfully fit params to free device memory
+0.00.410.977 I common_fit_params: fitting params to free memory took 0.34 seconds

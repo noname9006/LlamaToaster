@@ -21,6 +21,8 @@ import type {
   BenchmarkJob,
   TestProbeJobPayload,
   MeasureQualityJobPayload,
+  FitMapJobPayload,
+  ProbeTriggerSpec,
 } from "../../../shared/types.js";
 import { MIN_PROBE_CTX, MAX_PROBE_CTX, DATASET_HASH_RE } from "./measurements.js";
 import { recheckComparisonMember } from "./comparisons.js";
@@ -31,6 +33,7 @@ import {
   GPU_MEMORY_ACCURACY_LEVELS,
   GPU_MEMORY_MEASUREMENT_SOURCES,
   TEST_KINDS,
+  FLOW_STEPS,
 } from "../../../shared/types.js";
 import type { TestKind } from "../../../shared/types.js";
 import { expandSweep, validateDepthRule, validateConcurrencyRule } from "../../../shared/sweep.js";
@@ -54,6 +57,9 @@ import {
 } from "../../../shared/probeLadder.js";
 import type { GoalsConfig } from "../../../shared/goals.js";
 import { normalizeGoals } from "../../../shared/goals.js";
+import { validateFitMapSpec } from "../../../shared/optimizeFlow.js";
+import { THREAD_PP_TOKENS, THREAD_TG_TOKENS, validateSpeedRunSpec, validateThreadSweepSpec } from "../../../shared/speedRun.js";
+import { fitRepo } from "../db/fitRepo.js";
 import { getReleases, filterReleasesForWorker, assetMatchesWorker, buildInstallPayload } from "../github-releases.js";
 import {
   checkComparisonFairness,
@@ -73,6 +79,52 @@ const NUMERIC_SWEEP_FIELDS = [
   "n_cpu_moe",
 ] as const;
 const STRING_SWEEP_FIELDS = ["cache_type_k", "cache_type_v", "flash_attn", "mtp"] as const;
+
+// Optimization flow step 2 -- the placement ladder, stops, seeds and caps a
+// frontier probe may carry (see ProbeTriggerSpec.ladder). Bounded so a payload
+// can't make the worker search an absurd axis.
+const MAX_LADDER_STATES = 4096;
+function validateProbeLadderExtras(p: ProbeTriggerSpec): string | null {
+  const any = p.ladder !== undefined || p.ctx_stops !== undefined || p.seed !== undefined || p.cap !== undefined;
+  if (any && p.mode !== "frontier") return "probe.ladder/ctx_stops/seed/cap need mode frontier";
+  let axisMax = 4096;
+  if (p.ladder !== undefined) {
+    if (!Array.isArray(p.ladder) || p.ladder.length < 2 || p.ladder.length > MAX_LADDER_STATES) {
+      return `probe.ladder must list 2..${MAX_LADDER_STATES} placement states`;
+    }
+    for (const st of p.ladder) {
+      if (
+        !st ||
+        (st.phase !== "dense" && st.phase !== "expert") ||
+        !Number.isInteger(st.ngl) ||
+        st.ngl < 0 ||
+        st.ngl > 4096 ||
+        !Number.isInteger(st.expertsGpu) ||
+        st.expertsGpu < 0 ||
+        st.expertsGpu > 4096 ||
+        !["none", "ATTN", "UP", "GATE"].includes(st.boundary)
+      ) {
+        return "probe.ladder contains an invalid placement state";
+      }
+    }
+    axisMax = p.ladder.length - 1;
+  }
+  if (p.ctx_stops !== undefined) {
+    if (!Array.isArray(p.ctx_stops) || p.ctx_stops.length === 0 || p.ctx_stops.length > 16) return "probe.ctx_stops must list 1..16 contexts";
+    if (!p.ctx_stops.every((c) => Number.isInteger(c) && c >= 1024 && c <= 4_194_304)) return "probe.ctx_stops must be integers in [1024, 4194304]";
+  }
+  for (const [name, map] of [["seed", p.seed], ["cap", p.cap]] as const) {
+    if (map === undefined) continue;
+    if (!map || typeof map !== "object" || Array.isArray(map)) return `probe.${name} must be an object keyed by context`;
+    const entries = Object.entries(map);
+    if (entries.length > 16) return `probe.${name} has too many entries`;
+    for (const [k, v] of entries) {
+      if (!/^\d{3,7}$/.test(k) || !Number.isInteger(v) || v < 0 || v > axisMax) return `probe.${name} values must be integers in [0, ${axisMax}]`;
+    }
+  }
+  if (p.fa !== undefined && p.fa !== "on" && p.fa !== "off") return "probe.fa must be on or off";
+  return null;
+}
 
 function validateSweep(sweep: unknown): string | null {
   if (!sweep || typeof sweep !== "object") return "sweep must be an object";
@@ -287,6 +339,7 @@ function validateIngestResult(value: unknown): string | null {
     "gpu_memory_process_peak_mib",
     "ram_total_used_avg_mib",
     "ram_total_used_peak_mib",
+    "gpu_memory_shared_peak_mib",
   ] as const) {
     if (
       row[field] !== undefined &&
@@ -694,6 +747,30 @@ export async function testsRoutes(app: FastifyInstance): Promise<void> {
       if (body.knee && body.kind !== "runtime") {
         return reply.code(400).send({ error: "the knee block requires kind \"runtime\"" });
       }
+      if (body.kind === "fit" && !body.fit_map) {
+        return reply.code(400).send({ error: "fit runs require a fit_map block" });
+      }
+      if (body.fit_map && body.kind !== "fit") {
+        return reply.code(400).send({ error: 'the fit_map block requires kind "fit"' });
+      }
+      if ((body.speed_run || body.thread_sweep) && body.kind !== "runtime") {
+        return reply.code(400).send({ error: 'the speed_run and thread_sweep blocks require kind "runtime"' });
+      }
+      {
+        const runtimeBlocks = [body.curve_point, body.knee, body.speed_run, body.thread_sweep, body.fill_curve].filter(Boolean).length;
+        if (runtimeBlocks > 1) {
+          return reply.code(400).send({ error: "a run carries at most one of curve_point, knee, fill_curve, speed_run or thread_sweep" });
+        }
+      }
+      if (body.flow_id !== undefined && (typeof body.flow_id !== "string" || !/^[A-Za-z0-9_-]{6,64}$/.test(body.flow_id))) {
+        return reply.code(400).send({ error: "flow_id must be 6..64 characters of [A-Za-z0-9_-]" });
+      }
+      if (body.flow_step !== undefined && !(FLOW_STEPS as readonly string[]).includes(body.flow_step)) {
+        return reply.code(400).send({ error: `flow_step must be one of ${FLOW_STEPS.join(", ")}` });
+      }
+      if (body.flow_step !== undefined && !body.flow_id) {
+        return reply.code(400).send({ error: "flow_step needs a flow_id" });
+      }
       if (body.knee && body.curve_point) {
         return reply.code(400).send({
           error: "a runtime run measures either a curve point or a concurrency ladder, not both",
@@ -902,6 +979,17 @@ export async function testsRoutes(app: FastifyInstance): Promise<void> {
           "that machine runs an older worker build — update it to measure a concurrency knee on this model."
         );
       }
+      if (body.kind === "fit" && !capabilities.has("fit-map-v1")) {
+        throw new ConflictError(
+          "that machine runs an older worker build — update it to map context against layers with llama-fit-params."
+        );
+      }
+      if (body.speed_run && !capabilities.has("speed-run-v1")) {
+        throw new ConflictError("that machine runs an older worker build — update it to run the baseline and confirm speed tests.");
+      }
+      if (body.thread_sweep && !capabilities.has("thread-sweep-v1")) {
+        throw new ConflictError("that machine runs an older worker build — update it to test CPU thread settings.");
+      }
       if (body.fill_curve && !capabilities.has("fill-curve-v1")) {
         throw new ConflictError(
           "that machine runs an older worker build — update it to measure prefill along the context fill on this model."
@@ -940,6 +1028,8 @@ export async function testsRoutes(app: FastifyInstance): Promise<void> {
         if (!isProbeMode(p.mode)) {
           return reply.code(400).send({ error: `probe.mode must be one of ${PROBE_MODES.join(", ")}` });
         }
+        const ladderError = validateProbeLadderExtras(p);
+        if (ladderError) return reply.code(400).send({ error: ladderError });
         if (p.granularity !== undefined && !isProbeGranularity(p.granularity)) {
           return reply
             .code(400)
@@ -962,6 +1052,21 @@ export async function testsRoutes(app: FastifyInstance): Promise<void> {
         }
         if (typeof q.dataset_hash !== "string" || !DATASET_HASH_RE.test(q.dataset_hash)) {
           return reply.code(400).send({ error: "quality.dataset_hash must match sha256:<64 lowercase hex>" });
+        }
+      }
+      {
+        const trainedCtxForSpec = typeof model.metadata.trained_ctx === "number" ? model.metadata.trained_ctx : null;
+        if (body.fit_map) {
+          const err = validateFitMapSpec(body.fit_map, trainedCtxForSpec);
+          if (err) return reply.code(400).send({ error: err });
+        }
+        if (body.speed_run) {
+          const err = validateSpeedRunSpec(body.speed_run, trainedCtxForSpec);
+          if (err) return reply.code(400).send({ error: err });
+        }
+        if (body.thread_sweep) {
+          const err = validateThreadSweepSpec(body.thread_sweep);
+          if (err) return reply.code(400).send({ error: err });
         }
       }
       if (body.knee) {
@@ -1116,7 +1221,8 @@ export async function testsRoutes(app: FastifyInstance): Promise<void> {
       // by construction) and a comparison group counts once, not once per
       // member. On a single-tenant instance every run carries user_id NULL,
       // which is one bucket -- the same accounting, one implicit user.
-      if (kind !== "probe") {
+      // Fit maps are exempt like probes: no model load, minutes at most.
+      if (kind !== "probe" && kind !== "fit") {
         const activeRoots = repo.countActiveRoots(userId);
         const groupHasActiveMember = body.comparison_id
           ? await repo.hasActiveComparisonMember(body.comparison_id)
@@ -1206,6 +1312,11 @@ export async function testsRoutes(app: FastifyInstance): Promise<void> {
       if (body.curve_point) runConfig.curve_point = body.curve_point;
       if (body.knee) runConfig.knee = body.knee;
       if (body.fill_curve) runConfig.fill_curve = body.fill_curve;
+      if (body.fit_map) runConfig.fit_map = body.fit_map;
+      if (body.speed_run) runConfig.speed_run = body.speed_run;
+      if (body.thread_sweep) runConfig.thread_sweep = body.thread_sweep;
+      if (body.flow_id) runConfig.flow_id = body.flow_id;
+      if (body.flow_step) runConfig.flow_step = body.flow_step;
       const run: Test = {
         id: runId,
         // §0.5 -- denormalized at creation; points at the run itself for
@@ -1234,9 +1345,45 @@ export async function testsRoutes(app: FastifyInstance): Promise<void> {
       // placement/KV template (expanded[0]); n_prompt is overwritten per
       // item with the context it actually measures, one per curve point, so
       // status/progress tracks each ladder cell individually.
+      const speedRun = body.speed_run;
+      const threadSweep = body.thread_sweep;
       const items = body.curve_point
         ? curveContexts.map((ctx, i) => ({ ...expanded[0], idx: i, n_prompt: ctx }))
-        : expanded;
+        : body.fit_map
+          ? [{ ...expanded[0], idx: 0 }]
+          : speedRun
+            ? speedRun.candidates.map((c, i) => ({
+                ...expanded[0],
+                idx: i,
+                n_prompt: speedRun.prompt_tokens,
+                n_gen: speedRun.n_gen,
+                n_depth: 0,
+                concurrency: 1,
+                mtp: "off",
+                n_cpu_moe: 0,
+                n_gpu_layers: c.ngl,
+                cache_type_k: c.ctk,
+                cache_type_v: c.ctv,
+                flash_attn: c.fa,
+                threads: c.threads?.t ?? -1,
+              }))
+            : threadSweep
+              ? threadSweep.items.map((t, i) => ({
+                  ...expanded[0],
+                  idx: i,
+                  n_prompt: t.role === "tb" ? THREAD_PP_TOKENS : 0,
+                  n_gen: t.role === "t" ? THREAD_TG_TOKENS : 0,
+                  n_depth: 0,
+                  concurrency: 1,
+                  mtp: "off",
+                  n_cpu_moe: 0,
+                  threads: t.threads,
+                  n_gpu_layers: threadSweep.placement.ngl,
+                  cache_type_k: threadSweep.placement.ctk,
+                  cache_type_v: threadSweep.placement.ctv,
+                  flash_attn: threadSweep.placement.fa,
+                }))
+              : expanded;
       repo.createTestItems(userId, run.id, items);
       request.log.info(
         { run_id: run.id, worker: worker.id, model_id: body.model_id, items: items.length, kind },
@@ -1273,8 +1420,32 @@ export async function testsRoutes(app: FastifyInstance): Promise<void> {
           gpu_total_mib: worker.vram?.ok ? worker.vram.gpu_memory_total_mib : null,
           mode: body.probe.mode,
           granularity: body.probe.granularity,
+          ...(body.probe.ladder ? { ladder: body.probe.ladder } : {}),
+          ...(body.probe.ctx_stops ? { ctx_stops: body.probe.ctx_stops } : {}),
+          ...(body.probe.seed ? { seed: body.probe.seed } : {}),
+          ...(body.probe.cap ? { cap: body.probe.cap } : {}),
+          ...(body.probe.fa ? { fa: body.probe.fa } : {}),
         };
         repo.queueRepo.enqueueJob(worker.id, { type: "run_probe", payload: probePayload, runId: run.id });
+      } else if (body.kind === "fit" && body.fit_map) {
+        // Steps 1 / 1' / 4 / 5 -- llama-fit-params only, its own job type.
+        // KV support rows already known for this machine/build/model ride
+        // along so the worker can skip the 128-call detection.
+        const kvKnown = fitRepo.listKv({ worker_id: worker.id, build: resolved.tag, backend: targetBackend, model_id: body.model_id });
+        const memTotalMib = worker.hardware?.mem_total_bytes ? Math.floor(worker.hardware.mem_total_bytes / 1048576) : null;
+        const fitPayload: FitMapJobPayload = {
+          run_id: run.id,
+          model,
+          llama_cpp_build: resolved.tag,
+          llama_cpp_backend: targetBackend,
+          main_gpu: body.main_gpu,
+          spec: body.fit_map,
+          kv_known: kvKnown.length > 0 ? kvKnown : undefined,
+          // The host side of a partial offload has to fit in system RAM;
+          // the same margin the device gets is kept back from it.
+          ram_budget_mib: memTotalMib != null ? Math.max(0, memTotalMib - body.fit_map.margin_mib) : null,
+        };
+        repo.queueRepo.enqueueJob(worker.id, { type: "fit_map", payload: fitPayload, runId: run.id });
       } else if (body.kind === "quality" && body.quality) {
         // N4 -- a quality measurement is its own job type too, same reason as
         // a probe: one llama-perplexity invocation, not a sweep.
@@ -1300,6 +1471,11 @@ export async function testsRoutes(app: FastifyInstance): Promise<void> {
           main_gpu: body.main_gpu,
           llama_cpp_build: resolved.tag,
           llama_cpp_backend: targetBackend,
+          ...(body.speed_run
+            ? { mode: "speed_run" as const, speed_run: body.speed_run }
+            : body.thread_sweep
+              ? { mode: "thread_sweep" as const, thread_sweep: body.thread_sweep }
+              : {}),
           ...(body.curve_point
             ? { mode: "context_curve" as const, curve_point: body.curve_point }
             : body.knee

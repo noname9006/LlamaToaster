@@ -244,7 +244,7 @@ export function Compare() {
 
   return (
     <div>
-      <h1 className="text-2xl font-semibold text-fg">Compare tests</h1>
+      <h1 className="m-0 font-display text-[32px] font-semibold leading-tight text-fg">Compare</h1>
       <p className="mt-2 max-w-2xl text-sm text-muted">
         Select 2+ tests to compare avg tokens/s side by side. Tests with different sweep configs
         are matched by test config, not position — a config missing from a run shows as "—".

@@ -630,12 +630,18 @@ const BLOCK_TENSOR = /^blk\.(\d+)\.(.+)$/;
 // plain dense FFN tensors ("ffn_gate.weight", no _exps suffix or numeric
 // index) -- those are ordinary per-layer weights, not subject to
 // --n-cpu-moe.
-const MOE_EXPERT_TENSOR = /^ffn_(?:gate|up|down)(_exps)?(?:\.\d+)?\.(?:weight|bias)$/;
+//
+// Covers the same routed-expert names llama.cpp's own fit uses
+// (ffn_(up|down|gate_up|gate)_(ch|)exps): the fused gate+up stack some
+// architectures write (gemma-4 26B-A4B's "ffn_gate_up_exps") and the
+// "_chexps" variant. Shared experts ("_shexp") and the router
+// ("ffn_gate_inp") are dense -- used on every token -- and stay out.
+const MOE_EXPERT_TENSOR = /^ffn_(?:gate_up|gate|up|down)(_exps|_chexps)?(?:\.\d+)?\.(?:weight|bias|scale)$/;
 
 function isMoeExpertTensorName(rest: string): boolean {
   const m = MOE_EXPERT_TENSOR.exec(rest);
   if (!m) return false;
-  return m[1] === "_exps" || /^ffn_(?:gate|up|down)\.\d+\./.test(rest);
+  return m[1] === "_exps" || m[1] === "_chexps" || /^ffn_(?:gate_up|gate|up|down)\.\d+\./.test(rest);
 }
 
 // Buckets every tensor's real on-disk byte size (see readGgufInfo's caller

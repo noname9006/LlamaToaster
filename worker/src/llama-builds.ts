@@ -82,6 +82,8 @@ export interface InstalledBuildInfo {
   // Unavailability is surfaced at run-trigger time instead (see
   // server/src/routes/runs.ts).
   server_path?: string;
+  // llama-fit-params, when the archive ships it -- see findFitParamsBinary.
+  fit_params_path?: string;
   // Set when the matching cudart redistributable (CUDA runtime DLLs) was
   // downloaded and extracted alongside the binaries -- see installBuild's
   // opts.cudartUrl. Informational (surfaced on the Workers page); absence
@@ -165,6 +167,15 @@ function findServerBinary(dir: string): string | null {
   return findBinary(dir, SERVER_BASENAMES);
 }
 
+// llama-fit-params ships in the same release archive as llama-server (since
+// the b7xxx --fit work). The optimization flow's fit map runs it; a build
+// without it simply can't, which the server reports instead of queuing.
+const FIT_PARAMS_BASENAMES = new Set(["llama-fit-params.exe", "llama-fit-params"]);
+
+export function findFitParamsBinary(dir: string): string | null {
+  return findBinary(dir, FIT_PARAMS_BASENAMES);
+}
+
 export function listInstalledBuilds(buildsDir: string): InstalledBuildInfo[] {
   if (!existsSync(buildsDir)) return [];
   const out: InstalledBuildInfo[] = [];
@@ -183,7 +194,13 @@ export function listInstalledBuilds(buildsDir: string): InstalledBuildInfo[] {
       const benchPath = findBenchBinary(dir);
       if (!benchPath) continue;
       const serverPath = findServerBinary(dir);
-      out.push({ ...manifest, bench_path: benchPath, server_path: serverPath ?? undefined });
+      const fitParamsPath = findFitParamsBinary(dir);
+      out.push({
+        ...manifest,
+        bench_path: benchPath,
+        server_path: serverPath ?? undefined,
+        fit_params_path: fitParamsPath ?? undefined,
+      });
     } catch {
       /* skip a corrupt/partial install rather than fail the whole listing */
     }
@@ -359,6 +376,8 @@ export async function installBuild(opts: {
       try {
         chmodSync(benchPath, 0o755);
         if (serverPath) chmodSync(serverPath, 0o755);
+        const fitParams = findFitParamsBinary(targetDir);
+        if (fitParams) chmodSync(fitParams, 0o755);
       } catch {
         /* best effort -- extraction usually preserves the exec bit already */
       }
@@ -385,6 +404,7 @@ export async function installBuild(opts: {
       installed_at: installedAt,
       bench_path: benchPath,
       server_path: serverPath ?? undefined,
+      fit_params_path: findFitParamsBinary(targetDir) ?? undefined,
       ...(opts.cudartName ? { cudart_name: opts.cudartName } : {}),
     };
   } catch (err) {
@@ -445,6 +465,7 @@ export function reconcileBuildsDir(buildsDir: string): InstalledBuildInfo[] {
         installed_at: installedAt,
         bench_path: benchPath,
         server_path: findServerBinary(dir) ?? undefined,
+        fit_params_path: findFitParamsBinary(dir) ?? undefined,
       });
     } catch {
       // unwritable/partial dir -- skip rather than fail startup over it

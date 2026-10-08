@@ -94,6 +94,8 @@ export interface SpawnRuntimeServerInput {
   contextSizeOverride?: number;
   /** Speed runs load the model fully into RAM instead of mmap-ing it. */
   noMmap?: boolean;
+  /** See ServerArgsInput.extraArgs. */
+  extraArgs?: string[];
   log?: BenchLogger;
   onSpawn?: (proc: ChildProcess) => void;
   spawnFn?: SpawnFn;
@@ -125,6 +127,7 @@ export async function spawnRuntimeServer(input: SpawnRuntimeServerInput): Promis
     supportsMlock,
     contextSizeOverride: input.contextSizeOverride,
     noMmap,
+    extraArgs: input.extraArgs,
   });
   input.log?.info(`llama-server ${args.join(" ")}`);
   const proc = (input.spawnFn ?? defaultSpawn)(input.llamaServerPath, args);

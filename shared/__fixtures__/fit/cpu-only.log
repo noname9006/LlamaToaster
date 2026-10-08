@@ -1,0 +1,14 @@
+0.00.070.406 I common_params_fit_impl: getting device memory data for initial parameters:
+0.00.302.373 I print_info: n_ctx_train           = 32768
+0.00.302.374 I print_info: n_layer               = 48
+0.00.302.416 I print_info: n_expert              = 0
+0.00.302.416 I print_info: n_expert_used         = 0
+0.00.316.761 I llama_kv_cache: size =  768.00 MiB ( 32768 cells,  48 layers,  1/1 seqs), K (f16):  384.00 MiB, V (f16):  384.00 MiB
+0.00.322.425 I sched_reserve:        CPU compute buffer size =   300.25 MiB
+0.00.322.427 I sched_reserve: graph: nodes = 1638, splits = 1, input objects = 4, input tensors = 6
+0.00.322.656 I common_memory_breakdown_print: | memory breakdown [MiB] | total   free    self   model   context   compute    unaccounted |
+0.00.322.657 I common_memory_breakdown_print: |   - Host               |                 2069 =  1001 +     768 +     300                |
+0.00.347.419 I common_params_fit_impl: projected to use 2069 MiB of host memory vs. 32693 MiB of total host memory
+0.00.347.421 I common_params_fit_impl: will leave 30623 >= 1024 MiB of system memory, no changes needed
+0.00.347.422 I common_fit_params: successfully fit params to free device memory
+0.00.347.429 I common_fit_params: fitting params to free memory took 0.28 seconds

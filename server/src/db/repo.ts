@@ -230,6 +230,7 @@ interface ResultRowRaw {
   gpu_memory_process_peak_source: string | null;
   ram_total_used_avg_mib: number | null;
   ram_total_used_peak_mib: number | null;
+  gpu_memory_shared_peak_mib: number | null;
   gpu_layers_loaded: number | null;
   total_model_layers: number | null;
   gpu_layers_loaded_draft: number | null;
@@ -816,6 +817,7 @@ function mapResult(row: ResultRowRaw): ResultRow {
     gpu_memory_process_peak_source: row.gpu_memory_process_peak_source as ResultRow["gpu_memory_process_peak_source"],
     ram_total_used_avg_mib: row.ram_total_used_avg_mib ?? undefined,
     ram_total_used_peak_mib: row.ram_total_used_peak_mib ?? undefined,
+    gpu_memory_shared_peak_mib: row.gpu_memory_shared_peak_mib ?? undefined,
     gpu_layers_loaded: row.gpu_layers_loaded,
     total_model_layers: row.total_model_layers,
     gpu_layers_loaded_draft: row.gpu_layers_loaded_draft ?? undefined,
@@ -1869,7 +1871,7 @@ export const repo = {
               gpu_memory_process_avg_mib, gpu_memory_process_peak_mib,
               gpu_memory_process_avg_accuracy, gpu_memory_process_avg_source,
               gpu_memory_process_peak_accuracy, gpu_memory_process_peak_source,
-              ram_total_used_avg_mib, ram_total_used_peak_mib,
+              ram_total_used_avg_mib, ram_total_used_peak_mib, gpu_memory_shared_peak_mib,
               gpu_layers_loaded, total_model_layers, gpu_layers_loaded_draft, total_model_layers_draft,
               gpu_layers_resident_est, gpu_layers_resident_est_draft,
               sample_count, suspect_count, suspect_samples, repeat_samples, spec_drafted, spec_accepted,
@@ -1877,7 +1879,7 @@ export const repo = {
               concurrency, gpu_temp_c_max, gpu_clock_mhz_min, gpu_clock_samples,
               cpu_isa, ttft_ms_p50, ttft_ms_p95, ttft_n, e2e_ms_mean,
               worker_id, llama_cpp_build, engine, raw_json_path, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         );
         // Up to two rows for one idx (a pp row and a tg row from the same
         // benchmark process) -- distinguished by test_type, see
@@ -1943,6 +1945,7 @@ export const repo = {
             row.gpu_memory_process_peak_source,
             row.ram_total_used_avg_mib,
             row.ram_total_used_peak_mib,
+            row.gpu_memory_shared_peak_mib ?? null,
             row.gpu_layers_loaded,
             row.total_model_layers,
             row.gpu_layers_loaded_draft ?? null,
@@ -2900,7 +2903,7 @@ export const repo = {
         // quality run sat at 'scheduled' for its ENTIRE execution (the Tests
         // page mislabeled it, TestDetail hid its elapsed-time/Stop controls)
         // and only ever moved once its terminal result landed.
-        if (job.run_id && (job.job_type === "benchmark" || job.job_type === "run_probe" || job.job_type === "measure_quality")) {
+        if (job.run_id && (job.job_type === "benchmark" || job.job_type === "run_probe" || job.job_type === "measure_quality" || job.job_type === "fit_map")) {
           database
             .prepare(
               `UPDATE runs SET status = 'running', started_at = ?
@@ -4562,6 +4565,7 @@ function buildResultRow(
     gpu_memory_process_peak_source: r.gpu_memory_process_peak_source ?? null,
     ram_total_used_avg_mib: r.ram_total_used_avg_mib ?? null,
     ram_total_used_peak_mib: r.ram_total_used_peak_mib ?? null,
+    gpu_memory_shared_peak_mib: r.gpu_memory_shared_peak_mib ?? null,
     gpu_layers_loaded: r.gpu_layers_loaded,
     total_model_layers: r.total_model_layers,
     gpu_layers_loaded_draft: r.gpu_layers_loaded_draft ?? null,
@@ -4629,6 +4633,9 @@ function deriveEngineForResult(
   run: Test
 ): EngineKind {
   if (row.mtp === "on") return "server";
+  // The optimization flow's thread sweep rides kind "runtime" but measures
+  // with llama-bench.
+  if (run.kind === "runtime" && (run.config as TestConfig | undefined)?.thread_sweep) return "bench";
   if (run.kind === "runtime" || run.kind === "probe") return "server";
   return engineFromItem({ mtp: row.mtp });
 }

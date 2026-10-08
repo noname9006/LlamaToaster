@@ -20,6 +20,8 @@ import type {
 } from "../../shared/types.js";
 import type { ProbeDedupPoint } from "../../shared/api-v8.js";
 import { isRocmSupportList, type RocmSupportList } from "../../shared/rocmSupport.js";
+import type { FitPoint } from "../../shared/fitParams.js";
+import type { KvSupportRow } from "../../shared/kvSupport.js";
 
 // The server's daily-refreshed list of AMD GPUs ROCm supports -- used only to
 // pick the default backend at startup (see worker/src/index.ts). Public route
@@ -140,6 +142,41 @@ export async function postProbeAttempt(
     const text = await res.text();
     throw new HttpError(res.status, `probe attempt tick failed (${res.status}): ${text}`);
   }
+}
+
+// Optimization flow fit map: points stream in as each llama-fit-params call
+// answers, KV support rows land once detection finishes. Dual-mode worker
+// auth server-side (session or the shared secret + machine_id).
+export async function postFitPoints(
+  url: string,
+  token: string,
+  runId: string,
+  body: { machine_id?: string; points: FitPoint[] },
+  timeoutMs = 10_000
+): Promise<void> {
+  const res = await fetch(`${url}/api/tests/${runId}/fit-points`, {
+    method: "POST",
+    headers: { "content-type": "application/json", ...authHeader(token) },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  if (!res.ok) throw new HttpError(res.status, `fit points failed (${res.status}): ${await res.text()}`);
+}
+
+export async function postKvSupport(
+  url: string,
+  token: string,
+  runId: string,
+  body: { machine_id?: string; rows: KvSupportRow[] },
+  timeoutMs = 15_000
+): Promise<void> {
+  const res = await fetch(`${url}/api/tests/${runId}/kv-support`, {
+    method: "POST",
+    headers: { "content-type": "application/json", ...authHeader(token) },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  if (!res.ok) throw new HttpError(res.status, `kv support failed (${res.status}): ${await res.text()}`);
 }
 
 export async function postQualityResult(

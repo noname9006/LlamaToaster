@@ -2,7 +2,6 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { api } from "../api/client";
 import {
-  TestStatusPill,
   StatusDot,
   StatusPill,
   StatusCircle,
@@ -15,6 +14,9 @@ import {
 } from "../components/StatusPill";
 import { Th, toggleSort, type SortState } from "../components/Th";
 import type { Test, TestConfig, TestItem, TestStatus } from "../types";
+import { PageHeader, Seg } from "../components/optimize/ui";
+import { LtIcon } from "../components/ltIcons";
+import { flowParams, kindLabel, testStatusView } from "../testLabels";
 import { shortId, formatElapsed, formatFlashAttn } from "../utils";
 
 const TERMINAL_ITEM_STATUSES = new Set([
@@ -203,7 +205,8 @@ export function Tests() {
     let list = groups;
     if (workerFilter) list = list.filter((g) => g.members[0].worker_name === workerFilter);
     if (backendFilter) list = list.filter((g) => currentMember(g.members).llama_cpp_backend === backendFilter);
-    if (statusFilter) list = list.filter((g) => rowStatus(g.members) === statusFilter);
+    if (statusFilter === "active") list = list.filter((g) => ["running", "scheduled"].includes(rowStatus(g.members)));
+    else if (statusFilter) list = list.filter((g) => rowStatus(g.members) === statusFilter);
     const dir = sort.dir === "asc" ? 1 : -1;
     return [...list].sort((a, b) => {
       const av = groupSortValue(a, sort.key);
@@ -267,21 +270,34 @@ export function Tests() {
   }, [hasRunning]);
 
   const filtersActive = workerFilter || backendFilter || statusFilter;
+  const statusSeg: { value: string; label: string }[] = [
+    { value: "", label: "All" },
+    { value: "active", label: "Active" },
+    { value: "done", label: "Done" },
+    { value: "failed", label: "Failed" },
+    ...statusOptions.filter((o) => !["running", "scheduled", "done", "failed"].includes(o)).map((o) => ({ value: o, label: o })),
+  ];
+  const selectCls = "h-10 border border-border-strong bg-well px-2.5 text-sm text-fg";
 
   return (
     <div>
-      <h1 className="text-2xl font-semibold text-fg">Tests</h1>
-      {loaded && runs.length === 0 && <p className="mt-4 text-sm text-muted">No tests yet.</p>}
+      <PageHeader
+        title="Tests"
+        sub="Everything you've run or queued, newest first."
+        actions={
+          <Link to="/benchmark" className="inline-flex min-h-11 items-center border border-accent bg-accent px-5 font-display text-lg font-semibold text-accent-fg hover:bg-accent-hover">
+            New test
+          </Link>
+        }
+      />
+      {loaded && runs.length === 0 && <p className="text-sm text-muted">No tests yet.</p>}
       {runs.length > 0 && (
         <>
-          <div className="mt-4 flex flex-wrap items-end gap-3">
-            <label className="flex flex-col gap-1.5 text-sm">
-              <span className="text-muted">Worker</span>
-              <select
-                value={workerFilter}
-                onChange={(e) => setWorkerFilter(e.target.value)}
-                className="rounded-lg border border-border bg-surface px-3 py-1.5 text-fg outline-none focus:border-accent"
-              >
+          <div className="mb-4 flex flex-wrap items-end gap-3">
+            <Seg label="Filter by status" value={statusFilter} onChange={setStatusFilter} options={statusSeg} />
+            <label className="flex items-center gap-2 text-sm text-muted">
+              Machine
+              <select value={workerFilter} onChange={(e) => setWorkerFilter(e.target.value)} className={selectCls}>
                 <option value="">All</option>
                 {workerOptions.map((w) => (
                   <option key={w} value={w}>
@@ -290,32 +306,13 @@ export function Tests() {
                 ))}
               </select>
             </label>
-            <label className="flex flex-col gap-1.5 text-sm">
-              <span className="text-muted">Backend</span>
-              <select
-                value={backendFilter}
-                onChange={(e) => setBackendFilter(e.target.value)}
-                className="rounded-lg border border-border bg-surface px-3 py-1.5 text-fg outline-none focus:border-accent"
-              >
+            <label className="flex items-center gap-2 text-sm text-muted">
+              Backend
+              <select value={backendFilter} onChange={(e) => setBackendFilter(e.target.value)} className={selectCls}>
                 <option value="">All</option>
                 {backendOptions.map((b) => (
                   <option key={b} value={b}>
                     {b}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label className="flex flex-col gap-1.5 text-sm">
-              <span className="text-muted">Status</span>
-              <select
-                value={statusFilter}
-                onChange={(e) => setStatusFilter(e.target.value)}
-                className="rounded-lg border border-border bg-surface px-3 py-1.5 text-fg outline-none focus:border-accent"
-              >
-                <option value="">All</option>
-                {statusOptions.map((s) => (
-                  <option key={s} value={s}>
-                    {s}
                   </option>
                 ))}
               </select>
@@ -328,7 +325,7 @@ export function Tests() {
                   setBackendFilter("");
                   setStatusFilter("");
                 }}
-                className="rounded-lg border border-border px-3 py-1.5 text-sm text-muted hover:border-accent/40 hover:text-accent"
+                className="min-h-10 border border-border-strong px-3 text-sm text-fg-2 hover:border-accent hover:text-accent"
               >
                 Clear filters
               </button>
@@ -336,23 +333,23 @@ export function Tests() {
           </div>
 
           {visibleGroups.length === 0 ? (
-            <p className="mt-4 text-sm text-muted">No tests match the current filters.</p>
+            <p className="text-sm text-muted">No tests match the current filters.</p>
           ) : (
-            <div className="mt-4 overflow-x-auto rounded-xl border border-border bg-surface">
-              <table className="w-full text-left text-sm">
+            <div className="overflow-x-auto border border-border bg-surface">
+              <table className="w-full border-collapse text-left text-sm">
+                <caption className="px-4 pb-2 pt-3 text-left text-xs text-muted">
+                  {visibleGroups.length} of {groups.length} tests. A chain of stages, or a batch of context tests, is one row.
+                </caption>
                 <thead>
-                  <tr className="border-b border-border text-xs uppercase tracking-wide text-muted">
-                    <Th label="ID" description={COLUMN_DESCRIPTIONS.id} sortKey="id" sort={sort} onSort={(k) => setSort((s) => toggleSort(s, k))} className="!px-4 !py-2.5" />
-                    <Th label="Worker" description={COLUMN_DESCRIPTIONS.worker} sortKey="worker" sort={sort} onSort={(k) => setSort((s) => toggleSort(s, k))} className="!px-4 !py-2.5" />
-                    <Th label="Model" description={COLUMN_DESCRIPTIONS.model} sortKey="model" sort={sort} onSort={(k) => setSort((s) => toggleSort(s, k))} className="!px-4 !py-2.5" />
-                    <Th label="Backend" description={COLUMN_DESCRIPTIONS.backend} sortKey="backend" sort={sort} onSort={(k) => setSort((s) => toggleSort(s, k))} className="!px-4 !py-2.5" />
-                    <Th label="Build" description={COLUMN_DESCRIPTIONS.build} sortKey="build" sort={sort} onSort={(k) => setSort((s) => toggleSort(s, k))} className="!px-4 !py-2.5" />
-                    <Th label="Params" description={COLUMN_DESCRIPTIONS.params} className="!px-4 !py-2.5" />
-                    <Th label="Status" description={COLUMN_DESCRIPTIONS.status} sortKey="status" sort={sort} onSort={(k) => setSort((s) => toggleSort(s, k))} className="!px-4 !py-2.5" />
-                    <Th label="Started" description={COLUMN_DESCRIPTIONS.started} sortKey="started" sort={sort} onSort={(k) => setSort((s) => toggleSort(s, k))} className="!px-4 !py-2.5" />
+                  <tr className="border-b border-border-strong font-mono text-xs tracking-[0.04em] text-muted">
+                    <Th label="Model" description={COLUMN_DESCRIPTIONS.model} sortKey="model" sort={sort} onSort={(k) => setSort((s) => toggleSort(s, k))} className="!px-4 !py-2.5 !normal-case" />
+                    <Th label="Machine" description={COLUMN_DESCRIPTIONS.worker} sortKey="worker" sort={sort} onSort={(k) => setSort((s) => toggleSort(s, k))} className="!px-2 !py-2.5 !normal-case" />
+                    <Th label="Kind" description={COLUMN_DESCRIPTIONS.params} className="!px-2 !py-2.5 !normal-case" />
+                    <Th label="Status" description={COLUMN_DESCRIPTIONS.status} sortKey="status" sort={sort} onSort={(k) => setSort((s) => toggleSort(s, k))} className="!px-2 !py-2.5 !normal-case" />
+                    <Th label="When" description={COLUMN_DESCRIPTIONS.started} sortKey="started" sort={sort} onSort={(k) => setSort((s) => toggleSort(s, k))} className="!px-4 !py-2.5 !normal-case !text-right" />
                   </tr>
                 </thead>
-                <tbody className="divide-y divide-border">
+                <tbody>
                   {visibleGroups.map((g) => {
                     const root = g.members[0];
                     const cur = currentMember(g.members);
@@ -361,36 +358,29 @@ export function Tests() {
                     const current =
                       items?.find((it) => !TERMINAL_ITEM_STATUSES.has(it.status) && it.status !== "queued") ??
                       items?.find((it) => it.status === "queued");
+                    const st = testStatusView({ status: rowStatus(g.members) });
+                    const params = flowParams(cur) ?? formatProbeParams(cur.config) ?? formatSweepParams(cur.config.sweep);
                     return (
-                      <tr key={g.rootId} className="hover:bg-white/5">
+                      <tr key={g.rootId} className="border-b border-border align-top last:border-b-0 hover:bg-surface-raised">
                         <td className="px-4 py-2.5">
-                          <Link to={`/tests/${g.rootId}`} className="text-accent hover:underline">
-                            <code>{shortId(g.rootId)}</code>
+                          <Link to={`/tests/${g.rootId}`} className="font-medium text-fg hover:text-accent">
+                            {(root.model_filename || `${shortId(root.model_id)}…`).replace(/\.gguf$/i, "")}
                           </Link>
+                          <div className="font-mono text-xs text-muted">
+                            <code>{shortId(g.rootId)}</code> · {cur.llama_cpp_backend} · {cur.llama_cpp_build}
+                          </div>
                         </td>
-                        <td className="px-4 py-2.5 text-fg">{root.worker_name}</td>
-                        <td className="px-4 py-2.5 text-muted">{root.model_filename || `${shortId(root.model_id)}…`}</td>
-                        <td className="px-4 py-2.5 text-muted">{cur.llama_cpp_backend}</td>
-                        <td className="px-4 py-2.5 text-muted">{cur.llama_cpp_build}</td>
-                        <td className="px-4 py-2.5 text-muted whitespace-nowrap font-mono text-xs">
-                          {cur.kind === "probe" && (
-                            <span className="mr-1.5 rounded-full bg-accent/10 px-2 py-0.5 text-[10px] font-semibold not-italic text-accent">
-                              probe
-                            </span>
-                          )}
-                          {formatProbeParams(cur.config) ?? formatSweepParams(cur.config.sweep)}
+                        <td className="px-2 py-2.5 font-mono text-xs text-fg-2">{root.worker_name}</td>
+                        <td className="px-2 py-2.5">
+                          <div className="text-sm text-fg-2">{kindLabel(cur)}</div>
+                          <div className="font-mono text-xs text-muted">{params}</div>
                           {cur.status === "running" && items && items.length > 0 && (
                             <StatusCircleStrip units={buildProgressUnits(items, cur.config.sweep.repeats)} />
                           )}
                           {g.members.length > 1 && (
                             <div className="mt-1.5 flex flex-wrap items-center gap-1">
                               {g.members.map((m) => (
-                                <Link
-                                  key={m.id}
-                                  to={`/tests/${m.id}`}
-                                  title={`${memberChipLabel(m)}: ${m.status}`}
-                                  className="inline-flex items-center gap-1"
-                                >
+                                <Link key={m.id} to={`/tests/${m.id}`} title={`${memberChipLabel(m)}: ${m.status}`} className="inline-flex items-center gap-1">
                                   <StatusCircle tone={MEMBER_CIRCLE_TONE[m.status]} />
                                   <StatusPill label={memberChipLabel(m)} tone={TEST_STATUS_TONE[m.status]} />
                                 </Link>
@@ -398,33 +388,27 @@ export function Tests() {
                             </div>
                           )}
                         </td>
-                        <td className="px-4 py-2.5">
-                          <div className="flex flex-wrap items-center gap-2">
-                            <TestStatusPill status={rowStatus(g.members)} />
-                            {agg.total ? (
-                              <span className="text-xs text-muted">
-                                {agg.done}/{agg.total}
-                                {agg.failed ? ` (${agg.failed} failed)` : ""}
-                                {agg.cancelled ? ` (${agg.cancelled} cancelled)` : ""}
-                              </span>
-                            ) : null}
-                            {cur.status === "running" && (
-                              <span className="text-xs text-muted">{formatElapsed(now - root.started_at)}</span>
-                            )}
+                        <td className="px-2 py-2.5">
+                          <span className={`inline-flex items-center gap-1.5 font-mono text-xs tracking-[0.04em] ${st.tone}`}>
+                            {st.icon && <LtIcon name={st.icon} size={14} />}
+                            {st.label}
+                          </span>
+                          <div className="font-mono text-xs text-muted">
+                            {agg.total ? `${agg.done}/${agg.total}` : ""}
+                            {agg.failed ? ` · ${agg.failed} failed` : ""}
+                            {agg.cancelled ? ` · ${agg.cancelled} stopped` : ""}
+                            {cur.status === "running" ? ` · ${formatElapsed(now - root.started_at)}` : ""}
                           </div>
                           {cur.status === "running" && current && (
                             <div className="mt-1 flex items-center gap-1.5">
                               <StatusDot status={current.status} />
-                              <span className="text-xs text-muted">
-                                step {current.idx + 1}/{cur.items_total}
-                              </span>
                               <span className="max-w-xs truncate text-xs text-muted" title={describeItemPhase(current)}>
-                                {describeItemPhase(current)}
+                                {current.idx + 1}/{cur.items_total} · {describeItemPhase(current)}
                               </span>
                             </div>
                           )}
                         </td>
-                        <td className="px-4 py-2.5 text-muted">{new Date(root.started_at).toLocaleString()}</td>
+                        <td className="whitespace-nowrap px-4 py-2.5 text-right font-mono text-xs text-muted">{formatWhen(root.started_at, now)}</td>
                       </tr>
                     );
                   })}
@@ -435,8 +419,20 @@ export function Tests() {
         </>
       )}
       {runs.some((r) => r.status === "running" || r.status === "scheduled") && (
-        <p className="mt-2 text-sm text-muted">Polling every 5s (a test is in progress or scheduled)…</p>
+        <p className="mt-2 font-mono text-xs text-muted">Updating every 5 s while a test is in progress or queued.</p>
       )}
     </div>
   );
 }
+
+function formatWhen(ts: number, now: number): string {
+  const s = Math.max(0, Math.round((now - ts) / 1000));
+  if (s < 60) return "just now";
+  const m = Math.round(s / 60);
+  if (m < 60) return `${m} min ago`;
+  const h = Math.round(m / 60);
+  if (h < 24) return `${h} h ago`;
+  const d = Math.round(h / 24);
+  return d < 14 ? `${d} d ago` : new Date(ts).toLocaleDateString();
+}
+

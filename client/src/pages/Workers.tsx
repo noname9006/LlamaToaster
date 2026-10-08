@@ -40,7 +40,7 @@ export function Workers() {
     <div>
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
-          <h1 className="text-2xl font-semibold text-fg">Workers</h1>
+          <h1 className="m-0 font-display text-[32px] font-semibold leading-tight text-fg">Machines</h1>
           <p className="mt-2 max-w-2xl text-sm text-muted">
             llama.cpp build management per worker. Installing, activating, and deleting a build is
             always a manual click here — nothing downloads or switches on its own. Installable

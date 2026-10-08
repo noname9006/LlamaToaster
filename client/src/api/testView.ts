@@ -33,6 +33,7 @@ export interface TestViewApi {
   getTest: Api["getTest"];
   getBatchMembers: Api["getBatchMembers"];
   getProbeAttempts: Api["getProbeAttempts"];
+  getFitPoints: Api["getFitPoints"];
   getProfiles: Api["getProfiles"];
   getCurve: Api["getCurve"];
   getKnee: Api["getKnee"];
@@ -61,6 +62,7 @@ export const mainTestViewApi: TestViewApi = {
   getTest: (id) => api.getTest(id),
   getBatchMembers: (id) => api.getBatchMembers(id),
   getProbeAttempts: (id) => api.getProbeAttempts(id),
+  getFitPoints: (id) => api.getFitPoints(id),
   getProfiles: (id, goals) => api.getProfiles(id, goals),
   getCurve: (modelId, opts) => api.getCurve(modelId, opts),
   getKnee: (id) => api.getKnee(id),

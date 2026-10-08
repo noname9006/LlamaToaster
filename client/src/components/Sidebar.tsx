@@ -1,80 +1,83 @@
-import { NavLink } from "react-router-dom";
-import type { ComponentType, SVGProps } from "react";
-import { IconGrid, IconBox, IconActivity, IconPlusCircle, IconList, IconBarChart, IconServer, IconSettings } from "./icons";
+import { NavLink, useLocation } from "react-router-dom";
+import { LtIcon, type LtIconName } from "./ltIcons";
 
 interface NavItem {
   to: string;
   label: string;
-  icon: ComponentType<SVGProps<SVGSVGElement>>;
+  icon: LtIconName;
   end?: boolean;
+  /** Other routes that light this item up (a detail page under its list). */
+  also?: string[];
 }
 
-const NAV_ITEMS: NavItem[] = [
-  { to: "/", label: "Dashboard", icon: IconGrid, end: true },
-  { to: "/models", label: "Models", icon: IconBox },
-  // The v8 console (BENCHMARKING_PLAN_V8.md, docs/benchmark-page-mockup-v8.html):
-  // state the goal, the page derives the tuning->refine->sweep chain. "Custom Test"
-  // stays beside it as the hand-built single-grid path.
-  { to: "/benchmark", label: "Benchmark", icon: IconActivity },
-  { to: "/custom-test", label: "Custom Test", icon: IconPlusCircle },
-  { to: "/tests", label: "Tests", icon: IconList },
-  { to: "/compare", label: "Compare", icon: IconBarChart },
-  { to: "/workers", label: "Workers", icon: IconServer },
+// The v2 navigation (docs/plans/app-v2.dc.html). "New test" is the
+// optimization flow; Custom Test hangs under it, a test's detail page under
+// Tests. Settings is account-scoped and only exists when auth is on.
+export const NAV_ITEMS: NavItem[] = [
+  { to: "/", label: "Dashboard", icon: "grid", end: true },
+  { to: "/benchmark", label: "New test", icon: "plus", also: ["/custom-test", "/new"] },
+  { to: "/tests", label: "Tests", icon: "list" },
+  { to: "/compare", label: "Compare", icon: "bars" },
+  { to: "/models", label: "Models", icon: "box" },
+  { to: "/workers", label: "Machines", icon: "server", also: ["/device"] },
 ];
 
-// Kept separate from NAV_ITEMS -- Settings is account-scoped (session
-// management, connected accounts), not part of the benchmarking workflow
-// the rest of the nav covers, so it gets its own spot below the divider
-// rather than blending into that list.
-const SETTINGS_ITEM: NavItem = { to: "/settings", label: "Settings", icon: IconSettings };
+const SETTINGS_ITEM: NavItem = { to: "/settings", label: "Settings", icon: "sliders" };
 
-interface SidebarProps {
-  // Settings' own routes (GET/DELETE /api/sessions, GET /api/auth/identities)
-  // are only ever REGISTERED server-side when AUTH_ENABLED (server/src/index.ts)
-  // -- showing this link the rest of the time would point at routes that
-  // 404, not a page that gracefully explains itself. Hidden rather than
-  // shown-disabled since there's nothing here for a Stage-1-only deployment
-  // to grow into yet.
-  authEnabled: boolean;
+export function navItemsFor(authEnabled: boolean): NavItem[] {
+  return authEnabled ? [...NAV_ITEMS, SETTINGS_ITEM] : NAV_ITEMS;
 }
 
-export function Sidebar({ authEnabled }: SidebarProps) {
+function isActive(item: NavItem, pathname: string): boolean {
+  if (item.end) return pathname === item.to;
+  return [item.to, ...(item.also ?? [])].some((p) => pathname === p || pathname.startsWith(p + "/"));
+}
+
+export function NavList({ authEnabled, onNavigate, large }: { authEnabled: boolean; onNavigate?: () => void; large?: boolean }) {
+  const { pathname } = useLocation();
   return (
-    <aside className="flex w-56 shrink-0 flex-col border-r border-border bg-surface">
-      <div className="flex items-center gap-2 px-5 py-5">
-        <img src="/logo.png" alt="LlamaToaster" className="w-full" />
+    <>
+      {navItemsFor(authEnabled).map((item) => {
+        const active = isActive(item, pathname);
+        return (
+          <NavLink
+            key={item.to}
+            to={item.to}
+            end={item.end}
+            onClick={onNavigate}
+            aria-current={active ? "page" : undefined}
+            className={`flex w-full items-center gap-3 border-l-2 px-3 text-sm font-medium transition-colors ${
+              large ? "min-h-11" : "min-h-10"
+            } ${active ? "border-accent bg-accent-tint text-accent" : "border-transparent text-fg-2 hover:bg-surface-raised hover:text-fg"}`}
+          >
+            <LtIcon name={item.icon} className="flex-none" />
+            {item.label}
+          </NavLink>
+        );
+      })}
+    </>
+  );
+}
+
+interface SidebarProps {
+  // Settings' own routes are only registered server-side when AUTH_ENABLED
+  // -- see server/src/index.ts -- so the link is hidden the rest of the time.
+  authEnabled: boolean;
+  footer?: string | null;
+}
+
+export function Sidebar({ authEnabled, footer }: SidebarProps) {
+  return (
+    <aside className="sticky top-0 flex h-screen w-56 flex-none flex-col border-r border-border bg-surface">
+      <div className="flex items-center gap-2.5 px-[18px] pb-5 pt-[18px]">
+        <img src="/toaster_favicon.png" alt="" className="block h-8 w-8 object-contain" />
+        <span className="font-display text-lg font-semibold">LlamaToaster</span>
       </div>
-      <nav className="flex flex-1 flex-col gap-0.5 px-3">
-        {NAV_ITEMS.map(({ to, label, icon: ItemIcon, end }) => (
-          <NavLink
-            key={to}
-            to={to}
-            end={end}
-            className={({ isActive }) =>
-              `flex items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium transition-colors ${
-                isActive ? "bg-accent/15 text-accent" : "text-muted hover:bg-white/5 hover:text-fg"
-              }`
-            }
-          >
-            <ItemIcon className="h-4.5 w-4.5" width={18} height={18} />
-            {label}
-          </NavLink>
-        ))}
+      <nav aria-label="Main" className="flex flex-col gap-0.5 px-2.5">
+        <NavList authEnabled={authEnabled} />
       </nav>
-      {authEnabled && (
-        <div className="border-t border-border px-3 py-2">
-          <NavLink
-            to={SETTINGS_ITEM.to}
-            className={({ isActive }) =>
-              `flex items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium transition-colors ${
-                isActive ? "bg-accent/15 text-accent" : "text-muted hover:bg-white/5 hover:text-fg"
-              }`
-            }
-          >
-            <IconSettings className="h-4.5 w-4.5" width={18} height={18} />
-            {SETTINGS_ITEM.label}
-          </NavLink>
-        </div>
+      {footer && (
+        <p className="mt-auto truncate border-t border-border px-[18px] py-4 font-mono text-xs text-muted">{footer}</p>
       )}
     </aside>
   );

@@ -918,10 +918,23 @@ export function CustomTest() {
 
   return (
     <div>
-      <h1 className="text-2xl font-semibold text-fg">Custom Test</h1>
-      <p className="mt-2 max-w-2xl text-sm text-muted">
-        Every combination of the values below is expanded into one llama-bench sweep, averaged
-        over the repeat count.
+      <nav aria-label="Breadcrumb" className="mb-2 text-sm text-muted">
+        <ol className="m-0 flex list-none flex-wrap gap-2 p-0">
+          <li>
+            <Link to="/benchmark" className="text-accent">
+              New test
+            </Link>
+          </li>
+          <li aria-hidden="true">›</li>
+          <li aria-current="page" className="text-fg-2">
+            Custom test
+          </li>
+        </ol>
+      </nav>
+      <h1 className="m-0 font-display text-[32px] font-semibold leading-tight text-fg">Custom test</h1>
+      <p className="mt-1 max-w-2xl text-fg-2">
+        One grid, every value yours. Every combination of the values below is expanded into one llama-bench sweep,
+        averaged over the repeat count.
       </p>
 
       <form onSubmit={handleSubmit} className="mt-6 flex flex-col gap-6">
