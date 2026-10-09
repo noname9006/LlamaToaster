@@ -311,12 +311,10 @@ function Ensure-NodeJs {
 Ensure-NodeJs
 
 Push-Location $Dir
-Write-Host "Installing dependencies (npm install)..."
-# --ignore-scripts: skips better-sqlite3's install step, which always compiles
-# from source via node-gyp (it has no prebuilt-binary fallback) and needs the
-# full Visual Studio C++ Build Tools workload. The worker never imports
-# better-sqlite3 (server-only), so there's nothing to build here.
-npm install --ignore-scripts
+Write-Host "Installing worker dependencies (npm install --prefix worker)..."
+# Only worker\package.json's runtime deps -- see setup-worker.ps1. The root
+# manifest (server, UI builds, test tooling) is never installed on a worker.
+npm install --prefix worker --omit=dev --ignore-scripts
 $installExit = $LASTEXITCODE
 Pop-Location
 if ($installExit -ne 0) {

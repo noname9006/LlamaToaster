@@ -261,8 +261,18 @@ if [ ! -f "$DIR/package.json" ]; then
   echo "$DIR has no LlamaToaster checkout yet -- downloading it (branch: $BRANCH)..."
   mkdir -p "$DIR"
   if command -v git >/dev/null 2>&1; then
-    git clone --depth 1 --branch "$BRANCH" "$REPO_URL" "$DIR"
+    # Not `git clone`: ensure_node above may already have put Node.js in
+    # $DIR/.node, and clone refuses any non-empty target. init + fetch +
+    # checkout works in a folder that already has files, and leaves them be.
+    git -C "$DIR" init --quiet
+    git -C "$DIR" remote add origin "$REPO_URL"
+    if ! git -C "$DIR" fetch --depth 1 origin "$BRANCH"; then
+      echo "git fetch failed -- check network access and the branch name ($BRANCH)." >&2
+      exit 1
+    fi
+    # Before the checkout, so the pruned folders are never written at all.
     prune_checkout "$DIR"
+    git -C "$DIR" checkout --quiet -B "$BRANCH" FETCH_HEAD
   else
     echo "git not found -- downloading a tarball of the repo instead."
     TMP_TAR="$(mktemp -t llamatoaster-XXXXXX).tar.gz"
@@ -333,13 +343,10 @@ else
 fi
 
 cd "$DIR"
-echo "Installing dependencies (npm install)..."
-# --ignore-scripts: skips better-sqlite3's install step, which always compiles
-# from source via node-gyp (it has no prebuilt-binary fallback) and needs a
-# real C++ toolchain (Xcode Command Line Tools on macOS, build-essential on
-# Linux). The worker never imports better-sqlite3 (server-only), so there's
-# nothing to build here.
-if ! npm install --ignore-scripts; then
+echo "Installing worker dependencies (npm install --prefix worker)..."
+# Only worker/package.json's runtime deps -- see setup-worker.sh. The root
+# manifest (server, UI builds, test tooling) is never installed on a worker.
+if ! npm install --prefix worker --omit=dev --ignore-scripts; then
   echo "npm install failed." >&2
   exit 1
 fi

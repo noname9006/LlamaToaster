@@ -1,0 +1,20 @@
+{
+  "name": "llamatoaster-worker",
+  "version": "2.0.0",
+  "private": true,
+  "description": "LlamaToaster worker runtime dependencies only. A worker install runs `npm install --prefix worker --omit=dev --ignore-scripts` instead of installing the whole repo (server, UI build and test tooling). Keep in sync with the root package.json -- worker/package.test.ts enforces it.",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=22.22.2"
+  },
+  "scripts": {
+    "start": "cd .. && tsx worker/src/index.ts"
+  },
+  "dependencies": {
+    "adm-zip": "^0.6.1",
+    "better-sqlite3": "^13.0.3",
+    "systeminformation": "^5.33.10",
+    "tsx": "4.23.13"
+  }
+}

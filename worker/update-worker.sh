@@ -120,10 +120,19 @@ main() {
   fi
 
   echo ""
-  echo "Installing dependencies (npm install)..."
-  # --ignore-scripts: see setup-worker.sh -- better-sqlite3 is server-only.
-  (cd "$repo_root" && npm install --ignore-scripts) \
+  echo "Installing worker dependencies (npm install --prefix worker)..."
+  # Only worker/package.json's runtime deps -- see setup-worker.sh.
+  (cd "$repo_root" && npm install --prefix worker --omit=dev --ignore-scripts) \
     || fail "npm install failed. The code is updated but its dependencies may not be."
+
+  # Installs from before worker/package.json existed have the whole repo's
+  # dependency tree in the root node_modules, which nothing on a worker uses
+  # any more. Only removed on a worker-only checkout (no server/ folder) -- a
+  # dev checkout needs it -- and only after the running-worker check above.
+  if [ ! -d "$repo_root/server" ] && [ -d "$repo_root/node_modules" ]; then
+    echo "Removing the old full-repo node_modules (no longer used by the worker)..."
+    rm -rf "$repo_root/node_modules" || true
+  fi
 }
 
 main "$@"

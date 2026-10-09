@@ -71,9 +71,14 @@ function Assert-Git {
 # code. tsx's own command line always carries the absolute node_modules path,
 # so that's what identifies "a worker from THIS install" rather than any
 # node process.
-$tsxMarker = (Join-Path $RepoRoot "node_modules\tsx").ToLower()
+# worker\node_modules is where tsx lives now; root node_modules is where a
+# worker still on the pre-worker\package.json code runs it from.
+$tsxMarkers = @(
+    (Join-Path $RepoRoot "worker\node_modules\tsx").ToLower(),
+    (Join-Path $RepoRoot "node_modules\tsx").ToLower()
+)
 $running = @(Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue |
-    Where-Object { $_.CommandLine -and $_.CommandLine.ToLower().Contains($tsxMarker) })
+    Where-Object { $cl = $_.CommandLine; $cl -and @($tsxMarkers | Where-Object { $cl.ToLower().Contains($_) }).Count -gt 0 })
 if ($running.Count -gt 0) {
     Fail "A worker from $RepoRoot is still running (PID $(($running.ProcessId) -join ', ')). Stop it with Ctrl+C in its window first."
 }
@@ -112,13 +117,21 @@ if (-not $before) {
 }
 
 Write-Host ""
-Write-Host "Installing dependencies (npm install)..."
+Write-Host "Installing worker dependencies (npm install --prefix worker)..."
 Push-Location $RepoRoot
-# --ignore-scripts: see setup-worker.ps1 -- better-sqlite3 is server-only and
-# would otherwise need the Visual Studio C++ Build Tools to compile.
-npm install --ignore-scripts
+# Only worker\package.json's runtime deps -- see setup-worker.ps1.
+npm install --prefix worker --omit=dev --ignore-scripts
 $npmExit = $LASTEXITCODE
 Pop-Location
+# Installs from before worker\package.json existed have the whole repo's
+# dependency tree (server, test tooling) in the root node_modules, which
+# nothing on a worker uses any more. Only removed on a worker-only checkout
+# (no server\ folder) -- a dev checkout needs it -- and only after the
+# running-worker check above passed. Best-effort: leftovers are just disk.
+if ($npmExit -eq 0 -and -not (Test-Path (Join-Path $RepoRoot "server")) -and (Test-Path (Join-Path $RepoRoot "node_modules"))) {
+    Write-Host "Removing the old full-repo node_modules (no longer used by the worker)..."
+    Remove-Item -Recurse -Force (Join-Path $RepoRoot "node_modules") -ErrorAction SilentlyContinue
+}
 if ($npmExit -ne 0) {
     Fail "npm install failed (exit $npmExit). The code is updated but its dependencies may not be. If the error mentions EBUSY/EPERM, close every worker window and any editor open in $RepoRoot, then retry."
 }

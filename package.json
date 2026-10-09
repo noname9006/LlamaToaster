@@ -17,7 +17,7 @@
   },
   "scripts": {
     "server": "tsx server/src/index.ts",
-    "worker": "tsx worker/src/index.ts",
+    "worker": "npm --prefix worker start",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:node": "vitest run --project node",
@@ -29,7 +29,8 @@
     "dev:admin": "npm run dev --prefix admin",
     "install:client": "npm install --prefix client",
     "install:admin": "npm install --prefix admin",
-    "postinstall": "npm install --prefix client && npm install --prefix admin"
+    "install:worker": "npm install --prefix worker --omit=dev --ignore-scripts",
+    "postinstall": "npm run install:worker && npm install --prefix client && npm install --prefix admin"
   },
   "dependencies": {
     "@fastify/cookie": "^11.1.2",

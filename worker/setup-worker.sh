@@ -390,14 +390,14 @@ add_local_bin_to_path() {
 }
 
 cd "$REPO_ROOT"
-if [ ! -e node_modules/.bin/tsx ]; then
-  echo "Installing dependencies (npm install)..."
-  # --ignore-scripts: skips better-sqlite3's install step, which always
-  # compiles from source via node-gyp (it has no prebuilt-binary fallback)
-  # and needs a real C++ toolchain (Xcode Command Line Tools on macOS,
-  # build-essential on Linux). The worker never imports better-sqlite3
-  # (server-only), so there's nothing to build here.
-  npm install --ignore-scripts
+if [ ! -e worker/node_modules/.bin/tsx ]; then
+  echo "Installing worker dependencies (npm install --prefix worker)..."
+  # worker/package.json lists only what the worker imports -- not the root
+  # manifest, which also pulls in the server, UI builds and test tooling.
+  # --ignore-scripts: nothing in it needs an install step (better-sqlite3
+  # ships prebuilt binaries in the package), and skipping them means no
+  # C++ toolchain is ever needed.
+  npm install --prefix worker --omit=dev --ignore-scripts
 fi
 
 # Runs on every setup/restart, not just first install: it's idempotent, and
