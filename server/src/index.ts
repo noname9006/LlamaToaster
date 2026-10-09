@@ -1,4 +1,4 @@
-import Fastify, { type FastifyError } from "fastify";
+import Fastify from "fastify";
 import fastifyStatic from "@fastify/static";
 import fastifyCookie from "@fastify/cookie";
 import fastifyRateLimit from "@fastify/rate-limit";
@@ -27,6 +27,7 @@ import { installRoutes } from "./routes/install.js";
 import { getDb } from "./db/migrate.js";
 import { runMaintenanceSweep, REAP_INTERVAL_MS } from "./reaper.js";
 import { authMiddleware } from "./auth-middleware.js";
+import { appErrorHandler } from "./error-handler.js";
 import { startHfIndexService, stopHfIndexService } from "./hf-index.js";
 import { startHfHeaderService, stopHfHeaderService } from "./hf-header.js";
 import { startRocmSupportService, stopRocmSupportService } from "./rocm-support.js";
@@ -297,21 +298,12 @@ app.setNotFoundHandler((request, reply) => {
   return { error: "not found" };
 });
 
-app.setErrorHandler((error: FastifyError, _req, reply) => {
-  app.log.error(error);
-  const statusCode = error.statusCode ?? 500;
-  // Never leak an internal error's message to the client -- it can contain
-  // file paths, SQL, or other implementation detail. Only errors we
-  // deliberately threw as a 4xx (see errors.ts) have a message meant to be
-  // shown to the caller.
-  const message = statusCode >= 500 ? "internal server error" : error.message;
-  reply.code(statusCode).send({ error: message });
-});
+app.setErrorHandler(appErrorHandler);
 
 async function start(): Promise<void> {
   try {
     await app.listen({ port: PORT, host: HOST });
-    app.log.info(`VPS bound to ${HOST}:${PORT} (tailnet-only per plan)`);
+    app.log.info(`VPS bound to ${HOST}:${PORT}`);
   } catch (err) {
     app.log.error(err);
     process.exit(1);
