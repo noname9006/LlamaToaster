@@ -1,10 +1,13 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { renderHook, act } from "@testing-library/react";
 import { useWorkerStatuses } from "./useWorkerStatus";
-import { api } from "./client";
+import { api, ApiError } from "./client";
 import type { Worker } from "../types";
 
-vi.mock("./client", () => ({ api: { listWorkers: vi.fn() } }));
+vi.mock("./client", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./client")>()),
+  api: { listWorkers: vi.fn() },
+}));
 
 const listWorkers = vi.mocked(api.listWorkers);
 
@@ -168,5 +171,76 @@ describe("useWorkerStatuses", () => {
     const first = result.current.refresh;
     rerender();
     expect(result.current.refresh).toBe(first);
+  });
+
+  it("backs off after a 401 instead of re-polling every interval", async () => {
+    listWorkers.mockRejectedValue(new ApiError("no session", 401));
+    renderHook(() => useWorkerStatuses());
+    await flush();
+    expect(listWorkers).toHaveBeenCalledTimes(1);
+
+    // First 401 doubles the wait: 10s, not the normal 5s.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(POLL_MS);
+    });
+    expect(listWorkers).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(POLL_MS);
+    });
+    expect(listWorkers).toHaveBeenCalledTimes(2);
+
+    // Second consecutive 401 doubles again: 20s.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(POLL_MS * 4 - 1);
+    });
+    expect(listWorkers).toHaveBeenCalledTimes(2);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1);
+    });
+    expect(listWorkers).toHaveBeenCalledTimes(3);
+  });
+
+  it("caps the 401 backoff at one minute and keeps retrying", async () => {
+    listWorkers.mockRejectedValue(new ApiError("no session", 401));
+    renderHook(() => useWorkerStatuses());
+    await flush();
+
+    // Waits 10s, 20s, 40s -- call 4 lands at t=70s.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10_000 + 20_000 + 40_000);
+    });
+    expect(listWorkers).toHaveBeenCalledTimes(4);
+
+    // The next wait would be 80s uncapped; it is held to 60s.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60_000 - 1);
+    });
+    expect(listWorkers).toHaveBeenCalledTimes(4);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1);
+    });
+    expect(listWorkers).toHaveBeenCalledTimes(5);
+  });
+
+  it("returns to the normal interval once a request succeeds after a 401", async () => {
+    listWorkers.mockRejectedValueOnce(new ApiError("no session", 401));
+    const { result } = renderHook(() => useWorkerStatuses());
+    await flush();
+    expect(listWorkers).toHaveBeenCalledTimes(1);
+
+    // Signed in elsewhere: the backed-off retry succeeds and the data arrives.
+    listWorkers.mockResolvedValue([worker("back")]);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10_000);
+    });
+    expect(listWorkers).toHaveBeenCalledTimes(2);
+    expect(result.current.workers).toEqual([worker("back")]);
+
+    // The streak reset, so the next poll is back on the 5s interval.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(POLL_MS);
+    });
+    expect(listWorkers).toHaveBeenCalledTimes(3);
   });
 });

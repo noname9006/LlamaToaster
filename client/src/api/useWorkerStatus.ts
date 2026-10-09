@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api } from "./client";
+import { api, ApiError } from "./client";
 import type { Worker } from "../types";
 
 // Shared by the Dashboard (compact per-machine chips) and the Workers page
@@ -17,6 +17,11 @@ import type { Worker } from "../types";
 // Server-side data is already fresh within one heartbeat (~10s); this just
 // needs to keep asking for it.
 const POLL_MS = 5000;
+// A 401 means no session (signed out, or it expired). Polling every 5s would
+// just repeat the rejection, so back off doubling each time up to this cap.
+// Still retries, so a fresh sign-in in another tab is picked up without a
+// reload.
+const UNAUTHORIZED_MAX_MS = 60_000;
 
 export function useWorkerStatuses() {
   const [workers, setWorkers] = useState<Worker[]>([]);
@@ -31,25 +36,30 @@ export function useWorkerStatuses() {
 
   useEffect(() => {
     let cancelled = false;
+    let unauthorizedStreak = 0;
     async function poll() {
+      let delay = POLL_MS;
       try {
         const list = await api.listWorkers();
+        unauthorizedStreak = 0;
         if (cancelled) return;
         setWorkers(list);
         setLoaded(true);
-      } catch {
-        // Transient (server restart, brief network drop, a 401 during a
-        // session refresh) -- the finally below reschedules regardless, so the
-        // loop self-heals on the next tick and the page keeps showing its last
-        // good data rather than blanking.
-        //
+      } catch (err) {
+        // Transient (server restart, brief network drop) -- the finally below
+        // reschedules regardless, so the loop self-heals on the next tick and
+        // the page keeps showing its last good data rather than blanking.
+        if (err instanceof ApiError && err.status === 401) {
+          unauthorizedStreak += 1;
+          delay = Math.min(POLL_MS * 2 ** unauthorizedStreak, UNAUTHORIZED_MAX_MS);
+        }
         // Swallowed rather than allowed to propagate: poll() is invoked
         // un-awaited (`void poll()` below, and again from its own setTimeout),
         // so an escaping rejection has nowhere to go and surfaces as an
         // "Uncaught (in promise)" on EVERY failed poll -- once per interval,
         // for as long as the server is unreachable.
       } finally {
-        if (!cancelled) timerRef.current = window.setTimeout(poll, POLL_MS);
+        if (!cancelled) timerRef.current = window.setTimeout(poll, delay);
       }
     }
     void poll();
