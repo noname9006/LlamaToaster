@@ -16,50 +16,87 @@ import { Workers } from "./pages/Workers";
 import { Login } from "./pages/Login";
 import { Settings } from "./pages/Settings";
 import { Device } from "./pages/Device";
-import { api } from "./api/client";
+import { api, setUnauthorizedHandler } from "./api/client";
+import { createUnauthorizedRecheck, saveReturnPath, takeReturnPath } from "./api/session";
 import type { AuthStatus } from "./types";
+
+// Boot-check retry: 1s, 2s, 4s ... capped, until the server answers.
+const BOOT_RETRY_MAX_MS = 30_000;
 
 export default function App() {
   const location = useLocation();
   const navigate = useNavigate();
-  // null = boot check not resolved yet. A failed fetch (network hiccup, not
-  // an auth rejection -- getAuthStatus is itself a PUBLIC_PATH that never
-  // 401s) is treated as "auth off" rather than blocking the whole app.
+  // null = boot check not resolved yet. A failed check (server restarting,
+  // network down) is retried rather than guessed at: assuming "auth off"
+  // here used to mount the whole app with no user and the Settings page
+  // (and its Sign out) hidden, stuck that way until a reload.
   const [authStatus, setAuthStatus] = useState<AuthStatus | null>(null);
+  const [bootFailed, setBootFailed] = useState(false);
 
   useEffect(() => {
-    api
-      .getAuthStatus()
-      .then(setAuthStatus)
-      .catch(() =>
-        setAuthStatus({
-          user: null,
-          authEnabled: false,
-          appSettings: {
-            communitySharingAllowed: false,
-            communityUserChoiceAllowed: true,
-            accountDeletionAllowed: true,
-            workerVramDiscrepancyPolicy: "warn",
-            probeMaxLoads: 24,
-          },
-        })
+    let cancelled = false;
+    let timer: number | undefined;
+    let attempt = 0;
+    const load = () =>
+      api.getAuthStatus().then(
+        (status) => {
+          if (!cancelled) setAuthStatus(status);
+        },
+        () => {
+          if (cancelled) return;
+          setBootFailed(true);
+          timer = window.setTimeout(load, Math.min(1000 * 2 ** attempt++, BOOT_RETRY_MAX_MS));
+        }
       );
+    void load();
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, []);
+
+  // A session can end mid-visit (expired, signed out elsewhere, account
+  // deleted) while authStatus still says signed in. Any API 401 re-checks
+  // the status; if the server confirms nobody is signed in, the needsLogin
+  // redirect below takes over.
+  useEffect(() => {
+    setUnauthorizedHandler(
+      createUnauthorizedRecheck(api.getAuthStatus, (status) => {
+        if (status.authEnabled && status.user === null) setAuthStatus(status);
+      })
+    );
+    return () => setUnauthorizedHandler(null);
   }, []);
 
   const needsLogin = authStatus !== null && authStatus.authEnabled && authStatus.user === null;
+  const signedIn = authStatus?.user != null;
 
   // MULTIUSER_PLAN.md §2.8: an unauthenticated visitor hitting any route
   // gets redirected to /login. Runs as an effect (not during render) since
   // it's a navigation, and `replace` so the protected route they originally
-  // hit isn't left sitting in back-button history under a login wall.
+  // hit isn't left sitting in back-button history under a login wall. The
+  // route they were on is remembered for after sign-in.
   useEffect(() => {
     if (needsLogin && location.pathname !== "/login") {
+      saveReturnPath(location.pathname + location.search + location.hash);
       navigate("/login", { replace: true });
     }
-  }, [needsLogin, location.pathname, navigate]);
+  }, [needsLogin, location.pathname, location.search, location.hash, navigate]);
+
+  // The OAuth callback always lands on "/"; go back to where the visitor was
+  // sent away from, if anywhere.
+  useEffect(() => {
+    if (!signedIn) return;
+    const path = takeReturnPath();
+    if (path) navigate(path, { replace: true });
+  }, [signedIn, navigate]);
 
   if (authStatus === null) {
-    return <div className="flex min-h-screen items-center justify-center bg-bg text-sm text-muted">Loading…</div>;
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-bg text-sm text-muted" role="status">
+        {bootFailed ? "Can't reach the server — retrying…" : "Loading…"}
+      </div>
+    );
   }
 
   // /login (and the moment right before the redirect effect above fires) is

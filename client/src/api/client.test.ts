@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { api, ApiError } from "./client";
+import { api, ApiError, setUnauthorizedHandler } from "./client";
 import { WORKER_INACCESSIBLE_MESSAGE } from "../types";
 
 // `request` is module-private, so it is exercised through the thin api.*
@@ -115,5 +115,49 @@ describe("ApiError", () => {
     expect(e.name).toBe("ApiError");
     expect(e.status).toBe(418);
     expect(e.inaccessible).toBe(false);
+  });
+});
+
+describe("unauthorized handler", () => {
+  afterEach(() => {
+    setUnauthorizedHandler(null);
+  });
+
+  it("is called when an API request comes back 401", async () => {
+    const handler = vi.fn();
+    setUnauthorizedHandler(handler);
+    mockFetch({ status: 401, body: JSON.stringify({ error: "no session" }) });
+
+    const err = (await api.listWorkers().catch((e: unknown) => e)) as ApiError;
+
+    expect(handler).toHaveBeenCalledTimes(1);
+    // The caller still gets the normal rejection.
+    expect(err).toBeInstanceOf(ApiError);
+    expect(err.status).toBe(401);
+  });
+
+  it("is not called by the auth status check itself, so it cannot loop", async () => {
+    const handler = vi.fn();
+    setUnauthorizedHandler(handler);
+    mockFetch({ status: 401, body: JSON.stringify({ error: "no session" }) });
+
+    await api.getAuthStatus().catch(() => {});
+
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it.each([403, 404, 500])("is not called for a %i", async (status) => {
+    const handler = vi.fn();
+    setUnauthorizedHandler(handler);
+    mockFetch({ status, body: JSON.stringify({ error: "x" }) });
+
+    await api.listWorkers().catch(() => {});
+
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it("does nothing on a 401 when no handler is registered", async () => {
+    mockFetch({ status: 401, body: JSON.stringify({ error: "no session" }) });
+    await expect(api.listWorkers()).rejects.toBeInstanceOf(ApiError);
   });
 });

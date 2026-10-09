@@ -51,6 +51,16 @@ function extractErrorMessage(data: unknown, status: number): string {
   return `request failed: ${status}`;
 }
 
+// Called on every 401 so the app can notice a session that ended mid-visit
+// (expired, signed out elsewhere, account deleted). App.tsx registers it; it
+// re-checks /api/auth/status rather than trusting the 401 alone (session.ts).
+const AUTH_STATUS_PATH = "/api/auth/status";
+let unauthorizedHandler: (() => void) | null = null;
+
+export function setUnauthorizedHandler(handler: (() => void) | null): void {
+  unauthorizedHandler = handler;
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   let res: Response;
   try {
@@ -71,6 +81,8 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     }
   }
   if (!res.ok) {
+    // The status check itself is excluded so it can never trigger itself.
+    if (res.status === 401 && path !== AUTH_STATUS_PATH) unauthorizedHandler?.();
     const message = extractErrorMessage(data, res.status);
     throw new ApiError(message, res.status, message === WORKER_INACCESSIBLE_MESSAGE);
   }
@@ -387,7 +399,7 @@ export const api = {
   // Multi-user Stage 2 (MULTIUSER_PLAN.md §2) -- always reachable regardless
   // of AUTH_ENABLED (see routes/auth.ts's own doc comment); `authEnabled`
   // lets the SPA decide whether to gate on `user` at all.
-  getAuthStatus: (): Promise<AuthStatus> => request("/api/auth/status"),
+  getAuthStatus: (): Promise<AuthStatus> => request(AUTH_STATUS_PATH),
 
   // Public, daily-refreshed list of AMD GPUs ROCm supports -- see useRocmSupport.ts.
   getRocmSupport: (): Promise<RocmSupportSnapshot> => request("/api/rocm-support"),
