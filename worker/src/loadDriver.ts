@@ -58,14 +58,13 @@ export interface ServerArgsInput {
    * build that doesn't have --fit at all has no auto-adjustment behavior to
    * begin with, so there's nothing left to flag. */
   supportsFit?: boolean;
-  /** §0.7 probe result for --mlock -- keeps the model locked in RAM for the
-   * run's duration instead of left swappable. No row-level caveat needed:
-   * unlike --no-context-shift, there's no observable symptom to flag when a
-   * build lacks it. */
-  supportsMlock?: boolean;
+  /** §0.7-probed model-loading flags (binary-probe.ts's modelLoadArgs) --
+   * keep the model locked in RAM for the run's duration, and for speed runs
+   * force mmap off. `--load-mode ...` on current builds, --mlock/--no-mmap on
+   * older ones. No row-level caveat needed: unlike --no-context-shift,
+   * there's no observable symptom to flag when a build lacks them. */
+  modelLoadArgs?: string[];
   contextSizeOverride?: number;
-  /** Already probed by the caller -- see spawnRuntimeServer. */
-  noMmap?: boolean;
   /** Appended verbatim: -ot, -tb, -C/-Cb, --cpu-strict (optimization flow). */
   extraArgs?: string[];
 }
@@ -132,12 +131,12 @@ export function buildServerArgs(input: ServerArgsInput): string[] {
   // Probed, never assumed (§0.7): an unsupported flag disables its behavior
   // rather than failing the item.
   if (input.supportsNoContextShift) args.push("--no-context-shift");
-  if (input.supportsMlock) args.push("--mlock");
-  // No --no-mmap by default, unlike the speed-benchmark paths (bench.ts's
+  // mmap stays ON by default, unlike the speed-benchmark paths (bench.ts's
   // buildArgs, serverBench.ts's buildArgs): context tests measure spill/growth
   // behavior a real deployment would see, and a real deployment runs with mmap
-  // at its default ON. The fill curve IS a speed run, so it opts in.
-  if (input.noMmap) args.push("--no-mmap");
+  // at its default ON. The fill curve IS a speed run, so it opts out -- see
+  // spawnRuntimeServer, which picks the policy and probes the flags.
+  if (input.modelLoadArgs?.length) args.push(...input.modelLoadArgs);
   if (input.extraArgs?.length) args.push(...input.extraArgs);
   return args;
 }

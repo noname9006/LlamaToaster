@@ -81,11 +81,21 @@ describe("server arguments for the spec-off engine pair", () => {
     expect(with_[with_.indexOf("--fit") + 1]).toBe("off");
   });
 
-  it("only passes --mlock when the binary probe says it exists (§0.7)", () => {
+  it("passes the probed model-loading flags through verbatim, and none when the probe found none (§0.7)", () => {
     const without = buildServerArgs({ modelPath: "m.gguf", port: 8080, item, slots: 1 });
     expect(without).not.toContain("--mlock");
-    const with_ = buildServerArgs({ modelPath: "m.gguf", port: 8080, item, slots: 1, supportsMlock: true });
-    expect(with_).toContain("--mlock");
+    expect(without).not.toContain("--load-mode");
+    const legacy = buildServerArgs({ modelPath: "m.gguf", port: 8080, item, slots: 1, modelLoadArgs: ["--mlock"] });
+    expect(legacy).toContain("--mlock");
+    const current = buildServerArgs({
+      modelPath: "m.gguf",
+      port: 8080,
+      item,
+      slots: 1,
+      modelLoadArgs: ["--load-mode", "mmap+mlock"],
+    });
+    expect(current[current.indexOf("--load-mode") + 1]).toBe("mmap+mlock");
+    expect(current).not.toContain("--mlock");
   });
 });
 

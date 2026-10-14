@@ -19,7 +19,7 @@ import {
 } from "./bench.js";
 import { estimateResidentGpuLayersFromBufferSizes } from "../../shared/vramEstimate.js";
 import { buildPromptTokens, fetchFillerBlocks, type FillerBlocks } from "./fillerPrompt.js";
-import { supportsFlag } from "./binary-probe.js";
+import { modelLoadArgs, supportsFlag } from "./binary-probe.js";
 import { SERVER_METHOD_VERSION } from "../../shared/types.js";
 import {
   MAX_PLAUSIBLE_PP_TOKENS_PER_SECOND,
@@ -291,18 +291,13 @@ async function buildArgs(input: ServerBenchRunInput): Promise<string[]> {
   if (await supportsFlag(input.llamaServerPath, "--fit").catch(() => false)) {
     args.push("--fit", "off");
   }
-  // Same §0.7 probe pattern -- keeps the model (and draft model, if any)
-  // locked in RAM for the run's duration instead of left swappable.
-  if (await supportsFlag(input.llamaServerPath, "--mlock").catch(() => false)) {
-    args.push("--mlock");
-  }
-  // Same rationale as bench.ts's --mmap probe: this is a speed benchmark
-  // (MTP tok/s), so mmap is forced off (paired with --mlock above) to keep a
-  // run's timing from depending on the OS page cache an earlier load left
-  // behind. loadDriver.ts's context-test path leaves mmap at its default ON.
-  if (await supportsFlag(input.llamaServerPath, "--no-mmap").catch(() => false)) {
-    args.push("--no-mmap");
-  }
+  // Same §0.7 probe pattern and rationale as bench.ts: keeps the model (and
+  // draft model, if any) locked in RAM, and -- this being a speed benchmark
+  // (MTP tok/s) -- forces mmap off so a run's timing doesn't depend on the OS
+  // page cache an earlier load left behind. `--load-mode mlock` on current
+  // builds, --mlock / --no-mmap on older ones. loadDriver.ts's context-test
+  // path leaves mmap at its default ON.
+  args.push(...(await modelLoadArgs(input.llamaServerPath, "mlock_no_mmap")));
   if (input.mtpModelPath) {
     args.push("--model-draft", input.mtpModelPath);
     // Confirmed live against the installed build's own --help: llama-server

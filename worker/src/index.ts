@@ -53,7 +53,7 @@ import {
 } from "../../shared/probeLadder.js";
 import { DEFAULT_KNEE_SLOTS, generationRate } from "./loadDriver.js";
 import { fetchFillerBlocks } from "./fillerPrompt.js";
-import { supportsFlag, readListDevices, usedListedDevices } from "./binary-probe.js";
+import { modelLoadArgs, supportsFlag, readListDevices, usedListedDevices } from "./binary-probe.js";
 import { MemorySampler, captureFreeMemoryBaseline, type SampleStats, type FreeMemoryBaseline } from "./sampler.js";
 import { MemoryTrace } from "./memoryTrace.js";
 import { buildSpillAnchor, measureGrowthSpill, withAnchorControl, type SpillAnchor } from "../../shared/gpuSpill.js";
@@ -4637,8 +4637,9 @@ async function executeMeasureQualityJob(payload: MeasureQualityJobPayload): Prom
     ];
     if (payload.main_gpu != null) args.push("-sm", "none", "-mg", String(payload.main_gpu));
     // Same §0.7 probe pattern as the bench/server paths -- keeps the model
-    // locked in RAM for the run's duration instead of left swappable.
-    if (await supportsFlag(perplexityPath, "--mlock").catch(() => false)) args.push("--mlock");
+    // locked in RAM for the run's duration instead of left swappable (mmap
+    // left on: `--load-mode mmap+mlock`, or --mlock alone on older builds).
+    args.push(...(await modelLoadArgs(perplexityPath, "mlock_mmap")));
     log.info(`${label}: llama-perplexity ${args.join(" ")}`);
     const output = await runPerplexity(perplexityPath, args);
     const ppl = parsePerplexity(output);

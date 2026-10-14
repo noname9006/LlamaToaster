@@ -43,7 +43,7 @@ import {
   type RequestClass,
   type StreamSample,
 } from "./loadDriver.js";
-import { supportsFlag } from "./binary-probe.js";
+import { modelLoadArgs, supportsFlag } from "./binary-probe.js";
 import { PROBE_LADDER_MIN_CTX } from "../../shared/probeLadder.js";
 
 const READY_POLL_INTERVAL_MS = 500;
@@ -112,10 +112,10 @@ export async function spawnRuntimeServer(input: SpawnRuntimeServerInput): Promis
   // Same §0.7 probe pattern for --fit -- see buildServerArgs's own comment
   // for why this is forced off rather than left at llama-server's default.
   const supportsFit = await supportsFlag(input.llamaServerPath, "--fit").catch(() => false);
-  // Same §0.7 probe pattern for --mlock -- keeps the model locked in RAM for
-  // the run's duration instead of left swappable.
-  const supportsMlock = await supportsFlag(input.llamaServerPath, "--mlock").catch(() => false);
-  const noMmap = input.noMmap === true && (await supportsFlag(input.llamaServerPath, "--no-mmap").catch(() => false));
+  // Same §0.7 probe pattern for the model-loading flags -- keeps the model
+  // locked in RAM for the run's duration instead of left swappable, and with
+  // noMmap also reads it into RAM instead of mapping it.
+  const modelLoad = await modelLoadArgs(input.llamaServerPath, input.noMmap === true ? "mlock_no_mmap" : "mlock_mmap");
   const args = buildServerArgs({
     modelPath: input.modelPath,
     port: input.port,
@@ -124,9 +124,8 @@ export async function spawnRuntimeServer(input: SpawnRuntimeServerInput): Promis
     mainGpu: input.mainGpu,
     supportsNoContextShift,
     supportsFit,
-    supportsMlock,
+    modelLoadArgs: modelLoad,
     contextSizeOverride: input.contextSizeOverride,
-    noMmap,
     extraArgs: input.extraArgs,
   });
   input.log?.info(`llama-server ${args.join(" ")}`);

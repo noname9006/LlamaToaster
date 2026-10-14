@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import {
   parseModelBufferSizes,
   parseGpuBufferReport,
@@ -11,6 +11,7 @@ import {
   runBench,
   type BenchRunInput,
 } from "./bench.js";
+import { clearBinaryProbeCache, modelLoadArgsFromHelp, setHelpTextForTest } from "./binary-probe.js";
 import type { SweepItem } from "../../shared/sweep.js";
 
 const BASE_ITEM: SweepItem = {
@@ -54,6 +55,86 @@ describe("buildArgs", () => {
     const nIdx = args.indexOf("-n");
     expect(args[nIdx + 2]).toBe("-d");
     expect(args[nIdx + 3]).toBe("2048");
+  });
+});
+
+// Help-text excerpts copied from real builds' --help output.
+// b11529+ llama-bench: --mlock and -mmp/--mmap removed (passing -mmp is
+// rejected), replaced by a single --load-mode.
+const BENCH_HELP_LOAD_MODE = `
+  -dev, --device <dev0/dev1/...>                    (default: auto)
+  -lm, --load-mode <auto|none|mmap|mlock|mmap+mlock|dio> (default: auto)
+  -lzm, --lazy-mode <on|auto|off>                   (default: auto)
+`;
+// Older llama-bench: separate --mlock and -mmp/--mmap <0|1>.
+const BENCH_HELP_LEGACY = `
+  -mmp, --mmap <0|1>                                (default: 1)
+  --mlock                                           (default: 0)
+  -embd, --embeddings <0|1>                         (default: 0)
+`;
+// b11529+ llama-server / llama-perplexity (common args).
+const SERVER_HELP_LOAD_MODE = `
+-lm,   --load-mode MODE                 model loading mode (default: auto)
+                                        - auto: mmap, unless a device does not support it
+                                        - mlock: force system to keep model in RAM rather than swapping or
+`;
+// Older llama-server / llama-perplexity.
+const SERVER_HELP_LEGACY = `
+--mlock                                 force system to keep model in RAM rather than swapping or compressing
+--mmap, --no-mmap                       whether to memory-map model (default: enabled)
+`;
+
+describe("buildArgs model-loading flags", () => {
+  afterEach(() => clearBinaryProbeCache());
+
+  function inputFor(path: string): BenchRunInput {
+    return { ...benchInput(BASE_ITEM), llamaBenchPath: path };
+  }
+
+  it("uses --load-mode mlock (no mmap + locked) on builds that have --load-mode", async () => {
+    const path = "/nonexistent/llama-bench-load-mode";
+    setHelpTextForTest(path, BENCH_HELP_LOAD_MODE);
+    const args = await buildArgs(inputFor(path));
+    expect(args[args.indexOf("--load-mode") + 1]).toBe("mlock");
+    expect(args).not.toContain("--mlock");
+    expect(args).not.toContain("--mmap");
+  });
+
+  it("falls back to --mlock + --mmap 0 on older builds", async () => {
+    const path = "/nonexistent/llama-bench-legacy";
+    setHelpTextForTest(path, BENCH_HELP_LEGACY);
+    const args = await buildArgs(inputFor(path));
+    expect(args).toContain("--mlock");
+    expect(args[args.indexOf("--mmap") + 1]).toBe("0");
+    expect(args).not.toContain("--load-mode");
+  });
+
+  it("passes no loading flags when the binary advertises none", async () => {
+    const args = await buildArgs(benchInput(BASE_ITEM));
+    expect(args).not.toContain("--load-mode");
+    expect(args).not.toContain("--mlock");
+    expect(args).not.toContain("--mmap");
+  });
+});
+
+describe("modelLoadArgsFromHelp", () => {
+  it("maps both policies onto --load-mode values", () => {
+    expect(modelLoadArgsFromHelp(SERVER_HELP_LOAD_MODE, "mlock_no_mmap")).toEqual(["--load-mode", "mlock"]);
+    expect(modelLoadArgsFromHelp(SERVER_HELP_LOAD_MODE, "mlock_mmap")).toEqual(["--load-mode", "mmap+mlock"]);
+  });
+
+  it("uses --no-mmap on legacy server/perplexity help, --mmap 0 on legacy llama-bench help", () => {
+    expect(modelLoadArgsFromHelp(SERVER_HELP_LEGACY, "mlock_no_mmap")).toEqual(["--mlock", "--no-mmap"]);
+    expect(modelLoadArgsFromHelp(BENCH_HELP_LEGACY, "mlock_no_mmap")).toEqual(["--mlock", "--mmap", "0"]);
+  });
+
+  it("leaves mmap alone for the mmap policy on legacy builds", () => {
+    expect(modelLoadArgsFromHelp(SERVER_HELP_LEGACY, "mlock_mmap")).toEqual(["--mlock"]);
+    expect(modelLoadArgsFromHelp(BENCH_HELP_LEGACY, "mlock_mmap")).toEqual(["--mlock"]);
+  });
+
+  it("returns nothing for empty help (probe failed)", () => {
+    expect(modelLoadArgsFromHelp("", "mlock_no_mmap")).toEqual([]);
   });
 });
 
@@ -205,6 +286,32 @@ describe("parseModelBufferSizes", () => {
       main: { gpuMib: 0, cpuMib: 256, gpu_layers_exact: null },
       draft: null,
     });
+  });
+
+  // With mmap off (speed runs), CPU-resident weights land in the GPU
+  // backend's pinned host buffer, not CPU_Mapped -- the first line is real
+  // b11529 Vulkan output from `-ngl 0 --load-mode mlock`.
+  it("counts *_Host pinned buffers (mmap off) as CPU, not GPU", () => {
+    expect(parseModelBufferSizes("load_tensors:  Vulkan_Host model buffer size =  1001.58 MiB")).toEqual({
+      main: { gpuMib: 0, cpuMib: 1001.58, gpu_layers_exact: null },
+      draft: null,
+    });
+    const partial = [
+      "0.00.697.538 I load_tensors:        CUDA0 model buffer size =  3000.00 MiB",
+      "0.00.697.540 I load_tensors:    CUDA_Host model buffer size =  1200.00 MiB",
+    ].join("\n");
+    expect(parseModelBufferSizes(partial)?.main).toEqual({ gpuMib: 3000, cpuMib: 1200, gpu_layers_exact: null });
+  });
+
+  it("counts repacked/accelerated CPU layouts (CPU_REPACK, CPU_KLEIDIAI, AMX) as CPU", () => {
+    const stderr = [
+      "load_tensors:      Vulkan0 model buffer size =   800.00 MiB",
+      "load_tensors:   CPU_REPACK model buffer size =   100.00 MiB",
+      "load_tensors: CPU_KLEIDIAI model buffer size =    20.00 MiB",
+      "load_tensors:          AMX model buffer size =    30.00 MiB",
+      "load_tensors:   CPU_Mapped model buffer size =    50.00 MiB",
+    ].join("\n");
+    expect(parseModelBufferSizes(stderr)?.main).toEqual({ gpuMib: 800, cpuMib: 200, gpu_layers_exact: null });
   });
 
   it("sums multiple GPU devices from a multi-GPU split", () => {
@@ -394,6 +501,18 @@ describe("parseGpuBufferReport", () => {
     )!;
     expect(report.deviceMib).toBeCloseTo(6462.03, 2);
     expect(report.contextMib).toBeCloseTo(219.51, 2);
+  });
+
+  it("leaves mmap-off host weight buffers (*_Host, CPU_REPACK, AMX) out of the GPU claim", () => {
+    const report = parseGpuBufferReport(
+      [
+        "load_tensors:        CUDA0 model buffer size =  3000.00 MiB",
+        "load_tensors:    CUDA_Host model buffer size =  1200.00 MiB",
+        "load_tensors:   CPU_REPACK model buffer size =   100.00 MiB",
+        "load_tensors:          AMX model buffer size =    30.00 MiB",
+      ].join("\n")
+    )!;
+    expect(report.byDeviceMib).toEqual({ CUDA0: 3000 });
   });
 
   it("keeps only the latest reservation of a buffer reserved twice", () => {

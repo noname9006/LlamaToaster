@@ -2,7 +2,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { readFileSync } from "node:fs";
 import type { IngestResultInput } from "../../shared/types.js";
 import { deriveTestType, type SweepItem } from "../../shared/sweep.js";
-import { supportsFlag } from "./binary-probe.js";
+import { modelLoadArgs } from "./binary-probe.js";
 
 export interface BenchLogger {
   debug: (...parts: unknown[]) => void;
@@ -182,22 +182,15 @@ export async function buildArgs(input: BenchRunInput): Promise<string[]> {
     args.push("-v");
   }
   // Keeps the model locked in RAM for the run's duration so the OS can't
-  // swap/compress it out from under a benchmark -- probed rather than
-  // assumed (§0.7), same as --fit/--no-context-shift elsewhere: an
-  // unsupported flag would fail argument parsing and break every run on
-  // that build.
-  if (await supportsFlag(input.llamaBenchPath, "--mlock").catch(() => false)) {
-    args.push("--mlock");
-  }
-  // Speed benchmarks force mmap off (paired with --mlock above): a
+  // swap/compress it out from under a benchmark, and forces mmap off: a
   // page-cache-backed mapping lets a repeat's read latency depend on
   // whatever an earlier load already faulted in, which is exactly the kind
   // of run-to-run variance a tok/s reading can't afford. Context tests
   // (loadDriver.ts's buildServerArgs) deliberately leave mmap at its default
-  // ON instead -- see that function's own comment.
-  if (await supportsFlag(input.llamaBenchPath, "--mmap").catch(() => false)) {
-    args.push("--mmap", "0");
-  }
+  // ON instead -- see that function's own comment. Probed rather than
+  // assumed (§0.7): `--load-mode mlock` on current builds, --mlock /
+  // --mmap 0 on older ones (see binary-probe.ts's modelLoadArgsFromHelp).
+  args.push(...(await modelLoadArgs(input.llamaBenchPath, "mlock_no_mmap")));
   if (input.extraArgs?.length) args.push(...input.extraArgs);
   return args;
 }
@@ -389,7 +382,16 @@ export function matchOffloadLine(line: string): OffloadInfo | null {
 // prefix rather than anchoring at column 0. Applied per line (no `g`/`m`
 // statefulness to leak lastIndex across repeated .exec calls).
 const MODEL_BUFFER_SIZE_LINE_RE = /^.*?load_tensors:\s*(\S+) model buffer size\s*=\s*([\d.]+)\s*MiB/;
-const CPU_BUFFER_NAME_RE = /^CPU(_Mapped)?$/;
+// Buffers that live in host RAM, not on a GPU. CPU-resident weights are NOT
+// always CPU_Mapped: with mmap off (every speed run -- --mmap 0 /
+// --no-mmap / --load-mode mlock) llama.cpp's make_cpu_buft_list puts them in
+// the first GPU device's pinned host buffer instead, and repacked/accelerated
+// CPU layouts get their own names. Names read from b11529's ggml backends:
+// CPU, CPU_Mapped, CPU_REPACK, CPU_KLEIDIAI, AMX, and <backend>_Host
+// (CUDA_Host / ROCm_Host, Vulkan_Host, SYCL_Host). Verified live on b11529
+// Vulkan: the same -ngl 0 load prints "Vulkan_Host model buffer" under
+// --load-mode mlock and "CPU_Mapped model buffer" under mmap+mlock.
+const HOST_BUFFER_NAME_RE = /^CPU|^AMX$|_Host$/i;
 
 // llama.cpp's EXACT per-layer placement decision, printed once per layer at
 // DEBUG log level -- and llama-bench runs at DEBUG whenever this app's own
@@ -415,7 +417,8 @@ const CPU_DEVICE_NAME_RE = /^CPU$/i;
 export interface ModelBufferSizes {
   // Sum of every non-CPU buffer (CUDA0, CUDA1, ROCm0, Vulkan0, Metal, ...).
   gpuMib: number;
-  // Sum of every CPU/CPU_Mapped buffer -- includes weights the scheduler
+  // Sum of every host-RAM buffer (HOST_BUFFER_NAME_RE: CPU, CPU_Mapped,
+  // CPU_REPACK, Vulkan_Host, CUDA_Host, ...) -- includes weights the scheduler
   // itself assigned to the CPU (e.g. the untouched remainder of a partial
   // offload), not just a sysmem-fallback bounce off a GPU assignment.
   cpuMib: number;
@@ -498,7 +501,7 @@ export function parseModelBufferSizes(stderr: string): ModelBufferSizesByModel |
     }
     const mib = Number(bufferMatch[2]);
     if (!Number.isFinite(mib)) continue;
-    if (CPU_BUFFER_NAME_RE.test(bufferMatch[1])) groups[current].cpuMib += mib;
+    if (HOST_BUFFER_NAME_RE.test(bufferMatch[1])) groups[current].cpuMib += mib;
     else groups[current].gpuMib += mib;
   }
   const withBuffers = groups
@@ -526,14 +529,13 @@ export function parseModelBufferSizes(stderr: string): ModelBufferSizesByModel |
 //   0.02.240.526 I sched_reserve: Vulkan_Host compute buffer size =     4.51 MiB
 //
 // plus "RS buffer size" for a hybrid model's recurrent state. Host-side buffers
-// (CPU, CPU_Mapped, CPU_REPACK, and the *_Host pinned staging buffers) are not
+// (HOST_BUFFER_NAME_RE above: CPU*, AMX, and the *_Host pinned buffers) are not
 // GPU memory and are left out. Weights are summed; every other kind keeps its
 // LAST reported size per device, because a context can be reserved more than
 // once and each reservation replaces the one before. Single-model loads only --
 // an MTP draft's buffers would be counted in. Null when no buffer line was seen
 // at all. The shape is shared/gpuSpill.ts's GpuBufferReport.
 const GPU_BUFFER_SIZE_LINE_RE = /^.*?:\s*(\S+)\s+(model|KV|RS|compute|output)\s+buffer size\s*=\s*([\d.]+)\s*MiB/;
-const HOST_BUFFER_NAME_RE = /^CPU|_Host$/i;
 
 export function parseGpuBufferReport(
   stderr: string
