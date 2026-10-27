@@ -1,4 +1,4 @@
-import type { TensorLayerBreakdown } from "./vramEstimate.js";
+import type { KvLayout, TensorLayerBreakdown } from "./vramEstimate.js";
 
 // Where the parser's bytes come from -- a local file on a worker
 // (worker/src/gguf.ts), or HTTP Range reads of a Hugging Face file on the
@@ -33,6 +33,22 @@ const MAX_KV_COUNT = 1_000_000;
 // length field that would otherwise drive a wild, potentially multi-GB read.
 const MAX_TENSOR_COUNT = 50_000_000;
 const MAX_TENSOR_DIMS = 8;
+// Upper bound on a model's transformer block count. Everything sized per layer
+// (tensor_layer_bytes, the KV walk, the client's placement loops) allocates or
+// loops this many times, and the value comes straight from the file -- a
+// 240-byte header claiming 300M layers took the process down with an
+// uncatchable heap OOM (audit 2026-10-18 A1). Real models are in the low
+// hundreds; 4096 matches the caps on kv_layout.kinds, probe ngl and fit
+// layers_total.
+export const MAX_GGUF_LAYERS = 4096;
+// Per-layer arrays (head_count_kv, key_length, ...) longer than this can't be
+// one value per layer; they're skipped instead of materialised.
+const MAX_PER_LAYER_ARRAY = MAX_GGUF_LAYERS;
+
+/** A plausible transformer block count: an integer in [1, MAX_GGUF_LAYERS]. */
+export function isPlausibleLayerCount(n: unknown): n is number {
+  return typeof n === "number" && Number.isInteger(n) && n >= 1 && n <= MAX_GGUF_LAYERS;
+}
 
 const GGUF_TYPE = {
   UINT8: 0,
@@ -193,11 +209,22 @@ class GgufReader {
   // guess. For a homogeneous (non-SWA) array every element is identical
   // anyway, so this reduces to the same answer a scalar would have given.
   async numericScalarOrArrayLast(type: number): Promise<number | undefined> {
-    if (type !== GGUF_TYPE.ARRAY) return this.numeric(type);
+    const all = await this.numericScalarOrArray(type);
+    return all.length > 0 ? all[all.length - 1] : undefined;
+  }
+
+  // Same read, keeping every element: [v] for a scalar, the whole array
+  // otherwise (BOOL elements as 0/1). Feeds KvLayout's per-layer walk.
+  async numericScalarOrArray(type: number): Promise<number[]> {
+    if (type !== GGUF_TYPE.ARRAY) return [await this.numeric(type)];
     const elemType = await this.u32();
     const len = await this.u64();
     if (len < 0 || len > MAX_ARRAY_LEN) throw new Error(`gguf: implausible array length ${len}`);
-    let last: number | undefined;
+    if (len > MAX_PER_LAYER_ARRAY) {
+      for (let i = 0; i < len; i++) await this.skip(elemType);
+      return [];
+    }
+    const out: number[] = [];
     for (let i = 0; i < len; i++) {
       if (elemType === GGUF_TYPE.STRING) {
         await this.string(); // not a real case for any numeric hparam key; just don't crash
@@ -206,9 +233,22 @@ class GgufReader {
       // numeric() has no BOOL case (nothing scalar needs it) -- read it
       // directly rather than growing that method's contract for this one
       // array-only caller.
-      last = elemType === GGUF_TYPE.BOOL ? await this.u8() : await this.numeric(elemType);
+      out.push(elemType === GGUF_TYPE.BOOL ? await this.u8() : await this.numeric(elemType));
     }
-    return last;
+    return out;
+  }
+
+  // Length of an ARRAY value, consuming it (tokenizer.ggml.tokens -> n_vocab).
+  async arrayLength(type: number): Promise<number | undefined> {
+    if (type !== GGUF_TYPE.ARRAY) {
+      await this.skip(type);
+      return undefined;
+    }
+    const elemType = await this.u32();
+    const len = await this.u64();
+    if (len < 0 || len > MAX_ARRAY_LEN) throw new Error(`gguf: implausible array length ${len}`);
+    for (let i = 0; i < len; i++) await this.skip(elemType);
+    return len;
   }
 
   async skip(type: number): Promise<void> {
@@ -363,6 +403,14 @@ export interface GgufInfo {
   // means every layer allocates its own KV cache, same as before this field
   // existed.
   shared_kv_layers: number | null;
+  // Per-layer KV-cache layout (which layers cache the full context, which
+  // only a sliding window, which none) -- see KvLayout and buildKvLayout.
+  // Null when the geometry can't be resolved.
+  kv_layout: KvLayout | null;
+  // The header values kv_layout was built from -- local only, never sent over
+  // the wire (ggufMetadataPatch and the worker pick fields by name), so a fit
+  // simulation can walk blocks individually via kvLayerWalk.
+  kv_inputs?: KvHeaderInputs | null;
   // Real per-tensor weight-byte breakdown -- see TensorLayerBreakdown. Null
   // whenever it can't be built: n_layer unresolved (nothing to size the
   // per-block arrays against), the tensor_info walk failed, or the file has
@@ -391,6 +439,7 @@ function emptyGgufInfo(debugReason: string): GgufInfo {
     sliding_window: null,
     sliding_window_pattern: null,
     shared_kv_layers: null,
+    kv_layout: null,
     tensor_layer_bytes: null,
     debugReason,
   };
@@ -438,6 +487,23 @@ export async function parseGgufInfo(source: GgufByteSource, chunkBytes = READ_CH
     const slidingWindows = new Map<string, number>();
     const slidingWindowPatterns = new Map<string, number>();
     const sharedKvLayerCounts = new Map<string, number>();
+    // Full per-layer arrays (or [scalar]) for buildKvLayout.
+    const headCountKvArrays = new Map<string, number[]>();
+    const keyLengthArrays = new Map<string, number[]>();
+    const valueLengthArrays = new Map<string, number[]>();
+    const keyLengthSwa = new Map<string, number>();
+    const valueLengthSwa = new Map<string, number>();
+    const swaPatternArrays = new Map<string, number[]>();
+    const fullAttentionIntervals = new Map<string, number>();
+    // Facts that decide whether llama.cpp keeps a per-token cache at all, and
+    // where (docs/FIT_VALIDATION_2026-10-14.md): explicit per-layer recurrent
+    // flags, and the two inputs of llama_model::create_memory's LFM2 rule.
+    const recurrentLayerArrays = new Map<string, number[]>();
+    const causalFlags = new Map<string, boolean>();
+    const decisionBlockCounts = new Map<string, number>();
+    // <arch>.ssm.* -- recurrent state geometry (llama.cpp hparams ssm_d_*).
+    const ssmKeys = new Map<string, number>();
+    let nVocab: number | undefined;
 
     // Deliberately walks every KV pair rather than stopping at the first
     // "tokenizer."-prefixed key: a llama.cpp-produced GGUF always puts
@@ -477,14 +543,46 @@ export async function parseGgufInfo(source: GgufByteSource, chunkBytes = READ_CH
         // GgufReader.numericScalarOrArrayLast's doc comment for why reading
         // the array's last element, rather than skipping it like the
         // pre-fix code did, is the correct representative scalar here.
-        const v = await reader.numericScalarOrArrayLast(valueType);
-        if (v != null) headCountKv.set(key, v);
+        const arr = await reader.numericScalarOrArray(valueType);
+        if (arr.length > 0) {
+          headCountKv.set(key, arr[arr.length - 1]);
+          headCountKvArrays.set(key, arr);
+        }
       } else if (key.endsWith(".attention.key_length") && valueType !== GGUF_TYPE.STRING) {
-        const v = await reader.numericScalarOrArrayLast(valueType);
-        if (v != null) keyLengths.set(key, v);
+        const arr = await reader.numericScalarOrArray(valueType);
+        if (arr.length > 0) {
+          keyLengths.set(key, arr[arr.length - 1]);
+          keyLengthArrays.set(key, arr);
+        }
       } else if (key.endsWith(".attention.value_length") && valueType !== GGUF_TYPE.STRING) {
-        const v = await reader.numericScalarOrArrayLast(valueType);
-        if (v != null) valueLengths.set(key, v);
+        const arr = await reader.numericScalarOrArray(valueType);
+        if (arr.length > 0) {
+          valueLengths.set(key, arr[arr.length - 1]);
+          valueLengthArrays.set(key, arr);
+        }
+      } else if (key.endsWith(".attention.key_length_swa") && valueType !== GGUF_TYPE.ARRAY && valueType !== GGUF_TYPE.STRING) {
+        keyLengthSwa.set(key, await reader.numeric(valueType));
+      } else if (key.endsWith(".attention.value_length_swa") && valueType !== GGUF_TYPE.ARRAY && valueType !== GGUF_TYPE.STRING) {
+        valueLengthSwa.set(key, await reader.numeric(valueType));
+      } else if (key === "tokenizer.ggml.tokens") {
+        nVocab = await reader.arrayLength(valueType);
+      } else if (
+        /\.ssm\.(conv_kernel|inner_size|state_size|group_count)$/.test(key) &&
+        valueType !== GGUF_TYPE.ARRAY &&
+        valueType !== GGUF_TYPE.STRING
+      ) {
+        ssmKeys.set(key, await reader.numeric(valueType));
+      } else if (key.endsWith(".full_attention_interval") && valueType !== GGUF_TYPE.ARRAY && valueType !== GGUF_TYPE.STRING) {
+        fullAttentionIntervals.set(key, await reader.numeric(valueType));
+      } else if (key.endsWith(".attention.recurrent_layers") && valueType === GGUF_TYPE.ARRAY) {
+        recurrentLayerArrays.set(key, await reader.numericScalarOrArray(valueType));
+      } else if (key.endsWith(".attention.causal") && valueType === GGUF_TYPE.BOOL) {
+        causalFlags.set(key, (await reader.u8()) !== 0);
+      } else if (key.endsWith(".decision.block_count") && valueType !== GGUF_TYPE.ARRAY && valueType !== GGUF_TYPE.STRING) {
+        decisionBlockCounts.set(key, await reader.numeric(valueType));
+      } else if (key.endsWith(".attention.sliding_window_pattern") && valueType === GGUF_TYPE.ARRAY) {
+        // Per-layer is-SWA flags (Gemma-4) -- kept for buildKvLayout only.
+        swaPatternArrays.set(key, await reader.numericScalarOrArray(valueType));
       } else if (key.endsWith(".embedding_length") && valueType !== GGUF_TYPE.ARRAY && valueType !== GGUF_TYPE.STRING) {
         embeddingLengths.set(key, await reader.numeric(valueType));
       } else if (key.endsWith(".attention.head_count") && valueType !== GGUF_TYPE.STRING) {
@@ -515,6 +613,10 @@ export async function parseGgufInfo(source: GgufByteSource, chunkBytes = READ_CH
     }
     if (!architecture) return emptyGgufInfo("no general.architecture key found in the whole file");
     const n_layer = blockCounts.get(`${architecture}.block_count`) ?? null;
+    // 0 keeps its old meaning (no per-layer data is built for it below).
+    if (n_layer !== null && n_layer !== 0 && !isPlausibleLayerCount(n_layer)) {
+      return emptyGgufInfo(`implausible ${architecture}.block_count ${n_layer} (max ${MAX_GGUF_LAYERS})`);
+    }
 
     // Real per-file parameter count from the tensor_info section that
     // directly follows the KV metadata. Best-effort and deliberately
@@ -587,6 +689,42 @@ export async function parseGgufInfo(source: GgufByteSource, chunkBytes = READ_CH
       void sizeErr;
     }
 
+    const kvInputs: KvHeaderInputs | null =
+      n_layer != null && n_layer > 0
+        ? {
+            architecture,
+            nLayer: n_layer,
+            nextnLayers: mtpLayerCounts.get(`${architecture}.nextn_predict_layers`) ?? 0,
+            headCountKv:
+              headCountKvArrays.get(`${architecture}.attention.head_count_kv`) ??
+              (headCounts.has(`${architecture}.attention.head_count`)
+                ? [headCounts.get(`${architecture}.attention.head_count`)!]
+                : null),
+            keyLength: keyLengthArrays.get(`${architecture}.attention.key_length`) ?? null,
+            valueLength: valueLengthArrays.get(`${architecture}.attention.value_length`) ?? null,
+            keyLengthSwa: keyLengthSwa.get(`${architecture}.attention.key_length_swa`) ?? null,
+            valueLengthSwa: valueLengthSwa.get(`${architecture}.attention.value_length_swa`) ?? null,
+            nEmbd: embeddingLengths.get(`${architecture}.embedding_length`) ?? null,
+            nHead: headCounts.get(`${architecture}.attention.head_count`) ?? null,
+            slidingWindow: slidingWindows.get(`${architecture}.attention.sliding_window`) ?? null,
+            swaPatternScalar: slidingWindowPatterns.get(`${architecture}.attention.sliding_window_pattern`) ?? null,
+            swaPatternArray: swaPatternArrays.get(`${architecture}.attention.sliding_window_pattern`) ?? null,
+            sharedKvLayers: sharedKvLayerCounts.get(`${architecture}.attention.shared_kv_layers`) ?? 0,
+            fullAttentionInterval: fullAttentionIntervals.get(`${architecture}.full_attention_interval`) ?? null,
+            recurrentLayers: recurrentLayerArrays.get(`${architecture}.attention.recurrent_layers`) ?? null,
+            noCache:
+              NO_MEMORY_ARCHES.has(architecture) ||
+              (architecture === "lfm2" &&
+                causalFlags.get(`${architecture}.attention.causal`) === false &&
+                ((decisionBlockCounts.get(`${architecture}.decision.block_count`) ?? blockCounts.get(`${architecture}.decision.block_count`)) ?? 0) > 0),
+            ssmConvKernel: ssmKeys.get(`${architecture}.ssm.conv_kernel`) ?? null,
+            ssmInnerSize: ssmKeys.get(`${architecture}.ssm.inner_size`) ?? null,
+            ssmStateSize: ssmKeys.get(`${architecture}.ssm.state_size`) ?? null,
+            ssmGroupCount: ssmKeys.get(`${architecture}.ssm.group_count`) ?? null,
+            vocab: nVocab ?? null,
+          }
+        : null;
+
     return {
       n_layer,
       mtp_layers: mtpLayerCounts.get(`${architecture}.nextn_predict_layers`) ?? null,
@@ -611,6 +749,8 @@ export async function parseGgufInfo(source: GgufByteSource, chunkBytes = READ_CH
       sliding_window_pattern:
         slidingWindowPatterns.get(`${architecture}.attention.sliding_window_pattern`) ?? null,
       shared_kv_layers: sharedKvLayerCounts.get(`${architecture}.attention.shared_kv_layers`) ?? null,
+      kv_layout: kvInputs ? buildKvLayout(kvInputs) : null,
+      kv_inputs: kvInputs,
       tensor_layer_bytes,
       debugReason:
         n_layer === null ? `architecture "${architecture}" found but no ${architecture}.block_count key` : undefined,
@@ -619,6 +759,153 @@ export async function parseGgufInfo(source: GgufByteSource, chunkBytes = READ_CH
     return emptyGgufInfo(`parse threw: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
+
+// Hybrid attention/recurrent architectures whose llama.cpp loader marks
+// layer i recurrent unless (i + 1) % full_attention_interval == 0, defaulting
+// the interval to 4 when the key is absent (src/llama-model.cpp).
+const INTERVAL_HYBRID_ARCHES = new Set(["qwen3next", "qwen35", "qwen35moe"]);
+
+// Per-layer walk mirroring llama.cpp's own KV-cache allocation:
+// - a layer with n_head_kv == 0, or marked recurrent by the interval rule,
+//   has no KV cache (recurrent state is small and fixed; not counted);
+// - layers at index >= n_layer - shared_kv_layers reuse an earlier layer's
+//   cache (Gemma-3n/4);
+// - NextN/MTP blocks counted in block_count get no KV in normal runs;
+// - SWA layers come from the per-layer flag array, else the scalar period
+//   (llama.cpp set_swa_pattern: il % N < N - 1 is SWA), else -- when only a
+//   window is declared -- the period-6 fallback the rest of the estimator
+//   uses.
+// Null when head counts or head dims can't be resolved.
+export interface KvHeaderInputs {
+  architecture: string;
+  nLayer: number;
+  nextnLayers: number;
+  headCountKv: number[] | null;
+  keyLength: number[] | null;
+  valueLength: number[] | null;
+  keyLengthSwa: number | null;
+  valueLengthSwa: number | null;
+  nEmbd: number | null;
+  nHead: number | null;
+  slidingWindow: number | null;
+  swaPatternScalar: number | null;
+  swaPatternArray: number[] | null;
+  sharedKvLayers: number;
+  /** <arch>.attention.recurrent_layers: per-layer flags, 1 = recurrent.
+   * Overrides full_attention_interval when present (llama.cpp does). */
+  recurrentLayers?: number[] | null;
+  /** llama.cpp allocates no KV and no recurrent state for this model
+   * (NO_MEMORY_ARCHES, or a non-causal LFM2 with decision layers). */
+  noCache?: boolean;
+  fullAttentionInterval: number | null;
+  ssmConvKernel?: number | null;
+  ssmInnerSize?: number | null;
+  ssmStateSize?: number | null;
+  ssmGroupCount?: number | null;
+  vocab?: number | null;
+}
+
+// What one transformer block holds in the context cache: "full" and "swa"
+// layers cache kElems + vElems values per token (the window for swa),
+// "recurrent" layers a fixed stateBytes, "none" layers (shared-KV or MTP
+// blocks) nothing.
+export interface KvLayerEntry {
+  kind: "full" | "swa" | "recurrent" | "none";
+  kElems: number;
+  vElems: number;
+  stateBytes: number;
+}
+
+// Per-block walk behind buildKvLayout, kept separate so a fit simulation can
+// ask which blocks' caches land on the GPU. Null when head counts or head
+// dims can't be resolved.
+export function kvLayerWalk(h: KvHeaderInputs): KvLayerEntry[] | null {
+  if (!h.headCountKv || h.headCountKv.length === 0) return null;
+  if (!isPlausibleLayerCount(h.nLayer)) return null;
+  const at = (arr: number[] | null, i: number): number | null =>
+    arr == null || arr.length === 0 ? null : arr.length === 1 ? arr[0] : (arr[i] ?? null);
+  const fallbackDim = h.nEmbd != null && h.nHead != null && h.nHead > 0 ? h.nEmbd / h.nHead : null;
+  const window = h.slidingWindow != null && h.slidingWindow > 0 ? h.slidingWindow : 0;
+  const interval =
+    h.fullAttentionInterval != null && h.fullAttentionInterval > 0
+      ? h.fullAttentionInterval
+      : INTERVAL_HYBRID_ARCHES.has(h.architecture)
+        ? 4
+        : null;
+  const kvLayers = Math.max(0, h.nLayer - Math.max(0, h.nextnLayers) - Math.max(0, h.sharedKvLayers));
+  // Per recurrent layer, f32 (llama.cpp hparams n_embd_r / n_embd_s):
+  //   R = (d_conv - 1) * (d_inner + 2 * n_group * d_state), S = d_state * d_inner
+  const dInner = h.ssmInnerSize ?? 0;
+  const dState = h.ssmStateSize ?? 0;
+  const perRecurrentLayer =
+    dInner > 0 && dState > 0
+      ? (Math.max(0, (h.ssmConvKernel ?? 0) - 1) * (dInner + 2 * (h.ssmGroupCount ?? 0) * dState) + dState * dInner) * 4
+      : 0;
+  const out: KvLayerEntry[] = [];
+  for (let il = 0; il < h.nLayer; il++) {
+    if (il >= kvLayers) {
+      out.push({ kind: "none", kElems: 0, vElems: 0, stateBytes: 0 });
+      continue;
+    }
+    const heads = at(h.headCountKv, il);
+    const flagged = h.recurrentLayers && h.recurrentLayers.length > il ? h.recurrentLayers[il] !== 0 : null;
+    const recurrent = (flagged ?? (interval != null && (il + 1) % interval !== 0)) || heads === 0;
+    if (recurrent) {
+      out.push({ kind: "recurrent", kElems: 0, vElems: 0, stateBytes: perRecurrentLayer });
+      continue;
+    }
+    if (heads == null) return null;
+    let isSwa = false;
+    if (window > 0) {
+      if (h.swaPatternArray && h.swaPatternArray.length > 0) isSwa = (h.swaPatternArray[il] ?? 0) !== 0;
+      else {
+        const period = h.swaPatternScalar != null && h.swaPatternScalar > 0 ? h.swaPatternScalar : 6;
+        isSwa = il % period < period - 1;
+      }
+    }
+    const dK = (isSwa ? h.keyLengthSwa : null) ?? at(h.keyLength, il) ?? fallbackDim;
+    const dV = (isSwa ? h.valueLengthSwa : null) ?? at(h.valueLength, il) ?? dK;
+    if (dK == null || dV == null) return null;
+    out.push({ kind: isSwa ? "swa" : "full", kElems: heads * dK, vElems: heads * dV, stateBytes: 0 });
+  }
+  return out;
+}
+
+export function buildKvLayout(h: KvHeaderInputs): KvLayout | null {
+  const walk = kvLayerWalk(h);
+  if (!walk) return null;
+  const window = h.slidingWindow != null && h.slidingWindow > 0 ? h.slidingWindow : 0;
+  const out: KvLayout = { full_k: 0, full_v: 0, swa_k: 0, swa_v: 0, window };
+  let stateBytes = 0;
+  let fullMax = 0;
+  for (const e of walk) {
+    if (e.kind === "full") {
+      out.full_k += e.kElems;
+      out.full_v += e.vElems;
+      fullMax = Math.max(fullMax, e.kElems + e.vElems);
+    } else if (e.kind === "swa") {
+      out.swa_k += e.kElems;
+      out.swa_v += e.vElems;
+    } else stateBytes += e.stateBytes;
+  }
+  if (out.swa_k === 0) out.window = 0;
+  if (stateBytes > 0) out.state_bytes = stateBytes;
+  if (h.vocab != null && h.vocab > 0) out.vocab = h.vocab;
+  if (h.noCache) out.no_cache = true;
+  out.kinds = walk.map((e) => (e.kind === "full" ? "f" : e.kind === "swa" ? "s" : e.kind === "recurrent" ? "r" : "n")).join("");
+  out.full_max = fullMax;
+  return out;
+}
+
+// Architectures llama_model::create_memory gives no memory at all (b11609,
+// src/llama-model.cpp): encoders, embedding models, diffusion LMs and the
+// Clef classifier. Pooling or non-causal attention alone does not mean this --
+// Qwen3-VL-Embedding and the LFM2.5 encoders keep a KV cache.
+export const NO_MEMORY_ARCHES = new Set([
+  "bert", "jina-bert-v2", "jina-bert-v3", "nomic-bert", "nomic-bert-moe", "neo-bert", "eurobert",
+  "wavtokenizer-dec", "modern-bert", "gemma-embedding", "gemma-embedding2",
+  "dream", "llada", "llada-moe", "rnd1", "clef",
+]);
 
 // A block's transformer-block tensors, e.g. "blk.12.attn_q.weight" -- capture
 // group 1 is the block index, group 2 is everything after it.
@@ -650,20 +937,30 @@ function isMoeExpertTensorName(rest: string): boolean {
 // or non-standard file) falls back to the "other" bucket rather than
 // crashing or silently growing the per-block arrays past the real layer
 // count.
-function buildTensorLayerBreakdown(tensors: { name: string; size: number }[], nLayer: number): TensorLayerBreakdown {
+export function buildTensorLayerBreakdown(tensors: { name: string; size: number }[], nLayer: number): TensorLayerBreakdown {
+  if (!isPlausibleLayerCount(nLayer)) throw new RangeError(`implausible layer count ${nLayer}`);
   const dense = new Array(nLayer).fill(0);
   const moe = new Array(nLayer).fill(0);
   let embed = 0;
   let output = 0;
   let other = 0;
+  let maxDense = 0;
+  let maxMoe = 0;
+  let maxEmbed = 0;
+  let maxOutput = 0;
 
   for (const t of tensors) {
     const blockMatch = BLOCK_TENSOR.exec(t.name);
     if (blockMatch) {
       const idx = Number(blockMatch[1]);
       if (Number.isInteger(idx) && idx >= 0 && idx < nLayer) {
-        if (isMoeExpertTensorName(blockMatch[2])) moe[idx] += t.size;
-        else dense[idx] += t.size;
+        if (isMoeExpertTensorName(blockMatch[2])) {
+          moe[idx] += t.size;
+          maxMoe = Math.max(maxMoe, t.size);
+        } else {
+          dense[idx] += t.size;
+          maxDense = Math.max(maxDense, t.size);
+        }
         continue;
       }
       other += t.size;
@@ -671,12 +968,14 @@ function buildTensorLayerBreakdown(tensors: { name: string; size: number }[], nL
     }
     if (t.name.startsWith("token_embd.")) {
       embed += t.size;
+      maxEmbed = Math.max(maxEmbed, t.size);
     } else if (t.name.startsWith("output_norm.") || t.name.startsWith("output.")) {
       output += t.size;
+      maxOutput = Math.max(maxOutput, t.size);
     } else {
       other += t.size;
     }
   }
 
-  return { dense, moe, embed, output, other };
+  return { dense, moe, embed, output, other, max_dense: maxDense, max_moe: maxMoe, max_embed: maxEmbed, max_output: maxOutput };
 }

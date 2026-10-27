@@ -625,6 +625,24 @@ CREATE TABLE IF NOT EXISTS fit_points (
   PRIMARY KEY (run_id, ctx, fa, ctk, ctv)
 );
 
+-- docs/plans/HEADER_FIT_PLAN.md: the latest llama-fit-params answer for one
+-- model on one machine at one (context, margin, build) -- the model list's
+-- verdicts. A model not on the machine is sized from its GGUF header.
+CREATE TABLE IF NOT EXISTS fit_checks (
+  worker_id TEXT NOT NULL REFERENCES workers(id) ON DELETE CASCADE,
+  model_id  TEXT NOT NULL REFERENCES models(id)  ON DELETE CASCADE,
+  ctx INTEGER NOT NULL,
+  margin_mib INTEGER NOT NULL,
+  llama_cpp_build TEXT NOT NULL,
+  source TEXT,                    -- local | header
+  vram_free_mib REAL,             -- free VRAM fit sized against
+  point_json TEXT,                -- shared/fitParams.ts FitPoint
+  error TEXT,
+  fetched_bytes INTEGER,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (worker_id, model_id, ctx, margin_mib, llama_cpp_build)
+);
+
 -- Optimization flow step 4: which K/V cache pairs run on the GPU for this
 -- (machine, build, model). Cached across runs, so a repeat fit map skips the
 -- 128-call detection.
@@ -645,3 +663,16 @@ CREATE TABLE IF NOT EXISTS kv_support (
   PRIMARY KEY (worker_id, llama_cpp_build, backend, model_id, ctk, ctv, fa)
 );
 CREATE INDEX IF NOT EXISTS idx_kv_support_run ON kv_support(run_id);
+
+-- Who added a model through the Models page's "Add a model manually" form
+-- (POST /api/models). The id that form derives from the repo/file is the same
+-- for everyone, so a second user adding the same file joins the existing row
+-- here instead of being refused, and it shows up in their list
+-- (repo.listModelsVisibleTo). models.created_by stays the first adder.
+CREATE TABLE IF NOT EXISTS model_registrations (
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  model_id TEXT NOT NULL REFERENCES models(id) ON DELETE CASCADE,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (user_id, model_id)
+);
+CREATE INDEX IF NOT EXISTS idx_model_registrations_model ON model_registrations(model_id);

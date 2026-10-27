@@ -1,5 +1,5 @@
 import { createServer } from "node:http";
-import { existsSync } from "node:fs";
+import { existsSync, rmSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve, relative, isAbsolute, sep, basename } from "node:path";
 import {
@@ -17,7 +17,7 @@ import {
 import { createHash, randomUUID } from "node:crypto";
 import { generateMachineKey, signReenrol } from "./machine-key.js";
 import { gzipSync } from "node:zlib";
-import { hostname as osHostname } from "node:os";
+import { hostname as osHostname, tmpdir } from "node:os";
 import { pipeline } from "node:stream/promises";
 import { Readable, Transform } from "node:stream";
 import { runBench, matchOffloadLine, extractCudaDiagnosticLines, classifyFailure, collapseTensorLoadSpam, parseModelBufferSizes, parseGpuBufferReport, type BenchResult, type OffloadResult, type OffloadInfo, type ModelBufferSizes } from "./bench.js";
@@ -89,10 +89,14 @@ import {
   reportMemorySpeed,
   postFitPoints,
   postKvSupport,
+  postFitChecks,
 } from "./vps-client.js";
 import { makeFitCaller, runFitMap } from "./fitMap.js";
+import { prepareHeaderModel } from "./headerFit.js";
+import { killProcessesUnder } from "./orphans.js";
 import { detectMoe, toArgs as toPlacementArgs } from "../../shared/moePlacement.js";
 import type { FitPoint } from "../../shared/fitParams.js";
+import { buildFitArgs, fitPointFromOutput, parseFitOutput } from "../../shared/fitParams.js";
 import {
   candidateExtraServerArgs,
   threadSweepBenchArgs,
@@ -149,6 +153,9 @@ import {
   SPEED_RUN_METHOD_VERSION,
   type TestProbeJobPayload,
   type FitMapJobPayload,
+  type FitCheckJobPayload,
+  type FitCheckResult,
+  type FitCheckSource,
   type ProbeResultInput,
   type ProbeAttemptReport,
   type MeasureQualityJobPayload,
@@ -311,6 +318,22 @@ if (!config.machine_public_key || !config.machine_private_key) {
 // state for a fresh install and triggers enrolment rather than failing.
 
 const buildsDir = resolve(config.llama_cpp_builds_dir ?? join(__dirname, "..", "llama-builds"));
+
+// docs/plans/HEADER_FIT_PLAN.md: header placeholders for sizing a model that is
+// not on this machine (worker/src/headerFit.ts). Never inside model_dir, so no
+// scan or download ever takes one for a model; emptied at startup in case a
+// crash left one behind, and after every use.
+const headerCacheDir = (() => {
+  const beside = resolve(join(__dirname, "..", "header-cache"));
+  const rel = relative(resolve(config.model_dir), beside);
+  // A model_dir that contains the worker folder would scan the placeholders.
+  return rel.startsWith("..") || isAbsolute(rel) ? beside : resolve(join(tmpdir(), "llamatoaster-header-cache"));
+})();
+try {
+  rmSync(headerCacheDir, { recursive: true, force: true });
+} catch {
+  // A locked leftover is retried by the next job's own cleanup.
+}
 
 const logDir = resolve(config.log_dir ?? join(__dirname, "..", "logs"));
 configureLogging(logDir, process.env.LOG_LEVEL);
@@ -1017,6 +1040,34 @@ async function safeItemTerminal(
       log.warn(
         `item update attempt ${attempt + 1} failed for run ${runId} item ${idx}, retrying in ${delay}ms: ${message}`
       );
+      await sleep(delay);
+    }
+  }
+}
+
+// Reports a finished job's outcome, retrying on its own -- separately from
+// executing the job, so a network blip while reporting success can never be
+// turned into an ok:false that fails a job (and for install_build, its whole
+// run) that actually worked (audit 2026-10-11 N5). The job stays this
+// worker's active one meanwhile, so heartbeats keep its lease alive. If
+// every attempt fails, the server requeues the job once the lease runs out;
+// the re-run skips finished items (BenchmarkJob.completed_idx) and repeated
+// item reports are no-ops. A 4xx (e.g. the job is no longer ours) isn't
+// worth retrying.
+async function reportJobOutcome(jobId: string, outcome: { ok: true } | { ok: false; error: string }): Promise<void> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await withAuth((token) => reportJobResult(config.url, token, config.machine_id!, jobId, outcome));
+      return;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      const clientError = err instanceof HttpError && err.status >= 400 && err.status < 500 && err.status !== 408 && err.status !== 429;
+      if (clientError || attempt >= ITEM_RETRY_DELAYS_MS.length) {
+        log.error(`could not report job ${jobId} ${outcome.ok ? "completion" : "failure"} to the server, giving up: ${message}`);
+        return;
+      }
+      const delay = ITEM_RETRY_DELAYS_MS[attempt];
+      log.warn(`reporting job ${jobId} failed (attempt ${attempt + 1}), retrying in ${delay}ms: ${message}`);
       await sleep(delay);
     }
   }
@@ -2069,6 +2120,7 @@ async function runSweepItem(input: TestSweepItemInput): Promise<SweepItemOutcome
           }
           lastRepMarker = { kind, rep, at: now };
           phase = kind === "pp" ? "processing" : "generating";
+          sampler.pauseVramNow();
           detail = `run ${rep}/${reps}`;
           const tpsSuffix = liveTps != null ? ` (${liveTps.toFixed(1)} t/s measured last repeat)` : "";
           const current = sampler.current;
@@ -2081,6 +2133,7 @@ async function runSweepItem(input: TestSweepItemInput): Promise<SweepItemOutcome
           usedProgressMarkers = true;
           const isWarmup = WARMUP_RE.test(line);
           phase = "loading";
+          sampler.resumeVram();
           detail = isWarmup ? "warmup" : undefined;
           log.info(`${label}: ${isWarmup ? "warmup prompt run" : "starting"}`);
           return;
@@ -2229,6 +2282,7 @@ async function runSweepItemViaServer(input: TestSweepItemViaServerInput): Promis
         // item -- their repeats are binary-internal.)
         if (phase !== "loading" && !sensorWindowOpen) {
           sensorWindowOpen = true;
+          sampler.pauseVramNow();
           sampler.openSensorWindow();
         }
         const current = sampler.current;
@@ -2409,6 +2463,7 @@ async function executeRuntimeBenchmarkJob(
           },
         });
         // The timed window opens at the first measured request, not at spawn.
+        await sampler.pauseVram();
         sampler.openSensorWindow();
         sendTick(payload.run_id, item.idx, { status: "processing", detail: `context ${nPrompt}` });
         const execution = await executeCurvePoint({
@@ -2657,6 +2712,7 @@ async function executeFillCurveJob(payload: BenchmarkJob, spec: FillCurveSpec): 
             sampler.start(proc.pid, payload.llama_cpp_backend, TICK_INTERVAL_MS);
           },
         });
+        await sampler.pauseVram();
         sampler.openSensorWindow();
         let lastTickAt = 0;
         const execution = await executeFillCurve({
@@ -2815,6 +2871,7 @@ async function executeSpeedRunJob(payload: BenchmarkJob, spec: SpeedRunSpec): Pr
             sampler.start(proc.pid, payload.llama_cpp_backend, TICK_INTERVAL_MS);
           },
         });
+        await sampler.pauseVram();
         sampler.openSensorWindow();
         // One short request first, discarded: the first prompt a fresh server
         // processes runs cold (measured 1,701 +/- 343 pp tok/s vs 1,898 +/- 1
@@ -2976,8 +3033,6 @@ async function executeThreadSweepJob(payload: BenchmarkJob, spec: ThreadSweepSpe
 // to the server in small batches as they come in; the run's single item
 // carries progress and the final outcome.
 async function executeFitMapJob(payload: FitMapJobPayload): Promise<void> {
-  const modelPath = await resolveModelPath(payload.model);
-  if (!existsSync(modelPath)) throw new Error(`model file not found at ${modelPath}`);
   const resolvedBuild = getInstalledBuild(buildsDir, payload.llama_cpp_build);
   if (!resolvedBuild) throw new Error(`build ${payload.llama_cpp_build} is not installed on this worker`);
   const runId = payload.run_id;
@@ -2994,6 +3049,18 @@ async function executeFitMapJob(payload: FitMapJobPayload): Promise<void> {
   stopRequested = false;
   activeBenchProc = null;
   setRunLogFile(runLogFilePath(runId));
+  // The file itself when it is here, else its header from Hugging Face.
+  let prepared: PreparedModel;
+  try {
+    prepared = await modelPathOrHeader(payload.model, `fit-map-${runId}`);
+  } catch (err) {
+    setRunLogFile(null);
+    throw err;
+  }
+  const modelPath = prepared.path;
+  if (prepared.source === "header") {
+    log.info(`run ${runId}: ${payload.model.hf_file} is not on this machine -- sizing it from its header (${Math.round(prepared.fetchedBytes / 1048576)} MiB fetched)`);
+  }
   const spec = payload.spec;
   const deviceArgs =
     spec.machine === "cpu" ? ["-dev", "none"] : payload.main_gpu != null ? ["-sm", "none", "-mg", String(payload.main_gpu)] : [];
@@ -3100,10 +3167,111 @@ async function executeFitMapJob(payload: FitMapJobPayload): Promise<void> {
     });
   } finally {
     activeBenchProc = null;
+    await prepared.cleanup().catch(() => {});
     setRunLogFile(null);
     updateJobReport({ phase: "finalizing", detail: "pushing run log" });
     await pushTestLogIfPresent(runId);
   }
+}
+
+interface PreparedModel {
+  path: string;
+  source: FitCheckSource;
+  fetchedBytes: number;
+  cleanup: () => Promise<void>;
+}
+
+// A path llama-fit-params can size: the model file when this machine has it,
+// else a sparse placeholder holding its real header (worker/src/headerFit.ts).
+async function modelPathOrHeader(model: Model, slot: string): Promise<PreparedModel> {
+  const local = await resolveModelPath(model);
+  if (existsSync(local)) return { path: local, source: "local", fetchedBytes: 0, cleanup: async () => {} };
+  if (!model.hf_repo || !model.hf_file) {
+    throw new Error(`model file not found at ${local}, and the model has no Hugging Face source to size it from`);
+  }
+  validateHfRepo(model.hf_repo);
+  validateHfFile(model.hf_file);
+  const repoId = model.hf_repo;
+  const hm = await prepareHeaderModel({
+    dir: join(headerCacheDir, slot.replace(/[^A-Za-z0-9_-]/g, "_")),
+    file: model.hf_file,
+    urlFor: (f) => hfResolveUrl(repoId, f),
+    headers: getWorkerHfHeaders(),
+  });
+  return { path: hm.path, source: "header", fetchedBytes: hm.fetchedBytes, cleanup: hm.cleanup };
+}
+
+// docs/plans/HEADER_FIT_PLAN.md -- one llama-fit-params call per model at one
+// context (FA on, f16 KV), for the model list's verdicts. Each answer is
+// posted as it comes; one model failing never stops the rest.
+async function executeFitCheckJob(payload: FitCheckJobPayload): Promise<void> {
+  const base = { ctx: payload.ctx, margin_mib: payload.margin_mib, llama_cpp_build: payload.llama_cpp_build };
+  const post = async (r: FitCheckResult) => {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        await withAuth((token) => postFitChecks(config.url, token, { machine_id: config.machine_id, results: [r] }));
+        return;
+      } catch (err) {
+        log.warn(`fit check post failed (attempt ${attempt + 1}/3): ${err instanceof Error ? err.message : String(err)}`);
+        await sleep(1000 * (attempt + 1));
+      }
+    }
+  };
+  const resolvedBuild = getInstalledBuild(buildsDir, payload.llama_cpp_build);
+  const fitPath = resolvedBuild?.fit_params_path ?? null;
+  if (!fitPath || !(await supportsFlag(fitPath, "--fit-target").catch(() => false))) {
+    const error = `llama.cpp build ${payload.llama_cpp_build} has no llama-fit-params with --fit-target on this machine`;
+    for (const m of payload.models) await post({ ...base, model_id: m.id, source: null, vram_free_mib: null, point: null, error });
+    return;
+  }
+  stopRequested = false;
+  const deviceArgs = payload.main_gpu != null ? ["-sm", "none", "-mg", String(payload.main_gpu)] : [];
+  const call = makeFitCaller(fitPath, {
+    onSpawn: (proc) => (activeBenchProc = proc),
+    onExit: () => (activeBenchProc = null),
+  });
+  for (const [i, model] of payload.models.entries()) {
+    if (stopRequested) break;
+    const label = model.hf_file ?? model.filename ?? model.id;
+    updateJobReport({ phase: "benchmarking", item_idx: i, items_total: payload.models.length, detail: `sizing ${label}` });
+    let prepared: PreparedModel | null = null;
+    try {
+      prepared = await modelPathOrHeader(model, `fit-check-${i}`);
+      const res = await call(
+        buildFitArgs({ modelPath: prepared.path, ctx: payload.ctx, fa: "on", marginMib: payload.margin_mib, deviceArgs })
+      );
+      const parsed = parseFitOutput(res.stdout, res.log);
+      const point = fitPointFromOutput(parsed, {
+        ctx: payload.ctx,
+        fa: "on",
+        ctk: "f16",
+        ctv: "f16",
+        marginMib: payload.margin_mib,
+        ramBudgetMib: payload.ram_budget_mib ?? null,
+      });
+      const error =
+        point.verdict === "error"
+          ? point.error ?? (res.timedOut ? "llama-fit-params gave no answer in time" : `llama-fit-params exited ${res.code ?? "abnormally"}`)
+          : null;
+      await post({
+        ...base,
+        model_id: model.id,
+        source: prepared.source,
+        vram_free_mib: parsed.projectedFreeMib ?? null,
+        point: error ? null : point,
+        error,
+        ...(prepared.fetchedBytes > 0 ? { fetched_bytes: prepared.fetchedBytes } : {}),
+      });
+      log.info(`fit check ${label} @ ${payload.ctx}: ${error ?? `${point.verdict}, ${point.layers_gpu}/${point.layers_total} layers`} (${prepared.source})`);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      log.warn(`fit check ${label} failed: ${message}`);
+      await post({ ...base, model_id: model.id, source: prepared?.source ?? null, vram_free_mib: null, point: null, error: message.slice(0, 2000) });
+    } finally {
+      await prepared?.cleanup().catch(() => {});
+    }
+  }
+  activeBenchProc = null;
 }
 
 async function executeBenchmarkJob(payload: BenchmarkJob): Promise<void> {
@@ -3190,8 +3358,16 @@ async function executeBenchmarkJob(payload: BenchmarkJob): Promise<void> {
   const tally = (status: TerminalTestItemStatus): void => {
     statusCounts[status] = (statusCounts[status] ?? 0) + 1;
   };
+  // Items an earlier attempt at this job already finished (the server lists
+  // them when it hands out a requeued job -- audit 2026-10-11 N6): re-running
+  // them would only re-measure, and the server keeps the first results.
+  const alreadyFinished = new Set(payload.completed_idx ?? []);
+  if (alreadyFinished.size > 0) {
+    log.info(`run ${payload.run_id}: resuming -- ${alreadyFinished.size} item(s) already finished on an earlier attempt`);
+  }
   try {
     for (const item of items) {
+      if (alreadyFinished.has(item.idx)) continue;
       updateJobReport({
         phase: "benchmarking",
         item_idx: item.idx,
@@ -3276,10 +3452,14 @@ async function executeBenchmarkJob(payload: BenchmarkJob): Promise<void> {
         .filter((s) => statusCounts[s])
         .map((s) => `${s}=${statusCounts[s]}`)
         .join(" ") || "no items processed";
+    // The counts cover only what this attempt ran; a resumed job's earlier
+    // items were reported by the attempt that ran them.
+    const ranHere = items.length - alreadyFinished.size;
+    const resumedNote = alreadyFinished.size > 0 ? ` (resumed; ${alreadyFinished.size} finished earlier)` : "";
     log.info(
-      `run ${payload.run_id} finished all ${items.length} test(s)${stopRequested ? " (stopped early)" : ""}: ${breakdown}`
+      `run ${payload.run_id} finished all ${ranHere} test(s)${resumedNote}${stopRequested ? " (stopped early)" : ""}: ${breakdown}`
     );
-    log.info(formatRunLogFooter(payload.run_id, items.length, payload.sweep.repeats, statusCounts, stopRequested));
+    log.info(formatRunLogFooter(payload.run_id, ranHere, payload.sweep.repeats, statusCounts, stopRequested));
   } finally {
     setRunLogFile(null);
     updateJobReport({ phase: "finalizing", detail: "pushing run log" });
@@ -3494,6 +3674,7 @@ async function executeDownloadModelJob(
       sliding_window,
       sliding_window_pattern,
       shared_kv_layers,
+      kv_layout,
       debugReason,
     } = await readGgufInfo(target);
     log.info(
@@ -3540,6 +3721,7 @@ async function executeDownloadModelJob(
       sliding_window: sliding_window ?? undefined,
       sliding_window_pattern: sliding_window_pattern ?? undefined,
       shared_kv_layers: shared_kv_layers ?? undefined,
+      kv_layout: kv_layout ?? undefined,
       gguf_checked_at: Date.now(),
       last_verified: Date.now(),
       state: verificationState,
@@ -3589,6 +3771,7 @@ async function executeDownloadModelJob(
       sliding_window,
       sliding_window_pattern,
       shared_kv_layers,
+      kv_layout,
     });
     if (!reported) {
       // The file is on disk and hashed, but the server never learned about
@@ -4742,7 +4925,7 @@ async function executeRefreshModelsJob(): Promise<void> {
     config.model_dir,
     localModelCache,
     config.url,
-    authToken,
+    () => authToken,
     config.raw_json_dir
   );
   log.info("Model directory refresh completed");
@@ -4797,13 +4980,15 @@ async function executeJob(job: SerialQueueJob): Promise<void> {
       return executeShutdownWorkerJob();
     case "measure_memory_speed":
       return executeMeasureMemorySpeedJob();
+    case "fit_check":
+      return executeFitCheckJob(job.payload);
   }
 }
 
 function jobInitialPhase(type: QueueJob["type"]): ActiveJobReport["phase"] {
   return type === "download_model"
     ? "downloading"
-    : type === "measure_memory_speed"
+    : type === "measure_memory_speed" || type === "fit_check"
       ? "benchmarking"
       : "loading";
 }
@@ -5191,23 +5376,17 @@ async function runDownloadJob(job: { job_id: string; payload: DownloadModelJobPa
   kickHeartbeatSoon();
   log.info(`claimed job ${job.job_id} (download_model)`);
   try {
-    await executeDownloadModelJob(job.job_id, job.payload, controller.signal);
-    await withAuth((token) => reportJobResult(config.url, token, config.machine_id!, job.job_id, { ok: true }));
-    log.info(`job ${job.job_id} (download_model) completed`);
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    log.error(`job ${job.job_id} (download_model) failed: ${message}`);
+    let outcome: { ok: true } | { ok: false; error: string };
     try {
-      await withAuth((token) =>
-        reportJobResult(config.url, token, config.machine_id!, job.job_id, { ok: false, error: message })
-      );
-    } catch (reportErr) {
-      log.error(
-        `could not report job ${job.job_id} failure to server: ${
-          reportErr instanceof Error ? reportErr.message : String(reportErr)
-        }`
-      );
+      await executeDownloadModelJob(job.job_id, job.payload, controller.signal);
+      log.info(`job ${job.job_id} (download_model) completed`);
+      outcome = { ok: true };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      log.error(`job ${job.job_id} (download_model) failed: ${message}`);
+      outcome = { ok: false, error: message };
     }
+    await reportJobOutcome(job.job_id, outcome);
   } finally {
     activeDownloadReports.delete(job.job_id);
     activeDownloadControllers.delete(job.job_id);
@@ -5260,26 +5439,17 @@ async function workerMain(): Promise<void> {
       // whatever's left of the current idle heartbeat interval.
       kickHeartbeatSoon();
       try {
-        await executeJob(job);
-        await withAuth((token) => reportJobResult(config.url, token, config.machine_id!, job.job_id, { ok: true }));
-        log.info(`job ${job.job_id} (${job.type}) completed`);
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        log.error(`job ${job.job_id} (${job.type}) failed: ${message}`);
+        let outcome: { ok: true } | { ok: false; error: string };
         try {
-          await withAuth((token) =>
-            reportJobResult(config.url, token, config.machine_id!, job.job_id, {
-              ok: false,
-              error: message,
-            })
-          );
-        } catch (reportErr) {
-          log.error(
-            `could not report job ${job.job_id} failure to server: ${
-              reportErr instanceof Error ? reportErr.message : String(reportErr)
-            }`
-          );
+          await executeJob(job);
+          log.info(`job ${job.job_id} (${job.type}) completed`);
+          outcome = { ok: true };
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          log.error(`job ${job.job_id} (${job.type}) failed: ${message}`);
+          outcome = { ok: false, error: message };
         }
+        await reportJobOutcome(job.job_id, outcome);
       } finally {
         busy = false;
         currentJobReport = null;
@@ -5348,7 +5518,7 @@ void runStartupReconciliation(
   config.model_dir,
   localModelCache,
   config.url,
-  authToken,
+  () => authToken,
   config.raw_json_dir
 ).catch((err) => {
   log.error(`Startup reconciliation failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -5381,13 +5551,31 @@ try {
   log.warn(`llama.cpp builds dir scan failed: ${err instanceof Error ? err.message : String(err)}`);
 }
 
+// llama.cpp processes left behind by a previous run of this worker that was
+// killed outright (see orphans.ts) -- ended before claiming any job, so the
+// next run doesn't measure beside them.
+try {
+  const ended = await killProcessesUnder(buildsDir);
+  for (const p of ended) log.warn(`ended leftover llama.cpp process ${p.pid} from a previous worker run: ${p.path}`);
+} catch (err) {
+  log.warn(`could not check for leftover llama.cpp processes: ${err instanceof Error ? err.message : String(err)}`);
+}
+
 startHeartbeatLoop();
 void workerMain();
 
-function shutdown(signal: string): void {
+// Ctrl+C / SIGTERM: take the llama.cpp children down too rather than leaving
+// them holding VRAM (audit 2026-10-11 N10). Bounded, so a stuck process
+// listing can't keep the worker from exiting.
+let shuttingDown = false;
+async function shutdown(signal: string): Promise<void> {
+  if (shuttingDown) return;
+  shuttingDown = true;
   log.info(`received ${signal}, shutting down...`);
+  activeBenchProc?.kill("SIGKILL");
+  await Promise.race([killProcessesUnder(buildsDir).catch(() => []), sleep(5_000)]);
   process.exit(0);
 }
 
-process.on("SIGINT", () => shutdown("SIGINT"));
-process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => void shutdown("SIGINT"));
+process.on("SIGTERM", () => void shutdown("SIGTERM"));

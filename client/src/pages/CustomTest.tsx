@@ -14,7 +14,7 @@ import { formatGpuLabel, formatBytes } from "../utils";
 import { estimateVramNeededMib, estimateSafeNgl } from "../vramEstimate";
 import { GoalQuestionnaire } from "../components/GoalQuestionnaire";
 import { defaultGoals, goalsEqualDefaults, normalizeGoals, type GoalsConfig, type WorkloadShape } from "../goals";
-import { expandSweep } from "../../../shared/sweep";
+import { countSweepItems, expandSweep } from "../../../shared/sweep";
 import { priceMatrix, ETA_UNAVAILABLE } from "../../../shared/pricing";
 import type { ModelRatesResponse } from "../types";
 
@@ -872,7 +872,7 @@ export function CustomTest() {
   // axis product without anything here having to reconcile it.
   const expandedItems = useMemo(() => {
     try {
-      return expandSweep(sweep).length;
+      return countSweepItems(sweep);
     } catch {
       return 0;
     }

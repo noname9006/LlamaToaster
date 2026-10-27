@@ -27,6 +27,7 @@ import {
   type ProbeAttemptDto,
   type AdminStats,
   type RocmSupportSnapshot,
+  type FitCheckResult,
 } from "../types";
 import type { FitPoint } from "../../../shared/fitParams.js";
 import type { KvSupportRow } from "../../../shared/kvSupport.js";
@@ -239,6 +240,15 @@ export const api = {
   measureMemorySpeed: (workerId: string): Promise<{ ok: true; queued: true }> =>
     request(`/api/workers/${encodeURIComponent(workerId)}/measure-memory-speed`, postJson({})),
 
+  // docs/plans/HEADER_FIT_PLAN.md: asks the machine to size these models with
+  // llama-fit-params at one context; answers already on file are not asked
+  // again. Results arrive through fitChecks below.
+  requestFitChecks: (workerId: string, body: { model_ids: string[]; ctx: number }): Promise<{ ok: true; queued: number; pending?: boolean }> =>
+    request(`/api/workers/${encodeURIComponent(workerId)}/fit-check`, postJson(body)),
+
+  fitChecks: (workerId: string, ctx: number): Promise<{ results: FitCheckResult[]; pending: boolean }> =>
+    request(`/api/workers/${encodeURIComponent(workerId)}/fit-checks?ctx=${ctx}`),
+
   // sort/direction map to HF's own search API params (server/src/hf.ts);
   // cursor comes from a previous call's nextCursor -- HF paginates via a
   // forward-only cursor, not an offset/page number, so there's no way to
@@ -301,7 +311,7 @@ export const api = {
 
   listTests: (): Promise<Test[]> => request<{ runs: Test[] }>("/api/tests").then((d) => d.runs),
 
-  getTest: (id: string): Promise<{ run: Test; results: ResultRow[]; items: TestItem[]; paused?: boolean }> =>
+  getTest: (id: string): Promise<{ run: Test; results: ResultRow[]; items: TestItem[]; paused?: boolean; paused_since?: number }> =>
     request(`/api/tests/${encodeURIComponent(id)}`),
 
   triggerTest: (payload: TriggerPayload): Promise<Test> =>

@@ -36,6 +36,8 @@ worker/llama-builds/
 # Daily worker log files, using the default log_dir (worker/logs/ next to
 # worker/) -- runtime output, not source.
 worker/logs/
+# Header placeholders for sizing models not on the machine (worker/src/headerFit.ts).
+worker/header-cache/
 
 # Per-run structured log files, using the default LOG_DIR (data/run-logs/
 # next to the server's cwd, see server/src/routes/runs.ts) -- runtime

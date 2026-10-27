@@ -5,6 +5,7 @@
 import { getDb } from "./migrate.js";
 import type { FitPoint } from "../../../shared/fitParams.js";
 import type { KvSupportRow, KvSupportStatus } from "../../../shared/kvSupport.js";
+import type { FitCheckResult, FitCheckSource } from "../../../shared/types.js";
 
 export class FitPointLimitError extends Error {
   constructor(readonly maxRows: number) {
@@ -169,5 +170,83 @@ export const fitRepo = {
       baseline_splits: r.baseline_splits,
       detail: r.detail,
     }));
+  },
+
+  upsertFitChecks(workerId: string, results: FitCheckResult[], now = Date.now()): number {
+    const stmt = getDb().prepare(
+      `INSERT INTO fit_checks (worker_id, model_id, ctx, margin_mib, llama_cpp_build, source, vram_free_mib, point_json, error, fetched_bytes, created_at)
+       SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM models WHERE id = ?)
+       ON CONFLICT (worker_id, model_id, ctx, margin_mib, llama_cpp_build) DO UPDATE SET
+         source = excluded.source, vram_free_mib = excluded.vram_free_mib, point_json = excluded.point_json,
+         error = excluded.error, fetched_bytes = excluded.fetched_bytes, created_at = excluded.created_at`
+    );
+    let n = 0;
+    const tx = getDb().transaction(() => {
+      for (const r of results) {
+        n += stmt.run(
+          workerId,
+          r.model_id,
+          r.ctx,
+          r.margin_mib,
+          r.llama_cpp_build,
+          r.source,
+          r.vram_free_mib,
+          r.point ? JSON.stringify(r.point) : null,
+          r.error,
+          r.fetched_bytes ?? null,
+          now,
+          r.model_id
+        ).changes;
+      }
+    });
+    tx();
+    return n;
+  },
+
+  /** Latest answer per model at (ctx, margin) on this worker, any build. */
+  listFitChecks(filter: { worker_id: string; ctx: number; margin_mib: number }): FitCheckResult[] {
+    const rows = getDb()
+      .prepare(
+        `SELECT model_id, ctx, margin_mib, llama_cpp_build, source, vram_free_mib, point_json, error, fetched_bytes, created_at
+         FROM fit_checks WHERE worker_id = ? AND ctx = ? AND margin_mib = ?
+         ORDER BY created_at DESC`
+      )
+      .all(filter.worker_id, filter.ctx, filter.margin_mib) as {
+      model_id: string;
+      ctx: number;
+      margin_mib: number;
+      llama_cpp_build: string;
+      source: string | null;
+      vram_free_mib: number | null;
+      point_json: string | null;
+      error: string | null;
+      fetched_bytes: number | null;
+      created_at: number;
+    }[];
+    const seen = new Set<string>();
+    const out: FitCheckResult[] = [];
+    for (const r of rows) {
+      if (seen.has(r.model_id)) continue;
+      seen.add(r.model_id);
+      let point: FitCheckResult["point"] = null;
+      try {
+        point = r.point_json ? JSON.parse(r.point_json) : null;
+      } catch {
+        point = null;
+      }
+      out.push({
+        model_id: r.model_id,
+        ctx: r.ctx,
+        margin_mib: r.margin_mib,
+        llama_cpp_build: r.llama_cpp_build,
+        source: (r.source as FitCheckSource | null) ?? null,
+        vram_free_mib: r.vram_free_mib,
+        point,
+        error: r.error,
+        ...(r.fetched_bytes != null ? { fetched_bytes: r.fetched_bytes } : {}),
+        created_at: r.created_at,
+      });
+    }
+    return out;
   },
 };

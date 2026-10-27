@@ -27,6 +27,22 @@ import {
 // callback, which branches on the same hostname (§5.1's own split).
 export const ADMIN_HOSTNAME = process.env.ADMIN_PUBLIC_URL ? new URL(process.env.ADMIN_PUBLIC_URL).hostname : undefined;
 
+// Whether a request came in on the admin origin. Reads the raw Host header
+// (nginx forwards the real one: `proxy_set_header Host $host`), never
+// req.hostname -- with trustProxy on loopback that comes from
+// X-Forwarded-Host, which any client can set, so a main-site session could
+// reach the admin APIs by naming the admin host there (audit 2026-09-27 M1).
+// Same header the admin static files' `constraints: { host }` route on.
+export function isAdminHost(req: FastifyRequest): boolean {
+  const host = req.raw.headers.host;
+  if (!ADMIN_HOSTNAME || !host) return false;
+  try {
+    return new URL(`http://${host}`).hostname === ADMIN_HOSTNAME;
+  } catch {
+    return false;
+  }
+}
+
 export async function adminRoutes(app: FastifyInstance): Promise<void> {
   // Registered as onRequest, not preHandler, deliberately -- Fastify runs
   // every onRequest hook (regardless of which plugin registered it) before
@@ -43,7 +59,7 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
   // authMiddleware already populated req.user) for the same reason: this
   // hook must not depend on another plugin's hook having run first.
   app.addHook("onRequest", async (req) => {
-    if (!ADMIN_HOSTNAME || req.hostname !== ADMIN_HOSTNAME) throw new NotFoundError();
+    if (!isAdminHost(req)) throw new NotFoundError();
     const authed = resolveAuthUser(req);
     if (!authed || !authed.user.isSuperadmin) throw new ForbiddenError("superadmin required");
     (req as AuthenticatedRequest).user = authed.user;

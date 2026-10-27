@@ -40,6 +40,110 @@ export interface TensorLayerBreakdown {
   // Anything matched by neither bucket above (rope frequency tables, misc
   // top-level tensors) -- always treated as CPU-resident; typically tiny.
   other: number;
+  // Largest single tensor among the blocks' dense tensors / routed-expert
+  // tensors, and among token_embd.* / output.*. With layers on the CPU,
+  // llama.cpp copies a CPU-resident matmul weight to the GPU for prompt
+  // processing, so the compute buffer must hold the largest one
+  // (shared/fitSimulate.ts). Absent on rows read before these existed.
+  max_dense?: number;
+  max_moe?: number;
+  max_embed?: number;
+  max_output?: number;
+}
+
+// Which layers really keep a per-token KV cache, and how big each is, read
+// from the GGUF header (shared/gguf.ts buildKvLayout). The single-scalar
+// geometry above (nLayer * nHeadKv * dims) charges every layer a
+// full-context cache, which overstates hybrid models (Qwen3.5+: only every
+// full_attention_interval-th layer is attention, the rest are recurrent with
+// a small fixed state) and sliding-window ones (Gemma: most layers only
+// cache the window) several times over.
+//
+// Element counts per token, summed over layers: *_k = sum(n_head_kv * dK),
+// *_v = sum(n_head_kv * dV). Multiply by the cache type's bytes per element.
+export interface KvLayout {
+  // Layers caching the whole context.
+  full_k: number;
+  full_v: number;
+  // Sliding-window layers -- cache at most ~window tokens.
+  swa_k: number;
+  swa_v: number;
+  // attention.sliding_window; 0 when there are no SWA layers.
+  window: number;
+  // Recurrent (SSM / gated-delta) layers' fixed state per sequence, bytes,
+  // always f32 -- llama.cpp's llama_memory_recurrent R + S. Independent of
+  // context. Absent/0 for pure-attention models.
+  state_bytes?: number;
+  // Vocabulary size (tokenizer.ggml.tokens length): the logits tensor
+  // (n_vocab x n_ubatch x f32) is most of llama.cpp's compute buffer.
+  vocab?: number;
+  // One letter per block, in order: "f" full attention, "s" sliding window,
+  // "r" recurrent, "n" no cache (shared-KV / MTP blocks) -- where each block's
+  // cache lives once layers are split between GPU and CPU
+  // (shared/fitSimulate.ts). Absent on rows read before it existed.
+  kinds?: string;
+  // K + V elements per token of the largest full-attention layer: with that
+  // layer on the CPU, its cache is copied into the GPU's compute buffer.
+  full_max?: number;
+  // No per-token cache at all (non-causal / embedding / classifier models):
+  // llama.cpp allocates neither KV nor recurrent state, and computes no
+  // full-vocabulary logits.
+  no_cache?: boolean;
+}
+
+// llama.cpp's default n_ubatch -- the logits buffer is sized for one ubatch.
+const DEFAULT_UBATCH = 512;
+// Graph scratch on top of the logits tensor; measured 12-60 MiB at 8k on
+// Qwen3.5/3.6 and Gemma-4 (b11226). Context-dependent growth beyond that
+// (up to ~250 MiB at 256k on some models) is not modelled.
+const COMPUTE_SCRATCH_MIB = 64;
+
+// Context-independent runtime memory llama.cpp allocates beside weights and
+// KV: recurrent state + the compute buffer. 0 for what the layout doesn't
+// know (rows read before these fields existed).
+export function estimateRuntimeExtrasMib(layout: KvLayout, opts: { parallelSlots?: number } = {}): number {
+  const slots = Math.max(1, opts.parallelSlots ?? 1);
+  const state = (layout.state_bytes ?? 0) * slots;
+  const compute = layout.vocab ? layout.vocab * DEFAULT_UBATCH * 4 + COMPUTE_SCRATCH_MIB * BYTES_PER_MIB : 0;
+  return (state + compute) / BYTES_PER_MIB;
+}
+
+// Shape check for a KvLayout arriving over the wire.
+export function isKvLayout(value: unknown): value is KvLayout {
+  if (typeof value !== "object" || value === null) return false;
+  const v = value as Record<string, unknown>;
+  const num = (x: unknown) => typeof x === "number" && Number.isFinite(x) && x >= 0;
+  return (
+    (["full_k", "full_v", "swa_k", "swa_v", "window"] as const).every((k) => num(v[k])) &&
+    (v.state_bytes === undefined || num(v.state_bytes)) &&
+    (v.vocab === undefined || num(v.vocab)) &&
+    (v.kinds === undefined || (typeof v.kinds === "string" && v.kinds.length <= 4096 && /^[fsrn]*$/.test(v.kinds))) &&
+    (v.full_max === undefined || num(v.full_max)) &&
+    (v.no_cache === undefined || typeof v.no_cache === "boolean")
+  );
+}
+
+// llama.cpp's SWA cache holds window + one ubatch (512 default), padded to
+// 256 cells, never more than the context itself.
+function swaCacheCells(window: number, ctx: number): number {
+  return Math.min(ctx, Math.ceil((window + 512) / 256) * 256);
+}
+
+// KV cache MiB for `tokens` tokens from a KvLayout. Null when a cache type
+// is unknown.
+export function estimateKvLayoutMib(
+  layout: KvLayout,
+  opts: { tokens: number; cacheTypeK: string; cacheTypeV: string; parallelSlots?: number }
+): number | null {
+  const bK = bytesPerVal(opts.cacheTypeK);
+  const bV = bytesPerVal(opts.cacheTypeV);
+  if (bK == null || bV == null || opts.tokens <= 0) return null;
+  if (layout.no_cache) return 0;
+  const slots = Math.max(1, opts.parallelSlots ?? 1);
+  const full = (layout.full_k * bK + layout.full_v * bV) * opts.tokens * slots;
+  const swaCells = layout.window > 0 ? swaCacheCells(layout.window * slots, opts.tokens * slots) : 0;
+  const swa = (layout.swa_k * bK + layout.swa_v * bV) * swaCells;
+  return (full + swa) / BYTES_PER_MIB;
 }
 
 export interface WeightPlacementBytes {
@@ -77,7 +181,11 @@ export function placeWeightBytes(
   const gpuFrom = nLayer - gpuBlocks; // blocks [gpuFrom, nLayer) are GPU-resident
   let gpuBytes = 0;
   let cpuBytes = 0;
-  for (let i = 0; i < nLayer; i++) {
+  // Blocks past the breakdown's own arrays hold nothing; never loop further,
+  // whatever nLayer claims (an implausible n_layer would otherwise spin here
+  // for billions of iterations -- audit 2026-10-18 A3).
+  const blocks = Math.min(nLayer, Math.max(breakdown.dense.length, breakdown.moe.length));
+  for (let i = 0; i < blocks; i++) {
     const dense = breakdown.dense[i] ?? 0;
     const moe = breakdown.moe[i] ?? 0;
     const onGpu = i >= gpuFrom;
@@ -95,6 +203,43 @@ export function placeWeightBytes(
   if (clampedNgl > nLayer) gpuBytes += breakdown.output;
   else cpuBytes += breakdown.output;
   cpuBytes += breakdown.other;
+  return { gpuBytes, cpuBytes };
+}
+
+// True when the model has no separate output.weight: llama.cpp reuses
+// token_embd as the output matrix, so `output` holds only the tiny
+// output_norm while `embed` is the whole vocab matrix.
+export function hasTiedOutput(b: TensorLayerBreakdown): boolean {
+  return b.embed > 0 && b.output < b.embed * 0.1;
+}
+
+// Where llama.cpp really puts the weights, checked against its own per-device
+// memory table (Vulkan b9058, 14 files):
+//   - token_embd is an input-layer lookup and stays in system RAM, even at
+//     full offload;
+//   - a model with tied output also gets a duplicate of it on the GPU once
+//     the output layer is offloaded (ngl > nLayer), so that copy counts in
+//     BOTH pools;
+//   - an untied model's separate output.weight goes to the GPU at ngl > nLayer
+//     (already how placeWeightBytes handles `output`).
+// placeWeightBytes (used by the worker's probes) still puts the embedding on
+// the GPU at ngl >= nLayer, which overstates VRAM by one embedding for untied
+// models; this is the corrected split for fit verdicts.
+export function placeWeightPools(
+  breakdown: TensorLayerBreakdown,
+  nLayer: number,
+  ngl: number,
+  nCpuMoe = 0
+): WeightPlacementBytes {
+  const base = placeWeightBytes(breakdown, nLayer, ngl, nCpuMoe);
+  const clamped = Math.max(0, Math.min(Math.round(ngl), nLayer + 1));
+  let gpuBytes = base.gpuBytes;
+  let cpuBytes = base.cpuBytes;
+  if (Math.min(clamped, nLayer) >= nLayer) {
+    gpuBytes -= breakdown.embed;
+    cpuBytes += breakdown.embed;
+  }
+  if (hasTiedOutput(breakdown) && clamped > nLayer) gpuBytes += breakdown.embed;
   return { gpuBytes, cpuBytes };
 }
 

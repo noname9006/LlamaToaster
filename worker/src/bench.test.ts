@@ -526,6 +526,36 @@ describe("parseGpuBufferReport", () => {
     expect(report).toEqual({ deviceMib: 4150, contextMib: 150, byDeviceMib: { CUDA0: 4150 } });
   });
 
+  // b9503 llama-server, Gemma-4 E4B at 131072 tokens: one KV cache for the
+  // full-attention layers and one for the sliding window, on the same device.
+  it("sums a sliding-window model's two KV caches on the same device", () => {
+    const report = parseGpuBufferReport(
+      [
+        "load_tensors:      Vulkan0 model buffer size =  2493.31 MiB",
+        "llama_kv_cache:    Vulkan0 KV buffer size =  2048.00 MiB",
+        "llama_kv_cache_iswa: creating     SWA KV cache, size = 1024 cells",
+        "llama_kv_cache:    Vulkan0 KV buffer size =    40.00 MiB",
+        "sched_reserve:    Vulkan0 compute buffer size =   251.02 MiB",
+      ].join("\n")
+    )!;
+    expect(report.deviceMib).toBeCloseTo(2493.31 + 2088 + 251.02, 2);
+    expect(report.contextMib).toBeCloseTo(2088 + 251.02, 2);
+  });
+
+  it("replaces the caches when the context is created again", () => {
+    const report = parseGpuBufferReport(
+      [
+        "load_tensors:        CUDA0 model buffer size =  1000.00 MiB",
+        "llama_kv_cache:        CUDA0 KV buffer size =   300.00 MiB",
+        "llama_kv_cache:        CUDA0 KV buffer size =    20.00 MiB",
+        "sched_reserve:        CUDA0 compute buffer size =   100.00 MiB",
+        "llama_kv_cache:        CUDA0 KV buffer size =   200.00 MiB",
+        "sched_reserve:        CUDA0 compute buffer size =   100.00 MiB",
+      ].join("\n")
+    )!;
+    expect(report.byDeviceMib).toEqual({ CUDA0: 1300 });
+  });
+
   it("sums buffers across several GPUs", () => {
     const report = parseGpuBufferReport(
       [

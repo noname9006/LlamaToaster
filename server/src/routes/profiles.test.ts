@@ -218,6 +218,29 @@ describe("GET /api/runs/:id/profiles (M3)", () => {
     expect(body.target_ctx_clamped).toBe(true);
   });
 
+  // Audit 2026-10-18 A6: the shared catalog row can carry another tenant's
+  // reading; a profile is about the run's own machine, so it uses that
+  // machine's reading of its own file.
+  it("sizes against the run machine's own reading of the file, not the shared catalog row", async () => {
+    const sha = "a6".repeat(32);
+    repo.registerModel({
+      id: sha, filename: "a6.gguf", size_bytes: 1, source: "local",
+      metadata: { trained_ctx: 32_768, n_layer: 48, n_head_kv: 4, head_dim_k: 128, head_dim_v: 128 },
+    });
+    const worker = repo.workerRepo.getOrCreateByMachineId("a6-machine", "a6-box");
+    getDb()
+      .prepare(`UPDATE workers SET model_files_json = ? WHERE id = ?`)
+      .run(JSON.stringify([{ path: "a6.gguf", size_bytes: 1, sha256: sha, state: "verified", trained_ctx: 8192 }]), worker.id);
+    repo.createTest(undefined, {
+      id: "run-a6", kind: "sweep", worker_id: worker.id, worker_name: "w", llama_cpp_build: "b1", llama_cpp_backend: "cpu",
+      model_id: sha, config: { model_id: sha, sweep } as never, status: "running", started_at: Date.now(),
+    });
+    const res = await fetch(`${baseUrl}/api/runs/run-a6/profiles?goal=max_context&target_ctx=16384`);
+    const body = (await res.json()) as { goals: { target_ctx: number }; target_ctx_clamped: boolean };
+    expect(body.target_ctx_clamped).toBe(true);
+    expect(body.goals.target_ctx).toBe(8192);
+  });
+
   it("uses the run's stored goals when the caller states none (M2: intent stored as configuration)", async () => {
     makeScoredRun(
       "run-goals",

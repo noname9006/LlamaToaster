@@ -85,7 +85,8 @@ export async function comparisonRoutes(app: FastifyInstance): Promise<void> {
       const tgRows = results.filter((r) => r.test_type === "tg");
       const best = tgRows.sort((a, b) => b.avg_tps - a.avg_tps)[0];
       const pp = best ? results.find((r) => r.test_type === "pp" && r.idx === best.idx) : undefined;
-      const model = repo.getModel(run.model_id);
+      // As the member's own machine read its file (audit 2026-10-18 A6).
+      const model = repo.getModelForWorker(run.model_id, run.worker_id);
       const quality = repo.qualityRepo.listForModel(run.model_id)[0];
       const verified = run.worker_id
         ? repo.limitsRepo.listForModelAndWorker(run.model_id, run.worker_id)[0]

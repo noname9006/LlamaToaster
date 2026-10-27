@@ -15,7 +15,7 @@ import type {
   LlamaCppRelease,
   WorkerVramInfo,
 } from "../../../shared/types.js";
-import type { TensorLayerBreakdown } from "../../../shared/vramEstimate.js";
+import { parseHeaderFields } from "../validate-worker-state.js";
 import { HF_REPO_PATTERN, searchHfGgufModels, listHfGgufFiles, getHfGgufMeta, type HfSortField } from "../hf.js";
 
 const WORKER_READ_TIMEOUT_MS = 5_000;
@@ -33,48 +33,10 @@ function validateModelDownloadCallback(payload: unknown): string | null {
   } else if (p.error !== undefined && typeof p.error !== "string") {
     return "error must be a string";
   }
-  // Per-file GGUF header fields (ModelDownloadCallbackInput) -- all optional
-  // (an old worker sends none), but each must be a number when present. A
-  // null means the header was read and the key wasn't there; tolerated since
-  // it carries no information beyond absence here.
-  for (const key of [
-    "n_layer",
-    "mtp_layers",
-    "param_count",
-    "trained_ctx",
-    "n_head_kv",
-    "head_dim_k",
-    "head_dim_v",
-    "n_embd",
-    "n_head",
-    "sliding_window",
-  ] as const) {
-    const v = p[key];
-    if (v !== undefined && v !== null && typeof v !== "number") return `${key} must be a number`;
-  }
-  if (p.quant !== undefined && p.quant !== null && typeof p.quant !== "string") return "quant must be a string";
-  if (p.tensor_layer_bytes !== undefined && p.tensor_layer_bytes !== null) {
-    const err = validateTensorLayerBreakdownShape(p.tensor_layer_bytes);
-    if (err) return err;
-  }
-  return null;
-}
-
-// Same shape server/src/validate-worker-state.ts's optionalTensorLayerBreakdown
-// enforces for the heartbeat's model_files -- duplicated rather than shared
-// since this route validates a flat top-level field, not an array entry, and
-// the two payloads are otherwise unrelated (this one is worker download
-// callback -> catalog write, that one is a scan-derived heartbeat).
-function validateTensorLayerBreakdownShape(value: unknown): string | null {
-  if (typeof value !== "object" || value === null) return "tensor_layer_bytes must be an object";
-  const v = value as Record<string, unknown>;
-  const isNumArray = (arr: unknown): arr is number[] => Array.isArray(arr) && arr.every((n) => typeof n === "number");
-  if (!isNumArray(v.dense)) return "tensor_layer_bytes.dense must be an array of numbers";
-  if (!isNumArray(v.moe)) return "tensor_layer_bytes.moe must be an array of numbers";
-  if (v.dense.length !== v.moe.length) return "tensor_layer_bytes.dense and .moe must be the same length";
-  if (typeof v.embed !== "number") return "tensor_layer_bytes.embed must be a number";
-  if (typeof v.output !== "number") return "tensor_layer_bytes.output must be a number";
-  if (typeof v.other !== "number") return "tensor_layer_bytes.other must be a number";
+  // The per-file GGUF header fields are validated by parseHeaderFields in the
+  // handler (the same validator the heartbeat uses): a malformed or
+  // implausible reading drops those fields rather than refusing the callback,
+  // which would leave a finished download unregistered.
   return null;
 }
 
@@ -499,14 +461,8 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
         app.log.warn({ error: validationError }, "model download callback rejected: invalid payload");
         return reply.code(400).send({ error: validationError });
       }
+      const { worker, hf_repo, hf_file, ok, error, sha256, size_bytes } = request.body;
       const {
-        worker,
-        hf_repo,
-        hf_file,
-        ok,
-        error,
-        sha256,
-        size_bytes,
         n_layer,
         mtp_layers,
         quant,
@@ -519,8 +475,9 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
         n_head,
         sliding_window,
         tensor_layer_bytes,
-      } = request.body;
-      // Registration below locks the row's identity (lock_hf_identity) and
+        kv_layout,
+      } = parseHeaderFields(request.body as unknown as Record<string, unknown>, "body");
+      // Registration below locks the row's identity (verifiedBy "download") and
       // replaces its metadata wholesale, so it must be backed by a real
       // download a user queued for this worker -- never by the worker's own
       // say-so (the body's `worker` field is self-reported; caller.id isn't).
@@ -576,6 +533,7 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
           // Real per-tensor weight-byte breakdown from the same GGUF header
           // read -- see ModelMetadata.tensor_layer_bytes.
           ...(tensor_layer_bytes ? { tensor_layer_bytes } : {}),
+          ...(kv_layout ? { kv_layout } : {}),
         };
         // Record this owner's header reading and let the shared catalog take
         // whatever the independent readings resolve to (repo.resolveHeaderFields,
@@ -618,8 +576,7 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
           // exact hf_repo/hf_file for download -- see repo.ts's registerModel
           // doc comment for why this locks the row against a later scan
           // re-attributing it to a fork/mirror sharing the same hash.
-          lock_hf_identity: true,
-        });
+        }, { verifiedBy: "download" });
         return reply.code(200).send({ ok: true });
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);

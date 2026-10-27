@@ -5,6 +5,11 @@ import { join } from "node:path";
 import Fastify, { type FastifyInstance } from "fastify";
 import fastifyCookie from "@fastify/cookie";
 import type { AdminStats } from "../../../shared/types.js";
+import { hostFetch } from "../test-host-fetch.js";
+
+// Every request here names its origin with a real Host header, which fetch()
+// can't send.
+const fetch = hostFetch;
 
 // Multi-user Stage 5 (MULTIUSER_PLAN.md §5.1): the admin surface's own two
 // gates -- hostname (404 on mismatch, checked first) and isSuperadmin (403).
@@ -34,11 +39,8 @@ beforeAll(async () => {
   const { curveRoutes } = await import("./curves.js");
   const { authMiddleware } = await import("../auth-middleware.js");
 
-  // trustProxy so req.hostname reads X-Forwarded-Host -- plain fetch() can't
-  // override the real Host header (it's on the Fetch spec's forbidden-header
-  // list; undici silently ignores an attempt), so tests simulate hitting a
-  // second hostname this way instead of via raw sockets. Test-scoped only --
-  // the real server/src/index.ts app doesn't set this.
+  // trustProxy on, like production behind nginx (index.ts trusts loopback):
+  // the gate must still go by the real Host header, never X-Forwarded-Host.
   app = Fastify({ logger: false, trustProxy: true });
   app.setErrorHandler((error: { statusCode?: number; message: string }, _req, reply) => {
     reply.code(error.statusCode ?? 500).send({ error: error.message });
@@ -67,7 +69,7 @@ afterAll(async () => {
 });
 
 function withHost(host: string, extra: Record<string, string> = {}): Record<string, string> {
-  return { "x-forwarded-host": host, ...extra };
+  return { host, ...extra };
 }
 
 async function superadminSession(): Promise<string> {
@@ -98,6 +100,16 @@ describe("admin hostname gate", () => {
     // onRequest hook, this would come back 401, not 404, leaking that an
     // auth-gated surface exists at this path on the wrong hostname.
     const res = await fetch(`${baseUrl}/api/admin/stats`, { headers: withHost(MAIN_HOST) });
+    expect(res.status).toBe(404);
+  });
+
+  // Audit 2026-09-27 M1: with trustProxy, req.hostname comes from
+  // X-Forwarded-Host, so a main-site session could name the admin host there.
+  it("404s a main-host request that claims the admin host in X-Forwarded-Host", async () => {
+    const token = await superadminSession();
+    const res = await fetch(`${baseUrl}/api/admin/stats`, {
+      headers: withHost(MAIN_HOST, { "x-forwarded-host": ADMIN_HOST, authorization: `Bearer ${token}` }),
+    });
     expect(res.status).toBe(404);
   });
 

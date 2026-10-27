@@ -398,8 +398,8 @@ describe("POST /api/models/download-callback (worker credential, not a user sess
     const victim = "7".repeat(64);
     repo.registerModel({
       id: victim, filename: "real.gguf", size_bytes: 1, source: "huggingface",
-      hf_repo: "good/repo", hf_file: "real.gguf", metadata: { n_layer: 40 }, lock_hf_identity: true,
-    });
+      hf_repo: "good/repo", hf_file: "real.gguf", metadata: { n_layer: 40 },
+    }, { verifiedBy: "download" });
     const id = await heartbeatWorker("download-callback-forger");
     const { userId } = await sessionFor("download-callback-forger-owner");
     const { token } = repo.sessionRepo.create(userId, { isWorker: true, workerId: id });

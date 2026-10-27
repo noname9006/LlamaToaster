@@ -530,8 +530,13 @@ export function parseModelBufferSizes(stderr: string): ModelBufferSizesByModel |
 //
 // plus "RS buffer size" for a hybrid model's recurrent state. Host-side buffers
 // (HOST_BUFFER_NAME_RE above: CPU*, AMX, and the *_Host pinned buffers) are not
-// GPU memory and are left out. Weights are summed; every other kind keeps its
-// LAST reported size per device, because a context can be reserved more than
+// GPU memory and are left out. Weights are summed. The caches (KV, RS) are
+// summed within one run of cache lines -- a sliding-window model allocates two
+// KV caches on the same device (b9503, Gemma-4 E4B at 131072 tokens:
+// "Vulkan0 KV buffer size = 2048.00 MiB" for the full-attention layers, then
+// "Vulkan0 KV buffer size = 40.00 MiB" for the window) -- and a later run, the
+// context created again, replaces the earlier one. Compute and output keep
+// their LAST size per device, because a context can be reserved more than
 // once and each reservation replaces the one before. Single-model loads only --
 // an MTP draft's buffers would be counted in. Null when no buffer line was seen
 // at all. The shape is shared/gpuSpill.ts's GpuBufferReport.
@@ -543,15 +548,23 @@ export function parseGpuBufferReport(
   let seen = false;
   const byDeviceMib: Record<string, number> = {};
   const latest = new Map<string, { device: string; kind: string; mib: number }>();
+  let caches = new Map<string, { device: string; kind: string; mib: number }>();
+  let inCacheRun = false;
   for (const line of stderr.split("\n")) {
     const m = GPU_BUFFER_SIZE_LINE_RE.exec(line);
     if (!m) continue;
     seen = true;
+    const isCache = m[2] === "KV" || m[2] === "RS";
+    if (isCache && !inCacheRun) caches = new Map();
+    inCacheRun = isCache;
     const mib = Number(m[3]);
     if (!Number.isFinite(mib) || HOST_BUFFER_NAME_RE.test(m[1])) continue;
+    const key = `${m[1]}:${m[2]}`;
     if (m[2] === "model") byDeviceMib[m[1]] = (byDeviceMib[m[1]] ?? 0) + mib;
-    else latest.set(`${m[1]}:${m[2]}`, { device: m[1], kind: m[2], mib });
+    else if (isCache) caches.set(key, { device: m[1], kind: m[2], mib: (caches.get(key)?.mib ?? 0) + mib });
+    else latest.set(key, { device: m[1], kind: m[2], mib });
   }
+  for (const [key, entry] of caches) latest.set(key, entry);
   if (!seen) return null;
   let contextMib = 0;
   for (const { device, kind, mib } of latest.values()) {

@@ -124,6 +124,8 @@ describe("parseFitOutput + fitPointFromOutput on real b11226 logs", () => {
     expect(pt.verdict).toBe("partial");
     expect(pt.layers_gpu).toBe(5);
     expect(pt.ot).toContain("blk\\.37\\.");
+    // fit's summary line omits "(N overflowing)" in this phase; the -ot holds it.
+    expect(pt.overflow_layers).toBe(4);
   });
 
   it("cannot fit: fit still answers -ngl 0 with exit 0; free < margin is the verdict", () => {

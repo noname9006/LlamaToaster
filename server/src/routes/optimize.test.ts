@@ -317,3 +317,63 @@ describe("speed runs and thread sweeps", () => {
     expect(res.status).toBe(400);
   });
 });
+
+describe("fit checks (docs/plans/HEADER_FIT_PLAN.md)", () => {
+  const CHECK_CAPS = [...ALL_CAPS, "fit-check-v1"];
+  const pendingChecks = (workerId: string) =>
+    getDb().prepare(`SELECT payload_json FROM worker_jobs WHERE worker_id = ? AND job_type = 'fit_check' AND status = 'pending'`).all(workerId) as {
+      payload_json: string;
+    }[];
+
+  it("refuses an older worker and a bad body", async () => {
+    const old = await heartbeat("fc-old");
+    expect((await post(`/api/workers/${old.id}/fit-check`, { model_ids: ["opt-model"], ctx: 32768 })).status).toBe(409);
+    const w = await heartbeat("fc-bad", CHECK_CAPS);
+    expect((await post(`/api/workers/${w.id}/fit-check`, { model_ids: [], ctx: 32768 })).status).toBe(400);
+    expect((await post(`/api/workers/${w.id}/fit-check`, { model_ids: ["opt-model"], ctx: 32768, margin_mib: 700 })).status).toBe(400);
+    expect((await post(`/api/workers/${w.id}/fit-check`, { model_ids: ["nope"], ctx: 32768 })).status).toBe(400);
+  });
+
+  it("queues one job with the newest build, refuses a second while it is pending, and stores answers", async () => {
+    const w = await heartbeat("fc-a", CHECK_CAPS);
+    const res = await post(`/api/workers/${w.id}/fit-check`, { model_ids: ["opt-model"], ctx: 32768 });
+    expect(res.status).toBe(202);
+    expect((await json(res)).queued).toBe(1);
+    const jobs = pendingChecks(w.id);
+    expect(jobs).toHaveLength(1);
+    const payload = JSON.parse(jobs[0].payload_json);
+    expect(payload).toMatchObject({ ctx: 32768, margin_mib: 1024, llama_cpp_build: "b9999", llama_cpp_backend: "cpu" });
+    expect(payload.models.map((m: { id: string }) => m.id)).toEqual(["opt-model"]);
+    expect(payload.ram_budget_mib).toBe(32 * 1024 - 1024);
+
+    const again = await json(await post(`/api/workers/${w.id}/fit-check`, { model_ids: ["opt-model"], ctx: 32768 }));
+    expect(again).toMatchObject({ queued: 0, pending: true });
+    expect(pendingChecks(w.id)).toHaveLength(1);
+
+    const result = { model_id: "opt-model", ctx: 32768, margin_mib: 1024, llama_cpp_build: "b9999", source: "header", vram_free_mib: 7378, point: point(), error: null, fetched_bytes: 11_000_000 };
+    const stored = await post("/api/worker/fit-checks", { machine_id: "fc-a", results: [result] }, workerAuth);
+    expect(stored.status).toBe(200);
+    const list = await json(await fetch(`${baseUrl}/api/workers/${w.id}/fit-checks?ctx=32768`));
+    expect(list.results).toHaveLength(1);
+    expect(list.results[0]).toMatchObject({ model_id: "opt-model", source: "header", vram_free_mib: 7378, fetched_bytes: 11_000_000 });
+    expect(list.results[0].point.layers_gpu).toBe(16);
+  });
+
+  it("does not ask again for a fresh answer from the same build", async () => {
+    const w = await heartbeat("fc-b", CHECK_CAPS);
+    const result = { model_id: "opt-model", ctx: 8192, margin_mib: 1024, llama_cpp_build: "b9999", source: "local", vram_free_mib: null, point: point({ ctx: 8192 }), error: null };
+    expect((await post("/api/worker/fit-checks", { machine_id: "fc-b", results: [result] }, workerAuth)).status).toBe(200);
+    const res = await json(await post(`/api/workers/${w.id}/fit-check`, { model_ids: ["opt-model"], ctx: 8192 }));
+    expect(res.queued).toBe(0);
+    expect(pendingChecks(w.id)).toHaveLength(0);
+  });
+
+  it("asks again after a failed check, and rejects a result with neither point nor error", async () => {
+    const w = await heartbeat("fc-c", CHECK_CAPS);
+    const failed = { model_id: "opt-model", ctx: 16384, margin_mib: 1024, llama_cpp_build: "b9999", source: "header", vram_free_mib: null, point: null, error: "unknown model architecture: 'glm5-next'" };
+    expect((await post("/api/worker/fit-checks", { machine_id: "fc-c", results: [failed] }, workerAuth)).status).toBe(200);
+    expect((await json(await post(`/api/workers/${w.id}/fit-check`, { model_ids: ["opt-model"], ctx: 16384 }))).queued).toBe(1);
+    const empty = { ...failed, error: null };
+    expect((await post("/api/worker/fit-checks", { machine_id: "fc-c", results: [empty] }, workerAuth)).status).toBe(400);
+  });
+});

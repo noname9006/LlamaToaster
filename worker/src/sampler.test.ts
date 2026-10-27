@@ -277,3 +277,41 @@ describe("MemorySampler readings after the model loaded", () => {
     expect(sampler.stats.vram_process_loaded_jitter_mib).toBe(0);
   });
 });
+
+describe("MemorySampler VRAM pause during timed work", () => {
+  beforeEach(() => {
+    mockMem.mockReset().mockResolvedValue({ active: 1024 * 1024 * 1024 });
+    mockProcesses.mockReset().mockResolvedValue({ list: [{ pid: TEST_PID, memRss: 2048 }] });
+    mockReadGpuSensors.mockReset().mockResolvedValue({ clockMhz: null, tempC: null, source: null });
+    mockReadGpuMemory.mockReset().mockResolvedValue({
+      total: wholeAdapter(24000),
+      used: wholeAdapter(8000),
+      process: process(3000),
+    } satisfies GpuMemoryReading);
+  });
+
+  function sampler(): InstanceType<typeof MemorySampler> {
+    const s = new MemorySampler();
+    (s as unknown as { pid: number; backend: string }).pid = TEST_PID;
+    (s as unknown as { pid: number; backend: string }).backend = "vulkan";
+    return s;
+  }
+
+  it("skips VRAM probes while paused but keeps sensor readings on the same ticks", async () => {
+    const s = sampler();
+    s.pauseVramNow();
+    for (let i = 0; i < 6; i++) await tick(s);
+    expect(mockReadGpuMemory).not.toHaveBeenCalled();
+    expect(mockReadGpuSensors).toHaveBeenCalledTimes(2);
+  });
+
+  it("resumes the cadence after resumeVram", async () => {
+    const s = sampler();
+    s.pauseVramNow();
+    await tick(s);
+    s.resumeVram(); // no timer running -> no immediate reading in this test
+    for (let i = 0; i < 3; i++) await tick(s);
+    expect(mockReadGpuMemory).toHaveBeenCalledTimes(1);
+    expect(s.stats.vram_peak_mib).toBe(8000);
+  });
+});

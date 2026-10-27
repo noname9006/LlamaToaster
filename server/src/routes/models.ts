@@ -1,5 +1,5 @@
 import type { FastifyInstance } from "fastify";
-import { repo } from "../db/repo.js";
+import { deriveModelId, repo } from "../db/repo.js";
 import { getHfGgufMeta } from "../hf.js";
 import {
   lookupHfGgufHashes,
@@ -8,7 +8,8 @@ import {
   HF_INDEX_REFRESH_INTERVAL_MS,
 } from "../hf-index.js";
 import { isMtpDraftModel } from "../../../shared/types.js";
-import type { RegisterModelInput } from "../../../shared/types.js";
+import type { Model, RegisterModelInput } from "../../../shared/types.js";
+import { isPlausibleLayerCount } from "../../../shared/gguf.js";
 import { userOrIpKeyGenerator, resolveAuthUser, assertOwnsWorker } from "../auth-middleware.js";
 import { ForbiddenError, UnauthorizedError } from "../errors.js";
 import { resolveWorkerSession } from "../worker-auth.js";
@@ -31,6 +32,14 @@ const hfUpdatesCache = new Map<string, { value: string | null; expiresAt: number
 // backfill routes below, all comparably cheap-but-not-free registry writes.
 const REGISTRY_WRITE_RATE_LIMIT = { max: 60, timeWindow: "1 hour", keyGenerator: userOrIpKeyGenerator } as const;
 const HASH_LOOKUP_RATE_LIMIT = { max: 120, timeWindow: "1 hour", keyGenerator: userOrIpKeyGenerator } as const;
+
+// A model the caller may act on: with accounts, only one in their own list
+// (repo.listModelsVisibleTo), answered 404 otherwise -- same as a missing id,
+// so the route doesn't confirm another tenant's catalog row exists.
+function findVisibleModel(id: string, userId: string | undefined): Model | undefined {
+  if (userId === undefined) return repo.getModel(id);
+  return repo.listModelsVisibleTo(userId).find((m) => m.id === id);
+}
 
 export async function modelsRoutes(app: FastifyInstance): Promise<void> {
   app.get("/api/models", async (request) => {
@@ -61,29 +70,79 @@ export async function modelsRoutes(app: FastifyInstance): Promise<void> {
     }
   );
 
+  // The Models page's "Add a model manually" form. Create-only: an existing
+  // row -- shared catalog or someone else's -- is never changed from here
+  // (audit 2026-10-11 N3). Only the fields below are read from the body, so a
+  // client can't assert the download lock or an owner.
   app.post<{ Body: RegisterModelInput }>(
     "/api/models",
     { config: { rateLimit: REGISTRY_WRITE_RATE_LIMIT } },
     async (request, reply) => {
-      const body = request.body;
-      if (!body || !body.source) {
-        return reply.code(400).send({ error: "source is required" });
+      const body = (request.body ?? {}) as Partial<Record<keyof RegisterModelInput, unknown>>;
+      const { source, filename, size_bytes, hf_repo, hf_file, metadata } = body;
+      if (source !== "local" && source !== "huggingface") {
+        return reply.code(400).send({ error: "source must be \"local\" or \"huggingface\"" });
       }
-      if (
-        body.source === "huggingface" &&
-        (!body.hf_repo || !body.hf_file)
-      ) {
+      for (const [field, v] of [["id", body.id], ["filename", filename], ["hf_repo", hf_repo], ["hf_file", hf_file]] as const) {
+        if (v !== undefined && (typeof v !== "string" || v.length > 512)) {
+          return reply.code(400).send({ error: `${field} must be a string of at most 512 characters` });
+        }
+      }
+      if (size_bytes !== undefined && (typeof size_bytes !== "number" || !Number.isSafeInteger(size_bytes) || size_bytes < 0)) {
+        return reply.code(400).send({ error: "size_bytes must be a non-negative integer" });
+      }
+      if (metadata !== undefined && (metadata === null || typeof metadata !== "object" || Array.isArray(metadata))) {
+        return reply.code(400).send({ error: "metadata must be an object" });
+      }
+      if (source === "huggingface" && (!hf_repo || !hf_file)) {
         return reply
           .code(400)
           .send({ error: "hf_repo and hf_file are required for huggingface source" });
       }
-      // Multi-user Stage 4 (MULTIUSER_PLAN.md §4.4): created_by is set on
-      // first insert only -- see repo.registerModel's own doc comment for
-      // the full conflict-guard story. undefined in single-tenant mode,
-      // matching every other userId in this app.
+      let id = (body.id as string | undefined)?.trim() || undefined;
+      // A 64-hex id is a file's own sha256 -- the key a worker's heartbeat and
+      // the download callback write that file's shared row under. A client
+      // may reserve one only as a bare local file: its HF identity and header
+      // metadata come from those verified paths, which take the row over.
+      if (id && /^[0-9a-f]{64}$/i.test(id)) {
+        id = id.toLowerCase();
+        if (source !== "local" || hf_repo || hf_file || (metadata && Object.keys(metadata).length > 0)) {
+          return reply.code(400).send({
+            error:
+              "a sha256 id registers a local file only -- leave hf_repo, hf_file and metadata empty; they are filled in once a machine with the file reports it",
+          });
+        }
+      }
       const authed = resolveAuthUser(request);
-      const model = repo.registerModel({ ...body, created_by: authed?.user.id });
-      return reply.code(201).send({ model });
+      const input: RegisterModelInput = {
+        id,
+        filename: filename as string | undefined,
+        size_bytes: size_bytes as number | undefined,
+        source,
+        hf_repo: hf_repo as string | undefined,
+        hf_file: hf_file as string | undefined,
+        metadata: metadata as RegisterModelInput["metadata"],
+        // Multi-user Stage 4 (MULTIUSER_PLAN.md §4.4) -- undefined in
+        // single-tenant mode, matching every other userId in this app.
+        created_by: authed?.user.id,
+      };
+      const model = repo.insertModelIfAbsent(input);
+      if (model) {
+        // Only a derived-id row can be shared by several adders; an explicit
+        // id is the creator's alone (created_by covers it).
+        if (authed && !id) repo.addModelRegistration(authed.user.id, model.id);
+        return reply.code(201).send({ model });
+      }
+      // No id sent: the id is derived from the repo/file (or name/size), the
+      // same for everyone, so an existing row is this very model. Adding it
+      // again puts it on the caller's list without changing the row.
+      if (!id) {
+        const existing = repo.getModel(deriveModelId(input))!;
+        if (authed) repo.addModelRegistration(authed.user.id, existing.id);
+        return reply.code(200).send({ model: existing });
+      }
+      // An explicit id that's taken: never touched from here.
+      return reply.code(409).send({ error: "a model with this id is already registered" });
     }
   );
 
@@ -98,6 +157,21 @@ export async function modelsRoutes(app: FastifyInstance): Promise<void> {
     // superadmin may delete it. Single-tenant mode (no session) is unchanged.
     const authed = resolveAuthUser(request);
     const createdBy = repo.getModelCreatedBy(existing.id);
+    // Someone else also added this model (POST /api/models joins a shared
+    // derived row), so the row isn't the caller's alone: take it off their
+    // list instead of deleting it for everyone.
+    // (A creator from before model_registrations existed has no row there,
+    // hence the created_by check.)
+    const isCreator = !!authed && createdBy === authed.user.id;
+    if (
+      authed &&
+      (isCreator || repo.hasModelRegistration(authed.user.id, existing.id)) &&
+      (!isCreator || repo.hasOtherModelRegistrations(existing.id, authed.user.id))
+    ) {
+      repo.removeModelRegistration(authed.user.id, existing.id);
+      request.log.info({ model_id: existing.id }, "model removed from caller's list");
+      return reply.code(200).send({ ok: true });
+    }
     if (authed && createdBy && createdBy !== authed.user.id) {
       throw new ForbiddenError("you don't own this model");
     }
@@ -114,7 +188,7 @@ export async function modelsRoutes(app: FastifyInstance): Promise<void> {
     const runningCount = repo.countRunningTestsForModel(existing.id);
     if (runningCount > 0) {
       return reply.code(409).send({
-        error: `cannot delete model: ${runningCount} run(s) still in progress against it`,
+        error: `cannot delete model: ${runningCount} run(s) still running or scheduled against it`,
       });
     }
 
@@ -133,7 +207,8 @@ export async function modelsRoutes(app: FastifyInstance): Promise<void> {
     "/api/models/:id/backfill-layer-count",
     { config: { rateLimit: REGISTRY_WRITE_RATE_LIMIT } },
     async (request, reply) => {
-      const model = repo.getModel(request.params.id);
+      const authed = resolveAuthUser(request);
+      const model = findVisibleModel(request.params.id, authed?.user.id);
       if (!model) return reply.code(404).send({ error: "model not found" });
 
       // All three must already be known to skip the lookup -- an earlier
@@ -158,12 +233,12 @@ export async function modelsRoutes(app: FastifyInstance): Promise<void> {
 
       // Reads from the caller's own machines' cached model_files_json (last
       // heartbeat) -- no live round trip, see repo.workerRepo.findModelFileMeta.
-      const authed = resolveAuthUser(request);
-      const meta = repo.workerRepo.findModelFileMeta(authed?.user.id, filename) ?? {
-        n_layer: null,
-        mtp_layers: null,
-        tensor_layer_bytes: null,
-      };
+      // A stored reading from before the heartbeat bounds counts as no reading.
+      const found = repo.workerRepo.findModelFileMeta(authed?.user.id, filename);
+      const meta =
+        found && (found.n_layer == null || isPlausibleLayerCount(found.n_layer))
+          ? found
+          : { n_layer: null, mtp_layers: null, tensor_layer_bytes: null };
       // Fall back to the already-known value rather than letting a worker
       // that hasn't reported this file (temporarily offline, or no longer has
       // it) regress an n_layer this model already had, just because this
@@ -171,6 +246,14 @@ export async function modelsRoutes(app: FastifyInstance): Promise<void> {
       const resolvedNLayer = meta.n_layer ?? (hasLayerCount ? (model.metadata.n_layer as number) : null);
       if (resolvedNLayer == null) {
         return reply.code(200).send({ ok: true, n_layer: null });
+      }
+      // With accounts, the catalog row is shared: one user's machine reading
+      // a file that merely has the same NAME must not rewrite what everyone
+      // else sees (audit 2026-10-18 A3). The caller gets the value; their own
+      // machine's reading of the file itself already reaches their pages and
+      // jobs through the heartbeat (listModelsVisibleTo / getModelForWorker).
+      if (authed) {
+        return reply.code(200).send({ ok: true, n_layer: resolvedNLayer });
       }
       // mtp_layers comes along for free from the same lookup -- only worth
       // persisting when actually present (>0), same "don't clobber with a
@@ -208,7 +291,7 @@ export async function modelsRoutes(app: FastifyInstance): Promise<void> {
     "/api/models/:id/backfill-param-count",
     { config: { rateLimit: REGISTRY_WRITE_RATE_LIMIT } },
     async (request, reply) => {
-      const model = repo.getModel(request.params.id);
+      const model = findVisibleModel(request.params.id, resolveAuthUser(request)?.user.id);
       if (!model) return reply.code(404).send({ error: "model not found" });
 
       if (typeof model.metadata.param_count === "number") {
