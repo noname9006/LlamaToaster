@@ -6,7 +6,7 @@
 export const WORKER_INACCESSIBLE_MESSAGE = "worker is inaccessible";
 
 import type { EngineKind } from "./engineSpec.js";
-import type { TensorLayerBreakdown } from "./vramEstimate.js";
+import type { KvLayout, TensorLayerBreakdown } from "./vramEstimate.js";
 import type { ProbeGranularity, ProbeMode } from "./probeLadder.js";
 import { isRocmSupportedGpu, gpuNameInList, COMMUNITY_ROCM_GPUS, type RocmSupportList } from "./rocmSupport.js";
 export type { RocmSupportList, RocmSupportSnapshot } from "./rocmSupport.js";
@@ -158,6 +158,9 @@ export const WORKER_CAPABILITIES = [
   "fit-map-v1",
   "speed-run-v1",
   "thread-sweep-v1",
+  // docs/plans/HEADER_FIT_PLAN.md: fit_check jobs, and fit maps on a model
+  // that is not on the machine (sized from its header alone).
+  "fit-check-v1",
 ] as const;
 export type WorkerCapability = (typeof WORKER_CAPABILITIES)[number];
 
@@ -234,7 +237,6 @@ export const MIN_REPEATS = 1;
 export const MAX_REPEATS = 25;
 export const MAX_CHAIN_DEPTH = 3;
 export const MAX_ACTIVE_ROOTS_PER_USER = 3;
-export const CHAIN_WALL_CLOCK_MS = 48 * 60 * 60 * 1000;
 
 export const SPEEDUP_STATUSES = ["ok", "unverified", "unavailable"] as const;
 export type SpeedupStatus = (typeof SPEEDUP_STATUSES)[number];
@@ -309,6 +311,10 @@ export interface ModelMetadata {
   // model registered before this existed (falls back to that flat average),
   // or a "local" entry never hash-matched/downloaded through the app.
   tensor_layer_bytes?: TensorLayerBreakdown;
+  // Which layers keep a per-token KV cache and how big -- see KvLayout
+  // (shared/vramEstimate.ts). Drives the hybrid/SWA-aware KV estimate;
+  // undefined for models whose header was read before this existed.
+  kv_layout?: KvLayout;
   [key: string]: unknown;
 }
 
@@ -322,7 +328,7 @@ export interface Model {
   metadata: ModelMetadata;
   created_at: number;
   // True once an actual in-app download has recorded hf_repo/hf_file for
-  // this model (RegisterModelInput.lock_hf_identity, set only by
+  // this model (repo.registerModel's verifiedBy "download", set only by
   // workers.ts's download-callback route). See registerModel's own doc
   // comment for what this protects against: a hash-lookup-driven scan (e.g.
   // a hand-dropped-file heartbeat reconciliation) guessing the wrong repo
@@ -371,24 +377,12 @@ export interface RegisterModelInput {
   hf_repo?: string;
   hf_file?: string;
   metadata?: ModelMetadata;
-  // Multi-user Stage 4 (MULTIUSER_PLAN.md §4.4) -- populated by the ROUTE
-  // from req.user.id, never by the caller directly (undefined in
-  // single-tenant mode, matching every other userId in this app). Not a
-  // second positional parameter on registerModel itself -- keeping that
-  // function's signature exactly as-is is the plan's own explicit
-  // requirement (§4.3: "listModels/getModel/registerModel keep their
-  // current signatures -- the catalog is global").
+  // Multi-user Stage 4 (MULTIUSER_PLAN.md §4.4) -- set by the server from
+  // req.user.id, never taken from a request body (undefined in single-tenant
+  // mode, matching every other userId in this app). The identity lock is not
+  // here at all: it is repo.registerModel's opts.verifiedBy, which no route
+  // can take from a client.
   created_by?: string;
-  // True ONLY from workers.ts's download-callback route (the worker just
-  // downloaded this exact hf_repo/hf_file because a user asked it to) --
-  // never set by queue.ts's registerHashVerifiedModelFiles, which derives
-  // hf_repo/hf_file from a hash-lookup guess instead of an explicit user
-  // choice. See Model.hf_identity_locked and registerModel's own doc
-  // comment: once a row is locked this way, registerModel's ON CONFLICT
-  // refuses to change its identity fields unless the caller is itself
-  // asserting the lock again (i.e. another real download) -- a scan can
-  // never claw a locked row's hf_repo/hf_file back to a wrong guess.
-  lock_hf_identity?: boolean;
 }
 
 export interface SweepConfig {
@@ -1316,6 +1310,8 @@ export interface ModelDirFile {
   // field. Same optional-null convention: null = tensor_info walk ran but
   // couldn't build one (e.g. n_layer unresolved), absent = old worker code.
   tensor_layer_bytes?: TensorLayerBreakdown | null;
+  // See ModelMetadata.kv_layout.
+  kv_layout?: KvLayout | null;
 }
 
 export interface HardwareInfo {
@@ -1652,6 +1648,8 @@ export interface ModelDownloadCallbackInput {
   // Real per-tensor weight-byte breakdown from the same GGUF header read --
   // see ModelMetadata.tensor_layer_bytes.
   tensor_layer_bytes?: TensorLayerBreakdown | null;
+  // See ModelMetadata.kv_layout.
+  kv_layout?: KvLayout | null;
 }
 
 // --- Pull queue (MULTIUSER_PLAN.md Stage 1) ---
@@ -1863,6 +1861,11 @@ export interface BenchmarkJob {
   fill_curve?: FillCurveSpec;
   speed_run?: import("./speedRun.js").SpeedRunSpec;
   thread_sweep?: import("./speedRun.js").ThreadSweepSpec;
+  // Items already terminal when this job was claimed -- set by the server at
+  // claim time, so a requeued job (its worker crashed or lost the lease)
+  // resumes instead of re-measuring them (audit 2026-10-11 N6). Older
+  // servers never send it; older workers ignore it.
+  completed_idx?: number[];
 }
 
 // Optimization flow steps 1 / 1' / 4 / 5 -- one llama-fit-params job.
@@ -1877,6 +1880,38 @@ export interface FitMapJobPayload {
   kv_known?: import("./kvSupport.js").KvSupportRow[];
   /** System RAM the host side may use, MiB. */
   ram_budget_mib?: number | null;
+}
+
+// docs/plans/HEADER_FIT_PLAN.md: one llama-fit-params call per model at one
+// context, for the model list's verdicts. A model not on the machine is sized
+// from its GGUF header (worker/src/headerFit.ts).
+export interface FitCheckJobPayload {
+  ctx: number;
+  margin_mib: number;
+  llama_cpp_build: string;
+  llama_cpp_backend: Backend;
+  main_gpu?: number;
+  /** System RAM the host side may use, MiB. */
+  ram_budget_mib?: number | null;
+  models: Model[];
+}
+
+export type FitCheckSource = "local" | "header";
+
+export interface FitCheckResult {
+  model_id: string;
+  ctx: number;
+  margin_mib: number;
+  llama_cpp_build: string;
+  /** "local": the file on the machine; "header": a header placeholder. */
+  source: FitCheckSource | null;
+  /** Free VRAM fit sized against (all devices), MiB. */
+  vram_free_mib: number | null;
+  point: import("./fitParams.js").FitPoint | null;
+  error: string | null;
+  /** Bytes fetched from Hugging Face for a header placeholder. */
+  fetched_bytes?: number;
+  created_at?: number;
 }
 
 // N5 -- concurrency-knee ladder. Prompt/gen cells are fixed from the M2
@@ -2177,6 +2212,7 @@ export type QueueJob =
   | { job_id: string; type: "run_probe"; payload: TestProbeJobPayload }
   | { job_id: string; type: "measure_quality"; payload: MeasureQualityJobPayload }
   | { job_id: string; type: "fit_map"; payload: FitMapJobPayload }
+  | { job_id: string; type: "fit_check"; payload: FitCheckJobPayload }
   // Workers page "Measure memory speed" button -- no payload, just a signal.
   // Result is POSTed back separately (POST /api/worker/mem-speed, see
   // shared/types.ts's MemorySpeedResult) rather than riding this job's

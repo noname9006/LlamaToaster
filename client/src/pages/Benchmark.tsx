@@ -26,6 +26,7 @@ import { RealLoadSection } from "../components/optimize/RealLoadSection";
 import { ThreadsSection, threadArgsFromPlan } from "../components/optimize/ThreadsSection";
 import { speedRunView } from "../components/optimize/flowData";
 import { machineKind, modelVerdict, stateLabel } from "../components/optimize/machine";
+import { useFitChecks } from "../components/optimize/useFitChecks";
 import { fitCtxStops } from "../../../shared/fitParams.js";
 import { detectMoe } from "../../../shared/moePlacement.js";
 import { buildFitSeries, ctxLabel, machineClassOf, proposeCandidates } from "../../../shared/optimizeFlow.js";
@@ -130,6 +131,13 @@ export function Benchmark() {
     if (!locations) return [];
     return models.filter((m) => !isMtpDraftModel(m) && (workerId ? locations[m.id]?.includes(workerId) : (locations[m.id]?.length ?? 0) > 0));
   }, [models, locations, workerId]);
+
+  // The list's verdict context: the target, never past what a model was trained for.
+  const verdictCtx = useCallback(
+    (m: Model) => Math.min(targetCtx ?? 32768, typeof m.metadata.trained_ctx === "number" ? m.metadata.trained_ctx : Infinity),
+    [targetCtx]
+  );
+  const fitChecks = useFitChecks(worker, presentModels, verdictCtx);
 
   useEffect(() => {
     if (!workerId || presentModels.length === 0) return;
@@ -356,8 +364,8 @@ export function Benchmark() {
               <div role="radiogroup" aria-label="Model" className="flex flex-col border border-border">
                 {presentModels.map((m) => {
                   const on = m.id === modelId;
-                  const mTrained = typeof m.metadata.trained_ctx === "number" ? m.metadata.trained_ctx : null;
-                  const v = modelVerdict(m, worker, Math.min(targetCtx ?? 32768, mTrained ?? Infinity));
+                  const vCtx = verdictCtx(m);
+                  const v = modelVerdict(m, worker, vCtx, fitChecks.answer(m.id, vCtx));
                   const mo = detectMoe(m.metadata.tensor_layer_bytes ?? null);
                   return (
                     <button
@@ -394,7 +402,9 @@ export function Benchmark() {
               </div>
             )}
             <p className="mt-2 text-xs text-muted">
-              Verdicts are a quick estimate at your target context; the fit map below replaces them with llama.cpp&apos;s own sizing.{" "}
+              Verdicts at your target context come from llama.cpp&apos;s own sizing (llama-fit-params) on this machine
+              {fitChecks.pending ? ", still being sized" : ""}; ones marked estimate are read from the model&apos;s header until
+              that answer arrives.{" "}
               <Link to="/models" className="text-accent">Manage models</Link>
             </p>
           </fieldset>

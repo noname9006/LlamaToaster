@@ -384,6 +384,7 @@ describe("run stop/pause/resume", () => {
       sweep: baseSweep,
     });
     const { run } = (await triggerRes.json()) as { run: { id: string } };
+    repo.queueRepo.claimNextJob(worker.id); // only a running test can be paused
 
     expect(repo.workerRepo.getPauseRequested(worker.id)).toBe(false);
     await postJson(`/api/runs/${run.id}/pause`, {});
@@ -750,5 +751,133 @@ describe("N3 comparison_member_failed fires when a member's own results reveal d
     } finally {
       warnSpy.mockRestore();
     }
+  });
+});
+
+// Audit 2026-10-11 Phase 2 -- run lifecycle.
+describe("run lifecycle: repeated reports, requeues, pause, stop (audit N6/N7/N17)", () => {
+  beforeEach(() => drainActiveRuns());
+
+  async function startRun(machineId: string, sweep: Record<string, unknown> = baseSweep) {
+    await heartbeat(machineId, { backend: "cpu", installed: true });
+    const worker = repo.workerRepo.getByMachineId(machineId)!;
+    const res = await postJson("/api/runs/trigger", { model_id: "model-1", worker_id: worker.id, sweep });
+    const { run } = (await res.json()) as { run: { id: string } };
+    return { worker, runId: run.id };
+  }
+  const report = (runId: string, idx: number, body: unknown) =>
+    fetch(`${baseUrl}/api/runs/${runId}/items/${idx}`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Bearer runs-test-secret" },
+      body: JSON.stringify(body),
+    });
+  const resultCount = async (runId: string) => {
+    const { getDb } = await import("../db/migrate.js");
+    return (getDb().prepare(`SELECT COUNT(*) AS n FROM results WHERE run_id = ?`).get(runId) as { n: number }).n;
+  };
+
+  it("N6: a repeated terminal report is a no-op, not a 500", async () => {
+    const { worker, runId } = await startRun("life-repeat");
+    repo.queueRepo.claimNextJob(worker.id);
+    const done = { status: "done", results: [minimalResult()] };
+    expect((await report(runId, 0, done)).status).toBe(200);
+    const first = repo.getTestItems(runId)[0];
+
+    const again = await report(runId, 0, done);
+    expect(again.status).toBe(200);
+    expect(await resultCount(runId)).toBe(1);
+    expect(repo.getTestItems(runId)[0].completed_at).toBe(first.completed_at);
+  });
+
+  it("N6: a done item stays done when a re-run of it later fails", async () => {
+    const { worker, runId } = await startRun("life-done-stays");
+    repo.queueRepo.claimNextJob(worker.id);
+    await report(runId, 0, { status: "done", results: [minimalResult()] });
+    expect((await report(runId, 0, { status: "failed", error: "OOM on the re-run" })).status).toBe(200);
+    expect(repo.getTestItems(runId)[0].status).toBe("done");
+    expect(await resultCount(runId)).toBe(1);
+  });
+
+  it("N6: a stopped item the worker had in fact finished is still upgraded to done", async () => {
+    const { worker, runId } = await startRun("life-cancel-upgrade");
+    repo.queueRepo.claimNextJob(worker.id);
+    await report(runId, 0, { status: "cancelled", error: "cancelled by user" });
+    await report(runId, 0, { status: "done", results: [minimalResult()] });
+    expect(repo.getTestItems(runId)[0].status).toBe("done");
+    expect(await resultCount(runId)).toBe(1);
+  });
+
+  it("N6: an idx the run doesn't have is a 404 and stores nothing", async () => {
+    const { worker, runId } = await startRun("life-unknown-idx");
+    repo.queueRepo.claimNextJob(worker.id);
+    const res = await report(runId, 7, { status: "done", results: [minimalResult()] });
+    expect(res.status).toBe(404);
+    expect(await resultCount(runId)).toBe(0);
+  });
+
+  it("N6: a requeued benchmark job lists the items it already finished", async () => {
+    const { worker, runId } = await startRun("life-resume", { ...baseSweep, n_gpu_layers: [0, 99, 999] });
+    const first = repo.queueRepo.claimNextJob(worker.id)!;
+    expect((first.payload as { completed_idx?: number[] }).completed_idx).toEqual([]);
+    await report(runId, 0, { status: "done", results: [minimalResult()] });
+    await report(runId, 1, { status: "failed_oom", error: "out of memory" });
+
+    repo.queueRepo.returnToPending(first.job_id); // what the reaper does when the lease runs out
+    const second = repo.queueRepo.claimNextJob(worker.id)!;
+    expect(second.job_id).toBe(first.job_id);
+    expect((second.payload as { completed_idx?: number[] }).completed_idx).toEqual([0, 1]);
+  });
+
+  it("N7: claiming a run's job clears a pause left over from an earlier run", async () => {
+    const { worker } = await startRun("life-pause-reset");
+    repo.workerRepo.setPauseRequested(worker.id, true);
+    repo.queueRepo.claimNextJob(worker.id);
+    expect(repo.workerRepo.getPauseRequested(worker.id)).toBe(false);
+  });
+
+  it("N7: only a running test can be paused", async () => {
+    const { worker, runId } = await startRun("life-pause-scheduled");
+    expect((await postJson(`/api/runs/${runId}/pause`, {})).status).toBe(409);
+    expect(repo.workerRepo.getPauseRequested(worker.id)).toBe(false);
+  });
+
+  it("N17: stopping a finished run changes nothing", async () => {
+    const { worker, runId } = await startRun("life-stop-finished");
+    const job = repo.queueRepo.claimNextJob(worker.id)!;
+    await report(runId, 0, { status: "done", results: [minimalResult()] });
+    repo.queueRepo.markJobCompleted(job.job_id); // so Stop would take the reconcile path
+    const before = repo.getTest(undefined, runId)!;
+    expect(before.status).toBe("done");
+
+    await new Promise((r) => setTimeout(r, 5));
+    expect((await postJson(`/api/runs/${runId}/stop`, {})).status).toBe(200);
+    const after = repo.getTest(undefined, runId)!;
+    expect(after.status).toBe("done");
+    expect(after.completed_at).toBe(before.completed_at);
+  });
+
+  it("N17: a job failure reported after the run finished doesn't overwrite it", async () => {
+    const { worker, runId } = await startRun("life-late-failure");
+    repo.queueRepo.claimNextJob(worker.id);
+    await report(runId, 0, { status: "done", results: [minimalResult()] });
+    const before = repo.getTest(undefined, runId)!;
+    await new Promise((r) => setTimeout(r, 5));
+    repo.reportJobFailure(undefined, runId, "fetch failed");
+    repo.reconcileStaleTest(undefined, runId, "lost track");
+    const run = repo.getTest(undefined, runId)!;
+    expect(run.status).toBe("done");
+    expect(run.error ?? null).toBeNull();
+    expect(run.completed_at).toBe(before.completed_at);
+  });
+
+  it("N17: a run the user really stopped stays cancelled, not relabelled partial", async () => {
+    const { worker, runId } = await startRun("life-real-cancel", { ...baseSweep, n_gpu_layers: [0, 99] });
+    repo.queueRepo.claimNextJob(worker.id);
+    await report(runId, 0, { status: "done", results: [minimalResult()] });
+    await report(runId, 1, { status: "cancelled", error: "cancelled by user" });
+    expect(repo.getTest(undefined, runId)!.status).toBe("cancelled");
+
+    repo.reconcileStaleTest(undefined, runId, "worker stopped reporting");
+    expect(repo.getTest(undefined, runId)!.status).toBe("cancelled");
   });
 });

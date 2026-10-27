@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { expandSweep, deriveTestType, validateDepthRule, validateConcurrencyRule } from "./sweep.js";
+import { countSweepItems, expandSweep, deriveTestType, validateDepthRule, validateConcurrencyRule } from "./sweep.js";
 import type { SweepConfig } from "./types.js";
 
 const baseSweep: Omit<SweepConfig, "model_id"> = {
@@ -165,5 +165,50 @@ describe("concurrency axis (N5)", () => {
     const items = expandSweep({ ...baseSweep, concurrency: [4] });
     expect(validateConcurrencyRule(items)).toMatch(/only supported on the llama-server engine/);
     expect(validateConcurrencyRule(expandSweep({ ...baseSweep, mtp: ["on"], concurrency: [1, 2, 4, 8] }))).toBeNull();
+  });
+});
+
+describe("countSweepItems", () => {
+  // Small seeded PRNG so a failure reproduces.
+  function rng(seed: number) {
+    return () => {
+      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+      return seed / 0x7fffffff;
+    };
+  }
+  const CACHE = ["f32", "f16", "bf16", "q8_0", "q4_0"];
+  const FA = ["on", "off", "auto"];
+
+  it("matches expandSweep(...).length on random sweeps", () => {
+    const r = rng(42);
+    const pick = <T,>(pool: T[], min = 1) => {
+      const n = min + Math.floor(r() * 3);
+      return Array.from({ length: n }, () => pool[Math.floor(r() * pool.length)]);
+    };
+    const nums = (min = 1) => pick([0, 1, 2, 3], min);
+    for (let i = 0; i < 300; i++) {
+      const sweep: Omit<SweepConfig, "model_id"> = {
+        ...baseSweep,
+        n_prompt: nums(),
+        n_gen: nums(),
+        threads: nums(),
+        n_gpu_layers: nums(),
+        cache_type_k: pick(CACHE),
+        cache_type_v: pick(CACHE),
+        flash_attn: pick(FA),
+        mtp: pick(["on", "off"]),
+        n_cpu_moe: nums(),
+        ...(r() < 0.3 ? { cache_type_pairs: pick(CACHE, 0).map((k) => [k, pick(CACHE)[0]] as [string, string]) } : {}),
+        ...(r() < 0.5 ? { n_depth: nums(0) } : {}),
+        ...(r() < 0.5 ? { concurrency: nums(0) } : {}),
+      };
+      expect(countSweepItems(sweep)).toBe(expandSweep(sweep).length);
+    }
+  });
+
+  it("counts a huge sweep without building it", () => {
+    const axis = Array.from({ length: 64 }, (_, i) => i);
+    const sweep = { ...baseSweep, n_prompt: axis, n_gen: axis, threads: axis, n_gpu_layers: axis, batch_size: axis };
+    expect(countSweepItems(sweep)).toBe(64 ** 5 * 2);
   });
 });

@@ -242,7 +242,11 @@ export const getProfilesHandler =
       // A run that is itself excluded from scoring (a probe, a comparison
       // member) still answers here -- with an empty universe and the tallies
       // that say why, never a silent 404.
-      const model = repo.getModel(run.model_id);
+      // The model as the run's own machine read its file: the max-context
+      // estimates below are sized from these layer/KV facts, and the shared
+      // catalog row can carry another tenant's reading (audit 2026-10-18 A6,
+      // docs/PLAN_MODEL_METADATA_TRUST.md).
+      const model = repo.getModelForWorker(run.model_id, run.worker_id);
 
       const rows: ScoringRow[] = [];
       const itemStatusByIdx: Record<number, string> = {};

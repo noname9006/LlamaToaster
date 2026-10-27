@@ -9,7 +9,9 @@ import type {
   WorkerVramInfo,
   MemorySpeedResult,
 } from "../../shared/types.js";
-import type { TensorLayerBreakdown } from "../../shared/vramEstimate.js";
+import type { KvLayout, TensorLayerBreakdown } from "../../shared/vramEstimate.js";
+import { isKvLayout } from "../../shared/vramEstimate.js";
+import { MAX_GGUF_LAYERS, isPlausibleLayerCount } from "../../shared/gguf.js";
 import type { CpuCore, CpuTopology } from "../../shared/threadPlan.js";
 import {
   LOCAL_MODEL_STATES,
@@ -31,10 +33,10 @@ const LIMITS = {
   maxGpus: 16,
   maxCapabilities: 50,
   maxString: 256,
-  // Generous upper bound on a model's transformer block count -- real models
-  // top out in the low hundreds; this only guards against a corrupt/hostile
-  // payload driving unbounded array allocation.
-  maxTensorLayers: 2_048,
+  // Upper bound on a model's transformer block count -- the same one the
+  // GGUF parser applies (shared/gguf.ts's MAX_GGUF_LAYERS), so a file the
+  // worker can read is never one the server refuses.
+  maxTensorLayers: MAX_GGUF_LAYERS,
 } as const;
 
 // Strips C0/DEL control characters (newlines, tabs, escape sequences, ...)
@@ -78,12 +80,35 @@ function optionalTensorLayerBreakdown(value: unknown, field: string): TensorLaye
   const dense = numArray(v.dense, `${field}.dense`);
   const moe = numArray(v.moe, `${field}.moe`);
   if (dense.length !== moe.length) throw new BadRequestError(`${field}.dense and ${field}.moe must be the same length`);
+  const maxima: Partial<TensorLayerBreakdown> = {};
+  for (const k of ["max_dense", "max_moe", "max_embed", "max_output"] as const) {
+    const m = optionalNumber(v[k], `${field}.${k}`);
+    if (m !== undefined) maxima[k] = m;
+  }
   return {
     dense,
     moe,
     embed: requireNumber(v.embed, `${field}.embed`),
     output: requireNumber(v.output, `${field}.output`),
     other: requireNumber(v.other, `${field}.other`),
+    ...maxima,
+  };
+}
+
+function optionalKvLayout(value: unknown, field: string): KvLayout | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (!isKvLayout(value)) throw new BadRequestError(`${field} must be an object of non-negative numbers`);
+  return {
+    full_k: value.full_k,
+    full_v: value.full_v,
+    swa_k: value.swa_k,
+    swa_v: value.swa_v,
+    window: value.window,
+    ...(value.state_bytes !== undefined ? { state_bytes: value.state_bytes } : {}),
+    ...(value.vocab !== undefined ? { vocab: value.vocab } : {}),
+    ...(value.kinds !== undefined ? { kinds: value.kinds } : {}),
+    ...(value.full_max !== undefined ? { full_max: value.full_max } : {}),
+    ...(value.no_cache !== undefined ? { no_cache: value.no_cache } : {}),
   };
 }
 
@@ -268,6 +293,73 @@ function parseInstalledBuilds(value: unknown): InstalledBuild[] {
     });
 }
 
+type HeaderFields = Pick<
+  ModelDirFile,
+  | "n_layer"
+  | "mtp_layers"
+  | "param_count"
+  | "quant"
+  | "trained_ctx"
+  | "n_head_kv"
+  | "head_dim_k"
+  | "head_dim_v"
+  | "n_embd"
+  | "n_head"
+  | "sliding_window"
+  | "tensor_layer_bytes"
+  | "kv_layout"
+>;
+
+// Per-file GGUF header metadata (see ModelDirFile's doc comments and
+// worker/src/gguf.ts's readGgufInfo). Each field is included ONLY when the
+// worker actually reported a value -- "checked and got null" is deliberately
+// indistinguishable from "never reported" here, so the catalog-adoption code
+// (routes/queue.ts) can tell "a real value to store" from "nothing to store"
+// without a second presence flag. All-or-nothing per file: anything malformed,
+// or a layer count/per-layer array past MAX_GGUF_LAYERS, drops every header
+// field of that file -- these numbers size loops and allocations downstream
+// (audit 2026-10-18 A1/A3), and a partly-plausible reading isn't one to trust.
+export function parseHeaderFields(row: Record<string, unknown>, at: string): HeaderFields {
+  try {
+    const nLayer = optionalNumber(row.n_layer, `${at}.n_layer`);
+    const mtpLayers = optionalNumber(row.mtp_layers, `${at}.mtp_layers`);
+    const paramCount = optionalNumber(row.param_count, `${at}.param_count`);
+    const quant = optionalString(row.quant, `${at}.quant`, 32);
+    const trainedCtx = optionalNumber(row.trained_ctx, `${at}.trained_ctx`);
+    const nHeadKv = optionalNumber(row.n_head_kv, `${at}.n_head_kv`);
+    const headDimK = optionalNumber(row.head_dim_k, `${at}.head_dim_k`);
+    const headDimV = optionalNumber(row.head_dim_v, `${at}.head_dim_v`);
+    const nEmbd = optionalNumber(row.n_embd, `${at}.n_embd`);
+    const nHead = optionalNumber(row.n_head, `${at}.n_head`);
+    const slidingWindow = optionalNumber(row.sliding_window, `${at}.sliding_window`);
+    const tensorLayerBytes = optionalTensorLayerBreakdown(row.tensor_layer_bytes, `${at}.tensor_layer_bytes`);
+    const kvLayout = optionalKvLayout(row.kv_layout, `${at}.kv_layout`);
+
+    if (nLayer != null && !isPlausibleLayerCount(nLayer)) return {};
+    if (mtpLayers != null && !(Number.isInteger(mtpLayers) && mtpLayers >= 0 && mtpLayers <= MAX_GGUF_LAYERS)) return {};
+    if (tensorLayerBytes && nLayer != null && tensorLayerBytes.dense.length !== nLayer) return {};
+
+    return {
+      ...(nLayer != null ? { n_layer: nLayer } : {}),
+      ...(mtpLayers != null ? { mtp_layers: mtpLayers } : {}),
+      ...(paramCount != null ? { param_count: paramCount } : {}),
+      ...(quant != null ? { quant } : {}),
+      ...(trainedCtx != null ? { trained_ctx: trainedCtx } : {}),
+      ...(nHeadKv != null ? { n_head_kv: nHeadKv } : {}),
+      ...(headDimK != null ? { head_dim_k: headDimK } : {}),
+      ...(headDimV != null ? { head_dim_v: headDimV } : {}),
+      ...(nEmbd != null ? { n_embd: nEmbd } : {}),
+      ...(nHead != null ? { n_head: nHead } : {}),
+      ...(slidingWindow != null ? { sliding_window: slidingWindow } : {}),
+      ...(tensorLayerBytes !== undefined ? { tensor_layer_bytes: tensorLayerBytes } : {}),
+      ...(kvLayout !== undefined ? { kv_layout: kvLayout } : {}),
+    };
+  } catch (err) {
+    if (err instanceof BadRequestError) return {};
+    throw err;
+  }
+}
+
 function parseModelFiles(value: unknown): ModelDirFile[] {
   return requireArray(value, "model_files")
     .slice(0, LIMITS.maxModelFiles)
@@ -313,37 +405,16 @@ function parseModelFiles(value: unknown): ModelDirFile[] {
       // deliberately indistinguishable from "never reported" here, so the
       // catalog-adoption code (routes/queue.ts) can tell "a real value to
       // store" from "nothing to store" without a second presence flag.
-      const nLayer = optionalNumber(row.n_layer, `model_files[${i}].n_layer`);
-      const mtpLayers = optionalNumber(row.mtp_layers, `model_files[${i}].mtp_layers`);
-      const paramCount = optionalNumber(row.param_count, `model_files[${i}].param_count`);
-      const quant = optionalString(row.quant, `model_files[${i}].quant`, 32);
-      // Trained context + KV geometry (see ModelDirFile) -- same optional,
-      // presence-only convention: a field is included only when the worker
-      // actually reported a numeric value.
-      const trainedCtx = optionalNumber(row.trained_ctx, `model_files[${i}].trained_ctx`);
-      const nHeadKv = optionalNumber(row.n_head_kv, `model_files[${i}].n_head_kv`);
-      const headDimK = optionalNumber(row.head_dim_k, `model_files[${i}].head_dim_k`);
-      const headDimV = optionalNumber(row.head_dim_v, `model_files[${i}].head_dim_v`);
-      const nEmbd = optionalNumber(row.n_embd, `model_files[${i}].n_embd`);
-      const nHead = optionalNumber(row.n_head, `model_files[${i}].n_head`);
-      const slidingWindow = optionalNumber(row.sliding_window, `model_files[${i}].sliding_window`);
-      const tensorLayerBytes = optionalTensorLayerBreakdown(row.tensor_layer_bytes, `model_files[${i}].tensor_layer_bytes`);
+      // A file whose header fields are malformed or implausible loses those
+      // fields only -- the rest of the file entry, and every other file, still
+      // count. Rejecting the whole state push here would take the machine
+      // offline (heartbeat AND queue poll) over one bad file (audit 2026-10-18 A1).
+      const header = parseHeaderFields(row, `model_files[${i}]`);
 
       return {
         path: sanitizeString(row.path, `model_files[${i}].path`),
         size_bytes: requireNumber(row.size_bytes, `model_files[${i}].size_bytes`),
-        ...(nLayer != null ? { n_layer: nLayer } : {}),
-        ...(mtpLayers != null ? { mtp_layers: mtpLayers } : {}),
-        ...(paramCount != null ? { param_count: paramCount } : {}),
-        ...(quant != null ? { quant } : {}),
-        ...(trainedCtx != null ? { trained_ctx: trainedCtx } : {}),
-        ...(nHeadKv != null ? { n_head_kv: nHeadKv } : {}),
-        ...(headDimK != null ? { head_dim_k: headDimK } : {}),
-        ...(headDimV != null ? { head_dim_v: headDimV } : {}),
-        ...(nEmbd != null ? { n_embd: nEmbd } : {}),
-        ...(nHead != null ? { n_head: nHead } : {}),
-        ...(slidingWindow != null ? { sliding_window: slidingWindow } : {}),
-        ...(tensorLayerBytes !== undefined ? { tensor_layer_bytes: tensorLayerBytes } : {}),
+        ...header,
         ...(rawSha != null ? { sha256: rawSha.toLowerCase() } : {}),
         ...(state != null ? { state: state as ModelDirFile["state"] } : {}),
         hf_match,

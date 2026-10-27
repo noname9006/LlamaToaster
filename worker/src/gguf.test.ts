@@ -436,6 +436,11 @@ describe("readGgufInfo", () => {
       embed: 100,
       output: 100,
       other: 20,
+      // Largest single tensor per bucket (output = output_norm 10 + output 90).
+      max_dense: 50,
+      max_moe: 300,
+      max_embed: 100,
+      max_output: 90,
     });
   });
 

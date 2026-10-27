@@ -84,7 +84,7 @@ export function buildFitArgs(input: FitArgsInput): string[] {
 // parser reads. The worker keeps only matching lines while the call streams,
 // so a 2 MB log becomes ~100 lines.
 const KEEP_LINE_RE =
-  /common_params_fit_impl|common_memory_breakdown_print|common_fit_params|llama_kv_cache: size|compute buffer size|sched_reserve: graph|Flash Attention|failed to create|print_info: n_layer |print_info: n_ctx_train|print_info: n_expert(?:_used)? /;
+  /common_params_fit_impl|common_memory_breakdown_print|common_fit_params|llama_model_load: error|llama_kv_cache: size|compute buffer size|sched_reserve: graph|Flash Attention|failed to create|print_info: n_layer |print_info: n_ctx_train|print_info: n_expert(?:_used)? /;
 
 export function keepFitLogLine(line: string): boolean {
   return KEEP_LINE_RE.test(line);
@@ -305,6 +305,13 @@ export function parseFitOutput(stdout: string, log: string): ParsedFitOutput {
       out.aborted = true;
       continue;
     }
+    // The loader's own reason (e.g. "unknown model architecture: 'glm5-next'"
+    // on a build older than the model) beats fit's generic wrapper line.
+    const load = /llama_model_load: error loading model: ([^\r\n]+)/.exec(line);
+    if (load) {
+      out.error = load[1].trim();
+      continue;
+    }
     if (/failed to create llama_context|encountered an error while trying to fit params/.test(line)) {
       if (!out.error) {
         const m = /(?:error[^:]*: )?(failed to create llama_context[^\r\n]*)/.exec(line);
@@ -389,6 +396,18 @@ function sumRows(rows: FitBreakdownRow[], key: "selfMib" | "contextMib" | "compu
   return rows.reduce((a, r) => a + r[key], 0);
 }
 
+/** Blocks whose routed experts fit's -ot sends to the CPU (wholly or in part). */
+export function cpuExpertBlocks(ot: string | null): number {
+  if (!ot) return 0;
+  const blocks = new Set<string>();
+  for (const entry of ot.split(",")) {
+    if (!/=CPU$/i.test(entry.trim())) continue;
+    const m = /blk\\?\.(\d+)\\?\./.exec(entry);
+    if (m) blocks.add(m[1]);
+  }
+  return blocks.size;
+}
+
 export function fitPointFromOutput(parsed: ParsedFitOutput, c: FitVerdictContext): FitPoint {
   const layersTotal = parsed.nLayer != null ? parsed.nLayer + 1 : null;
   const base: FitPoint = {
@@ -458,7 +477,10 @@ export function fitPointFromOutput(parsed: ParsedFitOutput, c: FitVerdictContext
   } else if (parsed.finalDevices.length > 0) {
     const fin = parsed.finalDevices;
     base.layers_gpu = fin.reduce((a, f) => a + f.layers, 0);
-    base.overflow_layers = fin.reduce((a, f) => a + f.overflowing, 0);
+    // Fit's summary line only counts "(N overflowing)" when every layer is on
+    // a GPU; once it also drops layers, the experts it keeps off the GPU show
+    // only in the -ot it prints.
+    base.overflow_layers = Math.max(fin.reduce((a, f) => a + f.overflowing, 0), cpuExpertBlocks(parsed.ot));
     base.dev_used_mib = fin.reduce((a, f) => a + f.usedMib, 0);
     base.dev_free_mib = fin.reduce((a, f) => a + f.freeMib, 0);
     const shortOnDevice = fin.some((f) => f.freeMib < c.marginMib);

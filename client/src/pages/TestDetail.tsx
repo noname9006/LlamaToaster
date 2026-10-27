@@ -554,6 +554,7 @@ export function TestDetail() {
   const [items, setItems] = useState<TestItem[]>([]);
   const [now, setNow] = useState(() => Date.now());
   const [paused, setPaused] = useState(false);
+  const [pausedSince, setPausedSince] = useState<number | null>(null);
   const [controlPending, setControlPending] = useState(false);
   const [controlError, setControlError] = useState("");
   // Subheader hardware line (arch/cpu/gpu/os) -- not on Test itself, so
@@ -612,6 +613,7 @@ export function TestDetail() {
       setResults(data.results ?? []);
       setItems(data.items ?? []);
       setPaused(data.paused ?? false);
+      setPausedSince(data.paused_since ?? null);
       setPollTick((t) => t + 1);
       // Keep polling while scheduled too -- a scheduled run flips to
       // running on its own once whatever's ahead of it on that worker
@@ -1062,7 +1064,14 @@ export function TestDetail() {
           <p className="flex flex-wrap items-center gap-2">
             <TestStatusPill status={run.status} />
             {run.status === "running" && <span>· {formatElapsed(now - run.started_at)} elapsed</span>}
-            {run.status === "running" && paused && <span className="text-warning">· paused</span>}
+            {run.status === "running" && paused && (
+              <span
+                className="text-warning"
+                title="A pause is ended automatically after 7 days: the test is stopped, and finished items keep their results."
+              >
+                · paused{pausedSince !== null && ` for ${formatElapsed(now - pausedSince)}`}
+              </span>
+            )}
             {run.error && <span className="text-danger">· {run.error}</span>}
           </p>
         </div>

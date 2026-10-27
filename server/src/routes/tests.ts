@@ -36,7 +36,7 @@ import {
   FLOW_STEPS,
 } from "../../../shared/types.js";
 import type { TestKind } from "../../../shared/types.js";
-import { expandSweep, validateDepthRule, validateConcurrencyRule } from "../../../shared/sweep.js";
+import { countSweepItems, expandSweep, validateDepthRule, validateConcurrencyRule } from "../../../shared/sweep.js";
 import { validateFillCurveSpec } from "../../../shared/fillCurve.js";
 import {
   MAX_SWEEP_ITEMS,
@@ -46,7 +46,6 @@ import {
   MAX_REPEATS,
   MAX_CHAIN_DEPTH,
   MAX_ACTIVE_ROOTS_PER_USER,
-  CHAIN_WALL_CLOCK_MS,
 } from "../../../shared/types.js";
 import { CACHE_TYPE_VALUES, isKnownCacheType } from "../../../shared/engineSpec.js";
 import {
@@ -145,6 +144,18 @@ function validateSweep(sweep: unknown): string | null {
     if (!Array.isArray(depth) || !depth.every((x) => typeof x === "number" && Number.isFinite(x) && x >= 0)) {
       return "sweep.n_depth must be an array of non-negative numbers";
     }
+    if (depth.length > MAX_AXIS_VALUES) return `sweep.n_depth has more than ${MAX_AXIS_VALUES} values`;
+  }
+  // N5 -- concurrent slots; optional, same 1..64 range as knee.slots.
+  const concurrency = s.concurrency;
+  if (concurrency !== undefined) {
+    if (
+      !Array.isArray(concurrency) ||
+      concurrency.length > MAX_AXIS_VALUES ||
+      !concurrency.every((n) => Number.isInteger(n) && n >= 1 && n <= 64)
+    ) {
+      return `sweep.concurrency must be at most ${MAX_AXIS_VALUES} integers in [1, 64]`;
+    }
   }
   for (const field of STRING_SWEEP_FIELDS) {
     const v = s[field];
@@ -155,6 +166,7 @@ function validateSweep(sweep: unknown): string | null {
     ) {
       return `sweep.${field} must be a non-empty array of non-empty strings`;
     }
+    if (v.length > MAX_AXIS_VALUES) return `sweep.${field} has more than ${MAX_AXIS_VALUES} values`;
   }
   for (const [field, values] of [
     ["cache_type_k", s.cache_type_k],
@@ -595,11 +607,13 @@ export const getTestByIdHandler =
     // reaper (index.ts's reapExpiredLeases), not by this route reaching
     // out on every poll. `paused` reflects the same per-worker flag the
     // heartbeat handler delivers control from (MULTIUSER_PLAN.md §1.6/§1.7/§1.14).
+    const pausedSince =
+      data.run.status === "running" && data.run.worker_id ? repo.workerRepo.getPausedSince(data.run.worker_id) : null;
     const paused =
       data.run.status === "running" && data.run.worker_id
         ? repo.workerRepo.getPauseRequested(data.run.worker_id)
         : undefined;
-    return { ...data, paused };
+    return { ...data, paused, paused_since: pausedSince ?? undefined };
   };
 
 // Reads the log the worker pushed on job completion (POST below) -- no
@@ -784,6 +798,14 @@ export async function testsRoutes(app: FastifyInstance): Promise<void> {
       if (sweepError) {
         return reply.code(400).send({ error: sweepError });
       }
+      // §0.5 hard cap, counted before expanding: capped axes still multiply
+      // out to far more items than memory holds.
+      const itemCount = countSweepItems(body.sweep);
+      if (itemCount > MAX_SWEEP_ITEMS) {
+        return reply.code(400).send({
+          error: `sweep expands to ${itemCount.toLocaleString("en-US")} items -- the hard cap is ${MAX_SWEEP_ITEMS}. Reduce axis values or split into multiple runs.`,
+        });
+      }
       // expandSweep silently drops any flash_attn:"off" combo paired with a
       // quantized cache type (llama.cpp refuses those outright -- see its
       // own comment) -- a sweep built entirely out of such combos would
@@ -802,14 +824,9 @@ export async function testsRoutes(app: FastifyInstance): Promise<void> {
       const concurrencyError = validateConcurrencyRule(expanded);
       if (concurrencyError) return reply.code(400).send({ error: concurrencyError });
 
-      // §0.5 budgets -- hard 400 past MAX_SWEEP_ITEMS, 201-with-warning past
+      // §0.5 budgets -- the hard cap is checked above; 201-with-warning past
       // WARN_SWEEP_ITEMS.
       let budgetWarning: string | undefined;
-      if (expanded.length > MAX_SWEEP_ITEMS) {
-        return reply.code(400).send({
-          error: `sweep expands to ${expanded.length} items -- the hard cap is ${MAX_SWEEP_ITEMS}. Reduce axis values or split into multiple runs.`,
-        });
-      }
       if (expanded.length > WARN_SWEEP_ITEMS) {
         budgetWarning = `large sweep: ${expanded.length} items exceeds the ${WARN_SWEEP_ITEMS}-item warning threshold and may take a long time`;
       }
@@ -1233,7 +1250,6 @@ export async function testsRoutes(app: FastifyInstance): Promise<void> {
           );
         }
       }
-      repo.cancelExpiredRoots();
 
       const targetBackend: Backend | null = body.main_gpu_backend ?? worker.backend;
       if (!targetBackend) {
@@ -1550,6 +1566,10 @@ export async function testsRoutes(app: FastifyInstance): Promise<void> {
         throw new ForbiddenError("this machine did not execute this run");
       }
 
+      // Every run's items are created at trigger time, so an idx without a row
+      // is a bad report -- it used to update nothing yet still insert results.
+      if (!repo.hasTestItem(id, idx)) return reply.code(404).send({ error: "no such item in this run" });
+
       const validationError = validateRunItemUpdate(request.body);
       if (validationError) {
         app.log.warn(
@@ -1559,6 +1579,9 @@ export async function testsRoutes(app: FastifyInstance): Promise<void> {
         return reply.code(400).send({ error: validationError });
       }
       const body = request.body;
+      // Any valid item report is progress -- keeps the reaper's stall rule off
+      // a run that's working through a long item (llama-bench ticks per repeat).
+      repo.queueRepo.touchRunProgress(id);
 
       if (isTerminalTestItemInput(body)) {
         app.log[body.status === "done" ? "info" : "error"](
@@ -1587,7 +1610,9 @@ export async function testsRoutes(app: FastifyInstance): Promise<void> {
         return reply.code(200).send({ ok: true, run_status: updatedRun.status });
       }
 
-      repo.updateTestItemTick(id, idx, body);
+      // A late tick for a run that already finished changes nothing. 200, not
+      // an error, so the worker doesn't log or retry it.
+      if (run.status === "running" || run.status === "scheduled") repo.updateTestItemTick(id, idx, body);
       return reply.code(200).send({ ok: true });
   };
   app.post("/api/tests/:id/items/:idx", { logLevel: "silent" }, postTestItemHandler);
@@ -1598,6 +1623,8 @@ export async function testsRoutes(app: FastifyInstance): Promise<void> {
   // /stop route below for both the targeted run and, for a probe batch,
   // every sibling still in flight underneath it.
   function stopOneRun(authedUserId: string | undefined, run: Test): Test {
+    // Stopping a finished run changes nothing (audit 2026-10-11 N17).
+    if (run.status !== "running" && run.status !== "scheduled") return run;
     const jobs = repo.queueRepo.getNonTerminalJobsForTest(run.id);
     repo.queueRepo.cancelPendingJobsForTest(run.id); // never-claimed jobs -- nothing to signal, cancel outright
 
@@ -1652,6 +1679,9 @@ export async function testsRoutes(app: FastifyInstance): Promise<void> {
     const run = repo.getTest(authed?.user.id, request.params.id);
     if (!run) throw new NotFoundError("run not found");
     if (!run.worker_id) throw new ConflictError("run has no assigned machine");
+    // The flag pauses the whole machine, so only the run it's executing may
+    // set it -- pausing a scheduled run would pause whatever else is running.
+    if (run.status !== "running") throw new ConflictError("only a running test can be paused");
     repo.workerRepo.setPauseRequested(run.worker_id, true);
     return { ok: true };
   };

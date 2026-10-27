@@ -22,6 +22,7 @@ export function ggufMetadataPatch(f: ModelDirFile | GgufInfo): Partial<ModelMeta
   if (typeof f.n_head === "number" && f.n_head > 0) patch.n_head = f.n_head;
   if (typeof f.sliding_window === "number" && f.sliding_window > 0) patch.sliding_window = f.sliding_window;
   if (f.tensor_layer_bytes) patch.tensor_layer_bytes = f.tensor_layer_bytes;
+  if (f.kv_layout) patch.kv_layout = f.kv_layout;
   return patch;
 }
 
@@ -39,6 +40,7 @@ const HEADER_KEYS = [
   "n_head",
   "sliding_window",
   "tensor_layer_bytes",
+  "kv_layout",
 ] as const satisfies readonly (keyof ModelMetadata)[];
 
 // Puts a resolved header reading onto a stored metadata object by REPLACING

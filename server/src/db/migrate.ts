@@ -36,6 +36,13 @@ export function getDb(): Database.Database {
   return db;
 }
 
+// Graceful shutdown (index.ts): closing the last connection checkpoints the
+// WAL back into the main file.
+export function closeDb(): void {
+  db?.close();
+  db = null;
+}
+
 function migrate(database: Database.Database): void {
   const sql = readFileSync(join(__dirname, "schema.sql"), "utf8");
   // schema.sql mixes CREATE TABLE IF NOT EXISTS (a safe no-op on an existing
@@ -226,6 +233,13 @@ const COLUMN_MIGRATIONS: ColumnSpec[] = [
   // machine, which is exactly what lets it adopt Stage 3 enrolment later
   // with no separate migration path (§3.4's own point).
   { table: "workers", column: "user_id", ddlType: "TEXT REFERENCES users(id) ON DELETE CASCADE" },
+  // When the current pause started (NULL when not paused) -- the reaper ends
+  // a pause left for PAUSE_TIMEOUT_MS, and the UI shows "paused since".
+  { table: "workers", column: "pause_requested_at", ddlType: "INTEGER" },
+  // Last sign a claimed job is moving: claim, a changed heartbeat progress
+  // report, or an item tick/terminal report. The reaper stops a run whose job
+  // has none for STALL_TIMEOUT_MS while not paused.
+  { table: "worker_jobs", column: "progress_at", ddlType: "INTEGER" },
   // sha256(device_code) -- worker-held, never shown to a human, looked up by
   // hash exactly like a session token (§2.2). NOT the same value as
   // user_code below, which is the short human-facing code.

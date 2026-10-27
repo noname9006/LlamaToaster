@@ -168,6 +168,77 @@ describe("§0.2 depth rule + §0.5 budgets at trigger", () => {
     });
     expect(res3.status).toBe(400);
   });
+
+  // N2 (audit 2026-10-11) -- the cap used to run after expandSweep had built
+  // the whole cross-product, and six axes had no length limit.
+  it("caps every axis, including the string axes, n_depth and concurrency", async () => {
+    await heartbeat("v8-axis-all");
+    const worker = repo.workerRepo.getByMachineId("v8-axis-all")!;
+    const cases: Record<string, unknown> = {
+      flash_attn: Array.from({ length: 65 }, () => "on"),
+      mtp: Array.from({ length: 65 }, () => "off"),
+      cache_type_k: Array.from({ length: 65 }, () => "f16"),
+      cache_type_v: Array.from({ length: 65 }, () => "f16"),
+      n_depth: Array.from({ length: 65 }, () => 0),
+      concurrency: Array.from({ length: 65 }, () => 1),
+    };
+    for (const [field, values] of Object.entries(cases)) {
+      const res = await postJson("/api/runs/trigger", {
+        model_id: "v8-model",
+        worker_id: worker.id,
+        sweep: { ...baseSweep, [field]: values },
+      });
+      expect(res.status, field).toBe(400);
+      expect(((await res.json()) as { error: string }).error).toContain(`sweep.${field}`);
+    }
+    for (const concurrency of [[0], [65], [1.5], ["2"]]) {
+      const res = await postJson("/api/runs/trigger", {
+        model_id: "v8-model",
+        worker_id: worker.id,
+        sweep: { ...baseSweep, concurrency },
+      });
+      expect(res.status, JSON.stringify(concurrency)).toBe(400);
+    }
+  });
+
+  it("rejects a 1,000-value flash_attn axis quickly", async () => {
+    await heartbeat("v8-axis-fast");
+    const worker = repo.workerRepo.getByMachineId("v8-axis-fast")!;
+    const started = performance.now();
+    const res = await postJson("/api/runs/trigger", {
+      model_id: "v8-model",
+      worker_id: worker.id,
+      sweep: { ...baseSweep, flash_attn: Array.from({ length: 1000 }, () => "on"), n_prompt: Array.from({ length: 64 }, (_, i) => i + 1) },
+    });
+    expect(res.status).toBe(400);
+    expect(performance.now() - started).toBeLessThan(500);
+  });
+
+  it("rejects an every-axis-at-64 sweep by count, without expanding it", async () => {
+    await heartbeat("v8-count");
+    const worker = repo.workerRepo.getByMachineId("v8-count")!;
+    const axis = Array.from({ length: 64 }, (_, i) => i + 1);
+    const res = await postJson("/api/runs/trigger", {
+      model_id: "v8-model",
+      worker_id: worker.id,
+      sweep: {
+        ...baseSweep,
+        n_prompt: axis,
+        n_gen: axis,
+        threads: axis,
+        n_gpu_layers: axis,
+        batch_size: axis,
+        ubatch_size: axis,
+        n_gpu_layers_draft: axis,
+        n_cpu_moe: axis,
+        flash_attn: Array.from({ length: 64 }, () => "on"),
+        mtp: Array.from({ length: 64 }, () => "off"),
+        n_depth: axis,
+      },
+    });
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { error: string }).error).toContain("hard cap is 20000");
+  });
 });
 
 describe("§0.5 duplicate-trigger guard", () => {
@@ -874,32 +945,6 @@ describe("§0.5 chain quotas", () => {
       sweep: baseSweep,
     });
     expect(probe.status).toBe(201);
-  });
-
-  it("cancels running roots past the 48h wall clock", async () => {
-    await heartbeat("v8-wallclock");
-    const worker = repo.workerRepo.getByMachineId("v8-wallclock")!;
-    repo.registerModel({ id: "v8-old-model", filename: "old.gguf", size_bytes: 1, source: "local", metadata: {} });
-    repo.createTest(undefined, {
-      id: "v8-old-root",
-      kind: "sweep",
-      worker_id: worker.id,
-      worker_name: "w",
-      llama_cpp_build: "b9999",
-      llama_cpp_backend: "cpu",
-      model_id: "v8-old-model",
-      config: { model_id: "v8-old-model", sweep: baseSweep } as never,
-      status: "running",
-      started_at: Date.now() - 49 * 3600 * 1000,
-    });
-    repo.createTestItems(
-      undefined,
-      "v8-old-root",
-      [{ idx: 0, n_prompt: 1, n_gen: 1, n_depth: 0, concurrency: 1, threads: 1, n_gpu_layers: 0, batch_size: 1, ubatch_size: 1, cache_type_k: "f16", cache_type_v: "f16", flash_attn: "on", mtp: "off", n_gpu_layers_draft: 0, n_cpu_moe: 0 }]
-    );
-    const cancelled = repo.cancelExpiredRoots();
-    expect(cancelled).toContain("v8-old-root");
-    expect(repo.getTest(undefined, "v8-old-root")!.status).not.toBe("running");
   });
 });
 

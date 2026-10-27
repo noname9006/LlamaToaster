@@ -1,5 +1,5 @@
-import type { FastifyInstance } from "fastify";
-import type { IncomingMessage } from "node:http";
+import type { FastifyInstance, FastifyReply } from "fastify";
+import type { ServerResponse } from "node:http";
 import { repo } from "../db/repo.js";
 import { queueEvents } from "../queue-events.js";
 import { authenticateWorker } from "../worker-auth.js";
@@ -124,8 +124,8 @@ function registerHashVerifiedModelFiles(workerId: string, files: WorkerStatePush
       // A row locked by an actual in-app download (existing.hf_identity_locked
       // -- see repo.ts's registerModel doc comment) never gets its identity
       // touched by this scan path: registerModel's own ON CONFLICT WHERE
-      // would silently no-op the call anyway (lock_hf_identity is never
-      // passed here), but skipping it client-side keeps the intent readable
+      // would silently no-op the call anyway (verifiedBy "index" never
+      // locks), but skipping it client-side keeps the intent readable
       // and avoids a pointless write on every heartbeat for a file whose
       // hash happens to also match a fork/mirror.
       if (!identityOk && !existing?.hf_identity_locked) {
@@ -137,11 +137,11 @@ function registerHashVerifiedModelFiles(workerId: string, files: WorkerStatePush
           hf_repo: f.hf_match.repo_id,
           hf_file: f.hf_match.filename,
           metadata: merged,
-        });
+        }, { verifiedBy: "index" });
       }
       // Adoption-only: adjust metadata without touching identity. Identity
-      // updates are ownership-gated (registerModel's ON CONFLICT WHERE -- a
-      // foreign-owner row can block the whole statement, metadata included),
+      // updates are lock-gated (registerModel's ON CONFLICT WHERE -- a
+      // download-locked row blocks the whole statement, metadata included),
       // but filling in a derived metadata field must stay open:
       // updateModelMetadata is that always-open path. Re-reads the row so the
       // check sees the post-registration truth in both branches, and passes
@@ -172,24 +172,38 @@ function registerHashVerifiedModelFiles(workerId: string, files: WorkerStatePush
 }
 
 
-// Resolves as soon as a job is claimable for this worker (woken by
-// queueEvents) or LONG_POLL_MS elapses, whichever comes first. Resolves
-// `null` (never claims) if the client disconnects first -- claiming a job
-// onto a socket that's already gone would strand it "claimed" with nobody to
-// execute it until the lease reaper eventually rescues it (MULTIUSER_PLAN.md §1.4).
-function waitForJob(workerId: string, raw: IncomingMessage): Promise<QueueJob | null> {
+// Resolves as soon as a job is claimable for this worker (immediately, or
+// woken by queueEvents) or LONG_POLL_MS elapses, whichever comes first.
+// Resolves `null` (never claims) if the client disconnects first -- claiming
+// a job onto a socket that's already gone would strand it "claimed" with
+// nobody to execute it until the lease reaper requeues it, burning one of its
+// attempts (MULTIUSER_PLAN.md §1.4).
+//
+// Watches the response (reply.raw), not the request: on Node 22 the
+// request's 'close' fires as soon as Fastify has read the body -- before this
+// is even called -- so a listener on it never fires (audit 2026-10-11 N4;
+// routes/ai.ts has the same note). `destroyed` covers a disconnect during
+// the handler's own work before the listener was attached.
+// Every long-poll still waiting, so shutdown can answer them all with 204 at
+// once instead of app.close() waiting up to LONG_POLL_MS for each (pm2 kills
+// the process 1.6 s after asking it to stop).
+const waitingPolls = new Set<() => void>();
+
+function waitForJob(workerId: string, res: ServerResponse): Promise<QueueJob | null> {
   return new Promise((resolve) => {
     let done = false;
     const finish = (v: QueueJob | null) => {
       if (done) return;
       done = true;
+      waitingPolls.delete(onClose);
       queueEvents.off(workerId, onEvent);
-      raw.off("close", onClose);
+      res.off("close", onClose);
       clearInterval(backstop);
       clearTimeout(deadline);
       resolve(v);
     };
     const tryClaim = () => {
+      if (res.destroyed) return finish(null);
       const job = repo.queueRepo.claimNextJob(workerId);
       if (job) finish(job);
     };
@@ -198,12 +212,32 @@ function waitForJob(workerId: string, raw: IncomingMessage): Promise<QueueJob | 
     const backstop = setInterval(tryClaim, BACKSTOP_MS);
     const deadline = setTimeout(() => finish(null), LONG_POLL_MS);
     queueEvents.on(workerId, onEvent);
-    raw.on("close", onClose);
-    tryClaim(); // race: a job enqueued between the caller's own sync claim and this call
+    res.on("close", onClose);
+    waitingPolls.add(onClose);
+    tryClaim(); // a job already pending is handed out without waiting
   });
 }
 
+// The claim and the response aren't atomic: if the connection dies before
+// the job is flushed to it, the worker never got the job, so it goes straight
+// back to pending without using up an attempt.
+function sendClaimedJob(reply: FastifyReply, job: QueueJob) {
+  const res = reply.raw;
+  if (res.destroyed) {
+    repo.queueRepo.unclaimJob(job.job_id);
+  } else {
+    res.once("close", () => {
+      if (!res.writableFinished) repo.queueRepo.unclaimJob(job.job_id);
+    });
+  }
+  return reply.send(job);
+}
+
 export async function queueRoutes(app: FastifyInstance): Promise<void> {
+  app.addHook("preClose", async () => {
+    for (const release of [...waitingPolls]) release();
+  });
+
   // Only called while the worker is idle; hangs up to LONG_POLL_MS waiting
   // for work. See MULTIUSER_PLAN.md §1.3/§1.4.
   app.post("/api/worker/queue", { bodyLimit: WORKER_BODY_LIMIT }, async (req, reply) => {
@@ -216,11 +250,8 @@ export async function queueRoutes(app: FastifyInstance): Promise<void> {
     // it should be heartbeating, not queue-polling, while active.
     if (state.status === "busy") return reply.code(204).send();
 
-    const claimed = repo.queueRepo.claimNextJob(worker.id);
-    if (claimed) return reply.send(claimed);
-
-    const job = await waitForJob(worker.id, req.raw);
-    return job ? reply.send(job) : reply.code(204).send();
+    const job = await waitForJob(worker.id, reply.raw);
+    return job ? sendClaimedJob(reply, job) : reply.code(204).send();
   });
 
   // Called every 10s, ALWAYS (idle and busy) -- returns fast. Carries

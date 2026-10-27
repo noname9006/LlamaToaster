@@ -21,6 +21,7 @@ const HEADER_FIELDS = [
   "n_head",
   "sliding_window",
   "tensor_layer_bytes",
+  "kv_layout",
 ] as const satisfies readonly (keyof GgufInfo & keyof ModelMetadata)[];
 
 // Compared for the mismatch warning -- the ones that actually drive a
@@ -34,6 +35,7 @@ const DECISION_FIELDS: readonly (typeof HEADER_FIELDS)[number][] = [
   "head_dim_v",
   "sliding_window",
   "tensor_layer_bytes",
+  "kv_layout",
 ];
 
 export type HeaderReader = (path: string) => Promise<GgufInfo>;
@@ -69,7 +71,7 @@ export async function applyLocalHeader(
       server !== null &&
       JSON.stringify(server) !== JSON.stringify(local)
     ) {
-      differs.push(key === "tensor_layer_bytes" ? key : `${key} ${JSON.stringify(server)}→${JSON.stringify(local)}`);
+      differs.push((key === "tensor_layer_bytes" || key === "kv_layout") ? key : `${key} ${JSON.stringify(server)}→${JSON.stringify(local)}`);
     }
     (metadata as Record<string, unknown>)[key] = local;
   }

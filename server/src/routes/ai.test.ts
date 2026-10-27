@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, existsSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -141,6 +141,8 @@ describe("POST /api/ai/chat -- message shape limits", () => {
   it("a normal-sized conversation is accepted and streams a reply", async () => {
     const res = await chat({ messages: [{ role: "user", content: "hello" }] });
     expect(res.status).toBe(200);
+    // Tells nginx not to buffer the stream (audit 2026-09-27 M4).
+    expect(res.headers.get("x-accel-buffering")).toBe("no");
     const text = await res.text();
     expect(text).toContain("[DONE]");
   });
@@ -202,19 +204,34 @@ describe("POST /api/ai/chat -- per-user budget", () => {
   });
 
   it("blocks with 429 once the daily limit is reached", async () => {
-    const user = repo.userRepo.upsertByIdentity("github", { providerUserId: "budget-day", login: "budget-day-user", avatarUrl: null });
-    const { token } = repo.sessionRepo.create(user.id, { label: "day" });
-    const day = new Date().toISOString().slice(0, 10);
-    // Spread across several hours so the HOURLY check (30/hour) doesn't fire
-    // first and mask which limit actually triggered.
-    for (let h = 0; h < 24 && repo.aiUsageRepo.getUserDayCount(user.id, day) < 150; h++) {
-      for (let i = 0; i < 30; i++) repo.aiUsageRepo.recordUsage(user.id, day, h);
-    }
-    expect(repo.aiUsageRepo.getUserDayCount(user.id, day)).toBeGreaterThanOrEqual(150);
+    // Pinned inside UTC 00:00-04:59, the window where this test used to fail
+    // (audit 2026-10-18/25 B4): it seeded hours 0..4, so on those hours the
+    // current hour's bucket was full too and the HOURLY check answered first.
+    // Only Date is faked -- the request itself still runs on real timers.
+    const now = new Date();
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 3, 30));
+    try {
+      const user = repo.userRepo.upsertByIdentity("github", { providerUserId: "budget-day", login: "budget-day-user", avatarUrl: null });
+      const { token } = repo.sessionRepo.create(user.id, { label: "day" });
+      const day = new Date().toISOString().slice(0, 10);
+      const currentHour = new Date().getUTCHours();
+      // Spread across several hours so the HOURLY check (30/hour) doesn't fire
+      // first and mask which limit actually triggered -- never the current
+      // hour, whose bucket the hourly check reads.
+      for (let h = 0; h < 24 && repo.aiUsageRepo.getUserDayCount(user.id, day) < 150; h++) {
+        if (h === currentHour) continue;
+        for (let i = 0; i < 30; i++) repo.aiUsageRepo.recordUsage(user.id, day, h);
+      }
+      expect(repo.aiUsageRepo.getUserDayCount(user.id, day)).toBeGreaterThanOrEqual(150);
+      expect(repo.aiUsageRepo.getHourCount(user.id, day, currentHour)).toBe(0);
 
-    const res = await chat({ messages: [{ role: "user", content: "over the daily cap" }] }, authed(token));
-    expect(res.status).toBe(429);
-    expect((await res.json()) as { error: string }).toMatchObject({ error: expect.stringContaining("daily") });
+      const res = await chat({ messages: [{ role: "user", content: "over the daily cap" }] }, authed(token));
+      expect(res.status).toBe(429);
+      expect((await res.json()) as { error: string }).toMatchObject({ error: expect.stringContaining("daily") });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("an unauthenticated caller (AUTH_ENABLED-off equivalent) is never budget-limited", async () => {

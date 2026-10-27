@@ -20,11 +20,11 @@ import { queueRoutes } from "./routes/queue.js";
 import { authRoutes } from "./routes/auth.js";
 import { sessionRoutes } from "./routes/sessions.js";
 import { deviceRoutes, deviceApprovalRoutes } from "./routes/device.js";
-import { adminRoutes } from "./routes/admin.js";
+import { adminRoutes, isAdminHost } from "./routes/admin.js";
 import { statsRoutes } from "./routes/stats.js";
 import { rocmSupportRoutes } from "./routes/rocm-support.js";
 import { installRoutes } from "./routes/install.js";
-import { getDb } from "./db/migrate.js";
+import { closeDb, getDb } from "./db/migrate.js";
 import { runMaintenanceSweep, REAP_INTERVAL_MS } from "./reaper.js";
 import { authMiddleware } from "./auth-middleware.js";
 import { appErrorHandler } from "./error-handler.js";
@@ -285,7 +285,7 @@ const adminIndexHtmlPath = join(adminDist, "index.html");
 
 app.setNotFoundHandler((request, reply) => {
   if (request.method === "GET" && !request.url.startsWith("/api/")) {
-    const onAdminHost = ADMIN_HOSTNAME !== undefined && request.hostname === ADMIN_HOSTNAME;
+    const onAdminHost = isAdminHost(request);
     const path = onAdminHost ? adminIndexHtmlPath : indexHtmlPath;
     try {
       const indexHtml = readFileSync(path, "utf8");
@@ -312,5 +312,42 @@ async function start(): Promise<void> {
 
 const db = process.env.DB_PATH;
 if (db) app.log.info(`Using DB at ${db}`);
+
+// Audit 2026-09-27 M7. A stray throw or rejection anywhere would already kill
+// the process (Node's default); these make sure the reason reaches the log
+// first. pm2 (autorestart) and systemd (Restart=on-failure) then restart it.
+process.on("uncaughtException", (err) => {
+  app.log.fatal({ err }, "uncaught exception -- exiting");
+  process.exit(1);
+});
+process.on("unhandledRejection", (reason) => {
+  app.log.fatal({ err: reason }, "unhandled rejection -- exiting");
+  process.exit(1);
+});
+
+// Stop on SIGTERM (systemd) / SIGINT (pm2): finish what's in flight, then
+// close the DB cleanly. Waiting worker long-polls are answered at once (see
+// routes/queue.ts's preClose hook); the deadline stays under pm2's default
+// 1.6 s kill_timeout so the DB close isn't cut short by SIGKILL.
+let shuttingDown = false;
+async function shutdown(signal: NodeJS.Signals): Promise<void> {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  app.log.info({ signal }, "shutting down");
+  const deadline = setTimeout(() => {
+    app.log.warn("shutdown took too long -- exiting without waiting further");
+    process.exit(0);
+  }, 1_000);
+  deadline.unref();
+  try {
+    await app.close();
+  } catch (err) {
+    app.log.error({ err }, "error while closing the server");
+  }
+  closeDb();
+  process.exit(0);
+}
+process.once("SIGTERM", (s) => void shutdown(s));
+process.once("SIGINT", (s) => void shutdown(s));
 
 start();

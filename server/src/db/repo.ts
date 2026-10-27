@@ -50,7 +50,6 @@ import type {
 import {
   isVramDiscrepancyPolicy,
   isValidProbeMaxLoads,
-  CHAIN_WALL_CLOCK_MS,
 } from "../../../shared/types.js";
 import type { SweepItem } from "../../../shared/sweep.js";
 import type { TensorLayerBreakdown } from "../../../shared/vramEstimate.js";
@@ -866,7 +865,12 @@ function mapResult(row: ResultRowRaw): ResultRow {
 // caller omits an id, derive a stable one from the identifying fields it did
 // supply, so re-registering the same model doesn't create a duplicate row
 // with a fresh random id each time.
-function deriveModelId(input: RegisterModelInput): string {
+// done/partial/failed/cancelled -- the same test the routes use inline.
+function isFinishedTest(test: Test): boolean {
+  return test.status !== "running" && test.status !== "scheduled";
+}
+
+export function deriveModelId(input: RegisterModelInput): string {
   const key =
     input.source === "huggingface"
       ? `hf:${input.hf_repo ?? ""}/${input.hf_file ?? ""}`
@@ -917,6 +921,7 @@ export const repo = {
       .prepare(
         `SELECT m.* FROM models m
          WHERE m.created_by = ?
+            OR EXISTS (SELECT 1 FROM model_registrations g WHERE g.model_id = m.id AND g.user_id = ?)
             OR EXISTS (SELECT 1 FROM results r WHERE r.model_id = m.id AND r.user_id = ?)
             OR m.id IN (
               SELECT json_extract(f.value, '$.sha256')
@@ -925,7 +930,7 @@ export const repo = {
             )
          ORDER BY m.created_at DESC`
       )
-      .all(userId, userId, userId) as ModelRow[];
+      .all(userId, userId, userId, userId) as ModelRow[];
     // The caller's own header reading (from their own machine's file) wins
     // over the shared consensus -- what they see about their own file can't
     // be poisoned by another tenant at all.
@@ -969,37 +974,34 @@ export const repo = {
     return row ? mapModel(row) : undefined;
   },
 
-  // Multi-user Stage 4 (MULTIUSER_PLAN.md §4.4): created_by is set ONLY on
-  // the first insert (never touched by the ON CONFLICT branch, regardless of
-  // who's calling) -- re-registering an existing model never lets a caller
-  // "adopt" one they didn't originally create. The conflict WHERE clause is
-  // the actual ownership enforcement: an unclaimed model (created_by NULL --
-  // single-tenant mode, or a legacy row) stays freely updatable by anyone;
-  // once a model has a real creator, only that same creator's calls may
-  // overwrite filename/hf_repo/hf_file/metadata -- everyone else's identical
-  // upsert-shaped call just silently no-ops instead of erroring (updateModelMetadata
-  // below remains the always-open path for filling in a missing field, e.g.
-  // backfilling n_layer, which isn't an identity field). `IS` rather than
-  // `=` throughout so two NULLs (single-tenant mode on both sides) compare
-  // equal -- plain `=` never does for NULL in SQL.
+  // Multi-user Stage 4 (MULTIUSER_PLAN.md §4.4): created_by is set on the
+  // first insert. The conflict WHERE clause is the ownership enforcement: an
+  // unclaimed model (created_by NULL -- single-tenant mode, or a shared
+  // content-addressed row) stays updatable; once a model has a creator, only
+  // that creator's calls may overwrite filename/hf_repo/hf_file/metadata --
+  // anyone else's call silently no-ops (updateModelMetadata below remains the
+  // always-open path for filling in a missing field, e.g. backfilling
+  // n_layer). `IS` rather than `=` so two NULLs compare equal.
   //
-  // Second WHERE clause, same shape: once hf_identity_locked is set (an
-  // actual in-app download, never a hash-lookup-driven scan -- see
-  // RegisterModelInput.lock_hf_identity), the row's identity fields can only
-  // be changed by a call that's itself asserting the lock again (another
-  // real download), never by queue.ts's registerHashVerifiedModelFiles
-  // re-guessing the repo from a hash a fork/mirror also shares. An unlocked
-  // row (the common case -- a hand-dropped file, or any row predating this
-  // migration) stays freely correctable by a scan exactly as before.
-  registerModel(input: RegisterModelInput): Model {
+  // Second WHERE clause: once hf_identity_locked is set (an actual in-app
+  // download), the row's identity can only be changed by another real
+  // download, never by queue.ts's registerHashVerifiedModelFiles
+  // re-guessing the repo from a hash a fork/mirror also shares.
+  //
+  // opts.verifiedBy is the server's own proof of identity, never a client's
+  // claim: "download" (workers.ts's download callback -- this worker fetched
+  // exactly this hf_repo/hf_file and its sha256 matched; also locks the row)
+  // or "index" (queue.ts's heartbeat path -- a live hf_gguf_index pair). A
+  // verified write wins over ownership and hands the row back to the shared
+  // catalog (created_by NULL), so a user who registered a file's hash first
+  // can't keep the real download from correcting it, or later delete it out
+  // from under everyone (audit 2026-10-11 N3). The lock rule still applies.
+  registerModel(input: RegisterModelInput, opts: { verifiedBy?: "download" | "index" } = {}): Model {
     const id = input.id ?? deriveModelId(input);
-    const now = Date.now();
-    const metadata = JSON.stringify(input.metadata ?? {});
-    const lockHfIdentity = input.lock_hf_identity ? 1 : 0;
     getDb()
       .prepare(
         `INSERT INTO models (id, filename, size_bytes, source, hf_repo, hf_file, metadata, created_by, created_at, hf_identity_locked)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         VALUES (@id, @filename, @size_bytes, @source, @hf_repo, @hf_file, @metadata, @created_by, @now, @locked)
          ON CONFLICT(id) DO UPDATE SET
            filename = excluded.filename,
            size_bytes = excluded.size_bytes,
@@ -1007,9 +1009,37 @@ export const repo = {
            hf_repo = excluded.hf_repo,
            hf_file = excluded.hf_file,
            metadata = excluded.metadata,
-           hf_identity_locked = excluded.hf_identity_locked
-         WHERE (models.created_by IS NULL OR models.created_by IS excluded.created_by)
+           hf_identity_locked = excluded.hf_identity_locked,
+           created_by = CASE WHEN @verified = 1 THEN NULL ELSE models.created_by END
+         WHERE (models.created_by IS NULL OR models.created_by IS excluded.created_by OR @verified = 1)
            AND (models.hf_identity_locked = 0 OR excluded.hf_identity_locked = 1)`
+      )
+      .run({
+        id,
+        filename: input.filename ?? "",
+        size_bytes: input.size_bytes ?? 0,
+        source: input.source,
+        hf_repo: input.hf_repo ?? null,
+        hf_file: input.hf_file ?? null,
+        metadata: JSON.stringify(input.metadata ?? {}),
+        created_by: opts.verifiedBy ? null : (input.created_by ?? null),
+        now: Date.now(),
+        locked: opts.verifiedBy === "download" ? 1 : 0,
+        verified: opts.verifiedBy ? 1 : 0,
+      });
+    return this.getModel(id)!;
+  },
+
+  // POST /api/models: a client registration only ever creates a row, never
+  // changes an existing one -- a shared catalog row is written only by the
+  // verified paths above. Returns null when the id is already taken.
+  insertModelIfAbsent(input: RegisterModelInput): Model | null {
+    const id = input.id ?? deriveModelId(input);
+    const { changes } = getDb()
+      .prepare(
+        `INSERT INTO models (id, filename, size_bytes, source, hf_repo, hf_file, metadata, created_by, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO NOTHING`
       )
       .run(
         id,
@@ -1018,12 +1048,43 @@ export const repo = {
         input.source,
         input.hf_repo ?? null,
         input.hf_file ?? null,
-        metadata,
+        JSON.stringify(input.metadata ?? {}),
         input.created_by ?? null,
-        now,
-        lockHfIdentity
+        Date.now()
       );
-    return this.getModel(id)!;
+    return changes > 0 ? this.getModel(id)! : null;
+  },
+
+  // A user added this model through POST /api/models (see the
+  // model_registrations table). Idempotent.
+  addModelRegistration(userId: string, modelId: string): void {
+    getDb()
+      .prepare(`INSERT INTO model_registrations (user_id, model_id, created_at) VALUES (?, ?, ?) ON CONFLICT DO NOTHING`)
+      .run(userId, modelId, Date.now());
+  },
+
+  // Whether anyone other than `userId` has added this model.
+  hasOtherModelRegistrations(modelId: string, userId: string): boolean {
+    return !!getDb()
+      .prepare(`SELECT 1 FROM model_registrations WHERE model_id = ? AND user_id != ? LIMIT 1`)
+      .get(modelId, userId);
+  },
+
+  // Takes a model off one user's list without deleting the shared row: drops
+  // their registration and, if they were its creator, hands the row to the
+  // shared catalog (the others who added it still see it).
+  removeModelRegistration(userId: string, modelId: string): void {
+    const database = getDb();
+    database.transaction(() => {
+      database.prepare(`DELETE FROM model_registrations WHERE user_id = ? AND model_id = ?`).run(userId, modelId);
+      database.prepare(`UPDATE models SET created_by = NULL WHERE id = ? AND created_by = ?`).run(modelId, userId);
+    })();
+  },
+
+  hasModelRegistration(userId: string, modelId: string): boolean {
+    return !!getDb()
+      .prepare(`SELECT 1 FROM model_registrations WHERE user_id = ? AND model_id = ?`)
+      .get(userId, modelId);
   },
 
   // The live index hash for a repo/file path, if the index has one.
@@ -1100,9 +1161,12 @@ export const repo = {
   // that item (and potentially the whole run) would be stuck "running"
   // forever with no result and no clear error. Block deletion up front
   // instead.
+  // Scheduled counts too: its job already carries the model and will report
+  // results against it once claimed (audit 2026-10-18 A4). runs.model_id has
+  // no foreign key, so nothing below this check would stop the delete.
   countRunningTestsForModel(modelId: string): number {
     const row = getDb()
-      .prepare("SELECT COUNT(*) as n FROM runs WHERE model_id = ? AND status = 'running'")
+      .prepare("SELECT COUNT(*) as n FROM runs WHERE model_id = ? AND status IN ('running','scheduled')")
       .get(modelId) as { n: number };
     return row.n;
   },
@@ -1510,32 +1574,6 @@ export const repo = {
     return row.n > 0;
   },
 
-  // §0.5 -- 48h wall clock enforced continuously against RUNNING roots.
-  // Returns the ids that were just force-finalized (the caller cancels their
-  // pending jobs). Called from the trigger path and the maintenance reaper.
-  cancelExpiredRoots(): string[] {
-    const db = getDb();
-    const cutoff = Date.now() - CHAIN_WALL_CLOCK_MS;
-    const expired = db
-      .prepare(
-        `SELECT DISTINCT COALESCE(root_run_id, id) AS root FROM runs
-         WHERE status = 'running' AND started_at < ?`
-      )
-      .all(cutoff) as { root: string }[];
-    const cancelledIds: string[] = [];
-    for (const { root } of expired) {
-      const stillRunning = db
-        .prepare(`SELECT id FROM runs WHERE COALESCE(root_run_id, id) = ? AND status = 'running'`)
-        .all(root);
-      if (stillRunning.length === 0) continue;
-      for (const r of stillRunning) {
-        this.reconcileStaleTest(undefined, (r as { id: string }).id, "chain exceeded its 48 hour wall clock");
-        cancelledIds.push((r as { id: string }).id);
-      }
-    }
-    return cancelledIds;
-  },
-
   // backend_type/backend_device_name are denormalized from the parent run
   // here, not physical columns on `results` itself -- see ResultRow's own
   // doc comment for why (backend can't vary between one run's own items,
@@ -1626,7 +1664,8 @@ export const repo = {
   },
 
   // Catalog files still lacking the server's own HF header read: never tried,
-  // or a transient failure now due for retry. Only real content-addressed
+  // a transient failure now due for retry, or an ok read from before
+  // kv_layout. Only real content-addressed
   // rows (64-hex id) with an HF identity; the revision comes from the index
   // row when there is one (hf-header.ts checks the served sha256 either way).
   listModelsNeedingHfHeader(
@@ -1643,23 +1682,74 @@ export const repo = {
          LEFT JOIN model_hf_headers h ON h.sha256 = m.id
          WHERE m.hf_repo IS NOT NULL AND m.hf_file IS NOT NULL
            AND length(m.id) = 64
-           AND (h.sha256 IS NULL OR (h.status = 'failed' AND h.attempts < ? AND h.next_attempt_at <= ?))
+           AND (h.sha256 IS NULL
+                OR (h.status = 'failed' AND h.attempts < ? AND h.next_attempt_at <= ?)
+                -- Read before kv_layout existed: once more with the current
+                -- reader. Files that can't yield one (no KV geometry) never
+                -- match; the rest are bounded by the same attempt cap.
+                OR (h.status = 'ok' AND h.attempts < ?
+                    AND json_extract(h.fields_json, '$.kv_layout') IS NULL
+                    AND json_extract(h.fields_json, '$.n_head_kv') IS NOT NULL
+                    AND (json_extract(h.fields_json, '$.head_dim_k') IS NOT NULL
+                         OR json_extract(h.fields_json, '$.n_embd') IS NOT NULL))
+                -- Read before the per-block cache kinds and tensor maxima
+                -- (shared/fitSimulate.ts's partial-offload inputs) existed.
+                OR (h.status = 'ok' AND h.attempts < ?
+                    AND json_extract(h.fields_json, '$.kv_layout') IS NOT NULL
+                    AND json_extract(h.fields_json, '$.kv_layout.kinds') IS NULL))
          ORDER BY m.created_at DESC
          LIMIT ?`
       )
-      .all(HF_HEADER_MAX_ATTEMPTS, now, limit) as { id: string; hf_repo: string; hf_file: string; revision: string | null }[];
+      .all(HF_HEADER_MAX_ATTEMPTS, now, HF_HEADER_MAX_ATTEMPTS, HF_HEADER_MAX_ATTEMPTS, limit) as { id: string; hf_repo: string; hf_file: string; revision: string | null }[];
   },
 
+  // Counts an HF header read as attempted BEFORE it runs, so a read that
+  // takes the process down with it (audit 2026-10-18 A1) has still spent an
+  // attempt, and backed off, by the time the server is back -- instead of the
+  // same file being picked again on the first tick after every restart. A row
+  // already read ok keeps its header; only its re-read budget is spent.
+  markHfHeaderAttempt(sha256: string): void {
+    const now = Date.now();
+    const database = getDb();
+    const prev = database.prepare(`SELECT attempts, status FROM model_hf_headers WHERE sha256 = ?`).get(sha256) as
+      | { attempts: number; status: string }
+      | undefined;
+    const attempts = (prev?.attempts ?? 0) + 1;
+    const backoff = now + 10 * 60_000 * 2 ** (attempts - 1);
+    if (!prev) {
+      database
+        .prepare(
+          `INSERT INTO model_hf_headers (sha256, status, fields_json, reason, attempts, next_attempt_at, fetched_at)
+           VALUES (?, 'failed', NULL, 'read did not finish', ?, ?, ?)`
+        )
+        .run(sha256, attempts, backoff, now);
+    } else if (prev.status === "failed") {
+      database
+        .prepare(`UPDATE model_hf_headers SET attempts = ?, next_attempt_at = ?, reason = 'read did not finish' WHERE sha256 = ?`)
+        .run(attempts, backoff, sha256);
+    } else {
+      database.prepare(`UPDATE model_hf_headers SET attempts = ? WHERE sha256 = ?`).run(attempts, sha256);
+    }
+  },
+
+  // opts.attemptCounted: markHfHeaderAttempt already counted this read.
   recordHfHeader(
     sha256: string,
-    outcome: { status: "ok"; fields: Partial<ModelMetadata> } | { status: "unavailable" | "failed"; reason: string }
+    outcome: { status: "ok"; fields: Partial<ModelMetadata> } | { status: "unavailable" | "failed"; reason: string },
+    opts: { attemptCounted?: boolean } = {}
   ): void {
     const now = Date.now();
     const database = getDb();
-    const prev = database.prepare(`SELECT attempts FROM model_hf_headers WHERE sha256 = ?`).get(sha256) as
-      | { attempts: number }
+    const prev = database.prepare(`SELECT attempts, status FROM model_hf_headers WHERE sha256 = ?`).get(sha256) as
+      | { attempts: number; status: string }
       | undefined;
-    const attempts = (prev?.attempts ?? 0) + 1;
+    const attempts = opts.attemptCounted && prev ? prev.attempts : (prev?.attempts ?? 0) + 1;
+    // A failed re-read of a file already read ok keeps the good header; it
+    // only spends an attempt so the re-read stays bounded.
+    if (prev?.status === "ok" && outcome.status !== "ok") {
+      database.prepare(`UPDATE model_hf_headers SET attempts = ? WHERE sha256 = ?`).run(attempts, sha256);
+      return;
+    }
     // 10 min, 20, 40, 80, ... between transient retries.
     const nextAttemptAt = outcome.status === "failed" ? now + 10 * 60_000 * 2 ** (attempts - 1) : null;
     database
@@ -1768,6 +1858,10 @@ export const repo = {
     tx(items);
   },
 
+  hasTestItem(runId: string, idx: number): boolean {
+    return !!getDb().prepare(`SELECT 1 FROM run_items WHERE run_id = ? AND idx = ?`).get(runId, idx);
+  },
+
   getTestItems(runId: string): TestItem[] {
     const rows = getDb()
       .prepare("SELECT * FROM run_items WHERE run_id = ? ORDER BY idx ASC")
@@ -1793,7 +1887,11 @@ export const repo = {
            ram_free_before_mib = COALESCE(ram_free_before_mib, ?),
            vram_free_before_mib = COALESCE(vram_free_before_mib, ?),
            started_at = COALESCE(started_at, ?)
-         WHERE run_id = ? AND idx = ?`
+         WHERE run_id = ? AND idx = ?
+           -- A tick is fire-and-forget beside the item's terminal report and
+           -- can arrive after it; a finished item must stay finished, or its
+           -- run never finalizes (audit 2026-10-18 A2).
+           AND status NOT IN ('done','failed','failed_oom','failed_unsupported','failed_timeout','cancelled','skipped')`
       )
       .run(
         patch.status,
@@ -1833,6 +1931,17 @@ export const repo = {
 
     const tx = database.transaction(() => {
       const now = Date.now();
+      // Audit 2026-10-11 N6: the same terminal report can arrive twice -- a
+      // retry after a lost response, or a requeued job re-running an item.
+      // A repeat must be a no-op, not a UNIQUE-constraint 500 the worker then
+      // retries for a minute. A 'done' item stays done: its results are real,
+      // and a later re-run failing doesn't undo them. Other transitions
+      // (e.g. a stopped item the worker had in fact finished: cancelled ->
+      // done) still apply.
+      const current = database
+        .prepare(`SELECT status FROM run_items WHERE run_id = ? AND idx = ?`)
+        .get(runId, idx) as { status: string } | undefined;
+      if (!current || current.status === "done" || current.status === input.status) return;
       database
         .prepare(
           `UPDATE run_items SET
@@ -1881,11 +1990,18 @@ export const repo = {
               worker_id, llama_cpp_build, engine, raw_json_path, created_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         );
+        // An explicit check on the unique key rather than INSERT OR IGNORE,
+        // which would also swallow NOT NULL/CHECK failures on a bad row.
+        const resultExists = database.prepare(
+          `SELECT 1 FROM results WHERE run_id = ? AND idx = ? AND test_type = ?
+             AND COALESCE(n_depth, 0) = ? AND COALESCE(concurrency, 1) = ?`
+        );
         // Up to two rows for one idx (a pp row and a tg row from the same
         // benchmark process) -- distinguished by test_type, see
         // worker/src/index.ts's runSweepItem/runSweepItemViaServer.
         for (const resultInput of input.results) {
           const row = buildResultRow(runId, run.model_id, idx, resultInput);
+          if (resultExists.get(runId, idx, row.test_type, row.n_depth ?? 0, row.concurrency ?? 1)) continue;
           // §0.2/§0.8 -- one engine derivation feeds both the stored column
           // and the config hash, so twins can never disagree on engine.
           const engine = deriveEngineForResult(row, run);
@@ -1993,6 +2109,12 @@ export const repo = {
         database.prepare(`UPDATE runs SET backend_device_name = ? WHERE id = ?`).run(input.backend_device_name, runId);
       }
 
+      // A run that already finished (stopped, reconciled) keeps its outcome:
+      // this late report still records the item and its results above, but
+      // re-finalizing would rewrite completed_at and relabel the stop
+      // (audit 2026-10-18 A2, the rest of N17).
+      const runStatus = (database.prepare(`SELECT status FROM runs WHERE id = ?`).get(runId) as { status: string }).status;
+      if (runStatus !== "running" && runStatus !== "scheduled") return;
       if (this.countUnfinishedItems(runId) === 0) {
         this.finalizeTest(runId, now);
       }
@@ -2000,6 +2122,32 @@ export const repo = {
     tx();
 
     return this.getTest(undefined, runId);
+  },
+
+  // Runs left running/scheduled with no job left to finish them: every job of
+  // theirs reached a terminal state (or was pruned) more than `graceMs` ago, yet an item never
+  // got its terminal report (lost after the worker's retries, or -- before the
+  // tick guard -- reverted by a late tick). Without this they show "running"
+  // forever and hold one of the owner's active-run slots (audit 2026-10-18
+  // A2). The grace covers the gap between an install_build finishing and its
+  // benchmark job being claimed (that job is pending, so the run is skipped
+  // anyway) and a worker whose last item reports were still retrying.
+  listOrphanedActiveTests(graceMs: number, now = Date.now()): string[] {
+    return (
+      getDb()
+        .prepare(
+          `SELECT r.id FROM runs r
+           WHERE r.status IN ('running','scheduled')
+             AND NOT EXISTS (SELECT 1 FROM worker_jobs j WHERE j.run_id = r.id AND j.status IN ('pending','claimed'))
+             -- No jobs left at all (terminal ones are pruned after 7 days):
+             -- the run's own start time stands in.
+             AND COALESCE(
+                   (SELECT MAX(COALESCE(j.completed_at, j.claimed_at, j.created_at)) FROM worker_jobs j WHERE j.run_id = r.id),
+                   r.started_at
+                 ) < ?`
+        )
+        .all(now - graceMs) as { id: string }[]
+    ).map((r) => r.id);
   },
 
   countUnfinishedItems(runId: string): number {
@@ -2124,7 +2272,11 @@ export const repo = {
   // reportJobFailure below instead (see that function's own doc comment for
   // why conflating the two mislabels a genuine error as "cancelled").
   reconcileStaleTest(userId: string | undefined, runId: string, note: string): Test | undefined {
-    if (!this.getTest(userId, runId)) return undefined;
+    const existing = this.getTest(userId, runId);
+    if (!existing) return undefined;
+    // Already finished: nothing is unfinished to cancel, and re-finalizing
+    // would rewrite completed_at and relabel a real stop (audit N17).
+    if (isFinishedTest(existing)) return existing;
     const database = getDb();
     const now = Date.now();
     const tx = database.transaction(() => {
@@ -2154,7 +2306,12 @@ export const repo = {
   // summary; overwritten here with the worker's actual reported text so the
   // run-level line stays specific instead of vague.
   reportJobFailure(userId: string | undefined, runId: string, note: string): Test | undefined {
-    if (!this.getTest(userId, runId)) return undefined;
+    const existing = this.getTest(userId, runId);
+    if (!existing) return undefined;
+    // A job that fails after its run already finished (e.g. every item
+    // reported, then something after that broke) must not overwrite the
+    // finished run's outcome (audit N17/N5).
+    if (isFinishedTest(existing)) return existing;
     const database = getDb();
     const now = Date.now();
     const tx = database.transaction(() => {
@@ -2340,7 +2497,27 @@ export const repo = {
     // a standing state, matching the worker's own existing
     // pauseRequested/resume semantics (worker/src/index.ts).
     setPauseRequested(workerId: string, paused: boolean): void {
-      getDb().prepare(`UPDATE workers SET pause_requested = ? WHERE id = ?`).run(paused ? 1 : 0, workerId);
+      const database = getDb();
+      const now = Date.now();
+      database
+        .prepare(
+          `UPDATE workers SET pause_requested = ?,
+             pause_requested_at = CASE WHEN ? = 0 THEN NULL WHEN pause_requested = 1 THEN pause_requested_at ELSE ? END
+           WHERE id = ?`
+        )
+        .run(paused ? 1 : 0, paused ? 1 : 0, now, workerId);
+      // Time spent paused isn't a stall: the stall clock restarts on resume.
+      if (!paused) {
+        database.prepare(`UPDATE worker_jobs SET progress_at = ? WHERE worker_id = ? AND status = 'claimed'`).run(now, workerId);
+      }
+    },
+
+    // When the machine's current pause started, if it is paused.
+    getPausedSince(workerId: string): number | null {
+      const row = getDb().prepare(`SELECT pause_requested, pause_requested_at FROM workers WHERE id = ?`).get(workerId) as
+        | { pause_requested: number; pause_requested_at: number | null }
+        | undefined;
+      return row?.pause_requested === 1 ? row.pause_requested_at : null;
     },
 
     getPauseRequested(workerId: string): boolean {
@@ -2881,8 +3058,8 @@ export const repo = {
 
         const now = Date.now();
         database
-          .prepare(`UPDATE worker_jobs SET status = 'claimed', lease_expires_at = ?, claimed_at = ? WHERE id = ?`)
-          .run(now + LEASE_MS, now, job.id);
+          .prepare(`UPDATE worker_jobs SET status = 'claimed', lease_expires_at = ?, claimed_at = ?, progress_at = ? WHERE id = ?`)
+          .run(now + LEASE_MS, now, now, job.id);
 
         // Set immediately, in the same transaction as the claim -- NOT left
         // to wait for the worker's first heartbeat (which reports active_job
@@ -2910,9 +3087,27 @@ export const repo = {
                WHERE id = ? AND status NOT IN ('done','partial','failed','cancelled')`
             )
             .run(now, job.run_id);
+          // Pause is a per-machine flag; a new run always starts unpaused, so a
+          // pause left over from an earlier run can't stop this one after its
+          // first item (audit 2026-10-11 N7).
+          database.prepare(`UPDATE workers SET pause_requested = 0, pause_requested_at = NULL WHERE id = ?`).run(workerId);
         }
 
-        return { job_id: job.id, type: job.job_type, payload: JSON.parse(job.payload_json) } as QueueJob;
+        const payload = JSON.parse(job.payload_json);
+        // A requeued benchmark resumes after the items it already finished
+        // (audit 2026-10-11 N6) -- see BenchmarkJob.completed_idx.
+        if (job.run_id && job.job_type === "benchmark") {
+          payload.completed_idx = (
+            database
+              .prepare(
+                `SELECT idx FROM run_items
+                 WHERE run_id = ? AND status IN ('done','failed','failed_oom','failed_unsupported','failed_timeout','cancelled','skipped')
+                 ORDER BY idx`
+              )
+              .all(job.run_id) as { idx: number }[]
+          ).map((r) => r.idx);
+        }
+        return { job_id: job.id, type: job.job_type, payload } as QueueJob;
       });
       return tx();
     },
@@ -2934,8 +3129,12 @@ export const repo = {
         | undefined;
       if (!job || job.worker_id !== workerId || job.status !== "claimed") return undefined;
       database
-        .prepare(`UPDATE worker_jobs SET lease_expires_at = ?, progress_json = ? WHERE id = ?`)
-        .run(Date.now() + LEASE_MS, JSON.stringify(report), jobId);
+        .prepare(
+          `UPDATE worker_jobs SET lease_expires_at = ?, progress_json = ?,
+             progress_at = CASE WHEN progress_json IS ? THEN progress_at ELSE ? END
+           WHERE id = ?`
+        )
+        .run(Date.now() + LEASE_MS, JSON.stringify(report), JSON.stringify(report), Date.now(), jobId);
       return { cancel_requested: job.cancel_requested === 1, discard_requested: job.discard_requested === 1 };
     },
 
@@ -3134,6 +3333,73 @@ export const repo = {
         )
         .run(jobId);
       database.prepare(`UPDATE workers SET active_job_id = NULL WHERE active_job_id = ?`).run(jobId);
+    },
+
+    // An item tick or terminal report for this run: its job is moving.
+    touchRunProgress(runId: string): void {
+      getDb()
+        .prepare(`UPDATE worker_jobs SET progress_at = ? WHERE run_id = ? AND status = 'claimed'`)
+        .run(Date.now(), runId);
+    },
+
+    // Claimed run jobs on an unpaused machine with no sign of progress since
+    // `before` (see worker_jobs.progress_at).
+    listStalledRunJobs(before: number): { id: string; run_id: string; worker_id: string }[] {
+      const database = getDb();
+      // Jobs claimed before progress_at existed start their clock now rather
+      // than counting from claimed_at, so a deploy can't stop a healthy run.
+      database
+        .prepare(`UPDATE worker_jobs SET progress_at = ? WHERE status = 'claimed' AND progress_at IS NULL`)
+        .run(Date.now());
+      return database
+        .prepare(
+          `SELECT j.id, j.run_id, j.worker_id FROM worker_jobs j
+           JOIN workers w ON w.id = j.worker_id
+           WHERE j.status = 'claimed' AND j.run_id IS NOT NULL
+             AND w.pause_requested = 0 AND j.progress_at < ?`
+        )
+        .all(before) as { id: string; run_id: string; worker_id: string }[];
+    },
+
+    // Machines paused since before `before`, with the runs they hold.
+    listLongPausedWorkers(before: number): { worker_id: string; run_ids: string[] }[] {
+      const database = getDb();
+      // A pause from before pause_requested_at existed starts its clock now.
+      database
+        .prepare(`UPDATE workers SET pause_requested_at = ? WHERE pause_requested = 1 AND pause_requested_at IS NULL`)
+        .run(Date.now());
+      const workers = database
+        .prepare(`SELECT id FROM workers WHERE pause_requested = 1 AND pause_requested_at < ?`)
+        .all(before) as { id: string }[];
+      return workers.map(({ id }) => ({
+        worker_id: id,
+        run_ids: (
+          database
+            .prepare(
+              `SELECT DISTINCT run_id FROM worker_jobs
+               WHERE worker_id = ? AND run_id IS NOT NULL AND status IN ('pending','claimed')`
+            )
+            .all(id) as { run_id: string }[]
+        ).map((r) => r.run_id),
+      }));
+    },
+
+    // Undoes a claim whose job never reached the worker (its long-poll
+    // connection closed before the response was flushed -- routes/queue.ts's
+    // sendClaimedJob). Unlike returnToPending this doesn't count an attempt:
+    // nothing ran. The parent run keeps the 'running' status the claim gave
+    // it; the next claim re-stamps started_at.
+    unclaimJob(jobId: string): void {
+      const database = getDb();
+      const { changes } = database
+        .prepare(
+          `UPDATE worker_jobs SET status = 'pending', lease_expires_at = NULL, claimed_at = NULL, progress_at = NULL
+           WHERE id = ? AND status = 'claimed'`
+        )
+        .run(jobId);
+      if (changes > 0) {
+        database.prepare(`UPDATE workers SET active_job_id = NULL WHERE active_job_id = ?`).run(jobId);
+      }
     },
 
     // §1.7's own maintenance-sweep spec: "terminal-job pruning

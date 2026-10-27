@@ -2,6 +2,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from
 import { mkdtempSync, existsSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { hostFetch } from "../test-host-fetch.js";
 import Fastify, { type FastifyInstance } from "fastify";
 import fastifyCookie from "@fastify/cookie";
 
@@ -58,10 +59,9 @@ beforeAll(async () => {
     return originalFetch(url as any, init);
   }) as typeof fetch;
 
-  // trustProxy so req.hostname reads X-Forwarded-Host, letting the admin-
-  // hostname tests below simulate a second origin without a real DNS entry
-  // -- see admin.test.ts's own doc comment for why (Host itself can't be
-  // overridden via fetch()).
+  // trustProxy on, like production behind nginx: the admin origin must still
+  // be chosen by the real Host header only (sent via hostFetch, since fetch()
+  // can't set one), never by X-Forwarded-Host.
   app = Fastify({ logger: false, trustProxy: true });
   await app.register(fastifyCookie);
   await app.register(authRoutes);
@@ -97,7 +97,7 @@ async function startLogin(
   extraHeaders: Record<string, string> = {},
   query = ""
 ): Promise<{ state: string; stateCookie: string; linkCookie?: string }> {
-  const res = await fetch(`${baseUrl}/auth/github${query}`, { redirect: "manual", headers: extraHeaders });
+  const res = await hostFetch(`${baseUrl}/auth/github${query}`, { redirect: "manual", headers: extraHeaders });
   expect(res.status).toBe(302);
   const location = res.headers.get("location")!;
   const state = new URL(location).searchParams.get("state")!;
@@ -341,17 +341,16 @@ describe("GET /auth/:provider/callback", () => {
 
 // Multi-user Stage 5 (MULTIUSER_PLAN.md §5.1): the admin origin's own OAuth
 // branch -- lookup-only (never mints a new account), superadmin-gated, and
-// a host-only session cookie. Uses X-Forwarded-Host (see beforeAll's own
-// trustProxy comment) to simulate the second hostname.
+// a host-only session cookie. Sends the admin Host header via hostFetch.
 describe("admin origin OAuth branch (§5.1)", () => {
   async function startAdminLogin(extraHeaders: Record<string, string> = {}) {
-    return startLogin({ "x-forwarded-host": ADMIN_HOST, ...extraHeaders });
+    return startLogin({ host: ADMIN_HOST, ...extraHeaders });
   }
 
   it("the start handler builds a redirect_uri pointing at the ADMIN origin's own callback", async () => {
-    const res = await fetch(`${baseUrl}/auth/github`, {
+    const res = await hostFetch(`${baseUrl}/auth/github`, {
       redirect: "manual",
-      headers: { "x-forwarded-host": ADMIN_HOST },
+      headers: { host: ADMIN_HOST },
     });
     const location = res.headers.get("location")!;
     const redirectUri = new URL(location).searchParams.get("redirect_uri")!;
@@ -366,16 +365,16 @@ describe("admin origin OAuth branch (§5.1)", () => {
     // to "the operator already has an account from using the main app").
     repo.userRepo.upsertByIdentity("github", { providerUserId: "9100", login: "the-admin", avatarUrl: null });
     const login = await startAdminLogin();
-    const callbackRes = await fetch(`${baseUrl}/auth/github/callback?code=x&state=${login.state}`, {
+    const callbackRes = await hostFetch(`${baseUrl}/auth/github/callback?code=x&state=${login.state}`, {
       redirect: "manual",
-      headers: { cookie: `oauth_state=${login.stateCookie}`, "x-forwarded-host": ADMIN_HOST },
+      headers: { cookie: `oauth_state=${login.stateCookie}`, host: ADMIN_HOST },
     });
     const adminSessionToken = cookieValue(callbackRes, "lt_session")!;
     expect(adminSessionToken).toBeDefined();
 
-    const res = await fetch(`${baseUrl}/auth/github?link=1`, {
+    const res = await hostFetch(`${baseUrl}/auth/github?link=1`, {
       redirect: "manual",
-      headers: { cookie: `lt_session=${adminSessionToken}`, "x-forwarded-host": ADMIN_HOST },
+      headers: { cookie: `lt_session=${adminSessionToken}`, host: ADMIN_HOST },
     });
     expect(cookieValue(res, "oauth_link_user")).toBeUndefined();
     const { getDb } = await import("../db/migrate.js");
@@ -388,9 +387,9 @@ describe("admin origin OAuth branch (§5.1)", () => {
     repo.userRepo.upsertByIdentity("github", { providerUserId: "9100", login: "the-admin", avatarUrl: null });
 
     const login = await startAdminLogin();
-    const res = await fetch(`${baseUrl}/auth/github/callback?code=x&state=${login.state}`, {
+    const res = await hostFetch(`${baseUrl}/auth/github/callback?code=x&state=${login.state}`, {
       redirect: "manual",
-      headers: { cookie: `oauth_state=${login.stateCookie}`, "x-forwarded-host": ADMIN_HOST },
+      headers: { cookie: `oauth_state=${login.stateCookie}`, host: ADMIN_HOST },
     });
     expect(res.headers.get("location")).toBe("/");
     const token = cookieValue(res, "lt_session");
@@ -411,9 +410,9 @@ describe("admin origin OAuth branch (§5.1)", () => {
     process.env.SUPERADMIN_IDENTITIES = "github:9100,github:9101";
 
     const login = await startAdminLogin();
-    const res = await fetch(`${baseUrl}/auth/github/callback?code=x&state=${login.state}`, {
+    const res = await hostFetch(`${baseUrl}/auth/github/callback?code=x&state=${login.state}`, {
       redirect: "manual",
-      headers: { cookie: `oauth_state=${login.stateCookie}`, "x-forwarded-host": ADMIN_HOST },
+      headers: { cookie: `oauth_state=${login.stateCookie}`, host: ADMIN_HOST },
     });
     // Bounces to the MAIN site's absolute /login, not a relative one --
     // this origin's own admin SPA has no login page.
@@ -429,9 +428,9 @@ describe("admin origin OAuth branch (§5.1)", () => {
     repo.userRepo.upsertByIdentity("github", { providerUserId: "9102", login: "regular-account", avatarUrl: null });
 
     const login = await startAdminLogin();
-    const res = await fetch(`${baseUrl}/auth/github/callback?code=x&state=${login.state}`, {
+    const res = await hostFetch(`${baseUrl}/auth/github/callback?code=x&state=${login.state}`, {
       redirect: "manual",
-      headers: { cookie: `oauth_state=${login.stateCookie}`, "x-forwarded-host": ADMIN_HOST },
+      headers: { cookie: `oauth_state=${login.stateCookie}`, host: ADMIN_HOST },
     });
     expect(res.headers.get("location")).toBe("http://localhost:9999/login?error=not_authorized");
     expect(cookieValue(res, "lt_session")).toBeUndefined();

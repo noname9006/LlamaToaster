@@ -324,3 +324,57 @@ describe("parseDeviceStart", () => {
     expect(() => parseDeviceStart(body({ hardware: { platform: "linux" } }))).toThrow(BadRequestError);
   });
 });
+
+// Audit 2026-10-18 A1/A3: header numbers size loops and allocations
+// downstream, so an implausible or malformed reading must be dropped -- but
+// only for that one file: rejecting the whole state push would take the
+// machine offline (heartbeat and queue poll both).
+describe("parseWorkerState model_files header fields", () => {
+  const good = {
+    path: "good.gguf",
+    size_bytes: 1,
+    n_layer: 2,
+    quant: "Q4_K_M",
+    tensor_layer_bytes: { dense: [10, 10], moe: [0, 0], embed: 1, output: 1, other: 0 },
+  };
+
+  it("keeps a plausible reading as reported", () => {
+    const state = parseWorkerState(validBody({ model_files: [good] }));
+    expect(state.model_files[0]).toMatchObject({ n_layer: 2, quant: "Q4_K_M", tensor_layer_bytes: { dense: [10, 10] } });
+  });
+
+  it("drops every header field of a file with an implausible layer count, and keeps the other files", () => {
+    const state = parseWorkerState(
+      validBody({
+        model_files: [
+          { path: "bad.gguf", size_bytes: 5, sha256: "a".repeat(64), n_layer: 1_000_000_000, quant: "Q8_0", n_head_kv: 8 },
+          good,
+        ],
+      })
+    );
+    expect(state.model_files[0]).toEqual({ path: "bad.gguf", size_bytes: 5, sha256: "a".repeat(64), hf_match: null });
+    expect(state.model_files[1]).toMatchObject({ n_layer: 2 });
+  });
+
+  it("drops a malformed or mismatched per-layer breakdown instead of rejecting the push", () => {
+    const longBreakdown = { dense: new Array(5000).fill(1), moe: new Array(5000).fill(0), embed: 0, output: 0, other: 0 };
+    const state = parseWorkerState(
+      validBody({
+        model_files: [
+          { path: "a.gguf", size_bytes: 1, tensor_layer_bytes: longBreakdown },
+          { path: "b.gguf", size_bytes: 1, n_layer: 3, tensor_layer_bytes: good.tensor_layer_bytes },
+          { path: "c.gguf", size_bytes: 1, n_layer: "many" },
+          { path: "d.gguf", size_bytes: 1, n_layer: 2.5 },
+        ],
+      })
+    );
+    for (const f of state.model_files) {
+      expect(f.n_layer).toBeUndefined();
+      expect(f.tensor_layer_bytes).toBeUndefined();
+    }
+  });
+
+  it("still rejects a broken file entry itself (no path or size)", () => {
+    expect(() => parseWorkerState(validBody({ model_files: [{ n_layer: 2 }] }))).toThrow(BadRequestError);
+  });
+});

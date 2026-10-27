@@ -50,6 +50,18 @@ function buildGguf(nLayer: number): Buffer {
 
 const SHA = "ab".repeat(32);
 const file = buildGguf(16);
+// Audit 2026-10-18 A1: a few hundred bytes claiming 300M layers (with one
+// tensor and KV geometry, so every per-layer path is reached) used to kill
+// the process with an uncatchable heap OOM.
+const BOMB_SHA = "b0".repeat(32);
+const bomb = Buffer.concat([
+  u32(0x46554747), u32(3), u64(1), u64(4),
+  kvString("general.architecture", "llama"),
+  kvU32("llama.block_count", 300_000_000),
+  kvU32("llama.attention.head_count_kv", 8),
+  kvU32("llama.attention.key_length", 128),
+  Buffer.concat([str("blk.0.attn_q.weight"), u32(1), u64(16), u32(0), u64(0)]),
+]);
 
 // Fake HF: resolve/ 302s to a "CDN" path with HF's own headers; the CDN
 // honours Range. Behaviour per repo name lets each test pick a scenario.
@@ -69,6 +81,10 @@ beforeAll(async () => {
       if (url.startsWith("/moved/")) return void res.writeHead(307, { location: url.replace("/moved/", "/org/") }).end();
       if (url.startsWith("/offsite/")) return void res.writeHead(302, { location: "https://evil.example/f.gguf" }).end();
       if (url.startsWith("/inline/")) return void res.writeHead(200).end("small");
+      if (url.startsWith("/bomb/")) {
+        res.writeHead(302, { location: "/cdn-bomb", "x-linked-etag": `"${BOMB_SHA}"`, "x-linked-size": String(bomb.length + 64) });
+        return void res.end();
+      }
       const etag = url.startsWith("/wrongsha/") ? "cd".repeat(32) : url.startsWith("/norange-ef/") ? "ef".repeat(32) : SHA;
       const cdn = url.startsWith("/norange") ? "/cdn-norange" : "/cdn";
       res.writeHead(302, { location: cdn, "x-linked-etag": `"${etag}"`, "x-linked-size": String(file.length) });
@@ -83,6 +99,14 @@ beforeAll(async () => {
       return void res.end(file.subarray(s, e + 1));
     }
     if (url === "/cdn-norange") return void res.writeHead(200).end(file);
+    if (url === "/cdn-bomb") {
+      // Past the end of the bytes, the "file" is zeros.
+      const m = /bytes=(\d+)-(\d+)/.exec(req.headers.range ?? "");
+      const padded = Buffer.concat([bomb, Buffer.alloc(64)]);
+      const [s, e] = m ? [Number(m[1]), Number(m[2])] : [0, padded.length - 1];
+      res.writeHead(206, { "content-range": `bytes ${s}-${e}/${padded.length}` });
+      return void res.end(padded.subarray(s, e + 1));
+    }
     res.writeHead(404).end();
   });
   await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
@@ -132,6 +156,15 @@ describe("fetchHfHeader", () => {
   it("a CDN that ignores Range is a retryable failure, never a partial 'ok'", async () => {
     expect(await fetchHfHeader("norange/r", "f.gguf", "main", SHA, base)).toMatchObject({ status: "failed" });
   });
+
+  it("refuses a header claiming an implausible layer count, quickly and without a large allocation", async () => {
+    const heapBefore = process.memoryUsage().heapUsed;
+    const t0 = Date.now();
+    const out = await fetchHfHeader("bomb/r", "f.gguf", "main", BOMB_SHA, base);
+    expect(out).toMatchObject({ status: "unavailable", reason: expect.stringContaining("implausible") });
+    expect(Date.now() - t0).toBeLessThan(2000);
+    expect(process.memoryUsage().heapUsed - heapBefore).toBeLessThan(64 * 1024 * 1024);
+  });
 });
 
 describe("runHfHeaderTick", () => {
@@ -154,6 +187,49 @@ describe("runHfHeaderTick", () => {
     resolveRequests = 0;
     await runHfHeaderTick(base);
     expect(resolveRequests).toBe(0);
+  });
+
+  it("re-reads an ok header from before kv_layout once, and a failed re-read keeps the old header", async () => {
+    const old = { n_layer: 16, n_head_kv: 8, head_dim_k: 128, head_dim_v: 128 };
+    // Good file: re-read picks up the current reader's fields.
+    repo.registerModel({ id: SHA, filename: "f.gguf", size_bytes: 1, source: "huggingface", hf_repo: "org/r", hf_file: "f.gguf" });
+    repo.recordHfHeader(SHA, { status: "ok", fields: old });
+    expect(repo.listModelsNeedingHfHeader(10, Date.now()).map((m) => m.id)).toContain(SHA);
+    // Failing file (CDN ignores Range): the stored header must survive.
+    const sha = "12".repeat(32);
+    repo.registerModel({ id: sha, filename: "f.gguf", size_bytes: 1, source: "huggingface", hf_repo: "norange/r", hf_file: "f.gguf" });
+    repo.recordHfHeader(sha, { status: "ok", fields: old });
+    await runHfHeaderTick(base);
+    expect(repo.resolveHeaderFields(sha)).toEqual(old);
+    // The good file's fixture has no head dims, so it isn't due again.
+    expect(repo.listModelsNeedingHfHeader(10, Date.now()).map((m) => m.id)).not.toContain(SHA);
+    // The failing one stays due only until the attempt cap.
+    for (let i = 0; i < 10; i++) repo.recordHfHeader(sha, { status: "failed", reason: "x" });
+    expect(repo.resolveHeaderFields(sha)).toEqual(old);
+    expect(repo.listModelsNeedingHfHeader(10, Date.now()).map((m) => m.id)).not.toContain(sha);
+  });
+
+  it("a read that never finished (the process died during it) still spends an attempt and backs off", async () => {
+    const sha = "cc".repeat(32);
+    repo.registerModel({ id: sha, filename: "f.gguf", size_bytes: 1, source: "huggingface", hf_repo: "org/crash", hf_file: "f.gguf" });
+    expect(repo.listModelsNeedingHfHeader(50, Date.now()).map((m) => m.id)).toContain(sha);
+    // What runHfHeaderTick does before reading -- then the "crash": no outcome is recorded.
+    repo.markHfHeaderAttempt(sha);
+    expect(repo.listModelsNeedingHfHeader(50, Date.now()).map((m) => m.id)).not.toContain(sha);
+    expect(repo.listModelsNeedingHfHeader(50, Date.now() + 11 * 60_000).map((m) => m.id)).toContain(sha);
+    // ...and only up to the attempt cap.
+    for (let i = 0; i < 10; i++) repo.markHfHeaderAttempt(sha);
+    expect(repo.listModelsNeedingHfHeader(50, Date.now() + 365 * 24 * 3600_000).map((m) => m.id)).not.toContain(sha);
+  });
+
+  it("counts a finished read once, not twice", async () => {
+    const sha = "dd".repeat(32);
+    repo.markHfHeaderAttempt(sha);
+    repo.recordHfHeader(sha, { status: "failed", reason: "x" }, { attemptCounted: true });
+    repo.recordHfHeader(sha, { status: "failed", reason: "y" });
+    // Two reads so far: the next one is the third.
+    const { getDb } = await import("./db/migrate.js");
+    expect((getDb().prepare(`SELECT attempts FROM model_hf_headers WHERE sha256 = ?`).get(sha) as { attempts: number }).attempts).toBe(2);
   });
 
   it("backs off after a transient failure instead of retrying every tick", async () => {

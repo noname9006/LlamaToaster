@@ -3,7 +3,7 @@ import { repo } from "../db/repo.js";
 import { generateState, safeEqual } from "../session.js";
 import { resolveAuthUser } from "../auth-middleware.js";
 import { isSuperadminIdentity } from "../superadmin.js";
-import { ADMIN_HOSTNAME } from "./admin.js";
+import { isAdminHost } from "./admin.js";
 import type { AuthStatus, AuthUser } from "../../../shared/types.js";
 
 // Same-origin decision (MULTIUSER_PLAN.md §0.5): secure is DERIVED, never
@@ -33,7 +33,7 @@ function cookiesSecure(): boolean {
 // of the admin one, and the hostname branch below would never even see the
 // request.
 function originForRequest(req: FastifyRequest): string | undefined {
-  if (ADMIN_HOSTNAME && req.hostname === ADMIN_HOSTNAME) return process.env.ADMIN_PUBLIC_URL;
+  if (isAdminHost(req)) return process.env.ADMIN_PUBLIC_URL;
   return process.env.PUBLIC_URL;
 }
 
@@ -148,7 +148,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       // explicitly rather than relying on the admin cookie jar's isolation
       // alone, since an admin-origin session visiting this URL with ?link=1
       // would otherwise still have a real `authed` to carry through.
-      const authed = ADMIN_HOSTNAME && req.hostname === ADMIN_HOSTNAME ? null : resolveAuthUser(req);
+      const authed = isAdminHost(req) ? null : resolveAuthUser(req);
       // Stored server-side, keyed by this state and bound to this session --
       // never in a cookie, which the client could forge to name any user.
       if (req.query.link === "1" && authed) {
@@ -249,7 +249,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       // must never fall through to upsertByIdentity (which would silently
       // mint a normal-user account for someone who isn't already
       // allowlisted) or to the linking flow (a main-site-only concept).
-      if (ADMIN_HOSTNAME && req.hostname === ADMIN_HOSTNAME) {
+      if (isAdminHost(req)) {
         // Lookup-only -- findByIdentity returns undefined for anyone who
         // has never logged into the MAIN site with this identity before,
         // which is the common case for "not actually an admin" and is

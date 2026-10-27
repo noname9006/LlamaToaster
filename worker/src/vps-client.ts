@@ -22,6 +22,7 @@ import type { ProbeDedupPoint } from "../../shared/api-v8.js";
 import { isRocmSupportList, type RocmSupportList } from "../../shared/rocmSupport.js";
 import type { FitPoint } from "../../shared/fitParams.js";
 import type { KvSupportRow } from "../../shared/kvSupport.js";
+import type { FitCheckResult } from "../../shared/types.js";
 
 // The server's daily-refreshed list of AMD GPUs ROCm supports -- used only to
 // pick the default backend at startup (see worker/src/index.ts). Public route
@@ -161,6 +162,22 @@ export async function postFitPoints(
     signal: AbortSignal.timeout(timeoutMs),
   });
   if (!res.ok) throw new HttpError(res.status, `fit points failed (${res.status}): ${await res.text()}`);
+}
+
+// docs/plans/HEADER_FIT_PLAN.md: a fit_check job's answers, posted per model.
+export async function postFitChecks(
+  url: string,
+  token: string,
+  body: { machine_id?: string; results: FitCheckResult[] },
+  timeoutMs = 10_000
+): Promise<void> {
+  const res = await fetch(`${url}/api/worker/fit-checks`, {
+    method: "POST",
+    headers: { "content-type": "application/json", ...authHeader(token) },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  if (!res.ok) throw new HttpError(res.status, `fit checks failed (${res.status}): ${await res.text()}`);
 }
 
 export async function postKvSupport(

@@ -239,6 +239,11 @@ function aiConfig(): AiConfig | null {
 // on process restart. "google/gemma-4-31b-it:free,google/gemma-4-26b-a4b-it:free,openrouter/free"
 // with a bad first entry means every request eats the full fallback chain
 // otherwise.
+// X-Accel-Buffering: nginx would otherwise buffer the stream and deliver the
+// reply in one piece at the end (audit 2026-09-27 M4; deploy/nginx.conf also
+// turns buffering off for this route).
+const SSE_HEADERS = { "content-type": "text/event-stream", "cache-control": "no-cache", "x-accel-buffering": "no" };
+
 const MODEL_COOLDOWN_MS = 15 * 60 * 1000;
 // Per-attempt timeout, not overall -- "a couple of requests with a timeout"
 // means each attempt gets its own clock, not one budget shared across
@@ -787,7 +792,7 @@ export async function aiRoutes(app: FastifyInstance): Promise<void> {
               // which is flushed by reply.send(), which we never call on
               // this path.
               reply.hijack();
-              reply.raw.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+              reply.raw.writeHead(200, SSE_HEADERS);
               // Lets the client attribute this reply to the model that
               // actually produced it (fallback chains mean that isn't always
               // config.models[0]) -- sent once, before any content delta.
@@ -851,7 +856,7 @@ export async function aiRoutes(app: FastifyInstance): Promise<void> {
       if (!streamingToClient) {
         finished = true;
         reply.hijack();
-        reply.raw.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+        reply.raw.writeHead(200, SSE_HEADERS);
         reply.raw.write(`data: ${JSON.stringify({ model: usedModel })}\n\n`);
         reply.raw.write(`data: ${JSON.stringify({ choices: [{ delta: { content: "" } }] })}\n\n`);
       }
@@ -871,7 +876,7 @@ export async function aiRoutes(app: FastifyInstance): Promise<void> {
     );
     finished = true;
     reply.hijack();
-    reply.raw.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+    reply.raw.writeHead(200, SSE_HEADERS);
     reply.raw.write(
       `data: ${JSON.stringify({ choices: [{ delta: { content: "(stopped after several tool calls without a final answer -- try rephrasing.)" } }] })}\n\n`
     );

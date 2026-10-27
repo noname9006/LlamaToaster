@@ -154,8 +154,11 @@ export async function runHfHeaderTick(baseUrl = HF_BASE): Promise<number> {
 
   const due = repo.listModelsNeedingHfHeader(FILES_PER_TICK, Date.now());
   for (const m of due) {
+    // Counted before the read, so one that crashes the process can't be
+    // retried on every restart (audit 2026-10-18 A1).
+    repo.markHfHeaderAttempt(m.id);
     const outcome = await fetchHfHeader(m.hf_repo, m.hf_file, m.revision ?? "main", m.id, baseUrl);
-    repo.recordHfHeader(m.id, outcome);
+    repo.recordHfHeader(m.id, outcome, { attemptCounted: true });
     if (outcome.status === "ok") {
       const current = repo.getModel(m.id);
       if (current) repo.setModelMetadata(m.id, withHeaderFields(current.metadata, repo.resolveHeaderFields(m.id)));

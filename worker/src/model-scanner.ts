@@ -9,6 +9,13 @@ import { LocalModelCache, type LocalCacheEntry } from "./local-cache.js";
 import { readGgufInfo } from "./gguf.js";
 import type { ModelDirFile, LocalModelState } from "../../shared/types.js";
 
+// A reconciliation can hash a large model_dir for many minutes, during which
+// the worker may rotate its token -- pass a getter so each request uses the
+// current one rather than the value captured at the start (audit 2026-10-11
+// N18). A plain string still works for one-off callers and tests.
+export type TokenSource = string | (() => string);
+const tokenOf = (source: TokenSource): string => (typeof source === "function" ? source() : source);
+
 // How often an already-matched entry gets re-verified against the server
 // (matches the server's own HF_INDEX_REFRESH_INTERVAL_MS staleness window).
 // Without this, a match found once was cached forever and never re-checked,
@@ -285,7 +292,7 @@ export class HashingQueue {
  */
 export async function lookupHashes(
   apiBaseUrl: string,
-  authToken: string,
+  authToken: TokenSource,
   hashes: string[]
 ): Promise<
   Map<string, { repo_id: string; filename: string; revision: string; deleted_at: number | null; replaced_by_sha256: string | null }>
@@ -309,7 +316,7 @@ export async function lookupHashes(
         method: "POST",
         headers: {
           "content-type": "application/json",
-          authorization: `Bearer ${authToken}`,
+          authorization: `Bearer ${tokenOf(authToken)}`,
         },
         body: JSON.stringify({ hashes: batch }),
       });
@@ -366,7 +373,7 @@ export async function lookupHashes(
 export async function resolveHfMetadata(
   cache: LocalModelCache,
   apiBaseUrl: string,
-  authToken: string
+  authToken: TokenSource
 ): Promise<void> {
   const entries = await cache.getAll();
   const hashesToLookup: string[] = [];
@@ -435,7 +442,10 @@ export async function resolveHfMetadata(
 export async function backfillGgufMetadata(modelDir: string, cache: LocalModelCache): Promise<void> {
   const entries = await cache.getAll();
   for (const entry of entries) {
-    if (!isGgufCheckStale(entry.gguf_checked_at)) continue;
+    // A layout read before the per-block cache kinds existed is re-read now,
+    // not after the daily window (shared/fitSimulate.ts needs them).
+    const preKinds = entry.kv_layout != null && entry.kv_layout.kinds === undefined;
+    if (!preKinds && !isGgufCheckStale(entry.gguf_checked_at)) continue;
     const fullPath = resolve(modelDir, entry.path);
     if (!existsSync(fullPath)) continue;
     const info = await readGgufInfo(fullPath);
@@ -455,6 +465,7 @@ export async function backfillGgufMetadata(modelDir: string, cache: LocalModelCa
       sliding_window_pattern: info.sliding_window_pattern ?? entry.sliding_window_pattern,
       shared_kv_layers: info.shared_kv_layers ?? entry.shared_kv_layers,
       tensor_layer_bytes: info.tensor_layer_bytes ?? entry.tensor_layer_bytes,
+      kv_layout: info.kv_layout ?? entry.kv_layout,
       gguf_checked_at: Date.now(),
       last_verified: entry.last_verified,
     });
@@ -472,7 +483,7 @@ export async function runStartupReconciliation(
   modelDir: string,
   cache: LocalModelCache,
   apiBaseUrl: string,
-  authToken: string,
+  authToken: TokenSource,
   rawJsonDir?: string
 ): Promise<{ scanned: number; hashed: number; resolved: number; missing: number }> {
   log.info("[model-scan] Starting model directory reconciliation...");
@@ -610,7 +621,7 @@ export async function refreshModels(
   modelDir: string,
   cache: LocalModelCache,
   apiBaseUrl: string,
-  authToken: string,
+  authToken: TokenSource,
   rawJsonDir?: string
 ): Promise<{ scanned: number; hashed: number; resolved: number; missing: number }> {
   log.info("[model-scan] Manual refresh triggered");
@@ -710,6 +721,7 @@ export async function getModelFilesWithState(
       | "sliding_window_pattern"
       | "shared_kv_layers"
       | "tensor_layer_bytes"
+      | "kv_layout"
     > = {};
     if (entry.n_layer != null) ggufFields.n_layer = entry.n_layer;
     if (entry.mtp_layers != null) ggufFields.mtp_layers = entry.mtp_layers;
@@ -725,6 +737,7 @@ export async function getModelFilesWithState(
     if (entry.sliding_window_pattern != null) ggufFields.sliding_window_pattern = entry.sliding_window_pattern;
     if (entry.shared_kv_layers != null) ggufFields.shared_kv_layers = entry.shared_kv_layers;
     if (entry.tensor_layer_bytes != null) ggufFields.tensor_layer_bytes = entry.tensor_layer_bytes;
+    if (entry.kv_layout != null) ggufFields.kv_layout = entry.kv_layout;
 
     results.push({
       path: entry.path,

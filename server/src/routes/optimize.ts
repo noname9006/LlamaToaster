@@ -19,10 +19,12 @@ import { authenticateWorker } from "../worker-auth.js";
 import { assertOwnsWorker, sessionScope, type UserScope } from "../auth-middleware.js";
 import { BadRequestError, ConflictError, ForbiddenError, NotFoundError } from "../errors.js";
 import type { FitPoint, FitVerdict } from "../../../shared/fitParams.js";
-import { KV_CACHE_TYPES } from "../../../shared/fitParams.js";
+import { DEFAULT_FIT_MARGIN_MIB, isFitMargin, KV_CACHE_TYPES } from "../../../shared/fitParams.js";
 import { MAX_FIT_CTX_STOPS } from "../../../shared/optimizeFlow.js";
 import type { KvSupportRow, KvSupportStatus } from "../../../shared/kvSupport.js";
-import type { Test, TestConfig } from "../../../shared/types.js";
+import type { Backend, FitCheckJobPayload, FitCheckResult, Model, Test, TestConfig, Worker } from "../../../shared/types.js";
+import { queueEvents } from "../queue-events.js";
+import { assetMatchesWorker } from "../github-releases.js";
 
 const MAX_POINTS_PER_POST = 400;
 const MAX_KV_ROWS = 256;
@@ -213,4 +215,143 @@ export async function optimizeRoutes(app: FastifyInstance): Promise<void> {
 
   app.get("/api/tests/:id/fit-points", getFitPointsHandler(sessionScope));
   app.get("/api/flows/:flowId", getFlowHandler(sessionScope));
+
+  // docs/plans/HEADER_FIT_PLAN.md -- the model list's verdicts from
+  // llama-fit-params itself. Asks the machine to size the given models at one
+  // context (from the header alone for a model it does not hold); answers
+  // already on file for the same build, context and margin -- sized against
+  // about the same free VRAM, within a day -- are not asked again.
+  app.post<{ Params: { id: string }; Body: { model_ids?: unknown; ctx?: unknown; margin_mib?: unknown } }>(
+    "/api/workers/:id/fit-check",
+    { bodyLimit: 64 * 1024 },
+    async (request, reply) => {
+      const worker = repo.workerRepo.getWorker(request.params.id);
+      if (!worker) throw new NotFoundError("unknown machine");
+      assertOwnsWorker(sessionScope(request), worker.id);
+      if (worker.status === "offline") throw new ConflictError("that machine is offline");
+      if (!(worker.capabilities ?? []).includes("fit-check-v1")) {
+        throw new ConflictError("that machine runs an older worker build -- update it for llama.cpp fit checks");
+      }
+      const body = request.body ?? {};
+      const ctx = Number(body.ctx);
+      if (!Number.isInteger(ctx) || ctx < 512 || ctx > 4_194_304) throw new BadRequestError("ctx must be an integer in [512, 4194304]");
+      const margin = body.margin_mib === undefined ? DEFAULT_FIT_MARGIN_MIB : Number(body.margin_mib);
+      if (!isFitMargin(margin)) throw new BadRequestError("margin_mib must be 512, 1024 or 1536");
+      if (!Array.isArray(body.model_ids) || body.model_ids.length === 0 || body.model_ids.length > MAX_FIT_CHECK_MODELS) {
+        throw new BadRequestError(`model_ids must list 1..${MAX_FIT_CHECK_MODELS} models`);
+      }
+      const backend = worker.backend;
+      const build = newestInstalledBuild(worker, backend);
+      if (!backend || !build) throw new ConflictError("no llama.cpp build installed on that machine for its backend");
+
+      const freeNow = worker.vram?.vram_free_before_mib ?? null;
+      const known = new Map(fitRepo.listFitChecks({ worker_id: worker.id, ctx, margin_mib: margin }).map((r) => [r.model_id, r]));
+      const fresh = (id: string) => {
+        const r = known.get(id);
+        if (!r || r.llama_cpp_build !== build || r.created_at == null) return false;
+        if (Date.now() - r.created_at > FIT_CHECK_FRESH_MS) return false;
+        if (r.error) return false;
+        return freeNow == null || r.vram_free_mib == null || Math.abs(r.vram_free_mib - freeNow) <= FIT_CHECK_FREE_DRIFT_MIB;
+      };
+      const models: Model[] = [];
+      for (const raw of body.model_ids) {
+        if (typeof raw !== "string") throw new BadRequestError("model_ids must be strings");
+        const model = repo.getModelForWorker(raw, worker.id);
+        if (!model) throw new BadRequestError(`unknown model ${raw}`);
+        if (!fresh(model.id)) models.push(model);
+      }
+      if (models.length === 0) return reply.send({ ok: true, queued: 0 });
+      // One check job at a time per machine: a list re-render must not stack
+      // copies behind a long benchmark.
+      const pending = getDb()
+        .prepare(`SELECT COUNT(*) AS n FROM worker_jobs WHERE worker_id = ? AND job_type = 'fit_check' AND status IN ('pending','claimed')`)
+        .get(worker.id) as { n: number };
+      if (pending.n > 0) return reply.send({ ok: true, queued: 0, pending: true });
+      const memTotalMib = worker.hardware?.mem_total_bytes ? Math.floor(worker.hardware.mem_total_bytes / 1048576) : null;
+      const payload: FitCheckJobPayload = {
+        ctx,
+        margin_mib: margin,
+        llama_cpp_build: build,
+        llama_cpp_backend: backend,
+        ram_budget_mib: memTotalMib != null ? Math.max(0, memTotalMib - margin) : null,
+        models,
+      };
+      repo.queueRepo.enqueueJob(worker.id, { type: "fit_check", payload });
+      queueEvents.emit(worker.id);
+      return reply.code(202).send({ ok: true, queued: models.length });
+    }
+  );
+
+  app.get<{ Params: { id: string }; Querystring: { ctx?: string; margin_mib?: string } }>(
+    "/api/workers/:id/fit-checks",
+    async (request, reply) => {
+      const worker = repo.workerRepo.getWorker(request.params.id);
+      if (!worker) throw new NotFoundError("unknown machine");
+      assertOwnsWorker(sessionScope(request), worker.id);
+      const ctx = Number(request.query.ctx);
+      if (!Number.isInteger(ctx) || ctx <= 0) throw new BadRequestError("ctx must be a positive integer");
+      const margin = request.query.margin_mib === undefined ? DEFAULT_FIT_MARGIN_MIB : Number(request.query.margin_mib);
+      if (!isFitMargin(margin)) throw new BadRequestError("margin_mib must be 512, 1024 or 1536");
+      const pending = getDb()
+        .prepare(`SELECT COUNT(*) AS n FROM worker_jobs WHERE worker_id = ? AND job_type = 'fit_check' AND status IN ('pending','claimed')`)
+        .get(worker.id) as { n: number };
+      return reply.send({ results: fitRepo.listFitChecks({ worker_id: worker.id, ctx, margin_mib: margin }), pending: pending.n > 0 });
+    }
+  );
+
+  // Worker -> server: answers of a fit_check job, posted as they come in.
+  app.post<{ Body: { results?: unknown } }>("/api/worker/fit-checks", { bodyLimit: 2 * 1024 * 1024 }, async (request, reply) => {
+    const worker = await authenticateWorker(request);
+    const raw = request.body?.results;
+    if (!Array.isArray(raw) || raw.length > MAX_FIT_CHECK_MODELS) throw new BadRequestError(`results must be an array of at most ${MAX_FIT_CHECK_MODELS}`);
+    const results = raw.map((r, i) => validateFitCheckResult(r, `results[${i}]`));
+    return reply.send({ ok: true, stored: fitRepo.upsertFitChecks(worker.id, results) });
+  });
+}
+
+const MAX_FIT_CHECK_MODELS = 200;
+const FIT_CHECK_FRESH_MS = 24 * 3600 * 1000;
+const FIT_CHECK_FREE_DRIFT_MIB = 256;
+
+function newestInstalledBuild(worker: Worker, backend: Backend | null | undefined): string | null {
+  if (!backend || !worker.platform || !worker.arch) return null;
+  const tagNum = (tag: string) => Number(/^b(\d+)/.exec(tag)?.[1] ?? -1);
+  const matching = worker.installedBuilds
+    .filter((b) => assetMatchesWorker(b.asset_name, worker.platform!, worker.arch!, backend))
+    .sort((a, b) => tagNum(b.tag) - tagNum(a.tag));
+  return matching[0]?.tag ?? null;
+}
+
+function validateFitCheckResult(raw: unknown, field: string): FitCheckResult {
+  if (!raw || typeof raw !== "object") throw new BadRequestError(`${field} must be an object`);
+  const r = raw as Record<string, unknown>;
+  const str = (v: unknown, f: string, max = 256): string => {
+    if (typeof v !== "string" || v.length === 0 || v.length > max) throw new BadRequestError(`${field}.${f} must be a non-empty string`);
+    return v;
+  };
+  const optNum = (v: unknown, f: string): number | null => {
+    if (v === null || v === undefined) return null;
+    if (typeof v !== "number" || !Number.isFinite(v)) throw new BadRequestError(`${field}.${f} must be a number`);
+    return v;
+  };
+  const ctx = r.ctx;
+  if (typeof ctx !== "number" || !Number.isInteger(ctx) || ctx <= 0) throw new BadRequestError(`${field}.ctx must be a positive integer`);
+  const margin = r.margin_mib;
+  if (!isFitMargin(margin)) throw new BadRequestError(`${field}.margin_mib must be 512, 1024 or 1536`);
+  if (r.source !== null && r.source !== "local" && r.source !== "header") throw new BadRequestError(`${field}.source must be local, header or null`);
+  const error = r.error === null || r.error === undefined ? null : str(r.error, "error", 2000);
+  const point = r.point === null || r.point === undefined ? null : validateFitPoint(r.point, `${field}.point`);
+  if (!point && !error) throw new BadRequestError(`${field} needs a point or an error`);
+  const fetched = optNum(r.fetched_bytes, "fetched_bytes");
+  return {
+    model_id: str(r.model_id, "model_id", 128),
+    ctx,
+    margin_mib: margin,
+    llama_cpp_build: str(r.llama_cpp_build, "llama_cpp_build", 128),
+    source: (r.source as FitCheckResult["source"]) ?? null,
+    vram_free_mib: optNum(r.vram_free_mib, "vram_free_mib"),
+    point,
+    error,
+    ...(fetched != null ? { fetched_bytes: fetched } : {}),
+  };
 }

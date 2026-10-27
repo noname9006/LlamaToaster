@@ -168,6 +168,8 @@ export class MemorySampler {
   private backend: Backend = "cpu";
   private pid: number | undefined;
   private vramTickCount = 0;
+  // pauseVram/resumeVram: no VRAM probes while timed work runs.
+  private vramPaused = false;
 
   // The benchmark process's own RAM (per-pid RSS) -- the legacy stream.
   private ramPeakBytes = 0;
@@ -276,6 +278,7 @@ export class MemorySampler {
     this.vramClaimedPeakBytes = 0;
     this.vramClaimedMeasured = false;
     this.loaded = false;
+    this.vramPaused = false;
     this.loadedDedicatedMaxBytes = 0;
     this.loadedDedicatedMinBytes = 0;
     this.loadedDedicatedCount = 0;
@@ -303,6 +306,34 @@ export class MemorySampler {
   // finishes between two due ticks still has readings taken after markLoaded.
   async sampleVramNow(): Promise<void> {
     await this.readVram();
+  }
+
+  // No VRAM probes while timed work runs. On Windows each probe is a GPU
+  // performance-counter query, and measured against a CPU-bound child it cut
+  // single 500ms windows to ~65-80% of their mean throughput (vs ~95% with no
+  // probing), even from a warm PowerShell session -- the query itself, not the
+  // spawn. Allocations are made at load/context creation, so the reading taken
+  // here, before the first timed request, still sees the loaded peak.
+  // Sensors keep their cadence: their clock/temp window IS the timed work.
+  async pauseVram(): Promise<void> {
+    if (this.vramPaused) return;
+    if (this.timer) await this.readVram();
+    this.vramPaused = true;
+  }
+
+  // Synchronous pause for a caller that only learns timed work started once
+  // it already has (llama-bench's run markers) -- no reading, it would land
+  // inside the timed repeat.
+  pauseVramNow(): void {
+    this.vramPaused = true;
+  }
+
+  // Back to the tick cadence, with one reading right away: llama-bench
+  // resumes on a new test's warmup/start, after its context is allocated.
+  resumeVram(): void {
+    if (!this.vramPaused) return;
+    this.vramPaused = false;
+    if (this.timer) void this.readVram();
   }
 
   // M6's detection window is the TIMED work, not the spawn: server items
@@ -430,7 +461,7 @@ export class MemorySampler {
       this.vramTickCount++;
       if (!dueForVram) return;
 
-      await this.readVram();
+      if (!this.vramPaused) await this.readVram();
 
       // M6 -- same cadence, same best-effort posture: a sensorless platform
       // simply contributes nothing and its columns stay NULL.

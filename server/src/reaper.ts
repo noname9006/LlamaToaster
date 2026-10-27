@@ -11,6 +11,20 @@ export const MAX_ATTEMPTS = 2;
 
 export interface ReaperLogger {
   warn: (obj: Record<string, unknown>, msg: string) => void;
+  error?: (obj: Record<string, unknown>, msg: string) => void;
+}
+
+// Runs one unit of background bookkeeping, logging (never throwing) on
+// failure: this runs from a bare setInterval, where a throw would crash the
+// whole server, and one bad step or job must not starve the rest (audit
+// 2026-09-27 M7).
+function guarded<T>(log: ReaperLogger, what: Record<string, unknown>, fn: () => T, fallback: T): T {
+  try {
+    return fn();
+  } catch (err) {
+    (log.error ?? log.warn)({ ...what, err }, "maintenance sweep step failed");
+    return fallback;
+  }
 }
 
 interface ReapableJob {
@@ -39,7 +53,8 @@ function abandonJob(job: ReapableJob, reason: string, log: ReaperLogger, event: 
 
 export function reapExpiredLeases(log: ReaperLogger): void {
   const expired = repo.queueRepo.listExpiredLeases(Date.now());
-  for (const job of expired) {
+  for (const job of expired) guarded(log, { step: "reap expired lease", job_id: job.id }, () => reapOne(job), undefined);
+  function reapOne(job: ReapableJob): void {
     // A cancelled job must never be requeued, regardless of attempts: the
     // worker that had it never confirmed the stop before its lease expired
     // (e.g. it crashed right after a Stop was requested), and
@@ -75,11 +90,17 @@ export function reapExpiredLeases(log: ReaperLogger): void {
   // in the app uses) rather than a fixed delay.
   const stuck = repo.queueRepo.listStuckPendingJobsForOfflineWorkers(Date.now() - OFFLINE_AFTER_MS);
   for (const job of stuck) {
-    abandonJob(
-      job,
-      "worker went offline before reclaiming this job after its first lease expired",
+    guarded(
       log,
-      "stuck pending job abandoned -- its worker is offline"
+      { step: "abandon stuck pending job", job_id: job.id },
+      () =>
+        abandonJob(
+          job,
+          "worker went offline before reclaiming this job after its first lease expired",
+          log,
+          "stuck pending job abandoned -- its worker is offline"
+        ),
+      undefined
     );
   }
 }
@@ -102,17 +123,95 @@ export const TERMINAL_JOB_RETENTION_DAYS = 7;
 // comment for what stays behind (everything except the raw sample series).
 export const GPU_CLOCK_SAMPLE_RETENTION_DAYS = 30;
 
+// A run whose job shows no progress for this long while its machine isn't
+// paused is stuck: the worker is alive (heartbeats keep the lease) but
+// nothing moves -- no changed progress report, no item tick, no item result.
+// llama-bench ticks on every repetition, so this is far above any real gap;
+// generous on purpose, for very long single items.
+export const STALL_TIMEOUT_MS = 12 * 60 * 60 * 1000;
+// A pause this old was almost certainly forgotten. Ending it stops the run
+// (finished items and their results stay) and frees the machine and the
+// user's active-run slot.
+export const PAUSE_TIMEOUT_MS = 7 * 24 * 60 * 60 * 1000;
+
+export function stopStalledRuns(log: ReaperLogger): void {
+  const now = Date.now();
+  for (const job of repo.queueRepo.listStalledRunJobs(now - STALL_TIMEOUT_MS)) {
+    guarded(
+      log,
+      { step: "stop stalled run", job_id: job.id },
+      () =>
+        abandonJob(
+          { ...job, attempts: 0, cancel_requested: 0 },
+          "stopped: no progress for 12 hours",
+          log,
+          "stalled run stopped -- no progress while not paused"
+        ),
+      undefined
+    );
+  }
+  for (const { worker_id, run_ids } of repo.queueRepo.listLongPausedWorkers(now - PAUSE_TIMEOUT_MS)) {
+    guarded(
+      log,
+      { step: "end long pause", worker_id },
+      () => {
+        for (const runId of run_ids) {
+          repo.queueRepo.cancelPendingJobsForTest(runId);
+          const claimed = repo.queueRepo.getNonTerminalJobsForTest(runId).some((j) => j.status === "claimed");
+          // A claimed job gets the stop on the worker's next heartbeat (its
+          // pause loop exits on stop) and finishes the run itself.
+          if (claimed) repo.queueRepo.requestCancelForTest(runId);
+          else repo.reconcileStaleTest(undefined, runId, "stopped: paused for 7 days");
+        }
+        repo.workerRepo.setPauseRequested(worker_id, false);
+        queueEvents.emit(worker_id);
+        log.warn({ worker_id, run_ids }, "pause left for 7 days ended -- its runs were stopped");
+      },
+      undefined
+    );
+  }
+}
+
+// How long a run may sit running/scheduled after its last job ended before
+// it's finalized as-is -- covers a worker whose last item reports were still
+// retrying when it reported the job done.
+export const ORPHANED_RUN_GRACE_MS = 10 * 60 * 1000;
+
+// A run whose jobs have all ended but which never reached a final status (an
+// item's terminal report was lost) -- finalized with what it has, the
+// unreported items marked cancelled (audit 2026-10-18 A2).
+export function finalizeOrphanedRuns(log: ReaperLogger): void {
+  for (const runId of repo.listOrphanedActiveTests(ORPHANED_RUN_GRACE_MS)) {
+    guarded(
+      log,
+      { step: "finalize orphaned run", run_id: runId },
+      () => {
+        repo.reconcileStaleTest(undefined, runId, "the machine finished without reporting every item");
+        log.warn({ run_id: runId }, "run finalized -- its jobs had ended but some items never reported");
+      },
+      undefined
+    );
+  }
+}
+
 export function runMaintenanceSweep(log: ReaperLogger): void {
-  reapExpiredLeases(log);
-  const prunedSessions = repo.sessionRepo.pruneExpired();
-  const prunedJobs = repo.queueRepo.pruneCompletedOlderThan(TERMINAL_JOB_RETENTION_DAYS);
+  const step = <T>(name: string, fn: () => T, fallback: T) => guarded(log, { step: name }, fn, fallback);
+  step("reap expired leases", () => reapExpiredLeases(log), undefined);
+  step("stop stalled and long-paused runs", () => stopStalledRuns(log), undefined);
+  step("finalize orphaned runs", () => finalizeOrphanedRuns(log), undefined);
+  const prunedSessions = step("prune sessions", () => repo.sessionRepo.pruneExpired(), 0);
+  const prunedJobs = step("prune terminal jobs", () => repo.queueRepo.pruneCompletedOlderThan(TERMINAL_JOB_RETENTION_DAYS), 0);
   const prunedEnrolments =
-    repo.workerRepo.pruneExpiredEnrolments() +
-    repo.workerRepo.pruneExpiredReenrolments() +
-    repo.workerRepo.pruneExpiredChallenges() +
-    repo.sessionRepo.pruneExpiredLinkIntents();
-  const prunedGpuClockSamples = repo.pruneOldGpuClockSamples(GPU_CLOCK_SAMPLE_RETENTION_DAYS);
-  repo.pruneOldCatalogRowBudget();
+    step("prune enrolments", () => repo.workerRepo.pruneExpiredEnrolments(), 0) +
+    step("prune re-enrolments", () => repo.workerRepo.pruneExpiredReenrolments(), 0) +
+    step("prune challenges", () => repo.workerRepo.pruneExpiredChallenges(), 0) +
+    step("prune link intents", () => repo.sessionRepo.pruneExpiredLinkIntents(), 0);
+  const prunedGpuClockSamples = step(
+    "prune GPU clock samples",
+    () => repo.pruneOldGpuClockSamples(GPU_CLOCK_SAMPLE_RETENTION_DAYS),
+    0
+  );
+  step("prune catalog row budget", () => repo.pruneOldCatalogRowBudget(), undefined);
   if (prunedSessions || prunedJobs || prunedEnrolments || prunedGpuClockSamples) {
     log.warn(
       { prunedSessions, prunedJobs, prunedEnrolments, prunedGpuClockSamples },

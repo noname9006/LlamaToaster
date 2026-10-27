@@ -3,6 +3,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { readFile, readdir } from "node:fs/promises";
 import si from "systeminformation";
+import { runPowerShell } from "./psSession.js";
 import type { Backend, GpuMemoryAccuracyLevel, GpuMemoryMeasurementSource } from "../../shared/types.js";
 
 // Live VRAM usage has no single cross-platform source, and no single
@@ -292,10 +293,14 @@ async function readWindowsUsedMib(
       pid != null ? `Write-Output ("p=" + $p)` : null,
       pid != null ? `Write-Output ("s=" + $s)` : null,
     ].filter(Boolean);
-    const { stdout } = await execFileAsync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", lines.join("; ")], {
-      timeout: EXEC_TIMEOUT_MS,
-      windowsHide: true,
-    });
+    // The shared session (psSession.ts) instead of a powershell.exe per probe.
+    const script = lines.join("; ");
+    const stdout = await runPowerShell(script, EXEC_TIMEOUT_MS, () =>
+      execFileAsync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
+        timeout: EXEC_TIMEOUT_MS,
+        windowsHide: true,
+      })
+    );
     // A value is empty when its counter instance doesn't exist yet.
     const values = parseLabeledCounterOutput(stdout);
     return {
@@ -384,10 +389,12 @@ export function parseWindowsCudaMemoryOutput(stdout: string): WindowsCudaGpuMemo
 
 async function readWindowsCudaMemory(pid: number): Promise<WindowsCudaGpuMemory> {
   try {
-    const { stdout } = await execFileAsync(
-      "powershell.exe",
-      ["-NoProfile", "-NonInteractive", "-Command", windowsCudaMemoryCommand(pid)],
-      { timeout: EXEC_TIMEOUT_MS, windowsHide: true }
+    const script = windowsCudaMemoryCommand(pid);
+    const stdout = await runPowerShell(script, EXEC_TIMEOUT_MS, () =>
+      execFileAsync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
+        timeout: EXEC_TIMEOUT_MS,
+        windowsHide: true,
+      })
     );
     return parseWindowsCudaMemoryOutput(stdout);
   } catch {

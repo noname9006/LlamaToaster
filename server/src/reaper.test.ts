@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -199,5 +199,140 @@ describe("runMaintenanceSweep", () => {
       gpu_clock_samples: string | null;
     };
     expect(result.gpu_clock_samples).toBeNull();
+  });
+});
+
+// Audit 2026-09-27 M7: the sweep runs from a bare setInterval, so a throw
+// used to crash the server (SQLITE_FULL meant a crash loop) and one failing
+// step skipped every step after it.
+describe("runMaintenanceSweep crash guard", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it("logs a failing step and still runs the rest", () => {
+    vi.spyOn(repo.sessionRepo, "pruneExpired").mockImplementation(() => {
+      throw new Error("SQLITE_FULL: database or disk is full");
+    });
+    const pruneJobs = vi.spyOn(repo.queueRepo, "pruneCompletedOlderThan");
+    const pruneBudget = vi.spyOn(repo, "pruneOldCatalogRowBudget");
+    const error = vi.fn();
+
+    expect(() => runMaintenanceSweep({ warn: () => {}, error })).not.toThrow();
+
+    expect(error).toHaveBeenCalledWith(expect.objectContaining({ step: "prune sessions" }), "maintenance sweep step failed");
+    expect(pruneJobs).toHaveBeenCalled();
+    expect(pruneBudget).toHaveBeenCalled();
+  });
+
+  it("one expired job that throws doesn't stop the others being reaped", () => {
+    const job = (id: string) => ({ id, worker_id: "w", run_id: null, attempts: 0, cancel_requested: 0 });
+    vi.spyOn(repo.queueRepo, "listExpiredLeases").mockReturnValue([job("bad"), job("good")]);
+    const requeue = vi.spyOn(repo.queueRepo, "returnToPending").mockImplementation((id) => {
+      if (id === "bad") throw new Error("boom");
+    });
+    const error = vi.fn();
+
+    runMaintenanceSweep({ warn: () => {}, error });
+
+    expect(requeue.mock.calls.map(([id]) => id)).toEqual(["bad", "good"]);
+    expect(error).toHaveBeenCalledWith(expect.objectContaining({ job_id: "bad" }), "maintenance sweep step failed");
+  });
+});
+
+// N9 replacement (2026-10-13): no wall-clock cap on a whole run; instead a
+// run stuck with no progress for 12 h is stopped, and a pause left 7 days ends.
+describe("stall and pause timeouts", () => {
+  const HOUR = 3600 * 1000;
+  let seq = 0;
+  function setup(opts: { claimedAgo: number; pausedAgo?: number }) {
+    const db = getDb();
+    const n = ++seq;
+    const workerId = `w-stall-${n}`;
+    const runId = `run-stall-${n}`;
+    const jobId = `job-stall-${n}`;
+    db.prepare(`INSERT INTO workers (id, machine_id, display_name, last_heartbeat_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)`).run(
+      workerId, `m-stall-${n}`, "w", Date.now(), Date.now(), Date.now()
+    );
+    repo.registerModel({ id: `model-stall-${n}`, filename: "x.gguf", size_bytes: 1, source: "local" });
+    repo.createTest(undefined, {
+      id: runId, kind: "sweep", worker_id: workerId, worker_name: "w", llama_cpp_build: "b1", llama_cpp_backend: "cpu",
+      model_id: `model-stall-${n}`, config: {} as never, status: "running", started_at: Date.now() - opts.claimedAgo,
+    } as never);
+    db.prepare(
+      `INSERT INTO worker_jobs (id, worker_id, job_type, payload_json, status, run_id, created_at, claimed_at, lease_expires_at, progress_at)
+       VALUES (?, ?, 'benchmark', '{}', 'claimed', ?, ?, ?, ?, ?)`
+    ).run(jobId, workerId, runId, Date.now() - opts.claimedAgo, Date.now() - opts.claimedAgo, Date.now() + 60_000, Date.now() - opts.claimedAgo);
+    if (opts.pausedAgo !== undefined) {
+      db.prepare(`UPDATE workers SET pause_requested = 1, pause_requested_at = ? WHERE id = ?`).run(Date.now() - opts.pausedAgo, workerId);
+    }
+    return { workerId, runId, jobId };
+  }
+  const jobRow = (id: string) => getDb().prepare(`SELECT status, cancel_requested FROM worker_jobs WHERE id = ?`).get(id) as { status: string; cancel_requested: number };
+
+  it("stops a run with no progress for over 12 hours", () => {
+    const { runId, jobId } = setup({ claimedAgo: 13 * HOUR });
+    runMaintenanceSweep(silentLog);
+    expect(jobRow(jobId).status).toBe("failed");
+    expect(repo.getTest(undefined, runId)!.status).not.toBe("running");
+  });
+
+  it("leaves a run alone at 11 hours without progress", () => {
+    const { jobId } = setup({ claimedAgo: 11 * HOUR });
+    runMaintenanceSweep(silentLog);
+    expect(jobRow(jobId).status).toBe("claimed");
+  });
+
+  it("leaves a run alone that reported progress recently", () => {
+    const { runId, jobId } = setup({ claimedAgo: 13 * HOUR });
+    repo.queueRepo.touchRunProgress(runId);
+    runMaintenanceSweep(silentLog);
+    expect(jobRow(jobId).status).toBe("claimed");
+    expect(repo.getTest(undefined, runId)!.status).toBe("running");
+  });
+
+  it("a changed heartbeat progress report counts as progress; an identical one doesn't", () => {
+    const { workerId, jobId } = setup({ claimedAgo: 13 * HOUR });
+    const report = { job_id: jobId, phase: "benchmarking" as const, item_idx: 1, items_total: 4 };
+    repo.queueRepo.extendLeaseAndGetFlags(jobId, workerId, report);
+    const first = (getDb().prepare(`SELECT progress_at FROM worker_jobs WHERE id = ?`).get(jobId) as { progress_at: number }).progress_at;
+    expect(first).toBeGreaterThan(Date.now() - 1000);
+    getDb().prepare(`UPDATE worker_jobs SET progress_at = ? WHERE id = ?`).run(Date.now() - 13 * HOUR, jobId);
+    repo.queueRepo.extendLeaseAndGetFlags(jobId, workerId, report);
+    runMaintenanceSweep(silentLog);
+    expect(jobRow(jobId).status).toBe("failed");
+  });
+
+  it("doesn't count paused time as a stall, and resuming restarts the clock", () => {
+    const { workerId, runId, jobId } = setup({ claimedAgo: 13 * HOUR, pausedAgo: 12.5 * HOUR });
+    runMaintenanceSweep(silentLog);
+    expect(jobRow(jobId).status).toBe("claimed");
+    repo.workerRepo.setPauseRequested(workerId, false);
+    runMaintenanceSweep(silentLog);
+    expect(jobRow(jobId).status).toBe("claimed");
+    expect(repo.getTest(undefined, runId)!.status).toBe("running");
+  });
+
+  it("ends a pause older than 7 days: stop requested, pause cleared", () => {
+    const { workerId, jobId } = setup({ claimedAgo: 8 * DAY_MS, pausedAgo: 7.5 * DAY_MS });
+    runMaintenanceSweep(silentLog);
+    expect(jobRow(jobId)).toMatchObject({ status: "claimed", cancel_requested: 1 });
+    expect(repo.workerRepo.getPauseRequested(workerId)).toBe(false);
+  });
+
+  it("keeps a 6-day pause, and a re-pause doesn't reset its start", () => {
+    const { workerId, jobId } = setup({ claimedAgo: 7 * DAY_MS, pausedAgo: 6 * DAY_MS });
+    const since = repo.workerRepo.getPausedSince(workerId)!;
+    repo.workerRepo.setPauseRequested(workerId, true);
+    expect(repo.workerRepo.getPausedSince(workerId)).toBe(since);
+    runMaintenanceSweep(silentLog);
+    expect(jobRow(jobId)).toMatchObject({ status: "claimed", cancel_requested: 0 });
+    expect(repo.workerRepo.getPauseRequested(workerId)).toBe(true);
+  });
+
+  it("a job claimed before progress_at existed starts its clock now, not at claim", () => {
+    const { runId, jobId } = setup({ claimedAgo: 15 * HOUR });
+    getDb().prepare(`UPDATE worker_jobs SET progress_at = NULL WHERE id = ?`).run(jobId);
+    runMaintenanceSweep(silentLog);
+    expect(jobRow(jobId).status).toBe("claimed");
+    expect(repo.getTest(undefined, runId)!.status).toBe("running");
   });
 });

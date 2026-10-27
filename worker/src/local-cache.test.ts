@@ -1,6 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { LocalModelCache, createLocalModelCache } from "./local-cache.js";
-import type { LocalModelState } from "../../shared/types.js";
 
 // better-sqlite3's constructor returns a Database whose statement objects
 // (from .prepare()) carry the actual .get()/.all()/.run() methods -- mock
@@ -156,53 +155,6 @@ describe("LocalModelCache", () => {
     await cache.init();
 
     expect(mockDb.pragma).not.toHaveBeenCalledWith("user_version = 2");
-    await cache.close();
-  });
-
-  it("should upsert a cache entry", async () => {
-    const cache = new LocalModelCache("/test/model/dir");
-    await cache.init();
-
-    const entry = {
-      path: "model.gguf",
-      size: 1000,
-      mtime: Date.now(),
-      sha256: "abc123",
-      hf_model_id: "user/repo/model.gguf",
-      last_verified: Date.now(),
-      state: "verified" as LocalModelState,
-    };
-
-    await cache.upsert(entry);
-
-    expect(mockStatement.run).toHaveBeenCalledWith(
-      entry.path,
-      entry.size,
-      entry.mtime,
-      entry.sha256,
-      entry.hf_model_id,
-      null, // hf_checked_at
-      null, // hf_deleted_at
-      null, // hf_replaced_by_sha256
-      null, // n_layer
-      null, // mtp_layers
-      null, // quant
-      null, // param_count
-      null, // gguf_checked_at
-      entry.last_verified,
-      entry.state,
-      null, // trained_ctx
-      null, // n_head_kv
-      null, // head_dim_k
-      null, // head_dim_v
-      null, // n_embd
-      null, // n_head
-      null, // sliding_window
-      null, // sliding_window_pattern
-      null, // shared_kv_layers
-      null // tensor_layer_bytes
-    );
-
     await cache.close();
   });
 

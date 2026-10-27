@@ -92,6 +92,9 @@ describe("POST /api/worker/queue", () => {
     expect(body.job_id).toBe(jobId);
     expect(body.type).toBe("install_build");
     expect(Date.now() - started).toBeLessThan(2000);
+    // A delivered job stays claimed once the response has closed normally.
+    await new Promise((r) => setTimeout(r, 100));
+    expect(repo.queueRepo.getJob(jobId)?.status).toBe("claimed");
   });
 
   it("wakes the long-poll via queueEvents as soon as a job is enqueued, without waiting for the backstop", async () => {
@@ -113,6 +116,74 @@ describe("POST /api/worker/queue", () => {
     expect(body.job_id).toBe(jobId);
     // Must resolve via the event, not the 5s backstop poll.
     expect(Date.now() - started).toBeLessThan(2000);
+  });
+
+  // Audit 2026-10-11 N4: the wait listened on the request's 'close', which
+  // on Node 22 has already fired by then, so a job enqueued after the worker
+  // hung up was claimed onto the dead socket.
+  it("doesn't claim a job for a worker that disconnected mid-wait", async () => {
+    const worker = repo.workerRepo.getOrCreateByMachineId("q-gone", "q-gone");
+    const controller = new AbortController();
+    const poll = fetch(`${baseUrl}/api/worker/queue`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Bearer route-test-secret" },
+      body: JSON.stringify(hardwareState("q-gone", "idle")),
+      signal: controller.signal,
+    }).catch(() => null);
+    await new Promise((r) => setTimeout(r, 200));
+    controller.abort();
+    await poll;
+    await new Promise((r) => setTimeout(r, 200));
+
+    const jobId = repo.queueRepo.enqueueJob(worker.id, { type: "benchmark", payload: { run_id: "r-gone" } });
+    queueEvents.emit(worker.id);
+    await new Promise((r) => setTimeout(r, 200));
+
+    expect(repo.queueRepo.getJob(jobId)?.status).toBe("pending");
+    // And the reconnecting worker gets it straight away.
+    const res = await postJson("/api/worker/queue", hardwareState("q-gone", "idle"));
+    expect(((await res.json()) as { job_id: string }).job_id).toBe(jobId);
+  });
+
+  // Audit 2026-09-27 M7: app.close() used to wait out every idle long-poll
+  // (up to 25 s), far past pm2's 1.6 s kill timeout.
+  it("answers waiting long-polls with 204 as soon as the server starts closing", async () => {
+    const { queueRoutes } = await import("./queue.js");
+    const own = Fastify({ logger: false });
+    await own.register(queueRoutes);
+    await own.listen({ port: 0, host: "127.0.0.1" });
+    const port = (own.server.address() as { port: number }).port;
+    repo.workerRepo.getOrCreateByMachineId("q-shutdown", "q-shutdown");
+    const poll = fetch(`http://127.0.0.1:${port}/api/worker/queue`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Bearer route-test-secret" },
+      body: JSON.stringify(hardwareState("q-shutdown", "idle")),
+    });
+    await new Promise((r) => setTimeout(r, 200));
+
+    const started = Date.now();
+    await own.close();
+    expect(Date.now() - started).toBeLessThan(1000);
+    expect((await poll).status).toBe(204);
+  });
+
+  it("unclaimJob returns a never-delivered job to pending without spending an attempt", async () => {
+    const { getDb } = await import("../db/migrate.js");
+    const worker = repo.workerRepo.getOrCreateByMachineId("q-unclaim", "q-unclaim");
+    const jobId = repo.queueRepo.enqueueJob(worker.id, { type: "benchmark", payload: { run_id: "r-unclaim" } });
+    expect(repo.queueRepo.claimNextJob(worker.id)?.job_id).toBe(jobId);
+
+    repo.queueRepo.unclaimJob(jobId);
+
+    const row = getDb().prepare(`SELECT status, attempts, claimed_at FROM worker_jobs WHERE id = ?`).get(jobId);
+    expect(row).toEqual({ status: "pending", attempts: 0, claimed_at: null });
+    expect(getDb().prepare(`SELECT active_job_id FROM workers WHERE id = ?`).get(worker.id)).toEqual({ active_job_id: null });
+    expect(repo.queueRepo.claimNextJob(worker.id)?.job_id).toBe(jobId);
+
+    // A no-op once the job has moved on: a late close can't reopen it.
+    repo.queueRepo.markJobCompleted(jobId);
+    repo.queueRepo.unclaimJob(jobId);
+    expect(repo.queueRepo.getJob(jobId)?.status).toBe("completed");
   });
 });
 
@@ -257,8 +328,7 @@ describe("POST /api/worker/heartbeat", () => {
       hf_repo: "unsloth/Qwen3.8-27B-GGUF",
       hf_file: "Qwen3.8-27B-UD-Q5_K_M.gguf",
       metadata: { param_count: 27_000_000_000 },
-      lock_hf_identity: true, // exactly what workers.ts's download-callback route sets
-    });
+    }, { verifiedBy: "download" }); // exactly what workers.ts's download-callback route sets
     // Genuinely indexed, so it's the lock (not the index check) under test.
     await indexed(sha, "mingxianderen/Qwen3.8-27B-GGUF", "Qwen3.8-27B-UD-Q5_K_M.gguf");
 
@@ -288,7 +358,7 @@ describe("POST /api/worker/heartbeat", () => {
     expect(model?.hf_identity_locked).toBe(true);
   });
 
-  it("a locked model's identity can still be changed by another real download (lock_hf_identity asserted again)", async () => {
+  it("a locked model's identity can still be changed by another real download (verifiedBy download again)", async () => {
     // Not just permanently frozen at whatever the first download said -- a
     // second real download (same file, e.g. the user explicitly re-picks a
     // different repo hosting identical bytes) must still win, exactly like
@@ -302,8 +372,7 @@ describe("POST /api/worker/heartbeat", () => {
       hf_repo: "repo-a/first",
       hf_file: "first.gguf",
       metadata: {},
-      lock_hf_identity: true,
-    });
+    }, { verifiedBy: "download" });
     expect(repo.getModel(sha)?.hf_repo).toBe("repo-a/first");
 
     repo.registerModel({
@@ -314,8 +383,7 @@ describe("POST /api/worker/heartbeat", () => {
       hf_repo: "repo-b/second",
       hf_file: "second.gguf",
       metadata: {},
-      lock_hf_identity: true,
-    });
+    }, { verifiedBy: "download" });
     const model = repo.getModel(sha);
     expect(model?.hf_repo).toBe("repo-b/second");
     expect(model?.hf_identity_locked).toBe(true);

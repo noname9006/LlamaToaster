@@ -155,6 +155,37 @@ export function expandSweep(sweep: Omit<SweepConfig, "model_id">): SweepItem[] {
   return items;
 }
 
+// expandSweep(sweep).length without building the list -- the server checks
+// this against MAX_SWEEP_ITEMS before expanding, since the cross-product of
+// even capped axes is far too large to materialise. Must stay in step with
+// expandSweep's loops and its isValidCombo skip. Past 2^53 the result is
+// approximate, which is still far past any cap.
+export function countSweepItems(sweep: Omit<SweepConfig, "model_id">): number {
+  const n_depthCount = Array.isArray(sweep.n_depth) && sweep.n_depth.length > 0 ? sweep.n_depth.length : 1;
+  const concurrencyCount =
+    Array.isArray(sweep.concurrency) && sweep.concurrency.length > 0 ? sweep.concurrency.length : 1;
+  let validKvFa = 0;
+  for (const [cache_type_k, cache_type_v] of kvPairsFor(sweep)) {
+    for (const flash_attn of sweep.flash_attn) {
+      if (isValidCombo(cache_type_k, cache_type_v, flash_attn)) validKvFa++;
+    }
+  }
+  return (
+    sweep.n_prompt.length *
+    sweep.n_gen.length *
+    sweep.threads.length *
+    sweep.n_gpu_layers.length *
+    sweep.batch_size.length *
+    sweep.ubatch_size.length *
+    validKvFa *
+    sweep.mtp.length *
+    sweep.n_gpu_layers_draft.length *
+    sweep.n_cpu_moe.length *
+    n_depthCount *
+    concurrencyCount
+  );
+}
+
 // §0.2's depth rule: -d prefills KV before each test and is llama-bench-only
 // (llama-server has no KV-prefill flag). A server row always carries
 // n_depth = 0; its effective context is n_prompt. Returns the rejection copy
