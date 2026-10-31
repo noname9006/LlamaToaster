@@ -2,8 +2,8 @@
 // picker, so "which files count as the same model" and "which draft file is
 // this model's MTP companion" are answered identically in both places.
 import { modelAuthor, modelFamily } from "./utils";
-import { isMtpDraftModel } from "./types";
-import type { Model } from "./types";
+import { isMtpDraftModel, MTP_FILENAME_PATTERN } from "./types";
+import type { HfFileEntry, Model } from "./types";
 
 // Mirrors server/src/hf.ts's QUANT_PATTERN -- used here only to strip a
 // quant token off a *local* model's filename (an HF-backed model's grouping
@@ -12,7 +12,7 @@ import type { Model } from "./types";
 // optional, and kept separate from group 2 (the actual quant code) so
 // modelBaseLabel below can still strip the whole thing as one unit via the
 // full match, while extractQuant reassembles "UD-" + code for display.
-const QUANT_PATTERN = /(?:^|[-_.])(UD[-_])?((?:IQ|Q)[0-9]+(?:_[A-Z0-9]+)*|F16|F32|BF16)(?=[-_.]|$)/i;
+const QUANT_PATTERN = /(?:^|[-_.])(UD[-_])?((?:IQ|Q|MXFP)[0-9]+(?:_[A-Z0-9]+)*|F16|F32|BF16)(?=[-_.]|$)/i;
 
 // Best-effort "same model, different file" identity: for an HF-backed model
 // this is the repo name (quant variants of one model overwhelmingly live as
@@ -82,7 +82,7 @@ function quantBitRank(quant: string | null): number {
   const code = quant.replace(/^UD-/, "");
   if (/^F32$/i.test(code)) return 32;
   if (/^(F16|BF16)$/i.test(code)) return 16;
-  const m = code.match(/^I?Q(\d+)/i);
+  const m = code.match(/^(?:I?Q|MXFP)(\d+)/i);
   return m ? Number(m[1]) : Infinity;
 }
 
@@ -137,6 +137,61 @@ export function buildModelGroups(models: Model[]): ModelGroup[] {
     });
   }
   return Array.from(groups.values());
+}
+
+// One downloadable thing in a Hugging Face repo, the way the model card's quant
+// table shows it: a split model's shards are one chip with their sizes summed.
+export interface HfQuantChip {
+  /** Shard 1, or the file itself: what llama.cpp is pointed at. */
+  file: string;
+  label: string;
+  /** Only "quant" can run on its own, so only it gets a fit check. */
+  kind: "quant" | "mtp" | "mmproj";
+  files: HfFileEntry[];
+  sizeBytes: number;
+}
+
+export interface HfQuantTier {
+  label: string;
+  chips: HfQuantChip[];
+}
+
+const SHARD_SUFFIX = /-\d{5}-of-\d{5}\.gguf$/i;
+
+// Bit-width rows for a repo's file list. MTP drafts sit in their bit row with a
+// tag, as on the model card. The card leaves mmproj files and anything without a
+// quant token out; they stay reachable here, in a last "Other" row.
+export function groupHfFilesByTier(files: HfFileEntry[]): HfQuantTier[] {
+  const chips = new Map<string, HfQuantChip>();
+  for (const f of [...files].sort((a, b) => a.path.localeCompare(b.path))) {
+    const key = f.path.replace(SHARD_SUFFIX, "");
+    const name = f.path.split("/").pop() ?? f.path;
+    const chip = chips.get(key);
+    if (chip) {
+      chip.files.push(f);
+      chip.sizeBytes += f.size_bytes;
+      continue;
+    }
+    chips.set(key, {
+      file: f.path,
+      label: extractQuant(name) ?? name.replace(/\.gguf$/i, ""),
+      kind: /(^|\/)mmproj/i.test(f.path) ? "mmproj" : MTP_FILENAME_PATTERN.test(f.path) ? "mtp" : "quant",
+      files: [f],
+      sizeBytes: f.size_bytes,
+    });
+  }
+  const tiers = new Map<number, HfQuantChip[]>();
+  for (const chip of chips.values()) {
+    const name = chip.file.split("/").pop() ?? chip.file;
+    const rank = chip.kind === "mmproj" ? Infinity : quantBitRank(extractQuant(name));
+    tiers.set(rank, [...(tiers.get(rank) ?? []), chip]);
+  }
+  return [...tiers.entries()]
+    .sort(([a], [b]) => a - b)
+    .map(([rank, list]) => ({
+      label: Number.isFinite(rank) ? `${rank}-bit` : "Other",
+      chips: list.sort((a, b) => a.sizeBytes - b.sizeBytes),
+    }));
 }
 
 export interface QuantTier {

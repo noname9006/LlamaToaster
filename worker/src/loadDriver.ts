@@ -59,9 +59,8 @@ export interface ServerArgsInput {
    * begin with, so there's nothing left to flag. */
   supportsFit?: boolean;
   /** §0.7-probed model-loading flags (binary-probe.ts's modelLoadArgs) --
-   * keep the model locked in RAM for the run's duration, and for speed runs
-   * force mmap off. `--load-mode ...` on current builds, --mlock/--no-mmap on
-   * older ones. No row-level caveat needed: unlike --no-context-shift,
+   * read the model into RAM and keep it locked for the run's duration.
+   * `--load-mode mlock` on current builds, --mlock/--no-mmap on older ones. No row-level caveat needed: unlike --no-context-shift,
    * there's no observable symptom to flag when a build lacks them. */
   modelLoadArgs?: string[];
   contextSizeOverride?: number;

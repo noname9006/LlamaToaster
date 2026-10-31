@@ -57,7 +57,10 @@ async function postJson(path: string, body: unknown) {
   });
 }
 
-async function heartbeat(machineId: string, opts: { backend?: string; installed?: boolean } = {}) {
+async function heartbeat(
+  machineId: string,
+  opts: { backend?: string; installed?: boolean; builds?: { tag: string; asset_name: string; installed_at: number; active: boolean }[] } = {}
+) {
   return fetch(`${baseUrl}/api/worker/heartbeat`, {
     method: "POST",
     headers: { "content-type": "application/json", authorization: "Bearer runs-test-secret" },
@@ -66,9 +69,9 @@ async function heartbeat(machineId: string, opts: { backend?: string; installed?
       hostname: machineId,
       backend: opts.backend ?? "cpu",
       hardware: { platform: "linux", arch: "x64", cpu: { manufacturer: "x", brand: "x", flags: [], cores: 4 }, gpu: [] },
-      installed_builds: opts.installed
-        ? [{ tag: "b1", asset_name: "llama-b1-bin-ubuntu-x64.zip", installed_at: 1, active: true }]
-        : [],
+      installed_builds:
+        opts.builds ??
+        (opts.installed ? [{ tag: "b1", asset_name: "llama-b1-bin-ubuntu-x64.zip", installed_at: 1, active: true }] : []),
       model_files: [],
       status: "idle",
     }),
@@ -185,6 +188,22 @@ describe("POST /api/runs/trigger", () => {
 
     const updated = repo.getTest(undefined, run.id);
     expect(updated?.status).toBe("running");
+  });
+
+  it("runs on the build the user activated, not just the first one of that backend", async () => {
+    await heartbeat("trigger-active-build", {
+      backend: "cpu",
+      builds: [
+        { tag: "b3", asset_name: "llama-b3-bin-ubuntu-x64.zip", installed_at: 3, active: false },
+        { tag: "b2", asset_name: "llama-b2-bin-ubuntu-x64.zip", installed_at: 2, active: true },
+      ],
+    });
+    const worker = repo.workerRepo.getByMachineId("trigger-active-build")!;
+    const res = await postJson("/api/runs/trigger", { model_id: "model-1", worker_id: worker.id, sweep: baseSweep });
+    expect(res.status).toBe(201);
+    const claimed = repo.queueRepo.claimNextJob(worker.id);
+    expect(claimed?.type).toBe("benchmark");
+    expect((claimed?.payload as { llama_cpp_build: string }).llama_cpp_build).toBe("b2");
   });
 });
 

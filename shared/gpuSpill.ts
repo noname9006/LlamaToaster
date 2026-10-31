@@ -52,6 +52,9 @@ export interface GpuBufferReport {
   /** deviceMib split by llama.cpp device name ("Vulkan0", "CUDA1"), so a claim
    * can be held against each device's own free memory. */
   byDeviceMib?: Record<string, number>;
+  /** Host RAM the GPU driver pinned for this load (<backend>_Host buffers), which
+   * WDDM counts as shared GPU memory without any of it being spill. */
+  hostPinnedMib?: number;
 }
 
 export interface GpuSpillInput {
@@ -126,8 +129,17 @@ export function measureGpuSpill(input: GpuSpillInput): GpuSpillVerdict {
 // buffer that never lands in VRAM -- cancels out, and only what changed since
 // is judged. Two independent accounts of that change, per reading:
 //
-//   s = shared(n) - shared(A)                        shared memory grew
+//   s = (shared(n) - pin(n)) - (shared(A) - pin(A))  shared memory grew
 //   d = (claim(n) - claim(A)) - (ded(n) - ded(A))    claim grew, VRAM did not
+//
+// pin is llama.cpp's own report of the host buffers the driver pinned. These
+// loads run --load-mode mlock, which puts CPU-resident weights in the GPU's pinned
+// host buffer, so shared holds them too and shrinks as layers move to the GPU:
+// uncorrected, s goes negative and min(s, d) below can never fire. Measured on the
+// RX 6600 XT (Vulkan, b11840, gemma-4-12b Q8_0, 1,024 tokens, MiB), mlock against
+// mmap+mlock at the same placement: 15 layers s 2930 / 2929.5; 25 layers 4993 /
+// 4992.5; 35 layers 7088 / 7087.8; 42 layers 8909 / 8908.8. Uncorrected, mlock's s
+// read -305, -531, -744, -531.
 //
 // Real spill moves both by the same amount; overhead growing in shared moves s
 // alone (dedicated still took the whole claim); a buffer moving back INTO VRAM
@@ -187,6 +199,7 @@ export interface AnchorPhase {
 export interface SpillAnchor {
   claimMib: number;
   contextMib: number;
+  hostPinnedMib?: number;
   ready: AnchorPhase | null;
   work: AnchorPhase | null;
 }
@@ -246,6 +259,7 @@ export function buildSpillAnchor(first: MeasuredLoad): SpillAnchor | null {
   const anchor: SpillAnchor = {
     claimMib: first.buffers.deviceMib,
     contextMib: first.buffers.contextMib,
+    hostPinnedMib: first.buffers.hostPinnedMib ?? 0,
     ready: anchorPhase(first, "ready"),
     work: anchorPhase(first, "work"),
   };
@@ -299,7 +313,8 @@ function judgePhase(load: MeasuredLoad, anchor: SpillAnchor, phase: Phase, atSma
   // two series that could describe different moments.
   const dSeries = readings.map((r) => claimGrowth - ((r.dedicatedMib as number) - a.dedicatedMib));
   const shared = a.sharedMib == null ? null : sharedSeries(readings);
-  const sSeries = shared ? shared.map((v) => v - (a.sharedMib as number)) : null;
+  const pinGrowth = (load.buffers.hostPinnedMib ?? 0) - (anchor.hostPinnedMib ?? 0);
+  const sSeries = shared ? shared.map((v) => v - (a.sharedMib as number) - pinGrowth) : null;
   const d = pick(dSeries, phase);
   const s = sSeries ? pick(sSeries, phase) : null;
   const spill = s == null ? d : Math.min(s, d);

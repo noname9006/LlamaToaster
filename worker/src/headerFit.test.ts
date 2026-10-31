@@ -102,13 +102,14 @@ function cdn(files: Record<string, { header: Buffer; size: number }>, status?: n
     if (!f) return { status: 404, headers: { get: () => null }, arrayBuffer: async () => new ArrayBuffer(0) };
     const range = init.headers.range;
     ranges.push(range);
-    const end = Number(/bytes=0-(\d+)/.exec(range)![1]);
-    const body = Buffer.alloc(Math.min(end + 1, f.size));
-    f.header.copy(body, 0, 0, Math.min(f.header.length, body.length));
+    const [, from, to] = /bytes=(\d+)-(\d+)/.exec(range)!.map(Number);
+    const whole = Buffer.alloc(Math.min(to + 1, f.size));
+    f.header.copy(whole, 0, 0, Math.min(f.header.length, whole.length));
+    const body = whole.subarray(from);
     return {
       status: 206,
-      headers: { get: (n: string) => (n.toLowerCase() === "content-range" ? `bytes 0-${body.length - 1}/${f.size}` : null) },
-      arrayBuffer: async () => body.buffer.slice(body.byteOffset, body.byteOffset + body.length),
+      headers: { get: (n: string) => (n.toLowerCase() === "content-range" ? `bytes ${from}-${whole.length - 1}/${f.size}` : null) },
+      arrayBuffer: async () => body.buffer.slice(body.byteOffset, body.byteOffset + body.length) as ArrayBuffer,
     };
   };
   return { fetchFn, ranges };
@@ -123,7 +124,21 @@ describe("fetchGgufHeader", () => {
     const h = await fetchGgufHeader("https://x/m.gguf", { fetchFn });
     expect(h.header.length).toBe(g.end);
     expect(h.size).toBe(5_000_000_000);
-    expect(ranges).toEqual([`bytes=0-${HEADER_FIRST_READ_BYTES - 1}`, `bytes=0-${2 * HEADER_FIRST_READ_BYTES - 1}`]);
+    // The second read asks only for what the first did not bring.
+    expect(ranges).toEqual([`bytes=0-${HEADER_FIRST_READ_BYTES - 1}`, `bytes=${HEADER_FIRST_READ_BYTES}-${2 * HEADER_FIRST_READ_BYTES - 1}`]);
+    expect(h.fetchedBytes).toBeLessThanOrEqual(2 * HEADER_FIRST_READ_BYTES);
+  });
+
+  it("starts over when the server ignores the range and sends the whole file", async () => {
+    const g = gguf({ vocab: 3 });
+    const fetchFn: FetchFn = async () => ({
+      status: 200,
+      headers: { get: () => null },
+      arrayBuffer: async () => g.buf.buffer.slice(g.buf.byteOffset, g.buf.byteOffset + g.buf.length) as ArrayBuffer,
+    });
+    const h = await fetchGgufHeader("https://x/m.gguf", { fetchFn, firstReadBytes: 8 });
+    expect(h.header.length).toBe(Math.min(g.end, g.buf.length));
+    expect(h.size).toBe(g.buf.length);
   });
 
   it("names a gated repo", async () => {

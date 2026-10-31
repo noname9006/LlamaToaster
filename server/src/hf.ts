@@ -41,7 +41,7 @@ export const HF_REPO_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.-]*\/[A-Za-z0-9][A-Za-z0
 // Group 1 is unsloth's "Dynamic" quant prefix (UD-Q4_K_XL, UD-IQ2_M, ...) --
 // optional; group 2 is the actual quant code. Mirrored in
 // client/src/modelGrouping.ts's own QUANT_PATTERN.
-const QUANT_PATTERN = /(?:^|[-_.])(UD[-_])?((?:IQ|Q)[0-9]+(?:_[A-Z0-9]+)*|F16|F32|BF16)(?=[-_.]|$)/i;
+const QUANT_PATTERN = /(?:^|[-_.])(UD[-_])?((?:IQ|Q|MXFP)[0-9]+(?:_[A-Z0-9]+)*|F16|F32|BF16)(?=[-_.]|$)/i;
 
 export function parseQuant(filename: string): string | null {
   const base = filename.split("/").pop() ?? filename;

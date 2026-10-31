@@ -190,7 +190,7 @@ export async function buildArgs(input: BenchRunInput): Promise<string[]> {
   // ON instead -- see that function's own comment. Probed rather than
   // assumed (§0.7): `--load-mode mlock` on current builds, --mlock /
   // --mmap 0 on older ones (see binary-probe.ts's modelLoadArgsFromHelp).
-  args.push(...(await modelLoadArgs(input.llamaBenchPath, "mlock_no_mmap")));
+  args.push(...(await modelLoadArgs(input.llamaBenchPath)));
   if (input.extraArgs?.length) args.push(...input.extraArgs);
   return args;
 }
@@ -392,6 +392,7 @@ const MODEL_BUFFER_SIZE_LINE_RE = /^.*?load_tensors:\s*(\S+) model buffer size\s
 // Vulkan: the same -ngl 0 load prints "Vulkan_Host model buffer" under
 // --load-mode mlock and "CPU_Mapped model buffer" under mmap+mlock.
 const HOST_BUFFER_NAME_RE = /^CPU|^AMX$|_Host$/i;
+const PINNED_HOST_BUFFER_NAME_RE = /_Host$/i;
 
 // llama.cpp's EXACT per-layer placement decision, printed once per layer at
 // DEBUG log level -- and llama-bench runs at DEBUG whenever this app's own
@@ -544,9 +545,12 @@ const GPU_BUFFER_SIZE_LINE_RE = /^.*?:\s*(\S+)\s+(model|KV|RS|compute|output)\s+
 
 export function parseGpuBufferReport(
   stderr: string
-): { deviceMib: number; contextMib: number; byDeviceMib: Record<string, number> } | null {
+): { deviceMib: number; contextMib: number; byDeviceMib: Record<string, number>; hostPinnedMib: number } | null {
   let seen = false;
   const byDeviceMib: Record<string, number> = {};
+  // Host RAM the GPU driver pins: with mmap off, CPU-resident weights land in
+  // <backend>_Host, which WDDM counts as this process's shared GPU memory.
+  let hostPinnedMib = 0;
   const latest = new Map<string, { device: string; kind: string; mib: number }>();
   let caches = new Map<string, { device: string; kind: string; mib: number }>();
   let inCacheRun = false;
@@ -558,21 +562,28 @@ export function parseGpuBufferReport(
     if (isCache && !inCacheRun) caches = new Map();
     inCacheRun = isCache;
     const mib = Number(m[3]);
-    if (!Number.isFinite(mib) || HOST_BUFFER_NAME_RE.test(m[1])) continue;
+    const pinned = PINNED_HOST_BUFFER_NAME_RE.test(m[1]);
+    if (!Number.isFinite(mib) || (HOST_BUFFER_NAME_RE.test(m[1]) && !pinned)) continue;
     const key = `${m[1]}:${m[2]}`;
-    if (m[2] === "model") byDeviceMib[m[1]] = (byDeviceMib[m[1]] ?? 0) + mib;
-    else if (isCache) caches.set(key, { device: m[1], kind: m[2], mib: (caches.get(key)?.mib ?? 0) + mib });
+    if (m[2] === "model") {
+      if (pinned) hostPinnedMib += mib;
+      else byDeviceMib[m[1]] = (byDeviceMib[m[1]] ?? 0) + mib;
+    } else if (isCache) caches.set(key, { device: m[1], kind: m[2], mib: (caches.get(key)?.mib ?? 0) + mib });
     else latest.set(key, { device: m[1], kind: m[2], mib });
   }
   for (const [key, entry] of caches) latest.set(key, entry);
   if (!seen) return null;
   let contextMib = 0;
   for (const { device, kind, mib } of latest.values()) {
+    if (PINNED_HOST_BUFFER_NAME_RE.test(device)) {
+      hostPinnedMib += mib;
+      continue;
+    }
     byDeviceMib[device] = (byDeviceMib[device] ?? 0) + mib;
     if (kind === "KV" || kind === "compute") contextMib += mib;
   }
   const deviceMib = Object.values(byDeviceMib).reduce((sum, mib) => sum + mib, 0);
-  return { deviceMib, contextMib, byDeviceMib };
+  return { deviceMib, contextMib, byDeviceMib, hostPinnedMib };
 }
 
 // ---------------------------------------------------------------------------

@@ -5,6 +5,7 @@ import {
   modelBaseLabel,
   quantTierLabel,
   buildModelGroups,
+  groupHfFilesByTier,
   groupQuantsByTier,
 } from "./modelGrouping";
 import type { Model } from "./types";
@@ -20,6 +21,46 @@ function model(patch: Partial<Model> = {}): Model {
     ...patch,
   };
 }
+
+describe("groupHfFilesByTier", () => {
+  // unsloth/gemma-4-26B-A4B-it-GGUF's real file list, trimmed.
+  const f = (path: string, size_bytes: number) => ({ path, size_bytes, quant: null });
+  const tiers = groupHfFilesByTier([
+    f("BF16/gemma-BF16-00001-of-00002.gguf", 49_920),
+    f("BF16/gemma-BF16-00002-of-00002.gguf", 580),
+    f("MTP/mtp-gemma-Q8_0.gguf", 460),
+    f("MTP/mtp-gemma-BF16.gguf", 860),
+    f("gemma-MXFP4_MOE.gguf", 16_550),
+    f("gemma-Q8_0.gguf", 26_860),
+    f("gemma-UD-IQ2_M.gguf", 10_010),
+    f("gemma-UD-Q4_K_M.gguf", 16_950),
+    f("gemma-UD-IQ4_XS.gguf", 13_600),
+    f("mmproj-F32.gguf", 2_290),
+    f("mtp-gemma.gguf", 460),
+  ]);
+
+  it("rows are bit widths in ascending order, with what has no bit width last", () => {
+    expect(tiers.map((t) => t.label)).toEqual(["2-bit", "4-bit", "8-bit", "16-bit", "Other"]);
+  });
+
+  it("counts MXFP4 as 4-bit, sorted by size inside the row", () => {
+    expect(tiers[1].chips.map((c) => c.label)).toEqual(["UD-IQ4_XS", "MXFP4_MOE", "UD-Q4_K_M"]);
+  });
+
+  it("merges a split model into one chip pointing at shard 1", () => {
+    const bf16 = tiers[3].chips.find((c) => c.kind === "quant")!;
+    expect(bf16).toMatchObject({ label: "BF16", file: "BF16/gemma-BF16-00001-of-00002.gguf", sizeBytes: 50_500 });
+    expect(bf16.files).toHaveLength(2);
+  });
+
+  it("keeps MTP drafts in their bit row, tagged", () => {
+    expect(tiers[2].chips.map((c) => [c.label, c.kind])).toEqual([["Q8_0", "mtp"], ["Q8_0", "quant"]]);
+  });
+
+  it("drops nothing: mmproj and an unlabelled MTP land in Other", () => {
+    expect(tiers[4].chips.map((c) => c.kind).sort()).toEqual(["mmproj", "mtp"]);
+  });
+});
 
 describe("extractQuant", () => {
   it("pulls a standard quant token out of a filename", () => {

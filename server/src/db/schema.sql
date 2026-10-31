@@ -643,6 +643,26 @@ CREATE TABLE IF NOT EXISTS fit_checks (
   PRIMARY KEY (worker_id, model_id, ctx, margin_mib, llama_cpp_build)
 );
 
+-- "Will it fit?" on the Models page (docs/plans/MODEL_FIT_CHECK_PLAN.md). Keyed by
+-- target_key, not models(id): a file seen only in Hugging Face search is not in the
+-- catalog, and asking about it must not put it there -- the catalog is shared
+-- between users. Latest answer only.
+CREATE TABLE IF NOT EXISTS model_fit_checks (
+  worker_id TEXT NOT NULL REFERENCES workers(id) ON DELETE CASCADE,
+  target_key TEXT NOT NULL,       -- hf:<repo>/<file> | model:<id>
+  ctx INTEGER NOT NULL,           -- the context asked for; point_json.ctx is what was sized
+  margin_mib INTEGER NOT NULL,
+  llama_cpp_build TEXT NOT NULL,
+  backend TEXT NOT NULL,
+  source TEXT,                    -- local | header
+  memory_json TEXT NOT NULL,      -- shared/fitLevel.ts FitMemory at the time
+  point_json TEXT,                -- shared/fitParams.ts FitPoint
+  error TEXT,
+  fetched_bytes INTEGER,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (worker_id, target_key, ctx, margin_mib)
+);
+
 -- Optimization flow step 4: which K/V cache pairs run on the GPU for this
 -- (machine, build, model). Cached across runs, so a repeat fit map skips the
 -- 128-call detection.

@@ -9,7 +9,7 @@
 
 import { spawn, type ChildProcess } from "node:child_process";
 import type { IngestResultInput, ProbeAttemptReport } from "../../shared/types.js";
-import { CURVE_METHOD_VERSION, FILL_CURVE_METHOD_VERSION, SERVER_METHOD_VERSION } from "../../shared/types.js";
+import { CURVE_METHOD_VERSION, FILL_CURVE_METHOD_VERSION, KNEE_METHOD_VERSION, SERVER_METHOD_VERSION } from "../../shared/types.js";
 import { fillBoundaries, fillTarget } from "../../shared/fillCurve.js";
 import type { SweepItem } from "../../shared/sweep.js";
 import { isVramDiscrepancy } from "../../shared/vramEstimate.js";
@@ -92,8 +92,6 @@ export interface SpawnRuntimeServerInput {
   slots: number;
   mainGpu?: number;
   contextSizeOverride?: number;
-  /** Speed runs load the model fully into RAM instead of mmap-ing it. */
-  noMmap?: boolean;
   /** See ServerArgsInput.extraArgs. */
   extraArgs?: string[];
   log?: BenchLogger;
@@ -112,10 +110,9 @@ export async function spawnRuntimeServer(input: SpawnRuntimeServerInput): Promis
   // Same §0.7 probe pattern for --fit -- see buildServerArgs's own comment
   // for why this is forced off rather than left at llama-server's default.
   const supportsFit = await supportsFlag(input.llamaServerPath, "--fit").catch(() => false);
-  // Same §0.7 probe pattern for the model-loading flags -- keeps the model
-  // locked in RAM for the run's duration instead of left swappable, and with
-  // noMmap also reads it into RAM instead of mapping it.
-  const modelLoad = await modelLoadArgs(input.llamaServerPath, input.noMmap === true ? "mlock_no_mmap" : "mlock_mmap");
+  // Same §0.7 probe pattern for the model-loading flags -- reads the model into
+  // RAM and keeps it locked for the run's duration instead of left swappable.
+  const modelLoad = await modelLoadArgs(input.llamaServerPath);
   const args = buildServerArgs({
     modelPath: input.modelPath,
     port: input.port,
@@ -792,7 +789,7 @@ export async function executeKneeLadder(input: KneeExecutionInput): Promise<Inge
       mtp: "off",
       n_gpu_layers_draft: 0,
       n_cpu_moe: 0,
-      method_version: SERVER_METHOD_VERSION,
+      method_version: KNEE_METHOD_VERSION,
       concurrency: slots,
       ttft_ms_p50: summary.ttftP50Ms,
       ttft_ms_p95: summary.ttftP95Ms,

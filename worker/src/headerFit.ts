@@ -20,6 +20,9 @@ import { promisify } from "node:util";
 const execFileAsync = promisify(execFile);
 
 export const HEADER_FIRST_READ_BYTES = 4 * 1024 * 1024;
+// Shards after the first carry no tokenizer, only their own tensor list: 20
+// shards must not cost 80 MB.
+export const LATER_SHARD_FIRST_READ_BYTES = 1024 * 1024;
 // Same ceiling as shared/gguf.ts's MAX_READ_BYTES: a header past this is not
 // one we can size.
 export const HEADER_MAX_BYTES = 64 * 1024 * 1024;
@@ -129,29 +132,33 @@ export class HeaderFitError extends Error {
 }
 
 /** The header bytes of one remote GGUF and its full size, by range reads that
- * double until the header ends (never past HEADER_MAX_BYTES). */
+ * double until the header ends (never past HEADER_MAX_BYTES). Only the bytes not
+ * held yet are asked for, so the cost is the header plus at most one read's
+ * overshoot. */
 export async function fetchGgufHeader(
   url: string,
-  opts: { fetchFn?: FetchFn; headers?: Record<string, string> } = {}
+  opts: { fetchFn?: FetchFn; headers?: Record<string, string>; firstReadBytes?: number } = {}
 ): Promise<{ header: Buffer; size: number; fetchedBytes: number }> {
   const fetchFn = opts.fetchFn ?? (fetch as unknown as FetchFn);
-  let want = HEADER_FIRST_READ_BYTES;
+  let want = opts.firstReadBytes ?? HEADER_FIRST_READ_BYTES;
+  let held: Buffer = Buffer.alloc(0);
   let fetched = 0;
   for (;;) {
-    const res = await fetchFn(url, { headers: { ...(opts.headers ?? {}), range: `bytes=0-${want - 1}` } });
+    const res = await fetchFn(url, { headers: { ...(opts.headers ?? {}), range: `bytes=${held.length}-${want - 1}` } });
     if (res.status === 401 || res.status === 403) throw new HeaderFitError(`${res.status} from ${url} (gated or private repo)`, "gated");
     if (res.status === 404) throw new HeaderFitError(`404 from ${url}`, "not_found");
     if (res.status !== 206 && res.status !== 200) throw new HeaderFitError(`${res.status} from ${url}`, "http");
     const body = Buffer.from(await res.arrayBuffer());
     fetched += body.length;
-    // 206: "bytes 0-N/TOTAL"; 200: the whole (small) file.
+    // 206: "bytes A-B/TOTAL"; 200: the whole file, from byte 0 whatever was asked.
     const range = res.headers.get("content-range");
     const total = range ? Number(/\/(\d+)\s*$/.exec(range)?.[1]) : res.status === 200 ? body.length : NaN;
     if (!Number.isFinite(total) || total <= 0) throw new HeaderFitError(`no size for ${url}`, "http");
-    const end = ggufHeaderEnd(body);
+    held = res.status === 200 ? body : Buffer.concat([held, body]);
+    const end = ggufHeaderEnd(held);
     if (end === null) throw new HeaderFitError(`${basename(url)} is not a GGUF this reader can walk`, "not_gguf");
-    if (end !== "more") return { header: body.subarray(0, Math.min(end, total)), size: total, fetchedBytes: fetched };
-    if (body.length >= total) throw new HeaderFitError(`${basename(url)} ends inside its own header`, "not_gguf");
+    if (end !== "more") return { header: held.subarray(0, Math.min(end, total)), size: total, fetchedBytes: fetched };
+    if (held.length >= total) throw new HeaderFitError(`${basename(url)} ends inside its own header`, "not_gguf");
     if (want >= HEADER_MAX_BYTES) throw new HeaderFitError(`header of ${basename(url)} is over ${HEADER_MAX_BYTES >> 20} MiB`, "too_large");
     want = Math.min(want * 2, HEADER_MAX_BYTES);
   }
@@ -234,8 +241,12 @@ export async function prepareHeaderModel(input: {
     let fetched = 0;
     let total = 0;
     const shards = shardNames(input.file);
-    for (const shard of shards) {
-      const h = await fetchGgufHeader(input.urlFor(shard), { fetchFn: input.fetchFn, headers: input.headers });
+    for (const [i, shard] of shards.entries()) {
+      const h = await fetchGgufHeader(input.urlFor(shard), {
+        fetchFn: input.fetchFn,
+        headers: input.headers,
+        firstReadBytes: i === 0 ? HEADER_FIRST_READ_BYTES : LATER_SHARD_FIRST_READ_BYTES,
+      });
       fetched += h.fetchedBytes;
       total += h.size;
       await writeSparsePlaceholder(join(input.dir, basename(shard)), h.header, h.size, {

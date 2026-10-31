@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { api } from "../api/client";
+import { useRocmSupport } from "../api/useRocmSupport";
 import type { Worker, Test, LlamaCppRelease, ActiveJobReport } from "../types";
-import { extractCudaVariant, cudaDriverSupports, isRocmAssetName, findCommunityRocmGpu } from "../types";
+import { backendOfAsset, detectBackend, extractCudaVariant, cudaDriverSupports, isRocmAssetName, findCommunityRocmGpu } from "../types";
 import { StatusPill, WorkerStatusPill, ElapsedSince } from "./StatusPill";
 import { IconCheck, IconChevronDown, IconDownload, IconPencil, IconTrash } from "./icons";
 import { Tooltip } from "./Tooltip";
@@ -257,11 +258,15 @@ function RocmUnofficialNotice({ gpuModel, platform }: { gpuModel: string; platfo
 }
 
 export function WorkerCard({ worker, onRefresh }: { worker: Worker; onRefresh: () => void }) {
+  const rocmSupport = useRocmSupport();
   const [busyTag, setBusyTag] = useState<string | null>(null);
   const [msg, setMsg] = useState("");
   const [available, setAvailable] = useState<LlamaCppRelease[]>([]);
-  // Same OS/arch but a backend other than this machine's -- offered collapsed.
+  // Same OS/arch but a backend other than this machine's -- offered through the
+  // Backend selector, with a warning.
   const [otherAvailable, setOtherAvailable] = useState<LlamaCppRelease[]>([]);
+  // Which backend's builds the install list shows; null = the machine's own.
+  const [browseBackend, setBrowseBackend] = useState<string | null>(null);
   const [updateAvailable, setUpdateAvailable] = useState(false);
   // Bumped after every queued action (install/activate/delete/...) so the
   // available-builds fetch below re-runs immediately instead of waiting for
@@ -407,6 +412,20 @@ export function WorkerCard({ worker, onRefresh }: { worker: Worker; onRefresh: (
     rel.assets.filter((a) => !installedAssets.has(`${rel.tag}\0${a.name}`)).map((asset) => ({ rel, asset }))
   );
 
+  // What this machine's hardware calls for, whatever it runs now: activating a
+  // build of another backend changes worker.backend, so that is no longer it.
+  const detectedBackend =
+    worker.platform && worker.hardware ? detectBackend(worker.platform, worker.hardware.gpu, rocmSupport) : worker.backend ?? null;
+  const shownBackend = browseBackend ?? worker.backend ?? null;
+  const otherBackends = Array.from(
+    new Set(otherToInstall.map(({ asset }) => backendOfAsset(asset.name)).filter((b): b is string => b != null))
+  );
+  const backendRisk = (backend: string | null | undefined): string | null =>
+    backend && detectedBackend && backend !== detectedBackend
+      ? `${backend} is not the backend detected for this machine (${detectedBackend}). It may not work: llama.cpp can crash, or fall back to another device with degraded performance.`
+      : null;
+  const otherRows = otherToInstall.filter(({ asset }) => backendOfAsset(asset.name) === shownBackend);
+
   // This worker's own reported NVIDIA driver capability -- decides whether a
   // cuda-13.x variant is installable here or would fail to load at all.
   const driverCudaVersion = worker.hardware?.nvidia_driver?.cuda_version ?? null;
@@ -459,13 +478,15 @@ export function WorkerCard({ worker, onRefresh }: { worker: Worker; onRefresh: (
         <button
           type="button"
           disabled={busyTag === busyKey}
-          onClick={() =>
-            withBusy(
+          onClick={() => {
+            const risk = backendRisk(backendOfAsset(asset.name));
+            if (risk && !window.confirm(`${risk}\n\nInstall ${rel.tag} anyway?`)) return;
+            void withBusy(
               busyKey,
               () => api.installBuild(worker.id, rel.tag, asset.name).then(() => undefined),
               `Queued: install ${rel.tag} (${asset.name})`
-            )
-          }
+            );
+          }}
           className="flex items-center gap-1.5 rounded-md border border-border px-2.5 py-1 text-xs font-semibold text-fg hover:border-accent/40 hover:text-accent disabled:opacity-50"
         >
           <IconDownload width={14} height={14} />
@@ -486,7 +507,7 @@ export function WorkerCard({ worker, onRefresh }: { worker: Worker; onRefresh: (
       : undefined;
 
   return (
-    <div className="rounded-xl border border-border bg-surface p-5">
+    <div id={`machine-${worker.id}`} className="scroll-mt-4 rounded-xl border border-border bg-surface p-5">
       <div className="flex flex-wrap items-center justify-between gap-2">
         {renaming ? (
           <input
@@ -752,6 +773,11 @@ export function WorkerCard({ worker, onRefresh }: { worker: Worker; onRefresh: (
                           <StatusPill label="unofficial ROCm" tone="warning" />
                         </Tooltip>
                       )}
+                      {backendRisk(backendOfAsset(b.asset_name)) && (
+                        <Tooltip text={backendRisk(backendOfAsset(b.asset_name))!}>
+                          <StatusPill label={`${backendOfAsset(b.asset_name)}: not detected`} tone="warning" />
+                        </Tooltip>
+                      )}
                     </div>
                     <div className="flex items-center gap-2">
                       {needsDriverUpdate && (
@@ -766,13 +792,20 @@ export function WorkerCard({ worker, onRefresh }: { worker: Worker; onRefresh: (
                           <button
                             type="button"
                             disabled={busyTag === b.tag}
-                            onClick={() =>
-                              withBusy(
+                            onClick={() => {
+                              const risk = backendRisk(backendOfAsset(b.asset_name));
+                              if (
+                                risk &&
+                                !window.confirm(`${risk}\n\nThis machine's tests will run on this build. Activate ${b.tag} anyway?`)
+                              ) {
+                                return;
+                              }
+                              void withBusy(
                                 b.tag,
                                 () => api.activateBuild(worker.id, b.tag).then(() => undefined),
                                 `Queued: activate ${b.tag}`
-                              )
-                            }
+                              );
+                            }}
                             className="rounded-md bg-accent px-2.5 py-1 text-xs font-semibold text-accent-fg disabled:opacity-50"
                           >
                             Activate
@@ -804,32 +837,52 @@ export function WorkerCard({ worker, onRefresh }: { worker: Worker; onRefresh: (
           </div>
 
           <div className="mt-4">
-            <h4 className="text-xs font-semibold uppercase tracking-wide text-muted">Available to install</h4>
-            {availableToInstall.length === 0 ? (
-              <p className="mt-1.5 text-sm text-muted">Nothing new for this platform/backend.</p>
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <h4 className="m-0 text-xs font-semibold uppercase tracking-wide text-muted">Available to install</h4>
+              {otherBackends.length > 0 && worker.backend && (
+                <label className="flex items-center gap-1.5 text-xs text-muted">
+                  Backend
+                  <select
+                    value={shownBackend ?? ""}
+                    onChange={(e) => setBrowseBackend(e.target.value === worker.backend ? null : e.target.value)}
+                    className="rounded border border-border bg-surface px-1.5 py-0.5 text-xs text-fg outline-none focus:border-accent"
+                  >
+                    {Array.from(new Set([worker.backend, ...otherBackends, ...(shownBackend ? [shownBackend] : [])])).map((b) => (
+                      <option key={b} value={b}>
+                        {b}
+                        {b === detectedBackend ? " (auto-detected)" : ""}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              )}
+            </div>
+            {backendRisk(shownBackend) && (
+              <p role="alert" className="mt-1.5 rounded-lg border border-warning/40 bg-warning/5 px-3 py-2 text-xs text-warning">
+                {backendRisk(shownBackend)}
+              </p>
+            )}
+            {shownBackend === (worker.backend ?? null) ? (
+              availableToInstall.length === 0 ? (
+                <p className="mt-1.5 text-sm text-muted">Nothing new for this platform/backend.</p>
+              ) : (
+                <ul className="mt-1.5 flex max-h-64 flex-col gap-1.5 overflow-y-auto">
+                  {/* CUDA variants are ordered best-first by the server (see
+                      sortAssetsForWorker), so assets[0] is the one to offer. */}
+                  {availableToInstall.map((rel) => renderInstallRow(rel, rel.assets[0], rel.tag))}
+                </ul>
+              )
+            ) : otherRows.length === 0 ? (
+              <p className="mt-1.5 text-sm text-muted">Already installed: activate it above.</p>
             ) : (
-              <ul className="mt-1.5 flex max-h-64 flex-col gap-1.5 overflow-y-auto">
-                {/* CUDA variants are ordered best-first by the server (see
-                    sortAssetsForWorker), so assets[0] is the one to offer. */}
-                {availableToInstall.map((rel) => renderInstallRow(rel, rel.assets[0], rel.tag))}
-              </ul>
+              <>
+                <p className="mt-1.5 text-xs text-muted">Only the newest release of each variant is listed.</p>
+                <ul className="mt-1.5 flex max-h-64 flex-col gap-1.5 overflow-y-auto">
+                  {otherRows.map(({ rel, asset }) => renderInstallRow(rel, asset, `${rel.tag}:${asset.name}`))}
+                </ul>
+              </>
             )}
           </div>
-
-          {otherToInstall.length > 0 && (
-            <details className="group mt-4">
-              <summary className="cursor-pointer select-none text-xs font-semibold uppercase tracking-wide text-muted hover:text-fg">
-                Other builds for this OS ({otherToInstall.length}) — not recommended
-              </summary>
-              <p className="mt-1.5 text-xs text-muted">
-                These match this machine's OS and CPU architecture but not its detected backend ({worker.backend}), so
-                they may run slowly or fail to use the GPU. Only the newest release of each variant is listed.
-              </p>
-              <ul className="mt-1.5 flex max-h-64 flex-col gap-1.5 overflow-y-auto">
-                {otherToInstall.map(({ rel, asset }) => renderInstallRow(rel, asset, `${rel.tag}:${asset.name}`))}
-              </ul>
-            </details>
-          )}
         </>
       )}
 

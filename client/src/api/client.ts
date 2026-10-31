@@ -28,6 +28,9 @@ import {
   type AdminStats,
   type RocmSupportSnapshot,
   type FitCheckResult,
+  type ModelFitPlan,
+  type ModelFitResult,
+  type ModelFitTarget,
 } from "../types";
 import type { FitPoint } from "../../../shared/fitParams.js";
 import type { KvSupportRow } from "../../../shared/kvSupport.js";
@@ -248,6 +251,18 @@ export const api = {
 
   fitChecks: (workerId: string, ctx: number): Promise<{ results: FitCheckResult[]; pending: boolean }> =>
     request(`/api/workers/${encodeURIComponent(workerId)}/fit-checks?ctx=${ctx}`),
+
+  // docs/plans/MODEL_FIT_CHECK_PLAN.md: "Will it fit?" on the Models page.
+  getModelFitPlan: (workerId: string): Promise<ModelFitPlan> => request(`/api/workers/${encodeURIComponent(workerId)}/model-fit/plan`),
+
+  requestModelFit: (
+    workerId: string,
+    body: { targets: ModelFitTarget[]; auto_install: boolean; force: boolean }
+  ): Promise<{ ok: true; queued: number; queued_keys?: string[]; installing?: string }> =>
+    request(`/api/workers/${encodeURIComponent(workerId)}/model-fit`, postJson(body)),
+
+  listModelFit: (workerId: string): Promise<{ results: ModelFitResult[]; pending_keys: string[]; installing: string | null }> =>
+    request(`/api/workers/${encodeURIComponent(workerId)}/model-fit`),
 
   // sort/direction map to HF's own search API params (server/src/hf.ts);
   // cursor comes from a previous call's nextCursor -- HF paginates via a

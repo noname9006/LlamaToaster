@@ -54,7 +54,7 @@ import {
 import { DEFAULT_KNEE_SLOTS, generationRate } from "./loadDriver.js";
 import { fetchFillerBlocks } from "./fillerPrompt.js";
 import { modelLoadArgs, supportsFlag, readListDevices, usedListedDevices } from "./binary-probe.js";
-import { MemorySampler, captureFreeMemoryBaseline, type SampleStats, type FreeMemoryBaseline } from "./sampler.js";
+import { MemorySampler, captureFreeMemoryBaseline, readSystemRamMib, type SampleStats, type FreeMemoryBaseline } from "./sampler.js";
 import { MemoryTrace } from "./memoryTrace.js";
 import { buildSpillAnchor, measureGrowthSpill, withAnchorControl, type SpillAnchor } from "../../shared/gpuSpill.js";
 import { readGpuMemory, readNvidiaDriverInfo, type NvidiaDriverInfo } from "./vram.js";
@@ -90,9 +90,10 @@ import {
   postFitPoints,
   postKvSupport,
   postFitChecks,
+  postModelFit,
 } from "./vps-client.js";
 import { makeFitCaller, runFitMap } from "./fitMap.js";
-import { prepareHeaderModel } from "./headerFit.js";
+import { prepareHeaderModel, shardNames } from "./headerFit.js";
 import { killProcessesUnder } from "./orphans.js";
 import { detectMoe, toArgs as toPlacementArgs } from "../../shared/moePlacement.js";
 import type { FitPoint } from "../../shared/fitParams.js";
@@ -151,11 +152,13 @@ import {
   METHOD_VERSION,
   WORKER_CAPABILITIES,
   SPEED_RUN_METHOD_VERSION,
+  backendOfAsset,
   type TestProbeJobPayload,
   type FitMapJobPayload,
   type FitCheckJobPayload,
   type FitCheckResult,
   type FitCheckSource,
+  type ModelFitReport,
   type ProbeResultInput,
   type ProbeAttemptReport,
   type MeasureQualityJobPayload,
@@ -320,15 +323,11 @@ if (!config.machine_public_key || !config.machine_private_key) {
 const buildsDir = resolve(config.llama_cpp_builds_dir ?? join(__dirname, "..", "llama-builds"));
 
 // docs/plans/HEADER_FIT_PLAN.md: header placeholders for sizing a model that is
-// not on this machine (worker/src/headerFit.ts). Never inside model_dir, so no
-// scan or download ever takes one for a model; emptied at startup in case a
-// crash left one behind, and after every use.
-const headerCacheDir = (() => {
-  const beside = resolve(join(__dirname, "..", "header-cache"));
-  const rel = relative(resolve(config.model_dir), beside);
-  // A model_dir that contains the worker folder would scan the placeholders.
-  return rel.startsWith("..") || isAbsolute(rel) ? beside : resolve(join(tmpdir(), "llamatoaster-header-cache"));
-})();
+// not on this machine (worker/src/headerFit.ts). In the OS temp folder, never
+// inside model_dir, so no scan or download ever takes one for a model; emptied
+// at startup in case a crash left one behind, and after every use. Named per
+// machine id: two workers on one box must not sweep each other's files.
+const headerCacheDir = resolve(join(tmpdir(), `llamatoaster-header-cache-${config.machine_id}`));
 try {
   rmSync(headerCacheDir, { recursive: true, force: true });
 } catch {
@@ -383,7 +382,9 @@ const detectedHardware = await detectHardware();
 const needsRocmList =
   !config.backend && detectedHardware.gpu.some((g) => /amd|advanced micro devices/i.test(g.vendor));
 const rocmSupport = needsRocmList ? await getRocmSupport(config.url) : null;
-const backend: Backend =
+// Mutable: activating a build of another backend switches the machine to it
+// (executeActivateBuildJob), since every test picks its build by this value.
+let backend: Backend =
   config.backend ?? detectBackend(detectedHardware.platform, detectedHardware.gpu, rocmSupport ?? undefined);
 if (!config.backend) {
   log.info(`no backend set in config.json -- auto-detected "${backend}" from hardware`);
@@ -517,7 +518,7 @@ if (!activeBuild) {
 // (subfolder) -- and resolving straight from hf_file alone is what produced
 // the "model file not found at F:\...\Qwen3.5-9B\Qwen3.5-9B-PRISM-DQ.gguf"
 // benchmark failure. Throws when nothing can be resolved.
-async function resolveModelPath(model: Model): Promise<string> {
+async function resolveModelPath(model: Model, opts: { exactOnly?: boolean } = {}): Promise<string> {
   const name = model.source === "local" ? model.filename : model.hf_file ?? model.filename;
   if (!name) {
     throw new Error(`model ${model.id} has no filename to resolve (source=${model.source})`);
@@ -530,7 +531,7 @@ async function resolveModelPath(model: Model): Promise<string> {
   }
   if (existsSync(direct)) return direct;
 
-  const cached = await resolveModelPathFromCache(model, name);
+  const cached = await resolveModelPathFromCache(model, name, opts.exactOnly === true);
   if (cached) {
     log.info(
       `model ${model.id}: direct path ${direct} not present, resolved to cached path ${cached} ` +
@@ -555,7 +556,7 @@ async function resolveModelPath(model: Model): Promise<string> {
 //      with the same name in different folders) resolves to the first match,
 //      which is no worse than the old behavior's silent hard failure.
 // Returns the cache entry's model_dir-relative path, or null.
-async function resolveModelPathFromCache(model: Model, name: string): Promise<string | null> {
+async function resolveModelPathFromCache(model: Model, name: string, exactOnly = false): Promise<string | null> {
   const entries = await localModelCache.getAll();
   const shaId = /^[0-9a-f]{64}$/.test(model.id) ? model.id.toLowerCase() : null;
   const wantHfId = model.hf_repo && model.hf_file ? `${model.hf_repo}/${model.hf_file}` : null;
@@ -568,7 +569,7 @@ async function resolveModelPathFromCache(model: Model, name: string): Promise<st
     if (wantHfId && e.hf_model_id === wantHfId) return e.path;
     if (!baseMatch && basename(e.path) === wantBase) baseMatch = e.path;
   }
-  return baseMatch;
+  return exactOnly ? null : baseMatch;
 }
 
 // Same containment rule as resolveModelPath, applied to a raw filename
@@ -2705,7 +2706,6 @@ async function executeFillCurveJob(payload: BenchmarkJob, spec: FillCurveSpec): 
           slots: 1,
           mainGpu: payload.main_gpu,
           contextSizeOverride: spec.ctx,
-          noMmap: true,
           log,
           onSpawn: (proc) => {
             activeBenchProc = proc;
@@ -2863,7 +2863,6 @@ async function executeSpeedRunJob(payload: BenchmarkJob, spec: SpeedRunSpec): Pr
           slots: 1,
           mainGpu: payload.main_gpu,
           contextSizeOverride: spec.target_ctx,
-          noMmap: true,
           extraArgs: candidateExtraServerArgs(c),
           log,
           onSpawn: (proc) => {
@@ -3183,9 +3182,15 @@ interface PreparedModel {
 
 // A path llama-fit-params can size: the model file when this machine has it,
 // else a sparse placeholder holding its real header (worker/src/headerFit.ts).
-async function modelPathOrHeader(model: Model, slot: string): Promise<PreparedModel> {
-  const local = await resolveModelPath(model);
-  if (existsSync(local)) return { path: local, source: "local", fetchedBytes: 0, cleanup: async () => {} };
+async function modelPathOrHeader(model: Model, slot: string, opts: { exactOnly?: boolean } = {}): Promise<PreparedModel> {
+  const local = await resolveModelPath(model, opts);
+  // A split model is only here when every shard is; otherwise fit would fail on
+  // the missing ones when the headers can answer.
+  const localDir = dirname(local);
+  const complete = shardNames(basename(local)).every((f) => existsSync(join(localDir, f)));
+  if (existsSync(local) && (complete || !model.hf_repo || !model.hf_file)) {
+    return { path: local, source: "local", fetchedBytes: 0, cleanup: async () => {} };
+  }
   if (!model.hf_repo || !model.hf_file) {
     throw new Error(`model file not found at ${local}, and the model has no Hugging Face source to size it from`);
   }
@@ -3205,6 +3210,7 @@ async function modelPathOrHeader(model: Model, slot: string): Promise<PreparedMo
 // context (FA on, f16 KV), for the model list's verdicts. Each answer is
 // posted as it comes; one model failing never stops the rest.
 async function executeFitCheckJob(payload: FitCheckJobPayload): Promise<void> {
+  if (payload.target_keys) return executeModelFitJob(payload, payload.target_keys);
   const base = { ctx: payload.ctx, margin_mib: payload.margin_mib, llama_cpp_build: payload.llama_cpp_build };
   const post = async (r: FitCheckResult) => {
     for (let attempt = 0; attempt < 3; attempt++) {
@@ -3226,6 +3232,7 @@ async function executeFitCheckJob(payload: FitCheckJobPayload): Promise<void> {
   }
   stopRequested = false;
   const deviceArgs = payload.main_gpu != null ? ["-sm", "none", "-mg", String(payload.main_gpu)] : [];
+  const loadArgs = await modelLoadArgs(fitPath);
   const call = makeFitCaller(fitPath, {
     onSpawn: (proc) => (activeBenchProc = proc),
     onExit: () => (activeBenchProc = null),
@@ -3237,9 +3244,10 @@ async function executeFitCheckJob(payload: FitCheckJobPayload): Promise<void> {
     let prepared: PreparedModel | null = null;
     try {
       prepared = await modelPathOrHeader(model, `fit-check-${i}`);
-      const res = await call(
-        buildFitArgs({ modelPath: prepared.path, ctx: payload.ctx, fa: "on", marginMib: payload.margin_mib, deviceArgs })
-      );
+      const res = await call([
+        ...buildFitArgs({ modelPath: prepared.path, ctx: payload.ctx, fa: "on", marginMib: payload.margin_mib, deviceArgs }),
+        ...loadArgs,
+      ]);
       const parsed = parseFitOutput(res.stdout, res.log);
       const point = fitPointFromOutput(parsed, {
         ctx: payload.ctx,
@@ -3267,6 +3275,114 @@ async function executeFitCheckJob(payload: FitCheckJobPayload): Promise<void> {
       const message = err instanceof Error ? err.message : String(err);
       log.warn(`fit check ${label} failed: ${message}`);
       await post({ ...base, model_id: model.id, source: prepared?.source ?? null, vram_free_mib: null, point: null, error: message.slice(0, 2000) });
+    } finally {
+      await prepared?.cleanup().catch(() => {});
+    }
+  }
+  activeBenchProc = null;
+}
+
+// docs/plans/MODEL_FIT_CHECK_PLAN.md -- "Will it fit?" on the Models page: one
+// llama-fit-params call per target at the asked context, or the model's own
+// trained context when that is smaller, with what the machine has available.
+// llama.cpp's --list-devices has no row for the CPU, so RAM is the OS's reading.
+// Each answer is posted as it comes; one target failing never stops the rest.
+async function executeModelFitJob(payload: FitCheckJobPayload, targetKeys: string[]): Promise<void> {
+  const base = {
+    ctx: payload.ctx,
+    margin_mib: payload.margin_mib,
+    llama_cpp_build: payload.llama_cpp_build,
+    backend: payload.llama_cpp_backend,
+  };
+  const post = async (r: ModelFitReport) => {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        await withAuth((token) => postModelFit(config.url, token, { machine_id: config.machine_id, results: [r] }));
+        return;
+      } catch (err) {
+        log.warn(`model fit post failed (attempt ${attempt + 1}/3): ${err instanceof Error ? err.message : String(err)}`);
+        await sleep(1000 * (attempt + 1));
+      }
+    }
+  };
+  const fitPath = getInstalledBuild(buildsDir, payload.llama_cpp_build)?.fit_params_path ?? null;
+  const ram = async () => {
+    const r = await readSystemRamMib();
+    return { ram_available_mib: r.availableMib, ram_total_mib: r.totalMib };
+  };
+  const unified =
+    detectedHardware.unified_memory === true ||
+    detectedHardware.platform === "darwin" ||
+    detectedHardware.gpu.some((g) => g.vram_dynamic === true);
+  if (!fitPath || !(await supportsFlag(fitPath, "--fit-target").catch(() => false))) {
+    const error = `llama.cpp build ${payload.llama_cpp_build} has no llama-fit-params with --fit-target on this machine`;
+    const memory = { devices: [], ...(await ram()), unified };
+    for (const key of targetKeys) await post({ ...base, target_key: key, source: null, memory, point: null, error });
+    return;
+  }
+  stopRequested = false;
+  const devices = (await readListDevices(fitPath).catch(() => [])).map((d) => ({
+    name: d.name,
+    description: d.description,
+    total_mib: d.totalMib,
+    free_mib: d.freeMib,
+  }));
+  const loadArgs = await modelLoadArgs(fitPath);
+  const deviceArgs = payload.main_gpu != null ? ["-sm", "none", "-mg", String(payload.main_gpu)] : [];
+  const call = makeFitCaller(fitPath, {
+    onSpawn: (proc) => (activeBenchProc = proc),
+    onExit: () => (activeBenchProc = null),
+  });
+  for (const [i, model] of payload.models.entries()) {
+    if (stopRequested) break;
+    const key = targetKeys[i];
+    const label = model.hf_file ?? model.filename ?? model.id;
+    updateJobReport({ phase: "benchmarking", item_idx: i, items_total: payload.models.length, detail: `will it fit: ${label}` });
+    const memory = { devices, ...(await ram()), unified };
+    let prepared: PreparedModel | null = null;
+    try {
+      // Exact matches only: another repo's file of the same name is not this one.
+      prepared = await modelPathOrHeader(model, `model-fit-${i}`, { exactOnly: true });
+      const modelPath = prepared.path;
+      const size = (ctx: number) =>
+        call([...buildFitArgs({ modelPath, ctx, fa: "on", marginMib: payload.margin_mib, deviceArgs }), ...loadArgs]);
+      let ctx = payload.ctx;
+      let res = await size(ctx);
+      let parsed = parseFitOutput(res.stdout, res.log);
+      if (parsed.nCtxTrain != null && parsed.nCtxTrain > 0 && parsed.nCtxTrain < ctx) {
+        ctx = parsed.nCtxTrain;
+        res = await size(ctx);
+        parsed = parseFitOutput(res.stdout, res.log);
+      }
+      const point = fitPointFromOutput(parsed, {
+        ctx,
+        fa: "on",
+        ctk: "f16",
+        ctv: "f16",
+        marginMib: payload.margin_mib,
+        cpuOnly: devices.length === 0,
+      });
+      const error =
+        point.verdict === "error"
+          ? point.error ?? (res.timedOut ? "llama-fit-params gave no answer in time" : `llama-fit-params exited ${res.code ?? "abnormally"}`)
+          : null;
+      await post({
+        ...base,
+        target_key: key,
+        source: prepared.source,
+        memory,
+        point: error ? null : point,
+        error,
+        ...(prepared.fetchedBytes > 0 ? { fetched_bytes: prepared.fetchedBytes } : {}),
+      });
+      log.info(
+        `will it fit: ${label} @ ${ctx}: ${error ?? `${point.verdict}, ${point.layers_gpu}/${point.layers_total} layers`} ` +
+          `(${prepared.source}, ${Math.round(prepared.fetchedBytes / 1048576)} MiB fetched)`
+      );
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      log.warn(`will it fit: ${label} failed: ${message}`);
+      await post({ ...base, target_key: key, source: prepared?.source ?? null, memory, point: null, error: message.slice(0, 2000) });
     } finally {
       await prepared?.cleanup().catch(() => {});
     }
@@ -3503,12 +3619,19 @@ async function executeActivateBuildJob(payload: ActivateBuildJobPayload): Promis
   const build = getInstalledBuild(buildsDir, payload.tag);
   if (!build) throw new Error(`build ${payload.tag} is not installed`);
   activeBuild = { tag: build.tag, path: build.bench_path, serverPath: build.server_path };
+  // Tests pick their build by the machine's backend, so choosing a build of
+  // another one has to switch it or the choice would do nothing. An imported
+  // build's name says nothing about its backend: that leaves it alone.
+  const buildBackend = backendOfAsset(build.asset_name);
+  const switched = buildBackend != null && buildBackend !== backend;
+  if (switched) backend = buildBackend;
   persistConfig({
     llama_cpp_build: build.tag,
     llama_bench_path: build.bench_path,
     llama_server_path: build.server_path,
+    ...(switched ? { backend: buildBackend } : {}),
   });
-  log.info(`activated llama.cpp build ${activeBuild.tag}`);
+  log.info(`activated llama.cpp build ${activeBuild.tag}${switched ? `, switching this machine to the ${buildBackend} backend` : ""}`);
 }
 
 async function executeDeleteBuildJob(payload: DeleteBuildJobPayload): Promise<void> {
@@ -4502,6 +4625,8 @@ async function runOneProbeLoad(input: ProbeLoadInput): Promise<ProbeAttemptOutco
       slots: payload.placement.slots,
       mainGpu: payload.main_gpu,
       contextSizeOverride: candidateCtx,
+      // Loaded with --load-mode mlock, like every run: shared/gpuSpill.ts takes
+      // the resulting pinned host buffers out of its reading.
       extraArgs: placed.ot ? ["-ot", placed.ot] : undefined,
       log,
       onSpawn: (proc) => {
@@ -4819,10 +4944,9 @@ async function executeMeasureQualityJob(payload: MeasureQualityJobPayload): Prom
       payload.kvPair[1],
     ];
     if (payload.main_gpu != null) args.push("-sm", "none", "-mg", String(payload.main_gpu));
-    // Same §0.7 probe pattern as the bench/server paths -- keeps the model
-    // locked in RAM for the run's duration instead of left swappable (mmap
-    // left on: `--load-mode mmap+mlock`, or --mlock alone on older builds).
-    args.push(...(await modelLoadArgs(perplexityPath, "mlock_mmap")));
+    // Same §0.7 probe pattern as the bench/server paths -- reads the model into
+    // RAM and keeps it locked for the run's duration instead of left swappable.
+    args.push(...(await modelLoadArgs(perplexityPath)));
     log.info(`${label}: llama-perplexity ${args.join(" ")}`);
     const output = await runPerplexity(perplexityPath, args);
     const ppl = parsePerplexity(output);
