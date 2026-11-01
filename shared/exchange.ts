@@ -8,6 +8,8 @@ import { configHash, type ConfigHashInput } from "./configHash.js";
 import {
   CURVE_METHOD_VERSION,
   FILL_CURVE_METHOD_VERSION,
+  KNEE_METHOD_VERSION,
+  MMAP_MLOCK_CURVE_METHOD_VERSION,
   LEGACY_CURVE_METHOD_VERSION,
   METHOD_VERSION,
   SERVER_METHOD_VERSION,
@@ -122,25 +124,54 @@ export interface MethodsSection {
   pipeline: string[];
 }
 
+const CACHE_FREE_CURVE_PIPELINE = [
+  "every repeat: full prompt, streamed, ignore_eos, cache_prompt off, and a per-repeat nonce so no prefix can match even by accident",
+  "pp comes from that request's own timings.prompt_ms / prompt_n; tg from its timings.predicted_ms / predicted_n",
+  "TTFT is first-chunk arrival, one sample per repeat (p50/p95 over all of them)",
+  "cross-check: a tg reading is flagged suspect when it exceeds its own request's prefill rate, or when the server's decode timer disagrees with this side's wall clock -- batched prefill is never slower than token-by-token decode",
+  "implausibility filter rejects physically impossible rates; suspect readings are kept and flagged, never silently erased",
+  "stability gate: stddev <= max(10 % of mean, 0.5 tok/s), n >= 3",
+  "filler prompt: a tokenized mixed-register passage (prose, code, equations, structured data, non-Latin scripts), every register holding an equal share of the prompt at every size and interleaved below the ubatch so each batch sees all of them",
+];
+
 // Every shared number carries its own methods section. Keyed to
 // method_version so a mixed-vintage bundle explains both vintages.
 export function methodsFor(methodVersion: number): MethodsSection {
   // Ordered newest first, and every historical vintage keeps its own section:
   // this describes what a STORED row was measured by, so relabelling an old
   // row with today's pipeline would be a lie about data already shared.
+  if (methodVersion === KNEE_METHOD_VERSION) {
+    return {
+      method_version: KNEE_METHOD_VERSION,
+      summary:
+        "Concurrency ladder measured through llama-server: the same request load at each slot count, with the weights read into RAM and locked for the run.",
+      pipeline: [
+        "weights: --load-mode mlock, read into an owned buffer and locked, so nothing pages out mid-test and no weights held by the GPU stay pinned in RAM a second time",
+        "one llama-server per slot count, with the same prompt and generation length at each",
+        "filler prompt: a tokenized mixed-register passage (prose, code, equations, structured data, non-Latin scripts), every register holding an equal share of the prompt at every size and interleaved below the ubatch so each batch sees all of them",
+        "implausibility filter rejects physically impossible rates; suspect readings are kept and flagged, never silently erased",
+      ],
+    };
+  }
   if (methodVersion >= CURVE_METHOD_VERSION) {
     return {
       method_version: CURVE_METHOD_VERSION,
       summary:
+        "Context-curve points measured cache-free, with the weights read into RAM and locked (--load-mode mlock): every repeat is a cold, self-contained request with its own prompt, and both rates come from llama-server's own timers for that one request. No repeat reuses another's prefix cache, so no reading depends on a cache hit that may or may not have happened.",
+      pipeline: [
+        "weights: --load-mode mlock, read into an owned buffer and locked, so nothing pages out mid-test and no weights held by the GPU stay pinned in RAM a second time",
+        ...CACHE_FREE_CURVE_PIPELINE,
+      ],
+    };
+  }
+  if (methodVersion >= MMAP_MLOCK_CURVE_METHOD_VERSION) {
+    return {
+      method_version: MMAP_MLOCK_CURVE_METHOD_VERSION,
+      summary:
         "Context-curve points measured cache-free: every repeat is a cold, self-contained request with its own prompt, and both rates come from llama-server's own timers for that one request. No repeat reuses another's prefix cache, so no reading depends on a cache hit that may or may not have happened.",
       pipeline: [
-        "every repeat: full prompt, streamed, ignore_eos, cache_prompt off, and a per-repeat nonce so no prefix can match even by accident",
-        "pp comes from that request's own timings.prompt_ms / prompt_n; tg from its timings.predicted_ms / predicted_n",
-        "TTFT is first-chunk arrival, one sample per repeat (p50/p95 over all of them)",
-        "cross-check: a tg reading is flagged suspect when it exceeds its own request's prefill rate, or when the server's decode timer disagrees with this side's wall clock -- batched prefill is never slower than token-by-token decode",
-        "implausibility filter rejects physically impossible rates; suspect readings are kept and flagged, never silently erased",
-        "stability gate: stddev <= max(10 % of mean, 0.5 tok/s), n >= 3",
-        "filler prompt: a tokenized mixed-register passage (prose, code, equations, structured data, non-Latin scripts), every register holding an equal share of the prompt at every size and interleaved below the ubatch so each batch sees all of them",
+        "weights: mapped and locked (mmap+mlock), which also keeps the weights held by the GPU pinned in RAM, so RAM figures from this vintage read high by that amount",
+        ...CACHE_FREE_CURVE_PIPELINE,
       ],
     };
   }

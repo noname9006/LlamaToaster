@@ -22,9 +22,24 @@ import type { FitPoint, FitVerdict } from "../../../shared/fitParams.js";
 import { DEFAULT_FIT_MARGIN_MIB, isFitMargin, KV_CACHE_TYPES } from "../../../shared/fitParams.js";
 import { MAX_FIT_CTX_STOPS } from "../../../shared/optimizeFlow.js";
 import type { KvSupportRow, KvSupportStatus } from "../../../shared/kvSupport.js";
-import type { Backend, FitCheckJobPayload, FitCheckResult, Model, Test, TestConfig, Worker } from "../../../shared/types.js";
+import { backendOfAsset, detectBackend } from "../../../shared/types.js";
+import type {
+  Backend,
+  FitCheckJobPayload,
+  FitCheckResult,
+  Model,
+  ModelFitPlan,
+  ModelFitReport,
+  ModelFitResult,
+  Test,
+  TestConfig,
+  Worker,
+} from "../../../shared/types.js";
+import { fitTargetKey, type FitMemory } from "../../../shared/fitLevel.js";
 import { queueEvents } from "../queue-events.js";
-import { assetMatchesWorker } from "../github-releases.js";
+import { assetMatchesWorker, buildInstallPayload, filterReleasesForWorker, getReleases } from "../github-releases.js";
+import { HF_REPO_PATTERN } from "../hf.js";
+import { getRocmSupportSnapshot } from "../rocm-support.js";
 
 const MAX_POINTS_PER_POST = 400;
 const MAX_KV_ROWS = 256;
@@ -74,7 +89,9 @@ export function validateFitPoint(raw: unknown, field: string): FitPoint {
   }
   if (p.reason != null && p.reason !== "vram" && p.reason !== "ram") throw new BadRequestError(`${field}.reason must be vram, ram or null`);
   return {
-    ctx: int(p.ctx, `${field}.ctx`, 256, 4_194_304, false)!,
+    // As low as the smallest model trained: a "Will it fit?" answer sizes at
+    // min(1k, n_ctx_train), and stories15M's is 128.
+    ctx: int(p.ctx, `${field}.ctx`, 1, 4_194_304, false)!,
     fa: p.fa,
     ctk: p.ctk,
     ctv: p.ctv,
@@ -307,6 +324,311 @@ export async function optimizeRoutes(app: FastifyInstance): Promise<void> {
     const results = raw.map((r, i) => validateFitCheckResult(r, `results[${i}]`));
     return reply.send({ ok: true, stored: fitRepo.upsertFitChecks(worker.id, results) });
   });
+
+  // docs/plans/MODEL_FIT_CHECK_PLAN.md -- "Will it fit?" on the Models page.
+  // What the dialog shows before anything starts: which build would answer,
+  // installed or to be downloaded. A plain read: nothing is queued here.
+  app.get<{ Params: { id: string } }>("/api/workers/:id/model-fit/plan", async (request, reply) => {
+    const worker = repo.workerRepo.getWorker(request.params.id);
+    if (!worker) throw new NotFoundError("unknown machine");
+    assertOwnsWorker(sessionScope(request), worker.id);
+    const choice = await chooseFitBuild(worker);
+    const plan: ModelFitPlan = {
+      online: worker.status !== "offline",
+      capable: (worker.capabilities ?? []).includes("fit-check-v2"),
+      busy: worker.status === "busy",
+      detected_backend:
+        worker.platform && worker.hardware
+          ? detectBackend(worker.platform, worker.hardware.gpu, getRocmSupportSnapshot().list)
+          : worker.backend ?? null,
+      build: choice.build,
+      ...(choice.error ? { build_error: choice.error } : {}),
+      margin_mib: DEFAULT_FIT_MARGIN_MIB,
+      ctx: MODEL_FIT_CTX,
+    };
+    return reply.send(plan);
+  });
+
+  app.post<{ Params: { id: string }; Body: { targets?: unknown; auto_install?: unknown; force?: unknown } }>(
+    "/api/workers/:id/model-fit",
+    { bodyLimit: 256 * 1024 },
+    async (request, reply) => {
+      const worker = repo.workerRepo.getWorker(request.params.id);
+      if (!worker) throw new NotFoundError("unknown machine");
+      assertOwnsWorker(sessionScope(request), worker.id);
+      if (worker.status === "offline") throw new ConflictError("that machine is offline");
+      if (!(worker.capabilities ?? []).includes("fit-check-v2")) {
+        throw new ConflictError("that machine runs an older worker build -- update it to check whether a model fits");
+      }
+      const body = request.body ?? {};
+      if (!Array.isArray(body.targets) || body.targets.length === 0 || body.targets.length > MAX_MODEL_FIT_TARGETS) {
+        throw new BadRequestError(`targets must list 1..${MAX_MODEL_FIT_TARGETS} files`);
+      }
+      const requested = body.targets.map((t, i) => modelFitTarget(t, `targets[${i}]`, worker.id));
+
+      const choice = await chooseFitBuild(worker);
+      if (!choice.build) throw new ConflictError(choice.error ?? "no llama.cpp build available for that machine");
+      const build = choice.build;
+      if (!build.installed && body.auto_install !== true) {
+        throw new ConflictError(`no suitable llama.cpp build on that machine -- b${build.tag.replace(/^b/, "")} would have to be downloaded first`);
+      }
+
+      const known = new Map(fitRepo.listModelFit({ worker_id: worker.id, ctx: MODEL_FIT_CTX, margin_mib: DEFAULT_FIT_MARGIN_MIB }).map((r) => [r.target_key, r]));
+      const fresh = (key: string) => {
+        const r = known.get(key);
+        return !!r && !r.error && r.llama_cpp_build === build.tag && Date.now() - r.created_at <= FIT_CHECK_FRESH_MS;
+      };
+      const jobs = pendingFitJobs(worker.id);
+      const alreadyPending = new Set(jobs.flatMap((j) => j.target_keys));
+      const seen = new Set<string>();
+      const wanted = requested.filter(({ key }) => {
+        if (seen.has(key) || alreadyPending.has(key)) return false;
+        seen.add(key);
+        return body.force === true || !fresh(key);
+      });
+      if (wanted.length === 0) return reply.send({ ok: true, queued: 0 });
+      // Each click may add its own job so nothing asked for is lost, within reason:
+      // these sit in the same queue as the machine's benchmarks.
+      if (jobs.length >= MAX_PENDING_MODEL_FIT_JOBS) {
+        throw new ConflictError("that machine already has several fit checks waiting -- try again when they finish");
+      }
+
+      let installing: string | undefined;
+      if (!build.installed) {
+        installing = build.tag;
+        if (!pendingInstall(worker.id, build.tag)) {
+          repo.queueRepo.enqueueJob(worker.id, { type: "install_build", payload: choice.installPayload! });
+          // Only a machine with nothing active gets it activated: a build the
+          // user chose stays chosen, this one is just used for the check.
+          if (!worker.installedBuilds.some((b) => b.active)) {
+            repo.queueRepo.enqueueJob(worker.id, { type: "activate_build", payload: { tag: build.tag } });
+          }
+        }
+      }
+      const payload: FitCheckJobPayload = {
+        ctx: MODEL_FIT_CTX,
+        margin_mib: DEFAULT_FIT_MARGIN_MIB,
+        llama_cpp_build: build.tag,
+        llama_cpp_backend: build.backend,
+        models: wanted.map((t) => t.model),
+        target_keys: wanted.map((t) => t.key),
+      };
+      repo.queueRepo.enqueueJob(worker.id, { type: "fit_check", payload });
+      queueEvents.emit(worker.id);
+      return reply.code(202).send({ ok: true, queued: wanted.length, queued_keys: wanted.map((t) => t.key), ...(installing ? { installing } : {}) });
+    }
+  );
+
+  app.get<{ Params: { id: string } }>("/api/workers/:id/model-fit", async (request, reply) => {
+    const worker = repo.workerRepo.getWorker(request.params.id);
+    if (!worker) throw new NotFoundError("unknown machine");
+    assertOwnsWorker(sessionScope(request), worker.id);
+    const results: ModelFitResult[] = fitRepo.listModelFit({ worker_id: worker.id, ctx: MODEL_FIT_CTX, margin_mib: DEFAULT_FIT_MARGIN_MIB });
+    const byKey = new Map(results.map((r) => [r.target_key, r]));
+    // A key stays pending until an answer newer than its job arrives; the job
+    // ending without one clears it too, which the page shows as no answer.
+    const pending = new Set<string>();
+    for (const job of pendingFitJobs(worker.id)) {
+      for (const key of job.target_keys) {
+        const r = byKey.get(key);
+        if (!r || r.created_at < job.created_at) pending.add(key);
+      }
+    }
+    return reply.send({ results, pending_keys: [...pending], installing: pendingInstall(worker.id) });
+  });
+
+  // Worker -> server: "Will it fit?" answers, posted as they come in.
+  app.post<{ Body: { results?: unknown } }>("/api/worker/model-fit", { bodyLimit: 2 * 1024 * 1024 }, async (request, reply) => {
+    const worker = await authenticateWorker(request);
+    const raw = request.body?.results;
+    if (!Array.isArray(raw) || raw.length > MAX_MODEL_FIT_TARGETS) throw new BadRequestError(`results must be an array of at most ${MAX_MODEL_FIT_TARGETS}`);
+    const results = raw.map((r, i) => validateModelFitReport(r, `results[${i}]`));
+    return reply.send({ ok: true, stored: fitRepo.upsertModelFit(worker.id, results) });
+  });
+}
+
+/** 1k, or what the model was trained on when that is less -- the worker reads
+ * that from the header. Always the same, so every answer on a page compares. */
+export const MODEL_FIT_CTX = 1024;
+const MAX_MODEL_FIT_TARGETS = 64;
+const MAX_PENDING_MODEL_FIT_JOBS = 8;
+
+interface PendingFitJob {
+  target_keys: string[];
+  created_at: number;
+}
+
+function pendingFitJobs(workerId: string): PendingFitJob[] {
+  const rows = getDb()
+    .prepare(`SELECT payload_json, created_at FROM worker_jobs WHERE worker_id = ? AND job_type = 'fit_check' AND status IN ('pending','claimed')`)
+    .all(workerId) as { payload_json: string; created_at: number }[];
+  const jobs: PendingFitJob[] = [];
+  for (const row of rows) {
+    const keys = (JSON.parse(row.payload_json) as FitCheckJobPayload).target_keys;
+    // The New test page's own fit checks are not asked for here.
+    if (keys) jobs.push({ target_keys: keys, created_at: row.created_at });
+  }
+  return jobs;
+}
+
+/** The tag of a build install in the queue, or of `tag` only when given. */
+function pendingInstall(workerId: string, tag?: string): string | null {
+  const rows = getDb()
+    .prepare(`SELECT payload_json FROM worker_jobs WHERE worker_id = ? AND job_type = 'install_build' AND status IN ('pending','claimed')`)
+    .all(workerId) as { payload_json: string }[];
+  for (const row of rows) {
+    const t = (JSON.parse(row.payload_json) as { tag: string }).tag;
+    if (!tag || t === tag) return t;
+  }
+  return null;
+}
+
+interface FitBuildChoice {
+  build: ModelFitPlan["build"];
+  installPayload?: ReturnType<typeof buildInstallPayload>;
+  error?: string;
+}
+
+// The active build when it can answer: whatever the user chose is what they
+// will run. Else the newest for the machine's backend, else the latest release.
+async function chooseFitBuild(worker: Worker): Promise<FitBuildChoice> {
+  const canFit = worker.installedBuilds.filter((b) => b.fit_params_path);
+  const tagNum = (tag: string) => Number(/^b(\d+)/.exec(tag)?.[1] ?? -1);
+  const backend = worker.backend;
+  const installed =
+    canFit.find((b) => b.active) ??
+    canFit
+      .filter((b) => backend && worker.platform && worker.arch && assetMatchesWorker(b.asset_name, worker.platform, worker.arch, backend))
+      .sort((a, b) => tagNum(b.tag) - tagNum(a.tag))[0];
+  if (installed) {
+    return {
+      build: {
+        tag: installed.tag,
+        asset_name: installed.asset_name,
+        backend: backendOfAsset(installed.asset_name) ?? backend ?? "cpu",
+        installed: true,
+      },
+    };
+  }
+  if (!backend || !worker.platform || !worker.arch) return { build: null, error: "that machine has not reported its hardware yet" };
+  let releases;
+  try {
+    releases = await getReleases();
+  } catch (err) {
+    return { build: null, error: `could not look up llama.cpp releases: ${err instanceof Error ? err.message : String(err)}` };
+  }
+  const release = filterReleasesForWorker(releases, worker.platform, worker.arch, backend, worker.hardware?.nvidia_driver?.cuda_version ?? null).find(
+    (r) => r.assets.length > 0
+  );
+  if (!release) return { build: null, error: `no llama.cpp release found for ${backend} on ${worker.platform}/${worker.arch}` };
+  const asset = release.assets[0];
+  const cudart = release.cudart_assets?.[asset.name];
+  return {
+    build: {
+      tag: release.tag,
+      asset_name: asset.name,
+      backend,
+      installed: false,
+      size_bytes: asset.size_bytes + (cudart?.size_bytes ?? 0),
+    },
+    installPayload: buildInstallPayload(release, asset),
+  };
+}
+
+const HF_FILE_MAX = 512;
+
+function modelFitTarget(raw: unknown, field: string, workerId: string): { key: string; model: Model } {
+  if (!raw || typeof raw !== "object") throw new BadRequestError(`${field} must be an object`);
+  const t = raw as Record<string, unknown>;
+  if (typeof t.model_id === "string") {
+    const model = repo.getModelForWorker(t.model_id, workerId);
+    if (!model) throw new BadRequestError(`unknown model ${t.model_id}`);
+    return { key: fitTargetKey(model)!, model };
+  }
+  const { hf_repo: hfRepo, hf_file: hfFile, size_bytes: sizeBytes } = t;
+  if (typeof hfRepo !== "string" || !HF_REPO_PATTERN.test(hfRepo)) throw new BadRequestError(`${field}.hf_repo is not a repo id`);
+  if (
+    typeof hfFile !== "string" ||
+    hfFile.length > HF_FILE_MAX ||
+    !/\.gguf$/i.test(hfFile) ||
+    hfFile.startsWith("/") ||
+    /\.\.|\\|\0/.test(hfFile)
+  ) {
+    throw new BadRequestError(`${field}.hf_file is not a GGUF path`);
+  }
+  const key = fitTargetKey({ hf_repo: hfRepo, hf_file: hfFile })!;
+  // Never stored: the catalog is shared, and asking about a file must not publish it.
+  return {
+    key,
+    model: {
+      id: key,
+      filename: hfFile.split("/").pop()!,
+      size_bytes: typeof sizeBytes === "number" && Number.isFinite(sizeBytes) && sizeBytes > 0 ? sizeBytes : 0,
+      source: "huggingface",
+      hf_repo: hfRepo,
+      hf_file: hfFile,
+      metadata: {},
+      created_at: 0,
+    },
+  };
+}
+
+function validateModelFitReport(raw: unknown, field: string): ModelFitReport {
+  if (!raw || typeof raw !== "object") throw new BadRequestError(`${field} must be an object`);
+  const r = raw as Record<string, unknown>;
+  const str = (v: unknown, f: string, max = 256): string => {
+    if (typeof v !== "string" || v.length === 0 || v.length > max) throw new BadRequestError(`${field}.${f} must be a non-empty string`);
+    return v;
+  };
+  const key = str(r.target_key, "target_key", 800);
+  if (!/^(hf|model):./.test(key)) throw new BadRequestError(`${field}.target_key is not a target key`);
+  if (typeof r.ctx !== "number" || !Number.isInteger(r.ctx) || r.ctx <= 0) throw new BadRequestError(`${field}.ctx must be a positive integer`);
+  if (!isFitMargin(r.margin_mib)) throw new BadRequestError(`${field}.margin_mib must be 512, 1024 or 1536`);
+  if (r.source !== null && r.source !== undefined && r.source !== "local" && r.source !== "header") {
+    throw new BadRequestError(`${field}.source must be local, header or null`);
+  }
+  const error = r.error === null || r.error === undefined ? null : str(r.error, "error", 2000);
+  const point = r.point === null || r.point === undefined ? null : validateFitPoint(r.point, `${field}.point`);
+  if (!point && !error) throw new BadRequestError(`${field} needs a point or an error`);
+  const fetched = r.fetched_bytes === null || r.fetched_bytes === undefined ? null : mib(r.fetched_bytes, `${field}.fetched_bytes`);
+  return {
+    target_key: key,
+    ctx: r.ctx,
+    margin_mib: r.margin_mib,
+    llama_cpp_build: str(r.llama_cpp_build, "llama_cpp_build", 128),
+    backend: str(r.backend, "backend", 64),
+    source: (r.source as ModelFitReport["source"]) ?? null,
+    memory: validateFitMemory(r.memory, `${field}.memory`),
+    point,
+    error,
+    ...(fetched != null ? { fetched_bytes: fetched } : {}),
+  };
+}
+
+function validateFitMemory(raw: unknown, field: string): FitMemory {
+  if (!raw || typeof raw !== "object") throw new BadRequestError(`${field} must be an object`);
+  const m = raw as Record<string, unknown>;
+  if (!Array.isArray(m.devices) || m.devices.length > 64) throw new BadRequestError(`${field}.devices must be an array of at most 64`);
+  const devices = m.devices.map((d, i) => {
+    const row = (d ?? {}) as Record<string, unknown>;
+    const name = row.name;
+    const description = row.description;
+    if (typeof name !== "string" || name.length > 128 || typeof description !== "string" || description.length > 256) {
+      throw new BadRequestError(`${field}.devices[${i}] needs a name and a description`);
+    }
+    return {
+      name,
+      description,
+      total_mib: mib(row.total_mib, `${field}.devices[${i}].total_mib`) ?? 0,
+      free_mib: mib(row.free_mib, `${field}.devices[${i}].free_mib`) ?? 0,
+    };
+  });
+  return {
+    devices,
+    ram_available_mib: mib(m.ram_available_mib, `${field}.ram_available_mib`),
+    ram_total_mib: mib(m.ram_total_mib, `${field}.ram_total_mib`),
+    unified: m.unified === true,
+  };
 }
 
 const MAX_FIT_CHECK_MODELS = 200;

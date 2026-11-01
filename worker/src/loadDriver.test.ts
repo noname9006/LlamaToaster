@@ -92,9 +92,9 @@ describe("server arguments for the spec-off engine pair", () => {
       port: 8080,
       item,
       slots: 1,
-      modelLoadArgs: ["--load-mode", "mmap+mlock"],
+      modelLoadArgs: ["--load-mode", "mlock"],
     });
-    expect(current[current.indexOf("--load-mode") + 1]).toBe("mmap+mlock");
+    expect(current[current.indexOf("--load-mode") + 1]).toBe("mlock");
     expect(current).not.toContain("--mlock");
   });
 });

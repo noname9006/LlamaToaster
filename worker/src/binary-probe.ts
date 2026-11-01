@@ -68,35 +68,31 @@ export function helpHasFlag(text: string, flag: string): boolean {
   return new RegExp(`(^|[\\s,])${escaped}([\\s,=]|$)`, "m").test(text);
 }
 
-// How a run wants the model's weights held in host memory. Both lock them in
-// RAM; "no_mmap" also reads them into an owned buffer instead of mapping the
-// file (speed runs), "mmap" keeps llama.cpp's default mapping (context tests,
-// perplexity).
-export type ModelLoadPolicy = "mlock_no_mmap" | "mlock_mmap";
-
+// Every run holds the model's weights the same way: read into an owned buffer
+// and locked in RAM, so nothing pages out mid-test. Not mmap+mlock, which pins the
+// whole file and so keeps the weights already on the GPU in RAM a second time:
+// measured 4.2-5.1 GB over llama.cpp's own total on gemma-4-12b
+// (docs/FIT_COMPARISON_GEMMA12B_2026-10-29.md).
+//
 // llama.cpp replaced --mlock / --mmap 0 / --no-mmap with a single
 // `-lm, --load-mode <auto|none|mmap|mlock|mmap+mlock|dio>` (present in b11529,
 // where the old flags are gone and rejected). Read from that build's source:
 // llama-model-loader.cpp sets use_mmap only for MMAP / MMAP_MLOCK / AUTO, and
 // llama-model.cpp sets use_mlock for MLOCK / MMAP_MLOCK -- so "mlock" is
-// exactly the old --mlock + no-mmap pairing, "mmap+mlock" the old --mlock alone.
+// exactly the old --mlock + no-mmap pairing.
 // Older builds get the legacy flags, each probed (§0.7): llama-bench spells
 // no-mmap `--mmap 0`, llama-server/llama-perplexity `--no-mmap`.
-export function modelLoadArgsFromHelp(help: string, policy: ModelLoadPolicy): string[] {
-  if (helpHasFlag(help, "--load-mode")) {
-    return ["--load-mode", policy === "mlock_no_mmap" ? "mlock" : "mmap+mlock"];
-  }
+export function modelLoadArgsFromHelp(help: string): string[] {
+  if (helpHasFlag(help, "--load-mode")) return ["--load-mode", "mlock"];
   const args: string[] = [];
   if (helpHasFlag(help, "--mlock")) args.push("--mlock");
-  if (policy === "mlock_no_mmap") {
-    if (helpHasFlag(help, "--no-mmap")) args.push("--no-mmap");
-    else if (helpHasFlag(help, "--mmap")) args.push("--mmap", "0");
-  }
+  if (helpHasFlag(help, "--no-mmap")) args.push("--no-mmap");
+  else if (helpHasFlag(help, "--mmap")) args.push("--mmap", "0");
   return args;
 }
 
-export async function modelLoadArgs(path: string, policy: ModelLoadPolicy): Promise<string[]> {
-  return modelLoadArgsFromHelp(await helpText(path).catch(() => ""), policy);
+export async function modelLoadArgs(path: string): Promise<string[]> {
+  return modelLoadArgsFromHelp(await helpText(path).catch(() => ""));
 }
 
 // Test seam: answer this binary's --help probes with `text` instead of

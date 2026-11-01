@@ -83,6 +83,22 @@ export function detectBackend(
 // A llama.cpp release asset that is a ROCm/HIP build ("...-win-rocm-7.14-x64.zip",
 // "...-bin-win-hip-radeon-x64.zip", older "hipblas" naming). Token-matched so a
 // stray "hip" inside another word can't trip it.
+// The backend a release asset was built for, from its name alone: every
+// accelerated build names itself, a plain CPU build names none. Null for a
+// name that is not a release asset at all (a hand-imported build is listed as
+// "(imported)"), which says nothing either way.
+export function backendOfAsset(assetName: string): Backend | null {
+  const name = assetName.toLowerCase();
+  if (!/\.(zip|tar\.gz|tgz)$/.test(name)) return null;
+  if (name.includes("vulkan")) return "vulkan";
+  if (name.includes("cuda")) return "cuda";
+  if (isRocmAssetName(name)) return "rocm";
+  if (name.includes("sycl")) return "sycl";
+  if (name.includes("openvino")) return "openvino";
+  if (name.includes("opencl")) return "opencl-adreno";
+  return "cpu";
+}
+
 export function isRocmAssetName(assetName: string): boolean {
   return /(?:^|[-_.])(?:rocm|hip|hipblas)(?:[-_.]|$)/i.test(assetName);
 }
@@ -161,6 +177,9 @@ export const WORKER_CAPABILITIES = [
   // docs/plans/HEADER_FIT_PLAN.md: fit_check jobs, and fit maps on a model
   // that is not on the machine (sized from its header alone).
   "fit-check-v1",
+  // docs/plans/MODEL_FIT_CHECK_PLAN.md: "Will it fit?" on the Models page --
+  // fit_check jobs with target_keys, answered through /api/worker/model-fit.
+  "fit-check-v2",
 ] as const;
 export type WorkerCapability = (typeof WORKER_CAPABILITIES)[number];
 
@@ -187,7 +206,24 @@ export const METHOD_VERSION = 1;
 // never be averaged with v7. Skips 6: FILL_CURVE_METHOD_VERSION already
 // holds it, and fill-curve rows share this column AND engine "server", so
 // reusing 6 here would let prefill slices leak into context curves.
-export const CURVE_METHOD_VERSION = 7;
+// v10 (2026-11-01): weights read into RAM and locked (--load-mode mlock) instead of
+// mapped and locked (mmap+mlock). RAM figures drop by the weights on the GPU, which
+// mmap+mlock pinned a second time, and CPU-resident weights move to the GPU's
+// pinned host buffer. Speed between the two modes has not been compared, so v7 rows
+// must not be averaged with v10. Skips 8 and 9: SPEED_RUN_METHOD_VERSION and
+// KNEE_METHOD_VERSION hold them.
+export const CURVE_METHOD_VERSION = 10;
+
+// The cache-free curve vintage that held weights with mmap+mlock. Named because
+// stored rows still carry it and N7 bundles still have to describe it.
+export const MMAP_MLOCK_CURVE_METHOD_VERSION = 7;
+
+// N5's concurrency ladder: a server row like SERVER_METHOD_VERSION's, but split
+// out when it moved to --load-mode mlock (2026-11-01). The MTP path shares that
+// constant and was on mlock all along, so bumping it would falsely invalidate them.
+// Below CURVE_METHOD_VERSION on purpose: profile scoring keeps a chain's highest
+// vintage, and knee rows must not displace curve points there.
+export const KNEE_METHOD_VERSION = 9;
 
 // The optimization flow's baseline/confirm speed runs: the curve harness, but
 // at a -c larger than the prompt, after a discarded warm-up request, and with
@@ -344,7 +380,7 @@ export interface Model {
 // filename-prefix token, not merely a substring, so a legitimately
 // self-sufficient base model that happens to advertise MTP support in its
 // own name (e.g. a real "Qwen3.6-27B-MTP-Q4_K_M.gguf") doesn't false-positive.
-const MTP_FILENAME_PATTERN = /(^|\/)mtp[-_.]/i;
+export const MTP_FILENAME_PATTERN = /(^|\/)mtp[-_.]/i;
 
 // Re-derives whether a model is a standalone MTP/draft companion file (not
 // directly benchmarkable on its own) from its own stored metadata + filename,
@@ -1894,9 +1930,56 @@ export interface FitCheckJobPayload {
   /** System RAM the host side may use, MiB. */
   ram_budget_mib?: number | null;
   models: Model[];
+  /** "Will it fit?" (docs/plans/MODEL_FIT_CHECK_PLAN.md): each model's key,
+   * index for index. Present = answers go to /api/worker/model-fit with the
+   * machine's memory attached. */
+  target_keys?: string[];
 }
 
 export type FitCheckSource = "local" | "header";
+
+/** One "Will it fit?" answer, as the worker posts it. */
+export interface ModelFitReport {
+  target_key: string;
+  /** The context asked for: the answer's key. point.ctx is what was sized, lower
+   * for a model trained on less. */
+  ctx: number;
+  margin_mib: number;
+  llama_cpp_build: string;
+  backend: Backend;
+  source: FitCheckSource | null;
+  memory: import("./fitLevel.js").FitMemory;
+  point: import("./fitParams.js").FitPoint | null;
+  error: string | null;
+  fetched_bytes?: number;
+}
+
+export interface ModelFitResult extends ModelFitReport {
+  /** shared/fitLevel.ts; null when the check itself failed. */
+  level: import("./fitLevel.js").FitLevel | null;
+  created_at: number;
+}
+
+/** One thing to size: a file on Hugging Face, catalogued or not, or a
+ * catalogued model with no Hugging Face source. */
+export type ModelFitTarget = { hf_repo: string; hf_file: string; size_bytes?: number } | { model_id: string };
+
+/** What the Models page's dialog shows before anything starts. */
+export interface ModelFitPlan {
+  online: boolean;
+  /** The worker build answers "Will it fit?" at all. */
+  capable: boolean;
+  busy: boolean;
+  /** What this machine's hardware calls for, whatever is installed. */
+  detected_backend: Backend | null;
+  /** Null when nothing is installed and nothing could be found to install. */
+  build: { tag: string; asset_name: string; backend: Backend; installed: boolean; size_bytes?: number } | null;
+  /** Why no build could be found. */
+  build_error?: string;
+  /** Margin fit keeps free on each GPU, MiB. */
+  margin_mib: number;
+  ctx: number;
+}
 
 export interface FitCheckResult {
   model_id: string;

@@ -527,9 +527,10 @@ async function resolveBuildForRun(
     deviceName = picked?.model || picked?.vendor || undefined;
   }
 
-  const alreadyInstalled = worker.installedBuilds.find((b) =>
-    assetMatchesWorker(b.asset_name, platform, arch, backend)
-  );
+  // The build the user activated, when it serves this backend: the Machines page
+  // promises that choice is what runs. Else the first that matches.
+  const matchingInstalled = worker.installedBuilds.filter((b) => assetMatchesWorker(b.asset_name, platform, arch, backend));
+  const alreadyInstalled = matchingInstalled.find((b) => b.active) ?? matchingInstalled[0];
   if (alreadyInstalled) {
     return { tag: alreadyInstalled.tag, deviceName, alreadyInstalled: true };
   }

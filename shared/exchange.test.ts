@@ -11,6 +11,9 @@ import {
 } from "./exchange.js";
 import {
   CURVE_METHOD_VERSION,
+  KNEE_METHOD_VERSION,
+  MMAP_MLOCK_CURVE_METHOD_VERSION,
+  SPEED_RUN_METHOD_VERSION,
   WALL_CLOCK_CURVE_METHOD_VERSION,
   LEGACY_CURVE_METHOD_VERSION,
   METHOD_VERSION,
@@ -102,6 +105,17 @@ describe("N7 export bundle", () => {
     expect(methodsFor(METHOD_VERSION).pipeline.join(" ")).toContain("stddev");
     expect(methodsFor(CURVE_METHOD_VERSION).summary).toContain("cache-free");
     expect(methodsFor(CURVE_METHOD_VERSION).pipeline.join(" ")).toContain("cache_prompt off");
+    // How the weights were held is part of what each vintage measured.
+    expect(methodsFor(CURVE_METHOD_VERSION).pipeline.join(" ")).toContain("--load-mode mlock");
+    expect(methodsFor(MMAP_MLOCK_CURVE_METHOD_VERSION).method_version).toBe(MMAP_MLOCK_CURVE_METHOD_VERSION);
+    expect(methodsFor(MMAP_MLOCK_CURVE_METHOD_VERSION).pipeline.join(" ")).toContain("mmap+mlock");
+    expect(methodsFor(MMAP_MLOCK_CURVE_METHOD_VERSION).summary).toContain("cache-free");
+    // Speed runs stamp 8, between the two curve vintages: unchanged, they keep v7's section.
+    expect(methodsFor(SPEED_RUN_METHOD_VERSION).method_version).toBe(MMAP_MLOCK_CURVE_METHOD_VERSION);
+    expect(methodsFor(KNEE_METHOD_VERSION).method_version).toBe(KNEE_METHOD_VERSION);
+    expect(methodsFor(KNEE_METHOD_VERSION).summary).toContain("Concurrency ladder");
+    // Profile scoring keeps a chain's highest vintage: knee rows must not displace curve points.
+    expect(CURVE_METHOD_VERSION).toBeGreaterThan(KNEE_METHOD_VERSION);
     // The vintage whose generation rate came from the post-first-chunk
     // window keeps its own section, and states the caveat: relabelling those
     // stored rows with today's pipeline would misdescribe shared data, and

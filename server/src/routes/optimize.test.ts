@@ -15,6 +15,11 @@ vi.mock("../github-releases.js", async (importOriginal) => {
     ...actual,
     getReleases: vi.fn(async () => [
       {
+        tag: "b12000",
+        published_at: "2026-02-01T00:00:00Z",
+        assets: [{ name: "llama-b12000-bin-ubuntu-x64.zip", download_url: "http://example.invalid/y.zip", size_bytes: 40000000 }],
+      },
+      {
         tag: "b9999",
         published_at: "2026-01-01T00:00:00Z",
         assets: [{ name: "llama-b9999-bin-ubuntu-x64.zip", download_url: "http://example.invalid/x.zip", size_bytes: 123 }],
@@ -56,7 +61,11 @@ const workerAuth = { authorization: "Bearer optimize-secret" };
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const json = async (res: Response): Promise<any> => res.json();
 
-async function heartbeat(machineId: string, capabilities = ALL_CAPS) {
+const DEFAULT_BUILDS: Record<string, unknown>[] = [
+  { tag: "b9999", asset_name: "llama-b9999-bin-ubuntu-x64.zip", installed_at: 1, active: true, fit_params_path: "/x/llama-fit-params" },
+];
+
+async function heartbeat(machineId: string, capabilities = ALL_CAPS, builds = DEFAULT_BUILDS) {
   const res = await post(
     "/api/worker/heartbeat",
     {
@@ -78,9 +87,7 @@ async function heartbeat(machineId: string, capabilities = ALL_CAPS) {
           bogus: "dropped",
         },
       },
-      installed_builds: [
-        { tag: "b9999", asset_name: "llama-b9999-bin-ubuntu-x64.zip", installed_at: 1, active: true, fit_params_path: "/x/llama-fit-params" },
-      ],
+      installed_builds: builds,
       model_files: [],
       status: "idle",
     },
@@ -375,5 +382,149 @@ describe("fit checks (docs/plans/HEADER_FIT_PLAN.md)", () => {
     expect((await json(await post(`/api/workers/${w.id}/fit-check`, { model_ids: ["opt-model"], ctx: 16384 }))).queued).toBe(1);
     const empty = { ...failed, error: null };
     expect((await post("/api/worker/fit-checks", { machine_id: "fc-c", results: [empty] }, workerAuth)).status).toBe(400);
+  });
+});
+
+describe("Will it fit? (docs/plans/MODEL_FIT_CHECK_PLAN.md)", () => {
+  const CAPS = [...ALL_CAPS, "fit-check-v2"];
+  const target = (file: string) => ({ hf_repo: "unsloth/gemma-GGUF", hf_file: file, size_bytes: 1000 });
+  const keyOf = (file: string) => `hf:unsloth/gemma-GGUF/${file}`;
+  const memory = { devices: [{ name: "Vulkan0", description: "GPU", total_mib: 8176, free_mib: 7378 }], ram_available_mib: 29000, ram_total_mib: 49000, unified: false };
+  const report = (file: string, over: Record<string, unknown> = {}) => ({
+    target_key: keyOf(file),
+    ctx: 1024,
+    margin_mib: 1024,
+    llama_cpp_build: "b9999",
+    backend: "cpu",
+    source: "header",
+    memory,
+    point: point({ ctx: 1024 }),
+    error: null,
+    fetched_bytes: 16_000_000,
+    ...over,
+  });
+  const jobsOf = (workerId: string, type = "fit_check") =>
+    getDb().prepare(`SELECT payload_json, status FROM worker_jobs WHERE worker_id = ? AND job_type = ? ORDER BY created_at, rowid`).all(workerId, type) as {
+      payload_json: string;
+      status: string;
+    }[];
+  const finishJobs = (workerId: string) => getDb().prepare(`UPDATE worker_jobs SET status = 'completed' WHERE worker_id = ?`).run(workerId);
+
+  it("refuses an older worker and a bad target, and never touches the catalog", async () => {
+    const old = await heartbeat("mf-old");
+    expect((await post(`/api/workers/${old.id}/model-fit`, { targets: [target("a.gguf")] })).status).toBe(409);
+    const w = await heartbeat("mf-bad", CAPS);
+    const bad = async (t: unknown) => (await post(`/api/workers/${w.id}/model-fit`, { targets: [t] })).status;
+    expect(await bad({ hf_repo: "nope", hf_file: "a.gguf" })).toBe(400);
+    expect(await bad({ hf_repo: "u/r", hf_file: "../../etc/passwd.gguf" })).toBe(400);
+    expect(await bad({ hf_repo: "u/r", hf_file: "/abs.gguf" })).toBe(400);
+    expect(await bad({ hf_repo: "u/r", hf_file: "a\\b.gguf" })).toBe(400);
+    expect(await bad({ hf_repo: "u/r", hf_file: "notes.txt" })).toBe(400);
+    expect(await bad({ model_id: "nope" })).toBe(400);
+    expect((await post(`/api/workers/${w.id}/model-fit`, { targets: [] })).status).toBe(400);
+
+    const before = (getDb().prepare(`SELECT COUNT(*) AS n FROM models`).get() as { n: number }).n;
+    expect((await post(`/api/workers/${w.id}/model-fit`, { targets: [target("uncatalogued.gguf")] })).status).toBe(202);
+    expect((getDb().prepare(`SELECT COUNT(*) AS n FROM models`).get() as { n: number }).n).toBe(before);
+  });
+
+  it("the plan names the build a machine would use", async () => {
+    const w = await heartbeat("mf-plan", CAPS);
+    const plan = await json(await fetch(`${baseUrl}/api/workers/${w.id}/model-fit/plan`));
+    expect(plan).toMatchObject({ online: true, capable: true, ctx: 1024, margin_mib: 1024, build: { tag: "b9999", installed: true, backend: "cpu" } });
+  });
+
+  it("a second click adds its own job instead of being lost, and repeats are skipped", async () => {
+    const w = await heartbeat("mf-two", CAPS);
+    const first = await json(await post(`/api/workers/${w.id}/model-fit`, { targets: [target("a.gguf")] }));
+    expect(first).toMatchObject({ queued: 1, queued_keys: [keyOf("a.gguf")] });
+    const second = await json(await post(`/api/workers/${w.id}/model-fit`, { targets: [target("a.gguf"), target("b.gguf")] }));
+    expect(second).toMatchObject({ queued: 1, queued_keys: [keyOf("b.gguf")] });
+    const jobs = jobsOf(w.id);
+    expect(jobs).toHaveLength(2);
+    expect(JSON.parse(jobs[1].payload_json)).toMatchObject({ ctx: 1024, target_keys: [keyOf("b.gguf")], llama_cpp_build: "b9999" });
+    const list = await json(await fetch(`${baseUrl}/api/workers/${w.id}/model-fit`));
+    expect(list.pending_keys.sort()).toEqual([keyOf("a.gguf"), keyOf("b.gguf")]);
+  });
+
+  it("stores answers with a level, clears pending, skips fresh ones unless forced", async () => {
+    const w = await heartbeat("mf-store", CAPS);
+    await post(`/api/workers/${w.id}/model-fit`, { targets: [target("a.gguf")] });
+    await new Promise((r) => setTimeout(r, 5));
+    expect((await post("/api/worker/model-fit", { machine_id: "mf-store", results: [report("a.gguf")] }, workerAuth)).status).toBe(200);
+    const list = await json(await fetch(`${baseUrl}/api/workers/${w.id}/model-fit`));
+    expect(list.pending_keys).toEqual([]);
+    expect(list.results[0]).toMatchObject({ target_key: keyOf("a.gguf"), level: "partial", fetched_bytes: 16_000_000, memory });
+    finishJobs(w.id);
+
+    expect(await json(await post(`/api/workers/${w.id}/model-fit`, { targets: [target("a.gguf")] }))).toMatchObject({ queued: 0 });
+    expect(await json(await post(`/api/workers/${w.id}/model-fit`, { targets: [target("a.gguf")], force: true }))).toMatchObject({ queued: 1 });
+  });
+
+  it("a failed check is kept with its error, has no level, and is asked again", async () => {
+    const w = await heartbeat("mf-err", CAPS);
+    const failed = report("a.gguf", { point: null, error: "401 (gated or private repo)", source: null });
+    expect((await post("/api/worker/model-fit", { machine_id: "mf-err", results: [failed] }, workerAuth)).status).toBe(200);
+    const list = await json(await fetch(`${baseUrl}/api/workers/${w.id}/model-fit`));
+    expect(list.results[0]).toMatchObject({ level: null, error: "401 (gated or private repo)" });
+    expect(await json(await post(`/api/workers/${w.id}/model-fit`, { targets: [target("a.gguf")] }))).toMatchObject({ queued: 1 });
+    const empty = report("b.gguf", { point: null, error: null });
+    expect((await post("/api/worker/model-fit", { machine_id: "mf-err", results: [empty] }, workerAuth)).status).toBe(400);
+    const badKey = report("c.gguf", { target_key: "../evil" });
+    expect((await post("/api/worker/model-fit", { machine_id: "mf-err", results: [badKey] }, workerAuth)).status).toBe(400);
+  });
+
+  it("with no usable build: refuses without consent, then installs, activates and checks in order", async () => {
+    const w = await heartbeat("mf-none", CAPS, []);
+    const plan = await json(await fetch(`${baseUrl}/api/workers/${w.id}/model-fit/plan`));
+    expect(plan.build).toMatchObject({ tag: "b12000", installed: false, backend: "cpu", size_bytes: 40_000_000 });
+
+    expect((await post(`/api/workers/${w.id}/model-fit`, { targets: [target("a.gguf")] })).status).toBe(409);
+    expect(jobsOf(w.id)).toHaveLength(0);
+
+    const res = await json(await post(`/api/workers/${w.id}/model-fit`, { targets: [target("a.gguf")], auto_install: true }));
+    expect(res).toMatchObject({ queued: 1, installing: "b12000" });
+    const order = getDb().prepare(`SELECT job_type FROM worker_jobs WHERE worker_id = ? ORDER BY rowid`).all(w.id) as { job_type: string }[];
+    expect(order.map((j) => j.job_type)).toEqual(["install_build", "activate_build", "fit_check"]);
+    expect(JSON.parse(jobsOf(w.id)[0].payload_json).llama_cpp_build).toBe("b12000");
+
+    await post(`/api/workers/${w.id}/model-fit`, { targets: [target("b.gguf")], auto_install: true });
+    expect(jobsOf(w.id, "install_build")).toHaveLength(1);
+    expect((await json(await fetch(`${baseUrl}/api/workers/${w.id}/model-fit`))).installing).toBe("b12000");
+  });
+
+  it("a build without fit-params is passed over, but an active one is never replaced", async () => {
+    const w = await heartbeat("mf-old-build", CAPS, [
+      { tag: "b5000", asset_name: "llama-b5000-bin-ubuntu-x64.zip", installed_at: 1, active: true },
+    ]);
+    await post(`/api/workers/${w.id}/model-fit`, { targets: [target("a.gguf")], auto_install: true });
+    const order = getDb().prepare(`SELECT job_type FROM worker_jobs WHERE worker_id = ? ORDER BY rowid`).all(w.id) as { job_type: string }[];
+    expect(order.map((j) => j.job_type)).toEqual(["install_build", "fit_check"]);
+  });
+
+  it("prefers the active build, whatever its backend", async () => {
+    const w = await heartbeat("mf-active", CAPS, [
+      { tag: "b9999", asset_name: "llama-b9999-bin-ubuntu-x64.zip", installed_at: 1, active: false, fit_params_path: "/x/fit" },
+      { tag: "b9000", asset_name: "llama-b9000-bin-ubuntu-vulkan-x64.zip", installed_at: 2, active: true, fit_params_path: "/y/fit" },
+    ]);
+    const plan = await json(await fetch(`${baseUrl}/api/workers/${w.id}/model-fit/plan`));
+    expect(plan.build).toMatchObject({ tag: "b9000", backend: "vulkan", installed: true });
+  });
+
+  it("a catalogued model is sent as its own row, under the same key as its Hugging Face file", async () => {
+    const w = await heartbeat("mf-model", CAPS);
+    expect(await json(await post(`/api/workers/${w.id}/model-fit`, { targets: [{ model_id: "opt-model" }] }))).toMatchObject({ queued: 1 });
+    const payload = JSON.parse(jobsOf(w.id)[0].payload_json);
+    expect(payload.models[0].id).toBe("opt-model");
+    expect(payload.target_keys).toHaveLength(1);
+    expect(payload.target_keys[0]).toMatch(/^(hf|model):/);
+  });
+
+  it("caps pending jobs per machine", async () => {
+    const w = await heartbeat("mf-cap", CAPS);
+    for (let i = 0; i < 8; i++) {
+      expect((await post(`/api/workers/${w.id}/model-fit`, { targets: [target(`f${i}.gguf`)] })).status).toBe(202);
+    }
+    expect((await post(`/api/workers/${w.id}/model-fit`, { targets: [target("over.gguf")] })).status).toBe(409);
   });
 });

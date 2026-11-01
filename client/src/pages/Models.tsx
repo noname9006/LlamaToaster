@@ -1,7 +1,9 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { api, ApiError } from "../api/client";
 import { ModelFitTable } from "../components/optimize/ModelFitTable";
-import { StatusPill } from "../components/StatusPill";
+import { FitCheckDialog, type FitDialogRequest, type FitItem } from "../components/modelFit/FitCheckDialog";
+import { FitMark } from "../components/modelFit/FitMark";
+import { useModelFit, type FitMarkState } from "../components/modelFit/useModelFit";
 import {
   IconAlertTriangle,
   IconCheck,
@@ -13,7 +15,8 @@ import {
   IconX,
 } from "../components/icons";
 import { ParamsRangeSlider, PARAMS_STOPS, paramsInRange } from "../components/ParamsRangeSlider";
-import { buildModelGroups, resolveQuant, groupQuantsByTier, type ModelGroup } from "../modelGrouping";
+import { buildModelGroups, groupHfFilesByTier, resolveQuant, groupQuantsByTier, type HfQuantChip, type ModelGroup } from "../modelGrouping";
+import { fitTargetKey } from "../../../shared/fitLevel.js";
 import {
   formatBytes,
   formatParamsB,
@@ -495,6 +498,10 @@ export function Models() {
   const [sortDir, setSortDir] = useState<SortDir>(initialPrefs.sortDir);
   const [refreshingModels, setRefreshingModels] = useState(false);
   const [refreshModelsMsg, setRefreshModelsMsg] = useState("");
+
+  const workerIds = useMemo(() => workers.map((w) => w.id), [workers]);
+  const modelFit = useModelFit(workerIds);
+  const [fitDialog, setFitDialog] = useState<FitDialogRequest | null>(null);
 
   const enrichedModels = useMemo(
     () =>
@@ -1276,6 +1283,58 @@ export function Models() {
     }
   }
 
+  // "Will it fit?": a file is on a machine when its catalog row says so; the
+  // dialog only uses this to say what needs no download.
+  function hfFileIsOn(repoId: string, file: string, workerId: string): boolean {
+    return models.some((m) => m.hf_repo === repoId && m.hf_file === file && locations[m.id]?.includes(workerId));
+  }
+
+  function fitItemForModel(m: Model): FitItem {
+    return {
+      key: fitTargetKey(m)!,
+      // The catalog row, not its Hugging Face path: the machine finds the file by
+      // hash even when it was renamed, and needs no download for it.
+      target: { model_id: m.id },
+      label: resolveQuant(m) ?? m.filename,
+      shards: 1,
+      isLocalOn: (workerId) => !!locations[m.id]?.includes(workerId),
+    };
+  }
+
+  function fitItemForChip(repoId: string, chip: HfQuantChip): FitItem {
+    return {
+      key: fitTargetKey({ hf_repo: repoId, hf_file: chip.file })!,
+      target: { hf_repo: repoId, hf_file: chip.file, size_bytes: chip.sizeBytes },
+      label: chip.label,
+      shards: chip.files.length,
+      isLocalOn: (workerId) => chip.files.every((f) => hfFileIsOn(repoId, f.path, workerId)),
+    };
+  }
+
+  // A mark with an answer opens that answer; anything else opens the prompt.
+  function openFitForOne(item: FitItem, workerId: string | undefined, state: FitMarkState) {
+    setFitDialog({
+      title: item.label,
+      scope: "one",
+      items: [item],
+      workerId,
+      showResult: state.kind === "answered",
+    });
+  }
+
+  function renderWillItFitButton(title: string, items: FitItem[], workerId: string | undefined) {
+    return (
+      <button
+        type="button"
+        onClick={() => setFitDialog({ title, scope: "all", items, workerId })}
+        className="inline-flex items-center gap-1 rounded-md border border-border px-2 py-0.5 text-xs text-muted hover:border-accent/40 hover:text-accent"
+        title="Check every quant against this machine"
+      >
+        Will it fit? <span aria-hidden="true">❓</span>
+      </button>
+    );
+  }
+
   // Compact quant badge: state icon + quant code + size, nothing else --
   // matches Hugging Face's own quant-table style rather than a filename-first
   // row. The whole badge is the link to that exact file's HF page when one
@@ -1324,8 +1383,15 @@ export function Models() {
     return (
       <div
         key={key}
-        className={`group/badge relative inline-flex items-stretch ${isFirstInTier ? "" : "border-l border-border pl-2.5"}`}
+        className={`group/badge relative inline-flex items-center gap-1 ${isFirstInTier ? "" : "border-l border-border pl-2.5"}`}
       >
+        {!isMtpDraftModel(m) && (
+          <FitMark
+            state={modelFit.stateOf(worker.id, fitTargetKey(m))}
+            subject={quant}
+            onClick={() => openFitForOne(fitItemForModel(m), worker.id, modelFit.stateOf(worker.id, fitTargetKey(m)))}
+          />
+        )}
         {hfLinkRepo && hfLinkFile ? (
           <a href={hfFileUrl(hfLinkRepo, hfLinkFile)} target="_blank" rel="noreferrer" className={badgeClassName} title={title}>
             {content}
@@ -1458,14 +1524,22 @@ export function Models() {
           )}
           {!isOpen && (
             <span className="flex flex-wrap items-center gap-1">
-              {group.quants.map((q) => (
-                <span
-                  key={q.base.id}
-                  className="rounded border border-border bg-surface px-1.5 py-0.5 font-mono text-[11px] font-semibold text-fg"
-                >
-                  {resolveQuant(q.base) ?? "?"}
-                </span>
-              ))}
+              {group.quants.map((q) => {
+                const state = modelFit.stateOf(worker.id, fitTargetKey(q.base));
+                return (
+                  <span
+                    key={q.base.id}
+                    className="inline-flex items-center gap-1 rounded border border-border bg-surface px-1.5 py-0.5 font-mono text-[11px] font-semibold text-fg"
+                  >
+                    <FitMark
+                      state={state}
+                      subject={resolveQuant(q.base) ?? q.base.filename}
+                      onClick={() => openFitForOne(fitItemForModel(q.base), worker.id, state)}
+                    />
+                    {resolveQuant(q.base) ?? "?"}
+                  </span>
+                );
+              })}
               {uniqueDrafts.length > 0 && (
                 <span className="rounded border border-dashed border-border px-1.5 py-0.5 font-mono text-[11px] text-muted">
                   MTP
@@ -1474,6 +1548,7 @@ export function Models() {
             </span>
           )}
           <span className="flex-1" />
+          {renderWillItFitButton(repoName, group.quants.map((q) => fitItemForModel(q.base)), worker.id)}
           <span className="font-mono text-[10.5px] text-muted/70">
             {totalFiles} file{totalFiles === 1 ? "" : "s"} · {formatBytes(totalBytes)}
           </span>
@@ -1506,8 +1581,83 @@ export function Models() {
     );
   }
 
+  // One chip of a Hugging Face repo's bit-width table: fit mark, the quant's link,
+  // its size, and Download -- which for a split model queues every shard.
+  function renderHfChip(repoId: string, chip: HfQuantChip) {
+    const item = fitItemForChip(repoId, chip);
+    const fitWorker = downloadWorker || undefined;
+    const state = modelFit.stateOf(fitWorker, item.key);
+    const inFlight = chip.files.filter((f) => downloading[downloadKey(downloadWorker, repoId, f.path)]);
+    const bytes = chip.files.reduce((sum, f) => sum + (progress[downloadKey(downloadWorker, repoId, f.path)]?.bytes ?? 0), 0);
+    const pct = inFlight.length > 0 && chip.sizeBytes > 0 ? Math.min(100, Math.round((bytes / chip.sizeBytes) * 100)) : null;
+    const onMachine = !!fitWorker && item.isLocalOn(fitWorker);
+    return (
+      <span key={chip.file} className="inline-flex items-center gap-1.5 rounded-md border border-border bg-surface px-2 py-1 text-xs text-fg">
+        {chip.kind === "quant" && <FitMark state={state} subject={chip.label} onClick={() => openFitForOne(item, fitWorker, state)} />}
+        {chip.kind !== "quant" && (
+          <span className="rounded border border-border px-1 font-mono text-[9.5px] uppercase text-muted">{chip.kind === "mtp" ? "MTP" : "mmproj"}</span>
+        )}
+        <a href={hfFileUrl(repoId, chip.file)} target="_blank" rel="noreferrer" className="font-mono font-semibold text-fg hover:text-accent hover:underline">
+          {chip.label}
+        </a>
+        <span className="font-mono text-[11px] tabular-nums text-muted">
+          {formatBytes(chip.sizeBytes)}
+          {chip.files.length > 1 ? ` · ${chip.files.length} parts` : ""}
+        </span>
+        {onMachine ? (
+          <IconCheck width={12} height={12} className="shrink-0 text-success" aria-label="Already on this machine" />
+        ) : (
+          <button
+            type="button"
+            disabled={inFlight.length > 0}
+            onClick={() => {
+              for (const f of chip.files) void handleDownload(repoId, f);
+            }}
+            title={chip.files.length > 1 ? `Download all ${chip.files.length} parts` : "Download"}
+            aria-label={`Download ${chip.label}`}
+            className="flex items-center gap-1 rounded text-muted hover:text-accent disabled:opacity-60"
+          >
+            <IconDownload width={12} height={12} />
+            {inFlight.length > 0 && <span className="font-mono text-[11px]">{pct !== null && pct > 0 ? `${pct}%` : "…"}</span>}
+          </button>
+        )}
+      </span>
+    );
+  }
+
+  function renderHfFileTiers(repoId: string, files: HfFileEntry[]) {
+    const tiers = groupHfFilesByTier(files);
+    const quants = tiers.flatMap((t) => t.chips).filter((c) => c.kind === "quant");
+    return (
+      <div>
+        {quants.length > 0 && (
+          <div className="flex items-center justify-end px-4 pt-2.5">
+            {renderWillItFitButton(repoId.slice(repoId.indexOf("/") + 1), quants.map((c) => fitItemForChip(repoId, c)), downloadWorker || undefined)}
+          </div>
+        )}
+        {tiers.map((tier) => (
+          <div key={tier.label} className="flex items-start gap-3.5 border-t border-border/60 px-4 py-2 first:border-t-0">
+            <div className="w-14 shrink-0 pt-1.5 text-[11px] font-semibold text-muted">{tier.label}</div>
+            <div className="flex flex-1 flex-wrap content-start gap-1.5">{tier.chips.map((chip) => renderHfChip(repoId, chip))}</div>
+          </div>
+        ))}
+      </div>
+    );
+  }
+
   return (
     <div>
+      {fitDialog && (
+        <FitCheckDialog
+          request={fitDialog}
+          workers={workers}
+          fit={modelFit}
+          onClose={() => setFitDialog(null)}
+          onMachineChosen={(id) => {
+            if (!fitDialog.workerId) setDownloadWorker(id);
+          }}
+        />
+      )}
       <h1 className="m-0 font-display text-[32px] font-semibold leading-tight text-fg">Models</h1>
       <p className="mt-1 text-sm text-muted">
         The model catalog (filenames and metadata) is shared across every user, so downloads can be
@@ -2060,64 +2210,7 @@ export function Models() {
                     ) : filesByRepo[r.id].length === 0 ? (
                       <p className="px-4 py-3 text-sm text-muted">No .gguf files found in this repo.</p>
                     ) : (
-                      <ul className="divide-y divide-border">
-                        {filesByRepo[r.id].map((f) => {
-                          const dlKey = downloadKey(downloadWorker, r.id, f.path);
-                          const dl = downloading[dlKey];
-                          const prog = progress[dlKey];
-                          const speed = speeds[dlKey];
-                          const pct =
-                            prog?.total != null ? Math.min(100, Math.round((prog.bytes / prog.total) * 100)) : null;
-                          return (
-                            <li key={f.path} className="flex flex-col gap-2 px-4 py-2.5 text-sm">
-                              <div className="flex flex-wrap items-center justify-between gap-2">
-                                <div className="flex items-center gap-2">
-                                  <a
-                                    href={hfFileUrl(r.id, f.path)}
-                                    target="_blank"
-                                    rel="noreferrer"
-                                    className="text-fg hover:text-accent hover:underline"
-                                  >
-                                    {f.path}
-                                  </a>
-                                  {f.quant && <StatusPill label={f.quant} tone="muted" />}
-                                  <span className="text-xs text-muted">{formatBytes(f.size_bytes)}</span>
-                                </div>
-                                <button
-                                  type="button"
-                                  disabled={dl !== undefined}
-                                  onClick={() => handleDownload(r.id, f)}
-                                  className="flex items-center gap-1.5 rounded-md border border-border px-2.5 py-1 text-xs font-semibold text-fg hover:border-accent/40 hover:text-accent disabled:opacity-60"
-                                >
-                                  <IconDownload width={14} height={14} />
-                                  {dl ? (pct !== null ? `${pct}%` : "Starting…") : "Download"}
-                                </button>
-                              </div>
-                              {dl && (
-                                <div className="flex flex-col gap-1">
-                                  <div className="h-1.5 w-full overflow-hidden rounded-full bg-surface-raised">
-                                    {pct !== null ? (
-                                      <div
-                                        className="h-full rounded-full bg-accent transition-[width]"
-                                        style={{ width: `${pct}%` }}
-                                      />
-                                    ) : (
-                                      <div className="progress-indeterminate h-full w-full rounded-full" />
-                                    )}
-                                  </div>
-                                  <div className="flex items-center gap-2 text-xs text-muted">
-                                    <span>
-                                      {formatBytes(prog?.bytes ?? 0)}
-                                      {prog?.total != null ? ` / ${formatBytes(prog.total)}` : ""}
-                                    </span>
-                                    {speed !== undefined && <span>· {formatBytes(speed)}/s</span>}
-                                  </div>
-                                </div>
-                              )}
-                            </li>
-                          );
-                        })}
-                      </ul>
+                      renderHfFileTiers(r.id, filesByRepo[r.id])
                     )}
                   </div>
                 )}

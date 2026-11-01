@@ -169,3 +169,45 @@ describe("measureGrowthSpill", () => {
     expect(buildSpillAnchor({ ...A, buffers: null })).toBeNull();
   });
 });
+
+describe("measureGrowthSpill under --load-mode mlock", () => {
+  // Measured 2026-10-31: RX 6600 XT, Vulkan, b11840, gemma-4-12b Q8_0, 1,024 tokens.
+  // With mmap off the weights left on the CPU sit in the GPU's pinned host buffer,
+  // which WDDM counts as shared, so shared barely moves while real spill grows.
+  const load = (claim: number, pin: number, ded: number, shared: number): MeasuredLoad => ({
+    buffers: { deviceMib: claim, contextMib: 200, hostPinnedMib: pin },
+    readings: [{ atMs: 1500, dedicatedMib: ded, sharedMib: shared }],
+    ready: { fromMs: 1000, toMs: 2000 },
+    work: null,
+  });
+  const anchor = buildSpillAnchor(load(1170, 12101, 1227.6, 12101.7));
+
+  it.each([
+    { layers: 15, claim: 4492, pin: 8866, ded: 1649.4, shared: 11797, spill: 2900 },
+    { layers: 25, claim: 6854, pin: 6577, ded: 1950.9, shared: 11570.4, spill: 4960 },
+    { layers: 42, claim: 10881, pin: 2661, ded: 2069.7, shared: 11570.9, spill: 8868 },
+  ])("still sees the spill at $layers layers", ({ claim, pin, ded, shared, spill }) => {
+    const v = measureGrowthSpill(load(claim, pin, ded, shared), anchor);
+    expect(v.spilled).toBe(true);
+    expect(v.inSystemRamMib!).toBeCloseTo(spill, -1);
+  });
+
+  it("does not call pinned host memory leaving shared a spill, or hide one behind it", () => {
+    // Uncorrected, s here would read -304 and min(s, d) could never fire.
+    expect(measureGrowthSpill(load(4492, 8866, 1649.4, 11797), anchor).sharedGrowthMib!).toBeCloseTo(2930, 0);
+    // All of the claim landed in VRAM: no spill, whatever moved in shared.
+    expect(measureGrowthSpill(load(4492, 8866, 4560, 8870), anchor).spilled).toBe(false);
+  });
+
+  it("changes nothing when no host buffer moved", () => {
+    const plain = (claim: number, ded: number, shared: number): MeasuredLoad => ({
+      buffers: { deviceMib: claim, contextMib: 200 },
+      readings: [{ atMs: 1500, dedicatedMib: ded, sharedMib: shared }],
+      ready: { fromMs: 1000, toMs: 2000 },
+      work: null,
+    });
+    const v = measureGrowthSpill(plain(4492, 1614.8, 2963.3), buildSpillAnchor(plain(1170, 1180.4, 33.8)));
+    expect(v.sharedGrowthMib!).toBeCloseTo(2929.5, 1);
+    expect(v.spilled).toBe(true);
+  });
+});

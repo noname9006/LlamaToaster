@@ -295,9 +295,8 @@ async function buildArgs(input: ServerBenchRunInput): Promise<string[]> {
   // draft model, if any) locked in RAM, and -- this being a speed benchmark
   // (MTP tok/s) -- forces mmap off so a run's timing doesn't depend on the OS
   // page cache an earlier load left behind. `--load-mode mlock` on current
-  // builds, --mlock / --no-mmap on older ones. loadDriver.ts's context-test
-  // path leaves mmap at its default ON.
-  args.push(...(await modelLoadArgs(input.llamaServerPath, "mlock_no_mmap")));
+  // builds, --mlock / --no-mmap on older ones.
+  args.push(...(await modelLoadArgs(input.llamaServerPath)));
   if (input.mtpModelPath) {
     args.push("--model-draft", input.mtpModelPath);
     // Confirmed live against the installed build's own --help: llama-server

@@ -118,23 +118,17 @@ describe("buildArgs model-loading flags", () => {
 });
 
 describe("modelLoadArgsFromHelp", () => {
-  it("maps both policies onto --load-mode values", () => {
-    expect(modelLoadArgsFromHelp(SERVER_HELP_LOAD_MODE, "mlock_no_mmap")).toEqual(["--load-mode", "mlock"]);
-    expect(modelLoadArgsFromHelp(SERVER_HELP_LOAD_MODE, "mlock_mmap")).toEqual(["--load-mode", "mmap+mlock"]);
+  it("uses --load-mode mlock where the build has it", () => {
+    expect(modelLoadArgsFromHelp(SERVER_HELP_LOAD_MODE)).toEqual(["--load-mode", "mlock"]);
   });
 
   it("uses --no-mmap on legacy server/perplexity help, --mmap 0 on legacy llama-bench help", () => {
-    expect(modelLoadArgsFromHelp(SERVER_HELP_LEGACY, "mlock_no_mmap")).toEqual(["--mlock", "--no-mmap"]);
-    expect(modelLoadArgsFromHelp(BENCH_HELP_LEGACY, "mlock_no_mmap")).toEqual(["--mlock", "--mmap", "0"]);
-  });
-
-  it("leaves mmap alone for the mmap policy on legacy builds", () => {
-    expect(modelLoadArgsFromHelp(SERVER_HELP_LEGACY, "mlock_mmap")).toEqual(["--mlock"]);
-    expect(modelLoadArgsFromHelp(BENCH_HELP_LEGACY, "mlock_mmap")).toEqual(["--mlock"]);
+    expect(modelLoadArgsFromHelp(SERVER_HELP_LEGACY)).toEqual(["--mlock", "--no-mmap"]);
+    expect(modelLoadArgsFromHelp(BENCH_HELP_LEGACY)).toEqual(["--mlock", "--mmap", "0"]);
   });
 
   it("returns nothing for empty help (probe failed)", () => {
-    expect(modelLoadArgsFromHelp("", "mlock_no_mmap")).toEqual([]);
+    expect(modelLoadArgsFromHelp("")).toEqual([]);
   });
 });
 
@@ -501,6 +495,21 @@ describe("parseGpuBufferReport", () => {
     )!;
     expect(report.deviceMib).toBeCloseTo(6462.03, 2);
     expect(report.contextMib).toBeCloseTo(219.51, 2);
+    // Pinned host buffers, reported apart: output + compute here, no weights.
+    expect(report.hostPinnedMib).toBeCloseTo(0.95 + 21.11, 2);
+  });
+
+  it("counts weights in the GPU's pinned host buffer as pinned, not as on the GPU", () => {
+    const report = parseGpuBufferReport(
+      [
+        "load_tensors: Vulkan_Host model buffer size =  8833.00 MiB",
+        "load_tensors:      Vulkan0 model buffer size =  4200.00 MiB",
+        "sched_reserve:      Vulkan0 compute buffer size =   200.00 MiB",
+        "sched_reserve: Vulkan_Host compute buffer size =    33.00 MiB",
+      ].join("\n")
+    )!;
+    expect(report.deviceMib).toBeCloseTo(4400, 2);
+    expect(report.hostPinnedMib).toBeCloseTo(8866, 2);
   });
 
   it("leaves mmap-off host weight buffers (*_Host, CPU_REPACK, AMX) out of the GPU claim", () => {
@@ -523,7 +532,7 @@ describe("parseGpuBufferReport", () => {
         "sched_reserve:        CUDA0 compute buffer size =   150.00 MiB",
       ].join("\n")
     )!;
-    expect(report).toEqual({ deviceMib: 4150, contextMib: 150, byDeviceMib: { CUDA0: 4150 } });
+    expect(report).toEqual({ deviceMib: 4150, contextMib: 150, byDeviceMib: { CUDA0: 4150 }, hostPinnedMib: 0 });
   });
 
   // b9503 llama-server, Gemma-4 E4B at 131072 tokens: one KV cache for the
@@ -565,7 +574,7 @@ describe("parseGpuBufferReport", () => {
         "llama_kv_cache:        CUDA1 KV buffer size =    80.00 MiB",
       ].join("\n")
     )!;
-    expect(report).toEqual({ deviceMib: 3680, contextMib: 180, byDeviceMib: { CUDA0: 2100, CUDA1: 1580 } });
+    expect(report).toEqual({ deviceMib: 3680, contextMib: 180, byDeviceMib: { CUDA0: 2100, CUDA1: 1580 }, hostPinnedMib: 0 });
   });
 
   it("reports nothing on a GPU for a CPU-only load, rather than no report", () => {
@@ -573,7 +582,7 @@ describe("parseGpuBufferReport", () => {
       parseGpuBufferReport(
         ["load_tensors:   CPU_Mapped model buffer size =  5880.00 MiB", "llama_kv_cache:          CPU KV buffer size =   512.00 MiB"].join("\n")
       )
-    ).toEqual({ deviceMib: 0, contextMib: 0, byDeviceMib: {} });
+    ).toEqual({ deviceMib: 0, contextMib: 0, byDeviceMib: {}, hostPinnedMib: 0 });
   });
 
   it("returns null when the build printed no buffer sizes", () => {

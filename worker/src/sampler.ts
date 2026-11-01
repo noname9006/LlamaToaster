@@ -102,6 +102,16 @@ export interface FreeMemoryBaseline {
 
 const BYTES_PER_MIB = 1024 * 1024;
 
+/** What the OS says is available and installed. Null when it cannot be read. */
+export async function readSystemRamMib(): Promise<{ availableMib: number | null; totalMib: number | null }> {
+  try {
+    const mem = await si.mem();
+    return { availableMib: Math.round(mem.available / BYTES_PER_MIB), totalMib: Math.round(mem.total / BYTES_PER_MIB) };
+  } catch {
+    return { availableMib: null, totalMib: null };
+  }
+}
+
 // One-time snapshot taken right before a llama-bench process spawns -- not
 // part of MemorySampler's own interval loop since it's a single baseline
 // reading, not something to keep resampling.

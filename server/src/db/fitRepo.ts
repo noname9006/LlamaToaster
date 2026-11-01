@@ -5,7 +5,12 @@
 import { getDb } from "./migrate.js";
 import type { FitPoint } from "../../../shared/fitParams.js";
 import type { KvSupportRow, KvSupportStatus } from "../../../shared/kvSupport.js";
-import type { FitCheckResult, FitCheckSource } from "../../../shared/types.js";
+import { fitLevel, type FitMemory } from "../../../shared/fitLevel.js";
+import type { FitCheckResult, FitCheckSource, ModelFitReport, ModelFitResult } from "../../../shared/types.js";
+
+/** Answers one machine keeps; the oldest go first. A worker can only write its
+ * own rows, so this only bounds what a broken one can pile up. */
+export const MAX_MODEL_FIT_ROWS_PER_WORKER = 5000;
 
 export class FitPointLimitError extends Error {
   constructor(readonly maxRows: number) {
@@ -201,6 +206,78 @@ export const fitRepo = {
     });
     tx();
     return n;
+  },
+
+  upsertModelFit(workerId: string, results: ModelFitReport[], now = Date.now()): number {
+    const db = getDb();
+    const stmt = db.prepare(
+      `INSERT INTO model_fit_checks
+         (worker_id, target_key, ctx, margin_mib, llama_cpp_build, backend, source, memory_json, point_json, error, fetched_bytes, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT (worker_id, target_key, ctx, margin_mib) DO UPDATE SET
+         llama_cpp_build = excluded.llama_cpp_build, backend = excluded.backend, source = excluded.source,
+         memory_json = excluded.memory_json, point_json = excluded.point_json, error = excluded.error,
+         fetched_bytes = excluded.fetched_bytes, created_at = excluded.created_at`
+    );
+    db.transaction(() => {
+      for (const r of results) {
+        stmt.run(
+          workerId,
+          r.target_key,
+          r.ctx,
+          r.margin_mib,
+          r.llama_cpp_build,
+          r.backend,
+          r.source,
+          JSON.stringify(r.memory),
+          r.point ? JSON.stringify(r.point) : null,
+          r.error,
+          r.fetched_bytes ?? null,
+          now
+        );
+      }
+      db.prepare(
+        `DELETE FROM model_fit_checks WHERE worker_id = ? AND rowid NOT IN
+           (SELECT rowid FROM model_fit_checks WHERE worker_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?)`
+      ).run(workerId, workerId, MAX_MODEL_FIT_ROWS_PER_WORKER);
+    })();
+    return results.length;
+  },
+
+  listModelFit(filter: { worker_id: string; ctx: number; margin_mib: number }): ModelFitResult[] {
+    const rows = getDb()
+      .prepare(`SELECT * FROM model_fit_checks WHERE worker_id = ? AND ctx = ? AND margin_mib = ?`)
+      .all(filter.worker_id, filter.ctx, filter.margin_mib) as {
+      target_key: string;
+      ctx: number;
+      margin_mib: number;
+      llama_cpp_build: string;
+      backend: string;
+      source: string | null;
+      memory_json: string;
+      point_json: string | null;
+      error: string | null;
+      fetched_bytes: number | null;
+      created_at: number;
+    }[];
+    return rows.map((r) => {
+      const memory = JSON.parse(r.memory_json) as FitMemory;
+      const point = r.point_json ? (JSON.parse(r.point_json) as FitPoint) : null;
+      return {
+        target_key: r.target_key,
+        ctx: r.ctx,
+        margin_mib: r.margin_mib,
+        llama_cpp_build: r.llama_cpp_build,
+        backend: r.backend,
+        source: (r.source as FitCheckSource | null) ?? null,
+        memory,
+        point,
+        error: r.error,
+        ...(r.fetched_bytes != null ? { fetched_bytes: r.fetched_bytes } : {}),
+        level: point ? fitLevel(point, memory) : null,
+        created_at: r.created_at,
+      };
+    });
   },
 
   /** Latest answer per model at (ctx, margin) on this worker, any build. */

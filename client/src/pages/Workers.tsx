@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { useLocation } from "react-router-dom";
 import { useWorkerStatuses } from "../api/useWorkerStatus";
 import { useDeviceEnrolment } from "../api/useDeviceEnrolment";
 import { WorkerCard } from "../components/WorkerCard";
@@ -23,6 +24,13 @@ export function Workers() {
   // box next to the collapsed summary below and the full panel underneath
   // share one code/status/approve state instead of drifting independently.
   const enrolment = useDeviceEnrolment();
+
+  // The Models page links here to a machine's build list.
+  const { hash } = useLocation();
+  useEffect(() => {
+    if (loaded && hash) document.getElementById(decodeURIComponent(hash.slice(1)))?.scrollIntoView({ block: "start" });
+  }, [loaded, hash]);
+
   const [detailsOpen, setDetailsOpen] = useState(false);
   useEffect(() => {
     if (loaded && order.length === 0) setDetailsOpen(true);
@@ -42,10 +50,10 @@ export function Workers() {
         <div>
           <h1 className="m-0 font-display text-[32px] font-semibold leading-tight text-fg">Machines</h1>
           <p className="mt-2 max-w-2xl text-sm text-muted">
-            llama.cpp build management per worker. Installing, activating, and deleting a build is
-            always a manual click here — nothing downloads or switches on its own. Installable
-            versions are checked against GitHub every few minutes and refreshed whenever this page
-            loads.
+            llama.cpp build management per worker. Choose a build or another backend here. A build
+            only downloads on its own when something you asked for needs one and the machine has none
+            that can do it, and the page you asked from says so first. Installable versions are checked
+            against GitHub every few minutes and refreshed whenever this page loads.
           </p>
         </div>
       </div>
