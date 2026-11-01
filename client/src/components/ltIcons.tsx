@@ -24,6 +24,7 @@ export const LT_ICON_PATHS = {
   offline: "M2 2l20 20M8.5 16.5a5 5 0 017 0M5 12.9a10 10 0 015.2-2.7M19 12.9a10 10 0 00-2.4-1.7M12 20h.01",
   chevron: "M9 6l6 6-6 6",
   stop: "M6 6h12v12H6z",
+  play: "M6 4l14 8-14 8z",
 } as const;
 
 export type LtIconName = keyof typeof LT_ICON_PATHS;

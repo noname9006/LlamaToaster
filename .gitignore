@@ -59,6 +59,10 @@ worker/config.vps.json
 # (see its DEFAULT_OFFSET_STORE_PATH) -- runtime state, not source.
 worker/mtp-offsets.json
 
+# The Serve page's state on a worker (worker/src/daemon/store.ts): API key hashes,
+# usage counts and the owner's own system prompt.
+worker/daemon-state.json*
+
 # Throwaway verification scripts and screenshot dumps from local debugging
 # sessions -- never project source.
 scripts/_*

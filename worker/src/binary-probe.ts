@@ -60,6 +60,11 @@ export async function supportsFlag(path: string, flag: string): Promise<boolean>
   return helpHasFlag(await helpText(path), flag);
 }
 
+// The binary's --help, for callers checking many flags at once. "" when it cannot run.
+export function readHelpText(path: string): Promise<string> {
+  return helpText(path).catch(() => "");
+}
+
 export function helpHasFlag(text: string, flag: string): boolean {
   if (!text.trim()) return false;
   // Match the flag as a whole token: "--spec" must not match

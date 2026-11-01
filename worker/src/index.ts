@@ -91,6 +91,7 @@ import {
   postKvSupport,
   postFitChecks,
   postModelFit,
+  postDaemonTelemetry,
 } from "./vps-client.js";
 import { makeFitCaller, runFitMap } from "./fitMap.js";
 import { prepareHeaderModel, shardNames } from "./headerFit.js";
@@ -108,6 +109,9 @@ import {
 } from "../../shared/speedRun.js";
 import { measureMemorySpeed } from "./memSpeed.js";
 import { log, configureLogging, setRunLogFile, ansi, paint, colorsEnabled } from "./log.js";
+import { DaemonManager, DaemonLoadCancelled, MAX_LOAD_JOB_AGE_MS } from "./daemon/manager.js";
+import { DaemonStore } from "./daemon/store.js";
+import type { DaemonLoadJobPayload } from "../../shared/daemonTypes.js";
 import {
   detectPlatform,
   listInstalledBuilds,
@@ -170,7 +174,7 @@ import {
 import { fillCurveSteps, fillTarget } from "../../shared/fillCurve.js";
 import type { ProbeDedupPoint } from "../../shared/api-v8.js";
 import { detectSensorAvailability, LHM_HTTP_PORT, type SensorAvailability } from "./sensors.js";
-import { readCpuIsa } from "./binary-probe.js";
+import { readCpuIsa, readHelpText } from "./binary-probe.js";
 import { resolveVramDiscrepancyAction } from "./vram-policy.js";
 import { ensureDefaultQualityCorpus } from "./qualityCorpus.js";
 import { expandSweep, deriveTestType, type SweepItem } from "../../shared/sweep.js";
@@ -929,6 +933,33 @@ function toInstalledBuildList(): InstalledBuild[] {
   }));
 }
 
+// The Serve page's model daemon (docs/plans/MODEL_DAEMON_PLAN.md). Its state file
+// sits next to config.json, with the same owner-only permissions.
+const daemonStore = new DaemonStore(join(dirname(configPath), "daemon-state.json"), (msg) => log.warn(msg));
+const daemon = new DaemonManager(
+  {
+    get backend() {
+      return backend;
+    },
+    hardware: () => currentHardware(),
+    activeServer: () => (activeBuild?.serverPath ? { tag: activeBuild.tag, path: activeBuild.serverPath } : null),
+    helpText: (path) => readHelpText(path),
+    resolveModelPath: (model) => resolveModelPath(model),
+    resolveModelDirFile: (filename) => {
+      const root = resolve(config.model_dir);
+      const target = resolve(root, filename);
+      const rel = relative(root, target);
+      if (rel === "" || rel.startsWith("..") || isAbsolute(rel)) throw new Error(`file resolves outside model_dir: ${filename}`);
+      if (!existsSync(target)) throw new Error(`file not found in model_dir: ${filename}`);
+      return target;
+    },
+    log,
+    onChange: () => wakeDaemonTelemetry?.(),
+  },
+  daemonStore
+);
+const DAEMON_FIT_REFUSAL = "A model is loaded on this machine, so free memory would read low. Unload it on the Serve page, then check again.";
+
 // One self-reported snapshot sent on every heartbeat/queue poll -- replaces
 // the old live GET /health + GET /llama-cpp + GET /hardware fan-out
 // (MULTIUSER_PLAN.md §1.5). n_layer/mtp_layers are deliberately NOT read per
@@ -948,8 +979,12 @@ function toInstalledBuildList(): InstalledBuild[] {
 // already running something, and avoids a second concurrent readGpuMemory
 // call alongside MemorySampler's own (see captureFreeMemoryBaseline).
 async function collectState(): Promise<WorkerStatePush> {
-  if (!busy) await refreshListedDevices();
-  const vram = busy
+  // A loaded model is treated like a running job here: its buffers would read as
+  // "used" for a fit banner, and the Windows GPU counter query disturbs inference
+  // timing, so these wait until it is gone. Telemetry reads memory while watched.
+  const quiet = busy || daemon.holdsGpu();
+  if (!quiet) await refreshListedDevices();
+  const vram = quiet
     ? undefined
     : await captureFreeMemoryBaseline(backend)
         .then((baseline): WorkerVramInfo => ({ ok: true, backend, ...baseline }))
@@ -962,7 +997,7 @@ async function collectState(): Promise<WorkerStatePush> {
   // SENSOR_PROBE_BACKOFF_MS so a source coming online is picked up without
   // operator intervention -- without paying for a fresh multi-source probe on
   // every heartbeat either.
-  if (!busy && !sensorAvailability && Date.now() - sensorProbedAtMs >= SENSOR_PROBE_BACKOFF_MS) {
+  if (!quiet && !sensorAvailability && Date.now() - sensorProbedAtMs >= SENSOR_PROBE_BACKOFF_MS) {
     sensorProbedAtMs = Date.now();
     const probed = await detectSensorAvailability(backend).catch(() => null);
     if (probed && (probed.clock || probed.temp)) {
@@ -3230,6 +3265,10 @@ async function executeFitCheckJob(payload: FitCheckJobPayload): Promise<void> {
     for (const m of payload.models) await post({ ...base, model_id: m.id, source: null, vram_free_mib: null, point: null, error });
     return;
   }
+  if (daemon.holdsGpu()) {
+    for (const m of payload.models) await post({ ...base, model_id: m.id, source: null, vram_free_mib: null, point: null, error: DAEMON_FIT_REFUSAL });
+    return;
+  }
   stopRequested = false;
   const deviceArgs = payload.main_gpu != null ? ["-sm", "none", "-mg", String(payload.main_gpu)] : [];
   const loadArgs = await modelLoadArgs(fitPath);
@@ -3318,6 +3357,11 @@ async function executeModelFitJob(payload: FitCheckJobPayload, targetKeys: strin
     const error = `llama.cpp build ${payload.llama_cpp_build} has no llama-fit-params with --fit-target on this machine`;
     const memory = { devices: [], ...(await ram()), unified };
     for (const key of targetKeys) await post({ ...base, target_key: key, source: null, memory, point: null, error });
+    return;
+  }
+  if (daemon.holdsGpu()) {
+    const memory = { devices: [], ...(await ram()), unified };
+    for (const key of targetKeys) await post({ ...base, target_key: key, source: null, memory, point: null, error: DAEMON_FIT_REFUSAL });
     return;
   }
   stopRequested = false;
@@ -3638,6 +3682,9 @@ async function executeDeleteBuildJob(payload: DeleteBuildJobPayload): Promise<vo
   validateTag(payload.tag);
   if (activeBuild?.tag === payload.tag) {
     throw new Error("cannot delete the active build -- activate a different one first");
+  }
+  if (daemon.isServing(null, getInstalledBuild(buildsDir, payload.tag)?.server_path ?? null)) {
+    throw new Error("the served model is running on this build -- unload it on the Serve page first");
   }
   deleteBuild(buildsDir, payload.tag);
   log.info(`deleted llama.cpp build ${payload.tag}`);
@@ -5033,6 +5080,9 @@ async function executeShutdownWorkerJob(): Promise<void> {
 async function executeDeleteModelFileJob(payload: { filename: string }): Promise<void> {
   validateHfFile(payload.filename);
   const target = resolveDownloadTarget(payload.filename);
+  if (daemon.isServing(target, null)) {
+    throw new Error("this file is being served -- unload it on the Serve page first");
+  }
   if (!existsSync(target)) {
     // Already absent -- the desired end state already holds, so this is
     // treated as a harmless success (idempotent) rather than a failure.
@@ -5106,6 +5156,54 @@ async function executeJob(job: SerialQueueJob): Promise<void> {
       return executeMeasureMemorySpeedJob();
     case "fit_check":
       return executeFitCheckJob(job.payload);
+    case "daemon_load":
+      return executeDaemonLoadJob(job.payload);
+    case "daemon_unload":
+      return daemon.unload();
+  }
+}
+
+// Does this job measure the machine or fill its GPU? A loaded model next to it
+// would make a benchmark silently wrong, so these unload it first. A Record over
+// the union, so a new job type cannot be added without answering the question.
+const JOB_NEEDS_GPU_TO_ITSELF: Record<SerialQueueJob["type"], boolean> = {
+  benchmark: true,
+  run_probe: true,
+  measure_quality: true,
+  fit_map: true,
+  measure_memory_speed: true,
+  // Answers with a clear error while a model is loaded (DAEMON_FIT_REFUSAL) rather
+  // than unloading someone's model to answer a question about another.
+  fit_check: false,
+  install_build: false,
+  activate_build: false,
+  delete_build: false,
+  delete_model_file: false,
+  refresh_models: false,
+  shutdown_worker: false,
+  // Stops whatever is loaded by itself.
+  daemon_load: false,
+  daemon_unload: false,
+};
+
+async function executeDaemonLoadJob(payload: DaemonLoadJobPayload): Promise<void> {
+  if (Date.now() - payload.requested_at > MAX_LOAD_JOB_AGE_MS) {
+    throw new Error("this load was requested too long ago, so it was skipped");
+  }
+  await daemon.applyConfig(payload.config, { onlyIfNewer: true });
+  updateJobReport({ phase: "loading", detail: `Loading ${payload.spec.model_name}` });
+  try {
+    await daemon.load(payload.spec, {
+      onSpawn: (proc) => (activeBenchProc = proc),
+      isCancelled: () => stopRequested,
+    });
+  } catch (err) {
+    if (err instanceof DaemonLoadCancelled) throw new Error("load cancelled");
+    throw err;
+  } finally {
+    // The process now belongs to the daemon: a later Stop on some other job must
+    // not reach it through this variable.
+    activeBenchProc = null;
   }
 }
 
@@ -5518,6 +5616,57 @@ async function runDownloadJob(job: { job_id: string; payload: DownloadModelJobPa
   }
 }
 
+// The Serve page's live view and usage rows. Its own call rather than more on the
+// heartbeat, which carries the model file list and leases: speeding that up for a
+// page someone happens to have open would load the server for nothing. Memory is
+// read only while watched, because a GPU read disturbs inference timing, and never
+// during a job, whose own sampler owns those readings.
+let daemonWatched = false;
+let wakeDaemonTelemetry: (() => void) | null = null;
+const DAEMON_TICK_WATCHED_MS = 3_000;
+const DAEMON_TICK_LOADED_MS = 5_000;
+const DAEMON_TICK_IDLE_MS = 15_000;
+const DAEMON_TICK_NO_SERVER_ROUTE_MS = 60_000;
+
+async function daemonTelemetryLoop(): Promise<void> {
+  while (true) {
+    let wait = daemonWatched ? DAEMON_TICK_WATCHED_MS : daemon.holdsGpu() ? DAEMON_TICK_LOADED_MS : DAEMON_TICK_IDLE_MS;
+    try {
+      const status = await daemon.status(daemonWatched && !busy);
+      const usage = daemonStore.usageBatch();
+      const res = await withAuth((token) =>
+        postDaemonTelemetry(config.url, token, {
+          machine_id: config.machine_id!,
+          hostname: osHostname(),
+          config_version: daemonStore.config?.version ?? 0,
+          config_model_id: daemonStore.config?.sampling_model_id ?? null,
+          status,
+          usage,
+        })
+      );
+      daemonStore.ackUsage(res.acked);
+      daemonStore.flushIfDirty();
+      daemonWatched = res.watched;
+      daemon.setWatched(res.watched);
+      if (res.config) await daemon.applyConfig(res.config);
+    } catch (err) {
+      // An older server has no such route. Nothing here affects inference, which
+      // keeps running through any outage.
+      if (err instanceof HttpError && err.status === 404) wait = DAEMON_TICK_NO_SERVER_ROUTE_MS;
+      log.debug(`daemon telemetry failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+      daemonStore.flushIfDirty();
+    }
+    await new Promise<void>((done) => {
+      const timer = setTimeout(done, wait);
+      wakeDaemonTelemetry = () => {
+        clearTimeout(timer);
+        done();
+      };
+    });
+    wakeDaemonTelemetry = null;
+  }
+}
+
 // The main loop: pull one job at a time, execute it to completion, report
 // the outcome, repeat forever -- EXCEPT download_model jobs, which are
 // dispatched into a bounded concurrent pool (activeDownloadJobs,
@@ -5538,13 +5687,19 @@ async function workerMain(): Promise<void> {
         // Every download slot is full -- wait for one to free rather than
         // claim a job (of any type) we can't act on yet, which would
         // otherwise just sit 'claimed' un-executed until its lease expires.
+        void daemon.restoreIfPending();
         await Promise.race(activeDownloadJobs.values());
         continue;
       }
 
       const state = await collectState();
       const job = await withAuth((token) => pollQueue(config.url, token, state, QUEUE_POLL_TIMEOUT_MS));
-      if (!job) continue;
+      if (!job) {
+        // The queue ran dry. Restoring only now means a batch of tests does not
+        // reload the served model between each one.
+        void daemon.restoreIfPending();
+        continue;
+      }
 
       if (job.type === "download_model") {
         const p = runDownloadJob(job).finally(() => activeDownloadJobs.delete(job.job_id));
@@ -5565,6 +5720,7 @@ async function workerMain(): Promise<void> {
       try {
         let outcome: { ok: true } | { ok: false; error: string };
         try {
+          if (JOB_NEEDS_GPU_TO_ITSELF[job.type]) await daemon.suspendForJob(job.type);
           await executeJob(job);
           log.info(`job ${job.job_id} (${job.type}) completed`);
           outcome = { ok: true };
@@ -5590,6 +5746,9 @@ async function workerMain(): Promise<void> {
       }
     } catch (err) {
       log.error(`worker loop error: ${err instanceof Error ? err.message : String(err)}`);
+      // With the server unreachable no job can be claimed, so nothing is ahead of a
+      // model waiting to come back, and agents depend on this machine alone.
+      void daemon.restoreIfPending();
       await sleep(10_000);
     }
   }
@@ -5685,7 +5844,9 @@ try {
   log.warn(`could not check for leftover llama.cpp processes: ${err instanceof Error ? err.message : String(err)}`);
 }
 
+await daemon.start().catch((err) => log.warn(`daemon start failed: ${err instanceof Error ? err.message : String(err)}`));
 startHeartbeatLoop();
+void daemonTelemetryLoop();
 void workerMain();
 
 // Ctrl+C / SIGTERM: take the llama.cpp children down too rather than leaving
@@ -5697,6 +5858,7 @@ async function shutdown(signal: string): Promise<void> {
   shuttingDown = true;
   log.info(`received ${signal}, shutting down...`);
   activeBenchProc?.kill("SIGKILL");
+  await Promise.race([daemon.shutdown().catch(() => undefined), sleep(3_000)]);
   await Promise.race([killProcessesUnder(buildsDir).catch(() => []), sleep(5_000)]);
   process.exit(0);
 }
