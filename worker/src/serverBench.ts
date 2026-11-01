@@ -35,6 +35,9 @@ import {
 // results-reporting logic unchanged regardless of which path ran.
 
 export interface ServerBenchRunInput {
+  // Timed work is over and the process is still up: the caller's last chance to
+  // read its memory.
+  beforeStop?: () => Promise<void>;
   modelPath: string;
   // --model-draft target, only for a Gemma-4-style base model whose MTP head
   // ships as a separate companion file -- omitted for Qwen-style models
@@ -936,6 +939,7 @@ export async function runServerBench(input: ServerBenchRunInput): Promise<BenchR
     // Queried before stopServer below tears the process down -- /metrics is
     // only reachable while llama-server is still up.
     const specDecode = await checkSpecDecodeMetrics(input.port, label, input.repeats, log);
+    await input.beforeStop?.();
 
     const commonFields = {
       // Measured through llama-server, so it carries the server vintage rather

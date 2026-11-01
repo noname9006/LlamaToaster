@@ -15,6 +15,7 @@ import { exchangeRoutes } from "./routes/exchange.js";
 import { modelsRoutes } from "./routes/models.js";
 import { resultsRoutes } from "./routes/results.js";
 import { workersRoutes } from "./routes/workers.js";
+import { daemonRoutes } from "./routes/daemon.js";
 import { aiRoutes } from "./routes/ai.js";
 import { queueRoutes } from "./routes/queue.js";
 import { authRoutes } from "./routes/auth.js";
@@ -141,6 +142,8 @@ app.register(exchangeRoutes);
 app.register(modelsRoutes);
 app.register(resultsRoutes);
 app.register(workersRoutes);
+// The Serve page: load a model on a machine, usage from the agents using it.
+app.register(daemonRoutes);
 app.register(aiRoutes);
 app.register(queueRoutes);
 app.register(statsRoutes);

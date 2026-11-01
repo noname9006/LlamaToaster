@@ -180,6 +180,9 @@ export const WORKER_CAPABILITIES = [
   // docs/plans/MODEL_FIT_CHECK_PLAN.md: "Will it fit?" on the Models page --
   // fit_check jobs with target_keys, answered through /api/worker/model-fit.
   "fit-check-v2",
+  // docs/plans/MODEL_DAEMON_PLAN.md: the Serve page -- daemon_load/daemon_unload
+  // jobs, the OpenAI-compatible gateway, POST /api/worker/daemon/telemetry.
+  "daemon-v1",
 ] as const;
 export type WorkerCapability = (typeof WORKER_CAPABILITIES)[number];
 
@@ -2301,7 +2304,11 @@ export type QueueJob =
   // shared/types.ts's MemorySpeedResult) rather than riding this job's
   // completion report, so it's cached on the workers row like `vram` instead
   // of living only in transient job-progress state.
-  | { job_id: string; type: "measure_memory_speed"; payload: Record<string, never> };
+  | { job_id: string; type: "measure_memory_speed"; payload: Record<string, never> }
+  // The Serve page. Serial like a test, so they order correctly against tests; a
+  // load job ends when the model is ready and the process outlives the job.
+  | { job_id: string; type: "daemon_load"; payload: import("./daemonTypes.js").DaemonLoadJobPayload }
+  | { job_id: string; type: "daemon_unload"; payload: Record<string, never> };
 
 // --- Multi-user Stage 2: auth (MULTIUSER_PLAN.md §2) ---
 

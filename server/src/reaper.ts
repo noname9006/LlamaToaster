@@ -1,4 +1,5 @@
 import { repo } from "./db/repo.js";
+import { daemonRepo } from "./db/daemonRepo.js";
 import { queueEvents } from "./queue-events.js";
 import { OFFLINE_AFTER_MS } from "./liveness.js";
 
@@ -212,6 +213,7 @@ export function runMaintenanceSweep(log: ReaperLogger): void {
     0
   );
   step("prune catalog row budget", () => repo.pruneOldCatalogRowBudget(), undefined);
+  step("prune Serve usage", () => daemonRepo.pruneUsage(), 0);
   if (prunedSessions || prunedJobs || prunedEnrolments || prunedGpuClockSamples) {
     log.warn(
       { prunedSessions, prunedJobs, prunedEnrolments, prunedGpuClockSamples },

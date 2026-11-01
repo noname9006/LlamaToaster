@@ -19,6 +19,7 @@ export const NAV_ITEMS: NavItem[] = [
   { to: "/tests", label: "Tests", icon: "list" },
   { to: "/compare", label: "Compare", icon: "bars" },
   { to: "/models", label: "Models", icon: "box" },
+  { to: "/serve", label: "Serve", icon: "play" },
   { to: "/workers", label: "Machines", icon: "server", also: ["/device"] },
 ];
 

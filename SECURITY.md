@@ -38,6 +38,10 @@ In scope — bugs in code that ships in this repo (`server/`, `worker/`,
   crafted API response, or a malicious job payload cause the worker to
   execute unintended code or write outside its working directories —
   beyond the inherent risk of running `llama-bench`/`llama-server` itself.
+- **The Serve endpoint** (`worker/src/daemon/`): anything that bypasses its API keys,
+  reaches llama-server's own routes through it, lets another website use a local
+  endpoint from a browser, turns a Serve setting into an arbitrary llama-server flag,
+  or sends prompt or completion text off the machine.
 - **Server API**: injection (SQL, command), path traversal, SSRF, auth
   bypass, or anything that lets an unauthenticated caller reach
   unauthenticated-shouldn't-be-reachable data.

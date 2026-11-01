@@ -948,6 +948,41 @@ export const repo = {
     });
   },
 
+  // The same rule as listModelsVisibleTo, for one id. Every route that takes a
+  // model id from a caller checks this first and answers exactly as it would
+  // for an unknown id, so a catalog row can't be used or probed by someone it
+  // doesn't belong to (audit 2026-10-18 A11).
+  isModelVisibleTo(userId: string | undefined, id: string): boolean {
+    if (userId === undefined) return true;
+    return !!getDb()
+      .prepare(
+        `SELECT 1 FROM models m
+         WHERE m.id = ? AND (
+              m.created_by = ?
+           OR EXISTS (SELECT 1 FROM model_registrations g WHERE g.model_id = m.id AND g.user_id = ?)
+           OR EXISTS (SELECT 1 FROM results r WHERE r.model_id = m.id AND r.user_id = ?)
+           OR m.id IN (
+             SELECT json_extract(f.value, '$.sha256')
+             FROM workers w, json_each(COALESCE(w.model_files_json, '[]')) f
+             WHERE w.user_id = ?
+           )
+         )`
+      )
+      .get(id, userId, userId, userId, userId);
+  },
+
+  // One row as listModelsVisibleTo would return it: the caller's own reading on
+  // top of the shared record, or undefined if they can't see it.
+  getModelVisibleTo(userId: string | undefined, id: string): Model | undefined {
+    if (!this.isModelVisibleTo(userId, id)) return undefined;
+    const model = this.getModel(id);
+    if (!model || userId === undefined) return model;
+    const own = getDb()
+      .prepare(`SELECT fields_json FROM model_header_reports WHERE model_id = ? AND scope = ?`)
+      .get(id, userId) as { fields_json: string } | undefined;
+    return own ? { ...model, metadata: { ...model.metadata, ...safeParseJson<Partial<ModelMetadata>>(own.fields_json, {}) } } : model;
+  },
+
   // A model as one specific machine should see it: the shared catalog row
   // with that machine's own reading of its own copy of the file (last
   // heartbeat's model_files_json entry for this hash) on top. Anything the
@@ -1618,6 +1653,30 @@ export const repo = {
       );
       bump.run(scope, hour);
       bump.run("global", hour);
+      return true;
+    })();
+  },
+
+  // Spends `bytes` of `scope`'s current hour on the same table, under its own
+  // key space -- false, spending nothing, when that would pass `limit`. See
+  // server/src/ingest-budget.ts. A single request larger than the limit is
+  // still refused, which no real report is.
+  takeIngestBudget(scope: string, bytes: number, limit: number): boolean {
+    const database = getDb();
+    const key = `ingest:${scope}`;
+    const hour = Math.floor(Date.now() / 3600_000);
+    return database.transaction(() => {
+      const used =
+        (database.prepare(`SELECT count FROM catalog_row_budget WHERE scope = ? AND hour = ?`).get(key, hour) as
+          | { count: number }
+          | undefined)?.count ?? 0;
+      if (used + bytes > limit) return false;
+      database
+        .prepare(
+          `INSERT INTO catalog_row_budget (scope, hour, count) VALUES (?, ?, ?)
+           ON CONFLICT (scope, hour) DO UPDATE SET count = count + excluded.count`
+        )
+        .run(key, hour, bytes);
       return true;
     })();
   },

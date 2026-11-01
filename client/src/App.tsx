@@ -13,6 +13,7 @@ import { Tests } from "./pages/Tests";
 import { TestDetail } from "./pages/TestDetail";
 import { Compare } from "./pages/Compare";
 import { Workers } from "./pages/Workers";
+import { Serve } from "./pages/Serve";
 import { Login } from "./pages/Login";
 import { Settings } from "./pages/Settings";
 import { Device } from "./pages/Device";
@@ -181,6 +182,7 @@ function Shell({ authStatus }: { authStatus: AuthStatus }) {
             <Route path="/tests" element={<Tests />} />
             <Route path="/tests/:id" element={<TestDetail />} />
             <Route path="/compare" element={<Compare />} />
+            <Route path="/serve" element={<Serve />} />
             <Route path="/workers" element={<Workers />} />
             <Route path="/device" element={<Device />} />
             <Route path="/settings" element={<Settings />} />
