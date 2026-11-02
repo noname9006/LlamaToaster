@@ -45,9 +45,8 @@ export interface GpuMemoryReading {
   used: GpuMemoryValue;
   // Whole-adapter SYSTEM-RAM-backed GPU memory -- every process's WDDM
   // "Shared Usage" on this card combined; the shared-memory counterpart of
-  // `used`. Only read on Windows CUDA today, and only alongside a pid (the
-  // sampler's ticks, not the pid-less pre-spawn baseline). Absent, not 0,
-  // wherever it was not read.
+  // `used`. Read on Windows (CUDA only alongside a pid) and on Linux amdgpu.
+  // Absent, not 0, wherever it was not read.
   usedShared?: GpuMemoryValue;
   // This worker's own benchmark child process's usage -- only present on
   // backends/platforms with a per-process reading (nvidia-smi compute-apps,
@@ -218,8 +217,11 @@ async function readWindowsTotalMib(): Promise<number | null> {
 }
 
 function parseMiB(raw: string | undefined): number | null {
-  const bytes = Number(raw?.trim());
-  return Number.isFinite(bytes) && bytes > 0 ? Math.round(bytes / BYTES_PER_MIB) : null;
+  // A present 0 is a reading; only an absent instance (an empty value) is null.
+  const trimmed = raw?.trim();
+  if (!trimmed) return null;
+  const bytes = Number(trimmed);
+  return Number.isFinite(bytes) && bytes >= 0 ? Math.round(bytes / BYTES_PER_MIB) : null;
 }
 
 // Each value is written as `<label>=<bytes>` and read back by label, never by

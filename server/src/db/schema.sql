@@ -134,7 +134,9 @@ CREATE TABLE IF NOT EXISTS results (
   gpu_memory_process_peak_source TEXT,
   ram_total_used_avg_mib INTEGER,
   ram_total_used_peak_mib INTEGER,
-  gpu_memory_shared_peak_mib INTEGER,  -- process's system-RAM-backed GPU memory peak (spill)
+  gpu_memory_shared_peak_mib INTEGER,  -- process's system-RAM-backed GPU memory peak, *_Host buffers included
+  gpu_memory_host_pinned_mib REAL,     -- llama.cpp's *_Host buffers; shared minus these is spill
+  gpu_memory_cpu_mapped_mib REAL,      -- llama.cpp's CPU_Mapped model buffers, invisible to shared
   -- Read from llama.cpp's own runtime output, never inferred -- see
   -- worker/src/index.ts's parseOffloadLayers. n_gpu_layers above is already
   -- the *requested* value; these are what actually happened. Always the

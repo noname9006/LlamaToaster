@@ -27,7 +27,7 @@ function row(overrides: Partial<ProbeAttemptDto>): ProbeAttemptDto {
     host_backed_method: null, host_backed_slope: null, kv_host_backed_frac: null,
     gpu_buffers_mib: null, gpu_in_system_ram_mib: null, gpu_spill_jitter_mib: null, host_backed_fail: null, list_devices_free_mib: null, claim_fits_free: null,
     load_kind: null, spill_ready_mib: null, spill_ready_jitter_mib: null, spill_work_mib: null, spill_work_jitter_mib: null,
-    spill_method: null, spill_shared_growth_mib: null, spill_unlanded_growth_mib: null,
+    spill_method: null, spill_shared_growth_mib: null, spill_unlanded_growth_mib: null, gpu_host_pinned_mib: null, gpu_cpu_mapped_mib: null,
     ladder_ngl_max: null, ladder_max_ctx: null,
     error: null, created_at: 0, reused_from_run_id: null, vram_discrepancy: 0,
     gpu_layers_resident_est: null, gpu_layers_resident_exact: null,

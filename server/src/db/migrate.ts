@@ -191,6 +191,8 @@ const COLUMN_MIGRATIONS: ColumnSpec[] = [
   // WDDM "Shared Usage", Linux amdgpu GTT) -- the optimization flow's "ran,
   // but X GB lived in system RAM" reading.
   { table: "results", column: "gpu_memory_shared_peak_mib", ddlType: "INTEGER" },
+  { table: "results", column: "gpu_memory_host_pinned_mib", ddlType: "REAL" },
+  { table: "results", column: "gpu_memory_cpu_mapped_mib", ddlType: "REAL" },
   { table: "results", column: "gpu_layers_loaded", ddlType: "INTEGER" },
   { table: "results", column: "total_model_layers", ddlType: "INTEGER" },
   // The MTP/draft companion model's own actual offload -- see
@@ -461,6 +463,8 @@ const COLUMN_MIGRATIONS: ColumnSpec[] = [
   { table: "probe_attempts", column: "spill_method", ddlType: "TEXT" },
   { table: "probe_attempts", column: "spill_shared_growth_mib", ddlType: "REAL" },
   { table: "probe_attempts", column: "spill_unlanded_growth_mib", ddlType: "REAL" },
+  { table: "probe_attempts", column: "gpu_host_pinned_mib", ddlType: "REAL" },
+  { table: "probe_attempts", column: "gpu_cpu_mapped_mib", ddlType: "REAL" },
   // Cached worker.memSpeed -- see shared/types.ts's MemorySpeedResult doc
   // comment. Set once by POST /api/worker/mem-speed after a "Measure memory
   // speed" job completes; NULL until that button has been clicked at least

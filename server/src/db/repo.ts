@@ -230,6 +230,8 @@ interface ResultRowRaw {
   ram_total_used_avg_mib: number | null;
   ram_total_used_peak_mib: number | null;
   gpu_memory_shared_peak_mib: number | null;
+  gpu_memory_host_pinned_mib: number | null;
+  gpu_memory_cpu_mapped_mib: number | null;
   gpu_layers_loaded: number | null;
   total_model_layers: number | null;
   gpu_layers_loaded_draft: number | null;
@@ -817,6 +819,8 @@ function mapResult(row: ResultRowRaw): ResultRow {
     ram_total_used_avg_mib: row.ram_total_used_avg_mib ?? undefined,
     ram_total_used_peak_mib: row.ram_total_used_peak_mib ?? undefined,
     gpu_memory_shared_peak_mib: row.gpu_memory_shared_peak_mib ?? undefined,
+    gpu_memory_host_pinned_mib: row.gpu_memory_host_pinned_mib ?? undefined,
+    gpu_memory_cpu_mapped_mib: row.gpu_memory_cpu_mapped_mib ?? undefined,
     gpu_layers_loaded: row.gpu_layers_loaded,
     total_model_layers: row.total_model_layers,
     gpu_layers_loaded_draft: row.gpu_layers_loaded_draft ?? undefined,
@@ -1981,6 +1985,7 @@ export const repo = {
               gpu_memory_process_avg_accuracy, gpu_memory_process_avg_source,
               gpu_memory_process_peak_accuracy, gpu_memory_process_peak_source,
               ram_total_used_avg_mib, ram_total_used_peak_mib, gpu_memory_shared_peak_mib,
+              gpu_memory_host_pinned_mib, gpu_memory_cpu_mapped_mib,
               gpu_layers_loaded, total_model_layers, gpu_layers_loaded_draft, total_model_layers_draft,
               gpu_layers_resident_est, gpu_layers_resident_est_draft,
               sample_count, suspect_count, suspect_samples, repeat_samples, spec_drafted, spec_accepted,
@@ -1988,7 +1993,7 @@ export const repo = {
               concurrency, gpu_temp_c_max, gpu_clock_mhz_min, gpu_clock_samples,
               cpu_isa, ttft_ms_p50, ttft_ms_p95, ttft_n, e2e_ms_mean,
               worker_id, llama_cpp_build, engine, raw_json_path, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         );
         // An explicit check on the unique key rather than INSERT OR IGNORE,
         // which would also swallow NOT NULL/CHECK failures on a bad row.
@@ -2062,6 +2067,8 @@ export const repo = {
             row.ram_total_used_avg_mib,
             row.ram_total_used_peak_mib,
             row.gpu_memory_shared_peak_mib ?? null,
+            row.gpu_memory_host_pinned_mib ?? null,
+            row.gpu_memory_cpu_mapped_mib ?? null,
             row.gpu_layers_loaded,
             row.total_model_layers,
             row.gpu_layers_loaded_draft ?? null,
@@ -4289,8 +4296,8 @@ export const repo = {
               vram_shared_total_peak_mib, vram_claimed_peak_mib, gpu_buffers_mib, gpu_in_system_ram_mib,
               gpu_spill_jitter_mib, host_backed_fail, list_devices_free_mib, load_kind, spill_ready_mib,
               spill_ready_jitter_mib, spill_work_mib, spill_work_jitter_mib, ladder_ngl_max, ladder_max_ctx, claim_fits_free,
-              spill_method, spill_shared_growth_mib, spill_unlanded_growth_mib)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+              spill_method, spill_shared_growth_mib, spill_unlanded_growth_mib, gpu_host_pinned_mib, gpu_cpu_mapped_mib)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         );
         input.attempts.forEach((a, seq) => {
           insert.run(
@@ -4343,7 +4350,9 @@ export const repo = {
             a.claim_fits_free == null ? null : a.claim_fits_free ? 1 : 0,
             a.spill_method ?? null,
             a.spill_shared_growth_mib ?? null,
-            a.spill_unlanded_growth_mib ?? null
+            a.spill_unlanded_growth_mib ?? null,
+            a.gpu_host_pinned_mib ?? null,
+            a.gpu_cpu_mapped_mib ?? null
           );
         });
       });
@@ -4385,8 +4394,8 @@ export const repo = {
               vram_shared_total_peak_mib, vram_claimed_peak_mib, gpu_buffers_mib, gpu_in_system_ram_mib,
               gpu_spill_jitter_mib, host_backed_fail, list_devices_free_mib, load_kind, spill_ready_mib,
               spill_ready_jitter_mib, spill_work_mib, spill_work_jitter_mib, ladder_ngl_max, ladder_max_ctx, claim_fits_free,
-              spill_method, spill_shared_growth_mib, spill_unlanded_growth_mib)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              spill_method, spill_shared_growth_mib, spill_unlanded_growth_mib, gpu_host_pinned_mib, gpu_cpu_mapped_mib)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(run_id, seq) DO UPDATE SET
              candidate_ctx = excluded.candidate_ctx,
              ngl = excluded.ngl,
@@ -4432,7 +4441,9 @@ export const repo = {
              claim_fits_free = excluded.claim_fits_free,
              spill_method = excluded.spill_method,
              spill_shared_growth_mib = excluded.spill_shared_growth_mib,
-             spill_unlanded_growth_mib = excluded.spill_unlanded_growth_mib`
+             spill_unlanded_growth_mib = excluded.spill_unlanded_growth_mib,
+             gpu_host_pinned_mib = excluded.gpu_host_pinned_mib,
+             gpu_cpu_mapped_mib = excluded.gpu_cpu_mapped_mib`
         )
         .run(
           uuid(),
@@ -4484,7 +4495,9 @@ export const repo = {
           a.claim_fits_free == null ? null : a.claim_fits_free ? 1 : 0,
             a.spill_method ?? null,
             a.spill_shared_growth_mib ?? null,
-            a.spill_unlanded_growth_mib ?? null
+            a.spill_unlanded_growth_mib ?? null,
+            a.gpu_host_pinned_mib ?? null,
+            a.gpu_cpu_mapped_mib ?? null
         );
     },
   },
@@ -4727,6 +4740,8 @@ export interface ProbeAttemptRow {
   spill_method: string | null;
   spill_shared_growth_mib: number | null;
   spill_unlanded_growth_mib: number | null;
+  gpu_host_pinned_mib: number | null;
+  gpu_cpu_mapped_mib: number | null;
 }
 
 // N4 storage shapes.
@@ -4832,6 +4847,8 @@ function buildResultRow(
     ram_total_used_avg_mib: r.ram_total_used_avg_mib ?? null,
     ram_total_used_peak_mib: r.ram_total_used_peak_mib ?? null,
     gpu_memory_shared_peak_mib: r.gpu_memory_shared_peak_mib ?? null,
+    gpu_memory_host_pinned_mib: r.gpu_memory_host_pinned_mib ?? null,
+    gpu_memory_cpu_mapped_mib: r.gpu_memory_cpu_mapped_mib ?? null,
     gpu_layers_loaded: r.gpu_layers_loaded,
     total_model_layers: r.total_model_layers,
     gpu_layers_loaded_draft: r.gpu_layers_loaded_draft ?? null,

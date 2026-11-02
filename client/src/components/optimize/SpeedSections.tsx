@@ -2,7 +2,7 @@ import { useState } from "react";
 import { Btn, CopyCommand, Kicker, Notice, Panel, ProgressBar, StatCard, StepTitle, fmtDuration, fmtGb, fmtTps } from "./ui";
 import { LtIcon } from "../ltIcons";
 import type { FlowContext } from "./flowContext";
-import { isFailed, speedRunView, spilledMib, templateSweep, type SpeedRunView } from "./flowData";
+import { cpuSideMib, isFailed, speedRunView, spilledMib, templateSweep, type SpeedRunView } from "./flowData";
 import { isActive, type FlowRun } from "./useOptimizeFlow";
 import { ctxLabel } from "../../../../shared/optimizeFlow.js";
 import {
@@ -83,6 +83,7 @@ export function SpeedTable({ view, baseline }: { view: SpeedRunView; baseline: S
                     -ngl {candidate.ngl} · {candidate.ctk}/{candidate.ctv} · FA {candidate.fa}
                     {candidate.ot ? " · experts on CPU" : ""}
                     {candidate.threads ? ` · -t ${candidate.threads.t} -tb ${candidate.threads.tb}` : ""}
+                    {cpuSideMib(outcome) ? ` · ${fmtGb(cpuSideMib(outcome))} on CPU side` : ""}
                   </div>
                   {failed && outcome.error && <div className="mt-1 font-sans text-danger">{outcome.error}</div>}
                 </td>

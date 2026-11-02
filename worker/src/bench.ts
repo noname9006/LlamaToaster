@@ -545,12 +545,15 @@ const GPU_BUFFER_SIZE_LINE_RE = /^.*?:\s*(\S+)\s+(model|KV|RS|compute|output)\s+
 
 export function parseGpuBufferReport(
   stderr: string
-): { deviceMib: number; contextMib: number; byDeviceMib: Record<string, number>; hostPinnedMib: number } | null {
+): { deviceMib: number; contextMib: number; byDeviceMib: Record<string, number>; hostPinnedMib: number; cpuMappedMib: number } | null {
   let seen = false;
   const byDeviceMib: Record<string, number> = {};
   // Host RAM the GPU driver pins: with mmap off, CPU-resident weights land in
   // <backend>_Host, which WDDM counts as this process's shared GPU memory.
   let hostPinnedMib = 0;
+  // With mmap on, the same weights land in CPU_Mapped instead: an ordinary file
+  // mapping, which shared GPU memory never counts.
+  let cpuMappedMib = 0;
   const latest = new Map<string, { device: string; kind: string; mib: number }>();
   let caches = new Map<string, { device: string; kind: string; mib: number }>();
   let inCacheRun = false;
@@ -563,6 +566,7 @@ export function parseGpuBufferReport(
     inCacheRun = isCache;
     const mib = Number(m[3]);
     const pinned = PINNED_HOST_BUFFER_NAME_RE.test(m[1]);
+    if (Number.isFinite(mib) && m[2] === "model" && HOST_BUFFER_NAME_RE.test(m[1]) && !pinned) cpuMappedMib += mib;
     if (!Number.isFinite(mib) || (HOST_BUFFER_NAME_RE.test(m[1]) && !pinned)) continue;
     const key = `${m[1]}:${m[2]}`;
     if (m[2] === "model") {
@@ -583,7 +587,7 @@ export function parseGpuBufferReport(
     if (kind === "KV" || kind === "compute") contextMib += mib;
   }
   const deviceMib = Object.values(byDeviceMib).reduce((sum, mib) => sum + mib, 0);
-  return { deviceMib, contextMib, byDeviceMib, hostPinnedMib };
+  return { deviceMib, contextMib, byDeviceMib, hostPinnedMib, cpuMappedMib };
 }
 
 // ---------------------------------------------------------------------------

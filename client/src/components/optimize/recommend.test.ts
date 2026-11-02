@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { recommend } from "./SpeedSections";
-import type { SpeedRunView } from "./flowData";
+import { spilledMib, type SpeedRunView } from "./flowData";
 import { baselineCandidate, type SpeedCandidate } from "../../../../shared/speedRun.js";
 
 const cand: SpeedCandidate = { label: "Most layers", source: "fit", ngl: 17, ot: null, ctk: "q8_0", ctv: "q8_0", fa: "on", threads: null };
@@ -24,6 +24,19 @@ function view(base: [number, number, number], other: [number, number, number], s
     ],
   };
 }
+
+describe("spilledMib", () => {
+  const outcome = (sharedPeakMib: number, hostPinnedMib: number | null) =>
+    ({ idx: 0, status: "done" as const, error: null, pp: null, tg: null, sharedPeakMib, hostPinnedMib, vramPeakMib: 3000, ramPeakMib: 2000 });
+
+  it("does not count llama.cpp's own host buffers as spill", () => {
+    expect(spilledMib(outcome(1929, 1928))).toBeNull();
+  });
+
+  it("reports what is left after the host buffers", () => {
+    expect(spilledMib(outcome(17607, 349))).toBe(17258);
+  });
+});
 
 describe("recommend", () => {
   it("a clear winner replaces the default", () => {

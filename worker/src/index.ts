@@ -1669,6 +1669,7 @@ async function finalizeSweepItemResult(
           };
     }
   }
+  const gpuBuffers = parseGpuBufferReport(bench.stderr);
   if (bench.code === 0 && bench.results.length > 0) {
     // A single sweep item with both n_prompt and n_gen set (and no -pg)
     // produces two rows -- a pp-only row and a tg-only row -- both kept here
@@ -1728,6 +1729,8 @@ async function finalizeSweepItemResult(
       ram_total_used_avg_mib: stats.ram_total_avg_mib,
       ram_total_used_peak_mib: stats.ram_total_peak_mib,
       gpu_memory_shared_peak_mib: stats.vram_process_shared_peak_mib,
+      gpu_memory_host_pinned_mib: gpuBuffers?.hostPinnedMib ?? null,
+      gpu_memory_cpu_mapped_mib: gpuBuffers?.cpuMappedMib ?? null,
       gpu_layers_loaded: offload.main?.gpu_layers_loaded ?? null,
       total_model_layers: offload.main?.total_model_layers ?? null,
       gpu_layers_loaded_draft: offload.draft?.gpu_layers_loaded ?? null,
@@ -4281,6 +4284,8 @@ async function executeRunProbeJob(payload: TestProbeJobPayload): Promise<void> {
           ttftMs: dedupMatch.ttft_ms,
           prefillCliff: dedupMatch.prefill_cliff,
           gpuBuffersMib: dedupMatch.gpu_buffers_mib,
+          gpuHostPinnedMib: dedupMatch.gpu_host_pinned_mib,
+          gpuCpuMappedMib: dedupMatch.gpu_cpu_mapped_mib,
           gpuInSystemRamMib: dedupMatch.gpu_in_system_ram_mib,
           gpuSpillJitterMib: dedupMatch.gpu_spill_jitter_mib,
           hostBackedFailCause: dedupMatch.host_backed_fail,
@@ -4673,6 +4678,8 @@ async function runOneProbeLoad(input: ProbeLoadInput): Promise<ProbeAttemptOutco
         loadKind: fits ? "claim_only" : "claim_stop",
         claimFitsFree: fits,
         gpuBuffersMib: claimAtReady.deviceMib,
+        gpuHostPinnedMib: claimAtReady.hostPinnedMib,
+        gpuCpuMappedMib: claimAtReady.cpuMappedMib,
         error: fits
           ? undefined
           : `llama.cpp's GPU claim (${Object.entries(claimAtReady.byDeviceMib)
@@ -4818,6 +4825,8 @@ async function runOneProbeLoad(input: ProbeLoadInput): Promise<ProbeAttemptOutco
       // Kept whether or not the spill could be measured: it is also the claim
       // target 2 holds against --list-devices, which needs no VRAM counter.
       gpuBuffersMib: gpuBuffers?.deviceMib ?? null,
+      gpuHostPinnedMib: gpuBuffers?.hostPinnedMib ?? null,
+      gpuCpuMappedMib: gpuBuffers?.cpuMappedMib ?? null,
       gpuInSystemRamMib: verdict.gpuSpill.inSystemRamMib,
       gpuSpillJitterMib: verdict.gpuSpill.jitterMib,
       hostBackedFailCause: verdict.failCause,

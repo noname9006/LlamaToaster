@@ -352,6 +352,8 @@ function validateIngestResult(value: unknown): string | null {
     "ram_total_used_avg_mib",
     "ram_total_used_peak_mib",
     "gpu_memory_shared_peak_mib",
+    "gpu_memory_host_pinned_mib",
+    "gpu_memory_cpu_mapped_mib",
   ] as const) {
     if (
       row[field] !== undefined &&
