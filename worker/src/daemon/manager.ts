@@ -16,7 +16,8 @@ import type { Backend, Model } from "../../../shared/types.js";
 import { helpHasFlag } from "../binary-probe.js";
 import { DaemonGateway, type GatewayUpstream } from "./gateway.js";
 import { DaemonLog } from "./logParse.js";
-import { readDaemonMemory, type HardwareLike } from "./memory.js";
+import { spillBaselineKey } from "../../../shared/gpuSpill.js";
+import { pickGpu, readDaemonMemory, type HardwareLike } from "./memory.js";
 import { DaemonStore } from "./store.js";
 
 export const LOAD_TIMEOUT_MS = 15 * 60 * 1000;
@@ -564,11 +565,25 @@ export class DaemonManager {
   private refreshMemory(r: Running | null, report: ReturnType<DaemonLog["report"]> | null): void {
     if (this.memoryReading) return;
     const generation = this.memoryGeneration;
+    const hardware = this.host.hardware();
+    // What a probe measured for this file on this backend, GPU and build: without
+    // it a clean spill reading proves nothing (shared/gpuSpill.ts).
+    const spillBaseline = r
+      ? this.store.spillBaseline(
+          spillBaselineKey({
+            modelPath: r.files[0],
+            backend: this.host.backend,
+            gpuName: pickGpu(hardware, this.host.backend).name,
+            buildTag: r.buildTag,
+          })
+        )
+      : null;
     this.memoryReading = readDaemonMemory({
       backend: this.host.backend,
-      hardware: this.host.hardware(),
+      hardware,
       pid: r?.proc.pid ?? null,
       report,
+      spillBaseline,
       // Only a settled model: during a load or a wake its VRAM is still filling, and
       // the buffers it has reported would read as spilled.
       dedicatedReadings: r && this.phase === "ready" ? this.dedicatedReadings : undefined,

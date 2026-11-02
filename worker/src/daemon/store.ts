@@ -6,19 +6,24 @@
 import { readFileSync, renameSync, writeFileSync, chmodSync } from "node:fs";
 import type { DaemonConfig, DaemonLoadSpec } from "../../../shared/daemonTypes.js";
 import type { DaemonUsageRow } from "../../../shared/daemonUsage.js";
+import type { SpillBaseline } from "../../../shared/gpuSpill.js";
 
 export const MAX_SPOOLED_USAGE = 5000;
 export const MAX_USAGE_BATCH = 200;
+/** Baselines kept: one per file, backend, GPU and build a probe has measured. */
+export const MAX_SPILL_BASELINES = 200;
 
 interface StoreFile {
   config: DaemonConfig | null;
   last_spec: DaemonLoadSpec | null;
   usage: DaemonUsageRow[];
   usage_dropped: number;
+  /** What a probe measured, keyed by spillBaselineKey; the oldest go first. */
+  spill_baselines: Record<string, SpillBaseline & { at: number }>;
 }
 
 export class DaemonStore {
-  private data: StoreFile = { config: null, last_spec: null, usage: [], usage_dropped: 0 };
+  private data: StoreFile = { config: null, last_spec: null, usage: [], usage_dropped: 0, spill_baselines: {} };
   private dirty = false;
 
   constructor(private readonly path: string, private readonly warn: (msg: string) => void) {
@@ -29,6 +34,7 @@ export class DaemonStore {
         last_spec: parsed.last_spec ?? null,
         usage: Array.isArray(parsed.usage) ? parsed.usage.slice(-MAX_SPOOLED_USAGE) : [],
         usage_dropped: typeof parsed.usage_dropped === "number" ? parsed.usage_dropped : 0,
+        spill_baselines: parsed.spill_baselines && typeof parsed.spill_baselines === "object" ? parsed.spill_baselines : {},
       };
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "ENOENT") warn(`daemon state unreadable, starting fresh: ${(err as Error).message}`);
@@ -45,6 +51,21 @@ export class DaemonStore {
 
   get usageDropped(): number {
     return this.data.usage_dropped;
+  }
+
+  spillBaseline(key: string): SpillBaseline | null {
+    const b = this.data.spill_baselines[key];
+    return b && Number.isFinite(b.mib) && Number.isFinite(b.toleranceMib) ? { mib: b.mib, toleranceMib: b.toleranceMib } : null;
+  }
+
+  setSpillBaseline(key: string, baseline: SpillBaseline): void {
+    const all = this.data.spill_baselines;
+    // Re-inserted, so the key a probe just measured is the newest.
+    delete all[key];
+    all[key] = { mib: baseline.mib, toleranceMib: baseline.toleranceMib, at: Date.now() };
+    const keys = Object.keys(all);
+    for (const oldest of keys.slice(0, Math.max(0, keys.length - MAX_SPILL_BASELINES))) delete all[oldest];
+    this.flush();
   }
 
   setConfig(config: DaemonConfig): void {

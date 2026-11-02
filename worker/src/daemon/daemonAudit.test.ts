@@ -384,6 +384,40 @@ describe("the spill check", () => {
   it("reads clean when VRAM holds more than the buffers", () => {
     expect(spillFromReadings(buffers, [1110, 1110]).spilled).toBe(false);
   });
+
+  // Without a baseline VRAM can hold memory outside the buffers that hides a spill
+  // of its own size: a clean reading says nothing, a spill reading still stands.
+  it("calls a clean reading unmeasured when no probe has measured a baseline", () => {
+    expect(spillFromReadings(buffers, [1110, 1110])).toMatchObject({ measured: false, spilled: false });
+    expect(spillFromReadings(buffers, [1110, 1110], null).measured).toBe(false);
+    expect(spillFromReadings(buffers, [1050, 1050])).toMatchObject({ measured: true, spilled: true });
+  });
+
+  // GeForce MX150, CUDA, 7.5B gemma4 file at 40 layers: the buffers claim 1923MiB,
+  // dedicated VRAM holds 1954MiB, and 634MiB of weights sit in system RAM.
+  describe("with the baseline a probe measured (676MiB, +/-3)", () => {
+    const baseline = { mib: 676, toleranceMib: 3 };
+    const cuda40 = { deviceMib: 1923, contextMib: 55, byDeviceMib: {}, hostPinnedMib: 0 };
+    const cuda24 = { deviceMib: 1232, contextMib: 26, byDeviceMib: {}, hostPinnedMib: 0 };
+
+    it("finds the spill the buffers alone hide", () => {
+      expect(spillFromReadings(cuda40, [1954, 1954]).measured).toBe(false);
+      expect(spillFromReadings(cuda40, [1954, 1954], baseline)).toMatchObject({ measured: true, spilled: true, inSystemRamMib: 645 });
+    });
+
+    it("measures a load that did not spill as clean, not unknown", () => {
+      expect(spillFromReadings(cuda24, [1905, 1905], baseline)).toMatchObject({ measured: true, spilled: false });
+    });
+
+    it("takes the baseline's own tolerance on top of the counter's movement", () => {
+      expect(spillFromReadings(cuda24, [1905, 1905], { mib: 676, toleranceMib: 0 }).spilled).toBe(true);
+      expect(spillFromReadings(cuda24, [1905, 1905], { mib: 676, toleranceMib: 3 }).spilled).toBe(false);
+    });
+
+    it("still claims nothing from a single reading", () => {
+      expect(spillFromReadings(cuda40, [1954], baseline).measured).toBe(false);
+    });
+  });
 });
 
 describe("what stays in the log ring", () => {

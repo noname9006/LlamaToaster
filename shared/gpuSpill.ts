@@ -39,9 +39,14 @@
 // over an anchor" below for why zero is not a usable baseline. measureGpuSpill
 // remains only as probeSucceeded's fallback for a caller that passes no verdict.
 //
-// Not yet confirmed on Windows CUDA, where the CUDA context's own allocation
-// may land in dedicated VRAM outside llama.cpp's buffers and pull clean
-// readings further below zero -- which would hide a spill smaller than that.
+// Confirmed on Windows CUDA, and on Vulkan, where memory the process holds
+// outside llama.cpp's buffers pulls clean readings far below zero -- hiding a
+// spill smaller than that. Measured on a GeForce MX150 (2GiB, CUDA, b12040,
+// a 7.5B gemma4 file at 1 to 43 layers): clean loads read -673 to -676, and
+// 40 layers with 634MiB of weights in system RAM still read -31. The same file
+// on Vulkan reads -529 to -538; a 4.6B one reads -185 (CUDA) and -520 (Vulkan).
+// The amount is steady across layer counts for one model on one backend, so
+// `baselineMib` (see spillBaselineFromAnchor) adds it back to the claim.
 
 /** What llama.cpp itself reported placing on GPU devices for one load. */
 export interface GpuBufferReport {
@@ -69,6 +74,10 @@ export interface GpuSpillInput {
    * RAM -- less than that context's own 216MiB of buffers -- and was otherwise
    * filed as a spill a smaller context could fix. */
   atSmallestContext?: boolean;
+  /** Dedicated VRAM this model's process holds beyond llama.cpp's buffers when
+   * nothing has spilled, measured by an earlier probe (spillBaselineFromAnchor).
+   * Added to the claim, so a spill is judged against what VRAM should hold. */
+  baselineMib?: number | null;
 }
 
 export interface GpuSpillVerdict {
@@ -101,7 +110,7 @@ export const UNMEASURED_GPU_SPILL: GpuSpillVerdict = {
 export function measureGpuSpill(input: GpuSpillInput): GpuSpillVerdict {
   const { buffers, dedicatedMib } = input;
   if (buffers == null || buffers.deviceMib <= 0 || dedicatedMib == null) return UNMEASURED_GPU_SPILL;
-  const inSystemRamMib = buffers.deviceMib - dedicatedMib;
+  const inSystemRamMib = buffers.deviceMib + Math.max(0, input.baselineMib ?? 0) - dedicatedMib;
   const jitterMib = Math.max(0, input.dedicatedJitterMib ?? 0);
   const excessMib = inSystemRamMib - jitterMib;
   if (excessMib <= 0) return { measured: true, inSystemRamMib, jitterMib, spilled: false, cause: null };
@@ -354,4 +363,36 @@ export function measureGrowthSpill(
   if (measured.length === 0) return { ...UNMEASURED_GROWTH, readyPhase, workPhase };
   const worst = measured.reduce((x, y) => (excess(y) > excess(x) ? y : x));
   return { ...worst, readyPhase, workPhase };
+}
+
+// --- The baseline a probe leaves behind ---------------------------------------
+//
+// The anchor is a load at one layer and the smallest context, so nothing has
+// spilled in it: whatever its dedicated VRAM holds beyond the claim is the
+// model's own overhead on this backend, build and GPU. The probe records it so a
+// later load that has no anchor -- the Serve page's daemon -- can be judged by
+// measureGpuSpill with that overhead added back. Never negative: an anchor that
+// itself read below its claim must not make the later rule less sensitive.
+
+export interface SpillBaseline {
+  /** Dedicated VRAM beyond llama.cpp's buffers in the anchor load. */
+  mib: number;
+  /** How far the anchor's readings moved, and how far its control load differed. */
+  toleranceMib: number;
+}
+
+/** The baseline from a probe's anchor, judged on the ready hold (nothing has
+ * touched the memory yet); null when the anchor has no reading to take it from. */
+export function spillBaselineFromAnchor(anchor: SpillAnchor | null): SpillBaseline | null {
+  const phase = anchor?.ready ?? anchor?.work;
+  if (anchor == null || phase == null) return null;
+  return {
+    mib: Math.max(0, phase.dedicatedMib - anchor.claimMib),
+    toleranceMib: phase.movementMib + phase.noiseMib,
+  };
+}
+
+/** Where a baseline is kept: it holds for one file, backend, GPU and build only. */
+export function spillBaselineKey(parts: { modelPath: string; backend: string; gpuName: string | null; buildTag: string }): string {
+  return [parts.modelPath, parts.backend, parts.gpuName ?? "", parts.buildTag].join("|");
 }

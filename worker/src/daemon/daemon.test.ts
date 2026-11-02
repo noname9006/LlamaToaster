@@ -11,7 +11,7 @@ import { DaemonGateway, hashApiKey, MAX_IN_FLIGHT, type GatewayDeps } from "./ga
 import { DaemonLog } from "./logParse.js";
 import { extractUsage, UsageTap } from "./usageTap.js";
 import { buildMemorySnapshot, type MemoryInputs } from "./memory.js";
-import { DaemonStore, MAX_SPOOLED_USAGE } from "./store.js";
+import { DaemonStore, MAX_SPILL_BASELINES, MAX_SPOOLED_USAGE } from "./store.js";
 import { DaemonManager, loadHash, type DaemonHost } from "./manager.js";
 
 const quietLog = { info: () => undefined, warn: () => undefined, error: () => undefined };
@@ -578,6 +578,37 @@ describe("store", () => {
     const store = new DaemonStore(path, (m) => warnings.push(m));
     expect(store.config).toBeNull();
     expect(warnings).toHaveLength(1);
+  });
+
+  it("keeps a spill baseline across a restart", () => {
+    const path = temp();
+    const a = new DaemonStore(path, () => undefined);
+    expect(a.spillBaseline("m|cuda|gpu|b1")).toBeNull();
+    a.setSpillBaseline("m|cuda|gpu|b1", { mib: 676, toleranceMib: 3 });
+    const b = new DaemonStore(path, () => undefined);
+    expect(b.spillBaseline("m|cuda|gpu|b1")).toEqual({ mib: 676, toleranceMib: 3 });
+    expect(b.spillBaseline("m|cuda|gpu|b2")).toBeNull();
+    b.setSpillBaseline("m|cuda|gpu|b1", { mib: 700, toleranceMib: 1 });
+    expect(b.spillBaseline("m|cuda|gpu|b1")).toEqual({ mib: 700, toleranceMib: 1 });
+  });
+
+  it("drops the oldest spill baselines past its bound", () => {
+    const store = new DaemonStore(temp(), () => undefined);
+    for (let i = 0; i < MAX_SPILL_BASELINES + 2; i++) store.setSpillBaseline(`k${i}`, { mib: i, toleranceMib: 0 });
+    expect(store.spillBaseline("k0")).toBeNull();
+    expect(store.spillBaseline("k1")).toBeNull();
+    expect(store.spillBaseline("k2")).toEqual({ mib: 2, toleranceMib: 0 });
+    // A re-measured key counts as the newest, so it outlives the next eviction.
+    store.setSpillBaseline("k2", { mib: 9, toleranceMib: 0 });
+    store.setSpillBaseline("fresh", { mib: 1, toleranceMib: 0 });
+    expect(store.spillBaseline("k2")).toEqual({ mib: 9, toleranceMib: 0 });
+    expect(store.spillBaseline("k3")).toBeNull();
+  });
+
+  it("starts with no baselines from a state file written before they existed", () => {
+    const path = temp();
+    writeFileSync(path, JSON.stringify({ config: null, last_spec: null, usage: [], usage_dropped: 0 }));
+    expect(new DaemonStore(path, () => undefined).spillBaseline("anything")).toBeNull();
   });
 
   it("holds no key", () => {

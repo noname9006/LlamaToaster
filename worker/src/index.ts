@@ -56,7 +56,15 @@ import { fetchFillerBlocks } from "./fillerPrompt.js";
 import { modelLoadArgs, supportsFlag, readListDevices, usedListedDevices } from "./binary-probe.js";
 import { MemorySampler, captureFreeMemoryBaseline, readSystemRamMib, type SampleStats, type FreeMemoryBaseline } from "./sampler.js";
 import { MemoryTrace } from "./memoryTrace.js";
-import { buildSpillAnchor, measureGrowthSpill, withAnchorControl, type SpillAnchor } from "../../shared/gpuSpill.js";
+import {
+  buildSpillAnchor,
+  measureGrowthSpill,
+  spillBaselineFromAnchor,
+  spillBaselineKey,
+  withAnchorControl,
+  type SpillAnchor,
+} from "../../shared/gpuSpill.js";
+import { pickGpu } from "./daemon/memory.js";
 import { readGpuMemory, readNvidiaDriverInfo, type NvidiaDriverInfo } from "./vram.js";
 import {
   estimateResidentGpuLayers,
@@ -4407,6 +4415,22 @@ async function executeRunProbeJob(payload: TestProbeJobPayload): Promise<void> {
       if (anchorRole && attempt.spillAnchor !== undefined) {
         spillAnchor = attempt.spillAnchor;
         log.info(`${label}: ${describeSpillAnchor(spillAnchor, anchorRole)}`);
+        // What this model's process holds beyond llama.cpp's buffers when nothing
+        // has spilled. The Serve page's daemon has no anchor of its own and reads
+        // its spill against this; the control load refines it with its noise.
+        const baseline = spillBaselineFromAnchor(spillAnchor);
+        if (baseline) {
+          daemonStore.setSpillBaseline(
+            spillBaselineKey({
+              modelPath,
+              backend: payload.llama_cpp_backend,
+              gpuName: pickGpu(currentHardware(), payload.llama_cpp_backend).name,
+              buildTag: resolvedBuild.tag,
+            }),
+            baseline
+          );
+          log.info(`${label}: spill baseline ${Math.round(baseline.mib)}MiB (+/-${Math.round(baseline.toleranceMib)}MiB) kept for the Serve page`);
+        }
       }
       attempt = describeProbeVramDiscrepancy(rung, estimate?.vramMib ?? null, attempt);
       attempts.push(attempt);

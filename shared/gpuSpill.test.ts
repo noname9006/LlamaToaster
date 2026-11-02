@@ -3,10 +3,13 @@ import {
   buildSpillAnchor,
   measureGpuSpill,
   measureGrowthSpill,
+  spillBaselineFromAnchor,
+  spillBaselineKey,
   UNMEASURED_GPU_SPILL,
   withAnchorControl,
   type MeasuredLoad,
   type MemoryReading,
+  type SpillAnchor,
 } from "./gpuSpill.js";
 
 // Real loads, 2026-09-14: Qwen3.6-35B-A3B-UD-IQ4_NL on a Radeon RX 6600 XT
@@ -209,5 +212,90 @@ describe("measureGrowthSpill under --load-mode mlock", () => {
     const v = measureGrowthSpill(plain(4492, 1614.8, 2963.3), buildSpillAnchor(plain(1170, 1180.4, 33.8)));
     expect(v.sharedGrowthMib!).toBeCloseTo(2929.5, 1);
     expect(v.spilled).toBe(true);
+  });
+});
+
+// Real loads, 2026-11-02: a 7.5B gemma4 Q2_K file (42 layers) on a GeForce MX150
+// (2GiB), CUDA, llama.cpp b12040, llama-bench with a 512-token prompt. Claim is
+// llama.cpp's buffer report (model + KV + compute), dedicated and shared the
+// process's WDDM counters at peak. Weights past layer 24 land in system RAM:
+// shared grows by about one layer (41MiB) per layer while dedicated stops at
+// 1953MiB, yet the buffers-minus-dedicated difference reads below zero until 43.
+describe("a baseline outside llama.cpp's buffers", () => {
+  const CUDA_NEMOTRON: { ngl: number; claim: number; contextMib: number; dedicated: number; spilled: boolean }[] = [
+    { ngl: 2, claim: 337, contextMib: 17, dedicated: 1013, spilled: false },
+    { ngl: 14, claim: 820, contextMib: 17, dedicated: 1495, spilled: false },
+    { ngl: 20, claim: 1066, contextMib: 20, dedicated: 1739, spilled: false },
+    { ngl: 24, claim: 1232, contextMib: 26, dedicated: 1905, spilled: false },
+    { ngl: 26, claim: 1324, contextMib: 31, dedicated: 1931, spilled: true },
+    { ngl: 32, claim: 1582, contextMib: 41, dedicated: 1953, spilled: true },
+    { ngl: 40, claim: 1923, contextMib: 55, dedicated: 1954, spilled: true },
+    { ngl: 43, claim: 2101, contextMib: 59, dedicated: 1946, spilled: true },
+  ];
+  // The anchor: 2 layers, 1013MiB dedicated against a 337MiB claim.
+  const anchor: SpillAnchor = {
+    claimMib: 337,
+    contextMib: 17,
+    ready: { dedicatedMib: 1013, sharedMib: 110, movementMib: 1, noiseMib: 2 },
+    work: null,
+  };
+
+  it("reads 40 layers with 634MiB in system RAM as clean against zero -- the blind spot", () => {
+    const row = CUDA_NEMOTRON.find((r) => r.ngl === 40)!;
+    const v = measureGpuSpill({ buffers: { deviceMib: row.claim, contextMib: row.contextMib }, dedicatedMib: row.dedicated, dedicatedJitterMib: 1 });
+    expect(v).toMatchObject({ spilled: false, inSystemRamMib: -31 });
+  });
+
+  it.each(CUDA_NEMOTRON)("judges $ngl layers against the anchor's baseline", ({ claim, contextMib, dedicated, spilled }) => {
+    const baseline = spillBaselineFromAnchor(anchor)!;
+    const v = measureGpuSpill({
+      buffers: { deviceMib: claim, contextMib },
+      dedicatedMib: dedicated,
+      dedicatedJitterMib: 1 + baseline.toleranceMib,
+      baselineMib: baseline.mib,
+    });
+    expect(v.spilled).toBe(spilled);
+  });
+
+  it("measures how much is in system RAM once the baseline is added back", () => {
+    const v = measureGpuSpill({ buffers: { deviceMib: 1923, contextMib: 55 }, dedicatedMib: 1954, dedicatedJitterMib: 0, baselineMib: 676 });
+    expect(v).toMatchObject({ spilled: true, inSystemRamMib: 645, cause: "layers" });
+  });
+
+  it("changes nothing without a baseline, or with a negative one", () => {
+    const input = { buffers: { deviceMib: 2000, contextMib: 263 }, dedicatedMib: 1950, dedicatedJitterMib: 0 };
+    const bare = measureGpuSpill(input);
+    expect(measureGpuSpill({ ...input, baselineMib: null })).toEqual(bare);
+    expect(measureGpuSpill({ ...input, baselineMib: -40 })).toEqual(bare);
+  });
+
+  describe("spillBaselineFromAnchor", () => {
+    it("is the dedicated VRAM the anchor held beyond its claim, with its movement and noise as tolerance", () => {
+      expect(spillBaselineFromAnchor(anchor)).toEqual({ mib: 676, toleranceMib: 3 });
+    });
+
+    it("falls back to the work phase when the ready hold was not measured", () => {
+      const work = { dedicatedMib: 1020, sharedMib: null, movementMib: 4, noiseMib: 0 };
+      expect(spillBaselineFromAnchor({ ...anchor, ready: null, work })).toEqual({ mib: 683, toleranceMib: 4 });
+    });
+
+    it("is never negative", () => {
+      const low = { ...anchor, ready: { dedicatedMib: 300, sharedMib: null, movementMib: 0, noiseMib: 0 } };
+      expect(spillBaselineFromAnchor(low)).toEqual({ mib: 0, toleranceMib: 0 });
+    });
+
+    it("is null with no anchor, or an anchor with no reading", () => {
+      expect(spillBaselineFromAnchor(null)).toBeNull();
+      expect(spillBaselineFromAnchor({ ...anchor, ready: null, work: null })).toBeNull();
+    });
+  });
+
+  it("keys a baseline by file, backend, GPU and build", () => {
+    const parts = { modelPath: "C:\models\a.gguf", backend: "cuda", gpuName: "GeForce MX150", buildTag: "b12040" };
+    const key = spillBaselineKey(parts);
+    expect(spillBaselineKey({ ...parts })).toBe(key);
+    for (const other of [{ modelPath: "C:\models\b.gguf" }, { backend: "vulkan" }, { gpuName: "UHD 620" }, { gpuName: null }, { buildTag: "b12038" }]) {
+      expect(spillBaselineKey({ ...parts, ...other })).not.toBe(key);
+    }
   });
 });

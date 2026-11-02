@@ -16,7 +16,13 @@ import si from "systeminformation";
 import type { Backend } from "../../../shared/types.js";
 import { isSharedMemoryGpu } from "../../../shared/types.js";
 import type { DaemonMemorySnapshot } from "../../../shared/daemonTypes.js";
-import { measureGpuSpill, UNMEASURED_GPU_SPILL, type GpuSpillInput, type GpuSpillVerdict } from "../../../shared/gpuSpill.js";
+import {
+  measureGpuSpill,
+  UNMEASURED_GPU_SPILL,
+  type GpuSpillInput,
+  type GpuSpillVerdict,
+  type SpillBaseline,
+} from "../../../shared/gpuSpill.js";
 import { parseGpuBufferReport } from "../bench.js";
 import { readGpuMemory } from "../vram.js";
 import { runPowerShell } from "../psSession.js";
@@ -138,11 +144,26 @@ const READING_RESOLUTION_MIB = 1;
 
 /** The tolerance is the counter's own movement over these readings, as in a context
  * test. With fewer than two there is no movement to judge by, so nothing is claimed. */
-export function spillFromReadings(buffers: GpuSpillInput["buffers"], readings: number[]): GpuSpillVerdict {
+export function spillFromReadings(
+  buffers: GpuSpillInput["buffers"],
+  readings: number[],
+  baseline: SpillBaseline | null = null
+): GpuSpillVerdict {
   if (readings.length < 2) return UNMEASURED_GPU_SPILL;
   const highest = Math.max(...readings);
   const movement = highest - Math.min(...readings);
-  return measureGpuSpill({ buffers, dedicatedMib: highest, dedicatedJitterMib: movement + READING_RESOLUTION_MIB });
+  const verdict = measureGpuSpill({
+    buffers,
+    dedicatedMib: highest,
+    dedicatedJitterMib: movement + READING_RESOLUTION_MIB + (baseline?.toleranceMib ?? 0),
+    baselineMib: baseline?.mib,
+  });
+  // A spill found without a baseline stands: VRAM holding less than the buffers
+  // cannot be overhead. A clean reading proves nothing, though -- memory outside
+  // the buffers can hide a spill of its own size (shared/gpuSpill.ts) -- so it is
+  // left unmeasured until a probe has measured this model's baseline.
+  if (baseline == null && !verdict.spilled) return UNMEASURED_GPU_SPILL;
+  return verdict;
 }
 
 export async function readDaemonMemory(input: {
@@ -153,6 +174,9 @@ export async function readDaemonMemory(input: {
   /** Earlier readings of this load, which this appends to. Absent: no spill check,
    * because the model is not settled (it is loading, waking or asleep). */
   dedicatedReadings?: number[];
+  /** What a probe measured for this file, backend, GPU and build. Absent: a clean
+   * reading is reported as not measured. */
+  spillBaseline?: SpillBaseline | null;
 }): Promise<DaemonMemorySnapshot> {
   const { name: gpuName, count: gpuCount, unified } = pickGpu(input.hardware, input.backend);
   let ramTotalMib: number | null = null;
@@ -176,7 +200,7 @@ export async function readDaemonMemory(input: {
     readings.push(dedicated);
     if (readings.length > MAX_DEDICATED_READINGS) readings.shift();
   }
-  const spill = readings ? spillFromReadings(buffers, readings) : UNMEASURED_GPU_SPILL;
+  const spill = readings ? spillFromReadings(buffers, readings, input.spillBaseline ?? null) : UNMEASURED_GPU_SPILL;
   return buildMemorySnapshot({
     at: Date.now(),
     unified,
