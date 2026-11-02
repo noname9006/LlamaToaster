@@ -238,8 +238,7 @@ export function parseLabeledCounterOutput(stdout: string): Record<string, string
   return values;
 }
 
-// One powershell.exe spawn for ALL FOUR readings (each Get-Counter call pays
-// the same ~1-1.5s PDH cold-start cost, so separate spawns would multiply it):
+// One powershell.exe spawn for ALL FOUR readings:
 //   0. the whole-adapter "GPU Adapter Memory" Shared Usage sum (usedShared) --
 //      every process's system-RAM-backed GPU memory, summed across adapters
 //      exactly like the Dedicated Usage reading below,
@@ -270,6 +269,34 @@ export function parseLabeledCounterOutput(stdout: string): Record<string, string
 // "Dedicated Usage" is VidMm's *committed* accounting (what the driver
 // charged the process), not hardware residency -- same semantics as
 // nvidia-smi's per-process used_memory.
+//
+// All of them in ONE Get-Counter call, so they describe the same sample. Each
+// call takes ~1s, so separate calls read adapter usage up to ~3s before process
+// usage: measured live during a load as adapter shared 165MiB against that
+// process's own shared 7032MiB.
+export function windowsUsedMemoryCommand(pid: number | undefined): string {
+  const paths = [
+    `'\\GPU Adapter Memory(*)\\Dedicated Usage'`,
+    `'\\GPU Adapter Memory(*)\\Shared Usage'`,
+    ...(pid != null
+      ? [`'\\GPU Process Memory(pid_${pid}_*)\\Dedicated Usage'`, `'\\GPU Process Memory(pid_${pid}_*)\\Shared Usage'`]
+      : []),
+  ];
+  const sum = (category: string, counter: string) =>
+    `($c | Where-Object { $_.Path -like '*\\${category}(*\\${counter}' } | Measure-Object -Property CookedValue -Sum).Sum`;
+  return [
+    `$c = (Get-Counter ${paths.join(",")} -ErrorAction SilentlyContinue).CounterSamples`,
+    `Write-Output ("u=" + ${sum("gpu adapter memory", "dedicated usage")})`,
+    `Write-Output ("t=" + ${sum("gpu adapter memory", "shared usage")})`,
+    ...(pid != null
+      ? [
+          `Write-Output ("p=" + ${sum("gpu process memory", "dedicated usage")})`,
+          `Write-Output ("s=" + ${sum("gpu process memory", "shared usage")})`,
+        ]
+      : []),
+  ].join("; ");
+}
+
 async function readWindowsUsedMib(
   pid: number | undefined
 ): Promise<{
@@ -279,22 +306,8 @@ async function readWindowsUsedMib(
   processSharedMib: number | null;
 }> {
   try {
-    const lines = [
-      `$u = (Get-Counter '\\GPU Adapter Memory(*)\\Dedicated Usage' -ErrorAction SilentlyContinue).CounterSamples | Measure-Object -Property CookedValue -Sum | Select-Object -ExpandProperty Sum`,
-      `$t = (Get-Counter '\\GPU Adapter Memory(*)\\Shared Usage' -ErrorAction SilentlyContinue).CounterSamples | Measure-Object -Property CookedValue -Sum | Select-Object -ExpandProperty Sum`,
-      pid != null
-        ? `$p = (Get-Counter '\\GPU Process Memory(pid_${pid}_*)\\Dedicated Usage' -ErrorAction SilentlyContinue).CounterSamples | Measure-Object -Property CookedValue -Sum | Select-Object -ExpandProperty Sum`
-        : null,
-      pid != null
-        ? `$s = (Get-Counter '\\GPU Process Memory(pid_${pid}_*)\\Shared Usage' -ErrorAction SilentlyContinue).CounterSamples | Measure-Object -Property CookedValue -Sum | Select-Object -ExpandProperty Sum`
-        : null,
-      `Write-Output ("u=" + $u)`,
-      `Write-Output ("t=" + $t)`,
-      pid != null ? `Write-Output ("p=" + $p)` : null,
-      pid != null ? `Write-Output ("s=" + $s)` : null,
-    ].filter(Boolean);
     // The shared session (psSession.ts) instead of a powershell.exe per probe.
-    const script = lines.join("; ");
+    const script = windowsUsedMemoryCommand(pid);
     const stdout = await runPowerShell(script, EXEC_TIMEOUT_MS, () =>
       execFileAsync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
         timeout: EXEC_TIMEOUT_MS,
