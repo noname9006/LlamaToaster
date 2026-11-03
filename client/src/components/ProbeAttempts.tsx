@@ -470,8 +470,14 @@ export function ProbeAttempts({ testId, refreshKey }: ProbeAttemptsProps) {
                     title={
                       a.vram_shared_peak_mib != null
                         ? `${mib(a.vram_shared_peak_mib)} of this load's memory was system RAM the OS backed as GPU-accessible ` +
-                          "memory (Windows WDDM \"Shared Usage\" / Linux amdgpu GTT). Part of that is ordinary driver overhead, " +
-                          "which is why a spill is judged in the \"in system RAM\" column instead."
+                          "memory (Windows WDDM \"Shared Usage\" / Linux amdgpu GTT). " +
+                          (a.gpu_host_pinned_mib != null
+                            ? `${mib(a.gpu_host_pinned_mib)} of it is what llama.cpp kept in host buffers on purpose. `
+                            : "") +
+                          (a.gpu_cpu_mapped_mib
+                            ? `A further ${mib(a.gpu_cpu_mapped_mib)} of memory-mapped weights is on the CPU side, which this counter cannot see. `
+                            : "") +
+                          "A spill is judged in the \"in system RAM\" column instead."
                         : "No shared/system-RAM-backed GPU memory counter is available on this worker for this backend."
                     }
                   >

@@ -144,6 +144,8 @@ function validateOneProbeAttempt(raw: unknown, label: string): ProbeAttemptRepor
     vram_shared_peak_mib: optionalNonNegative(a.vram_shared_peak_mib, `${label}.vram_shared_peak_mib`),
     vram_shared_total_peak_mib: optionalNonNegative(a.vram_shared_total_peak_mib, `${label}.vram_shared_total_peak_mib`),
     vram_claimed_peak_mib: optionalNonNegative(a.vram_claimed_peak_mib, `${label}.vram_claimed_peak_mib`),
+    gpu_host_pinned_mib: optionalNonNegative(a.gpu_host_pinned_mib, `${label}.gpu_host_pinned_mib`),
+    gpu_cpu_mapped_mib: optionalNonNegative(a.gpu_cpu_mapped_mib, `${label}.gpu_cpu_mapped_mib`),
     gen_tps: optionalNonNegative(a.gen_tps, `${label}.gen_tps`),
     pp_tps: optionalNonNegative(a.pp_tps, `${label}.pp_tps`),
     ttft_ms: optionalNonNegative(a.ttft_ms, `${label}.ttft_ms`),
@@ -466,6 +468,8 @@ export async function measurementRoutes(app: FastifyInstance): Promise<void> {
         spill_method: row.spill_method === "anchor" || row.spill_method === "growth" ? row.spill_method : null,
         spill_shared_growth_mib: row.spill_shared_growth_mib,
         spill_unlanded_growth_mib: row.spill_unlanded_growth_mib,
+        gpu_host_pinned_mib: row.gpu_host_pinned_mib,
+        gpu_cpu_mapped_mib: row.gpu_cpu_mapped_mib,
         host_backed_fail:
           row.host_backed_fail === "layers" || row.host_backed_fail === "cache" ? row.host_backed_fail : null,
         vram_discrepancy: row.vram_discrepancy === 1,

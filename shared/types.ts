@@ -762,6 +762,10 @@ export interface ResultRow {
   // The benchmark process's peak system-RAM-backed GPU allocation (WDDM
   // "Shared Usage" / amdgpu GTT): what silently spilled out of VRAM.
   gpu_memory_shared_peak_mib?: number | null;
+  // llama.cpp's *_Host buffers, which the shared figure includes by design, and
+  // its CPU_Mapped model buffers, which it never sees.
+  gpu_memory_host_pinned_mib?: number | null;
+  gpu_memory_cpu_mapped_mib?: number | null;
   // Actual GPU layers loaded and the model's real total layer count, both
   // read from llama.cpp's own runtime output (worker/src/index.ts's
   // parseOffloadLayers, scraping "load_tensors: offloaded X/Y layers to
@@ -917,6 +921,10 @@ export interface IngestResultInput {
   // The benchmark process's peak system-RAM-backed GPU allocation (WDDM
   // "Shared Usage" / amdgpu GTT): what silently spilled out of VRAM.
   gpu_memory_shared_peak_mib?: number | null;
+  // llama.cpp's *_Host buffers, which the shared figure includes by design, and
+  // its CPU_Mapped model buffers, which it never sees.
+  gpu_memory_host_pinned_mib?: number | null;
+  gpu_memory_cpu_mapped_mib?: number | null;
   gpu_layers_loaded: number | null;
   total_model_layers: number | null;
   // See the matching fields on ResultRow above -- the MTP/draft companion
@@ -2162,6 +2170,10 @@ export interface ProbeAttemptReport {
   // min(s, d) and gpu_spill_jitter_mib the tolerance.
   spill_shared_growth_mib?: number | null;
   spill_unlanded_growth_mib?: number | null;
+  /** llama.cpp's *_Host buffers, which shared GPU memory counts, and CPU_Mapped
+   * model buffers, which it never sees. Null from a worker predating them. */
+  gpu_host_pinned_mib?: number | null;
+  gpu_cpu_mapped_mib?: number | null;
   // The ladder's own bounds (llama.cpp's -ngl ceiling for the model, and its
   // trained context), repeated on every row so a stored probe can be re-resolved
   // exactly by shared/probeLadder.ts's probeOutcome.

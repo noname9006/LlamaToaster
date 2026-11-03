@@ -9,38 +9,109 @@
   <img src="https://img.shields.io/badge/node-%3E%3D22.22.2-brightgreen" alt="Node >= 22.22.2">
 </p>
 
-**Find the llama.cpp settings your own hardware actually runs best, then
-compare them against everyone else's.** Point LlamaToaster at a model and a
-machine, and it sweeps the parameter space with `llama-bench` /
-`llama-server`, records every measurement, and hands you the configuration to
-put in your real inference command line.
+**LlamaToaster answers four questions: no, no, yes, no.**
+
+- **No!** You don't need your own data center to run your own AI.
+- **No!** You're not running your AI as well as your machine allows.
+- **Yes!** Your machine can run local inference without a top GPU, or with no
+  graphics card at all.
+- **No!** You don't need to be an engineer to do this. It's simpler than you think.
+
+It tells you whether a GGUF model will run on your machine before you download
+it, finds the best [llama.cpp](https://github.com/ggml-org/llama.cpp) settings for
+your hardware, and measures the speed you will really get.
 
 👉 **[llamatoaster.com](https://llamatoaster.com)** — the hosted instance.
 Sign in with GitHub, connect a machine, start testing.
 
-## What you get
+## The questions it settles
 
-- **Optimal configs for your box, not someone's blog post.** Sweep `-ngl`,
-  context, batch sizes, `--n-cpu-moe`, speculative decoding and more, on
-  *your* GPU, with *your* build of llama.cpp. What comes out is the setting
-  you paste into your own `llama-server`/`llama-cli` run.
-- **An AI assistant that reads the numbers so you don't have to.** Instead of
-  staring at a results table, ask what's actually limiting you, which
-  parameter moved the needle, and what to try next. It reads your own tests
-  directly.
-- **A GGUF index keyed by content hash.** Around 4 million GGUF files from
-  Hugging Face, indexed by sha256 — so a model file is identified by what it
-  *is*, not by whatever it was renamed to on disk, and the same file mirrored
-  across repos doesn't turn into three different entries.
-- **A shared results base that gets better as it grows.** As more machines
-  report in, the assistant can answer from the accumulated data rather than
-  from your tests alone — eventually predicting good settings for hardware
-  it has seen before, without you re-running the whole sweep yourself.
+| You're asking | Where you get the answer |
+|---|---|
+| Will this model run on my machine? Is there enough memory? | **Will it fit?** on the Models page, without downloading the model |
+| How many tokens per second will I really get, in prefill and in generation? | **New test**: a real `llama-server` run at the context you need |
+| Which launch parameters should I use? | **New test**: a map of context against layers, flash attention on and off, every K/V cache type that works, CPU threads |
+| How do I make it faster? | **New test**: your chosen configs measured next to the defaults. **Compare** and the AI assistant show what moved the number |
+| How do I tune it for the way I use it? | **Serve** already profiles your real traffic. Tuning from that profile is [in development](#in-development) |
 
-That last point is the reason to use the hosted instance rather than a
-private copy: the value compounds across contributors. One person's sweep on
-an RTX 4090 is a data point; a few thousand of them is a map of local LLM
-inference.
+## Know before you download
+
+Existing predictors don't work. They have no idea whether you can really run a
+model until you've downloaded it, because they estimate from a formula and a file
+size. They don't know your llama.cpp build, your backend, or what else is holding
+your memory right now.
+
+LlamaToaster asks llama.cpp itself. It fetches only the model's GGUF header from
+Hugging Face, pads it to full size as a sparse file, and runs llama.cpp's own
+`llama-fit-params` on your machine against what is free right now.
+
+**Download 10–15 MB instead of 20–30 GB, and get the answer.** On 12 models at
+4 context sizes, the header gave the same answer as the real file at 45 of 45 points.
+
+## Speed on your hardware, not someone else's
+
+Quality benchmarks are everywhere. Performance benchmarks either aren't universal,
+or don't show performance on your hardware, or both.
+
+LlamaToaster runs on your machine, with your build, on the model you picked. Prefill
+and generation are measured separately, because they behave differently and you feel
+them differently. What comes out is the setting you paste into your own
+`llama-server` or `llama-cli` run.
+
+## What it does for you
+
+- **Any platform, any backend.** Windows, Linux and macOS, on everything
+  [llama.cpp](https://github.com/ggml-org/llama.cpp) ships a release for: CPU,
+  Vulkan, CUDA, ROCm, SYCL, OpenVINO, Metal. The newest builds are listed within
+  minutes of release and install with one click.
+- **Any GGUF model on [Hugging Face](https://huggingface.co/models?library=gguf).**
+  Search, pick a quantization, download to the machine. Gated repos need `HF_TOKEN`
+  set on that machine. Around 4 million GGUF files are indexed by sha256, so a file is
+  identified by what it *is*, not by what it was renamed to, and a mirrored copy
+  doesn't turn into a second entry.
+- **One command to install and run.** [See below](#two-ways-to-run-it). Node.js and
+  the rest are handled for you.
+- **K/V cache quantization, found automatically.** Don't guess which cache types will
+  work and which will end in a silent fallback to the CPU. LlamaToaster tries all
+  64 type pairs with flash attention on and off, and reads the answer from llama.cpp's
+  own scheduler. No weights are loaded, so each check takes about half a second.
+- **Two ways to find the offload when VRAM runs short:**
+  - **llama-fit**, built into llama.cpp, quickly and quite accurately places both
+    dense and MoE models: layers and experts.
+  - **No-spill**, LlamaToaster's own method, takes longer and needs the model on disk,
+    but squeezes out the last few percent. It puts as much as possible in VRAM, right
+    up to the point where data starts silently spilling out of VRAM into system
+    memory. Spill degrades performance with no crash and no error, so you'd otherwise
+    never know.
+- **No surprise out-of-memory.** llama-fit's answers keep a margin of free VRAM
+  (1 GiB by default), and real loads with real requests can confirm them at your
+  context, so you don't lose a session to a sudden OOM and have to restart. No-spill
+  trades that margin for speed by design, and memory that other apps take later is
+  outside LlamaToaster's control.
+- **An AI assistant that reads the numbers for you.** Ask what's limiting you, which
+  parameter moved the needle and what to try next. It reads your own tests directly.
+
+## In development
+
+**Our own daemon for analyzing how you use your model and optimizing for it.** The
+Serve page already loads a model on your machine behind an OpenAI-compatible URL for
+your agents. It shows VRAM and RAM split into this app, other apps and free, speed
+against context length from real traffic, and your usage profile: tokens in, cached
+and out. Still to come is tuning from that profile, finding the right balance between
+generation and prefill for your workload.
+
+## Why every test counts
+
+The main value is the network effect. Every test you run is uploaded to a shared
+database, so the next person can get an answer faster, without repeating the work.
+Today, other people reach that data as anonymous aggregates through the AI assistant.
+Over time it should answer directly for hardware it has already seen.
+
+A million tests across different hardware, software and models is a million more
+people who can get into local AI with less friction. That's the reason to use the
+hosted instance rather than a private copy: one sweep on an RTX 4090 is a data point,
+and thousands of them are a map of local inference.
+[Here's what is collected.](#what-is-collected-and-what-isnt)
 
 ## Two ways to run it
 
@@ -78,22 +149,18 @@ If you use llamatoaster.com, this is what leaves your machine:
   and the machine's hostname (it becomes the default display name — rename it
   in the UI any time).
 - **Benchmark results**: the configurations tested and what they measured.
+- **If you use the Serve page**: for each request a machine serves, its token
+  counts, timings, status and endpoint, never its text. Prompts and answers stay
+  on that machine. Also the settings you save there, including a system prompt.
 - **Your GitHub account**, because that's how sign-in works: the numeric
   account id, login and avatar. The OAuth scope requested is `read:user`
   only — **not** `user:email`, and nothing that grants access to your
   repositories.
 
 What is *not* collected: your email address, your prompts or any content you
-generate (benchmarks run on synthetic tokens — LlamaToaster never sees what
-you actually use a model for), the model files themselves, or anything about
+generate (benchmarks run on synthetic tokens, and the Serve page's traffic stays on
+your machine), the model files themselves, or anything about
 your machine beyond the hardware inventory above.
-
-**Sharing with other users is opt-in and identity-free.** Settings →
-"Share my benchmarks with the community" controls whether your results feed
-the shared base at all. When they do, other people reach them only as
-aggregates through the assistant — averages grouped by model, backend,
-platform and GPU model, each carrying how many contributors it came from.
-No username, no account id, no hostname, and never your own rows back to you.
 
 ## Layout
 
@@ -120,7 +187,7 @@ the reasoning behind most of what's described in this document.
 ## Prerequisites
 
 - Node.js 22.22.2+ (22+ is required by `better-sqlite3` v13 and by Vite 8 for the client/admin builds; jsdom 30, used by the client tests, needs 22.22.2)
-- A built `llama-bench` (and `llama.cpp`) on each worker box — or install one from the Workers page after the worker is up, no manual build needed
+- A built `llama-bench` (and `llama.cpp`) on each worker box — or install one from the Machines page after the worker is up, no manual build needed
 - A GitHub OAuth App if you're running with accounts enabled (see below) — not needed for a single-user/no-login deployment
 
 Install once (root deps, then the client's and admin's own deps — `postinstall`
@@ -192,12 +259,12 @@ email/verification step. To enable it:
 Each account sees only its own machines, runs, and models it registered —
 enforced in SQL, not just hidden in the UI. The one exception is the AI
 assistant, which can also show **anonymised, aggregated** benchmark numbers
-contributed by other users who opted in (Settings → "Share my benchmarks
-with the community") — never a username, account id or hostname, never the
-caller's own rows, and always with the number of contributors the aggregate
+contributed by other users (once the operator enables community sharing in the
+admin console) — never a username, account id or hostname, never
+the caller's own rows, and always with the number of contributors the aggregate
 came from. Set `COMMUNITY_MIN_CONTRIBUTORS=<n>` to additionally suppress any
 aggregate built from fewer than *n* distinct contributors (default `1`, i.e.
-a single opted-in machine may be summarised — labelled as such).
+a single contributing machine may be summarised — labelled as such).
 
 **Superadmin** (optional, on top of `AUTH_ENABLED`): set
 `SUPERADMIN_IDENTITIES=github:<your-numeric-github-id>` (comma-separated for
@@ -348,9 +415,9 @@ To configure by hand instead, edit `worker/config.json`:
 ```
 
 `llama_cpp_builds_dir` is optional (defaults to a `llama-builds/` folder next
-to `worker/`) — it's where builds installed from the Workers page land, one
+to `worker/`) — it's where builds installed from the Machines page land, one
 subfolder per tag. `llama_bench_path`/`llama_cpp_build` are the *initial*
-active build; switching versions from the Workers page rewrites both fields
+active build; switching versions from the Machines page rewrites both fields
 in this file, so a restart doesn't revert the choice. If `llama_bench_path`
 doesn't exist at startup the worker still starts (logs a warning) so a brand
 new worker can have its first build installed entirely from the web UI.
@@ -402,10 +469,13 @@ on the VPS itself, is covered in [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md)
 2. **Models** (`/models`) — register a model (local path or Hugging Face repo/file),
    or use the "Search & download (Hugging Face)" panel: search by model name, expand a
    repo to see its quant files, pick a machine, download straight to its `model_dir`.
-3. **Benchmark** (`/benchmark`) — the guided path: pick a model + machine, state what
-   you're optimizing for (a goal questionnaire — speed floor, workload shape, KV
-   preset), and the page derives a tuning → refine → sweep chain of tests linked
-   together and scored as one unit, instead of you hand-building a grid.
+   **Will it fit?** sizes any of those files on a chosen machine, downloaded or not.
+3. **New test** (`/benchmark`) — the guided path: pick a machine, a model and the
+   context you need, then work through four steps, each its own test: **Baseline**
+   (the model at that context, every layer on the GPU), **Find the best fit**
+   (llama-fit's map of context against layers, K/V cache detection, an optional
+   real-load no-spill check), **CPU threads**, and **Confirm** (your chosen configs
+   measured next to the baseline).
 4. **Custom Test** (`/custom-test`) — the hand-built path: set the sweep yourself with
    graphical controls (chip inputs for numeric fields, toggles for cache types/flash
    attention, a repeats stepper), or open "Advanced: raw JSON" to edit/paste the
@@ -413,19 +483,21 @@ on the VPS itself, is covered in [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md)
 5. **Tests** (`/tests`) — list; polls every 5s while anything is `running`.
 6. **Test Detail** (`/tests/:id`) — results table + Chart.js bar chart + raw JSON download.
 7. **Compare** (`/compare`) — pick 2+ tests for side-by-side bars.
-8. **Workers** (`/workers`) — one card per machine: online/offline/**Inaccessible**
+8. **Serve** (`/serve`) — load a model on a machine for your agents; see
+   [Serving a model to agents](#serving-a-model-to-agents).
+9. **Machines** (`/workers`) — one card per machine: online/offline/**Inaccessible**
    status, platform/backend, detected CPU/GPU/RAM (best-effort, informational), and
    two separate lists — **Downloaded** (installed builds, active one marked, with
    Activate/Delete) and **Available to install** (from GitHub, checked every few
    minutes). Every action is a manual click — nothing downloads, switches, or
    deletes on its own.
-9. **Device** (`/device`) — approve a machine enrolment code (see "Running a worker"
-   above); bookmarkable, for enrolling a headless box you set up over SSH.
-10. **Settings** (`/settings`, only with `AUTH_ENABLED`) — connected sign-in providers,
+10. **Device** (`/device`) — approve a machine enrolment code (see "Running a worker"
+    above); bookmarkable, for enrolling a headless box you set up over SSH.
+11. **Settings** (`/settings`, only with `AUTH_ENABLED`) — connected sign-in providers,
     active sessions (revoke individually or "sign out everywhere else"), and the
     community-benchmarks sharing toggle.
-11. Export: `GET /api/results/export?format=json|csv|md[&tests=id1,id2]`.
-12. **AI Assistant** — collapsible panel on the right of every page (collapsed by
+12. Export: `GET /api/results/export?format=json|csv|md[&tests=id1,id2]`.
+13. **AI Assistant** — collapsible panel on the right of every page (collapsed by
     default). Chats with whatever OpenAI-compatible provider you configure via
     `AI_API_KEY`/`AI_BASE_URL`/`AI_MODEL`, with your hardware, registered
     models, and recent benchmark results automatically included as context, plus
@@ -458,6 +530,30 @@ flash_attn to be enabled"), so it can never produce a result. A sweep made
 up entirely of such combinations is rejected at trigger time instead of
 creating a run with nothing to do.
 
+## Serving a model to agents
+
+Open **Serve**, pick a machine and a model, and load it. Agents then connect to the
+machine, not to the LlamaToaster server:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8642/v1", api_key="your key, or anything without one")
+client.chat.completions.create(model="the API identifier on the page", messages=[{"role": "user", "content": "Hello"}])
+```
+
+The endpoint also speaks `/v1/completions`, `/v1/responses`, `/v1/embeddings`,
+`/v1/rerank` and `/v1/messages`. Images and other media must be sent inline as
+`data:` URLs, because llama-server would otherwise fetch a remote URL itself from your
+machine. It listens on that machine only until you choose
+otherwise in Endpoint settings, and refuses a network address without an API key. It
+is plain HTTP, so use a network you trust or put TLS in front of it.
+
+Load settings need a reload. Sampling settings apply on the next request, and fill
+in only what a request leaves unset unless you tell them to override it. Tests take
+priority: a test unloads the model, and agents get a 503 with `Retry-After` until it
+comes back when the machine's queue is clear.
+
 ## API
 
 A representative slice — [`docs/API.md`](docs/API.md) has the full table.
@@ -486,8 +582,14 @@ in [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
 
 ## Known limitations
 
-- VRAM peak is best-effort via `systeminformation.graphics()` (no clean AMD/Vulkan
-  equivalent of `nvidia-smi`). RAM peak is the trustworthy number.
+- VRAM readings depend on the platform: per-process where the OS or driver offers it
+  (Windows GPU counters, `nvidia-smi`), whole-adapter otherwise. Each reading is
+  labelled with its source and accuracy.
+- A no-spill answer can differ between sittings, because the driver splits memory
+  differently from one session to the next. Re-run it if the machine has changed
+  state. llama-fit's answer depends on free memory at that moment too.
+- Sizing a model without downloading it needs a filesystem with sparse files (NTFS,
+  ext4, XFS, APFS, not FAT or exFAT).
 - Only GitHub is supported as a sign-in provider today; the auth layer is
   written to make adding a second provider (e.g. Google) a config-map change,
   not a rewrite, but none is wired up yet.

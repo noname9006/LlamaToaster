@@ -366,7 +366,11 @@ export class MemorySampler {
     const processSharedAccuracy = this.vramProcessSharedMeasured ? this.vramProcessSharedWorstAccuracy : "unavailable";
     const processSharedSource = this.vramProcessSharedMeasured ? this.vramProcessSharedWorstSource : null;
     return {
-      ram_peak_mib: Math.round(this.ramPeakBytes / BYTES_PER_MIB),
+      // The process's shared GPU memory is host RAM too, and an overcommitted
+      // mlock load keeps it out of the working set: measured on flint at -ngl 99,
+      // working set 960 MiB against shared 17572 MiB, with the same free RAM as a
+      // load whose working set read 17802 MiB. A lower bound, not an exact figure.
+      ram_peak_mib: Math.round(Math.max(this.ramPeakBytes, this.vramProcessSharedPeakBytes) / BYTES_PER_MIB),
       vram_peak_mib: this.vramMeasured ? Math.round(this.vramPeakBytes / BYTES_PER_MIB) : null,
       ram_avg_mib:
         this.ramSampleCount > 0 ? Math.round(this.ramSumBytes / this.ramSampleCount / BYTES_PER_MIB) : 0,

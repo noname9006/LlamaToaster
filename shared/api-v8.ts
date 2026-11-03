@@ -106,6 +106,9 @@ export interface ProbeAttemptDto {
   spill_method: "anchor" | "growth" | null;
   spill_shared_growth_mib: number | null;
   spill_unlanded_growth_mib: number | null;
+  /** See ProbeAttemptReport.gpu_host_pinned_mib / gpu_cpu_mapped_mib. */
+  gpu_host_pinned_mib: number | null;
+  gpu_cpu_mapped_mib: number | null;
   /** See ProbeAttemptReport.ladder_ngl_max. */
   ladder_ngl_max: number | null;
   ladder_max_ctx: number | null;
@@ -188,6 +191,9 @@ export interface ProbeDedupPoint {
   spill_method: "anchor" | "growth" | null;
   spill_shared_growth_mib: number | null;
   spill_unlanded_growth_mib: number | null;
+  /** See ProbeAttemptReport.gpu_host_pinned_mib / gpu_cpu_mapped_mib. */
+  gpu_host_pinned_mib: number | null;
+  gpu_cpu_mapped_mib: number | null;
   host_backed_fail: "layers" | "cache" | null;
   /** See ProbeAttemptDto.vram_discrepancy; coerced to false for a sibling row
    * predating the check, same as ok/oom/spill's own boolean coercion above. */

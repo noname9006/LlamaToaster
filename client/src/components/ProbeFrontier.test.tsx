@@ -38,7 +38,7 @@ function row(r: LadderRung, seq: number, overrides: Partial<ProbeAttemptDto> = {
     host_backed_fail: fits && !ok ? "cache" : null, list_devices_free_mib: FREE, claim_fits_free: null,
     load_kind: fits ? "full" : "claim_stop", spill_ready_mib: null, spill_ready_jitter_mib: null,
     spill_work_mib: null, spill_work_jitter_mib: null,
-    spill_method: null, spill_shared_growth_mib: null, spill_unlanded_growth_mib: null, ladder_ngl_max: 41, ladder_max_ctx: 262_144,
+    spill_method: null, spill_shared_growth_mib: null, spill_unlanded_growth_mib: null, gpu_host_pinned_mib: null, gpu_cpu_mapped_mib: null, ladder_ngl_max: 41, ladder_max_ctx: 262_144,
     error: null, created_at: 0, reused_from_run_id: null, vram_discrepancy: 0,
     gpu_layers_resident_est: null, gpu_layers_resident_exact: null,
     ...overrides,

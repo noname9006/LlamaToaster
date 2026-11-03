@@ -153,6 +153,22 @@ describe("MemorySampler VRAM peak semantics", () => {
     expect(stats.vram_total_used_peak_mib).toBe(1949);
   });
 
+  it("counts shared GPU memory toward the RAM peak when the working set under-reads it", async () => {
+    mockReadGpuMemory.mockResolvedValueOnce({
+      total: wholeAdapter(8176),
+      used: wholeAdapter(7000),
+      process: process(7000),
+      processShared: process(17572),
+    } satisfies GpuMemoryReading);
+
+    const sampler = new MemorySampler();
+    (sampler as unknown as { pid: number; backend: string }).pid = TEST_PID;
+    (sampler as unknown as { pid: number; backend: string }).backend = "vulkan";
+    await tick(sampler);
+
+    expect(sampler.stats.ram_peak_mib).toBe(17572);
+  });
+
   it("reports whole-adapter shared memory as unavailable, not zero, when the backend never read it", async () => {
     mockReadGpuMemory.mockResolvedValueOnce({
       total: wholeAdapter(8176),

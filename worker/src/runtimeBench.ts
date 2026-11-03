@@ -940,6 +940,9 @@ export interface ProbeAttemptOutcome {
   spillMethod?: "anchor" | "growth" | null;
   spillSharedGrowthMib?: number | null;
   spillUnlandedGrowthMib?: number | null;
+  /** llama.cpp's *_Host buffers and CPU_Mapped model buffers for this load. */
+  gpuHostPinnedMib?: number | null;
+  gpuCpuMappedMib?: number | null;
   /** The anchor as it stands after an anchor load (built from the first, noise
    * folded in by the second). Worker-only: the ladder loop carries it to every
    * later load; never reported. Undefined on every other load. */
@@ -1269,6 +1272,8 @@ export function toProbeAttemptReport(attempt: ProbeAttemptOutcome): ProbeAttempt
     spill_method: attempt.spillMethod,
     spill_shared_growth_mib: attempt.spillSharedGrowthMib,
     spill_unlanded_growth_mib: attempt.spillUnlandedGrowthMib,
+    gpu_host_pinned_mib: attempt.gpuHostPinnedMib,
+    gpu_cpu_mapped_mib: attempt.gpuCpuMappedMib,
     ladder_ngl_max: attempt.ladderNglMax,
     ladder_max_ctx: attempt.ladderMaxCtx,
     host_backed_fail: attempt.hostBackedFailCause,

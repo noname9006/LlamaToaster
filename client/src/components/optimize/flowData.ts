@@ -39,6 +39,10 @@ export interface ItemOutcome {
   pp: SpeedReading | null;
   tg: SpeedReading | null;
   sharedPeakMib: number | null;
+  /** llama.cpp's *_Host buffers, which shared includes by design. Null: a worker predating the field. */
+  hostPinnedMib?: number | null;
+  /** llama.cpp's CPU_Mapped model buffers, which shared never sees. */
+  cpuMappedMib?: number | null;
   vramPeakMib: number | null;
   ramPeakMib: number | null;
   ppRow?: ResultRow;
@@ -59,6 +63,8 @@ export function itemOutcomes(run: FlowRun, count: number, repeats: number): Item
       pp: reading(ppRow, repeats),
       tg: reading(tgRow, repeats),
       sharedPeakMib: any?.gpu_memory_shared_peak_mib ?? null,
+      hostPinnedMib: any?.gpu_memory_host_pinned_mib ?? null,
+      cpuMappedMib: any?.gpu_memory_cpu_mapped_mib ?? null,
       vramPeakMib: any?.vram_peak_mib ?? null,
       ramPeakMib: any?.ram_peak_mib ?? null,
       ppRow,
@@ -108,5 +114,15 @@ export function isFailed(status: ItemOutcome["status"]): boolean {
 
 /** Spill worth mentioning: more than a quarter GB of the process's GPU memory in system RAM. */
 export function spilledMib(o: ItemOutcome): number | null {
-  return o.sharedPeakMib != null && o.sharedPeakMib > 256 ? o.sharedPeakMib : null;
+  if (o.sharedPeakMib == null) return null;
+  // Shared includes the tensors llama.cpp deliberately keeps in host buffers:
+  // a model that fits entirely can read 1.9 GB of it with nothing spilled.
+  const spill = o.sharedPeakMib - (o.hostPinnedMib ?? 0);
+  return spill > 256 ? spill : null;
+}
+
+/** Model and working memory llama.cpp placed on the CPU side on purpose. */
+export function cpuSideMib(o: ItemOutcome): number | null {
+  if (o.hostPinnedMib == null && o.cpuMappedMib == null) return null;
+  return (o.hostPinnedMib ?? 0) + (o.cpuMappedMib ?? 0);
 }
