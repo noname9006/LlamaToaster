@@ -118,13 +118,14 @@ generating and persisting the session credentials.
   `system` message is discarded outright, so `curl`ing the chat endpoint
   directly can't override its instructions or its per-user data scoping.
 - **Community benchmark aggregates are consent-gated in SQL**, not just
-  stripped of a username column: only users who opted in (Settings) are
-  included, the querying user's own rows never are, and the projection
+  stripped of a username column: only users with contribution switched on
+  (the default; Settings turns it off) are included, and only once the operator
+  has enabled community sharing. The querying user's own rows never are, and the projection
   carries no username, account id, hostname or build — every row is an
   average over a (model, backend, test type, platform, GPU model) group,
   with the contributor count alongside it. Set `COMMUNITY_MIN_CONTRIBUTORS`
   to suppress groups built from fewer than *n* distinct contributors; the
-  default is `1`, so a single opted-in machine can be summarised (labelled
+  default is `1`, so a single contributing machine can be summarised (labelled
   with `contributorCount: 1`). `COMMUNITY_MIN_CONTRIBUTORS=5` restores the
   original k-anonymity floor.
 - **The superadmin surface lives on a separate hostname** (`ADMIN_PUBLIC_URL`)

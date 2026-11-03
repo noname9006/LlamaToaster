@@ -1662,7 +1662,7 @@ export function Models() {
       <p className="mt-1 text-sm text-muted">
         The model catalog (filenames and metadata) is shared across every user, so downloads can be
         deduplicated — a filename you register or download may be visible to others. Benchmark
-        results themselves are never shared unless you opt in (Settings).
+        results reach other users only as anonymous averages.
       </p>
 
       <div className="mt-6">
