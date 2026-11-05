@@ -137,5 +137,5 @@ if ($npmExit -ne 0) {
 }
 # Registers (or re-points) the Chrome extension's VRAM host -- how a worker
 # installed before the host existed picks it up. Never fatal.
-try { & (Join-Path $RepoRoot "worker\chrome-hostegister.ps1") } catch { Write-Warning "Chrome VRAM host not registered: $_" }
+try { & (Join-Path $RepoRoot "worker\chrome-host\register.ps1") } catch { Write-Warning "Chrome VRAM host not registered: $_" }
 exit 0
