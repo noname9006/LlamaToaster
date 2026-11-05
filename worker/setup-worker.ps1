@@ -426,6 +426,10 @@ if (-not (Test-Path "worker\node_modules\.bin\tsx.cmd") -and -not (Test-Path "wo
 # the shim re-pointed at the new location.
 Install-ToasterShim -RepoRoot $RepoRoot
 
+# Lets the LlamaToaster Chrome extension read this machine's VRAM through the
+# worker (Chrome starts worker\chrome-hostram-host.bat on demand). Never fatal.
+try { & (Join-Path $RepoRoot "worker\chrome-hostegister.ps1") } catch { Write-Warning "Chrome VRAM host not registered: $_" }
+
 if ($Reconnect) {
     Write-Host "Starting worker -- watch the console for a short code and a link to re-approve this machine."
 } elseif ($SkippedSetup) {

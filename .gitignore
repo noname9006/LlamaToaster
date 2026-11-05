@@ -66,3 +66,7 @@ worker/daemon-state.json*
 # Throwaway verification scripts and screenshot dumps from local debugging
 # sessions -- never project source.
 scripts/_*
+
+# Written by worker/chrome-host/register.* on each machine.
+worker/chrome-host/com.llamatoaster.vram.json
+worker/chrome-host/vram-host.sh

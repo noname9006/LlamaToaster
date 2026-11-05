@@ -125,6 +125,10 @@ main() {
   (cd "$repo_root" && npm install --prefix worker --omit=dev --ignore-scripts) \
     || fail "npm install failed. The code is updated but its dependencies may not be."
 
+  # Registers (or re-points) the Chrome extension's VRAM host -- how a worker
+  # installed before the host existed picks it up. Never fatal.
+  sh "$repo_root/worker/chrome-host/register.sh" || echo "Warning: Chrome VRAM host not registered." >&2
+
   # Installs from before worker/package.json existed have the whole repo's
   # dependency tree in the root node_modules, which nothing on a worker uses
   # any more. Only removed on a worker-only checkout (no server/ folder) -- a
