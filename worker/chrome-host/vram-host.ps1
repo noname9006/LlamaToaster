@@ -54,6 +54,22 @@ function Read-Gpus {
       }
     }
   } catch {}
+  # What LlamaToaster's own llama.cpp processes hold, per adapter (LUID).
+  $llamaPids = @{}
+  foreach ($pr in Get-Process -ErrorAction SilentlyContinue) { if ($pr.ProcessName -like 'llama-*') { $llamaPids[[string]$pr.Id] = $true } }
+  $script:LlamaRamMib = [math]::Round((($llamaPids.Keys | ForEach-Object { try { (Get-Process -Id $_ -ErrorAction Stop).WorkingSet64 } catch { 0 } } | Measure-Object -Sum).Sum) / 1MB)
+  $llamaGpu = @{}
+  if ($llamaPids.Count -gt 0) {
+    try {
+      foreach ($c in Get-CimInstance Win32_PerfFormattedData_GPUPerformanceCounters_GPUProcessMemory) {
+        if ($c.Name -match '^pid_(\d+)_luid_0x([0-9a-fA-F]+)_0x([0-9a-fA-F]+)' -and $llamaPids[$Matches[1]]) {
+          $k = ("{0}_{1}" -f $Matches[2], $Matches[3]).ToLower()
+          if (-not $llamaGpu[$k]) { $llamaGpu[$k] = @{ d = 0.0; s = 0.0 } }
+          $llamaGpu[$k].d += [double]$c.DedicatedUsage; $llamaGpu[$k].s += [double]$c.SharedUsage
+        }
+      }
+    } catch {}
+  }
   $seen = @{}
   $out = @()
   foreach ($d in [LtDxgi]::Adapters()) {
@@ -73,6 +89,8 @@ function Read-Gpus {
       sharedTotalMib = [math]::Round($shr / 1MB)
       dedicatedUsedMib = $(if ($u) { [math]::Round([double]$u.DedicatedUsage / 1MB) } else { $null })
       sharedUsedMib = $(if ($u) { [math]::Round([double]$u.SharedUsage / 1MB) } else { $null })
+      llamaDedicatedMib = $(if ($llamaGpu[$key]) { [math]::Round($llamaGpu[$key].d / 1MB) } else { 0 })
+      llamaSharedMib = $(if ($llamaGpu[$key]) { [math]::Round($llamaGpu[$key].s / 1MB) } else { 0 })
     }
   }
   return $out
@@ -84,11 +102,11 @@ function Send($obj) {
   $b = [Text.Encoding]::UTF8.GetBytes(($obj | ConvertTo-Json -Depth 5 -Compress))
   $stdout.Write([BitConverter]::GetBytes([int]$b.Length), 0, 4); $stdout.Write($b, 0, $b.Length); $stdout.Flush()
 }
-if ($args -contains '--print') { ConvertTo-Json -InputObject @(Read-Gpus) -Depth 5; exit 0 }
+if ($args -contains '--print') { ConvertTo-Json -InputObject @(Read-Gpus) -Depth 5; "llamaRamMib=$($script:LlamaRamMib)"; exit 0 }
 $len = New-Object byte[] 4
 while ($stdin.Read($len, 0, 4) -eq 4) {
   $n = [BitConverter]::ToInt32($len, 0); $buf = New-Object byte[] $n; $got = 0
   while ($got -lt $n) { $r = $stdin.Read($buf, $got, $n - $got); if ($r -le 0) { exit 0 }; $got += $r }
-  try { Send @{ ok = $true; helper = 1; os = 'windows'; gpus = @(Read-Gpus) } }
+  try { $g = @(Read-Gpus); Send @{ ok = $true; helper = 1; os = 'windows'; gpus = $g; llamaRamMib = $script:LlamaRamMib } }
   catch { Send @{ ok = $false; helper = 1; error = $_.Exception.Message } }
 }

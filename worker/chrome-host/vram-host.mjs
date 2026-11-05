@@ -71,6 +71,20 @@ function mac() {
     dedicatedTotalMib: 0, sharedTotalMib: Math.round(total / MIB), dedicatedUsedMib: null, sharedUsedMib: Math.round((total - free) / MIB) }];
 }
 
+// What llama.cpp processes hold: resident RAM from ps; VRAM only where the driver names processes (nvidia-smi).
+function llamaUsage() {
+  const rows = run("ps", ["-axo", "pid=,rss=,comm="]).split("\n").map((l) => l.trim().match(/^(\d+)\s+(\d+)\s+(.*)$/)).filter(Boolean);
+  const mine = rows.filter((m) => /(^|\/)llama-/.test(m[3]));
+  const pids = new Set(mine.map((m) => m[1]));
+  const ramMib = Math.round(mine.reduce((a, m) => a + Number(m[2]), 0) / 1024);
+  let nvMib = 0;
+  for (const l of run("nvidia-smi", ["--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits"]).split("\n")) {
+    const [pid, mem] = l.split(",").map((s) => s.trim());
+    if (pids.has(pid)) nvMib += Number(mem) || 0;
+  }
+  return { ramMib, nvMib };
+}
+
 const readGpus = () => (process.platform === "darwin" ? ["macos", mac()] : ["linux", [...linuxDrm(), ...nvidia()]]);
 
 function send(obj) {
@@ -90,7 +104,9 @@ if (process.argv.includes("--print")) {
       acc = acc.subarray(4 + acc.readUInt32LE(0));
       try {
         const [os, gpus] = readGpus();
-        send({ ok: true, helper: 1, os, gpus });
+        const llama = llamaUsage();
+        for (const g of gpus) { g.llamaDedicatedMib = g.vendor === "NVIDIA" ? llama.nvMib : 0; g.llamaSharedMib = 0; }
+        send({ ok: true, helper: 1, os, gpus, llamaRamMib: llama.ramMib });
       } catch (e) {
         send({ ok: false, helper: 1, error: String(e?.message ?? e) });
       }
