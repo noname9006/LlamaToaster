@@ -191,9 +191,12 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
   // capabilities lack "mem-speed-v1"; this route doesn't re-check that
   // (an older worker just ignores the unrecognised job type, same as any
   // other capability-gated job -- see shared/types.ts's WORKER_CAPABILITIES).
-  app.post<{ Params: { id: string } }>("/api/workers/:id/measure-memory-speed", async (request, reply) => {
+  // Body { deep?: boolean }: deep adds the whole-memory scan (needs the
+  // "mem-speed-deep-v1" capability; an older worker just runs the quick sweep).
+  app.post<{ Params: { id: string }; Body: { deep?: unknown } | undefined }>("/api/workers/:id/measure-memory-speed", async (request, reply) => {
     const worker = requireOnlineWorker(resolveAuthUser(request)?.user.id, request.params.id);
-    repo.queueRepo.enqueueJob(worker.id, { type: "measure_memory_speed", payload: {} });
+    const deep = request.body?.deep === true;
+    repo.queueRepo.enqueueJob(worker.id, { type: "measure_memory_speed", payload: deep ? { deep: true } : {} });
     queueEvents.emit(worker.id);
     return reply.code(202).send({ ok: true, queued: true });
   });

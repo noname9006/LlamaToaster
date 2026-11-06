@@ -158,6 +158,8 @@ export type SensorMeasurementSource = (typeof SENSOR_MEASUREMENT_SOURCES)[number
 // "mem-speed-v1" is the Workers-page "Measure memory speed" button (see
 // worker/src/memSpeed.ts) -- an older worker has no measure_memory_speed
 // handler, so the button is hidden rather than queuing a job that just fails.
+// "mem-speed-deep-v1" adds the whole-memory "Deep" scan to that button (job
+// payload { deep: true }); an older worker would run only the quick sweep.
 // "fit-map-v1" is the optimization flow's llama-fit-params job (fit map + KV
 // support detection), "speed-run-v1" its baseline/confirm llama-server runs
 // at the user's context, and "thread-sweep-v1" its -t/-tb sweep -- see
@@ -171,6 +173,7 @@ export const WORKER_CAPABILITIES = [
   "probe-frontier-v1",
   "fill-curve-v1",
   "mem-speed-v1",
+  "mem-speed-deep-v1",
   "fit-map-v1",
   "speed-run-v1",
   "thread-sweep-v1",
@@ -1573,8 +1576,12 @@ export interface WorkerVramInfo {
 }
 
 // One thread-count row of the RAM sweep below -- read/write/copy are each
-// the best of several timed trials at that thread count (see
-// worker/src/memSpeed.ts), not a single sample.
+// the MEDIAN of several timed trials at that thread count (see
+// worker/src/memSpeed.ts), not a single sample and not the luckiest one.
+export interface MeasureMemorySpeedJobPayload {
+  deep?: boolean;
+}
+
 export interface MemorySpeedThreadPoint {
   threads: number;
   readGBs: number;
@@ -1586,6 +1593,35 @@ export interface MemorySpeedThreadPoint {
   copyGBs: number;
 }
 
+// Summary of one column over a deep scan's chunks.
+export interface MemorySpeedStat {
+  medianGBs: number;
+  minGBs: number;
+  maxGBs: number;
+}
+
+// "Deep" scan: instead of one fixed-size buffer, the whole free memory (minus
+// a safety margin) is split into equal chunks, every chunk is measured, and
+// the spread is reported. Matters on machines whose memory is not uniform --
+// unevenly populated channels make some physical ranges slower than others, so
+// a single buffer lands in a fast or a slow range at random and the number
+// "jumps" from run to run. read/write/copy per chunk are the best of a few
+// passes; these are the median/min/max over chunks.
+export interface MemorySpeedDeep {
+  chunkMiB: number;
+  chunks: number;
+  testedMiB: number;
+  read: MemorySpeedStat;
+  write: MemorySpeedStat;
+  copy: MemorySpeedStat;
+  // Chunks whose read speed was below 85% of the median read speed.
+  slowChunks: number;
+  // Read GB/s of each chunk in allocation order (capped; drives the speed
+  // strip in the UI). For VRAM a slow tail usually means the driver started
+  // spilling into shared system memory, i.e. the real on-card VRAM ran out.
+  chunkReadGBs: number[];
+}
+
 // Result of a worker's on-demand raw memory-bandwidth measurement (Workers
 // page "Measure memory speed" button) -- distinct from the benchmark-derived
 // tok/s numbers elsewhere in this app: this is the hardware ceiling (how
@@ -1594,6 +1630,9 @@ export interface MemorySpeedThreadPoint {
 // again; never sampled automatically.
 export interface MemorySpeedResult {
   measuredAt: number;
+  // "deep" adds the whole-memory chunk scans (ram.deep / vram.deep) on top of
+  // the usual quick sweep. Absent on results saved by older workers (= fast).
+  mode?: "fast" | "deep";
   ram: {
     // From systeminformation's si.cpu() (worker/src/hardware.ts already
     // uses the same library) -- null when the platform doesn't report a
@@ -1602,6 +1641,11 @@ export interface MemorySpeedResult {
     physicalCores: number | null;
     logicalCores: number;
     points: MemorySpeedThreadPoint[];
+    // Deep mode only: the whole-memory scan, run at the thread count whose
+    // quick-sweep read was highest.
+    deep?: MemorySpeedDeep & { threads: number };
+    // Deep mode was asked for but couldn't run (e.g. not enough free memory).
+    deepSkippedReason?: string;
   };
   vram: {
     deviceName: string;
@@ -1609,6 +1653,8 @@ export interface MemorySpeedResult {
     readGBs: number;
     writeGBs: number;
     copyGBs: number;
+    deep?: MemorySpeedDeep;
+    deepSkippedReason?: string;
   } | null;
   // Set whenever vram above is null -- e.g. no GPU, no OpenCL runtime on
   // this platform/backend, or the measurement itself failed -- so the UI can
@@ -2311,12 +2357,13 @@ export type QueueJob =
   | { job_id: string; type: "measure_quality"; payload: MeasureQualityJobPayload }
   | { job_id: string; type: "fit_map"; payload: FitMapJobPayload }
   | { job_id: string; type: "fit_check"; payload: FitCheckJobPayload }
-  // Workers page "Measure memory speed" button -- no payload, just a signal.
+  // Workers page "Measure memory speed" button -- payload.deep asks for the
+  // whole-memory scan on top of the quick sweep.
   // Result is POSTed back separately (POST /api/worker/mem-speed, see
   // shared/types.ts's MemorySpeedResult) rather than riding this job's
   // completion report, so it's cached on the workers row like `vram` instead
   // of living only in transient job-progress state.
-  | { job_id: string; type: "measure_memory_speed"; payload: Record<string, never> }
+  | { job_id: string; type: "measure_memory_speed"; payload: MeasureMemorySpeedJobPayload }
   // The Serve page. Serial like a test, so they order correctly against tests; a
   // load job ends when the model is ready and the process outlives the job.
   | { job_id: string; type: "daemon_load"; payload: import("./daemonTypes.js").DaemonLoadJobPayload }

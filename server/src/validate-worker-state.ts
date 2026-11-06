@@ -8,6 +8,8 @@ import type {
   ActiveJobReport,
   WorkerVramInfo,
   MemorySpeedResult,
+  MemorySpeedDeep,
+  MemorySpeedStat,
 } from "../../shared/types.js";
 import type { KvLayout, TensorLayerBreakdown } from "../../shared/vramEstimate.js";
 import { isKvLayout } from "../../shared/vramEstimate.js";
@@ -594,6 +596,36 @@ export interface DeviceStartInput {
 // non-negative before it's ever persisted, since it's rendered straight into
 // a table (client/src/components/WorkerCard.tsx).
 const MAX_RAM_POINTS = 64; // generous upper bound on thread-count rows, not a real limit
+const MAX_DEEP_CHUNKS = 512; // matches the worker's cap on the per-chunk speed map
+
+function parseSpeedStat(value: unknown, field: string): MemorySpeedStat {
+  if (typeof value !== "object" || value === null) throw new BadRequestError(`${field} must be an object`);
+  const v = value as Record<string, unknown>;
+  return {
+    medianGBs: requireNonNegNumber(v.medianGBs, `${field}.medianGBs`),
+    minGBs: requireNonNegNumber(v.minGBs, `${field}.minGBs`),
+    maxGBs: requireNonNegNumber(v.maxGBs, `${field}.maxGBs`),
+  };
+}
+
+// The whole-memory "deep scan" summary (shared/types.ts's MemorySpeedDeep).
+function parseMemorySpeedDeep(value: unknown, field: string): MemorySpeedDeep {
+  if (typeof value !== "object" || value === null) throw new BadRequestError(`${field} must be an object`);
+  const d = value as Record<string, unknown>;
+  if (!Array.isArray(d.chunkReadGBs)) throw new BadRequestError(`${field}.chunkReadGBs must be an array`);
+  return {
+    chunkMiB: Math.trunc(requireNonNegNumber(d.chunkMiB, `${field}.chunkMiB`)),
+    chunks: Math.trunc(requireNonNegNumber(d.chunks, `${field}.chunks`)),
+    testedMiB: requireNonNegNumber(d.testedMiB, `${field}.testedMiB`),
+    read: parseSpeedStat(d.read, `${field}.read`),
+    write: parseSpeedStat(d.write, `${field}.write`),
+    copy: parseSpeedStat(d.copy, `${field}.copy`),
+    slowChunks: Math.trunc(requireNonNegNumber(d.slowChunks, `${field}.slowChunks`)),
+    chunkReadGBs: d.chunkReadGBs
+      .slice(0, MAX_DEEP_CHUNKS)
+      .map((n, i) => requireNonNegNumber(n, `${field}.chunkReadGBs[${i}]`)),
+  };
+}
 
 function requireNonNegNumber(value: unknown, field: string): number {
   const n = requireNumber(value, field);
@@ -634,10 +666,23 @@ export function parseMemorySpeedResult(body: unknown): MemorySpeedResult {
       readGBs: requireNonNegNumber(v.readGBs, "result.vram.readGBs"),
       writeGBs: requireNonNegNumber(v.writeGBs, "result.vram.writeGBs"),
       copyGBs: requireNonNegNumber(v.copyGBs, "result.vram.copyGBs"),
+      ...(v.deep !== undefined && v.deep !== null ? { deep: parseMemorySpeedDeep(v.deep, "result.vram.deep") } : {}),
+      ...(typeof v.deepSkippedReason === "string"
+        ? { deepSkippedReason: optionalString(v.deepSkippedReason, "result.vram.deepSkippedReason", 300) }
+        : {}),
+    };
+  }
+
+  let ramDeep: MemorySpeedResult["ram"]["deep"];
+  if (ram.deep !== undefined && ram.deep !== null) {
+    ramDeep = {
+      ...parseMemorySpeedDeep(ram.deep, "result.ram.deep"),
+      threads: Math.trunc(requireNonNegNumber((ram.deep as Record<string, unknown>).threads, "result.ram.deep.threads")),
     };
   }
 
   return {
+    mode: r.mode === "deep" ? "deep" : "fast",
     measuredAt: Date.now(), // server clock, not whatever the worker reported -- same posture as other timestamps in this file
     ram: {
       physicalCores:
@@ -646,6 +691,10 @@ export function parseMemorySpeedResult(body: unknown): MemorySpeedResult {
           : Math.trunc(requireNonNegNumber(ram.physicalCores, "result.ram.physicalCores")),
       logicalCores: Math.trunc(requireNonNegNumber(ram.logicalCores, "result.ram.logicalCores")),
       points,
+      ...(ramDeep ? { deep: ramDeep } : {}),
+      ...(typeof ram.deepSkippedReason === "string"
+        ? { deepSkippedReason: optionalString(ram.deepSkippedReason, "result.ram.deepSkippedReason", 300) }
+        : {}),
     },
     vram,
     vramUnavailableReason: optionalString(r.vramUnavailableReason, "result.vramUnavailableReason", 500),

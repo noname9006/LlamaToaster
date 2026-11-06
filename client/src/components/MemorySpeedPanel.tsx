@@ -1,11 +1,13 @@
-import type { MemorySpeedResult, MemorySpeedThreadPoint } from "../types";
+import type { MemorySpeedDeep, MemorySpeedResult, MemorySpeedStat, MemorySpeedThreadPoint } from "../types";
 import { formatDate } from "../utils";
 import { Tooltip } from "./Tooltip";
 
 // Workers page "Measure memory speed" button + result table -- shows the
 // hardware ceiling this machine's RAM and (Windows/OpenCL only) VRAM can
 // move bytes at, distinct from any model's actual tok/s. See
-// shared/types.ts's MemorySpeedResult and worker/src/memSpeed.ts.
+// shared/types.ts's MemorySpeedResult and worker/src/memSpeed.ts. "Deep scan"
+// additionally walks (nearly) all free RAM / VRAM in chunks and shows the
+// spread over chunks -- see MemorySpeedDeep.
 
 function gbs(n: number): string {
   return `${n.toFixed(1)} GB/s`;
@@ -21,6 +23,84 @@ function bestIdx(points: MemorySpeedThreadPoint[], key: keyof Omit<MemorySpeedTh
 }
 
 const BEST_CELL_CLASS = "font-semibold text-accent";
+
+function statCell(stat: MemorySpeedStat): string {
+  return `${stat.medianGBs.toFixed(1)}`;
+}
+
+function rangeCell(stat: MemorySpeedStat): string {
+  return `${stat.minGBs.toFixed(1)}–${stat.maxGBs.toFixed(1)}`;
+}
+
+// One tiny bar per chunk, height = that chunk's read speed relative to the
+// fastest chunk; chunks under 85% of the median are drawn in the warning
+// colour. Makes uneven memory (slow bands) visible at a glance.
+function ChunkStrip({ deep }: { deep: MemorySpeedDeep }) {
+  const speeds = deep.chunkReadGBs;
+  if (speeds.length < 2) return null;
+  const max = Math.max(...speeds, 0.001);
+  const slowBelow = deep.read.medianGBs * 0.85;
+  return (
+    <div className="mt-2">
+      <div className="flex h-10 items-end gap-px" role="img" aria-label="Read speed of each scanned chunk">
+        {speeds.map((v, i) => (
+          <div
+            key={i}
+            title={`chunk ${i + 1}: ${v.toFixed(1)} GB/s`}
+            className={`min-w-[2px] flex-1 rounded-sm ${v < slowBelow ? "bg-warning" : "bg-accent/70"}`}
+            style={{ height: `${Math.max(4, (v / max) * 100)}%` }}
+          />
+        ))}
+      </div>
+      <p className="mt-1 text-xs text-muted">Read speed per {deep.chunkMiB} MiB chunk, in allocation order.</p>
+    </div>
+  );
+}
+
+function DeepSummary({ deep, threads, kind }: { deep: MemorySpeedDeep; threads?: number; kind: "RAM" | "VRAM" }) {
+  const rows: Array<{ label: string; stat: MemorySpeedStat }> = [
+    { label: "Read", stat: deep.read },
+    { label: "Write", stat: deep.write },
+    { label: "Copy (r+w)", stat: deep.copy },
+  ];
+  return (
+    <div className="mt-3">
+      <p className="mb-1 text-xs text-muted">
+        Deep scan · {(deep.testedMiB / 1024).toFixed(1)} GiB in {deep.chunks} × {deep.chunkMiB} MiB chunks
+        {threads !== undefined && ` · ${threads} thread${threads === 1 ? "" : "s"}`}
+        {deep.slowChunks > 0 &&
+          ` · ${deep.slowChunks} slow chunk${deep.slowChunks === 1 ? "" : "s"} (under 85% of the median read)`}
+      </p>
+      <div className="overflow-x-auto rounded-lg border border-border">
+        <table className="w-full text-left text-sm">
+          <thead>
+            <tr className="border-b border-border text-xs uppercase tracking-wide text-muted">
+              <th className="px-3 py-2 font-medium whitespace-nowrap">{kind}</th>
+              <th className="px-3 py-2 font-medium whitespace-nowrap">Median</th>
+              <th className="px-3 py-2 font-medium whitespace-nowrap">Min – max</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-border">
+            {rows.map((r) => (
+              <tr key={r.label}>
+                <td className="px-3 py-1.5 text-fg">{r.label}</td>
+                <td className="px-3 py-1.5 font-semibold text-accent">{statCell(r.stat)} GB/s</td>
+                <td className="px-3 py-1.5 text-fg">{rangeCell(r.stat)} GB/s</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <ChunkStrip deep={deep} />
+      {kind === "VRAM" && deep.slowChunks > 0 && (
+        <p className="mt-1 text-xs text-muted">
+          A slow tail in VRAM usually means the driver started spilling into shared system memory, i.e. the on-card
+          memory ran out.
+        </p>
+      )}
+    </div>
+  );
+}
 
 function RamTable({ ram }: { ram: MemorySpeedResult["ram"] }) {
   const { points } = ram;
@@ -101,14 +181,18 @@ function VramTable({ vram }: { vram: NonNullable<MemorySpeedResult["vram"]> }) {
 export function MemorySpeedPanel({
   result,
   onMeasure,
+  deepSupported,
   queuing,
   disabled,
 }: {
   result: MemorySpeedResult | null | undefined;
-  onMeasure: () => void;
+  // deep=true asks for the whole-memory scan on top of the quick sweep.
+  onMeasure: (deep: boolean) => void;
+  // False on a worker that predates the deep scan -- the button is hidden.
+  deepSupported: boolean;
   // True only for the brief window between clicking the button and the
   // server accepting the job (queuing.ts's withBusy) -- the sweep itself
-  // takes several seconds and shows up as this worker's normal busy/
+  // takes several seconds (a deep scan, a minute or more) and shows up as this worker's normal busy/
   // BusyPhaseCard state elsewhere on the card (phase "benchmarking", detail
   // like "measuring RAM bandwidth (4 threads)…"), not as a second spinner
   // here.
@@ -123,13 +207,24 @@ export function MemorySpeedPanel({
           {result && <span className="text-xs text-muted">measured {formatDate(result.measuredAt)}</span>}
           <button
             type="button"
-            onClick={onMeasure}
+            onClick={() => onMeasure(false)}
             disabled={disabled || queuing}
             className="flex-none rounded-lg border border-border px-2.5 py-1 text-xs font-semibold text-fg hover:border-accent/50 hover:text-accent disabled:opacity-50"
-            title="Sweep RAM read/write/copy bandwidth across several thread counts, plus VRAM bandwidth where available -- a few seconds, on demand."
+            title="Sweep RAM read/write/copy bandwidth across several thread counts, plus VRAM bandwidth where available -- about 15 seconds, on demand."
           >
             {queuing ? "Queuing…" : result ? "Re-measure" : "Measure memory speed"}
           </button>
+          {deepSupported && (
+            <button
+              type="button"
+              onClick={() => onMeasure(true)}
+              disabled={disabled || queuing}
+              className="flex-none rounded-lg border border-border px-2.5 py-1 text-xs font-semibold text-fg hover:border-accent/50 hover:text-accent disabled:opacity-50"
+              title="The quick sweep, then a scan of nearly all free RAM (and VRAM) in chunks, reporting the spread -- exposes uneven memory. Takes a minute or more and temporarily fills most free memory (a safety margin is kept)."
+            >
+              Deep scan
+            </button>
+          )}
         </div>
       </div>
 
@@ -149,11 +244,21 @@ export function MemorySpeedPanel({
               {result.ram.logicalCores === 1 ? "" : "s"}
             </p>
             <RamTable ram={result.ram} />
+            {result.ram.deep && <DeepSummary deep={result.ram.deep} threads={result.ram.deep.threads} kind="RAM" />}
+            {result.ram.deepSkippedReason && (
+              <p className="mt-2 text-sm text-muted">Deep RAM scan skipped: {result.ram.deepSkippedReason}.</p>
+            )}
           </div>
           <div>
             <p className="mb-1 text-xs text-muted">VRAM</p>
             {result.vram ? (
-              <VramTable vram={result.vram} />
+              <>
+                <VramTable vram={result.vram} />
+                {result.vram.deep && <DeepSummary deep={result.vram.deep} kind="VRAM" />}
+                {result.vram.deepSkippedReason && (
+                  <p className="mt-2 text-sm text-muted">Deep VRAM scan skipped: {result.vram.deepSkippedReason}.</p>
+                )}
+              </>
             ) : (
               <p className="text-sm text-muted">{result.vramUnavailableReason ?? "Not available on this machine."}</p>
             )}

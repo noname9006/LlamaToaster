@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseWorkerState, parseActiveJobReport, parseDeviceStart } from "./validate-worker-state.js";
+import { parseWorkerState, parseActiveJobReport, parseDeviceStart, parseMemorySpeedResult } from "./validate-worker-state.js";
 import { BadRequestError } from "./errors.js";
 
 function validBody(overrides: Record<string, unknown> = {}) {
@@ -376,5 +376,53 @@ describe("parseWorkerState model_files header fields", () => {
 
   it("still rejects a broken file entry itself (no path or size)", () => {
     expect(() => parseWorkerState(validBody({ model_files: [{ n_layer: 2 }] }))).toThrow(BadRequestError);
+  });
+});
+
+describe("parseMemorySpeedResult", () => {
+  const deep = {
+    chunkMiB: 512,
+    chunks: 3,
+    testedMiB: 1536,
+    read: { medianGBs: 40, minGBs: 20, maxGBs: 41 },
+    write: { medianGBs: 29, minGBs: 28, maxGBs: 30 },
+    copy: { medianGBs: 38, minGBs: 30, maxGBs: 40 },
+    slowChunks: 1,
+    chunkReadGBs: [40, 41, 20],
+  };
+  const base = {
+    ram: { physicalCores: 6, logicalCores: 12, points: [{ threads: 1, readGBs: 18, writeGBs: 29, copyGBs: 36 }] },
+    vram: null,
+  };
+
+  it("accepts a quick result without any deep fields (older workers)", () => {
+    const parsed = parseMemorySpeedResult({ result: base });
+    expect(parsed.mode).toBe("fast");
+    expect(parsed.ram.deep).toBeUndefined();
+  });
+
+  it("keeps the RAM and VRAM deep scans", () => {
+    const parsed = parseMemorySpeedResult({
+      result: {
+        mode: "deep",
+        ram: { ...base.ram, deep: { ...deep, threads: 6 } },
+        vram: { deviceName: "GPU", globalMemMiB: 8192, readGBs: 200, writeGBs: 240, copyGBs: 200, deep },
+      },
+    });
+    expect(parsed.mode).toBe("deep");
+    expect(parsed.ram.deep?.threads).toBe(6);
+    expect(parsed.ram.deep?.chunkReadGBs).toEqual([40, 41, 20]);
+    expect(parsed.vram?.deep?.slowChunks).toBe(1);
+  });
+
+  it("keeps the reason a deep scan was skipped", () => {
+    const parsed = parseMemorySpeedResult({ result: { ...base, ram: { ...base.ram, deepSkippedReason: "not enough free RAM" } } });
+    expect(parsed.ram.deepSkippedReason).toBe("not enough free RAM");
+  });
+
+  it("rejects a non-finite or negative deep number", () => {
+    const bad = { ...deep, read: { medianGBs: -1, minGBs: 0, maxGBs: 1 } };
+    expect(() => parseMemorySpeedResult({ result: { ...base, ram: { ...base.ram, deep: { ...bad, threads: 6 } } } })).toThrow(BadRequestError);
+    expect(() => parseMemorySpeedResult({ result: { ...base, ram: { ...base.ram, deep: { ...deep, chunkReadGBs: [1, "x"], threads: 6 } } } })).toThrow(BadRequestError);
   });
 });

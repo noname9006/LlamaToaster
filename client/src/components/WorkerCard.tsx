@@ -355,11 +355,11 @@ export function WorkerCard({ worker, onRefresh }: { worker: Worker; onRefresh: (
     await withBusy("shutdown", () => api.shutdownWorker(worker.id).then(() => undefined), "Shutdown queued");
   }
 
-  async function handleMeasureMemorySpeed() {
+  async function handleMeasureMemorySpeed(deep: boolean) {
     await withBusy(
       "measure-memory-speed",
-      () => api.measureMemorySpeed(worker.id).then(() => undefined),
-      "Memory speed measurement queued"
+      () => api.measureMemorySpeed(worker.id, deep).then(() => undefined),
+      deep ? "Deep memory speed scan queued" : "Memory speed measurement queued"
     );
   }
 
@@ -722,7 +722,8 @@ export function WorkerCard({ worker, onRefresh }: { worker: Worker; onRefresh: (
           {worker.capabilities.includes("mem-speed-v1") && (
             <MemorySpeedPanel
               result={worker.memSpeed}
-              onMeasure={() => void handleMeasureMemorySpeed()}
+              onMeasure={(deep) => void handleMeasureMemorySpeed(deep)}
+              deepSupported={worker.capabilities.includes("mem-speed-deep-v1")}
               queuing={busyTag === "measure-memory-speed"}
               disabled={busyTag !== null || worker.status === "busy"}
             />

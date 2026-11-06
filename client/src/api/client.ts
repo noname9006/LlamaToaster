@@ -280,8 +280,8 @@ export const api = {
   // Queues the RAM/VRAM bandwidth sweep -- result lands asynchronously on
   // this worker's `memSpeed` field once the job finishes (poll via the
   // existing useWorkerStatuses hook, same as every other worker field).
-  measureMemorySpeed: (workerId: string): Promise<{ ok: true; queued: true }> =>
-    request(`/api/workers/${encodeURIComponent(workerId)}/measure-memory-speed`, postJson({})),
+  measureMemorySpeed: (workerId: string, deep = false): Promise<{ ok: true; queued: true }> =>
+    request(`/api/workers/${encodeURIComponent(workerId)}/measure-memory-speed`, postJson(deep ? { deep: true } : {})),
 
   // docs/plans/HEADER_FIT_PLAN.md: asks the machine to size these models with
   // llama-fit-params at one context; answers already on file are not asked

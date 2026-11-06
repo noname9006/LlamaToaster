@@ -160,6 +160,7 @@ import {
   type TestProbeJobPayload,
   type FitMapJobPayload,
   type FitCheckJobPayload,
+  type MeasureMemorySpeedJobPayload,
   type FitCheckResult,
   type FitCheckSource,
   type ModelFitReport,
@@ -5122,9 +5123,10 @@ async function executeRefreshModelsJob(): Promise<void> {
 // caller to bundle into the completion report) -- see reportMemorySpeed's
 // own doc comment for why: it must be durably saved even if the completion
 // report itself has to retry.
-async function executeMeasureMemorySpeedJob(): Promise<void> {
-  log.info("Starting memory speed measurement");
-  const result = await measureMemorySpeed((detail) => updateJobReport({ detail }));
+async function executeMeasureMemorySpeedJob(payload: MeasureMemorySpeedJobPayload): Promise<void> {
+  const deep = payload?.deep === true;
+  log.info(`Starting memory speed measurement${deep ? " (deep)" : ""}`);
+  const result = await measureMemorySpeed((detail) => updateJobReport({ detail }), { deep });
   await withAuth((token) => reportMemorySpeed(config.url, token, config.machine_id!, result));
   log.info(
     `Memory speed measurement completed: RAM ${result.ram.points.length} row(s), VRAM ${
@@ -5162,7 +5164,7 @@ async function executeJob(job: SerialQueueJob): Promise<void> {
     case "shutdown_worker":
       return executeShutdownWorkerJob();
     case "measure_memory_speed":
-      return executeMeasureMemorySpeedJob();
+      return executeMeasureMemorySpeedJob(job.payload);
     case "fit_check":
       return executeFitCheckJob(job.payload);
     case "daemon_load":

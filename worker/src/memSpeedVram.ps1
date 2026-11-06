@@ -8,6 +8,18 @@
 # {"ok":false,"reason":"..."} otherwise. Always exits 0 -- errors are
 # reported IN the JSON, not via exit code, so the worker only has to parse
 # stdout.
+#
+# Quick mode (default): one 256 MiB pair of buffers; each cell is the MEDIAN
+# of five timed windows of ~150 ms (the repetition count is calibrated from a
+# warm-up run), not the single luckiest series.
+# -Deep: on top of that, allocates as many 256 MiB chunks as fit in the card's
+# memory minus a safety margin (the larger of 768 MiB and 10%: the desktop and
+# other apps already hold some), commits each one, then measures read/write/
+# copy on every chunk (best of three windows per chunk). The per-chunk arrays
+# come back in the JSON under "deep" and worker/src/memSpeed.ts summarises them
+# (median/min/max/slow chunks). A slow tail usually means the driver began
+# spilling into shared system memory, i.e. the real on-card VRAM ran out.
+param([switch]$Deep)
 $ErrorActionPreference = 'Stop'
 
 function Emit-Failure([string]$reason) {
@@ -17,7 +29,7 @@ function Emit-Failure([string]$reason) {
 
 try {
   $src = @'
-using System; using System.Diagnostics; using System.Runtime.InteropServices; using System.Text;
+using System; using System.Collections.Generic; using System.Diagnostics; using System.Runtime.InteropServices; using System.Text;
 
 public static class Cl {
   const string D = "OpenCL.dll";
@@ -37,8 +49,10 @@ public static class Cl {
   [DllImport(D)] static extern int clEnqueueWriteBuffer(IntPtr q, IntPtr buf, uint block, UIntPtr off, UIntPtr size, IntPtr ptr, uint nev, IntPtr[] evs, IntPtr ev);
   [DllImport(D)] static extern int clFinish(IntPtr q);
 
-  public static string DeviceName, FailReason;
+  public static string DeviceName, FailReason, DeepSkipped;
   public static double GlobalMemMiB, ReadGBs, WriteGBs, CopyGBs;
+  public static int ChunkMiB;
+  public static double[] ReadChunks, WriteChunks, CopyChunks;
   public static bool Ok;
 
   static void Chk(int e, string what) { if (e != 0) throw new Exception(what + " failed: OpenCL error " + e); }
@@ -46,6 +60,45 @@ public static class Cl {
     byte[] b = new byte[256]; UIntPtr r; clGetDeviceInfo(dev, p, (UIntPtr)256, b, out r);
     return Encoding.ASCII.GetString(b, 0, Math.Max(0, (int)r - 1));
   }
+  static void SetBuf(IntPtr k, uint idx, IntPtr buf) { Chk(clSetKernelArg(k, idx, (UIntPtr)IntPtr.Size, ref buf), "set kernel arg"); }
+
+  // Seconds taken by `reps` back-to-back launches of kernel k.
+  static double Window(IntPtr q, IntPtr k, UIntPtr[] gsz, UIntPtr[] lsz, int reps) {
+    Stopwatch sw = Stopwatch.StartNew();
+    for (int r = 0; r < reps; r++) Chk(clEnqueueNDRangeKernel(q, k, 1, null, gsz, lsz, 0, null, IntPtr.Zero), "run");
+    Chk(clFinish(q), "finish");
+    sw.Stop();
+    return sw.Elapsed.TotalSeconds;
+  }
+
+  static double Median(double[] v) {
+    double[] s = (double[])v.Clone(); Array.Sort(s); int n = s.Length;
+    return (n % 2 == 1) ? s[n / 2] : (s[n / 2 - 1] + s[n / 2]) / 2.0;
+  }
+
+  // Quick-mode cell: two warm-ups (the second calibrates the repetition count
+  // for a ~150 ms window), then five windows; the median GB/s.
+  static double Quick(IntPtr q, IntPtr k, UIntPtr[] gsz, UIntPtr[] lsz, ulong bytes, double factor) {
+    Window(q, k, gsz, lsz, 1);
+    double one = Window(q, k, gsz, lsz, 1);
+    int reps = (int)Math.Ceiling(0.15 / Math.Max(one, 1e-6));
+    if (reps < 1) reps = 1; if (reps > 400) reps = 400;
+    double[] s = new double[5];
+    for (int t = 0; t < 5; t++) s[t] = (double)bytes * reps * factor / Window(q, k, gsz, lsz, reps) / 1e9;
+    return Median(s);
+  }
+
+  // Deep-mode cell: one warm-up, then the best of three 20-launch windows.
+  static double Best(IntPtr q, IntPtr k, UIntPtr[] gsz, UIntPtr[] lsz, ulong bytes, double factor) {
+    Window(q, k, gsz, lsz, 1);
+    double best = 0;
+    for (int t = 0; t < 3; t++) {
+      double gb = (double)bytes * 20 * factor / Window(q, k, gsz, lsz, 20) / 1e9;
+      if (gb > best) best = gb;
+    }
+    return best;
+  }
+
   static ulong InfoU(IntPtr dev, uint p) { byte[] b = new byte[8]; UIntPtr r; clGetDeviceInfo(dev, p, (UIntPtr)8, b, out r); return BitConverter.ToUInt64(b, 0); }
 
   const string KSRC = @"
@@ -63,7 +116,38 @@ __kernel void cp(__global const float4* a, __global float4* b, uint n) {
   for (size_t i = gid; i < n; i += gs) b[i] = a[i];
 }";
 
-  public static void Run(int mib) {
+  // Allocates chunk-sized buffers until the card's memory (minus a margin) is
+  // used or the driver refuses, commits each by writing it once (some drivers
+  // allocate lazily), then measures every chunk. The copy kernel's second
+  // argument (buffer B, the copy destination) is already bound and stays put.
+  // The two quick-mode buffers (A and B, 2 chunks' worth) are still alive, so
+  // they are counted against the budget.
+  static void DeepScan(IntPtr ctx, IntPtr q, IntPtr kRd, IntPtr kWr, IntPtr kCp,
+                       UIntPtr[] gsz, UIntPtr[] lsz, ulong chunkBytes, ulong globalBytes, int mib) {
+    ulong reserve = Math.Max(768UL * 1024 * 1024, globalBytes / 10);
+    if (globalBytes <= reserve + 4 * chunkBytes) { DeepSkipped = "not enough VRAM for a deep scan"; return; }
+    int maxChunks = (int)Math.Min(96UL, (globalBytes - reserve - 2 * chunkBytes) / chunkBytes);
+    List<IntPtr> chunks = new List<IntPtr>();
+    for (int i = 0; i < maxChunks; i++) {
+      int err; IntPtr c = clCreateBuffer(ctx, 1, (UIntPtr)chunkBytes, IntPtr.Zero, out err);
+      if (err != 0 || c == IntPtr.Zero) break;
+      SetBuf(kWr, 0, c);
+      if (clEnqueueNDRangeKernel(q, kWr, 1, null, gsz, lsz, 0, null, IntPtr.Zero) != 0) break;
+      if (clFinish(q) != 0) break;
+      chunks.Add(c);
+    }
+    if (chunks.Count < 2) { DeepSkipped = "could not allocate enough VRAM for a deep scan"; return; }
+    double[] rd = new double[chunks.Count], wr = new double[chunks.Count], cp = new double[chunks.Count];
+    for (int i = 0; i < chunks.Count; i++) {
+      SetBuf(kRd, 0, chunks[i]); SetBuf(kWr, 0, chunks[i]); SetBuf(kCp, 0, chunks[i]);
+      rd[i] = Best(q, kRd, gsz, lsz, chunkBytes, 1.0);
+      wr[i] = Best(q, kWr, gsz, lsz, chunkBytes, 1.0);
+      cp[i] = Best(q, kCp, gsz, lsz, chunkBytes, 2.0);
+    }
+    ChunkMiB = mib; ReadChunks = rd; WriteChunks = wr; CopyChunks = cp;
+  }
+
+  public static void Run(int mib, bool deep) {
     uint np; Chk(clGetPlatformIDs(0, null, out np), "platforms");
     if (np == 0) { Ok = false; FailReason = "no OpenCL platform found"; return; }
     IntPtr[] plats = new IntPtr[np]; clGetPlatformIDs(np, plats, out np);
@@ -105,20 +189,11 @@ __kernel void cp(__global const float4* a, __global float4* b, uint n) {
     clSetKernelArg(kCp, 0, (UIntPtr)IntPtr.Size, ref a); clSetKernelArg(kCp, 1, (UIntPtr)IntPtr.Size, ref b); clSetKernelArg(kCp, 2, (UIntPtr)4, ref nn);
     UIntPtr[] gsz = new UIntPtr[] { (UIntPtr)(1 << 20) }; UIntPtr[] lsz = new UIntPtr[] { (UIntPtr)256 };
 
-    foreach (string which in new string[] { "read", "write", "copy" }) {
-      IntPtr k = which == "read" ? kRd : (which == "write" ? kWr : kCp);
-      double factor = which == "copy" ? 2.0 : 1.0;
-      int reps = 20; double best2 = 0;
-      Chk(clEnqueueNDRangeKernel(q, k, 1, null, gsz, lsz, 0, null, IntPtr.Zero), "warm"); clFinish(q);
-      for (int t = 0; t < 3; t++) {
-        Stopwatch sw = Stopwatch.StartNew();
-        for (int r = 0; r < reps; r++) Chk(clEnqueueNDRangeKernel(q, k, 1, null, gsz, lsz, 0, null, IntPtr.Zero), "run");
-        clFinish(q); sw.Stop();
-        double gb = (double)bytes * reps * factor / sw.Elapsed.TotalSeconds / 1e9;
-        if (gb > best2) best2 = gb;
-      }
-      if (which == "read") ReadGBs = best2; else if (which == "write") WriteGBs = best2; else CopyGBs = best2;
-    }
+    ReadGBs = Quick(q, kRd, gsz, lsz, bytes, 1.0);
+    WriteGBs = Quick(q, kWr, gsz, lsz, bytes, 1.0);
+    CopyGBs = Quick(q, kCp, gsz, lsz, bytes, 2.0);
+
+    if (deep) DeepScan(ctx, q, kRd, kWr, kCp, gsz, lsz, bytes, bestMem, mib);
     Ok = true;
   }
 }
@@ -127,16 +202,26 @@ __kernel void cp(__global const float4* a, __global float4* b, uint n) {
   $null = $cp.ReferencedAssemblies.Add('System.dll')
   Add-Type -TypeDefinition $src -Language CSharp -CompilerParameters $cp
 
-  [Cl]::Run(256)
+  [Cl]::Run(256, [bool]$Deep)
   if (-not [Cl]::Ok) { Emit-Failure([Cl]::FailReason) }
-  [PSCustomObject]@{
+  $out = [ordered]@{
     ok           = $true
     deviceName   = [Cl]::DeviceName
     globalMemMiB = [Cl]::GlobalMemMiB
     readGBs      = [Cl]::ReadGBs
     writeGBs     = [Cl]::WriteGBs
     copyGBs      = [Cl]::CopyGBs
-  } | ConvertTo-Json -Compress
+  }
+  if ($null -ne [Cl]::ReadChunks) {
+    $out.deep = [ordered]@{
+      chunkMiB    = [Cl]::ChunkMiB
+      readChunks  = @([Cl]::ReadChunks)
+      writeChunks = @([Cl]::WriteChunks)
+      copyChunks  = @([Cl]::CopyChunks)
+    }
+  }
+  if ([Cl]::DeepSkipped) { $out.deepSkippedReason = [Cl]::DeepSkipped }
+  $out | ConvertTo-Json -Compress -Depth 4
 } catch {
   Emit-Failure($_.Exception.Message)
 }

@@ -1,77 +1,124 @@
-// One RAM-bandwidth measurement thread, spawned by memSpeed.ts's
-// runRamSweep via worker_threads -- a plain, untranspiled .mjs (not .ts) so
-// it loads under `node worker_threads` regardless of how the parent process
-// itself was started (tsx vs a bundled build), see memSpeed.ts's own doc
-// comment for why.
+// One RAM-bandwidth measurement thread, spawned by memSpeed.ts via
+// worker_threads -- a plain, untranspiled .mjs (not .ts) so it loads under
+// `node worker_threads` regardless of how the parent process itself was
+// started (tsx vs a bundled build), see memSpeed.ts's own doc comment.
 //
-// Each thread owns a disjoint element range [start, end) of two shared
-// Float64Array views (bufA the source, bufB the copy destination) and times
-// its own read/write/copy loop with performance.now() -- the orchestrator
-// takes the SLOWEST thread's elapsed time as the row's wall-clock (the
-// other threads finished no later), which is the standard way to report a
-// parallel-threads bandwidth figure.
+// The thread is a small command server. The orchestrator hands it shared
+// WebAssembly.Memory regions ("attach"), then sends "commit" (touch the pages
+// of this thread's slice so first-touch page faults aren't measured) and
+// "run" (execute one op over this thread's slice).
+//
+// "run" is what makes the numbers trustworthy: every active thread first
+// meets at a barrier (Atomics on a shared control block), so they all start
+// the timed work within microseconds of each other; each records its own
+// start/end from process.hrtime (one monotonic clock for every thread --
+// performance.now() is per-thread-origin); the orchestrator then reports
+// total bytes / (latest end - earliest start). The earlier version let each
+// thread time itself from whenever its message happened to arrive and divided
+// by the slowest thread's own elapsed time, which under-counted overlap (so a
+// run could read high) and was at the mercy of one late thread.
 import { parentPort, workerData } from "node:worker_threads";
-import { performance } from "node:perf_hooks";
+import { instantiateKernels, KERNEL_STEP_BYTES } from "./memSpeedKernels.mjs";
 
-const a = new Float64Array(workerData.bufA);
-const b = new Float64Array(workerData.bufB);
-const { start, end } = workerData;
-const len = end - start;
+const ctl = new Int32Array(workerData.ctl); // [0] arrived, [1] go generation
+const times = new BigInt64Array(workerData.times); // [2*slot] start, [2*slot+1] end (ns)
 
-// Defeats dead-code elimination of the read loop without materially
-// affecting timing (the branch is never taken) -- same trick used in the
-// C#/PowerShell prototype this replaces.
-let sink = 0;
+// Work is issued to the kernels in blocks so (a) the wasm engine's dynamic
+// tier-up (Liftoff -> optimizing compiler) takes effect between calls -- there
+// is no on-stack replacement for wasm, so one giant call would run entirely in
+// the baseline tier -- and (b) a long pass doesn't sit in one uninterruptible
+// call.
+const BLOCK_BYTES = 4 * 1024 * 1024;
 
-function runRead(reps) {
-  // 4-way unrolled with independent accumulators -- lets the engine issue
-  // overlapping loads instead of stalling on one dependency chain, so this
-  // reflects the memory system's throughput rather than being an artifact
-  // of a single-accumulator loop's own per-element overhead.
-  let acc0 = 0, acc1 = 0, acc2 = 0, acc3 = 0;
-  const stop = end - ((end - start) % 4);
-  for (let r = 0; r < reps; r++) {
-    let i = start;
-    for (; i < stop; i += 4) {
-      acc0 += a[i];
-      acc1 += a[i + 1];
-      acc2 += a[i + 2];
-      acc3 += a[i + 3];
-    }
-    for (; i < end; i++) acc0 += a[i];
+const regions = new Map(); // id -> { r, w, c }
+let sink = 0n;
+
+function attach(id, memory) {
+  const k = instantiateKernels(memory);
+  // Tiny warm-up so the kernels are already optimized before the first timed
+  // window: a few hundred calls over 64 KiB at the start of the region, which
+  // is the thread's own memory anyway (the first run's commit pass rewrites it).
+  const span = 64 * 1024;
+  for (let i = 0; i < 400; i++) {
+    sink += k.r(0, span, 1);
+    k.w(0, span, 1);
+    k.c(0, span / 2, span / 2, 1);
   }
-  const acc = acc0 + acc1 + acc2 + acc3;
-  sink += acc === 123456789.123456 ? 1 : 0;
-  return len * 8 * reps;
+  regions.set(id, k);
 }
 
-function runWrite(reps) {
-  for (let r = 0; r < reps; r++) a.fill(r + 1, start, end);
-  return len * 8 * reps;
+function runBlocks(start, end, fn) {
+  for (let b = start; b < end; b += BLOCK_BYTES) fn(b, Math.min(b + BLOCK_BYTES, end));
 }
 
-function runCopy(reps) {
-  const src = a.subarray(start, end);
-  for (let r = 0; r < reps; r++) b.set(src, start);
-  return len * 8 * 2 * reps; // bytes read + bytes written
+function execute(op, region, start, end, delta, passes) {
+  const k = regions.get(region);
+  if (!k) throw new Error(`unknown region ${region}`);
+  if ((end - start) % KERNEL_STEP_BYTES !== 0 || end <= start) throw new Error("slice must be a positive multiple of 64 bytes");
+  if (op === "read") {
+    let acc = 0n;
+    for (let p = 0; p < passes; p++) runBlocks(start, end, (b, e) => { acc += k.r(b, e, 1); });
+    sink += acc;
+  } else if (op === "write") {
+    for (let p = 0; p < passes; p++) runBlocks(start, end, (b, e) => k.w(b, e, 1));
+  } else if (op === "copy") {
+    for (let p = 0; p < passes; p++) runBlocks(start, end, (b, e) => k.c(b, e, delta, 1));
+  } else {
+    throw new Error(`unknown op ${op}`);
+  }
 }
 
-function run(op, reps) {
-  if (op === "read") return runRead(reps);
-  if (op === "write") return runWrite(reps);
-  return runCopy(reps);
+function barrier(gen, n) {
+  const arrived = Atomics.add(ctl, 0, 1) + 1;
+  if (arrived === n) {
+    Atomics.store(ctl, 1, gen);
+    Atomics.notify(ctl, 1);
+    return;
+  }
+  // Spin briefly (the other threads are normally microseconds behind), then
+  // park on the futex so a straggler isn't starved by spinners.
+  for (let i = 0; i < 20000; i++) if (Atomics.load(ctl, 1) === gen) return;
+  for (;;) {
+    const cur = Atomics.load(ctl, 1);
+    if (cur === gen) return;
+    Atomics.wait(ctl, 1, cur, 100);
+  }
+}
+
+function handle(msg) {
+  switch (msg.cmd) {
+    case "attach":
+      attach(msg.region, msg.memory);
+      return {};
+    case "detach":
+      regions.delete(msg.region);
+      return {};
+    case "commit": {
+      // Touch (write) this thread's slice once: page faults and first-touch
+      // placement are paid here, never inside a timed window.
+      execute("write", msg.region, msg.start, msg.end, 0, 1);
+      return {};
+    }
+    case "run": {
+      barrier(msg.gen, msg.threads);
+      const t0 = process.hrtime.bigint();
+      execute(msg.op, msg.region, msg.start, msg.end, msg.delta, msg.passes);
+      const t1 = process.hrtime.bigint();
+      times[2 * msg.slot] = t0;
+      times[2 * msg.slot + 1] = t1;
+      return {};
+    }
+    default:
+      throw new Error(`unknown command ${msg.cmd}`);
+  }
 }
 
 parentPort.on("message", (msg) => {
-  if (msg.cmd !== "run") return;
-  // One untimed warm-up rep first -- lets the JIT settle on this thread
-  // before the timed loop, so the FIRST timed sample isn't penalized by
-  // interpreter-speed execution the way a cold single-shot call would be.
-  run(msg.op, 1);
-  const t0 = performance.now();
-  const bytes = run(msg.op, msg.reps);
-  const elapsedMs = performance.now() - t0;
-  parentPort.postMessage({ done: true, bytes, elapsedMs, sink });
+  try {
+    parentPort.postMessage({ reqId: msg.reqId, ...handle(msg) });
+  } catch (err) {
+    parentPort.postMessage({ reqId: msg.reqId, error: err instanceof Error ? err.message : String(err) });
+  }
 });
 
 parentPort.postMessage({ ready: true });
