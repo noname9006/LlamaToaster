@@ -15,7 +15,7 @@
 # supplies the short name. The raw URL keeps working directly if you prefer
 # to see exactly where it points, or the origin is unreachable:
 #
-#   irm https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.ps1 | iex
+#   irm https://raw.githubusercontent.com/LlamaToaster/LlamaToaster/main/worker/bootstrap.ps1 | iex
 #
 # It'll ask which drive/folder to use. To pass any option (including -Dir,
 # to skip the prompts for unattended/scripted use), a plain pipe into iex
@@ -89,8 +89,8 @@ Write-Host "  5. start the worker -- it prints a code to approve this machine at
 Write-Host "The worker opens no inbound ports; it polls $Url for work." -ForegroundColor DarkGray
 Write-Host ""
 
-$RepoUrl = "https://github.com/noname9006/LlamaToaster.git"
-$RepoOwnerSlash = "noname9006/LlamaToaster"
+$RepoUrl = "https://github.com/LlamaToaster/LlamaToaster.git"
+$RepoOwnerSlash = "LlamaToaster/LlamaToaster"
 
 # Fresh/default Windows machines ship with the PowerShell execution policy
 # set to Restricted (or AllSigned in some orgs), which blocks running *any*

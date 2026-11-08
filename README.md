@@ -310,11 +310,11 @@ audit. The raw GitHub URLs keep working directly if you prefer them, or the
 origin is unreachable:
 
 ```powershell
-irm https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.ps1 | iex
+irm https://raw.githubusercontent.com/LlamaToaster/LlamaToaster/main/worker/bootstrap.ps1 | iex
 ```
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.sh | bash
+curl -fsSL https://raw.githubusercontent.com/LlamaToaster/LlamaToaster/main/worker/bootstrap.sh | bash
 ```
 
 `-Url`/`--url` defaults to `https://llamatoaster.com`. **Self-hosting?** Pass

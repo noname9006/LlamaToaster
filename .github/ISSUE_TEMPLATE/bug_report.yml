@@ -6,7 +6,7 @@ body:
     attributes:
       value: |
         Please don't report security vulnerabilities here — see
-        [SECURITY.md](https://github.com/noname9006/LlamaToaster/blob/main/SECURITY.md)
+        [SECURITY.md](https://github.com/LlamaToaster/LlamaToaster/blob/main/SECURITY.md)
         for private reporting.
 
   - type: dropdown

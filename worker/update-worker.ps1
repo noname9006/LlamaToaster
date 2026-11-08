@@ -21,7 +21,7 @@ param(
 $ErrorActionPreference = "Stop"
 
 $RepoRoot = Split-Path -Parent $PSScriptRoot
-$RepoUrl = "https://github.com/noname9006/LlamaToaster.git"
+$RepoUrl = "https://github.com/LlamaToaster/LlamaToaster.git"
 
 function Fail {
     param([string]$Message)

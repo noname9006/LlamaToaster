@@ -82,7 +82,7 @@ export interface SetupScenario {
   sourceUrl?: Record<SetupOS, string>;
 }
 
-const RAW_BOOTSTRAP = "https://github.com/noname9006/LlamaToaster/blob/main/worker";
+const RAW_BOOTSTRAP = "https://github.com/LlamaToaster/LlamaToaster/blob/main/worker";
 
 // url is this server's own public origin (pass window.location.origin -- the
 // page showing this command IS served from PUBLIC_URL, see deploy/

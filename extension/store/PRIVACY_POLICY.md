@@ -36,7 +36,7 @@ The popup links to `llamatoaster.com` and to the project's GitHub page. These ar
 
 ## Contact and source code
 
-The extension is open source (MIT): <https://github.com/noname9006/LlamaToaster>. For questions about this policy, open an issue there.
+The extension is open source (MIT): <https://github.com/LlamaToaster/LlamaToaster>. For questions about this policy, open an issue there.
 
 ## Changes
 

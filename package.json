@@ -6,7 +6,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/noname9006/LlamaToaster.git"
+    "url": "git+https://github.com/LlamaToaster/LlamaToaster.git"
   },
   "engines": {
     "node": ">=22.22.2"
