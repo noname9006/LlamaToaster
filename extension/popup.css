@@ -210,19 +210,19 @@ body.panel { width: auto; min-height: 100vh; }
 button.ghost.tiny { padding: 0 5px; font-size: 11px; line-height: 16px; vertical-align: 1px; }
 #editVram { border: 0; background: transparent; color: var(--muted); padding: 0 0 0 4px; font-weight: 400; }
 #editVram:hover { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }
-.keep-row { height: 28px; align-items: center; }
-.keep-free { display: flex; flex-wrap: nowrap; align-items: center; justify-content: flex-end; white-space: nowrap; }
-#customMargin { width: 34px; height: 19px; line-height: 19px; box-sizing: border-box; padding: 0; border: 0; background: transparent; color: var(--fg); text-align: right; -moz-appearance: textfield; }
-/* Spin arrows stay in place (no layout shift) and only show on hover or while typing. */
-#customMargin { width: 50px; }
-#customMargin::-webkit-inner-spin-button { opacity: 0; margin-left: 2px; }
-#customMargin:hover::-webkit-inner-spin-button, #customMargin:focus::-webkit-inner-spin-button { opacity: 0.7; }
-#customMargin:focus { outline: 0; caret-color: var(--accent); }
-/* "Enter manually": the number box stands where the choice's label was; the select shrinks to its chevron. */
-#margin.chev-only { width: 14px; min-width: 0; padding: 0 0 0 4px; box-sizing: content-box; color: transparent; overflow: hidden; }
-#margin.chev-only option { color: var(--fg); }
-#margin { max-width: 130px; }
-#customUnit { margin: 0 2px 0 3px; color: var(--fg); }
+/* Keep free: a toaster-lever paddle under each memory bar, on one line with
+   its label. Where it stands is where the model's share ends; the part of the
+   bar right of it (kept free) is dimmed. */
+.bar > i.keep { right: 0; left: auto; background: rgba(11, 9, 7, 0.55); pointer-events: none; }
+.bar > i.edge { width: 2px; margin-left: -1px; background: var(--accent); pointer-events: none; }
+.keep-track { position: relative; height: 24px; margin: -4px 1px 6px; cursor: pointer; user-select: none; touch-action: none; }
+.keep-track:focus-visible { outline: 0; }
+.keep-track:focus-visible .lever { outline: 1px solid var(--accent); outline-offset: 2px; }
+.keep-track .lbl { position: absolute; left: -1px; top: 2px; line-height: 20px; color: var(--muted); pointer-events: none; }
+.keep-track .lever { position: absolute; top: 3px; width: 7px; height: 14px; margin-left: -3.5px; border-radius: 2.5px; background: var(--accent); box-shadow: inset 0 0 0 1px var(--accent-fg), 0 1px 1px rgba(0, 0, 0, 0.6); cursor: grab; z-index: 1; }
+.keep-track .lever::after { content: ""; position: absolute; left: 2px; top: 2px; width: 1.2px; height: 10px; border-radius: 1px; background: #ffd08a; }
+.keep-track.drag .lever { cursor: grabbing; }
+.keep-track .val { position: absolute; top: 2px; line-height: 20px; font-size: 12px; color: var(--accent); white-space: nowrap; pointer-events: none; }
 
 /* Manual / Auto: a rocker key between the two words. The chosen word gets an
    outer glow, its letters keep their colour. */

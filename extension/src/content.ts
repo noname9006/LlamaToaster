@@ -7,7 +7,7 @@
 // every chip is marked at once. Settings live in the extension popup.
 
 import toasterSvg from "virtual:toaster-svg";
-import { deviceBudget, deviceInUseMib, evaluateFit, type FitAnswer } from "./fit";
+import { deviceBudget, deviceInUseMib, evaluateFit, ramInUseMib, type FitAnswer } from "./fit";
 import { detectGpu, memoryPicture, type MemoryPicture, type RamReading } from "./hardware";
 import type { ModelFacts } from "./hfHeader";
 import { CTX_SLIDER_MAX, ctxFromSlider, ctxLabel, getGpu, getSettings, setSettings, sliderFromCtx, ticksHtml, type GpuInfo, type Settings } from "./settings";
@@ -78,6 +78,8 @@ interface PageState {
   armed: boolean;
   /** VRAM in use when the check started, for "keep free: in use now". */
   inUseAtStartMib: number | null;
+  /** RAM in use when the check started, for the RAM "keep free: in use now". */
+  ramInUseAtStartMib: number | null;
   bar: ToasterBar | null;
 }
 
@@ -178,7 +180,7 @@ function renderChip(c: Chip) {
 function reevaluate() {
   if (!page) return;
   const mem = memNow();
-  const budget = deviceBudget(mem, settings, page.inUseAtStartMib);
+  const budget = deviceBudget(mem, settings, page.inUseAtStartMib, page.ramInUseAtStartMib);
   for (const c of page.chips) {
     if (c.facts) {
       c.answer = mem.vramUnknown ? null : evaluateFit(c.facts, mem, settings, budget);
@@ -280,11 +282,15 @@ function buildInfo(): ModelInfo {
     if (!reevalFrame) reevalFrame = requestAnimationFrame(() => ((reevalFrame = 0), reevaluate()));
   });
   slider.addEventListener("change", () => flushCtxSave());
+  // Not activeElement: the slider keeps focus after a drag, which froze it against changes from the popup.
+  slider.addEventListener("pointerdown", () => (sliderDragging = true));
+  for (const ev of ["pointerup", "pointercancel"]) window.addEventListener(ev, () => { sliderDragging = false; });
   // Clicks on the slider must not reach Hugging Face's handlers.
   root.addEventListener("click", (e) => e.stopPropagation());
   return info;
 }
 
+let sliderDragging = false;
 let reevalFrame = 0;
 let ctxSaveTimer: ReturnType<typeof setTimeout> | null = null;
 let ctxPending: number | null = null;
@@ -341,7 +347,7 @@ function renderInfo(p: PageState) {
 
 function paintSlider(info: ModelInfo) {
   const ctx = info.maxCtx ? Math.min(settings.ctx, info.maxCtx) : settings.ctx;
-  if (document.activeElement !== info.slider) info.slider.value = String(sliderFromCtx(ctx));
+  if (!sliderDragging) info.slider.value = String(sliderFromCtx(ctx));
   info.slider.style.setProperty("--frac", String(Number(info.slider.value) / Number(info.slider.max)));
   info.value.textContent = `${ctxLabel(ctx)} tokens${info.maxCtx && settings.ctx > info.maxCtx ? " (model maximum)" : ""}`;
 }
@@ -424,7 +430,9 @@ async function calculate() {
   updateBar();
   try {
     await Promise.all([ensureGpu(), refreshRam()]);
-    p.inUseAtStartMib = deviceInUseMib(memNow());
+    const atStart = memNow();
+    p.inUseAtStartMib = deviceInUseMib(atStart);
+    p.ramInUseAtStartMib = ramInUseMib(atStart);
     if (queue.length) await mapChips(p);
     // Two headers at a time: quick, and gentle on Hugging Face. A file's
     // header never changes for a revision, so it is read only once.
@@ -504,7 +512,7 @@ function scan() {
   if (buttons.length === 0) return;
 
   if (!page) {
-    page = { repo, sha: null, chips: [], running: false, ready: false, armed: resumeArmed, inUseAtStartMib: null, bar: null };
+    page = { repo, sha: null, chips: [], running: false, ready: false, armed: resumeArmed, inUseAtStartMib: null, ramInUseAtStartMib: null, bar: null };
     resumeArmed = false;
   }
   let added = false;
@@ -547,7 +555,7 @@ async function init() {
   // Available RAM moves; keep the marks honest while the tab is in view.
   setInterval(() => {
     if (page && document.visibilityState === "visible" && page.chips.some((c) => c.facts)) void refreshRam().then(reevaluate);
-  }, 10_000);
+  }, 3_000);
 }
 
 void init();

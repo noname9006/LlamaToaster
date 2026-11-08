@@ -43,6 +43,16 @@ export interface DeviceBudget {
   marginNote: string;
   /** What freeMib is, for the tooltip: the device's whole memory or what it has available. */
   freeLabel: "total" | "available";
+  /** System RAM the same way: the base the fit may fill (null: no RAM reading) and what stays free of it. */
+  ramFreeMib: number | null;
+  ramMarginMib: number;
+  ramMarginNote: string;
+  ramFreeLabel: "total" | "available";
+}
+
+/** RAM in use right now (total minus available). */
+export function ramInUseMib(mem: MemoryPicture): number | null {
+  return mem.ramTotalMib != null && mem.ramAvailableMib != null ? Math.max(0, mem.ramTotalMib - mem.ramAvailableMib) : null;
 }
 
 /** VRAM in use right now (total minus free): what "keep free: in use now" captures when a check starts. */
@@ -51,9 +61,9 @@ export function deviceInUseMib(mem: MemoryPicture): number {
 }
 
 /**
- * "In use now" keeps free what was in use when the check started and fits
- * against the whole device, so the marks stay put as other apps' usage moves
- * (or as llama.cpp itself loads). The other modes keep a fixed amount free out
+ * "In use now" keeps free what is in use at this moment and fits against the
+ * whole device, so the marks follow other apps' usage live, like a context
+ * change does. The other modes keep a fixed amount free out
  * of the device's whole memory (8 GB with 1 GB kept free: the model gets 7 GB),
  * so "in use now" is just the same rule with the amount other apps hold.
  *
@@ -61,14 +71,28 @@ export function deviceInUseMib(mem: MemoryPicture): number {
  * is shared with RAM, the total isn't the right base: the user's own "other
  * apps use" figure is already taken off deviceFreeMib, and it stays.
  */
-export function deviceBudget(mem: MemoryPicture, s: Settings, inUseAtStartMib: number | null): DeviceBudget {
-  if (mem.kind === "cpu") return { freeMib: 0, marginMib: 0, marginNote: "", freeLabel: "available" };
+export function deviceBudget(mem: MemoryPicture, s: Settings, inUseAtStartMib: number | null, ramInUseAtStartMib: number | null = null): DeviceBudget {
+  return { ...gpuBudget(mem, s, inUseAtStartMib), ...ramBudget(mem, s, ramInUseAtStartMib) };
+}
+
+function gpuBudget(mem: MemoryPicture, s: Settings, inUseAtStartMib: number | null) {
+  if (mem.kind === "cpu") return { freeMib: 0, marginMib: 0, marginNote: "", freeLabel: "available" as const };
   if (s.marginMode === "current") {
-    return { freeMib: mem.deviceTotalMib, marginMib: inUseAtStartMib ?? deviceInUseMib(mem), marginNote: " (in use when the check started)", freeLabel: "total" };
+    return { freeMib: mem.deviceTotalMib, marginMib: deviceInUseMib(mem), marginNote: " (in use now)", freeLabel: "total" as const };
   }
-  const marginMib = s.marginMode === "custom" ? s.customMarginMib : s.marginMib;
-  if (mem.kind === "vram" && mem.measured) return { freeMib: mem.deviceTotalMib, marginMib, marginNote: "", freeLabel: "total" };
-  return { freeMib: mem.deviceFreeMib, marginMib, marginNote: "", freeLabel: "available" };
+  if (mem.kind === "vram" && mem.measured) return { freeMib: mem.deviceTotalMib, marginMib: s.marginMib, marginNote: "", freeLabel: "total" as const };
+  return { freeMib: mem.deviceFreeMib, marginMib: s.marginMib, marginNote: "", freeLabel: "available" as const };
+}
+
+/** RAM follows the GPU's rule: "in use now" keeps free what other apps held
+ * when the check started; a fixed amount is kept free of the whole RAM. */
+function ramBudget(mem: MemoryPicture, s: Settings, inUseAtStartMib: number | null) {
+  const total = mem.ramTotalMib;
+  if (total == null) return { ramFreeMib: null, ramMarginMib: 0, ramMarginNote: "", ramFreeLabel: "total" as const };
+  if (s.ramMarginMode === "current") {
+    return { ramFreeMib: total, ramMarginMib: ramInUseMib(mem) ?? 0, ramMarginNote: " (in use now)", ramFreeLabel: "total" as const };
+  }
+  return { ramFreeMib: total, ramMarginMib: s.ramMarginMib, ramMarginNote: "", ramFreeLabel: "total" as const };
 }
 
 /** Which bread scale this machine grades on. */
@@ -87,7 +111,8 @@ export function evaluateFit(facts: ModelFacts, mem: MemoryPicture, s: Settings, 
   const scale = memoryScale(mem);
   const memory: FitMemory = {
     devices: hasDevice ? [{ name: "gpu", description: "", total_mib: mem.deviceTotalMib, free_mib: freeMib }] : [],
-    ram_available_mib: mem.ramAvailableMib,
+    // What the model may take from RAM: the base less what stays free.
+    ram_available_mib: budget.ramFreeMib != null ? Math.max(0, budget.ramFreeMib - budget.ramMarginMib) : null,
     ram_total_mib: mem.ramTotalMib,
     unified: mem.kind === "unified",
   };
@@ -133,7 +158,7 @@ export function evaluateFit(facts: ModelFacts, mem: MemoryPicture, s: Settings, 
   if (hasDevice) {
     details.push(`${mem.kind === "unified" ? "Unified memory" : "VRAM"}: needs ${gb(sim.dev_used_mib)} of ${gb(freeMib)} ${budget.freeLabel}, keeping ${gb(marginMib)} free${budget.marginNote}`);
   }
-  if (mem.ramAvailableMib != null) details.push(`RAM: needs ${gb(sim.host_used_mib)} of ${gb(mem.ramAvailableMib)} available`);
+  if (budget.ramFreeMib != null) details.push(`RAM: needs ${gb(sim.host_used_mib)} of ${gb(budget.ramFreeMib)} ${budget.ramFreeLabel}, keeping ${gb(budget.ramMarginMib)} free${budget.ramMarginNote}`);
   else details.push(`RAM: needs ${gb(sim.host_used_mib)}`);
   if (hasDevice) {
     details.push(`Layers on the GPU: ${sim.layers_gpu} of ${sim.layers_total}${sim.overflow_layers > 0 ? `, experts of ${sim.overflow_layers} layers in RAM` : ""}`);

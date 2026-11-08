@@ -25,8 +25,7 @@ mkdirSync(join(out, "fonts"), { recursive: true });
 for (const f of ["manifest.json", "popup.html", "popup.css", "content.css"]) cpSync(join(here, f), join(out, f));
 // The side panel is the popup page, marked so it fills the panel's width.
 writeFileSync(join(out, "panel.html"), readFileSync(join(here, "popup.html"), "utf8").replace("<body>", '<body class="panel">'));
-cpSync(join(root, "client", "public", "toaster_favicon.png"), join(out, "icons", "icon.png"));
-cpSync(join(root, "client", "public", "logo.png"), join(out, "icons", "logo.png"));
+for (const s of [16, 32, 48, 128]) cpSync(join(here, "icons", `icon-${s}.png`), join(out, "icons", `icon-${s}.png`));
 cpSync(join(here, "icons", "llama.png"), join(out, "icons", "llama.png"));
 cpSync(join(here, "icons", "wordmark.png"), join(out, "icons", "wordmark.png"));
 

@@ -1,8 +1,8 @@
 import { measureBandwidth, type MeasurePhase } from "./bandwidth";
-import { deviceInUseMib } from "./fit";
+import { deviceBudget, deviceInUseMib } from "./fit";
 import { primaryGpu, ramLabel, readHelper, type HelperApp, type HelperGpu, type HelperRam, type HelperResult } from "./helper";
 import { detectGpu, memoryPicture, readCpu, readRam, type MemoryPicture } from "./hardware";
-import { CTX_SLIDER_MAX, ctxFromSlider, ctxLabel, getBandwidth, getGpu, getSettings, setSettings, sliderFromCtx, ticksHtml, type BandwidthResult, type GpuInfo, type Settings } from "./settings";
+import { CTX_SLIDER_MAX, ctxFromSlider, ctxLabel, getBandwidth, getGpu, getSettings, setSettings, sliderFromCtx, ticksHtml, type BandwidthResult, type GpuInfo, type MarginMode, type Settings } from "./settings";
 import { gradeSvg } from "../../shared/breadMarks";
 import { fitGradeLegendLabel, fitGrades } from "../../shared/fitGrade";
 import { memoryScale } from "./fit";
@@ -96,7 +96,7 @@ async function renderMemory() {
   const llamaRam = ram ? Math.min(helperRes?.ok ? helperRes.reading.llamaRamMib : 0, ram.totalMib - ram.availableMib) : 0;
 
   const type = ramLabel(ramInfo);
-  if (ram) parts("ram", ...(type ? [`${type} · `] : []), [gb(ram.availableMib)], " free of ", [size(ram.totalMib)]);
+  if (ram) parts("ram", [gb(ram.availableMib)], " free of ", [size(ram.totalMib)], ...(type ? [` · ${type}`] : []));
   else parts("ram", "unknown");
   $("ram").title = ramInfo ? `${ramInfo.modules} module${ramInfo.modules === 1 ? "" : "s"}${ramInfo.ratedMts ? `, rated ${ramInfo.ratedMts} MT/s` : ""}` : "RAM type and speed come from a LlamaToaster worker on this machine";
   if (ram) setBar("ramBar", llamaRam, ram.totalMib - ram.availableMib - llamaRam, ram.totalMib, barApps(helperRes?.ok ? helperRes.reading.topRam : null, APP_MIN_MIB.ram));
@@ -135,7 +135,8 @@ async function renderMemory() {
   else parts("vramAvail", [gb(mem.deviceFreeMib)], " free of ", [size(mem.deviceTotalMib)]);
   // VRAM: free vs in use. LlamaToaster's own llama.cpp counts as in use here.
   setBar("vramBar", 0, deviceInUseMib(mem), mem.deviceTotalMib, mem.measured ? barApps(helper?.apps, APP_MIN_MIB.vram) : []);
-  $("vramBar").style.display = mem.kind === "cpu" || unmeasured ? "none" : "";
+  // Unmeasured, the bar shows the user's "used by other apps" estimate, so the keep-free lever has a scale.
+  $("vramBar").style.display = mem.kind === "cpu" || mem.vramUnknown ? "none" : "";
   $("legendLlama").style.display = llamaRam > 0 ? "" : "none";
 
   const note = $("memNote");
@@ -153,25 +154,167 @@ async function renderMemory() {
     note.textContent = /apple/i.test(`${gpu?.vendor} ${gpu?.name}`) ? "Apple silicon: the GPU can use about 3/4 of RAM." : "The GPU shares system RAM.";
   } else note.textContent = "";
 
-  renderMargin(mem);
+  keepModels.ram = ram
+    ? { total: ram.totalMib, base: ram.totalMib, inUse: ram.totalMib - ram.availableMib, mode: settings.ramMarginMode, fixed: settings.ramMarginMib, estimate: false }
+    : null;
+  keepModels.vram =
+    mem.kind === "cpu" || mem.deviceTotalMib <= 0
+      ? null
+      : {
+          total: mem.deviceTotalMib,
+          base: deviceBudget(mem, { ...settings, marginMode: "preset" }, null).freeMib,
+          inUse: deviceInUseMib(mem),
+          mode: settings.marginMode,
+          fixed: settings.marginMib,
+          estimate: !mem.measured && mem.kind === "vram",
+        };
+  if (keepDragging !== "ram") renderKeep("ram");
+  if (keepDragging !== "vram") renderKeep("vram");
 }
 
-/** "Keep free on the GPU": the "In use now" choice shows the live figure it would capture. */
-function renderMargin(mem: MemoryPicture) {
-  const opt = $<HTMLOptionElement>("marginCurrent");
-  if (mem.kind === "cpu") {
-    opt.textContent = "In use now";
-    opt.disabled = true;
-  } else {
-    opt.disabled = false;
-    opt.textContent = `In use now (${mem.measured || mem.kind === "unified" ? "" : "est. "}${gb(deviceInUseMib(mem))})`;
-  }
-  // Shown on hover, not as a note under the row: a note appearing and vanishing made everything below jump.
-  $("keepRow").title =
-    settings.marginMode === "current"
-      ? "Captured when a check starts on a page, so the marks don't move as other apps (or llama.cpp itself) take memory afterwards."
-      : "";
+// ------------------------------------------------------------ keep free
+//
+// A lever under each memory bar. Where it stands is where the model's share
+// ends: any amount from 0 up to everything the fit could use, in 0.1 GB steps,
+// with a slight pull onto the presets, "in use now" and every whole GB.
+// "In use now" follows usage live here; a check freezes it when it starts.
+
+type KeepId = "ram" | "vram";
+interface KeepModel {
+  /** The bar's whole size. */
+  total: number;
+  /** What the fit may fill before anything is kept free: the total, or what is available. */
+  base: number;
+  /** In use right now: the "in use now" stop. */
+  inUse: number;
+  mode: MarginMode;
+  /** The fixed amount (mode "preset"). */
+  fixed: number;
+  /** Live in-use is the user's estimate (no worker reading). */
+  estimate: boolean;
 }
+const keepModels: Record<KeepId, KeepModel | null> = { ram: null, vram: null };
+const KEEP_PRESETS: Record<KeepId, number[]> = { ram: [0, 2048, 4096, 6144, 8192], vram: [0, 512, 1024, 1536, 2048] };
+const KEEP_STEP = 1024 / 10;
+const KEEP_PULL_PX = 4;
+let keepDragging: KeepId | null = null;
+
+const keepAmount = (m: KeepModel) => (m.mode === "current" ? m.inUse : m.fixed);
+/** Where a stop puts the lever, 0..1 along the bar: "in use now" sits where in-use starts, a fixed amount that far below the base. */
+const stopX = (m: KeepModel, stop: number | "current") =>
+  m.total > 0 ? Math.max(0, Math.min(1, (stop === "current" ? m.total - m.inUse : m.base - stop) / m.total)) : 0;
+
+function renderKeep(id: KeepId) {
+  const m = keepModels[id];
+  const track = $(`${id}Keep`);
+  const bar = $(`${id}Bar`);
+  track.style.display = m && bar.style.display !== "none" ? "" : "none";
+  if (!m) return;
+  const keep = keepAmount(m);
+  const x = stopX(m, m.mode === "current" ? "current" : m.fixed);
+  const [, , keepEl, edge] = bar.children as unknown as HTMLElement[];
+  keepEl.style.width = `${(1 - x) * 100}%`;
+  edge.style.left = `${x * 100}%`;
+  const lever = track.querySelector<HTMLElement>(".lever")!;
+  const val = track.querySelector<HTMLElement>(".val")!;
+  lever.style.left = val.style.left = `${x * 100}%`;
+  val.textContent = m.mode === "current" ? `in use${m.estimate ? " (est.)" : ""} · ${gb(keep)}` : gb(keep);
+  // Left of the lever when it fits there without touching the label; otherwise right of it, and never over the label.
+  const lblEnd = track.querySelector<HTMLElement>(".lbl")!.offsetWidth + 8;
+  const leverPx = x * track.clientWidth;
+  if (leverPx - 8 - val.offsetWidth >= lblEnd) val.style.transform = "translateX(calc(-100% - 8px))";
+  else val.style.transform = `translateX(${Math.max(8, lblEnd - leverPx)}px)`;
+  track.setAttribute("aria-valuemin", "0");
+  track.setAttribute("aria-valuemax", String(+(m.base / 1024).toFixed(1)));
+  track.setAttribute("aria-valuenow", String(+(keep / 1024).toFixed(1)));
+  track.setAttribute("aria-valuetext", val.textContent);
+  track.title =
+    m.mode === "current"
+      ? "Keeps free what other apps use when a check starts on a page, so the marks don't move as usage changes afterwards."
+      : `The model may use ${gb(Math.max(0, m.base - keep))}${m.base < m.total ? " of what is available" : ""}.`;
+}
+
+function keepPatch(id: KeepId, choice: number | "current"): Partial<Settings> {
+  if (id === "ram") return choice === "current" ? { ramMarginMode: "current" } : { ramMarginMode: "preset", ramMarginMib: choice };
+  return choice === "current" ? { marginMode: "current" } : { marginMode: "preset", marginMib: choice };
+}
+
+/** The pointer's x on the track to a choice: a stop when within a slight pull of it, else a free amount. */
+function keepChoiceAt(id: KeepId, m: KeepModel, px: number, width: number): number | "current" {
+  const pull = Math.min(KEEP_PULL_PX, (0.2 * width * 1024) / Math.max(m.total, 1)); // at most a fifth of the gap between whole GBs
+  const stops: (number | "current")[] = ["current", ...KEEP_PRESETS[id]];
+  for (let g = 1024; g < m.base; g += 1024) stops.push(g);
+  let best: number | "current" | null = null;
+  let bd = pull;
+  for (const s of stops) {
+    if (s !== "current" && s > m.base) continue;
+    const d = Math.abs(stopX(m, s) * width - px);
+    if (d < bd) {
+      bd = d;
+      best = s;
+    }
+  }
+  if (best != null) return best;
+  const raw = m.base - (px / width) * m.total;
+  return Math.max(0, Math.min(m.base, Math.round(Math.round(raw / KEEP_STEP) * KEEP_STEP)));
+}
+
+function setKeep(id: KeepId, choice: number | "current", now: boolean) {
+  const m = keepModels[id];
+  if (!m) return;
+  if (choice === "current") m.mode = "current";
+  else {
+    m.mode = "preset";
+    m.fixed = choice;
+  }
+  renderKeep(id);
+  void save(keepPatch(id, choice), now);
+}
+
+function wireKeep(id: KeepId) {
+  const track = $(`${id}Keep`);
+  const at = (ev: PointerEvent) => {
+    const m = keepModels[id];
+    if (!m) return;
+    const r = track.getBoundingClientRect();
+    setKeep(id, keepChoiceAt(id, m, Math.max(0, Math.min(r.width, ev.clientX - r.left)), r.width), false);
+  };
+  track.addEventListener("pointerdown", (e) => {
+    if (e.button !== 0) return;
+    track.setPointerCapture(e.pointerId);
+    track.classList.add("drag");
+    keepDragging = id;
+    at(e);
+  });
+  track.addEventListener("pointermove", (e) => {
+    if (keepDragging === id) at(e);
+  });
+  const end = () => {
+    if (keepDragging !== id) return;
+    keepDragging = null;
+    track.classList.remove("drag");
+    void save({}, true);
+  };
+  track.addEventListener("pointerup", end);
+  track.addEventListener("pointercancel", end);
+  // Arrows: 0.1 GB (Shift: 1 GB). Right gives the model more, as dragging right does.
+  track.addEventListener("keydown", (e) => {
+    const m = keepModels[id];
+    if (!m) return;
+    const step = e.shiftKey ? 1024 : KEEP_STEP;
+    const cur = keepAmount(m);
+    let next: number | null = null;
+    if (e.key === "ArrowLeft" || e.key === "ArrowDown") next = cur + step;
+    else if (e.key === "ArrowRight" || e.key === "ArrowUp") next = cur - step;
+    else if (e.key === "Home") next = m.base;
+    else if (e.key === "End") next = 0;
+    if (next == null) return;
+    e.preventDefault();
+    setKeep(id, Math.max(0, Math.min(m.base, Math.round(Math.round(next / KEEP_STEP) * KEEP_STEP))), true);
+  });
+}
+
+let sliderDragging = false;
 
 function renderFit() {
   const lever = $("lever");
@@ -180,19 +323,10 @@ function renderFit() {
 
   const slider = $<HTMLInputElement>("ctx");
   slider.max = String(CTX_SLIDER_MAX);
-  if (document.activeElement !== slider) slider.value = String(sliderFromCtx(settings.ctx));
+  // Not activeElement: the slider keeps focus after a drag, which froze it against changes from the page.
+  if (!sliderDragging) slider.value = String(sliderFromCtx(settings.ctx));
   setFill(slider);
   $("ctxVal").textContent = `${ctxLabel(settings.ctx)} tokens`;
-
-  const sel = $<HTMLSelectElement>("margin");
-  sel.value = settings.marginMode === "preset" ? String(settings.marginMib) : settings.marginMode;
-  if (sel.selectedIndex < 0) sel.value = "1024";
-  const custom = settings.marginMode === "custom";
-  const input = $<HTMLInputElement>("customMargin");
-  input.style.display = custom ? "" : "none";
-  $("customUnit").style.display = custom ? "" : "none";
-  sel.classList.toggle("chev-only", custom);
-  if (document.activeElement !== input) input.value = String(+(settings.customMarginMib / 1024).toFixed(2));
 }
 
 /** How far along the slot the heating element glows (to the handle's centre). */
@@ -310,20 +444,15 @@ async function main() {
     $("ctxVal").textContent = `${ctxLabel(c)} tokens`;
     void save({ ctx: c });
   });
+  $<HTMLInputElement>("ctx").addEventListener("pointerdown", () => (sliderDragging = true));
+  for (const ev of ["pointerup", "pointercancel"]) window.addEventListener(ev, () => { sliderDragging = false; });
   // Releasing the slider (or the popup closing) saves straight away.
   $<HTMLInputElement>("ctx").addEventListener("change", () => void save({}, true));
   window.addEventListener("pagehide", () => {
     if (flushTimer) void flush();
   });
-  $<HTMLSelectElement>("margin").addEventListener("change", (e) => {
-    const v = (e.target as HTMLSelectElement).value;
-    if (v === "current" || v === "custom") void save({ marginMode: v }, true).then(() => v === "custom" && $<HTMLInputElement>("customMargin").focus());
-    else void save({ marginMode: "preset", marginMib: Number(v) }, true);
-  });
-  $<HTMLInputElement>("customMargin").addEventListener("change", (e) => {
-    const v = gbInput(e.target as HTMLInputElement);
-    void save({ customMarginMib: v ?? settings.customMarginMib }, true);
-  });
+  wireKeep("ram");
+  wireKeep("vram");
   $<HTMLSelectElement>("kind").addEventListener("change", (e) => {
     const v = (e.target as HTMLSelectElement).value;
     void save({ cpuOnly: v === "cpu", unifiedOverride: v === "auto" || v === "cpu" ? null : v === "unified" });

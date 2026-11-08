@@ -24,10 +24,11 @@ export interface BandwidthResult {
   vramUnavailableReason?: string;
 }
 
-/** How much VRAM the fit keeps free: a fixed amount, what is in use when the
- * check starts (captured once, so the marks don't move as usage moves), or
- * an amount the user typed. */
-export type MarginMode = "preset" | "current" | "custom";
+/** How much memory the fit keeps free: a fixed amount (any value, set on the
+ * popup's lever), or what is in use when the check starts (captured once, so
+ * the marks don't move as usage moves). "custom" is an older saved value: it
+ * reads as "preset" with the typed amount. */
+export type MarginMode = "preset" | "current";
 
 export interface Settings {
   /** "auto": every GGUF page is checked as it opens. "manual": only when the
@@ -35,10 +36,12 @@ export interface Settings {
   mode: "manual" | "auto";
   ctx: number;
   marginMode: MarginMode;
-  /** The preset amount (marginMode "preset"), MiB. */
+  /** The fixed amount kept free on the GPU (marginMode "preset"), MiB. */
   marginMib: number;
-  /** The typed amount (marginMode "custom"), MiB. */
-  customMarginMib: number;
+  /** Kept free in system RAM: the same two modes as the GPU's. */
+  ramMarginMode: MarginMode;
+  /** The fixed amount kept free in RAM (ramMarginMode "preset"), MiB. */
+  ramMarginMib: number;
   /** User-entered total VRAM, MiB; null = use the table. */
   vramOverrideMib: number | null;
   /** VRAM already taken by the desktop and other apps, MiB. A browser cannot
@@ -57,7 +60,10 @@ export const DEFAULT_SETTINGS: Settings = {
   ctx: 4096,
   marginMode: "preset",
   marginMib: 1024,
-  customMarginMib: 2048,
+  // "In use now" for RAM is what the check did before RAM had a setting:
+  // the model gets what the OS reports as available.
+  ramMarginMode: "current",
+  ramMarginMib: 4096,
   vramOverrideMib: null,
   vramReservedMib: 512,
   unifiedOverride: null,
@@ -136,7 +142,14 @@ export async function getSettings(): Promise<Settings> {
       // sync unavailable: defaults
     }
   }
-  return { ...DEFAULT_SETTINGS, ...(saved ?? {}) };
+  const out = { ...DEFAULT_SETTINGS, ...(saved ?? {}) } as Settings & { customMarginMib?: number };
+  // The typed-amount mode became the lever's free value.
+  if ((out.marginMode as string) === "custom") {
+    out.marginMode = "preset";
+    if (typeof out.customMarginMib === "number") out.marginMib = out.customMarginMib;
+  }
+  delete out.customMarginMib;
+  return out;
 }
 
 // Writes run one after another, so a slow early write can never land after

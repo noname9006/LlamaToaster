@@ -5,16 +5,18 @@
   "version": "0.1.0",
   "description": "Will this GGUF fit your machine? Reads your RAM/VRAM, measures memory speed, and marks every quant on Hugging Face model pages.",
   "icons": {
-    "16": "icons/icon.png",
-    "48": "icons/icon.png",
-    "128": "icons/icon.png"
+    "16": "icons/icon-16.png",
+    "32": "icons/icon-32.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
   },
   "action": {
     "default_title": "LlamaToaster",
     "default_popup": "popup.html",
     "default_icon": {
-      "16": "icons/icon.png",
-      "48": "icons/icon.png"
+      "16": "icons/icon-16.png",
+      "32": "icons/icon-32.png",
+      "48": "icons/icon-48.png"
     }
   },
   "side_panel": {
