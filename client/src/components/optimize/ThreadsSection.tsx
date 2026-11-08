@@ -222,7 +222,7 @@ function CandidateList({
   note?: string;
 }) {
   return (
-    <fieldset className="m-0 border border-border p-3">
+    <fieldset className="m-0 border-0 border-t border-border p-0 pt-3">
       <legend className="px-1 font-mono text-xs text-muted">{title}</legend>
       <ul className="flex flex-col gap-1.5">
         {cands.map((c) => {
@@ -271,7 +271,7 @@ export function ThreadBars({
   const max = Math.max(1, ...rows.map((r) => r.reading?.mean ?? 0));
   const winner: ThreadCandidateKind | null = verdict?.kind === "winner" ? verdict.winner : null;
   return (
-    <figure className="m-0 border border-border bg-surface-raised p-3">
+    <figure className="m-0">
       <Kicker>{title}</Kicker>
       <ul className="mt-2 flex flex-col gap-2">
         {rows.map((r) => (
@@ -279,7 +279,7 @@ export function ThreadBars({
             <span className={r.item.kind === "default" ? "text-fg" : "text-fg-2"}>
               {r.item.threads} · {r.item.label}
             </span>
-            <span className="block h-3 border border-border bg-well">
+            <span className="block h-3 bg-surface-raised">
               <span
                 className={`block h-full ${r.item.kind === winner ? "bg-accent" : r.item.kind === "default" ? "bg-fg" : "bg-muted"}`}
                 style={{ width: `${((r.reading?.mean ?? 0) / max) * 100}%` }}

@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
   baselineCandidate,
+  batchCandidates,
   candidateExtraServerArgs,
+  hasBatchArgs,
   candidateKey,
   compareToBaseline,
   dedupeCandidates,
@@ -50,6 +52,29 @@ describe("args", () => {
     expect(cmd.startsWith("llama-server -m model.gguf -c 32768 -ngl 41 -fa on -ctk q8_0 -ctv q8_0")).toBe(true);
     expect(cmd.endsWith("--fit off")).toBe(true);
     expect(shellQuote("it's")).toBe(`'it'"'"'s'`);
+  });
+});
+
+describe("batch sizes", () => {
+  it("the batch step measures each -ub with -b at least 2048, default included", () => {
+    const list = batchCandidates(fitCand);
+    expect(list.map((c) => [c.b, c.ub])).toEqual([[2048, 256], [2048, 512], [2048, 1024], [2048, 2048]]);
+    expect(list.every((c) => c.ot === fitCand.ot && c.ctk === "q8_0")).toBe(true);
+    expect(new Set(list.map(candidateKey)).size).toBe(4);
+  });
+  it("-b/-ub appear in the command only when set, and old keys are unchanged", () => {
+    expect(serverCommandLine("m.gguf", 32768, fitCand)).not.toContain("-ub");
+    expect(serverCommandLine("m.gguf", 32768, { ...fitCand, b: 4096, ub: 1024 })).toContain("-b 4096 -ub 1024");
+    expect(candidateKey(fitCand)).toBe(JSON.stringify([41, OT, "q8_0", "q8_0", "on", fitCand.threads]));
+    expect(hasBatchArgs(fitCand)).toBe(false);
+    expect(hasBatchArgs({ ub: 256 })).toBe(true);
+  });
+  it("validation wants powers of two and ub <= b", () => {
+    const spec = { target_ctx: 32768, prompt_tokens: 4096, n_gen: 512, repeats: 3 };
+    expect(validateSpeedRunSpec({ ...spec, candidates: batchCandidates(fitCand) }, null)).toBeNull();
+    expect(validateSpeedRunSpec({ ...spec, candidates: [{ ...fitCand, ub: 1000 }] }, null)).toMatch(/power of two/);
+    expect(validateSpeedRunSpec({ ...spec, candidates: [{ ...fitCand, b: 512, ub: 1024 }] }, null)).toMatch(/ub must not exceed b/);
+    expect(validateSpeedRunSpec({ ...spec, candidates: [{ ...fitCand, ub: 4096 }] }, null)).toMatch(/ub must not exceed b/);
   });
 });
 

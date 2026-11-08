@@ -78,12 +78,12 @@ describe("N1 context curves", () => {
 });
 
 describe("N1 sizing ladder", () => {
-  it("renders points beyond trained context as unavailable-with-reason, never as silent gaps", () => {
+  it("renders points beyond maximum context as unavailable-with-reason, never as silent gaps", () => {
     const ladder = buildLadder([8_192, 16_384, 32_768], { trainedCtx: 32_768 });
     expect(ladder.map((c) => c.effectiveCtx)).toEqual([...CURVE_LADDER]);
     const beyond = ladder.filter((c) => c.effectiveCtx > 32_768);
     expect(beyond.length).toBeGreaterThan(0);
-    expect(beyond.every((c) => !c.available && c.unavailableReason!.includes("trained ctx"))).toBe(true);
+    expect(beyond.every((c) => !c.available && c.unavailableReason!.includes("max ctx"))).toBe(true);
     expect(ladder.find((c) => c.effectiveCtx === 8_192)!.measured).toBe(true);
     expect(ladder.find((c) => c.effectiveCtx === 4_096)!.measured).toBe(false);
   });

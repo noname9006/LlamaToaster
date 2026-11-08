@@ -66,7 +66,7 @@ export function SliderChipInput({
         <label className="text-sm font-medium text-fg">{label}</label>
         {hint && <span className="text-xs text-muted">{hint}</span>}
       </div>
-      <div className="mt-1.5 flex min-h-10 flex-wrap items-center gap-1.5 rounded-lg border border-border bg-surface px-2 py-1.5">
+      <div className="mt-1.5 flex min-h-10 flex-wrap items-center gap-1.5 rounded-lg border border-border-strong bg-surface px-2 py-1.5">
         {value.length === 0 && <span className="px-1 text-sm text-muted">No values added yet</span>}
         {value
           .slice()
@@ -106,13 +106,13 @@ export function SliderChipInput({
           disabled={disabled}
           onChange={(e) => setDraft(Number(e.target.value))}
           onBlur={() => setDraft((d) => clamp(d))}
-          className="w-16 rounded-lg border border-border bg-surface px-2 py-1 text-center text-sm text-fg outline-none focus:border-accent disabled:opacity-40"
+          className="w-16 rounded-lg border border-border-strong bg-surface px-2 py-1 text-center text-sm text-fg outline-none focus:border-accent disabled:opacity-40"
         />
         <button
           type="button"
           disabled={disabled}
           onClick={add}
-          className="rounded-lg border border-border px-3 py-1.5 text-sm font-semibold text-fg hover:border-accent/40 hover:text-accent disabled:opacity-40"
+          className="rounded-lg border border-border-strong px-3 py-1.5 text-sm font-semibold text-fg hover:border-accent/40 hover:text-accent disabled:opacity-40"
         >
           Add
         </button>

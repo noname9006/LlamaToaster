@@ -597,7 +597,7 @@ describe("§0.7/N2 capability gates", () => {
     expect(res.status).toBe(201);
   });
 
-  it("refuses curve points beyond trained ctx -- nothing beyond it can appear as measured", async () => {
+  it("refuses curve points beyond max ctx -- nothing beyond it can appear as measured", async () => {
     repo.registerModel({
       id: "v8-trained",
       filename: "trained.gguf",
@@ -615,7 +615,7 @@ describe("§0.7/N2 capability gates", () => {
       sweep: baseSweep,
     });
     expect(res.status).toBe(400);
-    expect(((await res.json()) as { error: string }).error).toContain("trained context");
+    expect(((await res.json()) as { error: string }).error).toContain("maximum context");
   });
 
   // N1's "Measure missing points" prices every uncovered ladder cell and
@@ -639,7 +639,7 @@ describe("§0.7/N2 capability gates", () => {
     expect(items.map((i) => i.n_prompt).sort((a, b) => a - b)).toEqual([2048, 4096, 8192]);
   });
 
-  it("rejects a curve-point list if any entry exceeds trained ctx", async () => {
+  it("rejects a curve-point list if any entry exceeds max ctx", async () => {
     drainActiveRuns();
     await heartbeat("v8-cap-curve-multi-bad", { capabilities: ["benchmark", "curve-v1"] });
     const worker = repo.workerRepo.getByMachineId("v8-cap-curve-multi-bad")!;
@@ -651,7 +651,7 @@ describe("§0.7/N2 capability gates", () => {
       sweep: baseSweep,
     });
     expect(res.status).toBe(400);
-    expect(((await res.json()) as { error: string }).error).toContain("trained context");
+    expect(((await res.json()) as { error: string }).error).toContain("maximum context");
   });
 });
 
@@ -976,7 +976,7 @@ describe("fill curve trigger", () => {
     expect((await post({ kind: "runtime", fill_curve: { ctx: 4096 } })).status).toBe(400);
     const beyond = await post({ kind: "sweep", model_id: "v8-trained", fill_curve: { ctx: 65536 } });
     expect(beyond.status).toBe(400);
-    expect(((await beyond.json()) as { error: string }).error).toContain("trained context");
+    expect(((await beyond.json()) as { error: string }).error).toContain("maximum context");
     const depth = await post({ kind: "sweep", fill_curve: { ctx: 4096 }, sweep: { ...fillSweep, n_depth: [0, 1024] } });
     expect(depth.status).toBe(400);
   });

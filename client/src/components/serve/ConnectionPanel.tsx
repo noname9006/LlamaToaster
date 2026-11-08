@@ -27,7 +27,7 @@ function CopyButton({ text, label }: { text: string; label: string }) {
 
 function CodeLine({ text, label }: { text: string; label: string }) {
   return (
-    <div className="flex items-start gap-2 border border-border bg-well py-1 pl-3 pr-1">
+    <div className="flex items-start gap-2 border border-border-strong bg-well py-1 pl-3 pr-1">
       <code className="min-w-0 flex-1 overflow-x-auto whitespace-pre py-1.5 font-mono text-[13px] text-fg">{text}</code>
       <CopyButton text={text} label={label} />
     </div>

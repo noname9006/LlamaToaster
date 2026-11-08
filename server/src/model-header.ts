@@ -12,7 +12,7 @@ export function ggufMetadataPatch(f: ModelDirFile | GgufInfo): Partial<ModelMeta
   if (typeof f.mtp_layers === "number" && f.mtp_layers > 0) patch.mtp_layers = f.mtp_layers;
   if (typeof f.param_count === "number" && f.param_count > 0) patch.param_count = f.param_count;
   if (typeof f.quant === "string" && f.quant) patch.quant = f.quant;
-  // Trained context + KV geometry -- adopted like the fields above so a
+  // Maximum context + KV geometry -- adopted like the fields above so a
   // hand-dropped file gets the same catalog metadata as an in-app download.
   if (typeof f.trained_ctx === "number" && f.trained_ctx > 0) patch.trained_ctx = f.trained_ctx;
   if (typeof f.n_head_kv === "number" && f.n_head_kv > 0) patch.n_head_kv = f.n_head_kv;

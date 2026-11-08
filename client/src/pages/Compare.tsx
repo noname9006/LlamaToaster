@@ -7,6 +7,7 @@ import { NewComparison } from "../components/NewComparison";
 import { ImportBundle } from "../components/ImportBundle";
 import type { Test, ResultRow } from "../types";
 import { shortId, formatFlashAttn } from "../utils";
+import { incompleteRepeatsNote } from "../../../shared/rowStats";
 
 interface ColumnDef {
   id: string;
@@ -26,6 +27,8 @@ interface CellValue {
   sample_count?: number;
   suspect_count?: number;
   suspect_samples?: number[];
+  repeats_requested?: number | null;
+  repeats_complete?: boolean | null;
 }
 interface RowDef {
   key: string;
@@ -33,13 +36,21 @@ interface RowDef {
   values: Record<string, CellValue>;
 }
 
+// Also true when some requested repeats produced no reading (shared/rowStats.ts).
 function isSuspectCell(v: CellValue | undefined): boolean {
-  return !!v?.suspect_count;
+  return !!v?.suspect_count || v?.repeats_complete === false;
 }
 
 // Mirrors RunDetail.tsx's resultSuspectTitle wording so the same measurement
 // reads identically wherever it's shown.
 function cellSuspectTitle(v: CellValue): string | undefined {
+  const incomplete = incompleteRepeatsNote(v);
+  const suspect = suspectOnlyTitle(v);
+  const parts = [suspect, incomplete].filter((s): s is string => !!s);
+  return parts.length > 0 ? parts.join(" -- ") : undefined;
+}
+
+function suspectOnlyTitle(v: CellValue): string | undefined {
   if (!v.suspect_count) return undefined;
   const raw = v.suspect_samples?.map((n) => n.toFixed(1)).join(", ") ?? "unknown";
   const total = v.sample_count ?? v.suspect_count;
@@ -192,6 +203,8 @@ export function Compare() {
               sample_count: r.sample_count,
               suspect_count: r.suspect_count,
               suspect_samples: r.suspect_samples,
+              repeats_requested: r.repeats_requested,
+              repeats_complete: r.repeats_complete,
             };
           }
         });
@@ -258,7 +271,7 @@ export function Compare() {
           into the conclusion. */}
       <section className="mt-6">
         <div className="flex items-center justify-between">
-          <h2 className="text-sm font-semibold uppercase tracking-wide text-muted">Model-vs-model comparisons</h2>
+          <h2 className="text-sm font-semibold text-muted">Model-vs-model comparisons</h2>
           <NewComparison
             onCreated={(id) => {
               refreshRuns();
@@ -325,16 +338,16 @@ export function Compare() {
       </button>
 
       {chartConfig && (
-        <div className="relative mt-4 h-72 rounded-xl border border-border bg-surface p-4">
+        <div className="relative mt-4 h-72">
           <Chart config={chartConfig} />
         </div>
       )}
 
       {rows.length > 0 && (
-        <div className="mt-4 overflow-x-auto rounded-xl border border-border bg-surface">
+        <div className="mt-4 overflow-x-auto">
           <table className="w-full text-left text-sm">
             <thead>
-              <tr className="border-b border-border text-xs uppercase tracking-wide text-muted">
+              <tr className="border-b border-border text-xs text-muted">
                 <th className="px-4 py-2.5 font-medium">config</th>
                 {columns.map((c) => (
                   <th key={c.id} className="px-4 py-2.5 font-medium">

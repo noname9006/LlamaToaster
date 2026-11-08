@@ -85,7 +85,7 @@ export function TokSpeedDemo() {
   const done = revealed >= words.length;
 
   return (
-    <div className="rounded-xl border border-border bg-surface p-5">
+    <div className="border-t border-border pt-5">
       <h3 className="text-lg font-semibold text-fg">What does {tps} tok/s mean?</h3>
       <p className="mt-0.5 text-xs text-muted">Simulated for illustration — not a real generation.</p>
 
@@ -106,7 +106,7 @@ export function TokSpeedDemo() {
         />
       </div>
 
-      <div className="mt-4 flex flex-col gap-2 rounded-lg border border-border bg-surface-raised p-3">
+      <div className="mt-4 flex flex-col gap-2 bg-surface p-3">
         <div className="flex justify-end">
           <div className="max-w-[85%] rounded-lg rounded-br-sm bg-accent/15 px-3 py-2 text-sm text-accent">
             What does {tps} tok/s mean?

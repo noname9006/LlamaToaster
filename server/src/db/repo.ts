@@ -51,9 +51,12 @@ import {
   isVramDiscrepancyPolicy,
   isValidProbeMaxLoads,
 } from "../../../shared/types.js";
+import { DEFAULT_BREAD_MARK_STYLE, isBreadMarkStyle, type BreadMarkStyle } from "../../../shared/breadMarks.js";
 import type { SweepItem } from "../../../shared/sweep.js";
 import type { TensorLayerBreakdown } from "../../../shared/vramEstimate.js";
 import { configHash, type ConfigHashInput } from "../../../shared/configHash.js";
+import { reconcileRowStats } from "../../../shared/rowStats.js";
+import { log } from "../log.js";
 import { engineFromItem, specTypeFor, type EngineKind } from "../../../shared/engineSpec.js";
 
 interface ModelRow {
@@ -107,7 +110,7 @@ const ADMIN_TEST_SUMMARY_SELECT = `SELECT runs.*, u.display_name AS user_display
                   m.filename AS model_filename,
                   (SELECT COUNT(*) FROM run_items WHERE run_items.run_id = runs.id) AS items_total,
                   (SELECT COUNT(*) FROM run_items WHERE run_items.run_id = runs.id AND status = 'done') AS items_done,
-                  (SELECT COUNT(*) FROM run_items WHERE run_items.run_id = runs.id AND status IN ('failed','failed_oom','failed_timeout')) AS items_failed
+                  (SELECT COUNT(*) FROM run_items WHERE run_items.run_id = runs.id AND status IN ('failed','failed_oom','failed_unsupported','failed_timeout')) AS items_failed
            FROM runs
            LEFT JOIN users u ON u.id = runs.user_id
            LEFT JOIN workers w ON w.id = runs.worker_id
@@ -246,6 +249,12 @@ interface ResultRowRaw {
   suspect_count: number | null;
   suspect_samples: string | null;
   repeat_samples: string | null;
+  clean_samples: string | null;
+  repeats_requested: number | null;
+  repeats_complete: number | null;
+  stats_mismatch: number | null;
+  worker_avg_tps: number | null;
+  worker_stddev_tps: number | null;
   spec_drafted: number | null;
   spec_accepted: number | null;
   // BENCHMARKING_PLAN_V8.md §0 columns -- NULL on every row predating them.
@@ -478,6 +487,7 @@ interface SessionRow {
   token_hash: string;
   refresh_hash: string | null;
   prev_refresh_hash: string | null;
+  rotated_at: number | null;
   expires_at: number;
   is_worker: number;
   worker_id: string | null;
@@ -493,6 +503,8 @@ export interface SessionRecord {
   id: string;
   userId: string;
   expiresAt: number;
+  // When the current refresh token replaced the previous one.
+  rotatedAt: number | null;
   isWorker: boolean;
   workerId: string | null;
   label: string | null;
@@ -604,6 +616,7 @@ function mapSession(row: SessionRow): SessionRecord {
     id: row.id,
     userId: row.user_id,
     expiresAt: row.expires_at,
+    rotatedAt: row.rotated_at,
     isWorker: row.is_worker === 1,
     workerId: row.worker_id,
     label: row.label,
@@ -834,6 +847,12 @@ function mapResult(row: ResultRowRaw): ResultRow {
     // this is diagnostic-only data, not load-bearing for the run itself.
     suspect_samples: row.suspect_samples ? safeParseNumberArray(row.suspect_samples) : undefined,
     repeat_samples: row.repeat_samples ? safeParseNumberArray(row.repeat_samples) : undefined,
+    clean_samples: row.clean_samples ? safeParseNumberArray(row.clean_samples) : undefined,
+    repeats_requested: row.repeats_requested ?? null,
+    repeats_complete: row.repeats_complete == null ? null : row.repeats_complete === 1,
+    stats_mismatch: row.stats_mismatch == null ? null : row.stats_mismatch === 1,
+    worker_avg_tps: row.worker_avg_tps ?? null,
+    worker_stddev_tps: row.worker_stddev_tps ?? null,
     spec_drafted: row.spec_drafted ?? undefined,
     spec_accepted: row.spec_accepted ?? undefined,
     method_version: row.method_version ?? null,
@@ -887,6 +906,17 @@ export function deriveModelId(input: RegisterModelInput): string {
 // rather than an import from shared/probeLadder.ts's own PROBE_MAX_LOADS.
 const DEFAULT_PROBE_MAX_LOADS = 40;
 
+// A hand-edited or stale meta row degrades to the shipped style, never a broken mark.
+function readBreadMarkStyle(raw: string | undefined): BreadMarkStyle {
+  if (raw === undefined) return { ...DEFAULT_BREAD_MARK_STYLE };
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    return isBreadMarkStyle(parsed) ? parsed : { ...DEFAULT_BREAD_MARK_STYLE };
+  } catch {
+    return { ...DEFAULT_BREAD_MARK_STYLE };
+  }
+}
+
 // The k-anonymity floor communityRepo's aggregates are subject to: the
 // minimum number of DISTINCT opted-in contributors a group must combine
 // before it is returned at all. See communityRepo's own comment for why the
@@ -904,6 +934,27 @@ export function communityMinContributors(): number {
   const n = Number(raw);
   if (!Number.isFinite(n) || !Number.isInteger(n) || n < 1) return DEFAULT_COMMUNITY_MIN_CONTRIBUTORS;
   return n;
+}
+
+// What another user's assistant may be told a model is called: only a row whose
+// identity the server's own Hugging Face index backs, and its file name from there.
+// Any other row's name is whatever its creator typed, and it would reach other
+// users' AI context as instructions (audit 2026-11-01 E2). This also keeps a private
+// local file's name out of community data.
+const COMMUNITY_VERIFIED_MODEL = `EXISTS (SELECT 1 FROM hf_gguf_index i
+               WHERE i.sha256 = m.id AND i.repo_id = m.hf_repo AND i.filename = m.hf_file AND i.deleted_at IS NULL)`;
+
+// A worker reports its own hardware strings. Text fit for another user's assistant
+// is short and looks like a product name; anything else reads as unknown.
+function plainLabel(value: string | null): string | null {
+  return value !== null && /^[\p{L}\p{N} ()._+\-/,:®™@]{1,64}$/u.test(value) ? value : null;
+}
+
+function labelledFacets(rows: { value: string; contributor_count: number }[]): { value: string; contributorCount: number }[] {
+  return rows.flatMap((r) => {
+    const value = plainLabel(r.value);
+    return value === null ? [] : [{ value, contributorCount: r.contributor_count }];
+  });
 }
 
 export const repo = {
@@ -1233,7 +1284,7 @@ export const repo = {
         `SELECT runs.*, m.filename AS model_filename,
                 (SELECT COUNT(*) FROM run_items WHERE run_items.run_id = runs.id) AS items_total,
                 (SELECT COUNT(*) FROM run_items WHERE run_items.run_id = runs.id AND status = 'done') AS items_done,
-                (SELECT COUNT(*) FROM run_items WHERE run_items.run_id = runs.id AND status IN ('failed','failed_oom','failed_timeout')) AS items_failed,
+                (SELECT COUNT(*) FROM run_items WHERE run_items.run_id = runs.id AND status IN ('failed','failed_oom','failed_unsupported','failed_timeout')) AS items_failed,
                 (SELECT COUNT(*) FROM run_items WHERE run_items.run_id = runs.id AND status = 'cancelled') AS items_cancelled
          FROM runs
          LEFT JOIN models m ON m.id = runs.model_id
@@ -1244,13 +1295,17 @@ export const repo = {
     return rows.map(mapTest);
   },
 
+  listTestIdsForUser(userId: string): string[] {
+    return (getDb().prepare(`SELECT id FROM runs WHERE user_id = ?`).all(userId) as { id: string }[]).map((r) => r.id);
+  },
+
   getTest(userId: string | undefined, id: string): Test | undefined {
     const row = getDb()
       .prepare(
         `SELECT runs.*, m.filename AS model_filename,
                 (SELECT COUNT(*) FROM run_items WHERE run_items.run_id = runs.id) AS items_total,
                 (SELECT COUNT(*) FROM run_items WHERE run_items.run_id = runs.id AND status = 'done') AS items_done,
-                (SELECT COUNT(*) FROM run_items WHERE run_items.run_id = runs.id AND status IN ('failed','failed_oom','failed_timeout')) AS items_failed,
+                (SELECT COUNT(*) FROM run_items WHERE run_items.run_id = runs.id AND status IN ('failed','failed_oom','failed_unsupported','failed_timeout')) AS items_failed,
                 (SELECT COUNT(*) FROM run_items WHERE run_items.run_id = runs.id AND status = 'cancelled') AS items_cancelled
          FROM runs
          LEFT JOIN models m ON m.id = runs.model_id
@@ -1266,6 +1321,12 @@ export const repo = {
     const results = this.getResultsForTest(id);
     const items = this.getTestItems(id);
     return { run, results, items };
+  },
+
+  // Whether an import claiming this hash attaches to the existing catalog row
+  // (true) or gets its own stand-in (false).
+  importLinksToCatalogRow(userId: string | undefined, claimed: string | null): boolean {
+    return !!claimed && !!this.getModel(claimed) && this.isModelVisibleTo(userId, claimed);
   },
 
   // N7 -- write an imported bundle's rows. They land on a synthetic run
@@ -1301,7 +1362,9 @@ export const repo = {
     // in metadata for display only. Owned by the importer, so it only shows
     // up for them (repo.listModelsVisibleTo).
     const claimed = input.run.model_sha256 ?? null;
-    const modelId = claimed && this.getModel(claimed) ? claimed : `imported:${input.bundleId}`;
+    // Only a row the importer can already see: linking to any other would put
+    // it on their list, just for naming its hash in a file (audit A11).
+    const modelId = this.importLinksToCatalogRow(userId, claimed) ? claimed! : `imported:${input.bundleId}`;
     if (!this.getModel(modelId)) {
       this.registerModel({
         id: modelId,
@@ -1571,7 +1634,7 @@ export const repo = {
         `SELECT runs.*, m.filename AS model_filename,
                 (SELECT COUNT(*) FROM run_items WHERE run_items.run_id = runs.id) AS items_total,
                 (SELECT COUNT(*) FROM run_items WHERE run_items.run_id = runs.id AND status = 'done') AS items_done,
-                (SELECT COUNT(*) FROM run_items WHERE run_items.run_id = runs.id AND status IN ('failed','failed_oom','failed_timeout')) AS items_failed,
+                (SELECT COUNT(*) FROM run_items WHERE run_items.run_id = runs.id AND status IN ('failed','failed_oom','failed_unsupported','failed_timeout')) AS items_failed,
                 (SELECT COUNT(*) FROM run_items WHERE run_items.run_id = runs.id AND status = 'cancelled') AS items_cancelled
          FROM runs
          LEFT JOIN models m ON m.id = runs.model_id
@@ -1604,12 +1667,16 @@ export const repo = {
     ).n;
   },
 
-  hasActiveComparisonMember(comparisonId: string): boolean {
+  // Scoped to one owner: comparison ids are client-chosen, so without this
+  // another tenant's id would lift the caller's active-run limit (audit
+  // 2026-10-11 N15).
+  hasActiveComparisonMember(comparisonId: string, userId: string | undefined): boolean {
     const row = getDb()
       .prepare(
-        `SELECT COUNT(*) AS n FROM runs WHERE comparison_id = ? AND status IN ('running','scheduled')`
+        `SELECT COUNT(*) AS n FROM runs
+         WHERE comparison_id = ? AND status IN ('running','scheduled') AND (? IS NULL OR user_id = ?)`
       )
-      .get(comparisonId) as { n: number };
+      .get(comparisonId, userId ?? null, userId ?? null) as { n: number };
     return row.n > 0;
   },
 
@@ -2047,12 +2114,14 @@ export const repo = {
               gpu_memory_host_pinned_mib, gpu_memory_cpu_mapped_mib,
               gpu_layers_loaded, total_model_layers, gpu_layers_loaded_draft, total_model_layers_draft,
               gpu_layers_resident_est, gpu_layers_resident_est_draft,
-              sample_count, suspect_count, suspect_samples, repeat_samples, spec_drafted, spec_accepted,
+              sample_count, suspect_count, suspect_samples, repeat_samples,
+              clean_samples, repeats_requested, repeats_complete, stats_mismatch, worker_avg_tps, worker_stddev_tps,
+              spec_drafted, spec_accepted,
               method_version, prompt_offset, spec_type, spec_n_max, spec_n_min, config_hash,
               concurrency, gpu_temp_c_max, gpu_clock_mhz_min, gpu_clock_samples,
               cpu_isa, ttft_ms_p50, ttft_ms_p95, ttft_n, e2e_ms_mean,
               worker_id, llama_cpp_build, engine, raw_json_path, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+           VALUES (${Array.from({ length: 92 }, () => "?").join(", ")})`
         );
         // An explicit check on the unique key rather than INSERT OR IGNORE,
         // which would also swallow NOT NULL/CHECK failures on a bad row.
@@ -2138,6 +2207,12 @@ export const repo = {
             row.suspect_count ?? null,
             row.suspect_samples ? JSON.stringify(row.suspect_samples) : null,
             row.repeat_samples ? JSON.stringify(row.repeat_samples) : null,
+            row.clean_samples ? JSON.stringify(row.clean_samples) : null,
+            row.repeats_requested ?? null,
+            row.repeats_complete == null ? null : row.repeats_complete ? 1 : 0,
+            row.stats_mismatch == null ? null : row.stats_mismatch ? 1 : 0,
+            row.worker_avg_tps ?? null,
+            row.worker_stddev_tps ?? null,
             row.spec_drafted ?? null,
             row.spec_accepted ?? null,
             row.method_version ?? null,
@@ -2879,26 +2954,48 @@ export const repo = {
         .run(Date.now(), workerId);
     },
 
-    // §1.7's own maintenance-sweep spec: "expired-enrolment pruning". Clears
-    // the code fields only -- deliberately NEVER deletes the row itself,
-    // even though a genuinely-abandoned first-time enrolment has no history
-    // to lose. A worker's own machine_id is meant to be stable, and
-    // /api/device/start's getByMachineId reuse (§3.4) means a Stage 1
-    // legacy machine UPGRADING to device-flow enrolment reuses its existing
-    // (historied) row via reissueEnrolment -- if that particular attempt
-    // then expires unapproved, deleting the row would destroy a real
-    // machine's identity/history, not just tidy up a throwaway one. Clearing
-    // just the code fields is safe either way: it frees the
-    // idx_workers_user_code_pending unique-index slot and retires a
-    // now-dead code (defense in depth -- /api/device/approve's own expiry
-    // check already rejects it) without ever risking data loss.
+    // §1.7's own maintenance-sweep spec: "expired-enrolment pruning".
+    //
+    // A row that only ever came from POST /api/device/start (it has a hostname
+    // from that body, but nobody approved it and it never sent a heartbeat) has
+    // nothing to lose, and is deleted. That route is public, so keeping these
+    // let anyone with no account grow this table forever (audit 2026-11-01 E1).
+    //
+    // Any other expired enrolment only has its code fields cleared. A Stage 1
+    // legacy machine upgrading to device-flow enrolment reuses its existing
+    // (historied) row via reissueEnrolment, and if that attempt expires
+    // unapproved, deleting the row would destroy a real machine's identity.
+    // Clearing frees the idx_workers_user_code_pending unique-index slot and
+    // retires a now-dead code (defense in depth -- /api/device/approve's own
+    // expiry check already rejects it).
     pruneExpiredEnrolments(): number {
-      return getDb()
+      const now = Date.now();
+      const deleted = getDb()
+        .prepare(
+          `DELETE FROM workers
+           WHERE user_id IS NULL AND approved_at IS NULL AND last_heartbeat_at IS NULL AND hostname IS NOT NULL
+             AND (enrolment_expires_at IS NULL OR enrolment_expires_at < ?)
+             AND NOT EXISTS (SELECT 1 FROM runs WHERE runs.worker_id = workers.id)`
+        )
+        .run(now).changes;
+      return deleted + getDb()
         .prepare(
           `UPDATE workers SET user_code = NULL, enrolment_code_hash = NULL, enrolment_expires_at = NULL
            WHERE approved_at IS NULL AND enrolment_expires_at IS NOT NULL AND enrolment_expires_at < ?`
         )
-        .run(Date.now()).changes;
+        .run(now).changes;
+    },
+
+    // First-time enrolments still waiting for a human, across everyone.
+    countPendingEnrolments(): number {
+      return (
+        getDb()
+          .prepare(
+            `SELECT COUNT(*) AS n FROM workers
+             WHERE approved_at IS NULL AND last_heartbeat_at IS NULL AND enrolment_expires_at >= ?`
+          )
+          .get(Date.now()) as { n: number }
+      ).n;
     },
 
     // --- Security finding C1: machine keys, re-enrolment, revocation ---
@@ -3155,8 +3252,11 @@ export const repo = {
             .run(now, job.run_id);
           // Pause is a per-machine flag; a new run always starts unpaused, so a
           // pause left over from an earlier run can't stop this one after its
-          // first item (audit 2026-10-11 N7).
-          database.prepare(`UPDATE workers SET pause_requested = 0, pause_requested_at = NULL WHERE id = ?`).run(workerId);
+          // first item (audit 2026-10-11 N7). A requeued job isn't a new run: a
+          // lease expiring mustn't resume a run the user paused (audit R2).
+          if (job.attempts === 0) {
+            database.prepare(`UPDATE workers SET pause_requested = 0, pause_requested_at = NULL WHERE id = ?`).run(workerId);
+          }
         }
 
         const payload = JSON.parse(job.payload_json);
@@ -3408,9 +3508,11 @@ export const repo = {
         .run(Date.now(), runId);
     },
 
-    // Claimed run jobs on an unpaused machine with no sign of progress since
-    // `before` (see worker_jobs.progress_at).
-    listStalledRunJobs(before: number): { id: string; run_id: string; worker_id: string }[] {
+    // Claimed jobs on an unpaused machine with no sign of progress since
+    // `before` (see worker_jobs.progress_at). Jobs without a run count too: a
+    // hung fit check or install would otherwise hold the machine's serial queue
+    // for as long as its heartbeats keep the lease alive (audit 2026-10-18 A7).
+    listStalledJobs(before: number): { id: string; run_id: string | null; worker_id: string }[] {
       const database = getDb();
       // Jobs claimed before progress_at existed start their clock now rather
       // than counting from claimed_at, so a deploy can't stop a healthy run.
@@ -3421,10 +3523,9 @@ export const repo = {
         .prepare(
           `SELECT j.id, j.run_id, j.worker_id FROM worker_jobs j
            JOIN workers w ON w.id = j.worker_id
-           WHERE j.status = 'claimed' AND j.run_id IS NOT NULL
-             AND w.pause_requested = 0 AND j.progress_at < ?`
+           WHERE j.status = 'claimed' AND w.pause_requested = 0 AND j.progress_at < ?`
         )
-        .all(before) as { id: string; run_id: string; worker_id: string }[];
+        .all(before) as { id: string; run_id: string | null; worker_id: string }[];
     },
 
     // Machines paused since before `before`, with the runs they hold.
@@ -3453,19 +3554,27 @@ export const repo = {
     // Undoes a claim whose job never reached the worker (its long-poll
     // connection closed before the response was flushed -- routes/queue.ts's
     // sendClaimedJob). Unlike returnToPending this doesn't count an attempt:
-    // nothing ran. The parent run keeps the 'running' status the claim gave
-    // it; the next claim re-stamps started_at.
+    // nothing ran. So the parent run goes back to 'scheduled' too -- its claim
+    // said it had started, and it hasn't.
     unclaimJob(jobId: string): void {
       const database = getDb();
-      const { changes } = database
-        .prepare(
-          `UPDATE worker_jobs SET status = 'pending', lease_expires_at = NULL, claimed_at = NULL, progress_at = NULL
-           WHERE id = ? AND status = 'claimed'`
-        )
-        .run(jobId);
-      if (changes > 0) {
+      database.transaction(() => {
+        const { changes } = database
+          .prepare(
+            `UPDATE worker_jobs SET status = 'pending', lease_expires_at = NULL, claimed_at = NULL, progress_at = NULL
+             WHERE id = ? AND status = 'claimed'`
+          )
+          .run(jobId);
+        if (changes === 0) return;
         database.prepare(`UPDATE workers SET active_job_id = NULL WHERE active_job_id = ?`).run(jobId);
-      }
+        database
+          .prepare(
+            `UPDATE runs SET status = 'scheduled'
+             WHERE status = 'running' AND id = (SELECT run_id FROM worker_jobs WHERE id = ?)
+               AND NOT EXISTS (SELECT 1 FROM worker_jobs j WHERE j.run_id = runs.id AND j.status = 'claimed')`
+          )
+          .run(jobId);
+      })();
     },
 
     // §1.7's own maintenance-sweep spec: "terminal-job pruning
@@ -3685,9 +3794,9 @@ export const repo = {
       const expiresAt = now + 90 * 24 * 3600 * 1000;
       database
         .prepare(
-          `UPDATE sessions SET token_hash = ?, refresh_hash = ?, prev_refresh_hash = ?, expires_at = ? WHERE id = ?`
+          `UPDATE sessions SET token_hash = ?, refresh_hash = ?, prev_refresh_hash = ?, rotated_at = ?, expires_at = ? WHERE id = ?`
         )
-        .run(hashToken(token), hashToken(refresh), current?.refresh_hash ?? null, expiresAt, sessionId);
+        .run(hashToken(token), hashToken(refresh), current?.refresh_hash ?? null, now, expiresAt, sessionId);
       return { token, refresh, expiresAt };
     },
 
@@ -4043,7 +4152,7 @@ export const repo = {
       const rows = getDb()
         .prepare(
           `SELECT
-             r.model_id AS model_id, m.filename AS model_filename,
+             r.model_id AS model_id, m.hf_file AS model_filename,
              r.llama_cpp_backend AS backend,
              ri.test_type AS test_type,
              json_extract(w.hardware_json, '$.platform')     AS platform,
@@ -4055,10 +4164,14 @@ export const repo = {
              ROUND(AVG(ri.vram_peak_mib))  AS avg_vram_peak_mib
            FROM runs r
            JOIN results ri ON ri.run_id = r.id
-           LEFT JOIN models m  ON m.id = r.model_id
+           JOIN models m  ON m.id = r.model_id
            LEFT JOIN workers w ON w.id = r.worker_id
            JOIN users u ON u.id = r.user_id AND u.share_benchmarks = 1
            WHERE r.user_id IS NOT NULL AND r.user_id <> ?
+             -- Measured on a machine, not typed into a file: an import carries
+             -- whatever numbers and filename its author wrote.
+             AND ri.imported_bundle_id IS NULL
+             AND ${COMMUNITY_VERIFIED_MODEL}
              AND (? IS NULL OR r.model_id = ?)
              AND (? IS NULL OR r.llama_cpp_backend = ?)
              AND (? IS NULL OR json_extract(w.hardware_json, '$.platform') = ?)
@@ -4093,10 +4206,10 @@ export const repo = {
       return rows.map((row) => ({
         modelId: row.model_id,
         modelFilename: row.model_filename,
-        backend: row.backend,
+        backend: plainLabel(row.backend) ?? "unknown",
         testType: row.test_type,
-        platform: row.platform,
-        gpuModel: row.gpu_model,
+        platform: plainLabel(row.platform),
+        gpuModel: plainLabel(row.gpu_model),
         contributorCount: row.contributor_count,
         runCount: row.run_count,
         avgTps: row.avg_tps,
@@ -4113,13 +4226,16 @@ export const repo = {
     // value below the floor never reaches the caller at all.
     listFacets(callerId: string): CommunityFacets {
       const db = getDb();
-      const consentWhere = `r.user_id IS NOT NULL AND r.user_id <> ? AND u.share_benchmarks = 1`;
+      // Same import exclusion as listAggregates, read from the run: this query
+      // has no results join.
+      const consentWhere = `r.user_id IS NOT NULL AND r.user_id <> ? AND u.share_benchmarks = 1
+             AND json_extract(r.config, '$.imported_bundle_id') IS NULL`;
 
       const models = db
         .prepare(
-          `SELECT r.model_id AS model_id, m.filename AS filename, COUNT(DISTINCT r.user_id) AS contributor_count
-           FROM runs r JOIN users u ON u.id = r.user_id LEFT JOIN models m ON m.id = r.model_id
-           WHERE ${consentWhere}
+          `SELECT r.model_id AS model_id, m.hf_file AS filename, COUNT(DISTINCT r.user_id) AS contributor_count
+           FROM runs r JOIN users u ON u.id = r.user_id JOIN models m ON m.id = r.model_id
+           WHERE ${consentWhere} AND ${COMMUNITY_VERIFIED_MODEL}
            GROUP BY r.model_id
            HAVING COUNT(DISTINCT r.user_id) >= ${communityMinContributors()}`
         )
@@ -4157,9 +4273,9 @@ export const repo = {
 
       return {
         models: models.map((m) => ({ modelId: m.model_id, value: m.filename ?? m.model_id, contributorCount: m.contributor_count })),
-        backends: backends.map((b) => ({ value: b.value, contributorCount: b.contributor_count })),
-        platforms: platforms.map((p) => ({ value: p.value, contributorCount: p.contributor_count })),
-        gpuModels: gpuModels.map((g) => ({ value: g.value, contributorCount: g.contributor_count })),
+        backends: labelledFacets(backends),
+        platforms: labelledFacets(platforms),
+        gpuModels: labelledFacets(gpuModels),
       };
     },
   },
@@ -4194,7 +4310,38 @@ export const repo = {
         probeMaxLoads: isValidProbeMaxLoads(parsedProbeMaxLoads)
           ? parsedProbeMaxLoads
           : DEFAULT_PROBE_MAX_LOADS, // documented default -- see that const's own comment
+        breadMarksEnabled: read("bread_marks_enabled") !== "0",
+        breadMarkStyle: readBreadMarkStyle(read("bread_mark_style")),
       };
+    },
+
+    setBreadMarksEnabled(enabled: boolean): AppSettings {
+      getDb()
+        .prepare(
+          `INSERT INTO meta (key, value) VALUES ('bread_marks_enabled', ?)
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value`
+        )
+        .run(enabled ? "1" : "0");
+      return repo.appSettingsRepo.get();
+    },
+
+    // Callers validate with isBreadMarkStyle first; a bad value throws here.
+    setBreadMarkStyle(style: BreadMarkStyle): AppSettings {
+      if (!isBreadMarkStyle(style)) throw new Error("not a bread mark style");
+      const clean: BreadMarkStyle = {
+        golden: style.golden,
+        darkFix: style.darkFix,
+        step: style.step,
+        falloff: style.falloff,
+        direction: style.direction,
+      };
+      getDb()
+        .prepare(
+          `INSERT INTO meta (key, value) VALUES ('bread_mark_style', ?)
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value`
+        )
+        .run(JSON.stringify(clean));
+      return repo.appSettingsRepo.get();
     },
 
     // Single-field convenience for callers that only need the live cap (e.g.
@@ -4649,10 +4796,18 @@ export const repo = {
         ) as QualityRow;
     },
 
-    listForModel(modelId: string): QualityRow[] {
+    // One tenant's rows, joined through the run that produced them. A null
+    // owner (single-tenant mode, or an owner-less legacy run) sees every row,
+    // the same convention listTests uses (audit 2026-10-11 N8).
+    listForModel(modelId: string, ownerId: string | null | undefined): QualityRow[] {
       return getDb()
-        .prepare(`SELECT * FROM quality_results WHERE model_id = ? ORDER BY created_at DESC`)
-        .all(modelId) as QualityRow[];
+        .prepare(
+          `SELECT q.* FROM quality_results q
+           JOIN runs r ON r.id = q.root_run_id
+           WHERE q.model_id = ? AND (? IS NULL OR r.user_id = ?)
+           ORDER BY q.created_at DESC`
+        )
+        .all(modelId, ownerId ?? null, ownerId ?? null) as QualityRow[];
     },
 
     listForRoot(rootRunId: string): QualityRow[] {
@@ -4845,6 +5000,15 @@ function buildResultRow(
   idx: number,
   r: IngestResultInput
 ): Omit<ResultRow, "backend_type" | "backend_device_name"> {
+  // RESULT_PROVENANCE_PLAN.md Phase 3 -- one formula for every stored row's
+  // statistics, whichever worker version computed them.
+  const stats = reconcileRowStats(r);
+  if (stats.stats_mismatch === 1) {
+    log.warn(
+      `result stats recomputed for run ${runId} item ${idx} ${r.test_type}: worker sent avg ${r.avg_tps} ± ${r.stddev_tps}, ` +
+        `its own clean samples give ${stats.avg_tps} ± ${stats.stddev_tps}`
+    );
+  }
   return {
     id: uuid(),
     run_id: runId,
@@ -4867,8 +5031,8 @@ function buildResultRow(
     n_gpu_layers_draft: r.n_gpu_layers_draft ?? 0,
     // Same reasoning as n_gpu_layers_draft above.
     n_cpu_moe: r.n_cpu_moe ?? 0,
-    avg_tps: r.avg_tps,
-    stddev_tps: r.stddev_tps,
+    avg_tps: stats.avg_tps,
+    stddev_tps: stats.stddev_tps,
     ram_peak_mib: r.ram_peak_mib,
     vram_peak_mib: r.vram_peak_mib,
     ram_avg_mib: r.ram_avg_mib,
@@ -4919,10 +5083,16 @@ function buildResultRow(
     // Same version-skew tolerance -- the draft companion's own estimate,
     // null on every non-MTP row (no draft buffer lines to derive from).
     gpu_layers_resident_est_draft: r.gpu_layers_resident_est_draft ?? null,
-    sample_count: r.sample_count,
-    suspect_count: r.suspect_count,
+    sample_count: stats.sample_count ?? undefined,
+    suspect_count: stats.suspect_count ?? undefined,
     suspect_samples: r.suspect_samples,
     repeat_samples: r.repeat_samples,
+    clean_samples: r.clean_samples,
+    repeats_requested: r.repeats_requested ?? null,
+    repeats_complete: stats.repeats_complete == null ? null : stats.repeats_complete === 1,
+    stats_mismatch: stats.stats_mismatch == null ? null : stats.stats_mismatch === 1,
+    worker_avg_tps: stats.worker_avg_tps,
+    worker_stddev_tps: stats.worker_stddev_tps,
     spec_drafted: r.spec_drafted,
     spec_accepted: r.spec_accepted,
     method_version: r.method_version ?? null,

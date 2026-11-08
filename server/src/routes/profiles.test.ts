@@ -211,7 +211,7 @@ describe("GET /api/runs/:id/profiles (M3)", () => {
     expect(after).toEqual(before);
   });
 
-  it("clamps a target past the model's trained context, and says it clamped", async () => {
+  it("clamps a target past the model's maximum context, and says it clamped", async () => {
     const res = await fetch(`${baseUrl}/api/runs/run-basic/profiles?goal=max_context&target_ctx=131072`);
     const body = (await res.json()) as { goals: { target_ctx: number }; target_ctx_clamped: boolean };
     expect(body.goals.target_ctx).toBe(32_768);
@@ -470,13 +470,15 @@ describe("GET /api/models/:id/verified-limits", () => {
     const res = await fetch(`${baseUrl}/api/models/m1/verified-limits?worker=${worker.id}`, {
       headers: authed(intruderToken),
     });
-    expect(res.status).toBe(403);
+    // m1 isn't on their list either, so it answers like an unknown model first.
+    expect(res.status).toBe(404);
   });
 
   it("the owner can read their own machine's verified limits", async () => {
     const worker = repo.workerRepo.getOrCreateByMachineId("limits-owner-ok", "limits-owner-ok");
     const { userId, token } = await sessionFor("limits-owner");
     claimWorker(worker.id, userId);
+    repo.addModelRegistration(userId, "m1");
     repo.limitsRepo.upsert({
       worker_id: worker.id,
       model_id: "m1",

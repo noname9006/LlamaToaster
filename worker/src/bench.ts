@@ -2,6 +2,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { readFileSync } from "node:fs";
 import type { IngestResultInput } from "../../shared/types.js";
 import { deriveTestType, type SweepItem } from "../../shared/sweep.js";
+import { llamaBenchSampleRates } from "../../shared/rowStats.js";
 import { modelLoadArgs } from "./binary-probe.js";
 
 export interface BenchLogger {
@@ -811,7 +812,7 @@ export async function runBench(input: BenchRunInput): Promise<BenchResult> {
       let gpu_info: string | undefined;
       let cpu_info: string | undefined;
       try {
-        const parsed = parseLlamaBench(stdout, input.item.n_cpu_moe);
+        const parsed = parseLlamaBench(stdout, input.item.n_cpu_moe, input.repeats);
         results = parsed.results;
         gpu_info = parsed.gpu_info;
         cpu_info = parsed.cpu_info;
@@ -868,7 +869,7 @@ export interface ParsedLlamaBench {
   cpu_info?: string;
 }
 
-export function parseLlamaBench(stdout: string, nCpuMoe: number): ParsedLlamaBench {
+export function parseLlamaBench(stdout: string, nCpuMoe: number, repeats?: number): ParsedLlamaBench {
   const arr = extractJsonArray(stdout);
   if (!Array.isArray(arr)) {
     throw new Error("llama-bench did not emit a JSON array");
@@ -876,6 +877,7 @@ export function parseLlamaBench(stdout: string, nCpuMoe: number): ParsedLlamaBen
   const results = arr.map((entry: LlamaBenchEntry) => {
     const nPrompt = entry.n_prompt ?? 0;
     const nGen = entry.n_gen ?? 0;
+    const samples = llamaBenchSampleRates(nPrompt, nGen, entry.samples_ns);
     return {
       test_type: deriveTestType(nPrompt, nGen),
       n_prompt: nPrompt,
@@ -923,6 +925,12 @@ export function parseLlamaBench(stdout: string, nCpuMoe: number): ParsedLlamaBen
       gpu_memory_model_peak_source: null,
       gpu_layers_loaded: null,
       total_model_layers: null,
+      // Per-repetition rates from llama-bench's own nanosecond timings (see
+      // shared/rowStats.ts for why not samples_ts). llama-bench either runs
+      // every repetition or fails the process, so these are all clean;
+      // absent on a build whose JSON has no samples_ns.
+      ...(samples ? { clean_samples: samples, repeat_samples: samples, sample_count: samples.length, suspect_count: 0 } : {}),
+      ...(repeats !== undefined ? { repeats_requested: repeats } : {}),
     };
   });
   // Identical across every entry in one invocation (one process, one model,

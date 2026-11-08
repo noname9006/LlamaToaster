@@ -114,7 +114,13 @@ export function buildServerArgs(input: ServerArgsInput): string[] {
     "5",
   ];
   if (input.mainGpu != null) args.push("-sm", "none", "-mg", String(input.mainGpu));
-  if (item.n_cpu_moe > 0) args.push("--n-cpu-moe", String(item.n_cpu_moe));
+  // Manual experiments only (LLAMATOASTER_FIT=on): hand placement to llama-server
+  // itself -- no -ngl / --n-cpu-moe, --fit on. Tests never set this.
+  const fitOn = process.env.LLAMATOASTER_FIT === "on";
+  if (fitOn) {
+    const i = args.indexOf("-ngl");
+    if (i >= 0) args.splice(i, 2);
+  } else if (item.n_cpu_moe > 0) args.push("--n-cpu-moe", String(item.n_cpu_moe));
   // --fit (default "on" on builds that have it) auto-adjusts whichever of
   // -ngl/-c/-ts/-ot were left UNSET to fit free device memory -- it's
   // documented to leave an explicitly-passed value alone. -ngl and -c are
@@ -126,7 +132,7 @@ export function buildServerArgs(input: ServerArgsInput): string[] {
   // reading in this app assumes. Forcing it off removes that gap regardless
   // of whether --n-cpu-moe itself would otherwise have shielded -ot from the
   // fitter -- not verified against real source, made moot instead.
-  if (input.supportsFit) args.push("--fit", "off");
+  if (input.supportsFit) args.push("--fit", fitOn ? "on" : "off");
   // Probed, never assumed (§0.7): an unsupported flag disables its behavior
   // rather than failing the item.
   if (input.supportsNoContextShift) args.push("--no-context-shift");
@@ -137,6 +143,8 @@ export function buildServerArgs(input: ServerArgsInput): string[] {
   // spawnRuntimeServer, which picks the policy and probes the flags.
   if (input.modelLoadArgs?.length) args.push(...input.modelLoadArgs);
   if (input.extraArgs?.length) args.push(...input.extraArgs);
+  // Experiments only: extra llama-server flags, space-separated.
+  if (process.env.LLAMATOASTER_EXTRA_ARGS) args.push(...process.env.LLAMATOASTER_EXTRA_ARGS.split(" ").filter(Boolean));
   return args;
 }
 

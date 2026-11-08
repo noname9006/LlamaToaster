@@ -1,3 +1,5 @@
+// First: other modules read env vars as they load (see load-env.ts).
+import "./load-env.js";
 import Fastify from "fastify";
 import fastifyStatic from "@fastify/static";
 import fastifyCookie from "@fastify/cookie";
@@ -27,25 +29,12 @@ import { rocmSupportRoutes } from "./routes/rocm-support.js";
 import { installRoutes } from "./routes/install.js";
 import { closeDb, getDb } from "./db/migrate.js";
 import { runMaintenanceSweep, REAP_INTERVAL_MS } from "./reaper.js";
+import { pruneRunLogs } from "./run-logs.js";
 import { authMiddleware } from "./auth-middleware.js";
 import { appErrorHandler } from "./error-handler.js";
 import { startHfIndexService, stopHfIndexService } from "./hf-index.js";
 import { startHfHeaderService, stopHfHeaderService } from "./hf-header.js";
 import { startRocmSupportService, stopRocmSupportService } from "./rocm-support.js";
-
-// Backs the AI assistant's server-side config only (AI_API_KEY/AI_BASE_URL/
-// AI_MODEL, see routes/ai.ts) -- every other env var here (PORT,
-// WORKER_PORT, ...) keeps coming from the shell/systemd as before, so a
-// missing .env (the common case -- it's optional and gitignored) is not an
-// error. process.loadEnvFile is a built-in Node 20.12+/22 API, no dotenv
-// dependency needed. Reading env vars happens inside route handlers/config.ts
-// at request time, not at module-load time, so it doesn't matter that this
-// runs after this file's own imports have already evaluated.
-try {
-  process.loadEnvFile();
-} catch {
-  /* no .env file at the repo root -- fine, AI_* vars just won't be set */
-}
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const clientDist = join(__dirname, "..", "..", "client", "dist");
@@ -232,8 +221,23 @@ app.addHook("onClose", async () => {
   clearInterval(pollingSummaryInterval);
 });
 
+// Listing a directory of log files is real I/O, so this runs hourly and apart
+// from the 15-second sweep. Never fatal: a bare interval's throw would crash
+// the server.
+function pruneRunLogsSafely(): void {
+  try {
+    const prunedLogs = pruneRunLogs();
+    if (prunedLogs) app.log.info({ prunedLogs }, "removed run logs past their retention");
+  } catch (err) {
+    app.log.error({ err }, "run log prune failed");
+  }
+}
+
 const reapInterval = setInterval(() => runMaintenanceSweep(app.log), REAP_INTERVAL_MS);
 reapInterval.unref();
+const runLogPruneInterval = setInterval(pruneRunLogsSafely, 3600_000);
+runLogPruneInterval.unref();
+pruneRunLogsSafely();
 
 // Hugging Face GGUF index service -- see server/src/hf-index.ts for the
 // full indexing flow. Started after the server is listening so a slow
@@ -248,6 +252,7 @@ startRocmSupportService();
 
 app.addHook("onClose", async () => {
   clearInterval(reapInterval);
+  clearInterval(runLogPruneInterval);
   stopHfIndexService();
   stopHfHeaderService();
   stopRocmSupportService();

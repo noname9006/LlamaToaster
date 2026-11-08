@@ -33,7 +33,7 @@ export interface ProfilesResponse {
   target_ctx_clamped: boolean;
 }
 
-// M2's target is clamped by trained context inline; scoring must see the same
+// M2's target is clamped by maximum context inline; scoring must see the same
 // clamped number the questionnaire showed.
 function clampTarget(goals: GoalsConfig, model: Model | undefined): { goals: GoalsConfig; clamped: boolean } {
   const trained = model?.metadata.trained_ctx;
@@ -217,6 +217,7 @@ function toScoringRow(row: ResultRow, idxOffset: number): ScoringRow {
     sample_count: row.sample_count,
     suspect_count: row.suspect_count,
     repeat_samples: row.repeat_samples,
+    repeats_complete: row.repeats_complete ?? null,
     vram_peak_mib: row.vram_peak_mib,
     ram_peak_mib: row.ram_peak_mib,
     gpu_memory_total_mb: row.gpu_memory_total_mb,
@@ -289,7 +290,7 @@ export const getProfilesHandler =
       const clamped = clampTarget(fromQuery.goals, model);
 
       // §0.3's "TG reference depth": a pinned depth, default 50 % of the
-      // stated target (else 50 % of trained context); the nearest measured
+      // stated target (else 50 % of maximum context); the nearest measured
       // depth is what actually gets compared.
       const anchor = clamped.goals.target_ctx ?? model?.metadata.trained_ctx ?? null;
       const referenceDepthTokens = anchor != null ? Math.floor(anchor / 2) : null;
@@ -313,7 +314,9 @@ export const getProfilesHandler =
       const verified = run.worker_id
         ? repo.limitsRepo.listForModelAndWorker(run.model_id, run.worker_id)
         : [];
-      const qualityResults = repo.qualityRepo.listForModel(run.model_id);
+      // The run owner's rows, under any scope: the supervise console shows what
+      // the owner sees, and nobody sees another tenant's measurements here.
+      const qualityResults = repo.qualityRepo.listForModel(run.model_id, repo.getTestOwnerId(run.id));
 
       const body: ProfilesResponse = {
         run_id: run.id,
@@ -343,7 +346,8 @@ export async function profilesRoutes(app: FastifyInstance): Promise<void> {
   app.get<{ Params: { id: string }; Querystring: { worker?: string } }>(
     "/api/models/:id/verified-limits",
     async (request, reply) => {
-      const model = repo.getModel(request.params.id);
+      const userId = resolveAuthUser(request)?.user.id;
+      const model = repo.isModelVisibleTo(userId, request.params.id) ? repo.getModel(request.params.id) : undefined;
       if (!model) return reply.code(404).send({ error: "model not found" });
 
       const workerId = request.query.worker;
@@ -351,7 +355,7 @@ export async function profilesRoutes(app: FastifyInstance): Promise<void> {
 
       const worker = repo.workerRepo.getWorker(workerId);
       if (!worker) return reply.code(404).send({ error: "unknown machine" });
-      assertOwnsWorker(resolveAuthUser(request)?.user.id, worker.id);
+      assertOwnsWorker(userId, worker.id);
 
       const limits: VerifiedLimitDto[] = repo.limitsRepo.listForModelAndWorker(model.id, worker.id);
       return { model_id: model.id, worker_id: worker.id, limits };

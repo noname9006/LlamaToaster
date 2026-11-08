@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { parseFitOutput } from "./fitParams.js";
-import { classifyKvProbe, kvCandidatePairs, kvSizeGroups, type KvSupportRow } from "./kvSupport.js";
+import { classifyKvProbe, kvCandidatePairs, kvKAtLeastV, kvSizeGroups, type KvSupportRow } from "./kvSupport.js";
 
 const fx = (n: string) =>
   parseFitOutput(readFileSync(join(__dirname, "__fixtures__", "fit", `${n}.stdout`), "utf8"), readFileSync(join(__dirname, "__fixtures__", "fit", `${n}.log`), "utf8"));
@@ -46,5 +46,16 @@ describe("kvSizeGroups", () => {
   });
   it("skips unusable pairs entirely", () => {
     expect(kvSizeGroups([{ ctk: "q8_0", ctv: "f16", fa: "off", status: "cpu_fallback", splits: 98, baseline_splits: 2, detail: null }])).toEqual([]);
+  });
+});
+
+describe("kvKAtLeastV", () => {
+  it("keeps K at least as precise as V", () => {
+    expect(kvKAtLeastV("f16", "q4_0")).toBe(true);
+    expect(kvKAtLeastV("q8_0", "q8_0")).toBe(true);
+    expect(kvKAtLeastV("q5_0", "q4_1")).toBe(true);
+    expect(kvKAtLeastV("q4_0", "q4_1")).toBe(false);
+    expect(kvKAtLeastV("q8_0", "f16")).toBe(false);
+    expect(kvKAtLeastV("f32", "f16")).toBe(false);
   });
 });

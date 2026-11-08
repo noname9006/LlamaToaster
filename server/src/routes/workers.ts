@@ -19,6 +19,10 @@ import { parseHeaderFields } from "../validate-worker-state.js";
 import { HF_REPO_PATTERN, searchHfGgufModels, listHfGgufFiles, getHfGgufMeta, type HfSortField } from "../hf.js";
 
 const WORKER_READ_TIMEOUT_MS = 5_000;
+// These spend the instance-wide Hugging Face budget (hf-rate-limit.ts), which
+// one user must not be able to exhaust for everyone (audit 2026-10-11 N12). Far
+// above a person clicking through results: a search page is one call each.
+const HF_PROXY_RATE_LIMIT = { max: 600, timeWindow: "1 hour", keyGenerator: userOrIpKeyGenerator } as const;
 
 function validateModelDownloadCallback(payload: unknown): string | null {
   if (!payload || typeof payload !== "object") return "payload must be an object";
@@ -275,6 +279,7 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
   // (search box empty, sort=downloads) shown before the user types anything.
   app.get<{ Querystring: { q?: string; sort?: string; direction?: string; cursor?: string } }>(
     "/api/hf/search",
+    { config: { rateLimit: HF_PROXY_RATE_LIMIT } },
     async (request, reply) => {
       const q = (request.query.q ?? "").trim();
       const sort = HF_SORT_FIELDS.has(request.query.sort as HfSortField) ? (request.query.sort as HfSortField) : undefined;
@@ -290,7 +295,7 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
     }
   );
 
-  app.get<{ Params: { "*": string } }>("/api/hf/repo/*", async (request, reply) => {
+  app.get<{ Params: { "*": string } }>("/api/hf/repo/*", { config: { rateLimit: HF_PROXY_RATE_LIMIT } }, async (request, reply) => {
     const repoId = request.params["*"];
     if (!repoId || !HF_REPO_PATTERN.test(repoId)) {
       return reply.code(400).send({ error: "invalid repo id" });
@@ -520,7 +525,7 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
           ...(typeof resolvedParamCount === "number" ? { param_count: resolvedParamCount } : {}),
           ...(typeof mtp_layers === "number" && mtp_layers > 0 ? { mtp_layers } : {}),
           ...(typeof quant === "string" && quant ? { quant } : {}),
-          // Trained context + KV geometry from the same GGUF header read --
+          // Maximum context + KV geometry from the same GGUF header read --
           // same >0 gate as above so a non-standard header's 0/undefined
           // can't overwrite anything with a meaningless value.
           ...(typeof trained_ctx === "number" && trained_ctx > 0 ? { trained_ctx } : {}),
@@ -581,7 +586,7 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         app.log.error({ worker, hf_repo, hf_file, err: message }, "model registration failed after download");
-        return reply.code(500).send({ error: message });
+        return reply.code(500).send({ error: "model registration failed" });
       }
     }
   );

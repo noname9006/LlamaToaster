@@ -29,7 +29,7 @@ describe("GET /install.ps1 and /install.sh", () => {
     const res = await fetch(`${baseUrl}/install.ps1`, { redirect: "manual" });
     expect(res.status).toBe(302);
     expect(res.headers.get("location")).toBe(
-      "https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.ps1"
+      "https://raw.githubusercontent.com/LlamaToaster/LlamaToaster/main/worker/bootstrap.ps1"
     );
   });
 
@@ -37,7 +37,7 @@ describe("GET /install.ps1 and /install.sh", () => {
     const res = await fetch(`${baseUrl}/install.sh`, { redirect: "manual" });
     expect(res.status).toBe(302);
     expect(res.headers.get("location")).toBe(
-      "https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.sh"
+      "https://raw.githubusercontent.com/LlamaToaster/LlamaToaster/main/worker/bootstrap.sh"
     );
   });
 

@@ -91,7 +91,7 @@ function SpeedChart({
 
 function Stat({ label, value, sub }: { label: string; value: string; sub?: string }) {
   return (
-    <div className="min-w-[132px] flex-[1_1_132px] border border-border bg-well px-3 py-2">
+    <div className="min-w-[132px] flex-[1_1_132px] bg-well px-3 py-2">
       <Kicker>{label}</Kicker>
       <div className="mt-0.5 font-mono text-lg text-fg">{value}</div>
       {sub && <div className="text-xs text-muted">{sub}</div>}

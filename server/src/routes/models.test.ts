@@ -151,10 +151,11 @@ describe("POST /api/models cannot write shared catalog rows (N3)", () => {
 
     downloaded(sha);
     expect(repo.getModel(sha)).toMatchObject({ filename: "real.gguf", hf_repo: "good/repo", hf_identity_locked: true });
-    // Shared now: the squatter can no longer delete it out from under others.
+    // Shared now: the squatter can no longer delete it out from under others,
+    // or even see it, having no machine with the file.
     expect(repo.getModelCreatedBy(sha)).toBeNull();
     const del = await fetch(`${baseUrl}/api/models/${sha}`, { method: "DELETE", headers: authed(token) });
-    expect(del.status).toBe(403);
+    expect(del.status).toBe(404);
   });
 
   it("an index-verified heartbeat write also takes a squatted row over, without locking it", async () => {
@@ -249,7 +250,8 @@ describe("DELETE /api/models/:id ownership", () => {
       method: "DELETE",
       headers: authed(intruderToken),
     });
-    expect(res.status).toBe(403);
+    // Answers like an unknown id: they can't see it (audit A11).
+    expect(res.status).toBe(404);
     expect(repo.getModel("m-del-protected")).toBeDefined();
   });
 
@@ -257,7 +259,7 @@ describe("DELETE /api/models/:id ownership", () => {
     await registerModel({ id: "m-del-unclaimed", filename: "x.gguf", size_bytes: 1, source: "local" });
     const token = await sessionFor("model-deleter-anyone");
     const res = await fetch(`${baseUrl}/api/models/m-del-unclaimed`, { method: "DELETE", headers: authed(token) });
-    expect(res.status).toBe(403);
+    expect(res.status).toBe(404);
     expect(repo.getModel("m-del-unclaimed")).toBeDefined();
   });
 
@@ -511,7 +513,10 @@ describe("POST /api/models without an id joins an existing row", () => {
     const second = await registerModel({ ...hfBody, filename: "renamed.gguf", metadata: { n_layer: 99 } }, authed(b));
     expect(second.status).toBe(200);
     expect(((await second.json()) as { model: { id: string } }).model.id).toBe(model.id);
-    expect(repo.getModel(model.id)).toMatchObject({ filename: "shared-Q4.gguf", metadata: { n_layer: 32 } });
+    // Neither adder's numbers are on the shared row; each sees only their own.
+    expect(repo.getModel(model.id)).toMatchObject({ filename: "shared-Q4.gguf", metadata: {} });
+    expect(repo.listModelsVisibleTo(repo.userRepo.findByIdentity("github", "r1-first")!.id).find((m) => m.id === model.id)?.metadata.n_layer).toBe(32);
+    expect(repo.listModelsVisibleTo(repo.userRepo.findByIdentity("github", "r1-second")!.id).find((m) => m.id === model.id)?.metadata.n_layer).toBe(99);
     expect(repo.getModelCreatedBy(model.id)).not.toBeNull();
     expect(await visible(b)).toContain(model.id);
   });

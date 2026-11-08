@@ -32,6 +32,10 @@ import { platform as osPlatform, cpus as osCpus } from "node:os";
 import si from "systeminformation";
 import { log } from "./log.js";
 import type { MemorySpeedResult, MemorySpeedThreadPoint } from "../../shared/types.js";
+import { buildReadKernelWasm } from "../../shared/memReadKernel.js";
+
+// The SIMD READ kernel (bytes are handed to every thread, which compiles its own copy).
+const READ_KERNEL = buildReadKernelWasm();
 
 const execFileAsync = promisify(execFile);
 
@@ -44,7 +48,7 @@ const VRAM_SCRIPT_PATH = fileURLToPath(new URL("./memSpeedVram.ps1", import.meta
 // light enough not to trouble a modest worker box that's also expected to
 // load multi-GB GGUF models.
 const RAM_MIB_PER_ARRAY = 256;
-const RAM_TRIALS = 3;
+const RAM_TRIALS = 6;
 const RAM_REPS = 4;
 const VRAM_TIMEOUT_MS = 60_000;
 const WORKER_READY_TIMEOUT_MS = 15_000;
@@ -73,14 +77,24 @@ interface ThreadHandle {
   ready: Promise<void>;
 }
 
-function spawnThread(bufA: SharedArrayBuffer, bufB: SharedArrayBuffer, start: number, end: number): ThreadHandle {
-  const worker = new ThreadWorker(WORKER_SCRIPT_URL, { workerData: { bufA, bufB, start, end } });
+let warnedJsRead = false;
+
+function spawnThread(elems: number): ThreadHandle {
+  // Each thread allocates its own private slice (no SharedArrayBuffer: V8 runs
+  // fill()/set() on shared buffers through a slow atomic loop that halves the
+  // write and copy figures -- see memSpeedWorker.mjs).
+  const worker = new ThreadWorker(WORKER_SCRIPT_URL, { workerData: { elems, kernel: READ_KERNEL } });
   const ready = new Promise<void>((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error("memory-speed worker thread did not become ready in time")), WORKER_READY_TIMEOUT_MS);
-    worker.once("message", (msg: { ready?: boolean }) => {
+    worker.once("message", (msg: { ready?: boolean; readKernel?: string }) => {
       clearTimeout(timer);
-      if (msg?.ready) resolve();
-      else reject(new Error("memory-speed worker thread sent an unexpected first message"));
+      if (msg?.ready) {
+        if (msg.readKernel === "js" && !warnedJsRead) {
+          warnedJsRead = true;
+          log.warn("memory-speed: WebAssembly SIMD unavailable, READ falls back to a JavaScript loop and reads low (a lower bound, not the memory's peak)");
+        }
+        resolve();
+      } else reject(new Error("memory-speed worker thread sent an unexpected first message"));
     });
     worker.once("error", (err) => {
       clearTimeout(timer);
@@ -121,14 +135,9 @@ async function runOp(threads: ThreadHandle[], op: Op, reps: number): Promise<num
 async function measureRamRow(threadCount: number): Promise<MemorySpeedThreadPoint> {
   const elemsPerArray = Math.floor((RAM_MIB_PER_ARRAY * 1024 * 1024) / 8);
   const chunkLen = Math.floor(elemsPerArray / threadCount);
-  const usedElems = chunkLen * threadCount;
-  const bufA = new SharedArrayBuffer(usedElems * 8);
-  const bufB = new SharedArrayBuffer(usedElems * 8);
 
   const threads: ThreadHandle[] = [];
-  for (let i = 0; i < threadCount; i++) {
-    threads.push(spawnThread(bufA, bufB, i * chunkLen, (i + 1) * chunkLen));
-  }
+  for (let i = 0; i < threadCount; i++) threads.push(spawnThread(chunkLen));
   try {
     await Promise.all(threads.map((t) => t.ready));
     const best: Record<Op, number> = { read: 0, write: 0, copy: 0 };

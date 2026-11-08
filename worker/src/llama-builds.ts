@@ -120,25 +120,23 @@ export function validateTag(tag: string): void {
   }
 }
 
-// The download URL is supposed to come from the orchestrator's cached GitHub
-// API response, never straight from a browser -- but the worker is the
-// process that will download, extract, and later exec whatever's at this
-// URL, so it re-checks the host itself rather than trusting the caller.
-const ALLOWED_DOWNLOAD_HOSTS = new Set([
-  "github.com",
-  "objects.githubusercontent.com",
-  "codeload.github.com",
-]);
-
-function assertAllowedDownloadUrl(url: string): void {
+// The download URL comes from the orchestrator's cached GitHub API response,
+// but this process will download, extract and later exec whatever's at it, so
+// it checks for itself that this is a llama.cpp release asset for the tag being
+// installed. Any github.com URL used to pass, which made a compromised server
+// (or a bug there) code execution on every enrolled machine (audit 2026-11-01
+// D2). The redirect to GitHub's CDN is GitHub's own to follow.
+export function assertAllowedDownloadUrl(url: string, tag: string): void {
   let parsed: URL;
   try {
     parsed = new URL(url);
   } catch {
     throw new Error(`invalid download url: ${url}`);
   }
-  if (parsed.protocol !== "https:" || !ALLOWED_DOWNLOAD_HOSTS.has(parsed.hostname)) {
-    throw new Error(`download url host not allowed: ${parsed.hostname}`);
+  const prefix = `/ggml-org/llama.cpp/releases/download/${tag}/`;
+  const asset = parsed.pathname.startsWith(prefix) ? parsed.pathname.slice(prefix.length) : "";
+  if (parsed.protocol !== "https:" || parsed.hostname !== "github.com" || !asset || asset.includes("/") || asset.includes("..")) {
+    throw new Error(`download url is not a llama.cpp release asset for ${tag}: ${url}`);
   }
 }
 
@@ -277,8 +275,8 @@ export async function installBuild(opts: {
   signal?: AbortSignal;
 }): Promise<InstalledBuildInfo> {
   validateTag(opts.tag);
-  assertAllowedDownloadUrl(opts.downloadUrl);
-  if (opts.cudartUrl) assertAllowedDownloadUrl(opts.cudartUrl);
+  assertAllowedDownloadUrl(opts.downloadUrl, opts.tag);
+  if (opts.cudartUrl) assertAllowedDownloadUrl(opts.cudartUrl, opts.tag);
   if (!existsSync(opts.buildsDir)) mkdirSync(opts.buildsDir, { recursive: true });
   const targetDir = join(opts.buildsDir, opts.tag);
   if (existsSync(targetDir)) {

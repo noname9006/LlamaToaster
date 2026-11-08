@@ -14,7 +14,7 @@ treated as the highest priority category below.
 Please **don't open a public GitHub issue** for security reports.
 
 Preferred: use GitHub's private reporting —
-[Security → Report a vulnerability](https://github.com/noname9006/LlamaToaster/security/advisories/new)
+[Security → Report a vulnerability](https://github.com/LlamaToaster/LlamaToaster/security/advisories/new)
 on this repo. It opens a private advisory only the maintainer can see until
 it's resolved.
 

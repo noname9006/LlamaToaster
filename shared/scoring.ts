@@ -40,13 +40,15 @@ export interface ScoringRow {
   sample_count?: number;
   suspect_count?: number;
   repeat_samples?: number[];
+  /** false when some requested repeats produced no reading (shared/rowStats.ts); null/undefined on older rows. */
+  repeats_complete?: boolean | null;
   vram_peak_mib: number | null;
   ram_peak_mib: number;
   gpu_memory_total_mb: number | null;
   system_memory_total_mb: number | null;
 }
 
-export type RejectionGate = "stability" | "suspect_samples" | "missing_pp_or_tg";
+export type RejectionGate = "stability" | "suspect_samples" | "missing_pp_or_tg" | "incomplete_repeats";
 
 export type ProfileId = "max_speed" | "balanced" | "max_context" | "low_memory";
 
@@ -121,7 +123,7 @@ export interface ScoringInput {
   discardFirstRepeats?: number;
   /**
    * Tokens the TG reference depth aims at (default 50 % of the stated target,
-   * else 50 % of trained context). The nearest available depth wins.
+   * else 50 % of maximum context). The nearest available depth wins.
    */
   referenceDepthTokens?: number | null;
   /** M1 per-placement inverse estimate; the caller owns weights/placement knowledge. */
@@ -275,6 +277,7 @@ export function scoreProfiles(input: ScoringInput): ScoringResult {
     stability: 0,
     suspect_samples: 0,
     missing_pp_or_tg: 0,
+    incomplete_repeats: 0,
   };
 
   // §0.1 -- rows of different method_version are never averaged together.
@@ -377,6 +380,13 @@ export function scoreProfiles(input: ScoringInput): ScoringResult {
 
     if (ppStats.suspect > 0 || tgStats.suspect > 0) {
       tallies.suspect_samples++;
+      continue;
+    }
+    // RESULT_PROVENANCE_PLAN.md Phase 3: a mean over the repeats that happened
+    // to produce a reading is not the measurement the sweep asked for. Only
+    // an explicit false disqualifies -- rows predating the field stay eligible.
+    if (ppRow.repeats_complete === false || tgRow.repeats_complete === false) {
+      tallies.incomplete_repeats++;
       continue;
     }
     medianByKey.set(config.key, {

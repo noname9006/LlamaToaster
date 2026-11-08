@@ -16,7 +16,7 @@
 # supplies the short name. The raw URL keeps working directly if you prefer
 # to see exactly where it points, or the origin is unreachable:
 #
-#   curl -fsSL https://raw.githubusercontent.com/noname9006/LlamaToaster/main/worker/bootstrap.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/LlamaToaster/LlamaToaster/main/worker/bootstrap.sh | bash
 #
 # It'll ask where to install. To pass any option (including --dir, to skip
 # the prompts for unattended/scripted use), forward arguments through bash:
@@ -48,8 +48,8 @@
 
 set -euo pipefail
 
-REPO_URL="https://github.com/noname9006/LlamaToaster.git"
-REPO_OWNER_SLASH="noname9006/LlamaToaster"
+REPO_URL="https://github.com/LlamaToaster/LlamaToaster.git"
+REPO_OWNER_SLASH="LlamaToaster/LlamaToaster"
 DIR=""
 BRANCH="main"
 WORKER_NAME="Local"

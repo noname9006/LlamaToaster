@@ -6,6 +6,7 @@ import { v4 as uuid } from "uuid";
 import { repo } from "../db/repo.js";
 import { resolveAuthUser, sessionScope, userOrIpKeyGenerator } from "../auth-middleware.js";
 import { MAX_NEW_CATALOG_ROWS_PER_USER_HOUR, MAX_NEW_CATALOG_ROWS_GLOBAL_HOUR } from "./queue.js";
+import { bodyBytes, chargeIngest } from "../ingest-budget.js";
 import type { UserScope } from "../auth-middleware.js";
 import type { ResultRow, Test, TestConfig } from "../../../shared/types.js";
 import {
@@ -148,6 +149,7 @@ export async function exchangeRoutes(app: FastifyInstance): Promise<void> {
     async (request, reply) => {
       const authed = resolveAuthUser(request);
       const userId = authed?.user.id;
+      if (userId) chargeIngest(userId, bodyBytes(request.headers, request.body));
       const validation = validateBundle(request.body?.bundle);
       if (validation.fatal) {
         request.log.warn({ import_rejected: true, reason: validation.fatal, row_id: null }, "import_rejected");
@@ -170,7 +172,7 @@ export async function exchangeRoutes(app: FastifyInstance): Promise<void> {
       // already known here; those count against the importer's hourly
       // new-catalog-row budget (shared with worker registrations).
       const claimed = bundle.run.model_sha256 ?? null;
-      const needsStandIn = !(claimed && repo.getModel(claimed));
+      const needsStandIn = !repo.importLinksToCatalogRow(userId, claimed);
       if (
         needsStandIn &&
         userId &&

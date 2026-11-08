@@ -101,7 +101,7 @@ export function ModelPicker({
       <button
         type="button"
         onClick={() => setOpen((o) => !o)}
-        className={`flex w-full items-center justify-between gap-2 rounded-lg border border-border bg-surface px-3 py-1.5 text-left text-fg outline-none focus:border-accent ${buttonClassName ?? ""}`}
+        className={`flex w-full items-center justify-between gap-2 rounded-lg border border-border-strong bg-surface px-3 py-1.5 text-left text-fg outline-none focus:border-accent ${buttonClassName ?? ""}`}
       >
         {selected ? (
           <span className="flex min-w-0 flex-col">
@@ -115,11 +115,11 @@ export function ModelPicker({
       </button>
 
       {open && (
-        <div className="absolute top-full z-40 mt-1 max-h-96 w-full min-w-[26rem] overflow-y-auto rounded-lg border border-border bg-surface-raised shadow-lg">
+        <div className="absolute top-full z-40 mt-1 max-h-96 w-full min-w-[26rem] overflow-y-auto rounded-lg border border-border-strong bg-surface-raised shadow-lg">
           {groups.length === 0 && <p className="px-3 py-2.5 text-sm text-muted">No models registered yet.</p>}
           {groups.map((group) => (
             <div key={group.key} className="border-b border-border last:border-b-0">
-              <div className="px-3 pt-2 pb-0.5 text-[11px] font-semibold uppercase tracking-wide text-muted">
+              <div className="px-3 pt-2 pb-0.5 text-[11px] font-semibold text-muted">
                 {group.author} · {group.family} · {group.label}
               </div>
               {group.quants.map(({ base }) => (

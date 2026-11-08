@@ -53,7 +53,7 @@ export function ChipInput({ label, hint, value, onChange, presets, placeholder }
         <label className="text-sm font-medium text-fg">{label}</label>
         {hint && <span className="text-xs text-muted">{hint}</span>}
       </div>
-      <div className="mt-1.5 flex min-h-10 flex-wrap items-center gap-1.5 rounded-lg border border-border bg-surface px-2 py-1.5 focus-within:border-accent">
+      <div className="mt-1.5 flex min-h-10 flex-wrap items-center gap-1.5 rounded-lg border border-border-strong bg-surface px-2 py-1.5 focus-within:border-accent">
         {value
           .slice()
           .sort((a, b) => a - b)

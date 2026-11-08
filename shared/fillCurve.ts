@@ -59,7 +59,7 @@ export function validateFillCurveSpec(spec: FillCurveSpec, trainedCtx: number | 
     return `fill_curve.ctx must be an integer between ${MIN_FILL_CURVE_CTX} and ${MAX_FILL_CURVE_CTX}`;
   }
   if (trainedCtx != null && trainedCtx > 0 && spec.ctx > trainedCtx) {
-    return `fill_curve.ctx exceeds the model's trained context (${trainedCtx})`;
+    return `fill_curve.ctx exceeds the model's maximum context (${trainedCtx})`;
   }
   if (
     spec.steps !== undefined &&

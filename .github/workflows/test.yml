@@ -15,7 +15,13 @@ concurrency:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # Workers run on Windows as much as Linux, and several paths differ there
+    # (GPU counters, process listing, file locking).
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
 
@@ -28,9 +34,23 @@ jobs:
             client/package-lock.json
             admin/package-lock.json
 
-      # `npm ci` at the root also installs client/ and admin/ through the
-      # root package.json's postinstall hook.
-      - run: npm ci
+      # better-sqlite3 ships prebuilt binaries but also a binding.gyp, so a plain
+      # `npm ci` runs node-gyp, which fails on windows-latest (its Visual Studio
+      # is newer than node-gyp knows). --ignore-scripts skips that build; the
+      # root postinstall hook (which installs worker/, client/ and admin/) is
+      # then done by hand: `npm run postinstall` would recurse, because each
+      # nested `npm install --prefix` runs the root postinstall again.
+      - run: npm ci --ignore-scripts
+      # `npm ci`, not the install:worker script: on windows-latest `npm install
+      # --prefix worker` wrote the root package into worker/package.json.
+      - run: npm ci --omit=dev --ignore-scripts --prefix worker
+      - run: npm ci --ignore-scripts --prefix client
+      - run: npm ci --ignore-scripts --prefix admin
+
+      # Informational: a new advisory shouldn't turn every open PR red.
+      - name: Audit runtime dependencies
+        run: npm audit --omit=dev --audit-level=high
+        continue-on-error: true
 
       - name: Typecheck (server, worker, shared)
         run: npm run typecheck

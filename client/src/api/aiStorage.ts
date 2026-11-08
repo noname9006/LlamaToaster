@@ -62,20 +62,43 @@ export function deriveTitle(messages: DisplayMessage[]): string {
   return text.length > TITLE_MAX_LEN ? `${text.slice(0, TITLE_MAX_LEN)}…` : text;
 }
 
+// Reading localStorage can throw too, where a browser blocks site data. The chat
+// panel sits in the app shell, so that would take the whole app down with it
+// (audit 2026-10-11 N21): this reads as "nothing stored" instead.
+export function readStored(key: string): string | null {
+  try {
+    return localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+export function writeStored(key: string, value: string): void {
+  try {
+    localStorage.setItem(key, value);
+  } catch {
+    /* best-effort, e.g. quota exceeded or storage blocked */
+  }
+}
+
 // One-time migration: this assistant used to keep a single flat message list
 // under LEGACY_HISTORY_KEY. The first time dialogues are loaded and none
 // exist yet, fold that old history into a single migrated dialogue instead
 // of silently discarding a user's existing chat.
 function migrateLegacyHistory(): Dialogue[] {
-  const legacy = safeParse<DisplayMessage[]>(localStorage.getItem(LEGACY_HISTORY_KEY), []);
-  localStorage.removeItem(LEGACY_HISTORY_KEY);
+  const legacy = safeParse<DisplayMessage[]>(readStored(LEGACY_HISTORY_KEY), []);
+  try {
+    localStorage.removeItem(LEGACY_HISTORY_KEY);
+  } catch {
+    /* best-effort */
+  }
   if (legacy.length === 0) return [];
   const now = Date.now();
   return [{ id: makeId(), title: deriveTitle(legacy), messages: legacy, createdAt: now, updatedAt: now }];
 }
 
 export function loadDialogues(): Dialogue[] {
-  const raw = localStorage.getItem(DIALOGUES_KEY);
+  const raw = readStored(DIALOGUES_KEY);
   if (raw === null) {
     const migrated = migrateLegacyHistory();
     if (migrated.length > 0) saveDialogues(migrated);
@@ -96,7 +119,7 @@ export function saveDialogues(dialogues: Dialogue[]): void {
 }
 
 export function loadActiveDialogueId(): string | null {
-  return localStorage.getItem(ACTIVE_DIALOGUE_KEY);
+  return readStored(ACTIVE_DIALOGUE_KEY);
 }
 
 export function saveActiveDialogueId(id: string | null): void {
@@ -109,7 +132,7 @@ export function saveActiveDialogueId(id: string | null): void {
 }
 
 export function loadMemory(): MemoryItem[] {
-  return safeParse<MemoryItem[]>(localStorage.getItem(MEMORY_KEY), []);
+  return safeParse<MemoryItem[]>(readStored(MEMORY_KEY), []);
 }
 
 export function saveMemory(items: MemoryItem[]): void {

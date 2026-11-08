@@ -30,8 +30,8 @@ export function ImportBundle() {
   }
 
   return (
-    <div className="rounded-xl border border-border bg-surface p-4">
-      <span className="text-[11px] font-semibold uppercase tracking-wide text-muted">Import a results bundle</span>
+    <div className="border-t border-border pt-4">
+      <span className="text-[11px] font-semibold text-muted">Import a results bundle</span>
       <p className="mt-2 text-xs leading-relaxed text-muted">
         Each row's hash is recomputed from its canonical form and re-checked here, so a bundle that was altered
         after export fails on exactly the altered rows. Imported rows are badged wherever they appear.
@@ -55,7 +55,7 @@ export function ImportBundle() {
       {error && <p className="mt-2 text-xs text-danger">{error}</p>}
 
       {result && (
-        <div className="mt-3 rounded-lg border border-border bg-surface-raised p-3 text-xs leading-relaxed text-muted">
+        <div className="mt-3 bg-surface p-3 text-xs leading-relaxed text-muted">
           <p>
             Imported <b className="text-fg">{result.imported_rows}</b> row
             {result.imported_rows === 1 ? "" : "s"}

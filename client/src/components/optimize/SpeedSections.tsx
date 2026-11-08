@@ -1,7 +1,8 @@
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import { Btn, CopyCommand, Kicker, Notice, Panel, ProgressBar, StatCard, StepTitle, fmtDuration, fmtGb, fmtTps } from "./ui";
-import { LtIcon } from "../ltIcons";
 import type { FlowContext } from "./flowContext";
+import type { FlowStep } from "../../types";
+import { SpeedBars } from "./charts";
 import { cpuSideMib, isFailed, speedRunView, spilledMib, templateSweep, type SpeedRunView } from "./flowData";
 import { isActive, type FlowRun } from "./useOptimizeFlow";
 import { ctxLabel } from "../../../../shared/optimizeFlow.js";
@@ -55,17 +56,21 @@ function statusText(view: SpeedRunView["rows"][number]["outcome"]): string {
   }
 }
 
-export function SpeedTable({ view, baseline }: { view: SpeedRunView; baseline: SpeedRunView | null }) {
+export function SpeedTable({ view, baseline, refName }: { view: SpeedRunView; baseline: SpeedRunView | null; refName?: string }) {
   const base = baseline?.rows.find((r) => r.candidate.source === "baseline")?.outcome ?? null;
   return (
     <div className="overflow-x-auto">
-      <table className="w-full border-collapse border border-border bg-surface text-left">
+      <table className="w-full border-collapse text-left">
         <thead>
-          <tr className="border-b border-border-strong font-mono text-xs tracking-[0.04em] text-muted">
+          <tr className="border-b border-border text-[13px] text-muted">
             <th scope="col" className="px-3 py-2 font-normal">Config</th>
             <th scope="col" className="px-2 py-2 text-right font-normal">pp t/s</th>
             <th scope="col" className="px-2 py-2 text-right font-normal">tg t/s</th>
-            {base && <th scope="col" className="px-2 py-2 text-right font-normal">tg vs default</th>}
+            {base && (
+              <th scope="col" className="px-2 py-2 text-right font-normal">
+                tg vs {refName && refName !== "the default settings" ? "current" : "default"}
+              </th>
+            )}
             <th scope="col" className="px-2 py-2 text-right font-normal">VRAM peak</th>
             <th scope="col" className="px-3 py-2 font-normal">Status</th>
           </tr>
@@ -82,6 +87,7 @@ export function SpeedTable({ view, baseline }: { view: SpeedRunView; baseline: S
                   <div className="text-muted [overflow-wrap:anywhere]">
                     -ngl {candidate.ngl} · {candidate.ctk}/{candidate.ctv} · FA {candidate.fa}
                     {candidate.ot ? " · experts on CPU" : ""}
+                    {candidate.b != null || candidate.ub != null ? ` · -b ${candidate.b ?? 2048} -ub ${candidate.ub ?? 512}` : ""}
                     {candidate.threads ? ` · -t ${candidate.threads.t} -tb ${candidate.threads.tb}` : ""}
                     {cpuSideMib(outcome) ? ` · ${fmtGb(cpuSideMib(outcome))} on CPU side` : ""}
                   </div>
@@ -120,7 +126,17 @@ export function RunProgress({ run }: { run: FlowRun }) {
   );
 }
 
-export function BaselineSection({ ctx, run }: { ctx: FlowContext; run: FlowRun | null }) {
+export function BaselineSection({
+  ctx,
+  run,
+  n = "1",
+  title = "Baseline — what you get with no tuning",
+}: {
+  ctx: FlowContext;
+  run: FlowRun | null;
+  n?: string;
+  title?: string;
+}) {
   const [error, setError] = useState<string | null>(null);
   const [starting, setStarting] = useState(false);
   const w = speedWorkload(ctx.targetCtx);
@@ -157,8 +173,8 @@ export function BaselineSection({ ctx, run }: { ctx: FlowContext; run: FlowRun |
   const spill = outcome ? spilledMib(outcome) : null;
   return (
     <Panel>
-      <StepTitle n="1" right={<span className="font-mono text-xs text-muted">llama-server · -ngl 999 · defaults</span>}>
-        Baseline — what you get with no tuning
+      <StepTitle n={n} right={<span className="font-mono text-xs text-muted">llama-server · -ngl 999 · defaults</span>}>
+        {title}
       </StepTitle>
       <p className="mb-3 text-sm text-fg-2">
         llama-server at {ctxLabel(ctx.targetCtx)} context{" "}
@@ -185,8 +201,8 @@ export function BaselineSection({ ctx, run }: { ctx: FlowContext; run: FlowRun |
       {outcome && spill != null && (
         <div className="mt-3">
           <Notice tone="warn">
-            It ran, but {fmtGb(spill)} of its GPU memory lived in system RAM — the driver paged it out instead of failing. The fit map below shows
-            placements that keep it on the GPU.
+            It ran, but {fmtGb(spill)} of its GPU memory lived in system RAM — the driver paged it out instead of failing. The context and offload
+            step finds placements that keep it on the GPU.
           </Notice>
         </div>
       )}
@@ -212,12 +228,33 @@ export function ConfirmSection({
   onRemove,
   run,
   baselineRun,
+  step = "confirm",
+  n = "4",
+  title = "Confirm the winners",
+  intro,
+  reference = baselineCandidate(),
+  refName = "the default settings",
+  emptyText = "Add configs from the fit map (or the suggestions) to measure them here.",
+  disabledReason,
+  resultTitle = "Recommended config",
 }: {
   ctx: FlowContext;
   candidates: SpeedCandidate[];
-  onRemove: (key: string) => void;
+  onRemove?: (key: string) => void;
   run: FlowRun | null;
   baselineRun: FlowRun | null;
+  /** The flow step the run is stored under. */
+  step?: FlowStep;
+  n?: string;
+  title?: string;
+  intro?: ReactNode;
+  /** Measured alongside every candidate as the comparison row (source "baseline"). */
+  reference?: SpeedCandidate;
+  refName?: string;
+  emptyText?: string;
+  /** Set when the run can't start for a reason the section doesn't know. */
+  disabledReason?: string | null;
+  resultTitle?: string;
 }) {
   const [error, setError] = useState<string | null>(null);
   const [starting, setStarting] = useState(false);
@@ -232,7 +269,7 @@ export function ConfirmSection({
     setError(null);
     setStarting(true);
     try {
-      await ctx.trigger("confirm", {
+      await ctx.trigger(step, {
         model_id: ctx.model.id,
         worker_id: ctx.workerId,
         main_gpu: ctx.mainGpu,
@@ -243,8 +280,8 @@ export function ConfirmSection({
           prompt_tokens: w.promptTokens,
           n_gen: w.nGen,
           repeats: ctx.repeats,
-          // The default runs alongside, so the comparison is from the same sitting.
-          candidates: [baselineCandidate(), ...list],
+          // The reference runs alongside, so the comparison is from the same sitting.
+          candidates: [{ ...reference, source: "baseline" }, ...list],
         },
       });
     } catch (err) {
@@ -254,20 +291,26 @@ export function ConfirmSection({
     }
   }
 
-  const best = view ? recommend(view) : null;
+  const best = view ? recommend(view, refName) : null;
+  const carried = best ? null : carryForward(view, refName);
   return (
-    <Panel accent={!!best}>
-      <StepTitle n="4" right={<span className="font-mono text-xs text-muted">same harness as the baseline</span>}>
-        Confirm the winners
+    <Panel>
+      <StepTitle n={n} right={<span className="font-mono text-xs text-muted">same harness as the baseline</span>}>
+        {title}
       </StepTitle>
       <p className="mb-3 text-sm text-fg-2">
-        Fit maximises layers, not speed — on some cards generation peaks below full offload. Each config below gets a real load at {ctxLabel(ctx.targetCtx)},
-        the same {w.promptTokens.toLocaleString("en-US")}-token prompt and {w.nGen} generated tokens, next to the default settings.
+        {intro ?? (
+          <>
+            Fit maximises layers, not speed — on some cards generation peaks below full offload. Each config below gets a real load at{" "}
+            {ctxLabel(ctx.targetCtx)}, the same {w.promptTokens.toLocaleString("en-US")}-token prompt and {w.nGen} generated tokens, next to{" "}
+            {refName}.
+          </>
+        )}
       </p>
       {list.length === 0 ? (
-        <Notice>Add configs from the fit map (or the suggestions) to measure them here.</Notice>
+        <Notice>{emptyText}</Notice>
       ) : (
-        <ul className="mb-3 flex flex-col border border-border">
+        <ul className="mb-3 flex flex-col border-t border-border">
           {list.map((c) => (
             <li key={candidateKey(c)} className="flex flex-wrap items-center gap-x-4 gap-y-1 border-b border-border px-3 py-2 last:border-b-0">
               <span className="min-w-0 flex-[1_1_220px]">
@@ -275,32 +318,46 @@ export function ConfirmSection({
                 <span className="block font-mono text-xs text-muted [overflow-wrap:anywhere]">
                   -ngl {c.ngl} · {c.ctk}/{c.ctv} · FA {c.fa}
                   {c.ot ? " · -ot (experts on CPU)" : ""}
+                  {c.b != null || c.ub != null ? ` · -b ${c.b ?? 2048} -ub ${c.ub ?? 512}` : ""}
                   {c.threads ? ` · -t ${c.threads.t} -tb ${c.threads.tb}` : ""}
                 </span>
               </span>
-              <Btn kind="ghost" onClick={() => onRemove(candidateKey(c))} disabled={active} aria-label={`Remove ${c.label}`}>
-                Remove
-              </Btn>
+              {onRemove && (
+                <Btn kind="ghost" onClick={() => onRemove(candidateKey(c))} disabled={active} aria-label={`Remove ${c.label}`}>
+                  Remove
+                </Btn>
+              )}
             </li>
           ))}
         </ul>
       )}
       <div className="flex flex-wrap items-center gap-3">
-        <Btn kind="primary" onClick={start} disabled={active || starting || list.length === 0 || ctx.machineOffline}>
+        <Btn
+          kind="primary"
+          onClick={start}
+          disabled={active || starting || list.length === 0 || ctx.machineOffline || !!disabledReason}
+          aria-describedby={disabledReason || ctx.machineOffline ? `${step}-why` : undefined}
+        >
           {active ? "Measuring…" : `Measure ${list.length + 1} config${list.length ? "s" : ""}`}
         </Btn>
         <span className="font-mono text-xs text-muted">
           {fmtDuration(eta)} · {ctx.repeats} repeat{ctx.repeats === 1 ? "" : "s"} each
         </span>
       </div>
+      {(disabledReason || ctx.machineOffline) && !active && (
+        <p id={`${step}-why`} className="mt-2 text-sm text-muted">
+          {disabledReason ?? `${ctx.worker.displayName} is offline — start its worker to measure.`}
+        </p>
+      )}
       {error && <div className="mt-3"><Notice tone="fail">{error}</Notice></div>}
       {run && active && <div className="mt-3"><RunProgress run={run} /></div>}
       {view && (
         <div className="mt-4 flex flex-col gap-4">
-          <SpeedTable view={view} baseline={view.rows.some((r) => r.candidate.source === "baseline") ? view : baseView} />
+          <SpeedTable view={view} baseline={view.rows.some((r) => r.candidate.source === "baseline") ? view : baseView} refName={refName} />
+          <SpeedBars view={view} chosen={best?.row.candidate ?? carried?.candidate ?? null} />
           {best && (
-            <div className="relative border border-accent bg-surface p-4 sm:px-[22px] sm:py-5">
-              <Kicker className="text-accent">Recommended config</Kicker>
+            <div className="relative bg-surface p-5 sm:px-6">
+              <Kicker className="text-accent">{resultTitle}</Kicker>
               <div className="mt-2 grid grid-cols-1 gap-4 sm:grid-cols-3">
                 <div>
                   <Kicker>Generation · tg</Kicker>
@@ -331,8 +388,8 @@ export function ConfirmSection({
       {view && !active && !best && view.rows.every((r) => r.outcome.status !== "pending") && (
         <div className="mt-3">
           <Notice tone="warn">
-            <LtIcon name="warn" size={14} className="mr-1 inline" />
             No config finished cleanly — see the reasons in the table.
+            {carried ? ` The next step builds on the fastest one that finished, ${carried.candidate.label}${carried.spilled ? ", which spilled" : ""}.` : ""}
           </Notice>
         </div>
       )}
@@ -340,10 +397,25 @@ export function ConfirmSection({
   );
 }
 
+/** The config the next step builds on: the recommendation, else (when every
+ * config spilled) the fastest one that finished, flagged as spilled. */
+export function carryForward(view: SpeedRunView | null, refName?: string): { candidate: SpeedCandidate; spilled: boolean } | null {
+  if (!view) return null;
+  const rec = recommend(view, refName);
+  if (rec) return { candidate: rec.row.candidate, spilled: false };
+  const done = view.rows.filter((r) => r.outcome.status === "done" && r.outcome.tg);
+  if (done.length === 0) return null;
+  const fastest = done.reduce((a, b) => (b.outcome.tg!.mean > a.outcome.tg!.mean ? b : a));
+  return { candidate: fastest.candidate, spilled: spilledMib(fastest.outcome) != null };
+}
+
 /** The recommended config: the fastest generation among clean runs (no
  * failure, nothing spilled), ties to the better prompt speed. It only beats
  * the default when the gap is larger than both spreads. */
-export function recommend(view: SpeedRunView): { row: SpeedRunView["rows"][number]; why: string; tgDelta: string } | null {
+export function recommend(
+  view: SpeedRunView,
+  refName = "the default settings"
+): { row: SpeedRunView["rows"][number]; why: string; tgDelta: string } | null {
   const clean = view.rows.filter((r) => r.outcome.status === "done" && r.outcome.tg && spilledMib(r.outcome) == null);
   if (clean.length === 0) return null;
   const base = view.rows.find((r) => r.candidate.source === "baseline")?.outcome ?? null;
@@ -360,18 +432,18 @@ export function recommend(view: SpeedRunView): { row: SpeedRunView["rows"][numbe
   };
   const tgDelta =
     pick.candidate.source === "baseline"
-      ? "the default settings"
+      ? refName
       : pc?.pct != null
-        ? `${signed(pc.pct)} over defaults${pc.noSpread ? " (single run)" : ""}`
+        ? `${signed(pc.pct)} over ${refName === "the default settings" ? "defaults" : refName}${pc.noSpread ? " (single run)" : ""}`
         : "measured";
   const faster = sorted[0];
   const why =
     pick.candidate.source === "baseline"
       ? cmp && !cmp.clear && faster !== baseRow
         ? cmp.noSpread
-          ? `${faster.candidate.label} read faster, but with one repeat there is no spread to tell it from noise, so the default stays. Raise the repeats to decide.`
-          : `${faster.candidate.label} measured faster, but within the run-to-run spread, so the default stays.`
-        : "Nothing measured beat the default settings cleanly."
+          ? `${faster.candidate.label} read faster, but with one repeat there is no spread to tell it from noise, so ${refName} stays. Raise the repeats to decide.`
+          : `${faster.candidate.label} measured faster, but within the run-to-run spread, so ${refName} stays.`
+        : `Nothing measured beat ${refName} cleanly.`
       : `Fastest generation of the configs that ran without spilling${pick.candidate.ot ? ", with the experts placed the way fit sized them" : ""}${pick.candidate.ctk !== "f16" || pick.candidate.ctv !== "f16" ? "; the quantized KV cache can slightly reduce output quality" : ""}.`;
   return { row: pick, why, tgDelta };
 }

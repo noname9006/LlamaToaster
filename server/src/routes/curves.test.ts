@@ -182,7 +182,7 @@ describe("GET /api/models/:id/curve (N1)", () => {
     expect(body.points.some((p) => p.tg === 99)).toBe(false);
   });
 
-  it("renders the ladder past trained context as unavailable-with-reason, never a silent gap", async () => {
+  it("renders the ladder past maximum context as unavailable-with-reason, never a silent gap", async () => {
     const body = (await (
       await fetch(`${baseUrl}/api/models/m1/curve?worker=${workerId}&engine=server`)
     ).json()) as { ladder: { effectiveCtx: number; available: boolean; unavailableReason: string | null }[] };

@@ -54,10 +54,10 @@ export function ComparisonView({ comparisonId }: { comparisonId: string }) {
         </p>
       )}
 
-      <div className="overflow-x-auto rounded-xl border border-border bg-surface">
+      <div className="overflow-x-auto">
         <table className="w-full text-xs">
           <thead>
-            <tr className="border-b border-border text-left text-[10px] uppercase tracking-wide text-muted">
+            <tr className="border-b border-border text-left text-[10px] text-muted">
               <th className="px-3 py-2">model</th>
               <th className="px-3 py-2">quant</th>
               <th className="px-3 py-2 text-right">PP tok/s</th>
@@ -123,11 +123,11 @@ export function ComparisonView({ comparisonId }: { comparisonId: string }) {
       </div>
 
       {data.pareto.length > 0 && (
-        <div className="rounded-xl border border-border bg-surface p-4">
-          <span className="text-[11px] font-semibold uppercase tracking-wide text-muted">
+        <div className="border-t border-border pt-4">
+          <span className="text-[11px] font-semibold text-muted">
             Pareto — speed × memory across models
           </span>
-          <div className="relative mt-3 h-48 rounded-lg border border-border bg-bg">
+          <div className="relative mt-3 h-48">
             {data.pareto.map((point) => (
               <span
                 key={point.model_id}

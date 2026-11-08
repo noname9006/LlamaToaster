@@ -37,7 +37,9 @@ export function recheckComparisonMember(
   run: Test,
   log?: FastifyBaseLogger
 ): FairnessViolation[] {
-  const members = repo.listComparisonMembers(comparisonId);
+  // Comparison ids are client-chosen: only this run's own owner's members are
+  // its group, never another tenant's run that happens to use the same id.
+  const members = repo.listComparisonMembers(comparisonId, repo.getTestOwnerId(run.id) ?? undefined);
   const reference = members.find((m) => m.id !== run.id);
   if (!reference) return [];
   const referenceFacts = { ...factsForTest(reference), method_version: methodVersionOf(reference.id) };
@@ -87,7 +89,7 @@ export async function comparisonRoutes(app: FastifyInstance): Promise<void> {
       const pp = best ? results.find((r) => r.test_type === "pp" && r.idx === best.idx) : undefined;
       // As the member's own machine read its file (audit 2026-10-18 A6).
       const model = repo.getModelForWorker(run.model_id, run.worker_id);
-      const quality = repo.qualityRepo.listForModel(run.model_id)[0];
+      const quality = repo.qualityRepo.listForModel(run.model_id, userId)[0];
       const verified = run.worker_id
         ? repo.limitsRepo.listForModelAndWorker(run.model_id, run.worker_id)[0]
         : undefined;

@@ -38,7 +38,7 @@ function Bar({ title, side, parts, sourceNote }: { title: string; side: DaemonMe
         <span className="font-mono text-xs text-muted">{formatMib(side.total)}</span>
       </div>
       {total > 0 ? (
-        <div role="img" aria-label={label} className="flex h-4 gap-0.5 border border-border bg-well">
+        <div role="img" aria-label={label} className="flex h-4 gap-0.5 bg-well">
           {unattributed != null ? (
             <Segment mib={unattributed} total={total} color="#7d7264" title={`In use: ${formatMib(unattributed)}`} />
           ) : (

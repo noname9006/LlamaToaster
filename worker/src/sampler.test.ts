@@ -330,4 +330,28 @@ describe("MemorySampler VRAM pause during timed work", () => {
     expect(mockReadGpuMemory).toHaveBeenCalledTimes(1);
     expect(s.stats.vram_peak_mib).toBe(8000);
   });
+
+  it("a reading after timed work sees what the work allocated, without resuming the cadence", async () => {
+    const s = sampler();
+    // Stands in for a running sampler: readAfterTimedWork reads only while started.
+    (s as unknown as { timer: unknown }).timer = {};
+    mockReadGpuMemory.mockResolvedValueOnce({ used: wholeAdapter(8000), process: process(6000), free: { mib: 1, accuracy: "high", source: "driver_reported_memory" } });
+    await s.pauseVram();
+    expect(s.stats.vram_peak_mib).toBe(8000);
+
+    mockReadGpuMemory.mockResolvedValueOnce({ used: wholeAdapter(8220), process: process(6220), free: { mib: 1, accuracy: "high", source: "driver_reported_memory" } });
+    await s.readAfterTimedWork();
+    expect(s.stats.vram_peak_mib).toBe(8220);
+    expect(s.stats.vram_process_peak_mib).toBe(6220);
+
+    mockReadGpuMemory.mockClear();
+    for (let i = 0; i < 3; i++) await tick(s);
+    expect(mockReadGpuMemory).not.toHaveBeenCalled();
+  });
+
+  it("reads nothing once the sampler has stopped", async () => {
+    const s = sampler();
+    await s.readAfterTimedWork();
+    expect(mockReadGpuMemory).not.toHaveBeenCalled();
+  });
 });

@@ -23,7 +23,7 @@ import type { FastifyInstance } from "fastify";
 // Kept in sync with client/src/components/WorkerCard.tsx's
 // buildSetupScenarios (the single source of truth for the copy-paste
 // commands shown in the UI) and README.md.
-const RAW_BASE = "https://raw.githubusercontent.com/noname9006/LlamaToaster";
+const RAW_BASE = "https://raw.githubusercontent.com/LlamaToaster/LlamaToaster";
 
 // The ref the redirect points at. "main" rather than a pinned commit SHA so
 // a fix to the installer reaches new machines without a server deploy --

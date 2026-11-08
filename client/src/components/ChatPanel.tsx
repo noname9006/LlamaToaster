@@ -13,6 +13,8 @@ import {
   type Dialogue,
   type DisplayMessage,
   type MemoryItem,
+  readStored,
+  writeStored,
 } from "../api/aiStorage";
 import { formatRelativeTime } from "../utils";
 import { IconBrain, IconChevronDown, IconHistory, IconMessageCircle, IconPlus, IconRefreshCw, IconTrash, IconX } from "./icons";
@@ -36,7 +38,7 @@ function clamp(value: number, min: number, max: number): number {
 }
 
 function loadWidth(): number {
-  const raw = Number(localStorage.getItem(WIDTH_KEY));
+  const raw = Number(readStored(WIDTH_KEY));
   return Number.isFinite(raw) && raw > 0 ? clamp(raw, MIN_WIDTH, MAX_WIDTH) : DEFAULT_WIDTH;
 }
 
@@ -53,7 +55,7 @@ function TypingDots() {
 // narrow: phone layouts get a floating button and a full-screen panel instead
 // of a side rail that would eat a third of the screen.
 export function ChatPanel({ narrow = false }: { narrow?: boolean } = {}) {
-  const [open, setOpen] = useState(() => localStorage.getItem(OPEN_KEY) === "1");
+  const [open, setOpen] = useState(() => readStored(OPEN_KEY) === "1");
   const [width, setWidth] = useState(loadWidth);
   const [resizing, setResizing] = useState(false);
   // undefined = not checked yet, null = checked, not configured
@@ -95,11 +97,11 @@ export function ChatPanel({ narrow = false }: { narrow?: boolean } = {}) {
   }, []);
 
   useEffect(() => {
-    localStorage.setItem(OPEN_KEY, open ? "1" : "0");
+    writeStored(OPEN_KEY, open ? "1" : "0");
   }, [open]);
 
   useEffect(() => {
-    localStorage.setItem(WIDTH_KEY, String(width));
+    writeStored(WIDTH_KEY, String(width));
   }, [width]);
 
   useEffect(() => {
@@ -320,7 +322,7 @@ export function ChatPanel({ narrow = false }: { narrow?: boolean } = {}) {
           ? open
             ? "fixed inset-0 z-30 flex flex-col bg-surface"
             : "fixed bottom-4 right-4 z-30 h-12 w-12 border border-border-strong bg-surface"
-          : `relative flex h-screen shrink-0 flex-col border-l border-border bg-surface ${resizing ? "" : "transition-[width] duration-150"} ${open ? "" : "w-11"}`
+          : `relative flex h-screen shrink-0 flex-col ${open ? "border-l border-border bg-surface" : "w-11 bg-bg"} ${resizing ? "" : "transition-[width] duration-150"}`
       }
       style={open && !narrow ? { width } : undefined}
     >
@@ -410,7 +412,7 @@ export function ChatPanel({ narrow = false }: { narrow?: boolean } = {}) {
                 type="button"
                 onClick={() => void checkStatus()}
                 disabled={checkingStatus}
-                className="flex w-fit items-center gap-1.5 rounded-lg border border-border px-3 py-1.5 text-xs font-semibold text-fg hover:border-accent/40 hover:text-accent disabled:opacity-50"
+                className="flex w-fit items-center gap-1.5 rounded-lg border border-border-strong px-3 py-1.5 text-xs font-semibold text-fg hover:border-accent/40 hover:text-accent disabled:opacity-50"
               >
                 <IconRefreshCw width={12} height={12} className={checkingStatus ? "animate-spin" : ""} />
                 Check again
@@ -467,7 +469,7 @@ export function ChatPanel({ narrow = false }: { narrow?: boolean } = {}) {
                       onChange={(e) => setMemoryDraft(e.target.value)}
                       onKeyDown={handleMemoryKeyDown}
                       placeholder="e.g. I mostly run Q4_K_M quants"
-                      className="w-full rounded-lg border border-border bg-surface px-2.5 py-1.5 text-sm text-fg outline-none focus:border-accent"
+                      className="w-full rounded-lg border border-border-strong bg-surface px-2.5 py-1.5 text-sm text-fg outline-none focus:border-accent"
                     />
                     <button
                       type="button"
@@ -515,7 +517,7 @@ export function ChatPanel({ narrow = false }: { narrow?: boolean } = {}) {
                                 key={p}
                                 type="button"
                                 onClick={() => setDraft(p)}
-                                className="rounded-lg border border-border px-3 py-1.5 text-left text-xs text-muted hover:border-accent/40 hover:text-fg"
+                                className="rounded-lg border border-border-strong px-3 py-1.5 text-left text-xs text-muted hover:border-accent/40 hover:text-fg"
                               >
                                 {p}
                               </button>
@@ -559,7 +561,7 @@ export function ChatPanel({ narrow = false }: { narrow?: boolean } = {}) {
                         onClick={scrollToBottom}
                         aria-label="Scroll to latest"
                         title="Scroll to latest"
-                        className="absolute bottom-3 right-3 flex h-8 w-8 items-center justify-center rounded-full border border-border bg-surface-raised text-fg shadow-lg hover:border-accent/40 hover:text-accent"
+                        className="absolute bottom-3 right-3 flex h-8 w-8 items-center justify-center rounded-full border border-border-strong bg-surface-raised text-fg shadow-lg hover:border-accent/40 hover:text-accent"
                       >
                         <IconChevronDown width={16} height={16} />
                       </button>
@@ -573,14 +575,14 @@ export function ChatPanel({ narrow = false }: { narrow?: boolean } = {}) {
                       onKeyDown={handleComposerKeyDown}
                       placeholder="Ask about parameters, models, or your results…"
                       rows={2}
-                      className="w-full resize-none rounded-lg border border-border bg-surface px-3 py-2 text-sm text-fg outline-none focus:border-accent"
+                      className="w-full resize-none rounded-lg border border-border-strong bg-surface px-3 py-2 text-sm text-fg outline-none focus:border-accent"
                     />
                     <div className="flex items-center justify-end gap-2">
                       {streaming ? (
                         <button
                           type="button"
                           onClick={handleStop}
-                          className="rounded-lg border border-border px-4 py-1.5 text-sm font-semibold text-fg hover:border-danger/40 hover:text-danger"
+                          className="rounded-lg border border-border-strong px-4 py-1.5 text-sm font-semibold text-fg hover:border-danger/40 hover:text-danger"
                         >
                           Stop
                         </button>

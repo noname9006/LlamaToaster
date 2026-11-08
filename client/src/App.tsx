@@ -146,10 +146,10 @@ function Shell({ authStatus }: { authStatus: AuthStatus }) {
       >
         Skip to content
       </a>
-      {!narrow && <Sidebar authEnabled={authStatus.authEnabled} footer={footer} />}
+      {!narrow && <Sidebar authEnabled={authStatus.authEnabled} footer={footer} status={<StatusBar workers={workers} variant="sidebar" />} />}
       {narrow && (
         <>
-          <header className="sticky top-0 z-[8] flex flex-[1_0_100%] items-center gap-2.5 border-b border-border bg-surface px-4 py-1.5">
+          <header className="sticky top-0 z-[8] flex flex-[1_0_100%] items-center gap-2.5 border-b border-border bg-bg px-4 py-1.5">
             <img src="/toaster_favicon.png" alt="" className="h-7 w-7 object-contain" />
             <span className="font-display text-lg font-semibold">LlamaToaster</span>
             <button
@@ -171,8 +171,8 @@ function Shell({ authStatus }: { authStatus: AuthStatus }) {
         </>
       )}
       <main id="lt-main" className={`min-w-0 flex-[1_1_320px] ${narrow ? "" : "h-screen overflow-y-auto"}`}>
-        <StatusBar workers={workers} sticky={!narrow} />
-        <div className="w-full px-[clamp(16px,4vw,32px)] pb-10 pt-7">
+        {narrow && <StatusBar workers={workers} variant="strip" />}
+        <div className="w-full max-w-[1280px] px-[clamp(16px,4vw,48px)] pb-12 pt-8">
           <Routes>
             <Route path="/" element={<Dashboard />} />
             <Route path="/models" element={<Models />} />

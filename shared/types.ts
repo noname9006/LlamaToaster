@@ -183,6 +183,8 @@ export const WORKER_CAPABILITIES = [
   // docs/plans/MODEL_DAEMON_PLAN.md: the Serve page -- daemon_load/daemon_unload
   // jobs, the OpenAI-compatible gateway, POST /api/worker/daemon/telemetry.
   "daemon-v1",
+  // Speed-run candidates may carry -b / -ub (the optimization flow's batch step).
+  "speed-batch-v1",
 ] as const;
 export type WorkerCapability = (typeof WORKER_CAPABILITIES)[number];
 
@@ -248,6 +250,16 @@ export const WALL_CLOCK_CURVE_METHOD_VERSION = 5;
 // are untouched by that change and stay at METHOD_VERSION -- bumping the
 // shared constant would have falsely invalidated them.
 export const SERVER_METHOD_VERSION = 3;
+
+// The MTP path (worker/src/serverBench.ts) since it sends one discarded
+// warm-up request before the timed repeats (2026-11-08). Until then repeat 1
+// hit a freshly started server and carried its one-time costs (pp 111 vs ~707
+// tok/s on the next repeats, observed live), so v3 MTP rows include a cold
+// repeat and must not be averaged with these. SERVER_METHOD_VERSION stays to
+// describe the stored v3 rows. 11, not a free lower number: every value below
+// is taken by a stored vintage. Profile scoring only reads sweep runs, so this
+// sitting above CURVE_METHOD_VERSION cannot displace curve points.
+export const MTP_METHOD_VERSION = 11;
 
 // Prefill speed per slice of one growing prompt (shared/fillCurve.ts): each
 // row's rate covers only the tokens appended on top of a cached prefix, so it
@@ -838,6 +850,20 @@ export interface ResultRow {
   // flagged-implausible ones specifically); this array has no such flag per
   // element, just the raw per-repeat values in the order they were measured.
   repeat_samples?: number[];
+  // RESULT_PROVENANCE_PLAN.md Phase 3 -- see shared/rowStats.ts. The clean
+  // readings avg_tps/stddev_tps are computed from (the server recomputes
+  // them at ingest); repeats_requested is how many repeats the item asked
+  // for; repeats_complete is false when some repeats produced no reading at
+  // all. stats_mismatch is true when the worker's own avg/stddev disagreed
+  // with the recomputation, whose result is then the stored avg_tps/
+  // stddev_tps, with the worker's figures kept in worker_avg_tps/
+  // worker_stddev_tps. All undefined/null on rows predating them.
+  clean_samples?: number[];
+  repeats_requested?: number | null;
+  repeats_complete?: boolean | null;
+  stats_mismatch?: boolean | null;
+  worker_avg_tps?: number | null;
+  worker_stddev_tps?: number | null;
   // Only populated on the tg row of an MTP item (worker/src/serverBench.ts) --
   // llama-server's own /metrics speculative-decoding counters, the only
   // direct evidence the --spec-type draft-mtp draft head actually contributed
@@ -948,6 +974,12 @@ export interface IngestResultInput {
   suspect_count?: number;
   suspect_samples?: number[];
   repeat_samples?: number[];
+  // RESULT_PROVENANCE_PLAN.md Phase 3 (shared/rowStats.ts): the readings
+  // avg_tps/stddev_tps were computed from, suspect ones excluded, and how
+  // many repeats the item asked for. Optional -- an older worker sends
+  // neither and its row is stored as before.
+  clean_samples?: number[];
+  repeats_requested?: number;
   spec_drafted?: number;
   spec_accepted?: number;
   // §0.1 -- worker-stamped methodology version. Absent on an older worker;
@@ -1182,7 +1214,9 @@ export interface TriggerPayload {
 }
 
 // Which step of the optimization flow a run is (docs/plans/OPTIMIZATION_FLOW_REDESIGN.md).
-export const FLOW_STEPS = ["baseline", "fit", "real_load", "threads", "confirm"] as const;
+// kv_fit / kv_confirm / batch are the 7-step flow's KV and batch-size stages:
+// the KV map rides kind "fit", the other two are speed runs.
+export const FLOW_STEPS = ["baseline", "fit", "real_load", "threads", "confirm", "kv_fit", "kv_confirm", "batch"] as const;
 export type FlowStep = (typeof FLOW_STEPS)[number];
 
 export interface ProbeTriggerSpec {
@@ -1339,7 +1373,7 @@ export interface ModelDirFile {
   mtp_layers?: number | null;
   quant?: string | null;
   param_count?: number | null;
-  // Trained context + KV-cache geometry, from the same GGUF header walk
+  // Maximum context + KV-cache geometry, from the same GGUF header walk
   // (see ModelMetadata's matching fields for what each feeds downstream).
   // Same optional-null convention as the fields above: null = header key
   // absent (e.g. no sliding-window attention), absent = old worker code.
@@ -1678,7 +1712,7 @@ export interface ModelDownloadCallbackInput {
   // it straight into ModelMetadata.param_count instead of calling
   // getHfGgufMeta.
   param_count?: number | null;
-  // Trained context + KV geometry from the same GGUF header read -- stored
+  // Maximum context + KV geometry from the same GGUF header read -- stored
   // straight into ModelMetadata (feeds M2's target-context clamp, N1's
   // sizing ladder, and the Benchmark page's model card). Optional/null so an
   // older worker binary that doesn't send them keeps validating.
@@ -1963,6 +1997,10 @@ export interface ModelFitReport {
   point: import("./fitParams.js").FitPoint | null;
   error: string | null;
   fetched_bytes?: number;
+  /** A second look at the model's maximum context, for the bread grades
+   * (shared/fitGrade.ts). Absent from older workers and when the first
+   * answer already did not fit. */
+  ceiling?: import("./fitGrade.js").FitCeiling | null;
 }
 
 export interface ModelFitResult extends ModelFitReport {
@@ -2175,7 +2213,7 @@ export interface ProbeAttemptReport {
   gpu_host_pinned_mib?: number | null;
   gpu_cpu_mapped_mib?: number | null;
   // The ladder's own bounds (llama.cpp's -ngl ceiling for the model, and its
-  // trained context), repeated on every row so a stored probe can be re-resolved
+  // maximum context), repeated on every row so a stored probe can be re-resolved
   // exactly by shared/probeLadder.ts's probeOutcome.
   ladder_ngl_max?: number | null;
   ladder_max_ctx?: number | null;
@@ -2434,6 +2472,12 @@ export interface AppSettings {
   // stale worker can never report more loads than the current setting
   // allows.
   probeMaxLoads: number;
+  // Whether the Models page draws "Will it fit?" answers as bread marks
+  // (shared/breadMarks.ts) instead of the older check marks -- default true.
+  breadMarksEnabled: boolean;
+  // How the bread marks are drawn -- default DEFAULT_BREAD_MARK_STYLE. Set on
+  // the admin console's Bread marks page.
+  breadMarkStyle: import("./breadMarks.js").BreadMarkStyle;
 }
 
 // GET /api/sessions -- one row per live session for the caller's own

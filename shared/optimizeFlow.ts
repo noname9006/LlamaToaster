@@ -5,7 +5,7 @@
 // the candidates the confirm step proposes.
 
 import { fitCtxStops, isFitMargin, isQuantizedKv, type FitFaMode, type FitMarginMib, type FitPoint } from "./fitParams.js";
-import { kvSizeGroups, pairLabel, type KvSupportRow } from "./kvSupport.js";
+import { kvKAtLeastV, kvSizeGroups, pairLabel, type KvSupportRow } from "./kvSupport.js";
 import { describePlacement, fromFit, type MoeInfo } from "./moePlacement.js";
 import type { SpeedCandidate, ThreadArgs } from "./speedRun.js";
 
@@ -387,6 +387,53 @@ export function proposeCandidates(input: {
     seen.add(k);
     return true;
   });
+}
+
+/** One quantized K/V size at the target context, for the KV step: the pair
+ * the flow would use (K at least as precise as V), its cache size and how
+ * the placement compares with the f16 cache. */
+export interface KvOption {
+  seriesId: string;
+  ctk: string;
+  ctv: string;
+  label: string;
+  point: FitPoint;
+  kvMib: number | null;
+  /** pointScore gain over the f16 FA-on cache at the same context (0 = same layers). */
+  scoreGain: number;
+}
+
+/** KV sizes that fit at the target context, smallest cache last. Pairs with
+ * K less precise than V are dropped; a size with no such pair is skipped. */
+export function kvOptionsAt(series: readonly FitSeries[], targetCtx: number, moe: MoeInfo | null): KvOption[] {
+  const stops = [...new Set(series.flatMap((s) => s.points.map((p) => p.ctx)))];
+  const at = targetStop(stops, targetCtx);
+  if (at == null) return [];
+  const def = series.find((s) => s.kind === "default")?.points.find((p) => p.ctx === at && fits(p)) ?? null;
+  const out: KvOption[] = [];
+  for (const s of series) {
+    if (s.kind !== "kv") continue;
+    const pair = s.pairs.find(([k, v]) => kvKAtLeastV(k, v));
+    const p = s.points.find((x) => x.ctx === at);
+    if (!pair || !p || !fits(p)) continue;
+    out.push({
+      seriesId: s.id,
+      ctk: pair[0],
+      ctv: pair[1],
+      label: pairLabel(pair[0], pair[1]),
+      point: p,
+      kvMib: p.kv_mib,
+      scoreGain: def ? pointScore(p, moe) - pointScore(def, moe) : 0,
+    });
+  }
+  return out.sort((a, b) => (b.kvMib ?? 0) - (a.kvMib ?? 0));
+}
+
+/** Up to `limit` KV candidates for the speed test: the ones that fit the most
+ * layers first, then the larger (less lossy) cache among equals. */
+export function proposeKvCandidates(options: readonly KvOption[], threads: ThreadArgs | null, limit = 3): SpeedCandidate[] {
+  const ranked = [...options].sort((a, b) => b.scoreGain - a.scoreGain || (b.kvMib ?? 0) - (a.kvMib ?? 0));
+  return ranked.slice(0, limit).map((o) => ({ ...candidateFromPoint(o.point, o.label, "fit_kv", threads), ctk: o.ctk, ctv: o.ctv }));
 }
 
 /** Fit-map job cost in seconds, for the run button (measured ~0.5 s for a

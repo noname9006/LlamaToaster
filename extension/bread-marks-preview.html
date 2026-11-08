@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bread marks test sheet</title>
+<style>
+  body { margin: 0; font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; background: #f3f4f6; color: #111827; }
+  h1 { font-size: 18px; margin: 16px; }
+  h2 { font-size: 14px; margin: 0 0 8px; }
+  .controls { margin: 0 16px 12px; display: flex; gap: 16px; flex-wrap: wrap; align-items: center; }
+  .panels { display: grid; grid-template-columns: repeat(auto-fit, minmax(380px, 1fr)); gap: 12px; margin: 0 16px 16px; }
+  .panel { border-radius: 10px; padding: 14px; }
+  .light { background: #ffffff; color: #1f2937; border: 1px solid #e5e7eb; }
+  .dark { background: #0b0f19; color: #e5e7eb; border: 1px solid #1f2937; }
+  table { border-collapse: collapse; width: 100%; }
+  td { padding: 5px 6px; vertical-align: middle; }
+  td.g { width: 28px; font-weight: 600; text-align: right; opacity: .7; }
+  td.desc { font-size: 12px; opacity: .65; padding-top: 0; padding-bottom: 9px; }
+  .panels { grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)) !important; }
+  tr.hd td { font-size: 11px; opacity: .55; padding-bottom: 0; }
+  .chip { display: inline-flex; align-items: center; gap: 6px; border-radius: 8px; padding: 3px 8px; font-size: 13px; white-space: nowrap; }
+  .light .chip { background: #fff; border: 1px solid #e5e7eb; color: #374151; }
+  .dark .chip { background: #111827; border: 1px solid #374151; color: #d1d5db; }
+  .chip .size { opacity: .6; }
+  .scale-title { margin: 14px 0 4px; font-size: 12px; text-transform: uppercase; letter-spacing: .05em; opacity: .6; }
+  .big svg { display: block; }
+  .strip { display: flex; gap: 18px; flex-wrap: wrap; align-items: flex-end; }
+  .strip figure { margin: 0; text-align: center; font-size: 11px; opacity: .9; }
+  .strip figcaption { margin-top: 4px; opacity: .7; }
+</style>
+</head>
+<body>
+<h1>Bread marks: test sheet</h1>
+<div class="controls">
+  <label>Golden style
+    <select id="golden"><option value="shine" selected>vivid + shine (production)</option><option value="butter">vivid + butter pat</option><option value="plain">plain</option></select>
+  </label>
+  <label>Dark-theme fix
+    <select id="fix"><option value="shrink" selected>shrink pale only (production)</option><option value="both">darker crust + shrink pale</option><option value="crust">darker crust only</option><option value="none">none</option></select>
+  </label>
+  <label>Gap falloff <input id="falloff" type="range" min="0.5" max="1" step="0.05" value="0.8"> <span id="falloffv">0.8</span></label>
+  <label>Overlap step <input id="step" type="range" min="2.5" max="7" step="0.5" value="3.5"> <span id="stepv">3.5</span></label>
+</div>
+<div class="panels" id="panels"></div>
+
+<script>
+// One slice in a 12 x 14 box: the classic toast silhouette (crown on top).
+const SLICE = "M2,13 L2,6.4 C0.4,5.8 0.3,1.2 6,1.2 C11.7,1.2 11.6,5.8 10,6.4 L10,13 Q10,13.7 9.3,13.7 L2.7,13.7 Q2,13.7 2,13 Z";
+
+// Doneness ramp. 1..4 step evenly; 5 (golden) is set apart by saturation, not just depth.
+const SHADES = {
+  1: { fill: "#F7EACB", crust: "#C9A469" },   // raw / pale
+  2: { fill: "#F1D9A2", crust: "#BC8F4C" },   // light
+  3: { fill: "#E8C281", crust: "#AA7A3A" },   // toasted
+  4: { fill: "#DDAA62", crust: "#9C6A2C" },   // deep: no darker than golden, just less saturated
+  5: { fill: "#F0A21E", crust: "#9A5A0C" },   // golden
+  0: { fill: "#2A1C14", crust: "#B8865E" },   // burnt: crust light enough to read on a dark page
+};
+
+// Light shapes look bigger on a dark page (irradiation). Dark-theme fixes:
+// a darker, thicker crust on the pale shades, and/or shrinking them a little.
+const DARK_CRUST = { 1: "#6E5130", 2: "#74532B", 3: "#755027" };
+const DARK_SCALE = { 1: 0.9, 2: 0.93, 3: 0.96, 4: 0.98 };
+
+function slice(x, s, golden, dark = false, fix = "none") {
+  const c = SHADES[s];
+  const crustFix = dark && (fix === "crust" || fix === "both") && DARK_CRUST[s];
+  const shrink = dark && (fix === "shrink" || fix === "both") ? (DARK_SCALE[s] ?? 1) : 1;
+  const crust = crustFix ? DARK_CRUST[s] : c.crust;
+  const sw = crustFix ? 1.6 : 1.25;
+  const sc = shrink !== 1 ? ` translate(6,7.8) scale(${shrink}) translate(-6,-7.8)` : "";
+  let extra = "";
+  if (s === 5 && golden === "shine") extra = `<path d="M3.4,4.2 Q4.4,2.7 6.6,2.6" fill="none" stroke="#FFF6D8" stroke-width="1" stroke-linecap="round"/>`;
+  if (s === 5 && golden === "butter") extra = `<rect x="4.1" y="6.3" width="3.8" height="3.2" rx=".6" fill="#FFF4B8" stroke="#D9B648" stroke-width=".5"/>`;
+  if (s === 0) extra = `<path d="M3.6,4.6 L5.6,6.6 L4.6,8.8 M8.4,7.6 L7.2,10.4 L8,12" fill="none" stroke="#E3A672" stroke-width=".85" stroke-linecap="round" stroke-linejoin="round"/>`;
+  return `<g transform="translate(${x},0)${sc}"><path d="${SLICE}" fill="${c.fill}" stroke="${crust}" stroke-width="${sw}" stroke-linejoin="round"/>${extra}</g>`;
+}
+
+// shades: drawn in order, last one on top (fully visible).
+// Offsets of each slice from the back (index 0) to the top. With falloff < 1
+// the gaps grow toward the top slice; the total width stays step * (n - 1).
+function offsets(n, step, falloff) {
+  if (n < 2) return [0];
+  const k = n - 1;
+  const weights = Array.from({ length: k }, (_, i) => Math.pow(falloff, k - 1 - i)); // back gap smallest
+  const scale = (step * k) / weights.reduce((a, b) => a + b, 0);
+  const out = [0];
+  for (const w of weights) out.push(out[out.length - 1] + w * scale);
+  return out;
+}
+
+function stack(shades, { px = 16, step = 3.5, falloff = 1, dir = "ltr", golden = "shine", dark = false, fix = "none" } = {}) {
+  const n = shades.length;
+  const off = offsets(n, step, falloff);
+  const w = 12 + off[n - 1];
+  let g = "";
+  shades.forEach((s, i) => {
+    const x = dir === "ltr" ? off[i] : off[n - 1] - off[i];
+    g += slice(x, s, golden, dark, fix);
+  });
+  const vbW = w + 0.6, vbH = 14.6;
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="-0.3 0 ${vbW} ${vbH}" height="${px}" width="${(px * vbW / vbH).toFixed(1)}" role="img">${g}</svg>`;
+}
+
+function unknownMark(px = 16) {
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="-0.3 0 12.6 14.6" height="${px}" width="${(px * 12.6 / 14.6).toFixed(1)}"><path d="${SLICE}" fill="none" stroke="#9CA3AF" stroke-width="1.1" stroke-dasharray="1.6 1.2" stroke-linejoin="round"/><text x="6" y="11.4" font-size="8" font-weight="700" text-anchor="middle" fill="#9CA3AF" font-family="system-ui, sans-serif">?</text></svg>`;
+}
+
+const SCALES = [
+  { title: "GPU with its own VRAM, and fast unified memory (Apple, Strix Halo)", rows: [
+    [5, [1,2,3,4,5], "All layers on the GPU at the maximum context"],
+    [4, [1,2,3,4], "All layers on the GPU at your context"],
+    [3, [1,2,3], "All layers on the GPU, experts in RAM (MoE models only)"],
+    [2, [1,2], "Partial offload, 50% of layers or more on the GPU"],
+    [1, [1], "Under 50% of layers on the GPU"],
+    [0, [0], "Won't fit"],
+  ]},
+  { title: "CPU only, and integrated GPU on ordinary DDR", rows: [
+    [2, [4,5], "Fits in RAM at the maximum context"],
+    [1, [4], "Fits in RAM at your context"],
+    [0, [0], "Won't fit"],
+  ]},
+];
+const QUANTS = ["Q8_0 8.5 GB", "Q6_K 6.6 GB", "Q5_K_M 5.7 GB", "Q4_K_M 4.9 GB", "Q3_K_M 4.0 GB", "Q2_K 3.2 GB"];
+
+function render() {
+  const dir = "ltr";
+  const golden = document.getElementById("golden").value;
+  const step = +document.getElementById("step").value;
+  document.getElementById("stepv").textContent = step;
+  const fix = document.getElementById("fix").value;
+  const falloff = +document.getElementById("falloff").value;
+  document.getElementById("falloffv").textContent = falloff === 1 ? "1 (even)" : falloff === 0.8 ? "0.8 (production)" : falloff;
+  const base = { dir, golden, step, fix, falloff };
+  let html = "";
+  for (const theme of ["light", "dark"]) {
+    const o = { ...base, dark: theme === "dark" };
+    html += `<div class="panel ${theme}"><h2>${theme === "light" ? "Hugging Face light" : "Hugging Face dark"}</h2>`;
+    for (const sc of SCALES) {
+      html += `<div class="scale-title">${sc.title}</div><table><tr class="hd"><td></td><td colspan="2">left to right</td><td colspan="2">right to left</td></tr>`;
+      sc.rows.forEach(([g, shades, desc], i) => {
+        const [q, size] = QUANTS[i].split(" ");
+        html += `<tr><td class="g">${g}</td>
+          <td>${stack(shades, { ...o, dir: "ltr", px: 16 })}</td>
+          <td><span class="chip">${stack(shades, { ...o, dir: "ltr", px: 15 })}${q} <span class="size">${size} GB</span></span></td>
+          <td>${stack(shades, { ...o, dir: "rtl", px: 16 })}</td>
+          <td><span class="chip">${stack(shades, { ...o, dir: "rtl", px: 15 })}${q} <span class="size">${size} GB</span></span></td></tr>
+          <tr><td></td><td class="desc" colspan="4">${desc}</td></tr>`;
+      });
+      html += `</table>`;
+    }
+    html += `<div class="scale-title">Even gaps vs growing gaps (falloff 0.8), 16px and 48px</div><table><tr class="hd"><td></td><td colspan="2">even</td><td colspan="2">growing</td></tr>`;
+    for (const [g, sh] of [[5,[1,2,3,4,5]],[4,[1,2,3,4]],[3,[1,2,3]]]) {
+      html += `<tr><td class="g">${g}</td>`;
+      for (const f of [1, 0.8]) html += `<td>${stack(sh, { ...o, falloff: f, px: 16 })}</td><td>${stack(sh, { ...o, falloff: f, px: 16, dir: "rtl" })}</td>`;
+      html += `</tr>`;
+    }
+    html += `</table><div class="strip big">`;
+    for (const f of [1, 0.8]) html += `<figure>${stack([1,2,3,4,5], { ...o, falloff: f, px: 48 })}<figcaption>${f === 1 ? "even" : "growing"} →</figcaption></figure><figure>${stack([1,2,3,4,5], { ...o, falloff: f, px: 48, dir: "rtl" })}<figcaption>${f === 1 ? "even" : "growing"} ←</figcaption></figure>`;
+    html += `</div>`;
+    html += `<div class="scale-title">Check could not finish</div><span class="chip">${unknownMark(15)}Q4_K_M <span class="size">4.9 GB</span></span>`;
+    html += `<div class="scale-title">Single slices, 48px</div><div class="strip big">`;
+    for (const s of [1,2,3,4,5,0]) html += `<figure>${stack([s], { ...o, px: 48 })}<figcaption>${s === 0 ? "burnt" : s === 5 ? "golden" : "shade " + s}</figcaption></figure>`;
+    html += `</div><div class="scale-title">GPU 5 and CPU 2, 48px</div><div class="strip big">`;
+    for (const d of ["ltr", "rtl"]) html += `<figure>${stack([1,2,3,4,5], { ...o, dir: d, px: 48 })}<figcaption>GPU 5 ${d === "ltr" ? "→" : "←"}</figcaption></figure><figure>${stack([4,5], { ...o, dir: d, px: 48 })}<figcaption>CPU 2 ${d === "ltr" ? "→" : "←"}</figcaption></figure>`;
+    html += `</div>`;
+    html += `</div>`;
+  }
+  document.getElementById("panels").innerHTML = html.replaceAll(" GB GB", " GB");
+}
+for (const id of ["golden", "step", "fix", "falloff"]) document.getElementById(id).addEventListener("input", render);
+render();
+</script>
+</body>
+</html>

@@ -298,7 +298,8 @@ describe("POST /api/ai/chat -- community tools (§5.4)", () => {
     const { token } = repo.sessionRepo.create(caller.id, { label: "community" });
     const db = (await import("../db/migrate.js")).getDb();
     const modelId = "route-test-model";
-    repo.registerModel({ id: modelId, filename: "route-test.gguf", size_bytes: 1, source: "local", metadata: {} });
+    repo.registerModel({ id: modelId, filename: "route-test.gguf", size_bytes: 1, source: "huggingface", hf_repo: "org/route-test", hf_file: "route-test.gguf", metadata: {} });
+    db.prepare(`INSERT INTO hf_gguf_index (sha256, repo_id, filename, last_seen) VALUES (?, 'org/route-test', 'route-test.gguf', ?)`).run(modelId, Date.now());
     const seedUserIds = [caller.id, "route-c1", "route-c2", "route-c3", "route-c4", "route-c5"];
     for (const uid of seedUserIds) {
       if (uid !== caller.id) {

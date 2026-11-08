@@ -63,9 +63,9 @@ export function CurvesPanel({ modelId, workerId, build, targetCtx, onMeasureMiss
   if (!curve) return <p className="text-sm text-muted">Loading curve…</p>;
 
   return (
-    <div className="rounded-xl border border-border bg-surface p-4">
+    <div className="border-t border-border pt-4">
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <span className="text-[11px] font-semibold uppercase tracking-wide text-muted">
+        <span className="text-[11px] font-semibold text-muted">
           Context curve — this model · this machine{build ? ` · ${build}` : ""} · {engine}
           {curve.method_version != null && (
             <span className="ml-2 rounded-full bg-accent/10 px-2 py-0.5 font-mono text-[10px] font-normal text-accent">
@@ -74,7 +74,7 @@ export function CurvesPanel({ modelId, workerId, build, targetCtx, onMeasureMiss
           )}
         </span>
         <div className="flex flex-wrap items-center gap-2">
-          <div className="inline-flex overflow-hidden rounded-lg border border-border" role="radiogroup" aria-label="Engine">
+          <div className="inline-flex overflow-hidden rounded-lg border border-border-strong" role="radiogroup" aria-label="Engine">
             {(["server", "bench"] as const).map((value) => (
               <button
                 key={value}
@@ -118,7 +118,7 @@ export function CurvesPanel({ modelId, workerId, build, targetCtx, onMeasureMiss
       <div className="mt-3 overflow-x-auto">
         <table className="w-full text-xs">
           <thead>
-            <tr className="border-b border-border text-left text-[10px] uppercase tracking-wide text-muted">
+            <tr className="border-b border-border text-left text-[10px] text-muted">
               <th className="px-2 py-1.5">effective ctx</th>
               <th className="px-2 py-1.5 text-right">PP tok/s</th>
               <th className="px-2 py-1.5 text-right">TG tok/s</th>
@@ -143,7 +143,7 @@ export function CurvesPanel({ modelId, workerId, build, targetCtx, onMeasureMiss
                 <td className="px-2 py-1.5 text-right font-mono text-muted">
                   {point.ttftMs != null ? `${(point.ttftMs / 1000).toFixed(1)} s` : "—"}
                   {point.ttftN === 1 && (
-                    <span className="ml-1 text-[9px] uppercase tracking-wide" title="single-shot cold reading, deliberately not a p50/p95">
+                    <span className="ml-1 text-[9px]" title="single-shot cold reading, deliberately not a p50/p95">
                       1-shot
                     </span>
                   )}
@@ -230,9 +230,9 @@ export function KneeChart({ testId }: { testId: string }) {
   const max = Math.max(...knee.samples.map((s) => s.ttftP95Ms ?? 0), knee.thresholdMs ?? 0, 1);
 
   return (
-    <div className="rounded-xl border border-border bg-surface p-4">
+    <div className="border-t border-border pt-4">
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <span className="text-[11px] font-semibold uppercase tracking-wide text-muted">
+        <span className="text-[11px] font-semibold text-muted">
           Concurrency — where batching stops being free
         </span>
         <span className="font-mono text-[11px] text-muted">

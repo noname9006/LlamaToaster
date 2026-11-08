@@ -52,7 +52,7 @@ function fitLine(config: ScoredConfig, goals: GoalsConfig): string | null {
   if (!config.maxCtx || config.maxCtx.confidence === "unknown") {
     const floor = config.maxCtx?.conservativeFloorTokens;
     return floor
-      ? `Affordability is unknown for this configuration — the estimate never fabricates a number. A conservative floor candidate (this model's full trained context, ${floor.toLocaleString()} tokens) can be verified with a probe instead.`
+      ? `Affordability is unknown for this configuration — the estimate never fabricates a number. A conservative floor candidate (this model's full maximum context, ${floor.toLocaleString()} tokens) can be verified with a probe instead.`
       : "Affordability is unknown for this configuration — the estimate never fabricates a number.";
   }
   const tokens = config.maxCtx.tokens;
@@ -141,11 +141,11 @@ export function ProfileCards({ testId, refreshKey, modelId, workerId }: ProfileC
     const candidate = isUnknown ? conservativeFloor : config.maxCtx?.tokens;
     if (!candidate) {
       setProbeMsg(
-        "No affordability estimate exists for this placement, and this model's trained context is unknown too, so there is no candidate context to verify at all."
+        "No affordability estimate exists for this placement, and this model's maximum context is unknown too, so there is no candidate context to verify at all."
       );
       return;
     }
-    setProbeMsg(isUnknown ? "Enqueueing a conservative full-trained-context probe…" : "Enqueueing probe…");
+    setProbeMsg(isUnknown ? "Enqueueing a conservative full-maximum-context probe…" : "Enqueueing probe…");
     try {
       await api.triggerTest({
         model_id: modelId,
@@ -181,7 +181,7 @@ export function ProfileCards({ testId, refreshKey, modelId, workerId }: ProfileC
       });
       setProbeMsg(
         isUnknown
-          ? `Conservative probe enqueued at ${candidate.toLocaleString()} tokens (this model's full trained context — no affordability estimate exists for this placement, so this is a floor, not a fitted candidate). Three loads maximum, ever.`
+          ? `Conservative probe enqueued at ${candidate.toLocaleString()} tokens (this model's full maximum context — no affordability estimate exists for this placement, so this is a floor, not a fitted candidate). Three loads maximum, ever.`
           : `Probe enqueued at ${candidate.toLocaleString()} tokens. Three loads maximum, ever — a failure retries once at ×0.75, and a roomy success probes once higher.`
       );
     } catch (err) {
@@ -268,7 +268,7 @@ export function ProfileCards({ testId, refreshKey, modelId, workerId }: ProfileC
 
   return (
     <div className="flex flex-col gap-3">
-      <div className="rounded-lg border border-border bg-surface px-3.5 py-2.5">
+      <div className="border-t border-border px-3.5 py-2.5">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <span className="text-sm text-fg">
             Scored for:{" "}
@@ -285,7 +285,7 @@ export function ProfileCards({ testId, refreshKey, modelId, workerId }: ProfileC
             type="button"
             onClick={() => setChanging((open) => !open)}
             aria-expanded={changing}
-            className="rounded-lg border border-border px-3 py-1 text-xs font-semibold text-fg hover:border-accent/40 hover:text-accent"
+            className="rounded-lg border border-border-strong px-3 py-1 text-xs font-semibold text-fg hover:border-accent/40 hover:text-accent"
           >
             Change goal ▾
           </button>
@@ -365,6 +365,8 @@ export function ProfileCards({ testId, refreshKey, modelId, workerId }: ProfileC
         {scoring.tallies.suspect_samples > 0 && ` · ${scoring.tallies.suspect_samples} carried suspect samples`}
         {scoring.tallies.missing_pp_or_tg > 0 &&
           ` · ${scoring.tallies.missing_pp_or_tg} never produced both a pp and a tg row`}
+        {(scoring.tallies.incomplete_repeats ?? 0) > 0 &&
+          ` · ${scoring.tallies.incomplete_repeats} had repeats that produced no reading`}
         .
         {scoring.profiles.length === 0 &&
           " No card could be produced from this run — the tallies above are the reason, not an error."}
@@ -498,7 +500,7 @@ function Card({
           <button
             type="button"
             onClick={() => onVerify(card.config)}
-            className="self-start rounded-lg border border-border px-3 py-1 text-[11px] font-semibold text-fg hover:border-accent/40 hover:text-accent"
+            className="self-start rounded-lg border border-border-strong px-3 py-1 text-[11px] font-semibold text-fg hover:border-accent/40 hover:text-accent"
           >
             Verify with a probe
           </button>
@@ -507,7 +509,7 @@ function Card({
           <button
             type="button"
             onClick={() => onMeasureQuality(card.config)}
-            className="self-start rounded-lg border border-border px-3 py-1 text-[11px] font-semibold text-fg hover:border-accent/40 hover:text-accent"
+            className="self-start rounded-lg border border-border-strong px-3 py-1 text-[11px] font-semibold text-fg hover:border-accent/40 hover:text-accent"
           >
             Measure quality
           </button>

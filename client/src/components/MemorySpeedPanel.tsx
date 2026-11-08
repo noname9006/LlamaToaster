@@ -30,10 +30,10 @@ function RamTable({ ram }: { ram: MemorySpeedResult["ram"] }) {
   const bestCopy = bestIdx(points, "copyGBs");
 
   return (
-    <div className="overflow-x-auto rounded-lg border border-border">
+    <div className="overflow-x-auto">
       <table className="w-full text-left text-sm">
         <thead>
-          <tr className="border-b border-border text-xs uppercase tracking-wide text-muted">
+          <tr className="border-b border-border text-xs text-muted">
             <th className="px-3 py-2 font-medium whitespace-nowrap">Threads</th>
             <th className="px-3 py-2 font-medium whitespace-nowrap">Read</th>
             <th className="px-3 py-2 font-medium whitespace-nowrap">Write</th>
@@ -69,10 +69,10 @@ function RamTable({ ram }: { ram: MemorySpeedResult["ram"] }) {
 
 function VramTable({ vram }: { vram: NonNullable<MemorySpeedResult["vram"]> }) {
   return (
-    <div className="overflow-x-auto rounded-lg border border-border">
+    <div className="overflow-x-auto">
       <table className="w-full text-left text-sm">
         <thead>
-          <tr className="border-b border-border text-xs uppercase tracking-wide text-muted">
+          <tr className="border-b border-border text-xs text-muted">
             <th className="px-3 py-2 font-medium whitespace-nowrap">Device</th>
             <th className="px-3 py-2 font-medium whitespace-nowrap">Read</th>
             <th className="px-3 py-2 font-medium whitespace-nowrap">Write</th>
@@ -118,14 +118,14 @@ export function MemorySpeedPanel({
   return (
     <div className="mt-4">
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <h4 className="text-xs font-semibold uppercase tracking-wide text-muted">Memory speed</h4>
+        <h4 className="text-xs font-semibold text-muted">Memory speed</h4>
         <div className="flex items-center gap-2">
           {result && <span className="text-xs text-muted">measured {formatDate(result.measuredAt)}</span>}
           <button
             type="button"
             onClick={onMeasure}
             disabled={disabled || queuing}
-            className="flex-none rounded-lg border border-border px-2.5 py-1 text-xs font-semibold text-fg hover:border-accent/50 hover:text-accent disabled:opacity-50"
+            className="flex-none rounded-lg border border-border-strong px-2.5 py-1 text-xs font-semibold text-fg hover:border-accent/50 hover:text-accent disabled:opacity-50"
             title="Sweep RAM read/write/copy bandwidth across several thread counts, plus VRAM bandwidth where available -- a few seconds, on demand."
           >
             {queuing ? "Queuing…" : result ? "Re-measure" : "Measure memory speed"}

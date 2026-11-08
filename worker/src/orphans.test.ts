@@ -35,8 +35,11 @@ describe("killProcessesUnder", () => {
 
   it("ends a process running from the builds dir and leaves the same binary elsewhere alone", async () => {
     const win = platform() === "win32";
-    const source = win ? "C:\\Windows\\System32\\PING.EXE" : "/bin/sleep";
-    const args = win ? ["-n", "120", "127.0.0.1"] : ["120"];
+    // Not /bin/sleep: on newer Linux images it is one multicall binary that picks
+    // its command from its own file name, so a copy named llama-server exits at
+    // once. node behaves the same under any name.
+    const source = win ? "C:\\Windows\\System32\\PING.EXE" : process.execPath;
+    const args = win ? ["-n", "120", "127.0.0.1"] : ["-e", "setTimeout(() => {}, 120000)"];
     dir = mkdtempSync(join(tmpdir(), "llamatoaster-orphans-test-"));
     const copy = join(dir, win ? "llama-server.exe" : "llama-server");
     copyFileSync(source, copy);

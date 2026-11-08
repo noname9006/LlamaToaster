@@ -301,7 +301,7 @@ describe("GET /auth/:provider/callback", () => {
   it("a link state whose session was revoked in between is rejected", async () => {
     const owner = await loginAs(9020, "owner-5");
     const s = await startLogin({ cookie: `lt_session=${owner.token}` }, "?link=1");
-    await fetch(`${baseUrl}/auth/logout`, { redirect: "manual", headers: { cookie: `lt_session=${owner.token}` } });
+    await fetch(`${baseUrl}/auth/logout`, { method: "POST", headers: { cookie: `lt_session=${owner.token}` } });
     mockProfileBody = { id: 9021, login: "late", avatar_url: null };
     const res = await callback(s, owner.token);
     // Revoking the session cascades the intent away, so this is just a login
@@ -437,7 +437,7 @@ describe("admin origin OAuth branch (§5.1)", () => {
   });
 });
 
-describe("GET /auth/logout", () => {
+describe("POST /auth/logout", () => {
   it("revokes the current session and clears the cookie", async () => {
     mockProfileBody = { id: 9007, login: "logout-user", avatar_url: null };
     const login = await startLogin();
@@ -449,15 +449,19 @@ describe("GET /auth/logout", () => {
     expect(repo.sessionRepo.getByTokenHash(hashToken(token))).toBeDefined();
 
     const logoutRes = await fetch(`${baseUrl}/auth/logout`, {
-      redirect: "manual",
+      method: "POST",
       headers: { cookie: `lt_session=${token}` },
     });
-    expect(logoutRes.headers.get("location")).toBe("/login");
+    expect(logoutRes.status).toBe(200);
+    expect(logoutRes.headers.get("set-cookie")).toMatch(/^lt_session=;/);
     expect(repo.sessionRepo.getByTokenHash(hashToken(token))).toBeUndefined();
   });
 
   it("is a harmless no-op when nobody is logged in", async () => {
-    const res = await fetch(`${baseUrl}/auth/logout`, { redirect: "manual" });
-    expect(res.headers.get("location")).toBe("/login");
+    const res = await fetch(`${baseUrl}/auth/logout`, { method: "POST" });
+    expect(res.status).toBe(200);
+    // What a cross-site form gets: no cookie sent, so nothing to clear. A Set-Cookie
+    // here would log the victim out anyway (audit 2026-11-01 E7).
+    expect(res.headers.get("set-cookie")).toBeNull();
   });
 });

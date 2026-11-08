@@ -1327,7 +1327,7 @@ export function Models() {
       <button
         type="button"
         onClick={() => setFitDialog({ title, scope: "all", items, workerId })}
-        className="inline-flex items-center gap-1 rounded-md border border-border px-2 py-0.5 text-xs text-muted hover:border-accent/40 hover:text-accent"
+        className="inline-flex items-center gap-1 rounded-md border border-border-strong px-2 py-0.5 text-xs text-muted hover:border-accent/40 hover:text-accent"
         title="Check every quant against this machine"
       >
         Will it fit? <span aria-hidden="true">❓</span>
@@ -1423,7 +1423,7 @@ export function Models() {
       <div key={label} className="flex items-start gap-3.5 border-t border-border/60 px-4 py-2 first:border-t-0">
         <div className="w-14 shrink-0 pt-0.5 text-[11px] font-semibold text-muted">
           {label}
-          <span className="block text-[9.5px] font-medium uppercase tracking-wide text-muted/60">{subtitle}</span>
+          <span className="block text-[9.5px] font-medium text-muted/60">{subtitle}</span>
         </div>
         <div className="flex flex-1 flex-wrap content-start gap-y-2">
           {quants.map((m, i) => renderQuantBadge(m, worker, i === 0))}
@@ -1595,7 +1595,7 @@ export function Models() {
       <span key={chip.file} className="inline-flex items-center gap-1.5 rounded-md border border-border bg-surface px-2 py-1 text-xs text-fg">
         {chip.kind === "quant" && <FitMark state={state} subject={chip.label} onClick={() => openFitForOne(item, fitWorker, state)} />}
         {chip.kind !== "quant" && (
-          <span className="rounded border border-border px-1 font-mono text-[9.5px] uppercase text-muted">{chip.kind === "mtp" ? "MTP" : "mmproj"}</span>
+          <span className="rounded border border-border px-1 font-mono text-[9.5px] text-muted">{chip.kind === "mtp" ? "MTP" : "mmproj"}</span>
         )}
         <a href={hfFileUrl(repoId, chip.file)} target="_blank" rel="noreferrer" className="font-mono font-semibold text-fg hover:text-accent hover:underline">
           {chip.label}
@@ -1670,7 +1670,7 @@ export function Models() {
       </div>
 
       <section className="mt-6">
-        <h2 className="text-sm font-semibold uppercase tracking-wide text-muted">My models</h2>
+        <h2 className="text-sm font-semibold text-muted">My models</h2>
         {models.length === 0 ? (
           <p className="mt-2 text-sm text-muted">No models registered yet.</p>
         ) : (
@@ -1681,7 +1681,7 @@ export function Models() {
                 <select
                   value={authorFilter}
                   onChange={(e) => setAuthorFilter(e.target.value)}
-                  className="rounded-lg border border-border bg-surface px-3 py-1.5 text-fg outline-none focus:border-accent"
+                  className="rounded-lg border border-border-strong bg-surface px-3 py-1.5 text-fg outline-none focus:border-accent"
                 >
                   <option value="">All</option>
                   {authorOptions.map((a) => (
@@ -1696,7 +1696,7 @@ export function Models() {
                 <select
                   value={familyFilter}
                   onChange={(e) => setFamilyFilter(e.target.value)}
-                  className="rounded-lg border border-border bg-surface px-3 py-1.5 text-fg outline-none focus:border-accent"
+                  className="rounded-lg border border-border-strong bg-surface px-3 py-1.5 text-fg outline-none focus:border-accent"
                 >
                   <option value="">All</option>
                   {familyOptions.map((f) => (
@@ -1723,7 +1723,7 @@ export function Models() {
                   <select
                     value={sortField}
                     onChange={(e) => setSortField(e.target.value as SortField)}
-                    className="rounded-lg border border-border bg-surface px-3 py-1.5 text-fg outline-none focus:border-accent"
+                    className="rounded-lg border border-border-strong bg-surface px-3 py-1.5 text-fg outline-none focus:border-accent"
                   >
                     {SORT_OPTIONS.map((o) => (
                       <option key={o.value} value={o.value}>
@@ -1734,7 +1734,7 @@ export function Models() {
                   <button
                     type="button"
                     onClick={() => setSortDir((d) => (d === "asc" ? "desc" : "asc"))}
-                    className="rounded-lg border border-border px-2.5 py-1.5 text-fg hover:border-accent/40"
+                    className="rounded-lg border border-border-strong px-2.5 py-1.5 text-fg hover:border-accent/40"
                     aria-label={sortDir === "asc" ? "Ascending" : "Descending"}
                     title={sortDir === "asc" ? "Ascending" : "Descending"}
                   >
@@ -1751,7 +1751,7 @@ export function Models() {
                     setParamsLoIndex(0);
                     setParamsHiIndex(PARAMS_STOPS.length - 1);
                   }}
-                  className="rounded-lg border border-border px-3 py-1.5 text-sm text-muted hover:border-accent/40 hover:text-accent"
+                  className="rounded-lg border border-border-strong px-3 py-1.5 text-sm text-muted hover:border-accent/40 hover:text-accent"
                 >
                   Clear filters
                 </button>
@@ -1769,7 +1769,7 @@ export function Models() {
                   <select
                     value={downloadWorker}
                     onChange={(e) => setDownloadWorker(e.target.value)}
-                    className="rounded-lg border border-border bg-surface px-3 py-1.5 text-fg outline-none focus:border-accent"
+                    className="rounded-lg border border-border-strong bg-surface px-3 py-1.5 text-fg outline-none focus:border-accent"
                   >
                     <option value="">select…</option>
                     {workers.map((w) => (
@@ -1784,7 +1784,7 @@ export function Models() {
                 type="button"
                 onClick={handleRefreshModels}
                 disabled={refreshingModels}
-                className="rounded-lg border border-border px-3 py-1.5 text-sm text-muted hover:border-accent/40 hover:text-accent disabled:opacity-50"
+                className="rounded-lg border border-border-strong px-3 py-1.5 text-sm text-muted hover:border-accent/40 hover:text-accent disabled:opacity-50"
               >
                 {refreshingModels ? "Refreshing..." : "Refresh Models"}
               </button>
@@ -1802,7 +1802,7 @@ export function Models() {
                       return ids.includes(worker.id) ? ids.filter((id) => id !== worker.id) : ids;
                     });
                   }}
-                  className="group rounded-xl border border-border bg-surface"
+                  className="group border-t border-border"
                 >
                   <summary className="flex cursor-pointer items-center justify-between px-4 py-2.5 text-sm font-semibold text-fg">
                     <span className="flex items-center gap-2">
@@ -1850,8 +1850,8 @@ export function Models() {
 
       {Object.keys(downloading).length > 0 && (
         <section className="mt-8">
-          <h2 className="text-sm font-semibold uppercase tracking-wide text-muted">Active downloads</h2>
-          <div className="mt-3 flex flex-col overflow-hidden rounded-lg border border-border bg-surface">
+          <h2 className="text-sm font-semibold text-muted">Active downloads</h2>
+          <div className="mt-3 flex flex-col overflow-hidden">
             {Object.entries(downloading).map(([key, state], i) => {
               const prog = progress[key];
               const speed = speeds[key];
@@ -1897,7 +1897,7 @@ export function Models() {
                       <button
                         type="button"
                         onClick={() => void handleResumeDownload(key)}
-                        className="whitespace-nowrap rounded border border-border px-1.5 py-1 text-[11px] text-fg hover:border-accent/40 hover:text-accent"
+                        className="whitespace-nowrap rounded border border-border-strong px-1.5 py-1 text-[11px] text-fg hover:border-accent/40 hover:text-accent"
                       >
                         Resume
                       </button>
@@ -1934,7 +1934,7 @@ export function Models() {
       )}
 
       <details
-        className="group mt-8 rounded-xl border border-border bg-surface"
+        className="group mt-8 border-t border-border"
         open={manualAddOpen}
         onToggle={(e) => {
           const open = e.currentTarget.open;
@@ -1942,7 +1942,7 @@ export function Models() {
           persistManualAddOpen(open);
         }}
       >
-        <summary className="flex cursor-pointer items-center justify-between px-5 py-3 text-sm font-semibold uppercase tracking-wide text-muted">
+        <summary className="flex cursor-pointer items-center justify-between px-5 py-3 text-sm font-semibold text-muted">
           Add a model manually
           <IconChevronDown width={16} height={16} className="transition-transform group-open:rotate-180" />
         </summary>
@@ -1953,7 +1953,7 @@ export function Models() {
               <select
                 value={form.source}
                 onChange={(e) => setForm({ ...form, source: e.target.value as ModelSource })}
-                className="rounded-lg border border-border bg-surface px-3 py-1.5 text-fg outline-none focus:border-accent"
+                className="rounded-lg border border-border-strong bg-surface px-3 py-1.5 text-fg outline-none focus:border-accent"
               >
                 <option value="local">local</option>
                 <option value="huggingface">huggingface</option>
@@ -1965,7 +1965,7 @@ export function Models() {
                 value={form.id}
                 onChange={(e) => setForm({ ...form, id: e.target.value })}
                 placeholder="sha256:…"
-                className="rounded-lg border border-border bg-surface px-3 py-1.5 text-fg outline-none focus:border-accent"
+                className="rounded-lg border border-border-strong bg-surface px-3 py-1.5 text-fg outline-none focus:border-accent"
               />
             </label>
             <label className="flex flex-col gap-1.5 text-sm">
@@ -1974,7 +1974,7 @@ export function Models() {
                 value={form.filename}
                 onChange={(e) => setForm({ ...form, filename: e.target.value })}
                 placeholder="model.gguf"
-                className="rounded-lg border border-border bg-surface px-3 py-1.5 text-fg outline-none focus:border-accent"
+                className="rounded-lg border border-border-strong bg-surface px-3 py-1.5 text-fg outline-none focus:border-accent"
               />
             </label>
             <label className="flex flex-col gap-1.5 text-sm">
@@ -1984,7 +1984,7 @@ export function Models() {
                 onChange={(e) => setForm({ ...form, size_bytes: e.target.value })}
                 type="number"
                 placeholder="0"
-                className="w-32 rounded-lg border border-border bg-surface px-3 py-1.5 text-fg outline-none focus:border-accent"
+                className="w-32 rounded-lg border border-border-strong bg-surface px-3 py-1.5 text-fg outline-none focus:border-accent"
               />
             </label>
           </div>
@@ -1996,7 +1996,7 @@ export function Models() {
                   value={form.hf_repo}
                   onChange={(e) => setForm({ ...form, hf_repo: e.target.value })}
                   placeholder="user/repo"
-                  className="rounded-lg border border-border bg-surface px-3 py-1.5 text-fg outline-none focus:border-accent"
+                  className="rounded-lg border border-border-strong bg-surface px-3 py-1.5 text-fg outline-none focus:border-accent"
                 />
               </label>
               <label className="flex flex-col gap-1.5 text-sm">
@@ -2005,7 +2005,7 @@ export function Models() {
                   value={form.hf_file}
                   onChange={(e) => setForm({ ...form, hf_file: e.target.value })}
                   placeholder="model-q4_k_m.gguf"
-                  className="rounded-lg border border-border bg-surface px-3 py-1.5 text-fg outline-none focus:border-accent"
+                  className="rounded-lg border border-border-strong bg-surface px-3 py-1.5 text-fg outline-none focus:border-accent"
                 />
               </label>
             </div>
@@ -2016,7 +2016,7 @@ export function Models() {
               value={form.metadata}
               onChange={(e) => setForm({ ...form, metadata: e.target.value })}
               placeholder='{"arch":"llama","quant":"q4_k_m"}'
-              className="rounded-lg border border-border bg-surface px-3 py-1.5 text-fg outline-none focus:border-accent"
+              className="rounded-lg border border-border-strong bg-surface px-3 py-1.5 text-fg outline-none focus:border-accent"
             />
           </label>
           <div className="flex items-center gap-3">
@@ -2032,7 +2032,7 @@ export function Models() {
       </details>
 
       <section className="mt-8">
-        <h2 className="text-sm font-semibold uppercase tracking-wide text-muted">
+        <h2 className="text-sm font-semibold text-muted">
           Search &amp; download (Hugging Face)
         </h2>
         <p className="mt-1 max-w-2xl text-sm text-muted">
@@ -2048,7 +2048,7 @@ export function Models() {
               value={hfQuery}
               onChange={(e) => setHfQuery(e.target.value)}
               placeholder="e.g. llama-3-8b"
-              className="w-64 rounded-lg border border-border bg-surface px-3 py-1.5 text-fg outline-none focus:border-accent"
+              className="w-64 rounded-lg border border-border-strong bg-surface px-3 py-1.5 text-fg outline-none focus:border-accent"
             />
           </label>
           <label className="flex flex-col gap-1.5 text-sm">
@@ -2061,7 +2061,7 @@ export function Models() {
                 if (e.target.value) setPickWorkerWarning(false);
               }}
               className={`w-48 rounded-lg border bg-surface px-3 py-1.5 text-fg outline-none focus:border-accent ${
-                pickWorkerWarning ? "border-danger" : "border-border"
+                pickWorkerWarning ? "border-danger" : "border-border-strong"
               }`}
             >
               <option value="">select…</option>
@@ -2116,7 +2116,7 @@ export function Models() {
                       setHfSortField(field);
                       void runFreshHfSearch(field, hfSortDir);
                     }}
-                    className="rounded-lg border border-border bg-surface px-3 py-1.5 text-fg outline-none focus:border-accent"
+                    className="rounded-lg border border-border-strong bg-surface px-3 py-1.5 text-fg outline-none focus:border-accent"
                   >
                     {HF_SORT_OPTIONS.map((o) => (
                       <option key={o.value} value={o.value}>
@@ -2132,7 +2132,7 @@ export function Models() {
                         setHfSortDir(dir);
                         void runFreshHfSearch(hfSortField, dir);
                       }}
-                      className="rounded-lg border border-border px-2.5 py-1.5 text-fg hover:border-accent/40"
+                      className="rounded-lg border border-border-strong px-2.5 py-1.5 text-fg hover:border-accent/40"
                       aria-label={hfSortDir === "asc" ? "Ascending" : "Descending"}
                       title={hfSortDir === "asc" ? "Ascending" : "Descending"}
                     >
@@ -2150,7 +2150,7 @@ export function Models() {
                     setHfPageIndex(0);
                     bumpHfSearchEpoch();
                   }}
-                  className="rounded-lg border border-border px-3 py-1.5 text-sm text-muted hover:border-accent/40 hover:text-accent"
+                  className="rounded-lg border border-border-strong px-3 py-1.5 text-sm text-muted hover:border-accent/40 hover:text-accent"
                 >
                   Clear filters
                 </button>
@@ -2167,7 +2167,7 @@ export function Models() {
           )}
           <div className="mt-4 flex flex-col gap-2">
             {visibleHfResults.map((r) => (
-              <div key={r.id} className="overflow-hidden rounded-lg border border-border">
+              <div key={r.id} className="overflow-hidden">
                 <button
                   type="button"
                   onClick={() => toggleRepo(r.id)}
@@ -2222,7 +2222,7 @@ export function Models() {
               type="button"
               onClick={goToPrevHfPage}
               disabled={hfPageIndex === 0 || searching}
-              className="rounded-lg border border-border px-3 py-1.5 text-muted hover:border-accent/40 hover:text-accent disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:border-border disabled:hover:text-muted"
+              className="rounded-lg border border-border-strong px-3 py-1.5 text-muted hover:border-accent/40 hover:text-accent disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:border-border disabled:hover:text-muted"
             >
               ← Prev
             </button>
@@ -2231,7 +2231,7 @@ export function Models() {
               type="button"
               onClick={() => void goToNextHfPage()}
               disabled={searching || !hasMoreHfPages}
-              className="rounded-lg border border-border px-3 py-1.5 text-muted hover:border-accent/40 hover:text-accent disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:border-border disabled:hover:text-muted"
+              className="rounded-lg border border-border-strong px-3 py-1.5 text-muted hover:border-accent/40 hover:text-accent disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:border-border disabled:hover:text-muted"
             >
               Next →
             </button>

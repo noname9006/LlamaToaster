@@ -4,7 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Fastify, { type FastifyInstance } from "fastify";
 import fastifyCookie from "@fastify/cookie";
-import type { AdminStats } from "../../../shared/types.js";
+import type { AdminStats, AppSettings } from "../../../shared/types.js";
+import { DEFAULT_BREAD_MARK_STYLE } from "../../../shared/breadMarks.js";
 import { hostFetch } from "../test-host-fetch.js";
 
 // Every request here names its origin with a real Host header, which fetch()
@@ -459,6 +460,31 @@ describe("admin settings (AppSettings toggles)", () => {
 
     // Restore the default for later tests in this file/process.
     await fetch(`${baseUrl}/api/admin/settings`, { method: "POST", headers, body: JSON.stringify({ probeMaxLoads: 40 }) });
+  });
+
+  it("bread marks: on by default with the shipped style; toggles, stores a style, and rejects a bad one", async () => {
+    const adminToken = await superadminSession();
+    const headers = { "content-type": "application/json", ...withHost(ADMIN_HOST, { authorization: `Bearer ${adminToken}` }) };
+    const get = async () => (await (await fetch(`${baseUrl}/api/admin/settings`, { headers })).json()) as AppSettings;
+    const set = (patch: unknown) => fetch(`${baseUrl}/api/admin/settings`, { method: "POST", headers, body: JSON.stringify(patch) });
+
+    const fresh = await get();
+    expect(fresh.breadMarksEnabled).toBe(true);
+    expect(fresh.breadMarkStyle).toEqual(DEFAULT_BREAD_MARK_STYLE);
+
+    expect((await set({ breadMarksEnabled: false })).status).toBe(200);
+    const style = { golden: "butter", darkFix: "both", step: 4, falloff: 1, direction: "rtl" };
+    expect((await set({ breadMarkStyle: { ...style, extra: "dropped" } })).status).toBe(200);
+    const after = await get();
+    expect(after.breadMarksEnabled).toBe(false);
+    expect(after.breadMarkStyle).toEqual(style);
+
+    expect((await set({ breadMarksEnabled: "no" })).status).toBe(400);
+    expect((await set({ breadMarkStyle: { ...style, step: 50 } })).status).toBe(400);
+    expect((await set({ breadMarkStyle: { ...style, golden: "jam" } })).status).toBe(400);
+    expect((await get()).breadMarkStyle).toEqual(style);
+
+    await set({ breadMarksEnabled: true, breadMarkStyle: DEFAULT_BREAD_MARK_STYLE });
   });
 
   it("400s a probeMaxLoads value outside [1, 200] instead of storing it", async () => {

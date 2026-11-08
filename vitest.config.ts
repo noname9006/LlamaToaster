@@ -28,6 +28,7 @@ export default defineConfig({
         test: {
           name: "node",
           environment: "node",
+          globalSetup: ["./vitest.global-setup.ts"],
           // Explicit roots rather than a bare default, so a stray test file
           // added outside these three packages fails loudly (unmatched) rather
           // than silently inheriting the wrong environment.

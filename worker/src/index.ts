@@ -1,7 +1,10 @@
 import { createServer } from "node:http";
-import { existsSync, rmSync } from "node:fs";
+import { existsSync, rmSync, appendFileSync } from "node:fs";
+import si from "systeminformation";
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve, relative, isAbsolute, sep, basename } from "node:path";
+import { chooseModelPath } from "./modelPath.js";
+import { dropSetAside, finishPart, keepExistingTarget, restoreSetAside, setAsidePath } from "./downloadVerify.js";
 import {
   readFileSync,
   writeFileSync,
@@ -99,8 +102,12 @@ import { killProcessesUnder } from "./orphans.js";
 import { detectMoe, toArgs as toPlacementArgs } from "../../shared/moePlacement.js";
 import type { FitPoint } from "../../shared/fitParams.js";
 import { buildFitArgs, fitPointFromOutput, parseFitOutput } from "../../shared/fitParams.js";
+import { fitLevel, type FitMemory } from "../../shared/fitLevel.js";
+import { fitScale, type FitCeiling } from "../../shared/fitGrade.js";
 import {
   candidateExtraServerArgs,
+  DEFAULT_BATCH,
+  DEFAULT_UBATCH,
   threadSweepBenchArgs,
   THREAD_PP_TOKENS,
   THREAD_TG_TOKENS,
@@ -299,7 +306,12 @@ function secureConfigFile(): void {
 function persistConfig(patch: Partial<WorkerConfig>): void {
   const merged = { ...config, ...patch };
   const tmp = `${configPath}.tmp`;
-  writeFileSync(tmp, JSON.stringify(merged, null, 2), "utf8");
+  // Owner-only from the moment it exists: this holds the session and refresh
+  // tokens and the machine's private key, and a rename keeps the temp file's mode
+  // (audit 2026-09-27 L5). A leftover temp file keeps its old mode on rewrite,
+  // hence the chmod as well. Both are no-ops for the bits used on Windows.
+  writeFileSync(tmp, JSON.stringify(merged, null, 2), { encoding: "utf8", mode: 0o600 });
+  chmodSync(tmp, 0o600);
   renameSync(tmp, configPath);
   secureConfigFile();
   Object.assign(config, patch);
@@ -512,17 +524,32 @@ if (!activeBuild) {
   );
 }
 
-// Resolves a registered Model to a concrete file path under model_dir. The
-// naive resolve (model.hf_file/model.filename joined onto model_dir) is tried
-// first; if that file doesn't exist, the local model cache is consulted to
-// find the file that actually matches this model on disk (see
-// resolveModelPathFromCache). A hand-dropped file commonly lives at a
+// Resolves a registered Model to a concrete file path under model_dir, by what
+// the local model cache knows the file to be before where it sits (see
+// chooseModelPath). A hand-dropped file commonly lives at a
 // different path than the canonical HF one -- e.g. "Qwen3.5-9B-PRISM-DQ.gguf"
 // at the repo root while its HF filename is "Qwen3.5-9B/Qwen3.5-9B-PRISM-DQ.gguf"
 // (subfolder) -- and resolving straight from hf_file alone is what produced
 // the "model file not found at F:\...\Qwen3.5-9B\Qwen3.5-9B-PRISM-DQ.gguf"
-// benchmark failure. Throws when nothing can be resolved.
-async function resolveModelPath(model: Model, opts: { exactOnly?: boolean } = {}): Promise<string> {
+// benchmark failure. Throws when the file at that path is known to be another
+// one; a model with no file at all gets its own path back, for the caller's
+// "not found" message.
+async function resolveModelPath(model: Model): Promise<string> {
+  const { choice, name, root, direct } = await chooseLocalModel(model, {});
+  if (choice.kind === "different") {
+    throw new Error(
+      `the file at ${name} is not this model: it hashes to ${choice.actual}, not ${model.id}. Remove or rename it, or refresh this machine's models if it was just replaced.`
+    );
+  }
+  if (choice.kind === "none") return direct;
+  if (choice.path !== name) {
+    log.info(`model ${model.id}: resolved to ${choice.path} (model_dir-relative), not its own path ${name}`);
+  }
+  return resolve(root, choice.path);
+}
+
+// The containment rule, then chooseModelPath over this machine's file cache.
+async function chooseLocalModel(model: Model, opts: { exactOnly?: boolean }) {
   const name = model.source === "local" ? model.filename : model.hf_file ?? model.filename;
   if (!name) {
     throw new Error(`model ${model.id} has no filename to resolve (source=${model.source})`);
@@ -533,47 +560,15 @@ async function resolveModelPath(model: Model, opts: { exactOnly?: boolean } = {}
   if (rel.startsWith("..") || isAbsolute(rel)) {
     throw new Error(`model filename resolves outside model_dir: ${name}`);
   }
-  if (existsSync(direct)) return direct;
-
-  const cached = await resolveModelPathFromCache(model, name, opts.exactOnly === true);
-  if (cached) {
-    log.info(
-      `model ${model.id}: direct path ${direct} not present, resolved to cached path ${cached} ` +
-        `(model_dir-relative) instead`
-    );
-    return resolve(root, cached);
-  }
-  return direct;
-}
-
-// Finds the cache entry whose local path corresponds to a registered Model,
-// when the model's own hf_file/filename doesn't directly map onto disk. Three
-// match keys, in priority order:
-//   1. model.id is a SHA-256 (every download and hash-identified scan
-//      registers by digest) -- exact sha256 match.
-//   2. hf provenance -- an entry whose hf_model_id ("repo_id/filename") equals
-//      this model's "hf_repo/hf_file". Covers a file stored at its canonical
-//      HF path under a different name than the catalog row.
-//   3. basename -- an entry whose file basename equals the requested
-//      filename's basename (the "flat instead of subfolder" hand-dropped case
-//      above). Lowest priority on purpose: a basename collision (two files
-//      with the same name in different folders) resolves to the first match,
-//      which is no worse than the old behavior's silent hard failure.
-// Returns the cache entry's model_dir-relative path, or null.
-async function resolveModelPathFromCache(model: Model, name: string, exactOnly = false): Promise<string | null> {
   const entries = await localModelCache.getAll();
-  const shaId = /^[0-9a-f]{64}$/.test(model.id) ? model.id.toLowerCase() : null;
-  const wantHfId = model.hf_repo && model.hf_file ? `${model.hf_repo}/${model.hf_file}` : null;
-  const wantBase = basename(name);
-
-  let baseMatch: string | null = null;
-  for (const e of entries) {
-    if (e.state === "missing") continue;
-    if (shaId && e.sha256 && e.sha256.toLowerCase() === shaId) return e.path;
-    if (wantHfId && e.hf_model_id === wantHfId) return e.path;
-    if (!baseMatch && basename(e.path) === wantBase) baseMatch = e.path;
+  const choice = chooseModelPath(model, name.split(sep).join("/"), entries, (p) => existsSync(resolve(root, p)), opts);
+  if (choice.kind === "found") {
+    const chosen = relative(root, resolve(root, choice.path));
+    if (chosen.startsWith("..") || isAbsolute(chosen)) {
+      throw new Error(`model file resolves outside model_dir: ${choice.path}`);
+    }
   }
-  return exactOnly ? null : baseMatch;
+  return { choice, name, root, direct };
 }
 
 // Same containment rule as resolveModelPath, applied to a raw filename
@@ -2313,6 +2308,7 @@ async function runSweepItemViaServer(input: TestSweepItemViaServerInput): Promis
         activeBenchProc = proc;
         sampler.start(proc.pid, backend, TICK_INTERVAL_MS);
       },
+      beforeStop: () => sampler.readAfterTimedWork(),
       onProgress: (phase, detail, liveTps) => {
         // M6's detection window is the TIMED work, not the spawn: a server
         // item brackets sampling from its first timed request onward, since
@@ -2464,7 +2460,11 @@ async function executeRuntimeBenchmarkJob(
       );
     }
 
+    // A requeued job resumes after what it already finished, in every executor
+    // with more than one item (audit 2026-10-11 N6 / 2026-10-25 R6).
+    const alreadyFinished = new Set(payload.completed_idx ?? []);
     for (let i = 0; i < contexts.length; i++) {
+      if (alreadyFinished.has(i)) continue;
       const nPrompt = contexts[i];
       const item = { ...template, idx: i };
       const label = `run ${payload.run_id} item ${item.idx} (context_curve)`;
@@ -2513,6 +2513,7 @@ async function executeRuntimeBenchmarkJob(
           log,
         });
 
+        await sampler.readAfterTimedWork();
         const stderr = server.stderr();
         await server.stop();
         activeBenchProc = null;
@@ -2712,7 +2713,9 @@ async function executeFillCurveJob(payload: BenchmarkJob, spec: FillCurveSpec): 
   );
 
   try {
+    const alreadyFinished = new Set(payload.completed_idx ?? []);
     for (const item of items) {
+      if (alreadyFinished.has(item.idx)) continue;
       const label = `run ${payload.run_id} item ${item.idx} (fill_curve)`;
       while (pauseRequested && !stopRequested) await sleep(500);
       if (stopRequested) {
@@ -2761,6 +2764,34 @@ async function executeFillCurveJob(payload: BenchmarkJob, spec: FillCurveSpec): 
           item,
           log,
           shouldStop: () => stopRequested,
+          beforeSlice: process.env.LLAMATOASTER_SLICE_MEM_DUMP
+            ? async ({ repeat, filled }) => {
+                // Experiments only: one memory reading between slices, never inside a timed request.
+                try {
+                  const pid = server!.proc.pid;
+                  const gpu = await readGpuMemory(payload.llama_cpp_backend, pid);
+                  const procs = await si.processes();
+                  const rss = (procs.list.find((p) => p.pid === pid)?.memRss ?? 0) / 1024;
+                  const mem = await si.mem();
+                  appendFileSync(
+                    process.env.LLAMATOASTER_SLICE_MEM_DUMP!,
+                    JSON.stringify({
+                      repeat,
+                      filled,
+                      ts: Date.now(),
+                      ram_proc_mib: Math.round(rss),
+                      ram_system_used_mib: Math.round(mem.active / 1048576),
+                      vram_total_used_mib: gpu.used.mib,
+                      vram_total_shared_mib: gpu.usedShared?.mib ?? null,
+                      vram_proc_mib: gpu.process?.mib ?? null,
+                      vram_proc_shared_mib: gpu.processShared?.mib ?? null,
+                    }) + "\n"
+                  );
+                } catch {
+                  /* experiment hook: never fatal */
+                }
+              }
+            : undefined,
           onProgress: ({ repeat, filled }) => {
             const now = Date.now();
             if (now - lastTickAt < TICK_INTERVAL_MS) return;
@@ -2772,6 +2803,7 @@ async function executeFillCurveJob(payload: BenchmarkJob, spec: FillCurveSpec): 
           },
         });
 
+        await sampler.readAfterTimedWork();
         const stderr = server.stderr();
         await server.stop();
         activeBenchProc = null;
@@ -2858,7 +2890,9 @@ async function executeSpeedRunJob(payload: BenchmarkJob, spec: SpeedRunSpec): Pr
       `${spec.prompt_tokens}-token prompt + ${spec.n_gen} generated, ${spec.repeats} repeat(s)`
   );
   try {
+    const alreadyFinished = new Set(payload.completed_idx ?? []);
     for (let i = 0; i < spec.candidates.length; i++) {
+      if (alreadyFinished.has(i)) continue;
       const c = spec.candidates[i];
       const item: SweepItem = {
         ...template,
@@ -2874,8 +2908,8 @@ async function executeSpeedRunJob(payload: BenchmarkJob, spec: SpeedRunSpec): Pr
         cache_type_v: c.ctv,
         flash_attn: c.fa,
         threads: c.threads?.t ?? -1,
-        batch_size: 2048,
-        ubatch_size: 512,
+        batch_size: c.b ?? DEFAULT_BATCH,
+        ubatch_size: c.ub ?? DEFAULT_UBATCH,
       };
       const label = `run ${payload.run_id} item ${i} (speed run: ${c.label})`;
       while (pauseRequested && !stopRequested) await sleep(500);
@@ -2926,6 +2960,7 @@ async function executeSpeedRunJob(payload: BenchmarkJob, spec: SpeedRunSpec): Pr
           port: server.port,
           log,
         });
+        await sampler.readAfterTimedWork();
         const stderr = server.stderr();
         await server.stop();
         activeBenchProc = null;
@@ -3013,7 +3048,9 @@ async function executeThreadSweepJob(payload: BenchmarkJob, spec: ThreadSweepSpe
   detectedCpuIsa = await readCpuIsa(resolvedBuild.bench_path).catch(() => null);
   log.info(`run ${payload.run_id}: thread sweep -- ${spec.items.length} candidate(s), ${spec.repeats} repeat(s)`);
   try {
+    const alreadyFinished = new Set(payload.completed_idx ?? []);
     for (let i = 0; i < spec.items.length; i++) {
+      if (alreadyFinished.has(i)) continue;
       const t = spec.items[i];
       while (pauseRequested && !stopRequested) await sleep(500);
       if (stopRequested) {
@@ -3221,16 +3258,25 @@ interface PreparedModel {
 // A path llama-fit-params can size: the model file when this machine has it,
 // else a sparse placeholder holding its real header (worker/src/headerFit.ts).
 async function modelPathOrHeader(model: Model, slot: string, opts: { exactOnly?: boolean } = {}): Promise<PreparedModel> {
-  const local = await resolveModelPath(model, opts);
-  // A split model is only here when every shard is; otherwise fit would fail on
-  // the missing ones when the headers can answer.
-  const localDir = dirname(local);
-  const complete = shardNames(basename(local)).every((f) => existsSync(join(localDir, f)));
-  if (existsSync(local) && (complete || !model.hf_repo || !model.hf_file)) {
-    return { path: local, source: "local", fetchedBytes: 0, cleanup: async () => {} };
+  // A file that is known or suspected to be some other file doesn't count as
+  // this model when its header can answer instead.
+  const { choice, name, root, direct } = await chooseLocalModel(model, opts);
+  const hasHfSource = !!model.hf_repo && !!model.hf_file;
+  if (choice.kind === "found" && (choice.proven || !opts.exactOnly || !hasHfSource)) {
+    const local = resolve(root, choice.path);
+    // A split model is only here when every shard is; otherwise fit would fail on
+    // the missing ones when the headers can answer.
+    const localDir = dirname(local);
+    const complete = shardNames(basename(local)).every((f) => existsSync(join(localDir, f)));
+    if (complete || !hasHfSource) {
+      return { path: local, source: "local", fetchedBytes: 0, cleanup: async () => {} };
+    }
   }
   if (!model.hf_repo || !model.hf_file) {
-    throw new Error(`model file not found at ${local}, and the model has no Hugging Face source to size it from`);
+    if (choice.kind === "different") {
+      throw new Error(`the file at ${name} is not this model, and the model has no Hugging Face source to size it from`);
+    }
+    throw new Error(`model file not found at ${direct}, and the model has no Hugging Face source to size it from`);
   }
   validateHfRepo(model.hf_repo);
   validateHfFile(model.hf_file);
@@ -3324,9 +3370,58 @@ async function executeFitCheckJob(payload: FitCheckJobPayload): Promise<void> {
   activeBenchProc = null;
 }
 
+// Bread grades 5/4 and 2/1 (shared/fitGrade.ts): a second look at the model's
+// maximum context, only when the first answer already fits fully and the model
+// was trained on more than was asked.
+//   gpu scale: -c left unset, so fit shrinks the context before moving any
+//     layer (verified on b12058: a 4B came back "-c 99072 -ngl -1", a 27B
+//     "-c 4096 -ngl 20"). Every layer still on the GPU at what it printed is
+//     the longest such context; no -c printed means the trained one fits.
+//   ram scale: fit does not shrink for host memory, so the maximum context is
+//     sized directly and judged against RAM.
+async function sizeTrainedContext(
+  first: FitPoint,
+  nCtxTrain: number | null,
+  memory: FitMemory,
+  askedCtx: number,
+  size: (ctx: number | null) => Promise<{ stdout: string; log: string }>,
+  marginMib: number,
+  cpuOnly: boolean
+): Promise<FitCeiling | null> {
+  if (nCtxTrain == null || nCtxTrain <= 0) return null;
+  const scale = fitScale(memory);
+  const firstLevel = fitLevel(first, memory);
+  if (firstLevel !== "fits" && !(scale === "ram" && firstLevel === "partial")) return null;
+  if (nCtxTrain <= askedCtx) return { trained_ctx: nCtxTrain, fits_at_trained: true, max_full_ctx: nCtxTrain };
+  const pointAt = (parsed: ReturnType<typeof parseFitOutput>, ctx: number) =>
+    fitPointFromOutput(parsed, { ctx, fa: "on", ctk: "f16", ctv: "f16", marginMib, cpuOnly });
+  if (scale === "ram") {
+    const res = await size(nCtxTrain);
+    const point = pointAt(parseFitOutput(res.stdout, res.log), nCtxTrain);
+    if (point.verdict === "error") return null;
+    const level = fitLevel(point, memory);
+    return { trained_ctx: nCtxTrain, fits_at_trained: level != null && level !== "no_fit", max_full_ctx: null };
+  }
+  const res = await size(null);
+  const parsed = parseFitOutput(res.stdout, res.log);
+  const fitted = parsed.ctx != null && parsed.ctx > 0 ? Math.min(parsed.ctx, nCtxTrain) : nCtxTrain;
+  // When fit only shrinks the context it logs "entire model can be fit by
+  // reducing context" and prints "-c N -ngl -1" with no per-device layer line,
+  // so the point parser has nothing to read: every layer stays (no -ot either).
+  const contextOnly = parsed.ngl === -1 && !parsed.ot && /entire model can be fit by reducing context/.test(res.log);
+  const point = pointAt(parsed, fitted);
+  if (point.verdict === "error" && !contextOnly) return null;
+  const allLayers = contextOnly || fitLevel(point, memory) === "fits";
+  return {
+    trained_ctx: nCtxTrain,
+    fits_at_trained: allLayers && fitted >= nCtxTrain,
+    max_full_ctx: allLayers ? fitted : null,
+  };
+}
+
 // docs/plans/MODEL_FIT_CHECK_PLAN.md -- "Will it fit?" on the Models page: one
 // llama-fit-params call per target at the asked context, or the model's own
-// trained context when that is smaller, with what the machine has available.
+// maximum context when that is smaller, with what the machine has available.
 // llama.cpp's --list-devices has no row for the CPU, so RAM is the OS's reading.
 // Each answer is posted as it comes; one target failing never stops the rest.
 async function executeModelFitJob(payload: FitCheckJobPayload, targetKeys: string[]): Promise<void> {
@@ -3391,7 +3486,7 @@ async function executeModelFitJob(payload: FitCheckJobPayload, targetKeys: strin
       // Exact matches only: another repo's file of the same name is not this one.
       prepared = await modelPathOrHeader(model, `model-fit-${i}`, { exactOnly: true });
       const modelPath = prepared.path;
-      const size = (ctx: number) =>
+      const size = (ctx: number | null) =>
         call([...buildFitArgs({ modelPath, ctx, fa: "on", marginMib: payload.margin_mib, deviceArgs }), ...loadArgs]);
       let ctx = payload.ctx;
       let res = await size(ctx);
@@ -3413,6 +3508,14 @@ async function executeModelFitJob(payload: FitCheckJobPayload, targetKeys: strin
         point.verdict === "error"
           ? point.error ?? (res.timedOut ? "llama-fit-params gave no answer in time" : `llama-fit-params exited ${res.code ?? "abnormally"}`)
           : null;
+      const ceiling = error
+        ? null
+        : await sizeTrainedContext(point, parsed.nCtxTrain, memory, ctx, (c) => size(c), payload.margin_mib, devices.length === 0).catch(
+            (err) => {
+              log.warn(`will it fit: ${label} maximum-context check failed: ${err instanceof Error ? err.message : String(err)}`);
+              return null;
+            }
+          );
       await post({
         ...base,
         target_key: key,
@@ -3420,6 +3523,7 @@ async function executeModelFitJob(payload: FitCheckJobPayload, targetKeys: strin
         memory,
         point: error ? null : point,
         error,
+        ...(ceiling ? { ceiling } : {}),
         ...(prepared.fetchedBytes > 0 ? { fetched_bytes: prepared.fetchedBytes } : {}),
       });
       log.info(
@@ -3736,9 +3840,18 @@ async function executeDownloadModelJob(
     // run afterward, since "the bytes are on disk" and "the catalog knows
     // about it" are two different things.
     let resumeFrom = 0;
-    if (existsSync(target)) {
+    // Left by an attempt that died before it could put the file back.
+    restoreSetAside(target);
+    const hadTarget = existsSync(target);
+    if (hadTarget) updateDownloadReport(jobId, { phase: "finalizing", detail: "hashing" });
+    let hashed = await keepExistingTarget(target, expectedSha256, hashFile);
+    if (hashed) {
       log.info(`${progressKey} already present at ${target}, skipping re-download`);
     } else {
+      if (hadTarget) {
+        log.warn(`${progressKey}: the file at ${target} isn't the one wanted -- set aside as ${setAsidePath(target)} until the download is verified`);
+        updateDownloadReport(jobId, { phase: "downloading", detail: progressKey });
+      }
       try {
         resumeFrom = statSync(partPath).size;
       } catch {
@@ -3798,22 +3911,22 @@ async function executeDownloadModelJob(
       );
       const elapsedMs = Date.now() - downloadStartedAt;
       log.info(`downloaded ${progressKey} -> ${partPath} in ${elapsedMs}ms`);
-      renameSync(partPath, target);
+      updateDownloadReport(jobId, { phase: "finalizing", detail: "hashing" });
+      hashed = await finishPart(partPath, target, expectedSha256, hashFile);
+      try {
+        if (dropSetAside(target)) log.warn(`${progressKey}: replaced the different file that was at ${target}`);
+      } catch (err) {
+        log.warn(`${progressKey}: couldn't remove ${setAsidePath(target)}: ${err instanceof Error ? err.message : String(err)}`);
+      }
     }
-
-    updateDownloadReport(jobId, { phase: "finalizing", detail: "hashing" });
-    const { sha256, byteLength } = await hashFile(target);
+    const { sha256, byteLength } = hashed!;
 
     // Download verification: compare expected vs actual (spec: After download calculate SHA256, compare, detect corruption)
-    let verificationState: "verified" | "corrupted" | "unknown" = "unknown";
+    let verificationState: "verified" | "unknown" = "unknown";
     if (expectedSha256) {
-      if (sha256 === expectedSha256) {
-        verificationState = "verified";
-        log.info(`Download verified: ${progressKey} hash matches expected ${expectedSha256}`);
-      } else {
-        verificationState = "corrupted";
-        log.error(`Download CORRUPTED: ${progressKey} expected ${expectedSha256} but got ${sha256}`);
-      }
+      // keepExistingTarget/finishPart let nothing else this far.
+      verificationState = "verified";
+      log.info(`Download verified: ${progressKey} hash matches expected ${expectedSha256}`);
     } else {
       // Fallback: check HF index existence (covers mirrored/cached expected unavailable)
       try {
@@ -3905,24 +4018,6 @@ async function executeDownloadModelJob(
     // (getModelFilesWithState), so the upsert above is visible to the server
     // within one beat.
 
-    // Only verified (and unknown where no expected hash was available) downloads
-    // are considered successfully imported per spec. Corrupted means the file
-    // is retained locally with corrupted state for UI inspection, but we do
-    // NOT register it in the server catalog and we surface the job as failed
-    // so the user sees the corruption and can retry.
-    if (verificationState === "corrupted") {
-      const errMsg = `SHA256 mismatch: expected ${expectedSha256} but got ${sha256} (file kept as corrupted)`;
-      await safeReportDownloadResult({
-        worker: config.worker_name,
-        machine_id: config.machine_id,
-        hf_repo: payload.hf_repo,
-        hf_file: payload.hf_file,
-        ok: false,
-        error: errMsg,
-      });
-      throw new Error(errMsg);
-    }
-
     const reported = await safeReportDownloadResult({
       worker: config.worker_name,
       machine_id: config.machine_id,
@@ -3955,6 +4050,11 @@ async function executeDownloadModelJob(
     }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
+    try {
+      restoreSetAside(target);
+    } catch (restoreErr) {
+      log.warn(`${progressKey}: couldn't put ${setAsidePath(target)} back: ${restoreErr instanceof Error ? restoreErr.message : String(restoreErr)}`);
+    }
     const discard = signal.aborted && discardRequestedJobIds.has(jobId);
     if (discard) {
       // Cancel Download (routes/workers.ts's cancel route ->
@@ -4199,7 +4299,7 @@ async function executeRunProbeJob(payload: TestProbeJobPayload): Promise<void> {
   function findDedupMatch(ctx: number, ngl: number, loadsHere: number, needsSpill: boolean): ProbeDedupPoint | undefined {
     return pickDedupPoint(dedupPoints, ctx, ngl, loadsHere, needsSpill);
   }
-  // The ladder never probes above what the model was trained for. With no
+  // The ladder never probes above the model's maximum context. With no
   // trained_ctx in the header there is no honest ceiling to search toward, so
   // the caller's own candidate stands as one rather than inventing a bound.
   const maxCtx = payload.trained_ctx ?? payload.candidateCtx;
@@ -5076,14 +5176,13 @@ export function parsePerplexity(output: string): number | null {
   return Number.isFinite(value) && value > 0 ? value : null;
 }
 
-// Resolves immediately (so the normal reportJobResult call right after
-// executeJob in workerMain still gets to fire and tell the server this job
-// succeeded) but schedules the actual exit a beat later rather than doing it
-// inline -- process.exit() here would race that HTTP report and could kill
-// the process before the response even goes out.
+// Only asks: workerMain exits once this job's outcome has been reported. A fixed
+// delay here could beat a slow report, and the job would then be handed out
+// again and stop the worker's next run as well (audit 2026-10-18 A10).
+let exitAfterJob = false;
 async function executeShutdownWorkerJob(): Promise<void> {
-  log.info("shutdown requested from server -- exiting shortly");
-  setTimeout(() => process.exit(0), 500);
+  log.info("shutdown requested from server -- exiting once that's reported");
+  exitAfterJob = true;
 }
 
 async function executeDeleteModelFileJob(payload: { filename: string }): Promise<void> {
@@ -5739,6 +5838,7 @@ async function workerMain(): Promise<void> {
           outcome = { ok: false, error: message };
         }
         await reportJobOutcome(job.job_id, outcome);
+        if (exitAfterJob) await shutdown("shutdown_worker job");
       } finally {
         busy = false;
         currentJobReport = null;
@@ -5862,15 +5962,25 @@ void workerMain();
 // them holding VRAM (audit 2026-10-11 N10). Bounded, so a stuck process
 // listing can't keep the worker from exiting.
 let shuttingDown = false;
-async function shutdown(signal: string): Promise<void> {
+async function shutdown(signal: string, exitCode = 0): Promise<void> {
   if (shuttingDown) return;
   shuttingDown = true;
   log.info(`received ${signal}, shutting down...`);
   activeBenchProc?.kill("SIGKILL");
   await Promise.race([daemon.shutdown().catch(() => undefined), sleep(3_000)]);
   await Promise.race([killProcessesUnder(buildsDir).catch(() => []), sleep(5_000)]);
-  process.exit(0);
+  process.exit(exitCode);
 }
+
+// A stray throw or rejection would already end the process (Node's default).
+// These make sure the reason reaches the log first, and that llama.cpp children
+// don't outlive it holding VRAM (audit 2026-10-25 B5). The supervisor restarts it.
+function crash(what: string, err: unknown): void {
+  log.error(`${what} -- exiting: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}`);
+  void shutdown(what, 1).catch(() => process.exit(1));
+}
+process.on("uncaughtException", (err) => crash("uncaught exception", err));
+process.on("unhandledRejection", (reason) => crash("unhandled rejection", reason));
 
 process.on("SIGINT", () => void shutdown("SIGINT"));
 process.on("SIGTERM", () => void shutdown("SIGTERM"));

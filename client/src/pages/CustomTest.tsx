@@ -1100,7 +1100,7 @@ export function CustomTest() {
             modelId ? "" : "pointer-events-none opacity-50"
           }`}
         >
-        <div className="grid grid-cols-[repeat(auto-fit,minmax(220px,1fr))] gap-5 rounded-xl border border-border bg-surface p-5">
+        <div className="grid grid-cols-[repeat(auto-fit,minmax(220px,1fr))] gap-5 border-t border-border pt-5">
           <ChipInput
             label="Prompt length (-p)"
             hint="Prompt tokens processed before generating (the pp test). 0 disables the pp phase."
@@ -1230,7 +1230,7 @@ export function CustomTest() {
           </div>
         )}
 
-        <div className="grid grid-cols-[repeat(auto-fit,minmax(220px,1fr))] gap-5 rounded-xl border border-border bg-surface p-5">
+        <div className="grid grid-cols-[repeat(auto-fit,minmax(220px,1fr))] gap-5 border-t border-border pt-5">
           <ToggleChipGroup
             label="K cache type (-ctk)"
             hint="Quantization of the K cache. Lower precision saves memory at some quality cost."
@@ -1283,7 +1283,7 @@ export function CustomTest() {
           triggering it against an unsupported model or mismatched pairing will fail the run.
         </div>
 
-        <div className="rounded-xl border border-border bg-surface p-5">
+        <div className="border-t border-border pt-5">
           <div className="flex items-baseline justify-between">
             <label className="text-sm font-medium text-fg">Repeats (-r)</label>
             <span className="text-xs text-muted">Runs averaged per combination — higher smooths out noise, takes longer.</span>
@@ -1292,7 +1292,7 @@ export function CustomTest() {
             <button
               type="button"
               onClick={() => setField("repeats", Math.max(1, sweep.repeats - 1))}
-              className="h-8 w-8 rounded-lg border border-border text-fg hover:border-accent/40"
+              className="h-8 w-8 rounded-lg border border-border-strong text-fg hover:border-accent/40"
             >
               −
             </button>
@@ -1308,7 +1308,7 @@ export function CustomTest() {
             <button
               type="button"
               onClick={() => setField("repeats", sweep.repeats + 1)}
-              className="h-8 w-8 rounded-lg border border-border text-fg hover:border-accent/40"
+              className="h-8 w-8 rounded-lg border border-border-strong text-fg hover:border-accent/40"
             >
               +
             </button>
@@ -1323,7 +1323,7 @@ export function CustomTest() {
         </div>
 
         <details
-          className="group rounded-xl border border-border bg-surface"
+          className="group border-t border-border"
           onToggle={(e) => {
             if ((e.target as HTMLDetailsElement).open) openAdvanced();
           }}
@@ -1333,7 +1333,7 @@ export function CustomTest() {
             onClick={(e) => {
               if (!modelId) e.preventDefault();
             }}
-            className="flex cursor-pointer items-center justify-between px-5 py-3 text-sm font-semibold uppercase tracking-wide text-muted"
+            className="flex cursor-pointer items-center justify-between px-5 py-3 text-sm font-semibold text-muted"
           >
             Advanced: raw JSON
             <IconChevronDown width={16} height={16} className="transition-transform group-open:rotate-180" />
@@ -1344,13 +1344,13 @@ export function CustomTest() {
               onChange={(e) => setJsonText(e.target.value)}
               rows={14}
               spellCheck={false}
-              className="w-full rounded-lg border border-border bg-surface-raised p-3 font-mono text-xs text-fg outline-none focus:border-accent"
+              className="w-full rounded-lg border border-border-strong bg-surface-raised p-3 font-mono text-xs text-fg outline-none focus:border-accent"
             />
             <div className="flex items-center gap-3">
               <button
                 type="button"
                 onClick={applyJson}
-                className="self-start rounded-lg border border-border px-3 py-1.5 text-sm font-semibold text-fg hover:border-accent/40 hover:text-accent"
+                className="self-start rounded-lg border border-border-strong px-3 py-1.5 text-sm font-semibold text-fg hover:border-accent/40 hover:text-accent"
               >
                 Apply JSON to form
               </button>
@@ -1362,13 +1362,13 @@ export function CustomTest() {
 
         {/* The workflows v8 adds on top of an ordinary sweep. Each states what
             it does to the grid rather than silently rewriting it. */}
-        <div className="rounded-xl border border-border bg-surface p-5">
+        <div className="border-t border-border pt-5">
           <span className="text-sm font-medium text-fg">Workflows</span>
           <div className="mt-3 flex flex-wrap gap-2">
             <button
               type="button"
               onClick={applyCpuTemplate}
-              className="rounded-lg border border-border px-3 py-1.5 text-xs font-semibold text-fg hover:border-accent/40 hover:text-accent"
+              className="rounded-lg border border-border-strong px-3 py-1.5 text-xs font-semibold text-fg hover:border-accent/40 hover:text-accent"
             >
               CPU-focused template
             </button>
@@ -1381,7 +1381,7 @@ export function CustomTest() {
                   ? "State a target context in Q2 first — that is what the sizes anchor to"
                   : "Pre-selects prompt sizes around your stated target"
               }
-              className="rounded-lg border border-border px-3 py-1.5 text-xs font-semibold text-fg hover:border-accent/40 hover:text-accent"
+              className="rounded-lg border border-border-strong px-3 py-1.5 text-xs font-semibold text-fg hover:border-accent/40 hover:text-accent"
             >
               Sizes around my target
             </button>
@@ -1389,7 +1389,7 @@ export function CustomTest() {
               type="button"
               onClick={applyWorkloadSizes}
               title={`Sets -p/-n to match the "${goals.workload}" workload shape's own premise, instead of leaving the sweep at whatever it was before you picked a workload`}
-              className="rounded-lg border border-border px-3 py-1.5 text-xs font-semibold text-fg hover:border-accent/40 hover:text-accent"
+              className="rounded-lg border border-border-strong px-3 py-1.5 text-xs font-semibold text-fg hover:border-accent/40 hover:text-accent"
             >
               Sizes for my workload
             </button>
@@ -1397,7 +1397,7 @@ export function CustomTest() {
               type="button"
               onClick={() => void startKneeLadder()}
               disabled={!modelId || !workerId}
-              className="rounded-lg border border-border px-3 py-1.5 text-xs font-semibold text-fg hover:border-accent/40 hover:text-accent disabled:opacity-50"
+              className="rounded-lg border border-border-strong px-3 py-1.5 text-xs font-semibold text-fg hover:border-accent/40 hover:text-accent disabled:opacity-50"
             >
               Start concurrency ladder
             </button>
@@ -1408,7 +1408,7 @@ export function CustomTest() {
         {/* The grid as it will actually run. The LIVE COUNT is the real
             expansion, so the number here and the number of tests that
             execute never disagree. */}
-        <div className="rounded-xl border border-border bg-surface p-5">
+        <div className="border-t border-border pt-5">
           <div className="flex flex-wrap items-baseline justify-between gap-3">
             <span className="text-sm font-medium text-fg">Grid as it will run</span>
             <span className="font-mono text-xs text-muted">

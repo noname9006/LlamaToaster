@@ -4,9 +4,10 @@ import { api } from "../api/client";
 import type { Test, Worker } from "../types";
 import { jobPercent } from "../jobProgress";
 
-// The v2 design's sticky system-status strip (docs/plans/app-v2.dc.html):
-// which machine is busy with what, how far along, what is queued and how many
-// machines are online. Purely a read of data the app already polls.
+// System status: which machine is busy with what, how far along, what is
+// queued and how many machines are online. In the sidebar footer on wide
+// layouts, one line under the top bar on narrow ones. Purely a read of data
+// the app already polls.
 
 function modelLabel(t: Test): string {
   return (t.model_filename ?? t.model_id).replace(/\.gguf$/i, "").split(/[\\/]/).pop() ?? t.model_id;
@@ -19,7 +20,9 @@ const KIND_LABEL: Record<string, string> = {
   quality: "quality",
 };
 
-export function StatusBar({ workers, sticky }: { workers: Worker[]; sticky: boolean }) {
+/** `sidebar`: a quiet block in the sidebar footer (wide layouts). `strip`:
+ * one line under the narrow layout's top bar. */
+export function StatusBar({ workers, variant }: { workers: Worker[]; variant: "sidebar" | "strip" }) {
   const [tests, setTests] = useState<Test[]>([]);
   useEffect(() => {
     let cancelled = false;
@@ -52,10 +55,15 @@ export function StatusBar({ workers, sticky }: { workers: Worker[]; sticky: bool
       ? Math.round((((running.items_done ?? 0) + (running.items_failed ?? 0)) / running.items_total) * 100)
       : 0;
 
+  const side = variant === "sidebar";
   return (
     <section
       aria-label="System status"
-      className={`${sticky ? "sticky" : "static"} top-0 z-[5] flex flex-wrap items-center gap-x-6 gap-y-2 border-b border-border bg-surface px-[clamp(16px,4vw,32px)] py-2.5 font-mono text-xs text-fg-2`}
+      className={
+        side
+          ? "flex flex-col gap-1.5 px-[18px] text-[13px] text-fg-2"
+          : "flex flex-wrap items-center gap-x-5 gap-y-1 border-b border-border px-4 py-2 text-[13px] text-fg-2"
+      }
     >
       <span className="inline-flex items-center gap-2">
         <span
@@ -65,7 +73,7 @@ export function StatusBar({ workers, sticky }: { workers: Worker[]; sticky: bool
           }`}
         />
         <strong className="font-medium text-fg">{head ? head.displayName : workers.length ? "No machines online" : "No machines yet"}</strong>
-        <span>{head ? (busy ? "testing" : "online") : workers.length ? "waiting for a check-in" : "add one on the Machines page"}</span>
+        {!side && <span>{head ? (busy ? "testing" : "online") : workers.length ? "waiting for a check-in" : "add one on the Machines page"}</span>}
       </span>
       {running && (
         <span aria-live="polite" className="inline-flex flex-wrap items-center gap-2.5">
@@ -80,14 +88,14 @@ export function StatusBar({ workers, sticky }: { workers: Worker[]; sticky: bool
             aria-valuemin={0}
             aria-valuemax={100}
             aria-valuenow={pct}
-            className="block h-2 w-24 border border-border-strong bg-well"
+            className={`block h-1.5 bg-surface-raised ${side ? "w-full" : "w-24"}`}
           >
             <span className="block h-full bg-accent" style={{ width: `${pct}%` }} />
           </span>
-          {busy?.activeJobProgress?.detail && <span className="max-w-[28ch] truncate">{busy.activeJobProgress.detail}</span>}
+          {busy?.activeJobProgress?.detail && <span className="max-w-[28ch] truncate text-muted">{busy.activeJobProgress.detail}</span>}
         </span>
       )}
-      <span className="ml-auto inline-flex gap-4">
+      <span className={side ? "inline-flex gap-3 text-muted" : "ml-auto inline-flex gap-4 text-muted"}>
         <span>{queued.length ? `Queue ${queued.length}` : "Queue empty"}</span>
         <span>
           {online.length} of {workers.length} online

@@ -85,6 +85,53 @@ function llamaUsage() {
   return { ramMib, nvMib };
 }
 
+// The apps holding the most memory, summed per app name: resident RAM from ps
+// (above 256 MiB, top 8) and, on NVIDIA, VRAM from nvidia-smi's compute apps.
+function topApps() {
+  const rows = run("ps", ["-axo", "pid=,rss=,comm="]).split("\n").map((l) => l.trim().match(/^(\d+)\s+(\d+)\s+(.*)$/)).filter(Boolean);
+  const nameOf = new Map();
+  const ram = new Map();
+  for (const m of rows) {
+    const name = basename(m[3]);
+    nameOf.set(m[1], name);
+    ram.set(name, (ram.get(name) ?? 0) + Number(m[2]) * 1024);
+  }
+  const vram = new Map();
+  for (const l of run("nvidia-smi", ["--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits"]).split("\n")) {
+    const [pid, mem] = l.split(",").map((s) => s.trim());
+    if (!pid || !Number(mem)) continue;
+    const name = nameOf.get(pid) ?? `pid ${pid}`;
+    vram.set(name, (vram.get(name) ?? 0) + Number(mem) * MIB);
+  }
+  const top = (m, minBytes) => [...m].filter(([, v]) => v >= minBytes).sort((a, b) => b[1] - a[1]).slice(0, 8).map(([name, v]) => ({ name, mib: Math.round(v / MIB) }));
+  return { ram: top(ram, 256 * MIB), nvidia: top(vram, 128 * MIB) };
+}
+
+// Installed RAM: type and speed. macOS: system_profiler. Linux: dmidecode,
+// which needs root on most systems (then this is null).
+function readRam() {
+  if (process.platform === "darwin") {
+    try {
+      const j = JSON.parse(run("system_profiler", ["SPMemoryDataType", "-json"]) || "{}");
+      const top = j.SPMemoryDataType?.[0] ?? {};
+      const items = top._items ?? [];
+      const type = top.dimm_type ?? items[0]?.dimm_type ?? null;
+      const speeds = items.map((i) => parseInt(i.dimm_speed, 10)).filter((n) => n > 0);
+      return type || speeds.length ? { type, mts: speeds.length ? Math.min(...speeds) : null, ratedMts: null, modules: items.length || 1 } : null;
+    } catch { return null; }
+  }
+  const out = run("dmidecode", ["-t", "17"]);
+  const mods = out.split(/\n(?=Memory Device)/).filter((b) => /Size:\s*\d/.test(b));
+  if (!mods.length) return null;
+  const pick = (b, re) => re.exec(b)?.[1] ?? null;
+  const type = mods.map((b) => pick(b, /\n\s*Type:\s*(\S+)/)).find((t) => t && t !== "Unknown") ?? null;
+  const run_ = mods.map((b) => parseInt(pick(b, /Configured (?:Memory|Clock) Speed:\s*(\d+)/) ?? pick(b, /\n\s*Speed:\s*(\d+)/) ?? "", 10)).filter((n) => n > 0);
+  const rated = mods.map((b) => parseInt(pick(b, /\n\s*Speed:\s*(\d+)/) ?? "", 10)).filter((n) => n > 0);
+  const mts = run_.length ? Math.min(...run_) : null;
+  const r = rated.length ? Math.min(...rated) : null;
+  return { type, mts, ratedMts: r && mts && r > mts ? r : null, modules: mods.length };
+}
+
 const readGpus = () => (process.platform === "darwin" ? ["macos", mac()] : ["linux", [...linuxDrm(), ...nvidia()]]);
 
 function send(obj) {
@@ -96,17 +143,27 @@ function send(obj) {
 
 if (process.argv.includes("--print")) {
   console.log(JSON.stringify(readGpus()[1], null, 2));
+  console.log(JSON.stringify(readRam()));
 } else {
   let acc = Buffer.alloc(0);
   process.stdin.on("data", (d) => {
     acc = Buffer.concat([acc, d]);
     while (acc.length >= 4 && acc.length >= 4 + acc.readUInt32LE(0)) {
-      acc = acc.subarray(4 + acc.readUInt32LE(0));
+      const len = acc.readUInt32LE(0);
+      let req = {};
+      try { req = JSON.parse(acc.subarray(4, 4 + len).toString("utf8")); } catch {}
+      acc = acc.subarray(4 + len);
       try {
         const [os, gpus] = readGpus();
         const llama = llamaUsage();
-        for (const g of gpus) { g.llamaDedicatedMib = g.vendor === "NVIDIA" ? llama.nvMib : 0; g.llamaSharedMib = 0; }
-        send({ ok: true, helper: 1, os, gpus, llamaRamMib: llama.ramMib });
+        const apps = req.apps ? topApps() : null;
+        for (const g of gpus) {
+          g.llamaDedicatedMib = g.vendor === "NVIDIA" ? llama.nvMib : 0;
+          g.llamaSharedMib = 0;
+          // nvidia-smi names processes; AMD/Intel DRM sysfs does not.
+          if (apps) g.apps = g.vendor === "NVIDIA" && gpus.filter((x) => x.vendor === "NVIDIA").length === 1 ? apps.nvidia : null;
+        }
+        send({ ok: true, helper: 1, os, gpus, ram: req.ram ? readRam() : null, llamaRamMib: llama.ramMib, topRam: apps ? apps.ram : null });
       } catch (e) {
         send({ ok: false, helper: 1, error: String(e?.message ?? e) });
       }

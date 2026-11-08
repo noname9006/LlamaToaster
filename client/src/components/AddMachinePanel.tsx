@@ -72,7 +72,7 @@ export function AddMachinePanel({
           "toaster" command that setup registers on the machine. */}
       <div className="mt-2 flex flex-col gap-3">
         {setupScenarios.map((scenario, i) => (
-          <div key={scenario.title} className="overflow-hidden rounded-lg border border-border">
+          <div key={scenario.title} className="overflow-hidden">
             <div className="bg-surface-raised px-3 py-2">
               <div className="flex items-center gap-2">
                 <span className="flex h-5 w-5 flex-none items-center justify-center rounded-md bg-accent/15 font-mono text-[11px] font-bold text-accent">
@@ -93,7 +93,7 @@ export function AddMachinePanel({
                   href={scenario.sourceUrl[os]}
                   target="_blank"
                   rel="noreferrer noopener"
-                  className="flex-none self-start rounded-md border border-border px-2 py-1 text-[11px] font-medium text-muted hover:border-accent/40 hover:text-accent"
+                  className="flex-none self-start rounded-md border border-border-strong px-2 py-1 text-[11px] font-medium text-muted hover:border-accent/40 hover:text-accent"
                 >
                   View source
                 </a>
@@ -135,7 +135,7 @@ export function AddMachinePanel({
                   onChange={(e) => handleCodeChange(e.target.value)}
                   placeholder="ABCD-EFGH"
                   maxLength={9}
-                  className="mt-1.5 w-40 rounded-lg border border-border bg-surface px-3 py-2 text-center font-mono text-sm uppercase tracking-widest text-fg outline-none focus:border-accent/50"
+                  className="mt-1.5 w-40 rounded-lg border border-border-strong bg-surface px-3 py-2 text-center font-mono text-sm text-fg outline-none focus:border-accent/50"
                 />
               </div>
             </>
@@ -155,7 +155,7 @@ export function AddMachinePanel({
           )}
 
           {status?.state === "pending" && (
-            <div className="mt-4 rounded-lg border border-border bg-surface-raised p-4">
+            <div className="mt-4 bg-surface p-4">
               <div className="flex items-center gap-2.5">
                 <IconServer width={20} height={20} className="text-muted" />
                 <span className="text-base font-semibold text-fg">
@@ -224,7 +224,7 @@ export function AddMachinePanel({
                     type="button"
                     onClick={() => void handleApprove()}
                     disabled={busy}
-                    className="rounded-lg border border-border px-4 py-1.5 text-sm font-semibold text-fg hover:border-accent/40 hover:text-accent disabled:opacity-50"
+                    className="rounded-lg border border-border-strong px-4 py-1.5 text-sm font-semibold text-fg hover:border-accent/40 hover:text-accent disabled:opacity-50"
                   >
                     Add as new machine
                   </button>
@@ -233,7 +233,7 @@ export function AddMachinePanel({
                   type="button"
                   onClick={handleDeny}
                   disabled={busy}
-                  className="rounded-lg border border-border px-4 py-1.5 text-sm font-semibold text-fg hover:border-danger/40 hover:text-danger disabled:opacity-50"
+                  className="rounded-lg border border-border-strong px-4 py-1.5 text-sm font-semibold text-fg hover:border-danger/40 hover:text-danger disabled:opacity-50"
                 >
                   Deny
                 </button>

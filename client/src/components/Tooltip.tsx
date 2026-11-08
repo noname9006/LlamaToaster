@@ -40,7 +40,7 @@ export function Tooltip({ text, children }: { text: string; children: ReactNode 
         createPortal(
           <div
             role="tooltip"
-            className="pointer-events-none fixed z-50 rounded-md border border-border bg-surface-raised px-2.5 py-1.5 text-xs font-normal normal-case leading-snug text-fg shadow-lg"
+            className="pointer-events-none fixed z-50 rounded-md border border-border-strong bg-surface-raised px-2.5 py-1.5 text-xs font-normal normal-case leading-snug text-fg shadow-lg"
             style={{ top: pos.top, left: pos.left, maxWidth: TOOLTIP_MAX_WIDTH }}
           >
             {text}

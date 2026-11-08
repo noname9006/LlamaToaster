@@ -344,10 +344,17 @@ export interface GgufInfo {
   // files under one repo id) can't report one file's count for another's.
   // null on any parse failure -- fail-soft, same as every other field here.
   param_count: number | null;
-  // GGUF's <architecture>.context_length -- the sequence length the model was
-  // trained on ("trained context"). Anchors M2's target-context clamp,
+  // GGUF's <architecture>.context_length -- the longest context the model
+  // accepts ("maximum context"). NOT the training length: RoPE-scaled models
+  // (YaRN, Llama 4 Scout's 10M via iRoPE) advertise far more than they were
+  // trained on. The field keeps its historical trained_ctx name (DB column,
+  // worker protocol). Anchors M2's target-context clamp,
   // N1's sizing-ladder ceiling, and the Benchmark page's model card.
   trained_ctx: number | null;
+  // <architecture>.expert_count / expert_used_count: routed experts in an
+  // MoE model and how many each token uses. null for dense models.
+  expert_count: number | null;
+  expert_used_count: number | null;
   // KV-cache geometry consumed by shared/vramEstimate.ts's
   // maxAffordableContext (M1) / kvBytesPerToken -- <architecture>.embedding_length
   // and <architecture>.attention.* hyperparameters. n_embd/n_head are the
@@ -431,6 +438,8 @@ function emptyGgufInfo(debugReason: string): GgufInfo {
     quant: null,
     param_count: null,
     trained_ctx: null,
+    expert_count: null,
+    expert_used_count: null,
     n_head_kv: null,
     head_dim_k: null,
     head_dim_v: null,
@@ -474,11 +483,12 @@ export async function parseGgufInfo(source: GgufByteSource, chunkBytes = READ_CH
     let alignment = 32;
     const blockCounts = new Map<string, number>();
     const mtpLayerCounts = new Map<string, number>();
-    // KV-cache geometry + trained context -- captured exactly like the maps
+    // KV-cache geometry + maximum context -- captured exactly like the maps
     // above (architecture-prefixed keys resolved after the walk), so a
     // hyperparameter that happens to appear before the architecture key is
     // still picked up. Suffix style matches block_count's handling.
     const contextLengths = new Map<string, number>();
+    const expertCounts = new Map<string, number>();
     const headCountKv = new Map<string, number>();
     const keyLengths = new Map<string, number>();
     const valueLengths = new Map<string, number>();
@@ -537,6 +547,8 @@ export async function parseGgufInfo(source: GgufByteSource, chunkBytes = READ_CH
         mtpLayerCounts.set(key, await reader.numeric(valueType));
       } else if (key.endsWith(".context_length") && valueType !== GGUF_TYPE.ARRAY && valueType !== GGUF_TYPE.STRING) {
         contextLengths.set(key, await reader.numeric(valueType));
+      } else if ((key.endsWith(".expert_count") || key.endsWith(".expert_used_count")) && valueType !== GGUF_TYPE.ARRAY && valueType !== GGUF_TYPE.STRING) {
+        expertCounts.set(key, await reader.numeric(valueType));
       } else if (key.endsWith(".attention.head_count_kv") && valueType !== GGUF_TYPE.STRING) {
         // ARRAY-typed for some architectures (real Gemma-4 files: one
         // n_head_kv per layer, not a single model-wide value) -- see
@@ -731,6 +743,8 @@ export async function parseGgufInfo(source: GgufByteSource, chunkBytes = READ_CH
       quant: fileType != null ? quantLabelFromFileType(fileType) : null,
       param_count,
       trained_ctx: contextLengths.get(`${architecture}.context_length`) ?? null,
+      expert_count: (expertCounts.get(`${architecture}.expert_count`) ?? 0) > 0 ? expertCounts.get(`${architecture}.expert_count`)! : null,
+      expert_used_count: (expertCounts.get(`${architecture}.expert_count`) ?? 0) > 0 ? expertCounts.get(`${architecture}.expert_used_count`) ?? null : null,
       // attention.head_count_kv is OPTIONAL in the GGUF spec: a model that
       // doesn't use grouped-query attention (plain multi-head) often has no
       // such key at all, and llama.cpp's own hparam loader defaults it to

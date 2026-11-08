@@ -6,6 +6,7 @@ import { getDb } from "./migrate.js";
 import type { FitPoint } from "../../../shared/fitParams.js";
 import type { KvSupportRow, KvSupportStatus } from "../../../shared/kvSupport.js";
 import { fitLevel, type FitMemory } from "../../../shared/fitLevel.js";
+import type { FitCeiling } from "../../../shared/fitGrade.js";
 import type { FitCheckResult, FitCheckSource, ModelFitReport, ModelFitResult } from "../../../shared/types.js";
 
 /** Answers one machine keeps; the oldest go first. A worker can only write its
@@ -212,12 +213,12 @@ export const fitRepo = {
     const db = getDb();
     const stmt = db.prepare(
       `INSERT INTO model_fit_checks
-         (worker_id, target_key, ctx, margin_mib, llama_cpp_build, backend, source, memory_json, point_json, error, fetched_bytes, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         (worker_id, target_key, ctx, margin_mib, llama_cpp_build, backend, source, memory_json, point_json, error, fetched_bytes, ceiling_json, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT (worker_id, target_key, ctx, margin_mib) DO UPDATE SET
          llama_cpp_build = excluded.llama_cpp_build, backend = excluded.backend, source = excluded.source,
          memory_json = excluded.memory_json, point_json = excluded.point_json, error = excluded.error,
-         fetched_bytes = excluded.fetched_bytes, created_at = excluded.created_at`
+         fetched_bytes = excluded.fetched_bytes, ceiling_json = excluded.ceiling_json, created_at = excluded.created_at`
     );
     db.transaction(() => {
       for (const r of results) {
@@ -233,6 +234,7 @@ export const fitRepo = {
           r.point ? JSON.stringify(r.point) : null,
           r.error,
           r.fetched_bytes ?? null,
+          r.ceiling ? JSON.stringify(r.ceiling) : null,
           now
         );
       }
@@ -258,10 +260,12 @@ export const fitRepo = {
       point_json: string | null;
       error: string | null;
       fetched_bytes: number | null;
+      ceiling_json: string | null;
       created_at: number;
     }[];
     return rows.map((r) => {
       const memory = JSON.parse(r.memory_json) as FitMemory;
+      const ceiling = r.ceiling_json ? (JSON.parse(r.ceiling_json) as FitCeiling) : null;
       const point = r.point_json ? (JSON.parse(r.point_json) as FitPoint) : null;
       return {
         target_key: r.target_key,
@@ -274,6 +278,7 @@ export const fitRepo = {
         point,
         error: r.error,
         ...(r.fetched_bytes != null ? { fetched_bytes: r.fetched_bytes } : {}),
+        ...(ceiling ? { ceiling } : {}),
         level: point ? fitLevel(point, memory) : null,
         created_at: r.created_at,
       };

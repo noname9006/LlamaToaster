@@ -44,7 +44,42 @@ public static class LtDxgi {
 }
 '@
 
-function Read-Gpus {
+# Friendly app name for a process: the exe's FileDescription ("Google
+# Chrome"), else the process name. Cached: it never changes for a name.
+$script:AppNames = @{}
+function App-Name($pr) {
+  $n = $pr.ProcessName
+  if (-not $script:AppNames.ContainsKey($n)) {
+    $d = $null
+    try { $d = $pr.MainModule.FileVersionInfo.FileDescription } catch {}
+    $script:AppNames[$n] = $(if ($d -and $d.Trim()) { $d.Trim() } else { $n })
+  }
+  return $script:AppNames[$n]
+}
+
+# The apps holding the most RAM: private working set (what Task Manager's
+# Memory column shows), summed over each app's processes. Above 256 MiB, top 8.
+function Read-TopRam {
+  $byPid = @{}
+  foreach ($pr in Get-Process -ErrorAction SilentlyContinue) { $byPid[[int]$pr.Id] = $pr }
+  $sum = @{}
+  try {
+    foreach ($c in Get-CimInstance Win32_PerfFormattedData_PerfProc_Process -Property IDProcess, WorkingSetPrivate) {
+      if ([int]$c.IDProcess -eq 0) { continue }
+      $pr = $byPid[[int]$c.IDProcess]
+      if (-not $pr) { continue }
+      $n = App-Name $pr
+      $sum[$n] = [double]$sum[$n] + [double]$c.WorkingSetPrivate
+    }
+  } catch {
+    # Perf counters disabled: the working set (includes shared pages).
+    foreach ($pr in $byPid.Values) { $n = App-Name $pr; $sum[$n] = [double]$sum[$n] + [double]$pr.WorkingSet64 }
+  }
+  return @($sum.GetEnumerator() | Where-Object { $_.Value -ge 256MB } | Sort-Object Value -Descending | Select-Object -First 8 |
+    ForEach-Object { [ordered]@{ name = $_.Key; mib = [math]::Round($_.Value / 1MB) } })
+}
+
+function Read-Gpus([bool]$wantApps = $false) {
   # Counter class has English property names on every Windows language.
   $usage = @{}
   try {
@@ -59,13 +94,24 @@ function Read-Gpus {
   foreach ($pr in Get-Process -ErrorAction SilentlyContinue) { if ($pr.ProcessName -like 'llama-*') { $llamaPids[[string]$pr.Id] = $true } }
   $script:LlamaRamMib = [math]::Round((($llamaPids.Keys | ForEach-Object { try { (Get-Process -Id $_ -ErrorAction Stop).WorkingSet64 } catch { 0 } } | Measure-Object -Sum).Sum) / 1MB)
   $llamaGpu = @{}
-  if ($llamaPids.Count -gt 0) {
+  # Per adapter: dedicated VRAM per app (only when the popup asks for apps).
+  $appGpu = @{}
+  if ($llamaPids.Count -gt 0 -or $wantApps) {
+    $procs = @{}
+    if ($wantApps) { foreach ($pr in Get-Process -ErrorAction SilentlyContinue) { $procs[[string]$pr.Id] = $pr } }
     try {
       foreach ($c in Get-CimInstance Win32_PerfFormattedData_GPUPerformanceCounters_GPUProcessMemory) {
-        if ($c.Name -match '^pid_(\d+)_luid_0x([0-9a-fA-F]+)_0x([0-9a-fA-F]+)' -and $llamaPids[$Matches[1]]) {
-          $k = ("{0}_{1}" -f $Matches[2], $Matches[3]).ToLower()
+        if ($c.Name -notmatch '^pid_(\d+)_luid_0x([0-9a-fA-F]+)_0x([0-9a-fA-F]+)') { continue }
+        $procId = $Matches[1]
+        $k = ("{0}_{1}" -f $Matches[2], $Matches[3]).ToLower()
+        if ($llamaPids[$procId]) {
           if (-not $llamaGpu[$k]) { $llamaGpu[$k] = @{ d = 0.0; s = 0.0 } }
           $llamaGpu[$k].d += [double]$c.DedicatedUsage; $llamaGpu[$k].s += [double]$c.SharedUsage
+        }
+        if ($wantApps -and $procs[$procId] -and [double]$c.DedicatedUsage -gt 0) {
+          if (-not $appGpu[$k]) { $appGpu[$k] = @{} }
+          $n = App-Name $procs[$procId]
+          $appGpu[$k][$n] = [double]$appGpu[$k][$n] + [double]$c.DedicatedUsage
         }
       }
     } catch {}
@@ -91,9 +137,26 @@ function Read-Gpus {
       sharedUsedMib = $(if ($u) { [math]::Round([double]$u.SharedUsage / 1MB) } else { $null })
       llamaDedicatedMib = $(if ($llamaGpu[$key]) { [math]::Round($llamaGpu[$key].d / 1MB) } else { 0 })
       llamaSharedMib = $(if ($llamaGpu[$key]) { [math]::Round($llamaGpu[$key].s / 1MB) } else { 0 })
+      apps = $(if ($wantApps -and $appGpu[$key]) {
+        @($appGpu[$key].GetEnumerator() | Where-Object { $_.Value -ge 128MB } | Sort-Object Value -Descending | Select-Object -First 8 |
+          ForEach-Object { [ordered]@{ name = $_.Key; mib = [math]::Round($_.Value / 1MB) } })
+      } else { $null })
     }
   }
   return $out
+}
+
+# Installed RAM from SMBIOS: type (SMBIOSMemoryType) and the speed it runs at.
+function Read-Ram {
+  $types = @{ 20 = 'DDR'; 21 = 'DDR2'; 24 = 'DDR3'; 26 = 'DDR4'; 27 = 'LPDDR'; 28 = 'LPDDR2'; 29 = 'LPDDR3'; 30 = 'LPDDR4'; 34 = 'DDR5'; 35 = 'LPDDR5' }
+  $mods = @(Get-CimInstance Win32_PhysicalMemory -ErrorAction Stop)
+  if ($mods.Count -eq 0) { return $null }
+  $type = ($mods | ForEach-Object { $types[[int]$_.SMBIOSMemoryType] } | Where-Object { $_ } | Group-Object | Sort-Object Count -Descending | Select-Object -First 1).Name
+  $run = @($mods | ForEach-Object { if ($_.ConfiguredClockSpeed) { [int]$_.ConfiguredClockSpeed } elseif ($_.Speed) { [int]$_.Speed } } | Where-Object { $_ -gt 0 })
+  $rated = @($mods | ForEach-Object { [int]$_.Speed } | Where-Object { $_ -gt 0 })
+  $mts = $(if ($run.Count) { ($run | Measure-Object -Minimum).Minimum } else { $null })
+  $ratedMin = $(if ($rated.Count) { ($rated | Measure-Object -Minimum).Minimum } else { $null })
+  return [ordered]@{ type = $type; mts = $mts; ratedMts = $(if ($ratedMin -and $mts -and $ratedMin -gt $mts) { $ratedMin } else { $null }); modules = $mods.Count }
 }
 
 $stdin = [Console]::OpenStandardInput()
@@ -102,11 +165,20 @@ function Send($obj) {
   $b = [Text.Encoding]::UTF8.GetBytes(($obj | ConvertTo-Json -Depth 5 -Compress))
   $stdout.Write([BitConverter]::GetBytes([int]$b.Length), 0, 4); $stdout.Write($b, 0, $b.Length); $stdout.Flush()
 }
-if ($args -contains '--print') { ConvertTo-Json -InputObject @(Read-Gpus) -Depth 5; "llamaRamMib=$($script:LlamaRamMib)"; exit 0 }
+if ($args -contains '--print') { ConvertTo-Json -InputObject @(Read-Gpus $true) -Depth 5; "llamaRamMib=$($script:LlamaRamMib)"; ConvertTo-Json -InputObject (Read-Ram) -Compress; ConvertTo-Json -InputObject @(Read-TopRam) -Compress; exit 0 }
 $len = New-Object byte[] 4
 while ($stdin.Read($len, 0, 4) -eq 4) {
   $n = [BitConverter]::ToInt32($len, 0); $buf = New-Object byte[] $n; $got = 0
   while ($got -lt $n) { $r = $stdin.Read($buf, $got, $n - $got); if ($r -le 0) { exit 0 }; $got += $r }
-  try { $g = @(Read-Gpus); Send @{ ok = $true; helper = 1; os = 'windows'; gpus = $g; llamaRamMib = $script:LlamaRamMib } }
+  $wantRam = $false; $wantApps = $false
+  try { $req = [Text.Encoding]::UTF8.GetString($buf) | ConvertFrom-Json; $wantRam = [bool]$req.ram; $wantApps = [bool]$req.apps } catch {}
+  try {
+    $g = @(Read-Gpus $wantApps)
+    $ram = $null
+    if ($wantRam) { try { $ram = Read-Ram } catch {} }
+    $topRam = $null
+    if ($wantApps) { try { $topRam = @(Read-TopRam) } catch {} }
+    Send @{ ok = $true; helper = 1; os = 'windows'; gpus = $g; ram = $ram; llamaRamMib = $script:LlamaRamMib; topRam = $topRam }
+  }
   catch { Send @{ ok = $false; helper = 1; error = $_.Exception.Message } }
 }

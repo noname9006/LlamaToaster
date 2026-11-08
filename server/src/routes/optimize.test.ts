@@ -294,6 +294,30 @@ describe("speed runs and thread sweeps", () => {
     repo.reconcileStaleTest(undefined, run.id, "done");
   });
 
+  it("batch sizes reach the items, and an older worker is refused rather than mislabelled", async () => {
+    const old = await heartbeat("opt-batch-old");
+    const batched = { ...speedRun, candidates: [{ ...candidate, b: 2048, ub: 1024 }] };
+    const refused = await post("/api/tests/trigger", { model_id: "opt-model", worker_id: old.id, sweep, kind: "runtime", speed_run: batched });
+    expect(refused.status).toBe(409);
+    expect((await json(refused)).error).toMatch(/batch sizes/);
+
+    const w = await heartbeat("opt-batch", [...ALL_CAPS, "speed-batch-v1"]);
+    const bad = await post("/api/tests/trigger", {
+      model_id: "opt-model", worker_id: w.id, sweep, kind: "runtime",
+      speed_run: { ...speedRun, candidates: [{ ...candidate, b: 512, ub: 1024 }] },
+    });
+    expect(bad.status).toBe(400);
+    const res = await post("/api/tests/trigger", {
+      model_id: "opt-model", worker_id: w.id, sweep, kind: "runtime", flow_id: "flow-batch1", flow_step: "batch",
+      speed_run: { ...speedRun, candidates: [candidate, { ...candidate, label: "-b 2048 -ub 1024", b: 2048, ub: 1024 }] },
+    });
+    const body = await json(res);
+    expect(res.status, JSON.stringify(body)).toBe(201);
+    const items = repo.getTestWithResults(undefined, body.run.id)!.items;
+    expect(items.map((i) => [i.batch_size, i.ubatch_size])).toEqual([[2048, 512], [2048, 1024]]);
+    repo.reconcileStaleTest(undefined, body.run.id, "done");
+  });
+
   it("thread sweep items carry role-specific workloads", async () => {
     const w = await heartbeat("opt-f");
     const res = await post("/api/tests/trigger", {
@@ -459,6 +483,21 @@ describe("Will it fit? (docs/plans/MODEL_FIT_CHECK_PLAN.md)", () => {
 
     expect(await json(await post(`/api/workers/${w.id}/model-fit`, { targets: [target("a.gguf")] }))).toMatchObject({ queued: 0 });
     expect(await json(await post(`/api/workers/${w.id}/model-fit`, { targets: [target("a.gguf")], force: true }))).toMatchObject({ queued: 1 });
+  });
+
+  it("keeps the trained-context answer (bread grades) and rejects a malformed one", async () => {
+    const w = await heartbeat("mf-ceiling", CAPS);
+    const ceiling = { trained_ctx: 262144, fits_at_trained: false, max_full_ctx: 99072 };
+    expect((await post("/api/worker/model-fit", { machine_id: "mf-ceiling", results: [report("a.gguf", { ceiling })] }, workerAuth)).status).toBe(200);
+    const list = await json(await fetch(`${baseUrl}/api/workers/${w.id}/model-fit`));
+    expect(list.results[0]).toMatchObject({ target_key: keyOf("a.gguf"), ceiling });
+    // An older worker's answer has none.
+    expect((await post("/api/worker/model-fit", { machine_id: "mf-ceiling", results: [report("b.gguf")] }, workerAuth)).status).toBe(200);
+    const both = await json(await fetch(`${baseUrl}/api/workers/${w.id}/model-fit`));
+    expect(both.results.find((r: { target_key: string }) => r.target_key === keyOf("b.gguf")).ceiling).toBeUndefined();
+    for (const bad of [{ ...ceiling, trained_ctx: -1 }, { ...ceiling, fits_at_trained: "yes" }, { ...ceiling, max_full_ctx: 0.5 }]) {
+      expect((await post("/api/worker/model-fit", { machine_id: "mf-ceiling", results: [report("c.gguf", { ceiling: bad })] }, workerAuth)).status).toBe(400);
+    }
   });
 
   it("a failed check is kept with its error, has no level, and is asked again", async () => {

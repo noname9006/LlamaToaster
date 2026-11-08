@@ -8,9 +8,11 @@
 // is unit-tested there; this file is the process and HTTP plumbing over it.
 
 import { spawn, type ChildProcess } from "node:child_process";
+import { appendFileSync } from "node:fs";
 import type { IngestResultInput, ProbeAttemptReport } from "../../shared/types.js";
 import { CURVE_METHOD_VERSION, FILL_CURVE_METHOD_VERSION, KNEE_METHOD_VERSION, SERVER_METHOD_VERSION } from "../../shared/types.js";
 import { fillBoundaries, fillTarget } from "../../shared/fillCurve.js";
+import { meanAndSampleStddev } from "../../shared/rowStats.js";
 import type { SweepItem } from "../../shared/sweep.js";
 import { isVramDiscrepancy } from "../../shared/vramEstimate.js";
 import {
@@ -130,6 +132,12 @@ export async function spawnRuntimeServer(input: SpawnRuntimeServerInput): Promis
   input.onSpawn?.(proc);
 
   let stderr = "";
+  const dumpPath = process.env.LLAMATOASTER_DUMP_SERVER_OUTPUT;
+  if (dumpPath) {
+    const dump = (chunk: Buffer) => appendFileSync(dumpPath, chunk);
+    proc.stderr?.on("data", dump);
+    proc.stdout?.on("data", dump);
+  }
   proc.stderr?.on("data", (chunk: Buffer) => {
     stderr = appendBoundedOutput(stderr, chunk.toString(), MAX_CAPTURED_PROCESS_OUTPUT_CHARS);
   });
@@ -539,18 +547,24 @@ export async function executeCurvePoint(input: CurvePointExecutionInput): Promis
     // says so through suspect_count -- see serverBench.ts's buildPhaseSummary
     // for the same decision and the incident that drove it.
     const basis = clean.length > 0 ? clean : suspect;
-    const mean = basis.reduce((a, b) => a + b, 0) / basis.length;
-    const variance = basis.length > 1 ? basis.reduce((acc, v) => acc + (v - mean) ** 2, 0) / (basis.length - 1) : 0;
+    const { mean, stddev } = meanAndSampleStddev(basis);
     results.push({
       ...shared,
       test_type: testType,
       n_prompt: input.effectiveCtx,
       avg_tps: mean,
-      stddev_tps: Math.sqrt(variance),
-      sample_count: basis.length,
+      stddev_tps: stddev,
+      // ResultRow's contract (shared/types.ts): every computable reading,
+      // clean + suspect, and repeat_samples in repeat order. This path used
+      // to send the averaged basis and the clean subset instead, so an
+      // all-clean row read the same but a mixed one under-counted its
+      // readings -- and the twin join's "suspect-only" test then misfired.
+      sample_count: usable.length,
       suspect_count: suspect.length,
-      repeat_samples: clean,
+      repeat_samples: usable.map((r) => r.value),
       suspect_samples: suspect,
+      clean_samples: clean,
+      repeats_requested: input.repeats,
       ...extra,
     } as IngestResultInput);
   };
@@ -603,6 +617,8 @@ export interface FillCurveExecutionInput {
   /** Checked before every request; a true return ends the curve early. */
   shouldStop?: () => boolean;
   onProgress?: (progress: { repeat: number; filled: number; fill: number }) => void;
+  /** Awaited between requests (outside every timed window), with the tokens already in the context. */
+  beforeSlice?: (info: { repeat: number; filled: number }) => Promise<void>;
 }
 
 export interface FillCurveExecution {
@@ -648,6 +664,7 @@ export async function executeFillCurve(input: FillCurveExecutionInput): Promise<
         break outer;
       }
       const end = boundaries[s];
+      await input.beforeSlice?.({ repeat: r, filled: prev });
       input.onProgress?.({ repeat: r, filled: end, fill });
       const sample = await completion({
         port: input.port,
@@ -672,6 +689,7 @@ export async function executeFillCurve(input: FillCurveExecutionInput): Promise<
       }
       prev = end;
     }
+    await input.beforeSlice?.({ repeat: r, filled: prev });
   }
 
   const { item } = input;
@@ -685,9 +703,9 @@ export async function executeFillCurve(input: FillCurveExecutionInput): Promise<
     const clean = all.filter((x) => x.held).map((x) => x.rate);
     const suspect = all.filter((x) => !x.held).map((x) => x.rate);
     excluded += suspect.length;
-    const mean = clean.length > 0 ? clean.reduce((a, b) => a + b, 0) / clean.length : 0;
-    const variance =
-      clean.length > 1 ? clean.reduce((acc, v) => acc + (v - mean) ** 2, 0) / (clean.length - 1) : 0;
+    // All-suspect slices report 0, not the flagged rates: a slice whose
+    // cache did not hold measured a different, larger prefill.
+    const { mean, stddev } = meanAndSampleStddev(clean);
     results.push({
       test_type: "pp",
       n_prompt: end - prev,
@@ -704,11 +722,13 @@ export async function executeFillCurve(input: FillCurveExecutionInput): Promise<
       n_gpu_layers_draft: 0,
       n_cpu_moe: item.n_cpu_moe,
       avg_tps: mean,
-      stddev_tps: Math.sqrt(variance),
+      stddev_tps: stddev,
       sample_count: all.length,
       suspect_count: suspect.length,
       suspect_samples: suspect,
       repeat_samples: clean,
+      clean_samples: clean,
+      repeats_requested: repeats,
       method_version: FILL_CURVE_METHOD_VERSION,
       prompt_offset: 0,
       concurrency: 1,

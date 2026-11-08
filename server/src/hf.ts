@@ -38,6 +38,20 @@ export interface HfFileEntry {
 }
 
 export const HF_REPO_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.-]*\/[A-Za-z0-9][A-Za-z0-9_.-]*$/;
+
+const HF_FILE_MAX = 512;
+
+// A GGUF's path inside a repo, as a caller may name one: relative, no walking
+// out, no backslashes. The worker joins this onto its model directory.
+export function isHfFilePath(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length <= HF_FILE_MAX &&
+    /\.gguf$/i.test(value) &&
+    !value.startsWith("/") &&
+    !/\.\.|\\|\0/.test(value)
+  );
+}
 // Group 1 is unsloth's "Dynamic" quant prefix (UD-Q4_K_XL, UD-IQ2_M, ...) --
 // optional; group 2 is the actual quant code. Mirrored in
 // client/src/modelGrouping.ts's own QUANT_PATTERN.
@@ -203,6 +217,13 @@ export async function hfFetch(
   return res;
 }
 
+// A stored repo id goes into a URL path segment by segment, so an old catalog
+// row holding something other than org/name can't reach another HF endpoint
+// with this server's token.
+function encodeRepoId(repoId: string): string {
+  return repoId.split("/").map(encodeURIComponent).join("/");
+}
+
 // Re-export token helpers so callers don't need to import hf-rate-limit directly.
 export { getHfToken, getHfAuthHeaders, isHfTokenConfigured } from "./hf-rate-limit.js";
 
@@ -316,7 +337,7 @@ export async function getHfRepoDefaultRevision(
   timeoutMs: number,
   reason: string
 ): Promise<{ revision: string | null; status: number }> {
-  const url = `https://huggingface.co/api/models/${repoId}`;
+  const url = `https://huggingface.co/api/models/${encodeRepoId(repoId)}`;
   const res = await hfFetch(url, undefined, { bucket: "api", timeoutMs, reason });
   if (!res.ok) return { revision: null, status: res.status };
   const data = (await res.json()) as { sha?: string };
@@ -342,7 +363,7 @@ export interface HfGgufMeta {
 
 export async function getHfGgufMeta(repoId: string, timeoutMs: number, reason: string): Promise<HfGgufMeta> {
   try {
-    const url = `https://huggingface.co/api/models/${repoId}`;
+    const url = `https://huggingface.co/api/models/${encodeRepoId(repoId)}`;
     const res = await hfFetch(url, undefined, { bucket: "api", timeoutMs, reason });
     if (!res.ok) return { param_count: null, last_modified: null };
     const data = (await res.json()) as { gguf?: { total?: number }; lastModified?: string };
@@ -371,7 +392,7 @@ const HF_COMMITS_PAGE_SIZE = 100;
 
 async function fetchRepoCreatedAt(repoId: string, timeoutMs: number, reason: string): Promise<string | null> {
   try {
-    const url = `https://huggingface.co/api/models/${repoId}?expand=createdAt`;
+    const url = `https://huggingface.co/api/models/${encodeRepoId(repoId)}?expand=createdAt`;
     const res = await hfFetch(url, undefined, { bucket: "api", timeoutMs, reason });
     if (!res.ok) return null;
     const data = (await res.json()) as { createdAt?: string };

@@ -1,0 +1,276 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Models page bread marks</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;600;700&family=Barlow+Condensed:wght@600&family=IBM+Plex+Mono:wght@400;600;700&display=swap" rel="stylesheet">
+<style>
+  /* The app's own tokens (client/src/styles/index.css). The app is dark only. */
+  :root {
+    --bg: #13100c; --surface: #1b1611; --raised: #262019; --well: #0b0907;
+    --border: #3d3329; --fg: #f4efe6; --fg2: #d2c8b9; --muted: #ab9f8d; --accent: #f5a623;
+    --sans: "Barlow", system-ui, -apple-system, "Segoe UI", sans-serif;
+    --display: "Barlow Condensed", "Barlow", system-ui, sans-serif;
+    --mono: "IBM Plex Mono", ui-monospace, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.4 var(--sans); }
+  .page { max-width: 1100px; margin: 0 auto; padding: 16px; }
+  h1 { font: 600 24px var(--display); margin: 0 0 4px; letter-spacing: .01em; }
+  h2 { font: 600 16px var(--display); margin: 22px 0 8px; color: var(--fg2); letter-spacing: .02em; text-transform: uppercase; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 12px; }
+  .toolbar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 12px 0; }
+  .seg { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  .seg button { background: var(--surface); color: var(--muted); border: 0; padding: 6px 12px; font: 500 13px var(--sans); cursor: pointer; }
+  .seg button + button { border-left: 1px solid var(--border); }
+  .seg button.on { background: var(--raised); color: var(--accent); }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+  .group { border-top: 1px solid var(--border); }
+  .group:first-child { border-top: 0; }
+  .ghead { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 9px 14px; }
+  .repo { font-weight: 600; }
+  .repo .author { color: var(--muted); font-weight: 400; }
+  .fam { color: var(--muted); font-size: 12px; }
+  .params { font: 700 12px var(--mono); border: 1px solid var(--border); background: var(--raised); border-radius: 4px; padding: 1px 6px; }
+  .mini { display: inline-flex; align-items: center; gap: 4px; border: 1px solid var(--border); background: var(--surface); border-radius: 4px; padding: 2px 6px; font: 600 11px var(--mono); }
+  .chips { display: inline-flex; flex-wrap: wrap; gap: 4px; }
+  .spacer { flex: 1; }
+  .meta { font: 10.5px var(--mono); color: rgba(171,159,141,.7); }
+  .wif { font: 500 12px var(--sans); color: var(--accent); background: transparent; border: 1px solid rgba(245,166,35,.35); border-radius: 6px; padding: 2px 8px; }
+  .chev { color: var(--muted); width: 20px; text-align: center; cursor: pointer; user-select: none; }
+  .tier { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 7px 14px 7px 28px; border-top: 1px dashed var(--border); background: var(--well); }
+  .tier .tl { font: 600 12px var(--mono); color: var(--fg2); width: 44px; }
+  .tier .tc { font-size: 11px; color: var(--muted); width: 60px; }
+  .badgewrap { display: inline-flex; align-items: center; gap: 4px; }
+  .badgewrap + .badgewrap { border-left: 1px solid var(--border); padding-left: 10px; }
+  .badge { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--border); background: var(--surface); border-radius: 6px; padding: 4px 8px; font-size: 12px; }
+  .badge .q { font: 600 12px var(--mono); }
+  .badge .sz, .hfchip .sz { font: 11px var(--mono); color: var(--muted); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: #9fb6cc; }
+  .fitbtn { display: inline-flex; align-items: center; padding: 0 2px; border-radius: 4px; border: 0; background: transparent; cursor: pointer; line-height: 0; }
+  .fitbtn:hover { background: var(--raised); }
+  .hfrow { padding: 10px 14px; border-top: 1px solid var(--border); }
+  .hfrow:first-child { border-top: 0; }
+  .hftier { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 6px; }
+  .hftier .tl { font: 600 11px var(--mono); color: var(--muted); width: 40px; }
+  .hfchip { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--border); background: var(--surface); border-radius: 6px; padding: 4px 8px; font-size: 12px; }
+  .hfchip a { font: 600 12px var(--mono); color: var(--fg); text-decoration: none; }
+  .dl { color: var(--muted); font-size: 12px; }
+  .legend { display: grid; grid-template-columns: auto 1fr; gap: 6px 12px; align-items: center; padding: 12px 14px; }
+  .legend .d { font-size: 13px; color: var(--fg2); }
+  .legend .n { font: 600 11px var(--mono); color: var(--muted); margin-right: 6px; }
+  .legend .m { display: flex; align-items: center; justify-content: flex-end; gap: 6px; }
+  .tip { position: fixed; pointer-events: none; background: var(--raised); color: var(--fg); border: 1px solid var(--border); border-radius: 6px; padding: 6px 9px; font-size: 12px; max-width: 320px; box-shadow: 0 4px 18px rgba(0,0,0,.5); display: none; z-index: 10; }
+  .note { color: var(--muted); font-size: 12px; margin-top: 8px; }
+  @media (max-width: 640px) { .tier { padding-left: 14px; } .meta { display: none; } }
+</style>
+</head>
+<body>
+<div class="page">
+  <h1>Models</h1>
+  <div class="sub">Preview: bread fit marks on the Models page, in the app's own palette. Hover a mark for its tooltip.</div>
+
+  <div class="toolbar">
+    <span class="fam">Machine</span>
+    <div class="seg" id="machine">
+      <button data-v="gpu" class="on">flint · RX 6600 XT 8 GB</button>
+      <button data-v="mac">studio · M2 Max 64 GB</button>
+      <button data-v="cpu">nas · CPU only, 32 GB</button>
+    </div>
+    <span class="fam">Stacks</span>
+    <div class="seg" id="dir">
+      <button data-v="ltr" class="on">left to right</button>
+      <button data-v="rtl">right to left</button>
+    </div>
+  </div>
+
+  <h2>On this machine</h2>
+  <div class="card" id="local"></div>
+
+  <h2>Search Hugging Face</h2>
+  <div class="card" id="hf"></div>
+
+  <h2>Legend for this machine</h2>
+  <div class="card" id="legend"></div>
+  <div class="note">Production settings: vivid + shine golden, pale slices shrunk (the app is dark only), gap 3.5 with 0.8 falloff.</div>
+</div>
+<div class="tip" id="tip"></div>
+
+<script>
+// ---- marks (production settings from extension/bread-marks-preview.html) ----
+const SLICE = "M2,13 L2,6.4 C0.4,5.8 0.3,1.2 6,1.2 C11.7,1.2 11.6,5.8 10,6.4 L10,13 Q10,13.7 9.3,13.7 L2.7,13.7 Q2,13.7 2,13 Z";
+const SHADES = {
+  1: { fill: "#F7EACB", crust: "#C9A469" }, 2: { fill: "#F1D9A2", crust: "#BC8F4C" },
+  3: { fill: "#E8C281", crust: "#AA7A3A" }, 4: { fill: "#DDAA62", crust: "#9C6A2C" },
+  5: { fill: "#F0A21E", crust: "#9A5A0C" }, 0: { fill: "#2A1C14", crust: "#B8865E" },
+};
+const DARK_SCALE = { 1: 0.9, 2: 0.93, 3: 0.96, 4: 0.98 };
+function slice(x, s) {
+  const c = SHADES[s];
+  const k = DARK_SCALE[s] ?? 1;
+  const sc = k !== 1 ? ` translate(6,7.8) scale(${k}) translate(-6,-7.8)` : "";
+  let extra = "";
+  if (s === 5) extra = `<path d="M3.4,4.2 Q4.4,2.7 6.6,2.6" fill="none" stroke="#FFF6D8" stroke-width="1" stroke-linecap="round"/>`;
+  if (s === 0) extra = `<path d="M3.6,4.6 L5.6,6.6 L4.6,8.8 M8.4,7.6 L7.2,10.4 L8,12" fill="none" stroke="#E3A672" stroke-width=".85" stroke-linecap="round" stroke-linejoin="round"/>`;
+  return `<g transform="translate(${x},0)${sc}"><path d="${SLICE}" fill="${c.fill}" stroke="${c.crust}" stroke-width="1.25" stroke-linejoin="round"/>${extra}</g>`;
+}
+function offsets(n, step = 3.5, falloff = 0.8) {
+  if (n < 2) return [0];
+  const k = n - 1;
+  const w = Array.from({ length: k }, (_, i) => Math.pow(falloff, k - 1 - i));
+  const scale = (step * k) / w.reduce((a, b) => a + b, 0);
+  const out = [0];
+  for (const x of w) out.push(out[out.length - 1] + x * scale);
+  return out;
+}
+let DIR = "ltr";
+function stack(shades, px) {
+  const n = shades.length, off = offsets(n);
+  let g = "";
+  shades.forEach((s, i) => { g += slice(DIR === "ltr" ? off[i] : off[n - 1] - off[i], s); });
+  const vbW = 12 + off[n - 1] + 0.6, vbH = 14.6;
+  return `<svg viewBox="-0.3 0 ${vbW} ${vbH}" height="${px}" width="${(px * vbW / vbH).toFixed(1)}" aria-hidden="true">${g}</svg>`;
+}
+function unknownMark(px) {
+  return `<svg viewBox="-0.3 0 12.6 14.6" height="${px}" width="${(px * 12.6 / 14.6).toFixed(1)}" aria-hidden="true"><path d="${SLICE}" fill="none" stroke="#ab9f8d" stroke-width="1.1" stroke-dasharray="1.6 1.2" stroke-linejoin="round"/><text x="6" y="11.4" font-size="8" font-weight="700" text-anchor="middle" fill="#ab9f8d" font-family="system-ui, sans-serif">?</text></svg>`;
+}
+
+// ---- scales ----
+const GPU_SCALE = {
+  5: { shades: [1,2,3,4,5], label: "All layers on the GPU at the trained context" },
+  4: { shades: [1,2,3,4], label: "All layers on the GPU, at a shorter context than trained" },
+  3: { shades: [1,2,3], label: "All layers on the GPU, experts in RAM" },
+  2: { shades: [1,2], label: "Partial offload: 50% of layers or more on the GPU" },
+  1: { shades: [1], label: "Partial offload: under 50% of layers on the GPU" },
+  0: { shades: [0], label: "Not enough memory" },
+};
+const CPU_SCALE = {
+  2: { shades: [4,5], label: "Fits in RAM at the trained context" },
+  1: { shades: [4], label: "Fits in RAM at a shorter context than trained" },
+  0: { shades: [0], label: "Not enough memory" },
+};
+const MACHINES = {
+  gpu: { scale: GPU_SCALE, ctx: "32k", name: "RX 6600 XT, 8 GB VRAM, 32 GB RAM" },
+  mac: { scale: GPU_SCALE, ctx: "32k", name: "M2 Max, 64 GB unified" },
+  cpu: { scale: CPU_SCALE, ctx: "32k", name: "CPU only, 32 GB RAM" },
+};
+
+// ---- mock data: grade per machine, with the detail line the popup would give ----
+// [quant, size, {gpu:[grade, detail], mac:[...], cpu:[...]}]
+const LOCAL = [
+  { author: "unsloth", repo: "Qwen3.6-8B-GGUF", fam: "qwen3", params: "8.2B", open: true, quants: [
+    ["Q8_0", "8.7 GB", { gpu: [1, "13 of 37 layers on the GPU"], mac: [5, "37 of 37 layers, 128k context"], cpu: [2, "Needs 11.9 GB of 27.4 GB RAM at 128k"] }],
+    ["Q6_K", "6.7 GB", { gpu: [2, "27 of 37 layers on the GPU"], mac: [5, "37 of 37 layers, 128k context"], cpu: [2, "Needs 9.9 GB at 128k"] }],
+    ["Q5_K_M", "5.9 GB", { gpu: [2, "32 of 37 layers on the GPU"], mac: [5, "37 of 37 layers, 128k context"], cpu: [2, "Needs 9.1 GB at 128k"] }],
+    ["Q4_K_M", "5.0 GB", { gpu: [4, "37 of 37 layers, context up to 48k of 128k"], mac: [5, "37 of 37 layers, 128k context"], cpu: [2, "Needs 8.2 GB at 128k"] }],
+    ["IQ4_XS", "4.6 GB", { gpu: [4, "37 of 37 layers, context up to 48k of 128k"], mac: [5, "37 of 37 layers, 128k context"], cpu: [2, "Needs 7.8 GB at 128k"] }],
+    ["Q3_K_M", "4.1 GB", { gpu: [5, "37 of 37 layers, 128k context"], mac: [5, "37 of 37 layers, 128k context"], cpu: [2, "Needs 7.3 GB at 128k"] }],
+  ]},
+  { author: "unsloth", repo: "gemma-4-26B-A4B-it-GGUF", fam: "gemma4 · MoE 128 experts", params: "26B", open: false, quants: [
+    ["Q8_0", "27.1 GB", { gpu: [1, "9 of 30 layers on the GPU"], mac: [4, "30 of 30 layers, context up to 48k of 256k"], cpu: [0, "Needs 31.0 GB, 27.4 GB available"] }],
+    ["Q6_K", "21.3 GB", { gpu: [3, "30 of 30 layers, experts of 22 layers in RAM"], mac: [5, "30 of 30 layers, 256k context"], cpu: [1, "Context up to 96k of 256k"] }],
+    ["Q4_K_M", "16.8 GB", { gpu: [3, "30 of 30 layers, experts of 17 layers in RAM"], mac: [5, "30 of 30 layers, 256k context"], cpu: [1, "Context up to 96k of 256k"] }],
+    ["IQ3_XXS", "11.2 GB", { gpu: [3, "30 of 30 layers, experts of 9 layers in RAM"], mac: [5, "30 of 30 layers, 256k context"], cpu: [2, "Needs 17.4 GB at 256k"] }],
+  ]},
+  { author: "bartowski", repo: "Llama-3.3-70B-Instruct-GGUF", fam: "llama", params: "70B", open: false, quants: [
+    ["Q4_K_M", "42.5 GB", { gpu: [0, "Needs 46.1 GB, 39.4 GB VRAM + RAM available"], mac: [2, "64 of 81 layers on the GPU"], cpu: [0, "Needs 46.1 GB, 27.4 GB available"] }],
+    ["IQ2_M", "24.1 GB", { gpu: [1, "17 of 81 layers on the GPU"], mac: [4, "81 of 81 layers, context up to 48k of 128k"], cpu: [1, "Context up to 40k of 128k"] }],
+    ["IQ1_M", "16.8 GB", { gpu: [1, "25 of 81 layers on the GPU"], mac: [5, "81 of 81 layers, 128k context"], cpu: [2, "Needs 21.6 GB at 128k"] }],
+  ]},
+];
+const HF = [
+  { repo: "unsloth/Qwen3.6-30B-A3B-GGUF", tiers: [
+    ["8-bit", [["Q8_0", "32.5 GB", { gpu: [1, "11 of 48 layers on the GPU"], mac: [4, "48 of 48 layers, context up to 64k of 256k"], cpu: [0, "Needs 35.0 GB"] }]]],
+    ["4-bit", [["Q4_K_M", "18.6 GB", { gpu: [3, "48 of 48 layers, experts of 31 layers in RAM"], mac: [5, "48 of 48 layers, 256k context"], cpu: [1, "Context up to 80k of 256k"] }],
+               ["IQ4_XS", "16.4 GB", { gpu: [3, "48 of 48 layers, experts of 27 layers in RAM"], mac: [5, "48 of 48 layers, 256k context"], cpu: [1, "Context up to 80k of 256k"] }]]],
+    ["3-bit", [["Q3_K_M", "14.7 GB", { gpu: [3, "48 of 48 layers, experts of 22 layers in RAM"], mac: [5, "48 of 48 layers, 256k context"], cpu: [2, "Needs 21.3 GB at 256k"] }],
+               ["?", "", null]]],
+  ]},
+];
+
+let MACHINE = "gpu";
+function mark(entry, px) {
+  if (!entry) return { svg: unknownMark(px), tip: "Will it fit? Click to check" };
+  const [grade, detail] = entry[MACHINE];
+  const sc = MACHINES[MACHINE].scale[grade];
+  return { svg: stack(sc.shades, px), tip: `${sc.label}<br><span style="color:var(--muted)">${detail}</span>` };
+}
+const fitBtn = (m, subject) => `<button class="fitbtn" data-tip="${m.tip.replaceAll('"', "&quot;")}" aria-label="${subject}">${m.svg}</button>`;
+
+function render() {
+  let html = "";
+  for (const g of LOCAL) {
+    html += `<div class="group"><div class="ghead">
+      <span class="repo"><span class="author">${g.author}/</span>${g.repo}</span>
+      <span class="fam">· ${g.fam}</span><span class="params">${g.params}</span>`;
+    if (!g.open) {
+      html += `<span class="chips">${g.quants.map(([q, , e]) => { const m = mark(e, 12); return `<span class="mini">${fitBtn(m, q)}${q}</span>`; }).join("")}</span>`;
+    }
+    const total = g.quants.length;
+    html += `<span class="spacer"></span><button class="wif">Will it fit?</button><span class="meta">${total} files</span>
+      <span class="chev" data-toggle="${g.repo}">${g.open ? "▴" : "▾"}</span></div>`;
+    if (g.open) {
+      const byTier = {};
+      for (const q of g.quants) { const t = q[0].startsWith("Q8") ? "8-bit" : q[0].startsWith("Q6") ? "6-bit" : q[0].startsWith("Q5") ? "5-bit" : q[0].includes("4") ? "4-bit" : "3-bit"; (byTier[t] ??= []).push(q); }
+      for (const [t, qs] of Object.entries(byTier)) {
+        html += `<div class="tier"><span class="tl">${t}</span><span class="tc">${qs.length} quant${qs.length > 1 ? "s" : ""}</span>`;
+        for (const [q, size, e] of qs) { const m = mark(e, 14); html += `<span class="badgewrap">${fitBtn(m, q)}<span class="badge"><span class="dot"></span><span class="q">${q}</span><span class="sz">${size}</span></span></span>`; }
+        html += `</div>`;
+      }
+    }
+    html += `</div>`;
+  }
+  document.getElementById("local").innerHTML = html;
+
+  let hf = "";
+  for (const r of HF) {
+    hf += `<div class="hfrow"><div class="repo">${r.repo}</div>`;
+    for (const [t, chips] of r.tiers) {
+      hf += `<div class="hftier"><span class="tl">${t}</span>`;
+      for (const [q, size, e] of chips) {
+        if (q === "?") { hf += `<span class="hfchip">${fitBtn(mark(null, 14), "Q3_K_S")}<a href="#">Q3_K_S</a><span class="sz">13.4 GB</span><span class="dl">⤓</span></span>`; continue; }
+        const m = mark(e, 14);
+        hf += `<span class="hfchip">${fitBtn(m, q)}<a href="#">${q}</a><span class="sz">${size}</span><span class="dl">⤓</span></span>`;
+      }
+      hf += `</div>`;
+    }
+    hf += `</div>`;
+  }
+  document.getElementById("hf").innerHTML = hf;
+
+  const sc = MACHINES[MACHINE].scale;
+  let lg = `<div class="legend">`;
+  for (const g of Object.keys(sc).map(Number).sort((a, b) => b - a)) {
+    lg += `<div class="m"><span class="n">${g}</span>${stack(sc[g].shades, 16)}</div><div class="d">${sc[g].label}</div>`;
+  }
+  lg += `<div class="m">${unknownMark(16)}</div><div class="d">Not checked yet: click to check</div></div>`;
+  document.getElementById("legend").innerHTML = lg;
+}
+
+function seg(id, set) {
+  document.getElementById(id).addEventListener("click", (e) => {
+    const b = e.target.closest("button"); if (!b) return;
+    for (const x of document.querySelectorAll(`#${id} button`)) x.classList.toggle("on", x === b);
+    set(b.dataset.v); render();
+  });
+}
+seg("machine", (v) => (MACHINE = v));
+seg("dir", (v) => (DIR = v));
+document.addEventListener("click", (e) => {
+  const t = e.target.closest("[data-toggle]"); if (!t) return;
+  const g = LOCAL.find((x) => x.repo === t.dataset.toggle); g.open = !g.open; render();
+});
+const tip = document.getElementById("tip");
+document.addEventListener("mouseover", (e) => {
+  const b = e.target.closest("[data-tip]"); if (!b) { tip.style.display = "none"; return; }
+  tip.innerHTML = b.dataset.tip; tip.style.display = "block";
+  const r = b.getBoundingClientRect();
+  tip.style.left = Math.min(window.innerWidth - tip.offsetWidth - 8, Math.max(8, r.left)) + "px";
+  tip.style.top = (r.top - tip.offsetHeight - 6 < 0 ? r.bottom + 6 : r.top - tip.offsetHeight - 6) + "px";
+});
+render();
+</script>
+</body>
+</html>

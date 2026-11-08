@@ -26,7 +26,7 @@ describe("validateFillCurveSpec", () => {
     expect(validateFillCurveSpec({ ctx: 8_192 }, 32_768)).toBeNull();
   });
   it("refuses a context beyond the trained one", () => {
-    expect(validateFillCurveSpec({ ctx: 65_536 }, 32_768)).toMatch(/trained context/);
+    expect(validateFillCurveSpec({ ctx: 65_536 }, 32_768)).toMatch(/maximum context/);
   });
   it("refuses out-of-range steps", () => {
     expect(validateFillCurveSpec({ ctx: 8_192, steps: 1 }, null)).toMatch(/steps/);

@@ -221,13 +221,19 @@ function waitForJob(workerId: string, res: ServerResponse): Promise<QueueJob | n
 // The claim and the response aren't atomic: if the connection dies before
 // the job is flushed to it, the worker never got the job, so it goes straight
 // back to pending without using up an attempt.
-function sendClaimedJob(reply: FastifyReply, job: QueueJob) {
+function sendClaimedJob(reply: FastifyReply, job: QueueJob, workerId: string) {
   const res = reply.raw;
-  if (res.destroyed) {
+  // A waiting long-poll (the worker has probably reconnected already) gets it
+  // straight away rather than at the next backstop tick.
+  const unclaim = () => {
     repo.queueRepo.unclaimJob(job.job_id);
+    queueEvents.emit(workerId);
+  };
+  if (res.destroyed) {
+    unclaim();
   } else {
     res.once("close", () => {
-      if (!res.writableFinished) repo.queueRepo.unclaimJob(job.job_id);
+      if (!res.writableFinished) unclaim();
     });
   }
   return reply.send(job);
@@ -251,7 +257,7 @@ export async function queueRoutes(app: FastifyInstance): Promise<void> {
     if (state.status === "busy") return reply.code(204).send();
 
     const job = await waitForJob(worker.id, reply.raw);
-    return job ? sendClaimedJob(reply, job) : reply.code(204).send();
+    return job ? sendClaimedJob(reply, job, worker.id) : reply.code(204).send();
   });
 
   // Called every 10s, ALWAYS (idle and busy) -- returns fast. Carries

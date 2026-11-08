@@ -5,7 +5,7 @@
 // the same model's f16/f16 baseline is the fallback signal, verified against
 // the 2026-09-29 real-load sweep.
 
-import { KV_CACHE_TYPES, kvRelativeSize, kvSizeKey, isQuantizedKv, type FitFaMode, type ParsedFitOutput } from "./fitParams.js";
+import { KV_CACHE_TYPES, KV_TYPE_UNITS, kvRelativeSize, kvSizeKey, isQuantizedKv, type FitFaMode, type ParsedFitOutput } from "./fitParams.js";
 
 export type KvSupportStatus = "ok" | "cpu_fallback" | "invalid" | "fa_disabled" | "cuda_slow";
 
@@ -117,6 +117,14 @@ export function kvSizeGroups(rows: readonly KvSupportRow[], equalHeadDims = true
     groups.push({ key, relSize: kvRelativeSize(pairs[0][0], pairs[0][1]), rep: pairs[0], fa, pairs });
   }
   return groups.sort((a, b) => b.relSize - a.relSize);
+}
+
+/** K at least as precise as V. Keys are more sensitive to quantization than
+ * values, so the flow never proposes a pair whose K has fewer bits than its V. */
+export function kvKAtLeastV(ctk: string, ctv: string): boolean {
+  const k = KV_TYPE_UNITS[ctk];
+  const v = KV_TYPE_UNITS[ctv];
+  return k != null && v != null && k >= v;
 }
 
 export function pairLabel(ctk: string, ctv: string): string {

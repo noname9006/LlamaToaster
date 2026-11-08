@@ -149,6 +149,17 @@ CREATE TABLE IF NOT EXISTS results (
   -- on an MTP row where the draft model's own runtime line wasn't captured.
   gpu_layers_loaded_draft INTEGER,
   total_model_layers_draft INTEGER,
+  -- RESULT_PROVENANCE_PLAN.md Phase 3 (shared/rowStats.ts): clean readings
+  -- avg/stddev were recomputed from (JSON number[]), repeats the item asked
+  -- for, whether every one produced a reading (0/1), whether the worker's
+  -- own avg/stddev disagreed with the recomputation (0/1), and the worker's
+  -- figures when they did. NULL on rows from workers that predate them.
+  clean_samples TEXT,
+  repeats_requested INTEGER,
+  repeats_complete INTEGER,
+  stats_mismatch INTEGER,
+  worker_avg_tps REAL,
+  worker_stddev_tps REAL,
   raw_json_path TEXT,             -- full llama-bench JSON output for this run
   created_at INTEGER
 );
@@ -297,6 +308,7 @@ CREATE TABLE IF NOT EXISTS worker_jobs (
 
 CREATE INDEX IF NOT EXISTS idx_worker_jobs_worker  ON worker_jobs(worker_id, status);
 CREATE INDEX IF NOT EXISTS idx_worker_jobs_lease   ON worker_jobs(status, lease_expires_at);
+CREATE INDEX IF NOT EXISTS idx_worker_jobs_run     ON worker_jobs(run_id, status);
 CREATE INDEX IF NOT EXISTS idx_workers_machine     ON workers(machine_id);
 
 -- Multi-user Stage 2: auth -- see MULTIUSER_PLAN.md §2.1/§2.2.
@@ -337,6 +349,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   token_hash TEXT NOT NULL,
   refresh_hash TEXT,
   prev_refresh_hash TEXT,
+  rotated_at INTEGER,                        -- when prev_refresh_hash was retired; see the refresh route's grace window
   expires_at INTEGER NOT NULL,
   is_worker INTEGER NOT NULL DEFAULT 0,
   worker_id TEXT,
@@ -661,6 +674,7 @@ CREATE TABLE IF NOT EXISTS model_fit_checks (
   point_json TEXT,                -- shared/fitParams.ts FitPoint
   error TEXT,
   fetched_bytes INTEGER,
+  ceiling_json TEXT,              -- shared/fitGrade.ts FitCeiling (bread grades 5/4, 2/1)
   created_at INTEGER NOT NULL,
   PRIMARY KEY (worker_id, target_key, ctx, margin_mib)
 );

@@ -8,6 +8,7 @@ import {
   buildArgs,
   classifyFailure,
   appendBoundedOutput,
+  parseLlamaBench,
   runBench,
   type BenchRunInput,
 } from "./bench.js";
@@ -667,5 +668,31 @@ describe("appendBoundedOutput", () => {
       acc = appendBoundedOutput(acc, "x".repeat(1000), 5000);
     }
     expect(acc.length).toBeLessThan(5000 * 2 + 200); // +200 slack for the elision marker text
+  });
+});
+
+describe("parseLlamaBench per-repetition samples (RESULT_PROVENANCE_PLAN Phase 3)", () => {
+  // Real llama-bench b9503 output, trimmed to the fields parsed here.
+  const json = JSON.stringify([
+    { n_prompt: 64, n_gen: 0, avg_ts: 1225.338233, stddev_ts: 4.097138, samples_ns: [52430400, 52158400, 52103800], samples_ts: [1220.67, 1227.03, 1228.32] },
+    { n_prompt: 0, n_gen: 16, avg_ts: 83.57616, stddev_ts: 0.210803, samples_ns: [191999400, 191204900, 191124600], samples_ts: [83.3336, 83.6799, 83.715] },
+  ]);
+
+  it("derives clean samples from samples_ns and records the requested repeats", () => {
+    const [pp, tg] = parseLlamaBench(json, 0, 3).results;
+    expect(pp.clean_samples).toHaveLength(3);
+    expect(pp.clean_samples![0]).toBeCloseTo(64e9 / 52430400, 9);
+    expect(pp.repeat_samples).toEqual(pp.clean_samples);
+    expect(pp.sample_count).toBe(3);
+    expect(pp.suspect_count).toBe(0);
+    expect(pp.repeats_requested).toBe(3);
+    expect(tg.clean_samples![2]).toBeCloseTo(16e9 / 191124600, 9);
+  });
+
+  it("leaves the sample fields out for a build whose JSON has no samples_ns", () => {
+    const [row] = parseLlamaBench(JSON.stringify([{ n_prompt: 64, n_gen: 0, avg_ts: 1, stddev_ts: 0 }]), 0).results;
+    expect(row.clean_samples).toBeUndefined();
+    expect(row.sample_count).toBeUndefined();
+    expect(row.repeats_requested).toBeUndefined();
   });
 });

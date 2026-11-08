@@ -274,3 +274,39 @@ describe("M6 thermal columns (storage)", () => {
     expect(row.gpu_clock_samples).toEqual([2480, 2479, 2100, 1971]);
   });
 });
+
+describe("RESULT_PROVENANCE_PLAN Phase 3: stats recomputed at ingest", () => {
+  it("stores the recomputed n-1 stddev when the worker sent a population stddev, keeping the worker's figure", () => {
+    makeRun("p3-mismatch");
+    // [10, 11, 12]: mean 11, sample stddev 1, population stddev sqrt(2/3)
+    terminal("p3-mismatch", 0, { avg_tps: 11, stddev_tps: Math.sqrt(2 / 3), clean_samples: [10, 11, 12], repeats_requested: 3 });
+    const row = repo.getResultsForTest("p3-mismatch")[0];
+    expect(row.stddev_tps).toBeCloseTo(1, 12);
+    expect(row.avg_tps).toBeCloseTo(11, 12);
+    expect(row.stats_mismatch).toBe(true);
+    expect(row.worker_stddev_tps).toBeCloseTo(Math.sqrt(2 / 3), 12);
+    expect(row.repeats_complete).toBe(true);
+    expect(row.sample_count).toBe(3);
+    expect(row.clean_samples).toEqual([10, 11, 12]);
+  });
+
+  it("marks a row whose repeats did not all produce a reading", () => {
+    makeRun("p3-incomplete");
+    terminal("p3-incomplete", 0, { avg_tps: 10, stddev_tps: 0, clean_samples: [10, 10, 10], repeats_requested: 5 });
+    const row = repo.getResultsForTest("p3-incomplete")[0];
+    expect(row.repeats_complete).toBe(false);
+    expect(row.repeats_requested).toBe(5);
+    expect(row.stats_mismatch).toBe(false);
+  });
+
+  it("stores an older worker's row as it arrived", () => {
+    makeRun("p3-legacy");
+    terminal("p3-legacy", 0, { avg_tps: 1000, stddev_tps: 5 });
+    const row = repo.getResultsForTest("p3-legacy")[0];
+    expect(row.avg_tps).toBe(1000);
+    expect(row.stddev_tps).toBe(5);
+    expect(row.stats_mismatch).toBeNull();
+    expect(row.repeats_complete).toBeNull();
+    expect(row.worker_avg_tps).toBeNull();
+  });
+});

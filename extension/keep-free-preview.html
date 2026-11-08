@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Keep-free flags</title>
+<style>
+  :root { --bg:#13100c; --surface:#1b1611; --well:#0b0907; --border:#3d3329; --border-strong:#64554a; --fg:#f4efe6; --fg-2:#d2c8b9; --muted:#ab9f8d; --accent:#f5a623; color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--fg); }
+  body { max-width: 400px; margin: 0 auto; font: 14px/1.5 "Barlow", system-ui, sans-serif; font-variant-numeric: tabular-nums; -webkit-font-smoothing: antialiased; }
+  section { padding: 12px 16px; border-bottom: 1px solid var(--border); }
+  h2 { font: 600 13px "Barlow Condensed", "Barlow", sans-serif; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 0 0 8px; }
+  .row { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; padding: 3px 0; }
+  .row .k { color: var(--muted); white-space: nowrap; }
+  .row .v { text-align: right; }
+  .amt { font-weight: 600; }
+  .bar { height: 8px; background: #b9b0a3; border: 1px solid var(--border); margin: 4px 0 0; position: relative; }
+  .bar > i { position: absolute; top: 0; bottom: 0; width: 0; }
+  .bar > i.other { right: 0; background: #4a4239; }
+  /* The kept-free part of the bar: just dimmed, no new colour. */
+  .bar > i.keep { right: 0; background: rgba(11, 9, 7, .55); transition: width .15s ease-out; }
+  .bar > i.edge { width: 2px; margin-left: -1px; background: var(--accent); transition: left .15s ease-out; }
+
+  /* The flag track: the Context slider's tick row, with a caret for the flag. */
+  .keep-track { position: relative; height: 30px; margin: 0 0 6px; cursor: pointer; user-select: none; touch-action: none; }
+  .keep-track .t { position: absolute; top: 12px; transform: translateX(-50%); font-size: 10px; color: var(--muted); white-space: nowrap; transition: left .15s ease-out, color .1s; }
+  .keep-track .t::before { content: ""; position: absolute; left: 50%; top: -7px; width: 1px; height: 4px; background: var(--border-strong); }
+  .keep-track .t.on { color: var(--accent); }
+  .keep-track { height: 40px; }
+  .keep-track .t.now { top: 24px; font-style: italic; }
+  .keep-track .t.now::before { top: -19px; height: 16px; background: none; border-left: 1px dotted var(--border-strong); }
+  .keep-track .caret { position: absolute; top: -1px; width: 16px; height: 22px; margin-left: -8px; cursor: grab; transition: left .15s ease-out; z-index: 1; filter: drop-shadow(0 1px 1px rgba(0,0,0,.6)); }
+  .keep-track .caret svg { display: block; }
+  .keep-track .t { top: 26px; }
+  .keep-track { height: 52px !important; }
+  .keep-track .t::before { top: -21px; height: 4px; }
+  /* Anchors are bare notches now; only the chosen value is written, under the flag. */
+  .keep-track .lbl { position: absolute; left: -1px; top: 2px; color: var(--muted); font-size: 14px; line-height: 20px; pointer-events: none; }
+  .keep-track { height: 28px !important; margin-left: 1px; margin-right: 1px; } /* match the bar's inner box (1px border) */
+  .keep-track .t { display: none; }
+  .keep-track .t::before { top: 0; height: 4px; }
+  .keep-track .t.now::before { top: 0; height: 6px; border: 0; background: var(--accent); opacity: .6; }
+  .keep-track .val { position: absolute; top: 2px; line-height: 20px; transform: translateX(-50%); font-size: 11px; color: var(--accent); white-space: nowrap; transition: left .15s ease-out; pointer-events: none; }
+  .keep-track.drag .val { transition: none; }
+  .variants { display: flex; gap: 4px; flex-wrap: wrap; padding: 10px 16px 0; font-size: 12px; color: var(--muted); align-items: center; }
+  .variants button { background: none; border: 1px solid var(--border); color: var(--fg-2); font: inherit; padding: 3px 8px; cursor: pointer; display: inline-flex; gap: 6px; align-items: center; }
+  .variants button.on { border-color: var(--accent); color: var(--fg); }
+  .keep-track.drag .caret, .keep-track.drag .t, .keep-track.drag ~ * { transition: none; }
+  .keep-track.drag .caret { cursor: grabbing; }
+
+  .legend-bar { display: flex; gap: 12px; font-size: 11px; color: var(--muted); margin-top: 2px; }
+  .legend-bar .sw { display: inline-block; width: 8px; height: 8px; margin-right: 4px; border: 1px solid var(--border); }
+  .sw.free { background: #b9b0a3; } .sw.other { background: #4a4239; } .sw.keep { background: #5a534b; }
+  .sim { font-size: 12px; color: var(--muted); padding-top: 10px; }
+  .sim button { background: none; border: 0; color: var(--muted); font: inherit; text-decoration: underline; cursor: pointer; padding: 0; }
+  .sim button:hover { color: var(--accent); }
+</style>
+</head>
+<body>
+<div class="variants" id="variants">Flag:</div>
+<section id="memory">
+  <h2>This machine</h2>
+  <div class="row"><span class="k">RAM</span><span class="v"><span class="amt" id="ramFree"></span> free of <span id="ramTotal"></span></span></div>
+  <div class="bar" id="ramBar"><i class="other"></i><i class="keep"></i><i class="edge"></i></div>
+  <div class="keep-track" id="ramTrack" aria-label="RAM to keep free"><span class="lbl">Keep free</span></div>
+
+  <div class="row" style="margin-top:8px"><span class="k">VRAM available</span><span class="v"><span class="amt" id="vramFree"></span> free of <span id="vramTotal"></span></span></div>
+  <div class="bar" id="vramBar"><i class="other"></i><i class="keep"></i><i class="edge"></i></div>
+  <div class="keep-track" id="vramTrack" aria-label="VRAM to keep free"><span class="lbl">Keep free</span></div>
+
+  <div class="legend-bar" style="margin-top:6px"><span><b class="sw free"></b>free</span><span><b class="sw other"></b>in use</span><span><b class="sw keep"></b>kept free</span></div>
+  <div class="sim">Preview: other apps' usage drifts every 1.5 s. <button id="pause" type="button">Pause</button></div>
+</section>
+<script>
+// Each flag is 16x22, its tip at the top centre touching the bar.
+const A = "#f5a623", D = "#1a1305", S = "#64554a";
+const FLAGS = {
+  lever: { name: "Toaster lever", svg: // the carriage lever: a short stem up to the slot, a wide paddle
+    `<svg viewBox="0 0 16 22" width="16" height="22"><rect x="4.5" y="3" width="7" height="14" rx="2.5" fill="${A}" stroke="${D}" stroke-width="1"/><rect x="6.5" y="5" width="1.2" height="10" rx=".6" fill="#ffd08a"/></svg>` },
+  knob: { name: "Browning dial", svg: // the shade knob, pointer up at the bar
+    `<svg viewBox="0 0 16 22" width="16" height="22"><g transform="rotate(90 8 12)"><path d="M8 3.5 L10 7.5 H6 Z" fill="${A}"/><circle cx="8" cy="12" r="6.5" fill="#262019" stroke="${A}" stroke-width="1.5"/><rect x="7.2" y="5.8" width="1.6" height="5.5" rx=".8" fill="${A}"/></g></svg>` },
+  toast: { name: "Toast on a pick", svg: // a cocktail pick with a slice as the pennant
+    `<svg viewBox="0 0 16 22" width="16" height="22"><rect x="2.3" y="0" width="1.4" height="22" rx=".7" fill="${S}"/><circle cx="3" cy="1" r="1.3" fill="${A}"/><path d="M3.6 4 h6.2 a3.4 3.4 0 0 1 1.8 6.2 V15 a1 1 0 0 1 -1 1 H3.6 Z" fill="#e8b25c" stroke="#8a5a22" stroke-width="1.1" stroke-linejoin="round"/></svg>` },
+  plug: { name: "Plug", svg: // prongs reach up to the bar
+    `<svg viewBox="0 0 16 22" width="16" height="22"><rect x="4.2" y="0" width="1.8" height="7" fill="#d2c8b9"/><rect x="10" y="0" width="1.8" height="7" fill="#d2c8b9"/><path d="M2 6 H14 V12 a6 6 0 0 1 -12 0 Z" fill="${A}" stroke="${D}" stroke-width="1"/><rect x="7" y="17" width="2" height="5" fill="${S}"/></svg>` },
+  timer: { name: "Egg timer", svg: // the twist timer's pointer tab
+    `<svg viewBox="0 0 16 22" width="16" height="22"><path d="M8 0 L11 6 H5 Z" fill="${A}"/><ellipse cx="8" cy="14" rx="7" ry="7.5" fill="#f4efe6" stroke="${D}" stroke-width="1"/><path d="M1.2 13 H14.8" stroke="${A}" stroke-width="2"/><circle cx="8" cy="13" r="1.4" fill="${D}"/></svg>` },
+};
+let variant = "lever";
+const vEl = document.getElementById("variants");
+for (const [k, f] of Object.entries(FLAGS)) {
+  const b = document.createElement("button"); b.type = "button"; b.dataset.k = k;
+  b.innerHTML = f.svg.replace(/width="16" height="22"/, 'width="11" height="15"') + f.name;
+  b.onclick = () => { variant = k; document.querySelectorAll(".caret").forEach((c) => (c.innerHTML = FLAGS[k].svg)); vEl.querySelectorAll("button").forEach((x) => x.classList.toggle("on", x.dataset.k === k)); };
+  vEl.appendChild(b);
+}
+vEl.querySelector('[data-k="lever"]').classList.add("on");
+const GB = 1024;
+const gb = (m) => (m / GB).toFixed(1).replace(/\.0$/, "") + " GB";
+
+function keepFlag({ id, total, used, anchors }) {
+  const st = { total, used, choice: "current" };
+  const track = document.getElementById(id + "Track"), bar = document.getElementById(id + "Bar");
+  const keepOf = (c) => (c === "current" ? st.used : c);
+  const pos = (keep) => Math.max(0, Math.min(1, 1 - keep / st.total)); // flag sits where the model's share ends
+  const choices = [...anchors, "current"];
+  const ticks = choices.map((c) => {
+    const t = document.createElement("span");
+    t.className = "t" + (c === "current" ? " now" : "");
+    t.textContent = c === "current" ? "in use" : gb(c).replace(" GB", "");
+    track.appendChild(t);
+    return t;
+  });
+  const caret = document.createElement("i"); caret.className = "caret"; caret.innerHTML = FLAGS[variant].svg; track.appendChild(caret);
+  const val = document.createElement("span"); val.className = "val"; track.appendChild(val);
+
+  function render(dragX) {
+    const keep = keepOf(st.choice);
+    bar.querySelector(".other").style.width = (st.used / st.total) * 100 + "%";
+    bar.querySelector(".keep").style.width = (keep / st.total) * 100 + "%";
+    bar.querySelector(".edge").style.left = pos(keep) * 100 + "%";
+    ticks.forEach((t, i) => { t.style.left = pos(keepOf(choices[i])) * 100 + "%"; t.classList.toggle("on", choices[i] === st.choice); });
+    caret.style.left = val.style.left = dragX != null ? dragX + "px" : pos(keep) * 100 + "%";
+    val.textContent = st.choice === "current" ? "in use · " + gb(keep) : gb(keep);
+    const p = pos(keep);
+    // Beside the lever on the same line: to its left, unless that would run into the "Keep free" label.
+    const lblEnd = track.querySelector(".lbl").offsetWidth + 8;
+    const leverX = p * track.clientWidth;
+    // Left of the lever if it fits before it without touching the label; otherwise right of the lever, and never over the label.
+    if (leverX - 8 - val.offsetWidth >= lblEnd) val.style.transform = "translateX(calc(-100% - 8px))";
+    else val.style.transform = `translateX(${Math.max(10, lblEnd - leverX)}px)`;
+    document.getElementById(id + "Free").textContent = gb(st.total - st.used);
+    document.getElementById(id + "Total").textContent = gb(st.total);
+  }
+  // Any value from 0 to the whole memory, in 0.1 GB steps. A slight pull (4px) onto
+  // the presets, "in use now" and every whole GB.
+  const PULL = 4;
+  function pick(ev) {
+    const r = track.getBoundingClientRect();
+    const px = Math.max(0, Math.min(r.width, ev.clientX - r.left));
+    const magnets = [...choices];
+    for (let g = GB; g < st.total; g += GB) magnets.push(g);
+    const pull = Math.min(PULL, 0.2 * (r.width * GB) / st.total); // slight: a fifth of the gap between whole GBs at most
+    let best = null, bd = pull;
+    for (const c of magnets) { const d = Math.abs(pos(keepOf(c)) * r.width - px); if (d < bd) { bd = d; best = c; } }
+    st.choice = best ?? Math.round(((1 - px / r.width) * st.total) / (GB / 10)) * (GB / 10);
+    render();
+  }
+  track.addEventListener("pointerdown", (e) => {
+    track.setPointerCapture(e.pointerId); track.classList.add("drag"); pick(e);
+    const move = (ev) => pick(ev);
+    const up = () => { track.classList.remove("drag"); track.removeEventListener("pointermove", move); track.removeEventListener("pointerup", up); };
+    track.addEventListener("pointermove", move); track.addEventListener("pointerup", up);
+  });
+  render();
+  return { st, render };
+}
+
+const flags = [
+  [keepFlag({ id: "ram", total: 32 * GB, used: 13.4 * GB, anchors: [0, 2, 4, 6, 8].map((g) => g * GB) }), 9, 20, 0.8],
+  [keepFlag({ id: "vram", total: 8 * GB, used: 1.1 * GB, anchors: [0, 0.5, 1, 1.5, 2].map((g) => g * GB) }), 0.3, 3, 0.25],
+];
+let paused = false;
+document.getElementById("pause").onclick = (e) => { paused = !paused; e.target.textContent = paused ? "Resume" : "Pause"; };
+setInterval(() => {
+  if (paused) return;
+  for (const [f, lo, hi, step] of flags) { f.st.used = Math.max(lo * GB, Math.min(hi * GB, f.st.used + (Math.random() - 0.5) * 2 * step * GB)); f.render(); }
+}, 1500);
+</script>
+</body>
+</html>
