@@ -34,9 +34,13 @@ jobs:
             client/package-lock.json
             admin/package-lock.json
 
-      # `npm ci` at the root also installs client/ and admin/ through the
-      # root package.json's postinstall hook.
-      - run: npm ci
+      # better-sqlite3 ships prebuilt binaries but also a binding.gyp, so a plain
+      # `npm ci` runs node-gyp, which fails on windows-latest (its Visual Studio
+      # is newer than node-gyp knows). --ignore-scripts skips that build; the
+      # root postinstall hook (which installs worker/, client/ and admin/) is
+      # then run by hand.
+      - run: npm ci --ignore-scripts
+      - run: npm run postinstall
 
       # Informational: a new advisory shouldn't turn every open PR red.
       - name: Audit runtime dependencies

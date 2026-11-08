@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { CTX_MAX, CTX_SLIDER_MAX, ctxFromSlider, sliderFromCtx, stopPositions } from "../extension/src/settings";
+import { CTX_MAX, CTX_SLIDER_MAX, ctxFromSlider, sliderFromCtx, stopPositions } from "../extension/src/ctxSlider";
 
-// The extension's context slider (extension/src/settings.ts): 1k..1M at 100
+// The extension's context slider (extension/src/ctxSlider.ts): 1k..1M at 100
 // positions per doubling, then one short 1M..10M segment at the end.
 describe("extension context slider", () => {
   it("ends at 10M, with the 1M..10M stretch far shorter than a doubling", () => {
