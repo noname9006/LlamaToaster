@@ -7,7 +7,7 @@ param([switch]$Uninstall)
 $ErrorActionPreference = 'Stop'
 $name = 'com.llamatoaster.vram'
 # Every LlamaToaster extension ID allowed to call the host: the unpacked build
-# (fixed by the "key" in extension/manifest.json). Add the Chrome Web Store ID
+# (fixed by the "key" in manifest.json of the LlamaToaster/extension repo). Add the Chrome Web Store ID
 # here if it is ever published under a different key.
 $extensionIds = @('odghfahbjacleniojhemnojbiabfebon')
 $dir = Split-Path -Parent $MyInvocation.MyCommand.Path
