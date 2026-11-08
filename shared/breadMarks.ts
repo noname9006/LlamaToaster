@@ -1,7 +1,7 @@
 // The bread fit marks: slices of toast from pale to golden (and burnt),
 // stacked to show a grade (shared/fitGrade.ts). Plain SVG strings, so the
 // React client and the extension's content script draw the same thing.
-// Designed on extension/bread-marks-preview.html; the operator tunes the
+// Designed on bread-marks-preview.html (LlamaToaster/extension repo); the operator tunes the
 // style from the admin console (AppSettings.breadMarkStyle).
 
 import type { FitGrade, FitScale } from "./fitGrade.js";

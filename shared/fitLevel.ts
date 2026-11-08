@@ -12,6 +12,9 @@ import type { FitPoint } from "./fitParams.js";
 
 export type FitLevel = "fits" | "partial" | "no_fit";
 
+/** The mark each level is drawn with, on the Models page and in the Chrome extension. */
+export const FIT_MARKS: Record<FitLevel, string> = { fits: "✅✅", partial: "✅", no_fit: "❗" };
+
 export interface FitMemory {
   /** What --list-devices reports for each GPU; its "free" is really "available". */
   devices: { name: string; description: string; total_mib: number; free_mib: number }[];

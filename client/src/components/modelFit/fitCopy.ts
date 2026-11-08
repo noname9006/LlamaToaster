@@ -1,12 +1,12 @@
 // The words of "Will it fit?" (docs/plans/MODEL_FIT_CHECK_PLAN.md), apart from
 // the components so they can be tested and read in one place.
 
-import type { FitLevel } from "../../../../shared/fitLevel.js";
+import { FIT_MARKS } from "../../../../shared/fitLevel.js";
 import { ctxShort, fitGrade, fitGradeLabel, fitScale, type FitGrade, type FitScale } from "../../../../shared/fitGrade.js";
 import type { ModelFitResult } from "../../types";
 import { formatBytes } from "../../utils";
 
-export const FIT_MARKS: Record<FitLevel, string> = { fits: "✅✅", partial: "✅", no_fit: "❗" };
+export { FIT_MARKS };
 
 export const ACCURACY_NOTE =
   "This measurement is quite accurate, but in certain circumstances the real experience may differ, depending on context size, cache quantization and other details.";
