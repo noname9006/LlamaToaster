@@ -3,7 +3,9 @@ import { Link } from "react-router-dom";
 import { api } from "../../api/client";
 import type { ModelFitPlan, ModelFitResult, ModelFitTarget, Worker } from "../../types";
 import { formatBytes } from "../../utils";
-import { ACCURACY_NOTE, FIT_MARKS, fitDetails, fitHeadline, headerDownloadMib } from "./fitCopy";
+import { ACCURACY_NOTE, FIT_MARKS, fitBreadHeadline, fitDetails, fitHeadline, headerDownloadMib } from "./fitCopy";
+import { useBreadSettings } from "./breadSettings";
+import { breadSvg } from "./FitMark";
 import type { ModelFitStore } from "./useModelFit";
 
 export interface FitItem {
@@ -127,7 +129,7 @@ export function FitCheckDialog({
         aria-modal="true"
         aria-labelledby="fit-dialog-title"
         tabIndex={-1}
-        className="max-h-[90vh] w-full max-w-lg overflow-y-auto rounded-xl border border-border bg-surface p-5 text-sm text-fg outline-none"
+        className="max-h-[90vh] w-full max-w-lg overflow-y-auto rounded-xl border border-border-strong bg-surface p-5 text-sm text-fg outline-none"
       >
         <h2 id="fit-dialog-title" className="m-0 font-display text-lg font-semibold">
           Will it fit? <span className="font-mono text-sm font-normal text-muted">{request.title}</span>
@@ -143,7 +145,7 @@ export function FitCheckDialog({
                 <select
                   value={workerId}
                   onChange={(e) => setWorkerId(e.target.value)}
-                  className="rounded-lg border border-border bg-surface px-3 py-1.5 text-fg outline-none focus:border-accent"
+                  className="rounded-lg border border-border-strong bg-surface px-3 py-1.5 text-fg outline-none focus:border-accent"
                 >
                   <option value="">select…</option>
                   {workers.map((w) => (
@@ -183,7 +185,7 @@ export function FitCheckDialog({
             {planError && <p className="mt-3 text-danger">{planError}</p>}
             {workerId && !plan && !planError && <p className="mt-3 text-muted">Looking at the machine…</p>}
             {plan && (
-              <div className="mt-3 rounded-lg border border-border bg-surface-raised px-3 py-2">
+              <div className="mt-3 bg-surface px-3 py-2">
                 {!plan.online ? (
                   <p className="m-0 text-danger">This machine is offline.</p>
                 ) : !plan.capable ? (
@@ -219,7 +221,7 @@ export function FitCheckDialog({
         {submitError && <p className="mt-2 text-danger">{submitError}</p>}
 
         <div className="mt-4 flex flex-wrap justify-end gap-2">
-          <button type="button" onClick={onClose} className="rounded-lg border border-border px-3 py-1.5 text-muted hover:border-accent/40 hover:text-accent">
+          <button type="button" onClick={onClose} className="rounded-lg border border-border-strong px-3 py-1.5 text-muted hover:border-accent/40 hover:text-accent">
             {showingResult || allAnswered ? "Close" : "Cancel"}
           </button>
           {showingResult || allAnswered ? (
@@ -238,11 +240,18 @@ export function FitCheckDialog({
 }
 
 function ResultDetails({ result, machineName }: { result: ModelFitResult; machineName?: string }) {
+  const bread = useBreadSettings();
+  const svg = bread.enabled && result.level ? breadSvg(result, bread, 18) : null;
   return (
     <div className="mt-3">
-      <p className="m-0 font-semibold">
-        {result.level ? `${FIT_MARKS[result.level]} ` : "⚠️ "}
-        {fitHeadline(result)}
+      <p className="m-0 flex items-center gap-2 font-semibold">
+        {svg ? (
+          // Built from constants in shared/breadMarks.ts, never from user input.
+          <span className="inline-flex shrink-0" dangerouslySetInnerHTML={{ __html: svg }} />
+        ) : (
+          <span>{result.level ? FIT_MARKS[result.level] : "⚠️"}</span>
+        )}
+        <span>{svg ? fitBreadHeadline(result) : fitHeadline(result)}</span>
       </p>
       {result.error && <p className="mt-2 break-words text-danger">{result.error}</p>}
       <ul className="m-0 mt-2 list-none p-0 text-muted">

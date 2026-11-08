@@ -148,7 +148,7 @@ export function NewComparison({ onCreated }: { onCreated: (comparisonId: string)
       <button
         type="button"
         onClick={() => setOpen(true)}
-        className="rounded-lg border border-border px-3 py-1.5 text-xs font-semibold text-fg hover:border-accent/40 hover:text-accent"
+        className="rounded-lg border border-border-strong px-3 py-1.5 text-xs font-semibold text-fg hover:border-accent/40 hover:text-accent"
       >
         + New comparison
       </button>
@@ -156,7 +156,7 @@ export function NewComparison({ onCreated }: { onCreated: (comparisonId: string)
   }
 
   return (
-    <div className="rounded-xl border border-border bg-surface p-4">
+    <div className="border-t border-border pt-4">
       <div className="flex items-center justify-between">
         <h3 className="text-sm font-semibold text-fg">New model-vs-model comparison</h3>
         <button type="button" onClick={() => setOpen(false)} className="text-xs text-muted hover:text-fg">
@@ -175,7 +175,7 @@ export function NewComparison({ onCreated }: { onCreated: (comparisonId: string)
           <select
             value={workerId}
             onChange={(e) => setWorkerId(e.target.value)}
-            className="rounded-lg border border-border bg-bg px-2.5 py-1.5 text-sm text-fg"
+            className="rounded-lg border border-border-strong bg-bg px-2.5 py-1.5 text-sm text-fg"
           >
             <option value="">Choose a machine…</option>
             {workers.map((w) => (
@@ -191,7 +191,7 @@ export function NewComparison({ onCreated }: { onCreated: (comparisonId: string)
           <select
             value={KV_PAIR_CHOICES.findIndex(({ pair }) => pair[0] === kvPair[0] && pair[1] === kvPair[1])}
             onChange={(e) => setKvPair(KV_PAIR_CHOICES[Number(e.target.value)].pair)}
-            className="rounded-lg border border-border bg-bg px-2.5 py-1.5 text-sm text-fg"
+            className="rounded-lg border border-border-strong bg-bg px-2.5 py-1.5 text-sm text-fg"
           >
             {KV_PAIR_CHOICES.map((c, i) => (
               <option key={c.label} value={i}>
@@ -246,7 +246,7 @@ export function NewComparison({ onCreated }: { onCreated: (comparisonId: string)
             min={1}
             value={nPrompt}
             onChange={(e) => setNPrompt(Number(e.target.value) || 1)}
-            className="rounded-lg border border-border bg-bg px-2 py-1 font-mono text-sm text-fg"
+            className="rounded-lg border border-border-strong bg-bg px-2 py-1 font-mono text-sm text-fg"
           />
         </label>
         <label className="flex flex-col gap-1 text-xs text-muted">
@@ -256,7 +256,7 @@ export function NewComparison({ onCreated }: { onCreated: (comparisonId: string)
             min={1}
             value={nGen}
             onChange={(e) => setNGen(Number(e.target.value) || 1)}
-            className="rounded-lg border border-border bg-bg px-2 py-1 font-mono text-sm text-fg"
+            className="rounded-lg border border-border-strong bg-bg px-2 py-1 font-mono text-sm text-fg"
           />
         </label>
         <label className="flex flex-col gap-1 text-xs text-muted">
@@ -267,7 +267,7 @@ export function NewComparison({ onCreated }: { onCreated: (comparisonId: string)
             max={25}
             value={repeats}
             onChange={(e) => setRepeats(Number(e.target.value) || 1)}
-            className="rounded-lg border border-border bg-bg px-2 py-1 font-mono text-sm text-fg"
+            className="rounded-lg border border-border-strong bg-bg px-2 py-1 font-mono text-sm text-fg"
           />
         </label>
         <label className="flex flex-col gap-1 text-xs text-muted">
@@ -277,7 +277,7 @@ export function NewComparison({ onCreated }: { onCreated: (comparisonId: string)
             min={0}
             value={nGpuLayers}
             onChange={(e) => setNGpuLayers(Number(e.target.value) || 0)}
-            className="rounded-lg border border-border bg-bg px-2 py-1 font-mono text-sm text-fg"
+            className="rounded-lg border border-border-strong bg-bg px-2 py-1 font-mono text-sm text-fg"
           />
         </label>
       </div>
@@ -287,7 +287,7 @@ export function NewComparison({ onCreated }: { onCreated: (comparisonId: string)
           type="button"
           onClick={priceTotal}
           disabled={!worker || selectedModelIds.length < MIN_COMPARISON_MEMBERS}
-          className="rounded-lg border border-border px-3 py-1.5 text-xs font-semibold text-fg hover:border-accent/40 hover:text-accent disabled:opacity-50"
+          className="rounded-lg border border-border-strong px-3 py-1.5 text-xs font-semibold text-fg hover:border-accent/40 hover:text-accent disabled:opacity-50"
         >
           Price total
         </button>

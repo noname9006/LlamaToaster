@@ -1088,7 +1088,7 @@ export function TestDetail() {
                 ? "Resume before the next sweep combination"
                 : "Pause before the next sweep combination -- the one currently in flight (including all its repeats) finishes first"
             }
-            className="rounded-lg border border-border px-3 py-1.5 text-sm font-semibold text-fg hover:border-accent/40 hover:text-accent disabled:opacity-50"
+            className="rounded-lg border border-border-strong px-3 py-1.5 text-sm font-semibold text-fg hover:border-accent/40 hover:text-accent disabled:opacity-50"
           >
             {paused ? "Resume" : "Pause"}
           </button>
@@ -1125,7 +1125,7 @@ export function TestDetail() {
           scenario still waiting its turn behind another one on the worker. */}
       {run?.kind === "probe" && (
         <section className="mt-6">
-          <h2 className="text-sm font-semibold uppercase tracking-wide text-muted">Context tests</h2>
+          <h2 className="text-sm font-semibold text-muted">Context tests</h2>
           <div className="mt-3 flex flex-col gap-5">
             {batchMembers.length > 1
               ? batchMembers.map((m) => (
@@ -1166,7 +1166,7 @@ export function TestDetail() {
           half-finished run would rank on a moving target. */}
       {run && !isFlowRun(run) && (run.status === "done" || run.status === "partial") && fillCurveCtx == null && (
         <section className="mt-6">
-          <h2 className="text-sm font-semibold uppercase tracking-wide text-muted">Scored profiles</h2>
+          <h2 className="text-sm font-semibold text-muted">Scored profiles</h2>
           <div className="mt-3">
             <ProfileCards testId={id} refreshKey={run.status} modelId={run.model_id} workerId={run.worker_id ?? null} />
           </div>
@@ -1176,7 +1176,7 @@ export function TestDetail() {
       {/* N1 + N5 -- the curve and the knee, both derived on read. */}
       {run && !isFlowRun(run) && (
         <section className="mt-6">
-          <h2 className="text-sm font-semibold uppercase tracking-wide text-muted">Context curve &amp; concurrency</h2>
+          <h2 className="text-sm font-semibold text-muted">Context curve &amp; concurrency</h2>
           <div className="mt-3 flex flex-col gap-3">
             <CurvesPanel
               modelId={run.model_id}
@@ -1198,13 +1198,13 @@ export function TestDetail() {
           <div className="mt-3 flex flex-wrap items-center gap-3">
             <a
               href={view.bundleExportUrl(id, "test")}
-              className="rounded-lg border border-border px-3 py-1.5 text-xs font-semibold text-fg hover:border-accent/40 hover:text-accent"
+              className="rounded-lg border border-border-strong px-3 py-1.5 text-xs font-semibold text-fg hover:border-accent/40 hover:text-accent"
             >
               Export bundle ⤓
             </a>
             <a
               href={view.bundleExportUrl(id, "root")}
-              className="rounded-lg border border-border px-3 py-1.5 text-xs font-semibold text-muted hover:border-accent/40 hover:text-accent"
+              className="rounded-lg border border-border-strong px-3 py-1.5 text-xs font-semibold text-muted hover:border-accent/40 hover:text-accent"
             >
               Export whole chain ⤓
             </a>
@@ -1226,7 +1226,7 @@ export function TestDetail() {
       {items.length > 0 && run?.kind !== "probe" && (
         <section className="mt-6">
           <div className="flex flex-wrap items-baseline justify-between gap-2">
-            <h2 className="text-sm font-semibold uppercase tracking-wide text-muted">
+            <h2 className="text-sm font-semibold text-muted">
               Tests ({itemsCompleted} of {items.length}) · Total runs: {totalRuns}
             </h2>
             <div className="flex flex-wrap items-baseline gap-3">
@@ -1266,7 +1266,7 @@ export function TestDetail() {
             ))}
           </div>
           {vramAccuracyNotes.size > 0 && (
-            <div className="mt-2 flex items-start gap-1.5 rounded-lg border border-border bg-surface-raised px-3 py-2 text-xs text-muted">
+            <div className="mt-2 flex items-start gap-1.5 bg-surface px-3 py-2 text-xs text-muted">
               <IconInfo width={13} height={13} className="mt-0.5 flex-none" />
               <p>
                 VRAM columns marked <IconInfo width={11} height={11} className="inline -translate-y-px" /> are
@@ -1277,10 +1277,10 @@ export function TestDetail() {
           {visibleItems.length === 0 ? (
             <p className="mt-3 text-sm text-muted">No tests match the current filter.</p>
           ) : (
-          <div className="mt-2 overflow-x-auto rounded-xl border border-border bg-surface">
+          <div className="mt-2 overflow-x-auto">
             <table className="w-full text-left text-xs">
               <thead>
-                <tr className="uppercase tracking-wide text-muted">
+                <tr className="text-muted">
                   {PRIMARY_COLUMN_DEFS.map((c) => (
                     <Th
                       key={c.label}
@@ -1306,7 +1306,7 @@ export function TestDetail() {
                     <Tooltip text={MEMORY_GROUP_DESCRIPTIONS.vram}>VRAM</Tooltip>
                   </th>
                 </tr>
-                <tr className="border-b border-border uppercase tracking-wide text-muted">
+                <tr className="border-b border-border text-muted">
                   {[...RAM_COLUMN_DEFS, ...VRAM_COLUMN_DEFS].map((c, i) => (
                     <Th
                       key={`${c.group}-${c.label}-${i}`}
@@ -1537,7 +1537,7 @@ export function TestDetail() {
                           <>
                             {(measuredTtftMs / 1000).toFixed(2)}s
                             {ttftSampleCount === 1 && (
-                              <span className="ml-0.5 text-[9px] uppercase tracking-wide text-muted">1-shot</span>
+                              <span className="ml-0.5 text-[9px] text-muted">1-shot</span>
                             )}
                           </>
                         ) : ttftSeconds != null ? (
@@ -1629,11 +1629,11 @@ export function TestDetail() {
           nothing for them. */}
       {items.length === 0 && results.length > 0 && (
         <section className="mt-6">
-          <h2 className="text-sm font-semibold uppercase tracking-wide text-muted">Results</h2>
-          <div className="mt-2 overflow-x-auto rounded-xl border border-border bg-surface">
+          <h2 className="text-sm font-semibold text-muted">Results</h2>
+          <div className="mt-2 overflow-x-auto">
             <table className="w-full text-left text-xs">
               <thead>
-                <tr className="border-b border-border uppercase tracking-wide text-muted">
+                <tr className="border-b border-border text-muted">
                    {["test", "n_prompt", "n_gen", "threads", "ngl", "batch", "ubatch", "ctk", "ctv", "fa", "Tok/s", "stddev", "ram MiB", "vram MiB"].map(
                     (h) => (
                       <Th key={h} label={h} description={LEGACY_COLUMN_DESCRIPTIONS[h]} className="!px-3 !py-2" />
@@ -1667,8 +1667,8 @@ export function TestDetail() {
       )}
 
       {results.length > 0 && fillCurveCtx != null && (
-        <div className="mt-6 rounded-xl border border-border bg-surface p-4">
-          <span className="text-[11px] font-semibold uppercase tracking-wide text-muted">
+        <div className="mt-6 border-t border-border pt-4">
+          <span className="text-[11px] font-semibold text-muted">
             Prefill along the context fill · -c {fillCurveCtx.toLocaleString()}
           </span>
           <div className="mt-2">
@@ -1678,7 +1678,7 @@ export function TestDetail() {
       )}
 
       {results.length > 0 && fillCurveCtx == null && (
-        <div className="relative mt-6 h-72 rounded-xl border border-border bg-surface p-4">
+        <div className="relative mt-6 h-72">
           {chartConfig && <Chart config={chartConfig} />}
         </div>
       )}

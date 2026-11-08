@@ -35,16 +35,26 @@ export function FitMapSection({
   onTrigger,
   onAddCandidate,
   candidateKeys,
+  kv,
+  n = "2",
+  title = "Find the best fit",
 }: {
   ctx: FlowContext;
   fitRun: FlowRun | null;
   fit: FitData | null;
   onTrigger: (payload: Parameters<FlowContext["trigger"]>[1]) => Promise<void>;
-  onAddCandidate: (c: SpeedCandidate) => void;
+  /** Unset: the step proposes its own speed tests, so no "Add" button. */
+  onAddCandidate?: (c: SpeedCandidate) => void;
   candidateKeys: Set<string>;
+  /** Fixed by the step: false = flash attention on/off only (step 5), true =
+   * every K/V cache this build runs (step 6). Unset = the user's checkbox. */
+  kv?: boolean;
+  n?: string;
+  title?: string;
 }) {
   const [margin, setMargin] = useState<FitMarginMib>(DEFAULT_FIT_MARGIN_MIB);
-  const [withKv, setWithKv] = useState(true);
+  const [withKvChoice, setWithKv] = useState(true);
+  const withKv = kv ?? withKvChoice;
   const [selection, setSelection] = useState<FitSelection | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [starting, setStarting] = useState(false);
@@ -108,14 +118,14 @@ export function FitMapSection({
   return (
     <Panel>
       <StepTitle
-        n="2"
+        n={n}
         right={
           <span className="font-mono text-xs text-muted">
             {ctx.machine === "dgpu" ? "context × layers · FA on / off" : "max context · FA on / off"}
           </span>
         }
       >
-        Find the best fit
+        {title}
       </StepTitle>
       <p className="mb-3 text-sm text-fg-2">
         llama-fit-params sizes every context from 4k up to {ctxLabel(stops[stops.length - 1])} against this machine&apos;s memory without loading
@@ -135,25 +145,32 @@ export function FitMapSection({
           />
           <span className="text-xs text-muted">{MARGIN_HINT[margin]}</span>
         </div>
-        <Kicker>KV caches</Kicker>
-        <label className="flex cursor-pointer items-start gap-2.5 text-sm">
-          <input type="checkbox" checked={withKv} disabled={running} onChange={(e) => setWithKv(e.target.checked)} className="mt-0.5 h-[18px] w-[18px] accent-[var(--color-accent)]" />
-          <span>
-            Detect quantized K/V caches and map each one
-            <span className="block text-xs text-muted">{KV_QUALITY_WARNING}</span>
-          </span>
-        </label>
+        {kv === undefined && (
+          <>
+            <Kicker>KV caches</Kicker>
+            <label className="flex cursor-pointer items-start gap-2.5 text-sm">
+              <input type="checkbox" checked={withKv} disabled={running} onChange={(e) => setWithKv(e.target.checked)} className="mt-0.5 h-[18px] w-[18px] accent-[var(--color-accent)]" />
+              <span>
+                Detect quantized K/V caches and map each one
+                <span className="block text-xs text-muted">{KV_QUALITY_WARNING}</span>
+              </span>
+            </label>
+          </>
+        )}
       </div>
 
       <div className="flex flex-wrap items-center gap-3">
         <Btn kind="primary" onClick={run} disabled={running || starting || !ctx.canFit || ctx.machineOffline}>
-          {running ? "Mapping…" : fit?.points.length ? "Map again" : "Map context × layers"}
+          {running ? "Mapping…" : fit?.points.length ? "Map again" : kv ? "Map KV cache types" : "Map context × layers"}
         </Btn>
         <span className="font-mono text-xs text-muted">
           {stops.length} contexts · {fmtDuration(eta)} · no model load
         </span>
       </div>
       {!ctx.canFit && <div className="mt-3"><Notice tone="warn">{ctx.canFitReason}</Notice></div>}
+      {ctx.canFit && ctx.machineOffline && !running && (
+        <p className="mt-2 text-sm text-muted">{ctx.worker.displayName} is offline — start its worker to map.</p>
+      )}
       {error && <div className="mt-3"><Notice tone="fail">{error}</Notice></div>}
       {running && (
         <div className="mt-3 flex flex-col gap-1.5" aria-live="polite">
@@ -221,7 +238,7 @@ export function FitMapSection({
               </div>
               {!unified && selPoint.total_mib != null && selPoint.total_mib > 0 && (
                 <div className="flex flex-col gap-1.5">
-                  <div className="flex h-[22px] border border-border" aria-hidden="true">
+                  <div className="flex h-[22px]" aria-hidden="true">
                     <div className="bg-accent" style={{ width: `${vramShare}%` }} />
                     <div className="bg-border-strong" style={{ width: `${100 - vramShare}%` }} />
                   </div>
@@ -239,14 +256,16 @@ export function FitMapSection({
               {selCandidate && (
                 <div className="flex flex-col gap-2.5">
                   <CopyCommand command={serverCommandLine(ctx.modelFile, selPoint.ctx, selCandidate)} />
-                  <div className="flex flex-wrap items-center gap-2.5">
-                    <Btn kind="primary" disabled={added} onClick={() => onAddCandidate(selCandidate)}>
-                      {added ? "In the speed tests" : "Add to speed tests"}
-                    </Btn>
-                    {selPoint.ctx !== target && (
-                      <span className="text-xs text-muted">Speed tests run at your target context ({ctxLabel(target)}) with this placement.</span>
-                    )}
-                  </div>
+                  {onAddCandidate && (
+                    <div className="flex flex-wrap items-center gap-2.5">
+                      <Btn kind="primary" disabled={added} onClick={() => onAddCandidate(selCandidate)}>
+                        {added ? "In the speed tests" : "Add to speed tests"}
+                      </Btn>
+                      {selPoint.ctx !== target && (
+                        <span className="text-xs text-muted">Speed tests run at your target context ({ctxLabel(target)}) with this placement.</span>
+                      )}
+                    </div>
+                  )}
                 </div>
               )}
             </>

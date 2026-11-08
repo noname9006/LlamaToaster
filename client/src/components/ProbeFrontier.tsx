@@ -177,7 +177,7 @@ export function ProbeFrontier({ testId, refreshKey }: { testId: string; refreshK
   const anyUnjudged = curve.some((s) => s.clean.resolved && s.clean.value != null && !s.clean.judged);
 
   return (
-    <div className="rounded-xl border border-border bg-surface p-4">
+    <div className="border-t border-border pt-4">
       <h3 className="text-[12.5px] font-semibold text-fg">Layers against context</h3>
       <p className="mt-1 text-[11px] leading-relaxed text-muted">
         Two answers per context, smallest context first. <span className="text-fg">No spill</span>: the most layers whose GPU

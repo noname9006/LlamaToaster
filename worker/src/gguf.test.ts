@@ -92,10 +92,34 @@ describe("readGgufInfo", () => {
     expect(info.debugReason).toBeUndefined();
   });
 
-  // Trained context + KV geometry -- resolved via the same suffix-matching
+  it("reads the MoE expert counts, and leaves them null for a dense model", async () => {
+    const moe = await readGgufInfo(
+      writeTempGguf([
+        ["llama4.expert_used_count", T.UINT32, 1],
+        ["general.architecture", T.STRING, "llama4"],
+        ["llama4.block_count", T.UINT32, 48],
+        ["llama4.expert_count", T.UINT32, 16],
+        ["llama4.context_length", T.UINT32, 10485760],
+      ])
+    );
+    expect(moe.expert_count).toBe(16);
+    expect(moe.expert_used_count).toBe(1);
+    expect(moe.trained_ctx).toBe(10485760);
+    const dense = await readGgufInfo(
+      writeTempGguf([
+        ["general.architecture", T.STRING, "qwen3"],
+        ["qwen3.block_count", T.UINT32, 36],
+        ["qwen3.expert_count", T.UINT32, 0],
+      ])
+    );
+    expect(dense.expert_count).toBeNull();
+    expect(dense.expert_used_count).toBeNull();
+  });
+
+  // Maximum context + KV geometry -- resolved via the same suffix-matching
   // walk as block_count, keyed off the file's own architecture,
   // so keys that appear before general.architecture are still found.
-  it("resolves trained context and KV-cache geometry from architecture-prefixed keys", async () => {
+  it("resolves maximum context and KV-cache geometry from architecture-prefixed keys", async () => {
     const path = writeTempGguf([
       ["general.architecture", T.STRING, "qwen3"],
       ["qwen3.block_count", T.UINT32, 36],
@@ -306,7 +330,7 @@ describe("readGgufInfo", () => {
     expect(info.n_head).toBe(28);
   });
 
-  it("leaves trained context / KV fields null when their header keys are absent", async () => {
+  it("leaves maximum context / KV fields null when their header keys are absent", async () => {
     const path = writeTempGguf([
       ["general.architecture", T.STRING, "qwen35"],
       ["qwen35.block_count", T.UINT32, 12],

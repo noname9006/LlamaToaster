@@ -6,7 +6,7 @@ import { generateEnrolmentCode, generateUserCode, hashToken } from "../session.j
 import { parseDeviceStart, parseDeviceToken, parseDeviceChallenge, parseRegisterKey } from "../validate-worker-state.js";
 import { resolveWorkerSession } from "../worker-auth.js";
 import type { DeviceStartInput } from "../validate-worker-state.js";
-import { NotFoundError, ConflictError, BadRequestError, ForbiddenError, UnauthorizedError } from "../errors.js";
+import { NotFoundError, ConflictError, BadRequestError, ForbiddenError, HttpError, UnauthorizedError } from "../errors.js";
 import { reenrolMessage } from "../../../shared/machineKey.js";
 import type { AuthenticatedRequest } from "../auth-middleware.js";
 import { userOrIpKeyGenerator, assertOwnsWorker } from "../auth-middleware.js";
@@ -21,6 +21,7 @@ import type {
 
 const ENROLMENT_TTL_MS = 15 * 60 * 1000;
 const CHALLENGE_TTL_MS = 60 * 1000;
+export const MAX_PENDING_ENROLMENTS = 2_000;
 
 // user_codes are looked up across first enrolments and re-enrolments alike,
 // so a fresh one must be free in both tables. Collisions are ~1 in 10^12;
@@ -75,10 +76,10 @@ export async function deviceRoutes(app: FastifyInstance): Promise<void> {
   // see the security finding C1 comment below).
   app.post(
     "/api/device/start",
-    // 16KB, not the old 4KB -- this now also carries a HardwareInfo blob
-    // (cpu flags, gpu list, ...), same shape/validator as the heartbeat path
-    // but nowhere near that route's 1MB WORKER_BODY_LIMIT (queue.ts).
-    { config: { bodyLimit: 16_384, rateLimit: { max: 30, timeWindow: "1 minute" } } },
+    // Carries a HardwareInfo blob (cpu flags, gpu list, per-core topology), same
+    // shape/validator as the heartbeat path. Sized for the validator's own
+    // ceiling of 1,024 cores, far below that route's 1MB WORKER_BODY_LIMIT.
+    { bodyLimit: 128 * 1024, config: { rateLimit: { max: 30, timeWindow: "1 minute" } } },
     async (req): Promise<DeviceStartResponse> => {
       const input = parseDeviceStart(req.body);
       const { machine_id, hostname, platform, arch, hardware, public_key: publicKey } = input;
@@ -90,6 +91,11 @@ export async function deviceRoutes(app: FastifyInstance): Promise<void> {
       const existing = repo.workerRepo.getByMachineId(machine_id);
       const enrolment = existing ? repo.workerRepo.getEnrolmentById(existing.id) : undefined;
       if (!enrolment) {
+        // A bound on what this public route can hold at once, whatever the
+        // per-IP limit lets through across many addresses (audit 2026-11-01 E1).
+        if (repo.workerRepo.countPendingEnrolments() >= MAX_PENDING_ENROLMENTS) {
+          throw new HttpError("too many machines are waiting for approval -- try again in a few minutes", 429);
+        }
         repo.workerRepo.createPending({ machineId: machine_id, hostname, platform, arch, deviceCode, userCode, expiresAt, hardware, publicKey });
       } else if (!enrolment.userId) {
         // Nobody owns it yet (a retried first enrolment, or a Stage 1
@@ -136,7 +142,7 @@ export async function deviceRoutes(app: FastifyInstance): Promise<void> {
   // caller asking for nonces never invalidates another's.
   app.post(
     "/api/device/challenge",
-    { config: { bodyLimit: 1_024, rateLimit: { max: 30, timeWindow: "1 minute" } } },
+    { bodyLimit: 1_024, config: { rateLimit: { max: 30, timeWindow: "1 minute" } } },
     async (req): Promise<DeviceChallengeResponse> => {
       const { machine_id } = parseDeviceChallenge(req.body);
       const nonce = randomBytes(32).toString("base64url");
@@ -152,7 +158,7 @@ export async function deviceRoutes(app: FastifyInstance): Promise<void> {
   // middleware; this handler accepts an enrolled worker session only, never
   // the shared deployment secret (a shared-token machine has no owner to
   // reconnect to).
-  app.post("/api/worker/register-key", { config: { bodyLimit: 2_048 } }, async (req, reply) => {
+  app.post("/api/worker/register-key", { bodyLimit: 2_048 }, async (req, reply) => {
     const worker = resolveWorkerSession(req);
     if (!worker) throw new UnauthorizedError("this route requires an enrolled worker session");
     const { public_key } = parseRegisterKey(req.body);
@@ -173,7 +179,7 @@ export async function deviceRoutes(app: FastifyInstance): Promise<void> {
   // approve() -- is where the code actually gets consumed).
   app.post(
     "/api/device/token",
-    { config: { bodyLimit: 1_024, rateLimit: { max: 60, timeWindow: "1 minute" } } },
+    { bodyLimit: 1_024, config: { rateLimit: { max: 60, timeWindow: "1 minute" } } },
     async (req, reply): Promise<DeviceTokenSuccess | DeviceTokenError> => {
       const { device_code } = parseDeviceToken(req.body);
       const codeHash = hashToken(device_code);
@@ -228,7 +234,13 @@ export async function deviceRoutes(app: FastifyInstance): Promise<void> {
 // and reasoning as routes/sessions.ts's sessionRoutes: these read req.user
 // unconditionally, which only the auth middleware ever populates.
 export async function deviceApprovalRoutes(app: FastifyInstance): Promise<void> {
-  app.get<{ Querystring: { user_code?: string } }>("/api/device/status", async (req): Promise<DeviceStatusResponse> => {
+  // 60/min covers the client's 2s poll of one code with headroom; status answers "is this a live code, and whose
+  // machine is it" for any guess, so leaving it unthrottled would let an
+  // attacker find a valid code at full speed and spend one approve on it.
+  app.get<{ Querystring: { user_code?: string } }>(
+    "/api/device/status",
+    { config: { rateLimit: { max: 60, timeWindow: "1 minute", keyGenerator: userOrIpKeyGenerator } } },
+    async (req): Promise<DeviceStatusResponse> => {
     const userCode = req.query.user_code ?? "";
     const worker = repo.workerRepo.getByUserCode(userCode);
     if (!worker) {
@@ -272,13 +284,15 @@ export async function deviceApprovalRoutes(app: FastifyInstance): Promise<void> 
       machine: { hostname: worker.hostname, platform: worker.platform, arch: worker.arch, gpu: worker.gpuModel },
       possibleDuplicate,
     };
-  });
+    }
+  );
 
   app.post<{ Body: { user_code?: string; confirm_duplicate?: boolean; merge_into?: string } }>(
     "/api/device/approve",
     { config: { rateLimit: { max: 20, timeWindow: "1 minute", keyGenerator: userOrIpKeyGenerator } } },
     async (req): Promise<DeviceApproveResponse> => {
-      const userCode = req.body.user_code ?? "";
+      if (!req.body || typeof req.body !== "object") throw new BadRequestError("user_code is required");
+      const userCode = typeof req.body.user_code === "string" ? req.body.user_code : "";
       const worker = repo.workerRepo.getByUserCode(userCode);
       if (!worker) {
         const attempt = repo.workerRepo.getReenrolmentByUserCode(userCode);

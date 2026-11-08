@@ -149,7 +149,7 @@ export function CopyCommandButton({ text }: { text: string }) {
           setTimeout(() => setCopied(false), 1500);
         }
       }}
-      className="flex flex-none items-center gap-1 self-start rounded-md border border-border px-2 py-1 text-[11px] font-medium text-muted hover:border-accent/40 hover:text-accent"
+      className="flex flex-none items-center gap-1 self-start rounded-md border border-border-strong px-2 py-1 text-[11px] font-medium text-muted hover:border-accent/40 hover:text-accent"
     >
       {copied ? (
         <>
@@ -191,7 +191,7 @@ function InstallProgressBar({ progress }: { progress: ActiveJobReport }) {
   const total = typeof progress.total_bytes === "number" && progress.total_bytes > 0 ? progress.total_bytes : null;
   const pct = total !== null ? Math.min(100, Math.round(((progress.bytes ?? 0) / total) * 100)) : null;
   return (
-    <div className="mt-3 rounded-lg border border-border bg-surface-raised px-3 py-2">
+    <div className="mt-3 bg-surface px-3 py-2">
       <div className="flex items-center justify-between gap-2 text-[13px]">
         <div className="flex min-w-0 items-center gap-2">
           <IconDownload width={13} height={13} className="shrink-0 text-accent" />
@@ -227,7 +227,7 @@ function InstallProgressBar({ progress }: { progress: ActiveJobReport }) {
 function BusyPhaseCard({ phase, detail }: { phase?: string; detail?: string }) {
   const label = detail || (phase ? `${phase}…` : "working…");
   return (
-    <div className="mt-3 rounded-lg border border-border bg-surface-raised px-3 py-2">
+    <div className="mt-3 bg-surface px-3 py-2">
       <div className="flex items-center gap-2 text-[13px]">
         <span
           aria-hidden
@@ -487,7 +487,7 @@ export function WorkerCard({ worker, onRefresh }: { worker: Worker; onRefresh: (
               `Queued: install ${rel.tag} (${asset.name})`
             );
           }}
-          className="flex items-center gap-1.5 rounded-md border border-border px-2.5 py-1 text-xs font-semibold text-fg hover:border-accent/40 hover:text-accent disabled:opacity-50"
+          className="flex items-center gap-1.5 rounded-md border border-border-strong px-2.5 py-1 text-xs font-semibold text-fg hover:border-accent/40 hover:text-accent disabled:opacity-50"
         >
           <IconDownload width={14} height={14} />
           {busyTag === busyKey ? "Queuing…" : "Install"}
@@ -507,7 +507,7 @@ export function WorkerCard({ worker, onRefresh }: { worker: Worker; onRefresh: (
       : undefined;
 
   return (
-    <div id={`machine-${worker.id}`} className="scroll-mt-4 rounded-xl border border-border bg-surface p-5">
+    <div id={`machine-${worker.id}`} className="scroll-mt-4 border-t-2 border-border pt-5">
       <div className="flex flex-wrap items-center justify-between gap-2">
         {renaming ? (
           <input
@@ -523,7 +523,7 @@ export function WorkerCard({ worker, onRefresh }: { worker: Worker; onRefresh: (
               }
             }}
             maxLength={100}
-            className="rounded-lg border border-border bg-surface px-2 py-1 text-lg font-semibold text-fg outline-none focus:border-accent/50"
+            className="rounded-lg border border-border-strong bg-surface px-2 py-1 text-lg font-semibold text-fg outline-none focus:border-accent/50"
           />
         ) : (
           <button
@@ -595,8 +595,8 @@ export function WorkerCard({ worker, onRefresh }: { worker: Worker; onRefresh: (
           </button>
         </div>
       )}
-      <details className="group mt-3 rounded-lg border border-border bg-surface-raised">
-        <summary className="flex cursor-pointer items-center justify-between px-2.5 py-1.5 text-xs font-semibold uppercase tracking-wide text-muted">
+      <details className="group mt-3 bg-surface">
+        <summary className="flex cursor-pointer items-center justify-between px-2.5 py-1.5 text-xs font-semibold text-muted">
           Setup / restart commands
           <IconChevronDown width={14} height={14} className="transition-transform group-open:rotate-180" />
         </summary>
@@ -634,7 +634,7 @@ export function WorkerCard({ worker, onRefresh }: { worker: Worker; onRefresh: (
                   {effectiveOS === "windows" && <PowerShellNotice />}
                 </div>
                 {buildSetupScenarios(window.location.origin).map((scenario, i) => (
-                  <div key={scenario.title} className="overflow-hidden rounded-lg border border-border">
+                  <div key={scenario.title} className="overflow-hidden">
                     <div className="bg-surface-raised px-3 py-2.5">
                       <div className="flex items-center gap-2">
                         <span className="flex h-5 w-5 flex-none items-center justify-center rounded-md bg-accent/15 font-mono text-[11px] font-bold text-accent">
@@ -655,7 +655,7 @@ export function WorkerCard({ worker, onRefresh }: { worker: Worker; onRefresh: (
                           href={scenario.sourceUrl[effectiveOS]}
                           target="_blank"
                           rel="noreferrer noopener"
-                          className="flex-none self-start rounded-md border border-border px-2 py-1 text-[11px] font-medium text-muted hover:border-accent/40 hover:text-accent"
+                          className="flex-none self-start rounded-md border border-border-strong px-2 py-1 text-[11px] font-medium text-muted hover:border-accent/40 hover:text-accent"
                         >
                           View source
                         </a>
@@ -694,7 +694,7 @@ export function WorkerCard({ worker, onRefresh }: { worker: Worker; onRefresh: (
       {!inaccessible && (
         <>
           <div className="mt-4">
-            <h4 className="text-xs font-semibold uppercase tracking-wide text-muted">Hardware &amp; OS</h4>
+            <h4 className="text-xs font-semibold text-muted">Hardware &amp; OS</h4>
             {/* One row per piece: OS, CPU, RAM, and every GPU (max usable / total VRAM). */}
             <div className="mt-1.5">
               <HardwareSummary hardware={worker.hardware} platform={`${worker.platform} (${worker.arch})`} layout="lines" />
@@ -734,7 +734,7 @@ export function WorkerCard({ worker, onRefresh }: { worker: Worker; onRefresh: (
           )}
 
           <div className="mt-4">
-            <h4 className="text-xs font-semibold uppercase tracking-wide text-muted">Downloaded</h4>
+            <h4 className="text-xs font-semibold text-muted">Downloaded</h4>
             {worker.installedBuilds.length === 0 ? (
               <p className="mt-1.5 text-sm text-muted">No builds installed yet.</p>
             ) : (
@@ -821,7 +821,7 @@ export function WorkerCard({ worker, onRefresh }: { worker: Worker; onRefresh: (
                                 `Queued: delete ${b.tag}`
                               );
                             }}
-                            className="rounded-md border border-border p-1.5 text-muted hover:border-danger/40 hover:text-danger disabled:opacity-50"
+                            className="rounded-md border border-border-strong p-1.5 text-muted hover:border-danger/40 hover:text-danger disabled:opacity-50"
                             aria-label={`Delete ${b.tag}`}
                           >
                             <IconTrash width={14} height={14} />
@@ -838,14 +838,14 @@ export function WorkerCard({ worker, onRefresh }: { worker: Worker; onRefresh: (
 
           <div className="mt-4">
             <div className="flex flex-wrap items-center justify-between gap-2">
-              <h4 className="m-0 text-xs font-semibold uppercase tracking-wide text-muted">Available to install</h4>
+              <h4 className="m-0 text-xs font-semibold text-muted">Available to install</h4>
               {otherBackends.length > 0 && worker.backend && (
                 <label className="flex items-center gap-1.5 text-xs text-muted">
                   Backend
                   <select
                     value={shownBackend ?? ""}
                     onChange={(e) => setBrowseBackend(e.target.value === worker.backend ? null : e.target.value)}
-                    className="rounded border border-border bg-surface px-1.5 py-0.5 text-xs text-fg outline-none focus:border-accent"
+                    className="rounded border border-border-strong bg-surface px-1.5 py-0.5 text-xs text-fg outline-none focus:border-accent"
                   >
                     {Array.from(new Set([worker.backend, ...otherBackends, ...(shownBackend ? [shownBackend] : [])])).map((b) => (
                       <option key={b} value={b}>

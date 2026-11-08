@@ -439,6 +439,7 @@ describe("run stop/pause/resume cross-user isolation (§4.3)", () => {
     const worker = repo.workerRepo.getByMachineId(machineId)!;
     const db = (await import("../db/migrate.js")).getDb();
     db.prepare(`UPDATE workers SET user_id = ? WHERE id = ?`).run(owner.userId, worker.id);
+    repo.addModelRegistration(owner.userId, "model-1");
     const res = await fetch(`${baseUrl}/api/runs/trigger`, {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${owner.token}` },

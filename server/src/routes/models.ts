@@ -1,6 +1,6 @@
 import type { FastifyInstance } from "fastify";
 import { deriveModelId, repo } from "../db/repo.js";
-import { getHfGgufMeta } from "../hf.js";
+import { getHfGgufMeta, HF_REPO_PATTERN, isHfFilePath } from "../hf.js";
 import {
   lookupHfGgufHashes,
   verifyRepoInBackground,
@@ -25,6 +25,7 @@ const HF_META_TIMEOUT_MS = 15_000;
 // modelCooldownUntil -- reset on process restart, which is fine for a
 // last-modified check that's only ever a "possibly newer" hint anyway.
 const HF_UPDATES_CACHE_TTL_MS = 10 * 60 * 1000;
+const MAX_CLIENT_METADATA_BYTES = 64 * 1024;
 const hfUpdatesCache = new Map<string, { value: string | null; expiresAt: number }>();
 
 // §2.6: 60/hour, keyed on user (IP fallback, same reasoning as
@@ -32,13 +33,18 @@ const hfUpdatesCache = new Map<string, { value: string | null; expiresAt: number
 // backfill routes below, all comparably cheap-but-not-free registry writes.
 const REGISTRY_WRITE_RATE_LIMIT = { max: 60, timeWindow: "1 hour", keyGenerator: userOrIpKeyGenerator } as const;
 const HASH_LOOKUP_RATE_LIMIT = { max: 120, timeWindow: "1 hour", keyGenerator: userOrIpKeyGenerator } as const;
+// One call per model-picker load, fanning out to HF per repo the first time.
+const HF_UPDATES_RATE_LIMIT = { max: 240, timeWindow: "1 hour", keyGenerator: userOrIpKeyGenerator } as const;
 
 // A model the caller may act on: with accounts, only one in their own list
-// (repo.listModelsVisibleTo), answered 404 otherwise -- same as a missing id,
+// (repo.isModelVisibleTo), answered 404 otherwise -- same as a missing id,
 // so the route doesn't confirm another tenant's catalog row exists.
 function findVisibleModel(id: string, userId: string | undefined): Model | undefined {
-  if (userId === undefined) return repo.getModel(id);
-  return repo.listModelsVisibleTo(userId).find((m) => m.id === id);
+  return repo.getModelVisibleTo(userId, id);
+}
+
+function withOwnMetadata(model: Model, own: RegisterModelInput["metadata"] | undefined): Model {
+  return own ? { ...model, metadata: { ...model.metadata, ...own } } : model;
 }
 
 export async function modelsRoutes(app: FastifyInstance): Promise<void> {
@@ -94,6 +100,16 @@ export async function modelsRoutes(app: FastifyInstance): Promise<void> {
       if (metadata !== undefined && (metadata === null || typeof metadata !== "object" || Array.isArray(metadata))) {
         return reply.code(400).send({ error: "metadata must be an object" });
       }
+      if (metadata !== undefined && JSON.stringify(metadata).length > MAX_CLIENT_METADATA_BYTES) {
+        return reply.code(400).send({ error: "metadata is too large" });
+      }
+      // These reach Hugging Face URLs and the worker's model directory.
+      if (hf_repo !== undefined && !HF_REPO_PATTERN.test(hf_repo as string)) {
+        return reply.code(400).send({ error: "hf_repo must look like org/name" });
+      }
+      if (hf_file !== undefined && !isHfFilePath(hf_file)) {
+        return reply.code(400).send({ error: "hf_file must be a relative path to a .gguf file" });
+      }
       if (source === "huggingface" && (!hf_repo || !hf_file)) {
         return reply
           .code(400)
@@ -114,14 +130,21 @@ export async function modelsRoutes(app: FastifyInstance): Promise<void> {
         }
       }
       const authed = resolveAuthUser(request);
+      // With accounts, a derived id is one row shared by everyone who adds this
+      // file, so what the first of them typed can't be what the rest are served
+      // (audit 2026-11-01 D4). The row keeps only what the id is derived from,
+      // and each adder's own metadata becomes their own reading of it, on top
+      // of the shared row for them alone (repo.listModelsVisibleTo).
+      const sharedRow = !!authed && !id;
+      const ownMetadata = sharedRow && metadata && Object.keys(metadata).length > 0 ? (metadata as RegisterModelInput["metadata"]) : undefined;
       const input: RegisterModelInput = {
         id,
-        filename: filename as string | undefined,
-        size_bytes: size_bytes as number | undefined,
+        filename: sharedRow && source === "huggingface" ? (hf_file as string).split("/").pop() : (filename as string | undefined),
+        size_bytes: sharedRow && source === "huggingface" ? 0 : (size_bytes as number | undefined),
         source,
         hf_repo: hf_repo as string | undefined,
         hf_file: hf_file as string | undefined,
-        metadata: metadata as RegisterModelInput["metadata"],
+        metadata: sharedRow ? {} : (metadata as RegisterModelInput["metadata"]),
         // Multi-user Stage 4 (MULTIUSER_PLAN.md §4.4) -- undefined in
         // single-tenant mode, matching every other userId in this app.
         created_by: authed?.user.id,
@@ -131,7 +154,8 @@ export async function modelsRoutes(app: FastifyInstance): Promise<void> {
         // Only a derived-id row can be shared by several adders; an explicit
         // id is the creator's alone (created_by covers it).
         if (authed && !id) repo.addModelRegistration(authed.user.id, model.id);
-        return reply.code(201).send({ model });
+        if (authed && ownMetadata) repo.recordHeaderReport(model.id, authed.user.id, ownMetadata);
+        return reply.code(201).send({ model: withOwnMetadata(model, ownMetadata) });
       }
       // No id sent: the id is derived from the repo/file (or name/size), the
       // same for everyone, so an existing row is this very model. Adding it
@@ -139,7 +163,8 @@ export async function modelsRoutes(app: FastifyInstance): Promise<void> {
       if (!id) {
         const existing = repo.getModel(deriveModelId(input))!;
         if (authed) repo.addModelRegistration(authed.user.id, existing.id);
-        return reply.code(200).send({ model: existing });
+        if (authed && ownMetadata) repo.recordHeaderReport(existing.id, authed.user.id, ownMetadata);
+        return reply.code(200).send({ model: withOwnMetadata(existing, ownMetadata) });
       }
       // An explicit id that's taken: never touched from here.
       return reply.code(409).send({ error: "a model with this id is already registered" });
@@ -156,6 +181,11 @@ export async function modelsRoutes(app: FastifyInstance): Promise<void> {
     // catalog entry other tenants may depend on, so with auth on only a
     // superadmin may delete it. Single-tenant mode (no session) is unchanged.
     const authed = resolveAuthUser(request);
+    // Someone else's row answers as if it weren't there (audit A11). A
+    // superadmin keeps access, for the shared-catalog deletes below.
+    if (authed && !authed.user.isSuperadmin && !repo.isModelVisibleTo(authed.user.id, existing.id)) {
+      return reply.code(404).send({ error: "model not found" });
+    }
     const createdBy = repo.getModelCreatedBy(existing.id);
     // Someone else also added this model (POST /api/models joins a shared
     // derived row), so the row isn't the caller's alone: take it off their
@@ -362,7 +392,7 @@ export async function modelsRoutes(app: FastifyInstance): Promise<void> {
   // are checked; local models have nothing to compare against. Requests are
   // deduped by repo since several registered models (different quants) often
   // share one -- no reason to ask HF the same question twice.
-  app.get("/api/models/hf-updates", async (request) => {
+  app.get("/api/models/hf-updates", { config: { rateLimit: HF_UPDATES_RATE_LIMIT } }, async (request) => {
     const withRepo = repo.listModelsVisibleTo(resolveAuthUser(request)?.user.id).filter((m): m is typeof m & { hf_repo: string } => Boolean(m.hf_repo));
     const byRepo = new Map<string, Promise<string | null>>();
     for (const m of withRepo) {

@@ -78,7 +78,7 @@ function MachineCard({
   const stateLabel = testing ? "Testing" : offline ? "Offline" : queued ? `Online · ${queued} queued` : "Online · idle";
 
   return (
-    <article className={`relative flex flex-col gap-3 border bg-surface p-4 ${testing ? "border-accent" : "border-border"} ${hidden ? "border-dashed opacity-60" : ""}`}>
+    <article className={`relative flex flex-col gap-3 border-t-2 pt-4 ${testing ? "border-accent" : "border-border"} ${hidden ? "border-dashed opacity-60" : ""}`}>
       {testing && (
         <span aria-hidden="true" className="absolute -top-3.5 right-6 flex gap-1.5">
           <span className="lt-steam block h-3 w-0.5 bg-muted" />
@@ -107,14 +107,14 @@ function MachineCard({
           <span>{memLabel}</span>
           <span>{offline || used == null || total == null ? `— / ${total ? (total / 1024).toFixed(1) : "?"} GB` : `${(used / 1024).toFixed(1)} / ${(total / 1024).toFixed(1)} GB`}</span>
         </div>
-        <div aria-hidden="true" className="mt-1 h-3 border border-border-strong bg-well p-0.5 shadow-[inset_0_2px_0_var(--color-bg)]">
+        <div aria-hidden="true" className="mt-1 h-3 bg-surface-raised p-0.5">
           <span className="block h-full bg-muted" style={{ width: `${offline ? 0 : pct}%` }} />
         </div>
       </div>
       {testing ? (
         <div>
           <p className="m-0 text-sm text-fg">{active ? `${modelLabel(active)} · ${kindLabel(active)}` : progress?.phase ?? "working"}</p>
-          <div className="mt-1.5 h-2 border border-border-strong bg-well">
+          <div className="mt-1.5 h-2 bg-surface-raised">
             <span className="lt-progress-fill block h-full" style={{ width: `${Math.max(5, progressPct)}%` }} />
           </div>
           {progress?.detail && <p className="mt-1.5 truncate font-mono text-xs text-fg-2">{progress.detail}</p>}
@@ -217,7 +217,7 @@ export function Dashboard() {
       />
 
       {allOffline && (
-        <div role="alert" className="mb-5 flex flex-wrap items-center gap-x-5 gap-y-3 border border-border-strong bg-surface px-[18px] py-4">
+        <div role="alert" className="mb-6 flex flex-wrap items-center gap-x-5 gap-y-3 bg-surface px-5 py-4">
           <LtIcon name="offline" size={22} className="text-fg-2" />
           <div className="flex-[1_1_280px]">
             <h2 className="m-0 font-display text-lg font-semibold">Every bay is cold</h2>
@@ -252,7 +252,7 @@ export function Dashboard() {
               onUnhide={() => setHidden(hiddenWorkerIds.filter((x) => x !== w.id))}
             />
           ))}
-          <article className="flex flex-col justify-center gap-2 border border-dashed border-border-strong p-4">
+          <article className="flex flex-col justify-center gap-2 border-t-2 border-dashed border-border pt-4">
             <h3 className="m-0 font-display text-lg font-semibold">{loaded && workers.length === 0 ? "No machines yet" : "Empty bay"}</h3>
             <p className="m-0 text-fg-2">
               {loaded && workers.length === 0 ? "LlamaToaster runs benchmarks on your own hardware — connecting one takes a minute." : "Add another machine with a one-time enrolment code."}
@@ -264,8 +264,8 @@ export function Dashboard() {
         </div>
       </section>
 
-      <section aria-labelledby="h-recent" className="mt-7 border border-border bg-surface">
-        <div className="flex items-center justify-between gap-3 border-b border-border px-4 py-3">
+      <section aria-labelledby="h-recent" className="mt-10">
+        <div className="flex items-center justify-between gap-3 border-b border-border pb-3">
           <h2 id="h-recent" className="m-0 font-display text-lg font-semibold">Recent tests</h2>
           <Link to="/tests" className="text-sm font-medium text-accent">
             All tests
@@ -276,7 +276,7 @@ export function Dashboard() {
           {recent.map((t) => {
             const st = testStatusView(t);
             return (
-              <li key={t.id} className="flex flex-wrap items-center gap-x-4 gap-y-1 border-b border-border px-4 py-2.5 last:border-b-0">
+              <li key={t.id} className="flex flex-wrap items-center gap-x-4 gap-y-1 border-b border-border py-2.5 last:border-b-0">
                 <div className="min-w-0 flex-[1_1_200px]">
                   <Link to={`/tests/${t.id}`} className="text-sm font-medium text-fg hover:text-accent">
                     {modelLabel(t)}

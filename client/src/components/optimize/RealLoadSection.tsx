@@ -227,7 +227,7 @@ function RealLoadResult({
 
   return (
     <div className="mt-4 overflow-x-auto">
-      <table className="w-full border-collapse border border-border text-left">
+      <table className="w-full border-collapse text-left">
         <thead>
           <tr className="border-b border-border-strong font-mono text-xs text-muted">
             <th scope="col" className="px-3 py-2 font-normal">Context</th>

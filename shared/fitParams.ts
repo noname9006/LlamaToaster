@@ -31,7 +31,7 @@ export const FIT_MIN_CTX = 4096;
  * walking every layer count) took 38 s. */
 export const FIT_CALL_TIMEOUT_MS = 60_000;
 
-/** Doublings from 4096 up to the model's trained context, plus the trained
+/** Doublings from 4096 up to the model's maximum context, plus the maximum
  * context itself when it isn't a power of two. */
 export function fitCtxStops(nCtxTrain: number | null | undefined): number[] {
   const ceiling = Math.max(FIT_MIN_CTX, Math.floor(nCtxTrain && nCtxTrain > 0 ? nCtxTrain : FIT_MIN_CTX));
@@ -45,7 +45,10 @@ export type FitFaMode = "on" | "off";
 
 export interface FitArgsInput {
   modelPath: string;
-  ctx: number;
+  /** Null leaves -c unset on purpose: fit then shrinks the context (down to
+   * FIT_MIN_CTX) before it moves any layer, so its answer is the longest
+   * context that keeps every layer on the GPU (bread grades 5 and 4). */
+  ctx: number | null;
   fa: FitFaMode | "auto";
   ctk?: string;
   ctv?: string;
@@ -61,8 +64,7 @@ export function buildFitArgs(input: FitArgsInput): string[] {
   const args = [
     "-m",
     input.modelPath,
-    "-c",
-    String(Math.floor(input.ctx)),
+    ...(input.ctx == null ? [] : ["-c", String(Math.floor(input.ctx))]),
     "-fa",
     input.fa,
     "-ctk",

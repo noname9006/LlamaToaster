@@ -60,7 +60,7 @@ export function Workers() {
 
       {authEnabled && (
         <details
-          className="group mt-4 rounded-xl border border-border bg-surface"
+          className="group mt-4 border-t border-border"
           open={detailsOpen}
           onToggle={(e) => setDetailsOpen(e.currentTarget.open)}
         >
@@ -85,7 +85,7 @@ export function Workers() {
                 placeholder="ABCD-EFGH"
                 maxLength={9}
                 aria-label="Enrolment code"
-                className="w-32 rounded-lg border border-border bg-surface px-2.5 py-1 text-center font-mono text-xs uppercase tracking-widest text-fg outline-none focus:border-accent/50"
+                className="w-32 rounded-lg border border-border-strong bg-surface px-2.5 py-1 text-center font-mono text-xs text-fg outline-none focus:border-accent/50"
               />
               <IconChevronDown
                 width={14}

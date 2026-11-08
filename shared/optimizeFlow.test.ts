@@ -8,7 +8,9 @@ import {
   fitInsight,
   machineClassOf,
   pointY,
+  kvOptionsAt,
   proposeCandidates,
+  proposeKvCandidates,
   targetStop,
   validateFitMapSpec,
 } from "./optimizeFlow.js";
@@ -116,5 +118,25 @@ describe("proposeCandidates", () => {
       // q4_0/q4_0 holds the most layers at 256k, so it is the long-context pick.
       ["fit_ctx", "q4_0", "on", 17],
     ]);
+  });
+});
+
+describe("KV step options", () => {
+  it("lists quantized sizes that fit at the target, with their gain over f16", () => {
+    const series = buildFitSeries(points, kvRows);
+    const opts = kvOptionsAt(series, 32768, null);
+    expect(opts.map((o) => [o.ctk, o.ctv, o.scoreGain])).toEqual([
+      ["q8_0", "q8_0", 1],
+      ["q4_0", "q4_0", 1],
+    ]);
+    const cands = proposeKvCandidates(opts, null, 1);
+    expect(cands).toHaveLength(1);
+    expect(cands[0]).toMatchObject({ source: "fit_kv", ctk: "q8_0", ctv: "q8_0", ngl: 17 });
+  });
+  it("drops a size whose only pairs have K less precise than V", () => {
+    const lowK = STOPS.map((c) => pt("q4_0", "q8_0", "on", c, 18));
+    const series = buildFitSeries([...points, ...lowK], [...kvRows, ok("q4_0", "q8_0")]);
+    expect(series.some((s) => s.ctk === "q4_0" && s.ctv === "q8_0")).toBe(true);
+    expect(kvOptionsAt(series, 32768, null).some((o) => o.ctv === "q8_0" && o.ctk === "q4_0")).toBe(false);
   });
 });

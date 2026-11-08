@@ -180,6 +180,11 @@ export const WORKER_CAPABILITIES = [
   // docs/plans/MODEL_FIT_CHECK_PLAN.md: "Will it fit?" on the Models page --
   // fit_check jobs with target_keys, answered through /api/worker/model-fit.
   "fit-check-v2",
+  // docs/plans/MODEL_DAEMON_PLAN.md: the Serve page -- daemon_load/daemon_unload
+  // jobs, the OpenAI-compatible gateway, POST /api/worker/daemon/telemetry.
+  "daemon-v1",
+  // Speed-run candidates may carry -b / -ub (the optimization flow's batch step).
+  "speed-batch-v1",
 ] as const;
 export type WorkerCapability = (typeof WORKER_CAPABILITIES)[number];
 
@@ -1179,7 +1184,9 @@ export interface TriggerPayload {
 }
 
 // Which step of the optimization flow a run is (docs/plans/OPTIMIZATION_FLOW_REDESIGN.md).
-export const FLOW_STEPS = ["baseline", "fit", "real_load", "threads", "confirm"] as const;
+// kv_fit / kv_confirm / batch are the 7-step flow's KV and batch-size stages:
+// the KV map rides kind "fit", the other two are speed runs.
+export const FLOW_STEPS = ["baseline", "fit", "real_load", "threads", "confirm", "kv_fit", "kv_confirm", "batch"] as const;
 export type FlowStep = (typeof FLOW_STEPS)[number];
 
 export interface ProbeTriggerSpec {
@@ -1336,7 +1343,7 @@ export interface ModelDirFile {
   mtp_layers?: number | null;
   quant?: string | null;
   param_count?: number | null;
-  // Trained context + KV-cache geometry, from the same GGUF header walk
+  // Maximum context + KV-cache geometry, from the same GGUF header walk
   // (see ModelMetadata's matching fields for what each feeds downstream).
   // Same optional-null convention as the fields above: null = header key
   // absent (e.g. no sliding-window attention), absent = old worker code.
@@ -1675,7 +1682,7 @@ export interface ModelDownloadCallbackInput {
   // it straight into ModelMetadata.param_count instead of calling
   // getHfGgufMeta.
   param_count?: number | null;
-  // Trained context + KV geometry from the same GGUF header read -- stored
+  // Maximum context + KV geometry from the same GGUF header read -- stored
   // straight into ModelMetadata (feeds M2's target-context clamp, N1's
   // sizing ladder, and the Benchmark page's model card). Optional/null so an
   // older worker binary that doesn't send them keeps validating.
@@ -1960,6 +1967,10 @@ export interface ModelFitReport {
   point: import("./fitParams.js").FitPoint | null;
   error: string | null;
   fetched_bytes?: number;
+  /** A second look at the model's maximum context, for the bread grades
+   * (shared/fitGrade.ts). Absent from older workers and when the first
+   * answer already did not fit. */
+  ceiling?: import("./fitGrade.js").FitCeiling | null;
 }
 
 export interface ModelFitResult extends ModelFitReport {
@@ -2172,7 +2183,7 @@ export interface ProbeAttemptReport {
   gpu_host_pinned_mib?: number | null;
   gpu_cpu_mapped_mib?: number | null;
   // The ladder's own bounds (llama.cpp's -ngl ceiling for the model, and its
-  // trained context), repeated on every row so a stored probe can be re-resolved
+  // maximum context), repeated on every row so a stored probe can be re-resolved
   // exactly by shared/probeLadder.ts's probeOutcome.
   ladder_ngl_max?: number | null;
   ladder_max_ctx?: number | null;
@@ -2313,7 +2324,11 @@ export type QueueJob =
   // shared/types.ts's MemorySpeedResult) rather than riding this job's
   // completion report, so it's cached on the workers row like `vram` instead
   // of living only in transient job-progress state.
-  | { job_id: string; type: "measure_memory_speed"; payload: Record<string, never> };
+  | { job_id: string; type: "measure_memory_speed"; payload: Record<string, never> }
+  // The Serve page. Serial like a test, so they order correctly against tests; a
+  // load job ends when the model is ready and the process outlives the job.
+  | { job_id: string; type: "daemon_load"; payload: import("./daemonTypes.js").DaemonLoadJobPayload }
+  | { job_id: string; type: "daemon_unload"; payload: Record<string, never> };
 
 // --- Multi-user Stage 2: auth (MULTIUSER_PLAN.md §2) ---
 
@@ -2427,6 +2442,12 @@ export interface AppSettings {
   // stale worker can never report more loads than the current setting
   // allows.
   probeMaxLoads: number;
+  // Whether the Models page draws "Will it fit?" answers as bread marks
+  // (shared/breadMarks.ts) instead of the older check marks -- default true.
+  breadMarksEnabled: boolean;
+  // How the bread marks are drawn -- default DEFAULT_BREAD_MARK_STYLE. Set on
+  // the admin console's Bread marks page.
+  breadMarkStyle: import("./breadMarks.js").BreadMarkStyle;
 }
 
 // GET /api/sessions -- one row per live session for the caller's own

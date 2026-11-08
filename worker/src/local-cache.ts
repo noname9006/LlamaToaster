@@ -35,7 +35,7 @@ export interface LocalCacheEntry {
   mtp_layers?: number;
   quant?: string;
   param_count?: number;
-  // Trained context + KV geometry (see gguf.ts's GgufInfo) -- persisted
+  // Maximum context + KV geometry (see gguf.ts's GgufInfo) -- persisted
   // alongside the fields above so heartbeats report the full set.
   trained_ctx?: number;
   n_head_kv?: number;
@@ -205,7 +205,7 @@ export class LocalModelCache {
     if (!cols.some((c) => c.name === "gguf_checked_at")) {
       this.db.exec(`ALTER TABLE local_model_cache ADD COLUMN gguf_checked_at INTEGER`);
     }
-    // Trained context + KV geometry -- added together so a single PRAGMA
+    // Maximum context + KV geometry -- added together so a single PRAGMA
     // check covers all seven (see LocalCacheEntry's doc comments).
     if (!cols.some((c) => c.name === "trained_ctx")) {
       this.db.exec(`ALTER TABLE local_model_cache ADD COLUMN trained_ctx INTEGER`);

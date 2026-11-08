@@ -95,6 +95,12 @@ function ensureChild(): ChildProcess {
   c.on("error", () => {
     if (child === c) shutdown("powershell session failed");
   });
+  // powershell.exe dying between two requests makes the next write fail with
+  // EPIPE, emitted here. Unheard, that is an uncaught exception that ends the
+  // worker mid-test (audit 2026-10-25 B5). Callers fall back to a one-shot.
+  c.stdin?.on("error", () => {
+    if (child === c) shutdown("powershell session pipe failed");
+  });
   c.on("exit", () => {
     if (child === c) shutdown("powershell session exited");
   });

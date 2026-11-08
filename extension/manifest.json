@@ -1,0 +1,67 @@
+{
+  "manifest_version": 3,
+  "name": "LlamaToaster",
+  "short_name": "LlamaToaster",
+  "version": "0.1.0",
+  "description": "Will this GGUF fit your machine? Reads your RAM/VRAM, measures memory speed, and marks every quant on Hugging Face model pages.",
+  "icons": {
+    "16": "icons/icon.png",
+    "48": "icons/icon.png",
+    "128": "icons/icon.png"
+  },
+  "action": {
+    "default_title": "LlamaToaster",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon.png",
+      "48": "icons/icon.png"
+    }
+  },
+  "side_panel": {
+    "default_path": "panel.html"
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "permissions": [
+    "storage",
+    "system.memory",
+    "system.cpu",
+    "nativeMessaging",
+    "sidePanel"
+  ],
+  "host_permissions": [
+    "https://huggingface.co/*",
+    "https://*.huggingface.co/*",
+    "https://*.hf.co/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://huggingface.co/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "css": [
+        "content.css"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "fonts/*",
+        "icons/*"
+      ],
+      "matches": [
+        "https://huggingface.co/*"
+      ]
+    }
+  ],
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAv8pJ1qaWmvkD6mV6NvHfMlCDNoGi/LicuDN8VedB3v1VhtFGTHtuyF6paaJWI4IB6cWyU9kxMZwNBGrwN+PJ4eKg4cPnuTAKJ133304bn6qIVd+EjsaoWNl+7jd+qY1eiWXMV/vw5ckenpyneewFJyhNA0Y6jTCI+ZxalUCvzTf/ezhE54UPKYIA3P4wsfClHVj/wdZP5HOjd1F0jPqD5nZfYAr2kYBLU4Ni4/cHGnhvkiJQtJD43KvtvBtRe3re0ySLku9eA2JEYuVjmBpwjULqxSP5i+uENSiOf+UzrAIqFbXIFH4SqQnTmszrvMqXpl7zxpwA+F2VZbfDuUkBHwIDAQAB"
+}

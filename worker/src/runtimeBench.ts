@@ -8,6 +8,7 @@
 // is unit-tested there; this file is the process and HTTP plumbing over it.
 
 import { spawn, type ChildProcess } from "node:child_process";
+import { appendFileSync } from "node:fs";
 import type { IngestResultInput, ProbeAttemptReport } from "../../shared/types.js";
 import { CURVE_METHOD_VERSION, FILL_CURVE_METHOD_VERSION, KNEE_METHOD_VERSION, SERVER_METHOD_VERSION } from "../../shared/types.js";
 import { fillBoundaries, fillTarget } from "../../shared/fillCurve.js";
@@ -130,6 +131,12 @@ export async function spawnRuntimeServer(input: SpawnRuntimeServerInput): Promis
   input.onSpawn?.(proc);
 
   let stderr = "";
+  const dumpPath = process.env.LLAMATOASTER_DUMP_SERVER_OUTPUT;
+  if (dumpPath) {
+    const dump = (chunk: Buffer) => appendFileSync(dumpPath, chunk);
+    proc.stderr?.on("data", dump);
+    proc.stdout?.on("data", dump);
+  }
   proc.stderr?.on("data", (chunk: Buffer) => {
     stderr = appendBoundedOutput(stderr, chunk.toString(), MAX_CAPTURED_PROCESS_OUTPUT_CHARS);
   });
@@ -603,6 +610,8 @@ export interface FillCurveExecutionInput {
   /** Checked before every request; a true return ends the curve early. */
   shouldStop?: () => boolean;
   onProgress?: (progress: { repeat: number; filled: number; fill: number }) => void;
+  /** Awaited between requests (outside every timed window), with the tokens already in the context. */
+  beforeSlice?: (info: { repeat: number; filled: number }) => Promise<void>;
 }
 
 export interface FillCurveExecution {
@@ -648,6 +657,7 @@ export async function executeFillCurve(input: FillCurveExecutionInput): Promise<
         break outer;
       }
       const end = boundaries[s];
+      await input.beforeSlice?.({ repeat: r, filled: prev });
       input.onProgress?.({ repeat: r, filled: end, fill });
       const sample = await completion({
         port: input.port,
@@ -672,6 +682,7 @@ export async function executeFillCurve(input: FillCurveExecutionInput): Promise<
       }
       prev = end;
     }
+    await input.beforeSlice?.({ repeat: r, filled: prev });
   }
 
   const { item } = input;

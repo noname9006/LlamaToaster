@@ -258,7 +258,7 @@ export function Compare() {
           into the conclusion. */}
       <section className="mt-6">
         <div className="flex items-center justify-between">
-          <h2 className="text-sm font-semibold uppercase tracking-wide text-muted">Model-vs-model comparisons</h2>
+          <h2 className="text-sm font-semibold text-muted">Model-vs-model comparisons</h2>
           <NewComparison
             onCreated={(id) => {
               refreshRuns();
@@ -325,16 +325,16 @@ export function Compare() {
       </button>
 
       {chartConfig && (
-        <div className="relative mt-4 h-72 rounded-xl border border-border bg-surface p-4">
+        <div className="relative mt-4 h-72">
           <Chart config={chartConfig} />
         </div>
       )}
 
       {rows.length > 0 && (
-        <div className="mt-4 overflow-x-auto rounded-xl border border-border bg-surface">
+        <div className="mt-4 overflow-x-auto">
           <table className="w-full text-left text-sm">
             <thead>
-              <tr className="border-b border-border text-xs uppercase tracking-wide text-muted">
+              <tr className="border-b border-border text-xs text-muted">
                 <th className="px-4 py-2.5 font-medium">config</th>
                 {columns.map((c) => (
                   <th key={c.id} className="px-4 py-2.5 font-medium">

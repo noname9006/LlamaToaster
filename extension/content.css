@@ -1,0 +1,120 @@
+/* LlamaToaster marks on Hugging Face's GGUF quant chips. Hugging Face's own
+   check/cross icons are removed while ours is there. */
+.lt-marked svg { display: none !important; }
+/* ...but not the bread mark itself (more specific, so it wins). */
+.lt-marked .lt-mark svg { display: block !important; }
+.lt-mark {
+  display: inline-flex;
+  align-items: center;
+  font-size: 10px;
+  line-height: 1;
+  letter-spacing: -0.15em;
+  margin-right: 2px;
+  cursor: help;
+}
+
+.lt-tip {
+  position: absolute;
+  z-index: 2147483647;
+  max-width: 240px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  background: #000;
+  color: #fff;
+  font: 500 13px/1.35 "Source Sans Pro", ui-sans-serif, system-ui, sans-serif;
+  pointer-events: none;
+  white-space: normal;
+}
+.lt-tip::after {
+  content: "";
+  position: absolute;
+  top: 100%;
+  left: var(--arrow-x, 50%);
+  transform: translateX(-50%);
+  border: 6px solid transparent;
+  border-top-color: #000;
+}
+
+/* The toaster that replaces Hugging Face's "Hardware compatibility" heading.
+   Its dial turns while the headers are read. */
+.lt-hw-head > :not(.lt-bar) { display: none !important; }
+/* Typography and colour come from Hugging Face's own heading classes
+   (text-smd, text-gray-500), so it matches in light and dark mode. */
+.lt-bar { min-width: 0; cursor: pointer; }
+.lt-bar-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lt-toaster {
+  flex: none;
+  display: inline-flex;
+  padding: 0;
+  margin: 0 6px 0 0;
+  background: none;
+  border: 0;
+  border-radius: 3px;
+  cursor: pointer;
+  transition: transform 0.15s ease;
+}
+/* Bigger than HF's 15px heading icon on purpose: it's the button. The
+   negative margins keep the heading row from growing much. */
+.lt-toaster-svg { display: block; width: 39px; height: 32px; margin: -5px 0; }
+.lt-bar:hover .lt-toaster { transform: translateY(-1px); }
+.lt-toaster:focus-visible { outline: 2px solid #f5a623; outline-offset: 2px; }
+.lt-toaster.lt-spin .lt-knob { animation: lt-knob-turn 0.9s linear infinite; }
+@keyframes lt-knob-turn { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  .lt-toaster.lt-spin .lt-knob { animation: lt-knob-pulse 1s ease-in-out infinite; }
+  @keyframes lt-knob-pulse { 50% { opacity: 0.4; } }
+}
+
+/* Under the toaster: the model's shape and the context slider (the same
+   setting as the popup's slider; moving either moves the other). */
+.lt-info {
+  --lt-ink: #4b5563; --lt-ink-2: #6b7280; --lt-val: #c2410c;
+  margin: 12px 0 10px;
+  font: 13px/1.4 "Source Sans Pro", ui-sans-serif, system-ui, sans-serif;
+  color: var(--lt-ink);
+}
+.lt-info.lt-dark { --lt-ink: #d1d5db; --lt-ink-2: #9ca3af; --lt-val: #ffb066; }
+/* The facts line always takes its row (blank until a header is read), so the
+   block does not grow when the model's shape arrives. */
+.lt-info-facts { color: var(--lt-ink); margin-bottom: 4px; cursor: default; min-height: 1.4em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.lt-info-facts.lt-empty { color: var(--lt-ink-2); }
+.lt-info-ctx { display: flex; justify-content: flex-end; align-items: baseline; gap: 0.3em; margin-top: 2px; color: var(--lt-ink-2); }
+.lt-info-v { font-variant-numeric: tabular-nums; }
+.lt-range { --frac: 0; -webkit-appearance: none; appearance: none; display: block; width: 100%; height: 22px; margin: 2px 0 0; background: transparent; }
+/* Unknown max context: grey and locked; becoming enabled fades to the orange coil. */
+.lt-range::-webkit-slider-runnable-track, .lt-range::-webkit-slider-thumb { transition: filter 0.35s ease-out, opacity 0.35s ease-out; }
+.lt-range:disabled::-webkit-slider-runnable-track { filter: grayscale(1); opacity: 0.6; }
+.lt-range:disabled::-webkit-slider-thumb { filter: grayscale(1); opacity: 0.6; cursor: default; }
+.lt-range:focus-visible { outline: 2px solid #f5a623; outline-offset: 1px; }
+/* The toaster-element look: a glowing coil in a slot, a metal knob. Same shape
+   on both themes; only the colours change (light slot and knob on a light page). */
+.lt-range::-webkit-slider-runnable-track {
+  height: 10px; border: 1px solid #9ca3af; border-radius: 5px;
+  background:
+    repeating-linear-gradient(90deg, rgba(120, 30, 0, 0.25) 0 1px, transparent 1px 4px) 0 0 / calc(11px + (100% - 22px) * var(--frac)) 100% no-repeat,
+    linear-gradient(#ffc274, #ff8a2a 45%, #e0561a) 0 0 / calc(11px + (100% - 22px) * var(--frac)) 100% no-repeat,
+    linear-gradient(#d4d7dc, #eceef1);
+  box-shadow: inset 0 2px 3px rgba(0, 0, 0, 0.18);
+}
+.lt-range::-webkit-slider-thumb {
+  -webkit-appearance: none; width: 20px; height: 18px; margin-top: -5px;
+  border: 1px solid #8b9099; border-radius: 5px;
+  background: linear-gradient(90deg, transparent 9px, rgba(0, 0, 0, 0.18) 9px 11px, transparent 11px), linear-gradient(#ffffff, #e5e7eb 45%, #c9cdd3);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.9), 0 1px 3px rgba(0, 0, 0, 0.25);
+  cursor: grab;
+}
+.lt-info.lt-dark .lt-range::-webkit-slider-runnable-track {
+  border-color: #000;
+  background:
+    repeating-linear-gradient(90deg, rgba(70, 12, 0, 0.35) 0 1px, transparent 1px 4px) 0 0 / calc(11px + (100% - 22px) * var(--frac)) 100% no-repeat,
+    linear-gradient(#ffc274, #ff7a1a 45%, #c4330b) 0 0 / calc(11px + (100% - 22px) * var(--frac)) 100% no-repeat,
+    linear-gradient(#050403, #17120d);
+  box-shadow: inset 0 2px 3px rgba(0, 0, 0, 0.8);
+}
+.lt-info.lt-dark .lt-range::-webkit-slider-thumb {
+  border-color: #0b0a0a;
+  background: linear-gradient(90deg, transparent 9px, rgba(0, 0, 0, 0.4) 9px 11px, transparent 11px), linear-gradient(#6a6b6e, #4d4e50 45%, #2d2e2f);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.25), 0 2px 3px rgba(0, 0, 0, 0.5);
+}
+.lt-ticks { position: relative; height: 14px; font-size: 10px; color: var(--lt-ink-2); }
+.lt-ticks span { position: absolute; top: 0; transform: translateX(-50%); white-space: nowrap; }

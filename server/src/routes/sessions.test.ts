@@ -85,7 +85,9 @@ describe("POST /api/auth/refresh", () => {
     const rotated = (await rotateRes.json()) as { session_token: string };
     expect(rotateRes.status).toBe(200);
 
-    // Present the ORIGINAL (now-stale) refresh token again -- a captured/replayed token.
+    // Present the ORIGINAL (now-stale) refresh token again, past the
+    // lost-response grace window -- a captured/replayed token.
+    (await import("../db/migrate.js")).getDb().prepare(`UPDATE sessions SET rotated_at = ? WHERE user_id = ?`).run(Date.now() - 120_000, user.id);
     const replayRes = await fetch(`${baseUrl}/api/auth/refresh`, { method: "POST", headers: authed(created.refresh!) });
     expect(replayRes.status).toBe(401);
 

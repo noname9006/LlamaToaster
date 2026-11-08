@@ -1146,7 +1146,7 @@ describe("POST /api/runs/:id/quality-result (N4)", () => {
       workerToken
     );
     expect(res.status).toBe(400);
-    expect(repo.qualityRepo.listForModel("m1")).toHaveLength(0);
+    expect(repo.qualityRepo.listForModel("m1", undefined)).toHaveLength(0);
   });
 
   it("rejects non-finite or non-positive readings -- never stored as data", async () => {
@@ -1159,7 +1159,7 @@ describe("POST /api/runs/:id/quality-result (N4)", () => {
       );
       expect(res.status).toBe(400);
     }
-    expect(repo.qualityRepo.listForModel("m1")).toHaveLength(0);
+    expect(repo.qualityRepo.listForModel("m1", undefined)).toHaveLength(0);
   });
 
   it("records ppl with its corpus hash, and leaves KLD null unless the measurement reported one", async () => {
@@ -1254,14 +1254,14 @@ describe("POST /api/runs/:id/quality-result (N4)", () => {
 
   it("orphans dependent KLD rows loudly when the baseline goes away", async () => {
     const before = repo.qualityRepo
-      .listForModel("m1")
+      .listForModel("m1", undefined)
       .filter((r) => r.cache_type_k === "q8_0" && r.kld_vs_baseline != null);
     expect(before.length).toBeGreaterThan(0);
     const changed = repo.qualityRepo.orphanDependents("m1", "b1", 16_384, dataset);
     expect(changed).toBeGreaterThan(0);
     // Deleting a baseline marks dependents orphaned rather than silently
     // re-baselining them onto some other row.
-    const after = repo.qualityRepo.listForModel("m1").filter((r) => r.ctx_tokens === 16_384);
+    const after = repo.qualityRepo.listForModel("m1", undefined).filter((r) => r.ctx_tokens === 16_384);
     expect(after.every((r) => r.kld_vs_baseline == null)).toBe(true);
   });
 

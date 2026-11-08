@@ -61,6 +61,7 @@ export function useOptimizeFlow(workerId: string, modelId: string, urlFlowId: st
   const [flowId, setFlowIdState] = useState<string | null>(null);
   const [runs, setRuns] = useState<FlowRun[]>([]);
   const [fit, setFit] = useState<FitData | null>(null);
+  const [kvFit, setKvFit] = useState<FitData | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const tick = useRef(0);
@@ -74,6 +75,7 @@ export function useOptimizeFlow(workerId: string, modelId: string, urlFlowId: st
     setFlowIdState(pairKey ? storageGet(pairKey) : null);
     setRuns([]);
     setFit(null);
+    setKvFit(null);
   }, [pairKey, urlFlowId]);
 
   const setFlowId = useCallback(
@@ -97,14 +99,16 @@ export function useOptimizeFlow(workerId: string, modelId: string, urlFlowId: st
       );
       if (my !== tick.current) return;
       setRuns(detailed);
-      const fitRun = [...detailed].reverse().find((r) => r.test.kind === "fit");
-      if (fitRun) {
-        const f = await api.getFitPoints(fitRun.test.id);
-        if (my !== tick.current) return;
-        setFit({ testId: fitRun.test.id, ...f });
-      } else {
-        setFit(null);
-      }
+      // Step 5's map (flow_step "fit", or an older run with no step) and
+      // step 6's KV map (flow_step "kv_fit") are read separately.
+      const latestFit = (kv: boolean) =>
+        [...detailed].reverse().find((r) => r.test.kind === "fit" && (stepOf(r.test) === "kv_fit") === kv) ?? null;
+      const [f, k] = await Promise.all(
+        [latestFit(false), latestFit(true)].map(async (r) => (r ? { testId: r.test.id, ...(await api.getFitPoints(r.test.id)) } : null))
+      );
+      if (my !== tick.current) return;
+      setFit(f);
+      setKvFit(k);
       setError(null);
     } catch (err) {
       if (my === tick.current) setError(err instanceof Error ? err.message : String(err));
@@ -160,10 +164,11 @@ export function useOptimizeFlow(workerId: string, modelId: string, urlFlowId: st
     setFlowId(null);
     setRuns([]);
     setFit(null);
+    setKvFit(null);
   }, [setFlowId]);
 
   return useMemo(
-    () => ({ flowId, runs, fit, loading, error, trigger, latest, reset, refresh: load, anyActive }),
-    [flowId, runs, fit, loading, error, trigger, latest, reset, load, anyActive]
+    () => ({ flowId, runs, fit, kvFit, loading, error, trigger, latest, reset, refresh: load, anyActive }),
+    [flowId, runs, fit, kvFit, loading, error, trigger, latest, reset, load, anyActive]
   );
 }

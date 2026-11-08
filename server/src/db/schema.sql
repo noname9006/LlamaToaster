@@ -297,6 +297,7 @@ CREATE TABLE IF NOT EXISTS worker_jobs (
 
 CREATE INDEX IF NOT EXISTS idx_worker_jobs_worker  ON worker_jobs(worker_id, status);
 CREATE INDEX IF NOT EXISTS idx_worker_jobs_lease   ON worker_jobs(status, lease_expires_at);
+CREATE INDEX IF NOT EXISTS idx_worker_jobs_run     ON worker_jobs(run_id, status);
 CREATE INDEX IF NOT EXISTS idx_workers_machine     ON workers(machine_id);
 
 -- Multi-user Stage 2: auth -- see MULTIUSER_PLAN.md §2.1/§2.2.
@@ -337,6 +338,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   token_hash TEXT NOT NULL,
   refresh_hash TEXT,
   prev_refresh_hash TEXT,
+  rotated_at INTEGER,                        -- when prev_refresh_hash was retired; see the refresh route's grace window
   expires_at INTEGER NOT NULL,
   is_worker INTEGER NOT NULL DEFAULT 0,
   worker_id TEXT,
@@ -661,6 +663,7 @@ CREATE TABLE IF NOT EXISTS model_fit_checks (
   point_json TEXT,                -- shared/fitParams.ts FitPoint
   error TEXT,
   fetched_bytes INTEGER,
+  ceiling_json TEXT,              -- shared/fitGrade.ts FitCeiling (bread grades 5/4, 2/1)
   created_at INTEGER NOT NULL,
   PRIMARY KEY (worker_id, target_key, ctx, margin_mib)
 );
@@ -698,3 +701,75 @@ CREATE TABLE IF NOT EXISTS model_registrations (
   PRIMARY KEY (user_id, model_id)
 );
 CREATE INDEX IF NOT EXISTS idx_model_registrations_model ON model_registrations(model_id);
+
+-- The Serve page (docs/plans/MODEL_DAEMON_PLAN.md). No row exists until the owner
+-- uses the page, and until then the worker opens no port.
+CREATE TABLE IF NOT EXISTS daemon_config (
+  worker_id TEXT PRIMARY KEY REFERENCES workers(id) ON DELETE CASCADE,
+  version INTEGER NOT NULL,
+  gateway_json TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+-- Keys are stored hashed: the clear text exists once, in the create response.
+CREATE TABLE IF NOT EXISTS daemon_api_keys (
+  id TEXT PRIMARY KEY,
+  worker_id TEXT NOT NULL REFERENCES workers(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  prefix TEXT NOT NULL,
+  sha256 TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  revoked_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_daemon_api_keys_worker ON daemon_api_keys(worker_id, revoked_at);
+
+-- The last settings per (machine, model), like LM Studio's "remember settings".
+CREATE TABLE IF NOT EXISTS daemon_model_settings (
+  worker_id TEXT NOT NULL REFERENCES workers(id) ON DELETE CASCADE,
+  model_id TEXT NOT NULL,
+  settings_json TEXT NOT NULL,
+  sampling_json TEXT NOT NULL,
+  alias TEXT,
+  mmproj_filename TEXT,
+  draft_model_id TEXT,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (worker_id, model_id)
+);
+
+-- One row per distinct load configuration, so usage can be read per placement.
+CREATE TABLE IF NOT EXISTS daemon_loads (
+  worker_id TEXT NOT NULL REFERENCES workers(id) ON DELETE CASCADE,
+  load_hash TEXT NOT NULL,
+  model_id TEXT NOT NULL,
+  build_tag TEXT,
+  settings_json TEXT NOT NULL,
+  actual_json TEXT,
+  first_seen INTEGER NOT NULL,
+  PRIMARY KEY (worker_id, load_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_daemon_loads_model ON daemon_loads(worker_id, model_id);
+
+-- One row per request served. Counts and speeds only: no prompt or completion text.
+CREATE TABLE IF NOT EXISTS daemon_usage (
+  worker_id TEXT NOT NULL REFERENCES workers(id) ON DELETE CASCADE,
+  id TEXT NOT NULL,
+  at INTEGER NOT NULL,
+  model_id TEXT NOT NULL,
+  load_hash TEXT NOT NULL,
+  endpoint TEXT NOT NULL,
+  stream INTEGER NOT NULL,
+  status INTEGER NOT NULL,
+  cancelled INTEGER NOT NULL,
+  processed_tokens INTEGER,
+  cached_tokens INTEGER,
+  generated_tokens INTEGER,
+  prompt_ms REAL,
+  predicted_ms REAL,
+  total_ms REAL NOT NULL,
+  concurrency INTEGER NOT NULL,
+  watched INTEGER NOT NULL,
+  PRIMARY KEY (worker_id, id)
+);
+CREATE INDEX IF NOT EXISTS idx_daemon_usage_read ON daemon_usage(worker_id, model_id, at);
+CREATE INDEX IF NOT EXISTS idx_daemon_usage_at ON daemon_usage(at);
+CREATE INDEX IF NOT EXISTS idx_daemon_usage_hash ON daemon_usage(worker_id, load_hash);

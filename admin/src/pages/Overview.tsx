@@ -22,7 +22,7 @@ function StatCard({ label, value }: { label: string; value: string | number }) {
 // Same visual pattern as the main app's own Settings.tsx toggle -- kept as a
 // separate copy rather than a shared component since admin/ and client/ are
 // two independently-built SPAs with no shared component module between them.
-function Toggle({ checked, onChange, disabled }: { checked: boolean; onChange: () => void; disabled?: boolean }) {
+export function Toggle({ checked, onChange, disabled }: { checked: boolean; onChange: () => void; disabled?: boolean }) {
   return (
     <button
       type="button"
@@ -295,6 +295,24 @@ export function Overview() {
             <Toggle
               checked={settings?.accountDeletionAllowed ?? false}
               onChange={() => void handleToggleSetting("accountDeletionAllowed")}
+              disabled={settings === null}
+            />
+          </div>
+          <div className="flex items-center justify-between gap-4 rounded-lg border border-border px-3 py-2.5">
+            <div>
+              <div className="text-sm font-medium text-fg">Bread fit marks on the Models page</div>
+              <div className="text-xs text-muted">
+                Draw "Will it fit?" answers as stacks of toast, from pale to golden (and burnt), instead of the
+                older check marks. The top grade (5, or 2 on a CPU-only machine) needs a worker that reports the
+                maximum-context check; answers from older workers stop one below it.{" "}
+                <Link to="/bread-marks" className="text-accent hover:underline">
+                  Bread mark style
+                </Link>
+              </div>
+            </div>
+            <Toggle
+              checked={settings?.breadMarksEnabled ?? true}
+              onChange={() => void handleToggleSetting("breadMarksEnabled")}
               disabled={settings === null}
             />
           </div>

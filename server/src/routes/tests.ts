@@ -1,9 +1,10 @@
 import type { FastifyInstance, FastifyRequest, FastifyReply } from "fastify";
 import { v4 as uuid } from "uuid";
 import { mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
-import { join } from "node:path";
 import { repo } from "../db/repo.js";
 import { queueEvents } from "../queue-events.js";
+import { runLogDir, runLogPath } from "../run-logs.js";
+import { bodyBytes, chargeIngest, RUN_ITEM_ROW_BYTES } from "../ingest-budget.js";
 import { safeEqual, hashToken } from "../session.js";
 import { userOrIpKeyGenerator, resolveAuthUser, assertOwnsWorker, sessionScope } from "../auth-middleware.js";
 import type { UserScope } from "../auth-middleware.js";
@@ -48,6 +49,7 @@ import {
   MAX_ACTIVE_ROOTS_PER_USER,
 } from "../../../shared/types.js";
 import { CACHE_TYPE_VALUES, isKnownCacheType } from "../../../shared/engineSpec.js";
+import { isResultLabel } from "../../../shared/exchange.js";
 import {
   isProbeGranularity,
   isProbeMode,
@@ -57,7 +59,15 @@ import {
 import type { GoalsConfig } from "../../../shared/goals.js";
 import { normalizeGoals } from "../../../shared/goals.js";
 import { validateFitMapSpec } from "../../../shared/optimizeFlow.js";
-import { THREAD_PP_TOKENS, THREAD_TG_TOKENS, validateSpeedRunSpec, validateThreadSweepSpec } from "../../../shared/speedRun.js";
+import {
+  DEFAULT_BATCH,
+  DEFAULT_UBATCH,
+  THREAD_PP_TOKENS,
+  THREAD_TG_TOKENS,
+  hasBatchArgs,
+  validateSpeedRunSpec,
+  validateThreadSweepSpec,
+} from "../../../shared/speedRun.js";
 import { fitRepo } from "../db/fitRepo.js";
 import { getReleases, filterReleasesForWorker, assetMatchesWorker, buildInstallPayload } from "../github-releases.js";
 import {
@@ -247,9 +257,13 @@ function validateIngestResult(value: unknown): string | null {
       return `${field} must be a number or null`;
     }
   }
+  // Bounded to a short label's shape rather than a closed list, so a worker on
+  // a newer llama.cpp reporting a cache type this server doesn't know yet
+  // doesn't lose the item's results. Rules out formulas and free text (audit
+  // 2026-10-25 B3).
   for (const field of STRING_RESULT_FIELDS) {
-    if (typeof row[field] !== "string") {
-      return `${field} must be a string`;
+    if (typeof row[field] !== "string" || !isResultLabel(row[field] as string)) {
+      return `${field} must be a short label`;
     }
   }
   // Optional -- only ever populated by the llama-server/MTP path (see
@@ -494,6 +508,28 @@ function validateRunItemUpdate(payload: unknown): string | null {
   return null;
 }
 
+// What a report's free-text fields may store. A real stderr tail is well under
+// these; the rest of a longer one is in the run's log.
+const MAX_ITEM_DETAIL_CHARS = 2_000;
+const MAX_ITEM_ERROR_CHARS = 8_000;
+
+function capItemText(body: TestItemUpdateInput): TestItemUpdateInput {
+  const capped = { ...body } as TestItemUpdateInput & { detail?: unknown; error?: unknown };
+  if (typeof capped.detail === "string") capped.detail = capped.detail.slice(0, MAX_ITEM_DETAIL_CHARS);
+  if (typeof capped.error === "string") capped.error = capped.error.slice(0, MAX_ITEM_ERROR_CHARS);
+  return capped;
+}
+
+// How many run_items a trigger is about to create -- the same choice as the
+// `items` expression below, for charging before anything is written.
+function countSweepItemsForRun(body: TriggerPayload, curveContexts: number[], expanded: number): number {
+  if (body.curve_point) return curveContexts.length;
+  if (body.fit_map) return 1;
+  if (body.speed_run) return body.speed_run.candidates.length;
+  if (body.thread_sweep) return body.thread_sweep.items.length;
+  return expanded;
+}
+
 type ResolvedBuild =
   | { tag: string; deviceName?: string; alreadyInstalled: true }
   | { tag: string; deviceName?: string; alreadyInstalled: false; installPayload: InstallBuildJobPayload }
@@ -581,16 +617,7 @@ async function resolveBuildForRun(
 // survives the worker being wiped. Stored gzipped exactly as the worker sent
 // it; served back with Content-Encoding: gzip so the browser decompresses it
 // rather than spending server CPU on it.
-const LOG_DIR = process.env.LOG_DIR ?? join(process.cwd(), "data", "run-logs");
 const MAX_LOG_BYTES = 5 * 1024 * 1024;
-
-function runLogPath(runId: string): string {
-  // Test ids are server-generated UUIDs (see createTest's uuid()), never
-  // user-controlled path segments -- no traversal risk from this value, but
-  // the param still comes off the URL, so it's validated as a run id (an
-  // existing `runs` row) before ever reaching this function regardless.
-  return join(LOG_DIR, `run-${runId}.log.gz`);
-}
 
 // The read handlers below are shared with the supervise console
 // (routes/admin.ts mounts them again under /api/admin/tests/... with
@@ -719,7 +746,8 @@ export async function testsRoutes(app: FastifyInstance): Promise<void> {
     if (!Buffer.isBuffer(body) || body.length === 0) {
       throw new BadRequestError("request body must be non-empty gzip bytes");
     }
-    mkdirSync(LOG_DIR, { recursive: true });
+    chargeIngest(repo.catalogBudgetScopeForWorker(worker.id), body.length);
+    mkdirSync(runLogDir(), { recursive: true });
     writeFileSync(runLogPath(run.id), body);
     return reply.code(200).send({ ok: true });
   };
@@ -854,8 +882,8 @@ export async function testsRoutes(app: FastifyInstance): Promise<void> {
       if (body.main_gpu !== undefined && (!Number.isInteger(body.main_gpu) || body.main_gpu < 0)) {
         return reply.code(400).send({ error: "main_gpu must be a non-negative integer" });
       }
-      if (body.main_gpu_backend !== undefined && typeof body.main_gpu_backend !== "string") {
-        return reply.code(400).send({ error: "main_gpu_backend must be a string" });
+      if (body.main_gpu_backend !== undefined && (typeof body.main_gpu_backend !== "string" || !isResultLabel(body.main_gpu_backend))) {
+        return reply.code(400).send({ error: "main_gpu_backend must be a backend name" });
       }
       if (
         body.comparison_id !== undefined &&
@@ -865,7 +893,7 @@ export async function testsRoutes(app: FastifyInstance): Promise<void> {
       }
       // As the target machine sees it (its own reading of its own file), not
       // the shared catalog copy -- see repo.getModelForWorker.
-      const model = repo.getModelForWorker(body.model_id, body.worker_id);
+      const model = repo.isModelVisibleTo(userId, body.model_id) ? repo.getModelForWorker(body.model_id, body.worker_id) : undefined;
       if (!model) {
         return reply.code(400).send({ error: "unknown model_id" });
       }
@@ -899,7 +927,7 @@ export async function testsRoutes(app: FastifyInstance): Promise<void> {
                 'sweep includes mtp:"on" but this model has no built-in MTP head -- pick an MTP/draft companion model first',
             });
           }
-          mtpModel = repo.getModelForWorker(body.mtp_model_id, body.worker_id);
+          mtpModel = repo.isModelVisibleTo(userId, body.mtp_model_id) ? repo.getModelForWorker(body.mtp_model_id, body.worker_id) : undefined;
           if (!mtpModel) {
             return reply.code(400).send({ error: "unknown mtp_model_id" });
           }
@@ -1007,6 +1035,16 @@ export async function testsRoutes(app: FastifyInstance): Promise<void> {
       if (body.speed_run && !capabilities.has("speed-run-v1")) {
         throw new ConflictError("that machine runs an older worker build — update it to run the baseline and confirm speed tests.");
       }
+      // An older worker would silently measure -b 2048 -ub 512 for every
+      // candidate, so batch sizes are refused rather than mislabelled.
+      const speedCands: unknown = body.speed_run?.candidates;
+      if (
+        Array.isArray(speedCands) &&
+        speedCands.some((c) => c && typeof c === "object" && hasBatchArgs(c as { b?: number; ub?: number })) &&
+        !capabilities.has("speed-batch-v1")
+      ) {
+        throw new ConflictError("that machine runs an older worker build — update it to measure batch sizes.");
+      }
       if (body.thread_sweep && !capabilities.has("thread-sweep-v1")) {
         throw new ConflictError("that machine runs an older worker build — update it to test CPU thread settings.");
       }
@@ -1020,6 +1058,12 @@ export async function testsRoutes(app: FastifyInstance): Promise<void> {
       // 400, never a silent clamp.
       if (body.probe) {
         const p = body.probe;
+        if (!p.placement || typeof p.placement !== "object") {
+          return reply.code(400).send({ error: "probe.placement is required" });
+        }
+        if (!Array.isArray(p.kv_pair) || p.kv_pair.length !== 2) {
+          return reply.code(400).send({ error: "probe.kv_pair must be [cache_type_k, cache_type_v]" });
+        }
         if (!Number.isFinite(p.candidate_ctx) || p.candidate_ctx < 256 || p.candidate_ctx > 4_194_304) {
           return reply.code(400).send({ error: "probe.candidate_ctx must be between 256 and 4194304" });
         }
@@ -1062,6 +1106,9 @@ export async function testsRoutes(app: FastifyInstance): Promise<void> {
       // hash is meaningless.
       if (body.quality) {
         const q = body.quality;
+        if (!Array.isArray(q.kv_pair) || q.kv_pair.length !== 2) {
+          return reply.code(400).send({ error: "quality.kv_pair must be [cache_type_k, cache_type_v]" });
+        }
         if (!Number.isFinite(q.ctx_tokens) || q.ctx_tokens < MIN_PROBE_CTX || q.ctx_tokens > MAX_PROBE_CTX) {
           return reply.code(400).send({ error: `quality.ctx_tokens must be between ${MIN_PROBE_CTX} and ${MAX_PROBE_CTX}` });
         }
@@ -1172,7 +1219,7 @@ export async function testsRoutes(app: FastifyInstance): Promise<void> {
           }
           if (trainedCtx != null && ctx > trainedCtx) {
             return reply.code(400).send({
-              error: `curve_point.effective_ctx exceeds the model's trained context (${trainedCtx}) -- nothing beyond trained ctx can appear as measured`,
+              error: `curve_point.effective_ctx exceeds the model's maximum context (${trainedCtx}) -- nothing beyond max ctx can appear as measured`,
             });
           }
         }
@@ -1197,6 +1244,25 @@ export async function testsRoutes(app: FastifyInstance): Promise<void> {
         if (batchRootOwnerId != null && userId != null && batchRootOwnerId !== userId) {
           return reply.code(403).send({ error: "that batch belongs to another user" });
         }
+      }
+
+      const targetBackend: Backend | null = body.main_gpu_backend ?? worker.backend;
+      if (!targetBackend) {
+        throw new BadRequestError("worker has not reported a backend yet");
+      }
+
+      // Resolved ONCE, from the worker's own cached state -- no live HTTP
+      // round trip (MULTIUSER_PLAN.md §1.12). The only wait in this handler, so
+      // it comes before the duplicate and quota checks: from here to the
+      // inserts below nothing yields, so two simultaneous triggers can't both
+      // pass them (audit 2026-09-27 L7).
+      const resolved = await resolveBuildForRun(worker, targetBackend, body.main_gpu);
+      if ("error" in resolved) {
+        request.log.warn(
+          { worker: worker.id, model_id: body.model_id, error: resolved.error },
+          "run trigger rejected: could not resolve a llama.cpp build"
+        );
+        throw new BadRequestError(resolved.error);
       }
 
       // §0.5 duplicate-trigger guard -- same (user, model, worker) triple with
@@ -1244,30 +1310,12 @@ export async function testsRoutes(app: FastifyInstance): Promise<void> {
       // Fit maps are exempt like probes: no model load, minutes at most.
       if (kind !== "probe" && kind !== "fit") {
         const activeRoots = repo.countActiveRoots(userId);
-        const groupHasActiveMember = body.comparison_id
-          ? await repo.hasActiveComparisonMember(body.comparison_id)
-          : false;
+        const groupHasActiveMember = body.comparison_id ? repo.hasActiveComparisonMember(body.comparison_id, userId) : false;
         if (!groupHasActiveMember && activeRoots >= MAX_ACTIVE_ROOTS_PER_USER) {
           throw new ConflictError(
             `you already have ${activeRoots} active runs (limit ${MAX_ACTIVE_ROOTS_PER_USER} per account). Stop one first or wait for it to finish.`
           );
         }
-      }
-
-      const targetBackend: Backend | null = body.main_gpu_backend ?? worker.backend;
-      if (!targetBackend) {
-        throw new BadRequestError("worker has not reported a backend yet");
-      }
-
-      // Resolved ONCE, from the worker's own cached state -- no live HTTP
-      // round trip (MULTIUSER_PLAN.md §1.12).
-      const resolved = await resolveBuildForRun(worker, targetBackend, body.main_gpu);
-      if ("error" in resolved) {
-        request.log.warn(
-          { worker: worker.id, model_id: body.model_id, error: resolved.error },
-          "run trigger rejected: could not resolve a llama.cpp build"
-        );
-        throw new BadRequestError(resolved.error);
       }
 
       if (comparisonReference) {
@@ -1358,6 +1406,7 @@ export async function testsRoutes(app: FastifyInstance): Promise<void> {
         status: "scheduled",
         started_at: Date.now(),
       };
+      chargeIngest(userId ?? `worker:${worker.id}`, RUN_ITEM_ROW_BYTES * countSweepItemsForRun(body, curveContexts, expanded.length));
       repo.createTest(userId, run);
       // A context-curve run gets one item PER MEASURED CONTEXT, not the
       // sweep's own cross-product -- the sweep here only supplies the
@@ -1385,6 +1434,8 @@ export async function testsRoutes(app: FastifyInstance): Promise<void> {
                 cache_type_v: c.ctv,
                 flash_attn: c.fa,
                 threads: c.threads?.t ?? -1,
+                batch_size: c.b ?? DEFAULT_BATCH,
+                ubatch_size: c.ub ?? DEFAULT_UBATCH,
               }))
             : threadSweep
               ? threadSweep.items.map((t, i) => ({
@@ -1581,12 +1632,15 @@ export async function testsRoutes(app: FastifyInstance): Promise<void> {
         );
         return reply.code(400).send({ error: validationError });
       }
-      const body = request.body;
+      // Free text only ever shown back to the user: what a report may leave in
+      // the database is bounded here, whatever its total size (audit D1).
+      const body = capItemText(request.body);
       // Any valid item report is progress -- keeps the reaper's stall rule off
       // a run that's working through a long item (llama-bench ticks per repeat).
       repo.queueRepo.touchRunProgress(id);
 
       if (isTerminalTestItemInput(body)) {
+        chargeIngest(repo.catalogBudgetScopeForWorker(run.worker_id), bodyBytes(request.headers, body));
         app.log[body.status === "done" ? "info" : "error"](
           { run_id: id, idx, status: body.status, error: body.error },
           "item terminal update received"

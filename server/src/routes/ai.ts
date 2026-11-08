@@ -603,7 +603,12 @@ export async function aiRoutes(app: FastifyInstance): Promise<void> {
     // instruction enforceable (previously the browser built the whole
     // conversation including the system message, so `curl`ing this endpoint
     // directly could send anything).
-    const userMessages = rawMessages.filter((m) => m.role !== "system");
+    // Rebuilt from role and content only: a client has no business sending the
+    // provider anything else (tool_calls, name, ...) under this server's key
+    // (audit 2026-09-27 M8).
+    const userMessages: AiChatMessage[] = rawMessages
+      .filter((m) => m.role !== "system")
+      .map((m) => ({ role: m.role, content: m.content }));
     if (userMessages.length !== rawMessages.length) {
       request.log.warn({ discarded: rawMessages.length - userMessages.length }, "ai chat: client-supplied system message(s) discarded");
     }

@@ -48,7 +48,7 @@ type CurveRequest = FastifyRequest<{
 export const getCurveHandler =
   (scope: UserScope) => async (request: CurveRequest, reply: FastifyReply) => {
     const userId = scope(request);
-    const model = repo.getModel(request.params.id);
+    const model = repo.isModelVisibleTo(userId, request.params.id) ? repo.getModel(request.params.id) : undefined;
     if (!model) return reply.code(404).send({ error: "model not found" });
 
     const engine = request.query.engine;
@@ -166,7 +166,7 @@ export async function curveRoutes(app: FastifyInstance): Promise<void> {
     async (request, reply) => {
       const authed = resolveAuthUser(request);
       const userId = authed?.user.id;
-      const model = repo.getModel(request.params.id);
+      const model = repo.isModelVisibleTo(userId, request.params.id) ? repo.getModel(request.params.id) : undefined;
       if (!model) return reply.code(404).send({ error: "model not found" });
 
       const rows = repo.listCurveRows(userId, model.id, {

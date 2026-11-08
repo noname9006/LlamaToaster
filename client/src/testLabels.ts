@@ -12,6 +12,9 @@ const STEP_LABEL: Record<string, string> = {
   real_load: "Real-load check",
   threads: "Thread sweep",
   confirm: "Confirm",
+  kv_fit: "KV cache map",
+  kv_confirm: "KV cache speed",
+  batch: "Batch sizes",
 };
 
 export function kindLabel(t: Test): string {

@@ -8,7 +8,7 @@ const PROVIDERS: { id: string; label: string }[] = [{ id: "github", label: "Cont
 export function Login() {
   return (
     <div className="flex min-h-screen items-center justify-center bg-bg px-4">
-      <div className="w-full max-w-sm rounded-2xl border border-border bg-surface p-8 text-center">
+      <div className="w-full max-w-sm rounded-2xl border border-border-strong bg-surface p-8 text-center">
         <img src="/logo.png" alt="LlamaToaster" className="mx-auto w-16" />
         <h1 className="mt-4 text-xl font-semibold text-fg">LlamaToaster</h1>
         <p className="mt-1 text-sm text-muted">Sign in to manage your machines and benchmarks.</p>

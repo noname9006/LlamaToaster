@@ -42,7 +42,7 @@ export function ModelFitTable() {
   if (rows.length === 0 || workers.length === 0) return null;
 
   return (
-    <section aria-labelledby="h-fit-table" className="mb-6 border border-border bg-surface">
+    <section aria-labelledby="h-fit-table" className="mb-6">
       <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border px-4 py-3">
         <h2 id="h-fit-table" className="m-0 font-display text-lg font-semibold">
           Fit per machine

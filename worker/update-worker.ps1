@@ -135,4 +135,7 @@ if ($npmExit -eq 0 -and -not (Test-Path (Join-Path $RepoRoot "server")) -and (Te
 if ($npmExit -ne 0) {
     Fail "npm install failed (exit $npmExit). The code is updated but its dependencies may not be. If the error mentions EBUSY/EPERM, close every worker window and any editor open in $RepoRoot, then retry."
 }
+# Registers (or re-points) the Chrome extension's VRAM host -- how a worker
+# installed before the host existed picks it up. Never fatal.
+try { & (Join-Path $RepoRoot "worker\chrome-host\register.ps1") } catch { Write-Warning "Chrome VRAM host not registered: $_" }
 exit 0

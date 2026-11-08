@@ -303,6 +303,22 @@ export async function postHeartbeat(
   return (await res.json()) as HeartbeatResponse;
 }
 
+export async function postDaemonTelemetry(
+  url: string,
+  token: string,
+  input: import("../../shared/daemonTypes.js").DaemonTelemetryInput,
+  timeoutMs = 10_000
+): Promise<import("../../shared/daemonTypes.js").DaemonTelemetryResponse> {
+  const res = await fetch(`${url}/api/worker/daemon/telemetry`, {
+    method: "POST",
+    headers: { "content-type": "application/json", ...authHeader(token) },
+    body: JSON.stringify(input),
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  if (!res.ok) throw new HttpError(res.status, `daemon telemetry failed (${res.status}): ${await res.text()}`);
+  return (await res.json()) as import("../../shared/daemonTypes.js").DaemonTelemetryResponse;
+}
+
 // Only ever called while idle. Hangs up to ~25s server-side (its own
 // long-poll window) -- timeoutMs here must stay comfortably above that, or
 // this call would abort spuriously on every poll that didn't get a job

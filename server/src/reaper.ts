@@ -1,4 +1,5 @@
 import { repo } from "./db/repo.js";
+import { daemonRepo } from "./db/daemonRepo.js";
 import { queueEvents } from "./queue-events.js";
 import { OFFLINE_AFTER_MS } from "./liveness.js";
 
@@ -123,7 +124,7 @@ export const TERMINAL_JOB_RETENTION_DAYS = 7;
 // comment for what stays behind (everything except the raw sample series).
 export const GPU_CLOCK_SAMPLE_RETENTION_DAYS = 30;
 
-// A run whose job shows no progress for this long while its machine isn't
+// A job that shows no progress for this long while its machine isn't
 // paused is stuck: the worker is alive (heartbeats keep the lease) but
 // nothing moves -- no changed progress report, no item tick, no item result.
 // llama-bench ticks on every repetition, so this is far above any real gap;
@@ -136,7 +137,7 @@ export const PAUSE_TIMEOUT_MS = 7 * 24 * 60 * 60 * 1000;
 
 export function stopStalledRuns(log: ReaperLogger): void {
   const now = Date.now();
-  for (const job of repo.queueRepo.listStalledRunJobs(now - STALL_TIMEOUT_MS)) {
+  for (const job of repo.queueRepo.listStalledJobs(now - STALL_TIMEOUT_MS)) {
     guarded(
       log,
       { step: "stop stalled run", job_id: job.id },
@@ -212,6 +213,7 @@ export function runMaintenanceSweep(log: ReaperLogger): void {
     0
   );
   step("prune catalog row budget", () => repo.pruneOldCatalogRowBudget(), undefined);
+  step("prune Serve usage", () => daemonRepo.pruneUsage(), 0);
   if (prunedSessions || prunedJobs || prunedEnrolments || prunedGpuClockSamples) {
     log.warn(
       { prunedSessions, prunedJobs, prunedEnrolments, prunedGpuClockSamples },

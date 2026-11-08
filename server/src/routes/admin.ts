@@ -10,6 +10,7 @@ import { getCurveHandler, getKneeHandler } from "./curves.js";
 import { getProbeAttemptsHandler } from "./measurements.js";
 import { getFitPointsHandler } from "./optimize.js";
 import { exportTestHandler } from "./exchange.js";
+import { BREAD_FALLOFF_RANGE, BREAD_STEP_RANGE, isBreadMarkStyle } from "../../../shared/breadMarks.js";
 import {
   isVramDiscrepancyPolicy,
   isValidProbeMaxLoads,
@@ -162,6 +163,14 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
     if (body.probeMaxLoads !== undefined && !isValidProbeMaxLoads(body.probeMaxLoads)) {
       return reply.code(400).send({ error: "probeMaxLoads must be an integer in [1, 200]" });
     }
+    if (body.breadMarksEnabled !== undefined && typeof body.breadMarksEnabled !== "boolean") {
+      return reply.code(400).send({ error: "breadMarksEnabled must be a boolean" });
+    }
+    if (body.breadMarkStyle !== undefined && !isBreadMarkStyle(body.breadMarkStyle)) {
+      return reply.code(400).send({
+        error: `breadMarkStyle must have golden (shine|butter|plain), darkFix (shrink|crust|both|none), step ${BREAD_STEP_RANGE.min}-${BREAD_STEP_RANGE.max}, falloff ${BREAD_FALLOFF_RANGE.min}-${BREAD_FALLOFF_RANGE.max}, direction (ltr|rtl)`,
+      });
+    }
     if (body.communitySharingAllowed !== undefined) {
       repo.appSettingsRepo.setCommunitySharingAllowed(body.communitySharingAllowed);
     }
@@ -176,6 +185,12 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
     }
     if (body.probeMaxLoads !== undefined) {
       repo.appSettingsRepo.setProbeMaxLoads(body.probeMaxLoads);
+    }
+    if (body.breadMarksEnabled !== undefined) {
+      repo.appSettingsRepo.setBreadMarksEnabled(body.breadMarksEnabled);
+    }
+    if (body.breadMarkStyle !== undefined) {
+      repo.appSettingsRepo.setBreadMarkStyle(body.breadMarkStyle);
     }
     return repo.appSettingsRepo.get();
   });

@@ -114,10 +114,20 @@ export interface ResultExportRow {
 
 // Neutralize CSV/formula injection: a field starting with =, +, -, @, tab, or
 // CR gets interpreted as a formula by Excel/Sheets when the export is opened
-// there. model_filename/worker_name/model_id are free text a client can set
-// via the API, so they need this before being written out.
+// there. Applied to every string cell, not a list of "free text" columns: the
+// admin export spans every tenant, and a column that looks enumerated (cache
+// types, backend, ...) can hold whatever an old row or a modified worker wrote
+// (audit 2026-10-25 B3). Leading whitespace and the full-width forms are
+// covered because spreadsheets trim or fold them. A plain number stays as is.
 function neutralizeFormula(value: string): string {
-  return /^[=+\-@\t\r]/.test(value) ? `'${value}` : value;
+  if (/^-?\d+(\.\d+)?$/.test(value)) return value;
+  return /^[\s\u0000-\u001f]*[=+\-@\uFF1D\uFF0B\uFF0D\uFF20]/.test(value) || /^[\t\r\n]/.test(value) ? `'${value}` : value;
+}
+
+// A Markdown table cell: a pipe or a newline in a filename would otherwise
+// start a new column or row.
+function mdCell(value: string): string {
+  return value.replace(/\|/g, "\\|").replace(/[\r\n]+/g, " ");
 }
 
 function fmtNullable(value: number | null): string {
@@ -283,7 +293,7 @@ export function formatResultsExport(
         fmtSampleList(r.repeat_samples),
         fmtSpecDecode(r.spec_drafted, r.spec_accepted),
       ]
-        .map((v) => `"${String(v).replace(/"/g, '""')}"`)
+        .map((v) => `"${(typeof v === "string" ? neutralizeFormula(v) : String(v)).replace(/"/g, '""')}"`)
         .join(",")
     );
     const csv = [header, ...lines].join("\n");
@@ -304,7 +314,7 @@ export function formatResultsExport(
       "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |";
     const lines = rows.map(
       (r) =>
-        `| ${neutralizeFormula(r.run_id.slice(0, 8))} | ${neutralizeFormula(r.worker_name)} | ${neutralizeFormula(`${r.backend_type}${r.backend_device_name ? ` (${r.backend_device_name})` : ""}`)} | ${neutralizeFormula(r.model_filename)} | ${r.test_type} | ${r.n_prompt} | ${r.n_gen} | ${r.n_threads} | ${r.n_gpu_layers} | ${fmtNullable(r.gpu_layers_loaded)}/${fmtNullable(r.total_model_layers)}${r.gpu_layers_resident_est != null ? ` (claimed; ~${r.gpu_layers_resident_est} actual)` : ""} | ${r.batch_size} | ${r.ubatch_size} | ${r.cache_type_k} | ${r.cache_type_v} | ${r.flash_attn} | ${r.mtp} | ${fmtNgldCell(r.n_gpu_layers_draft, r.gpu_layers_loaded_draft, r.total_model_layers_draft, r.gpu_layers_resident_est_draft)} | ${r.n_cpu_moe > 0 ? r.n_cpu_moe : "—"} | ${r.avg_tps.toFixed(2)} | ${r.stddev_tps.toFixed(2)} | ${r.ram_peak_mib} | ${fmtNullable(r.ram_total_used_avg_mib)} | ${fmtNullable(r.ram_total_used_peak_mib)} | ${fmtNullable(r.vram_peak_mib)} | ${fmtNullable(r.gpu_memory_used_avg_mib)} | ${fmtNullable(r.gpu_memory_used_peak_mib)} | ${fmtNullable(r.gpu_memory_process_avg_mib)} | ${fmtNullable(r.gpu_memory_process_peak_mib)} | ${fmtNullable(r.gpu_memory_total_mib)} | ${fmtNullable(r.suspect_count)}/${fmtNullable(r.sample_count)} | ${fmtSampleList(r.suspect_samples)} | ${fmtSampleList(r.repeat_samples)} | ${fmtSpecDecode(r.spec_drafted, r.spec_accepted)} |`
+        `| ${mdCell(neutralizeFormula(r.run_id.slice(0, 8)))} | ${mdCell(neutralizeFormula(r.worker_name))} | ${mdCell(neutralizeFormula(`${r.backend_type}${r.backend_device_name ? ` (${r.backend_device_name})` : ""}`))} | ${mdCell(neutralizeFormula(r.model_filename))} | ${r.test_type} | ${r.n_prompt} | ${r.n_gen} | ${r.n_threads} | ${r.n_gpu_layers} | ${fmtNullable(r.gpu_layers_loaded)}/${fmtNullable(r.total_model_layers)}${r.gpu_layers_resident_est != null ? ` (claimed; ~${r.gpu_layers_resident_est} actual)` : ""} | ${r.batch_size} | ${r.ubatch_size} | ${mdCell(r.cache_type_k)} | ${mdCell(r.cache_type_v)} | ${mdCell(r.flash_attn)} | ${mdCell(r.mtp)} |${fmtNgldCell(r.n_gpu_layers_draft, r.gpu_layers_loaded_draft, r.total_model_layers_draft, r.gpu_layers_resident_est_draft)} | ${r.n_cpu_moe > 0 ? r.n_cpu_moe : "—"} | ${r.avg_tps.toFixed(2)} | ${r.stddev_tps.toFixed(2)} | ${r.ram_peak_mib} | ${fmtNullable(r.ram_total_used_avg_mib)} | ${fmtNullable(r.ram_total_used_peak_mib)} | ${fmtNullable(r.vram_peak_mib)} | ${fmtNullable(r.gpu_memory_used_avg_mib)} | ${fmtNullable(r.gpu_memory_used_peak_mib)} | ${fmtNullable(r.gpu_memory_process_avg_mib)} | ${fmtNullable(r.gpu_memory_process_peak_mib)} | ${fmtNullable(r.gpu_memory_total_mib)} | ${fmtNullable(r.suspect_count)}/${fmtNullable(r.sample_count)} | ${fmtSampleList(r.suspect_samples)} | ${fmtSampleList(r.repeat_samples)} | ${fmtSpecDecode(r.spec_drafted, r.spec_accepted)} |`
     );
     const md = ["# Benchmark results", "", header, sep, ...lines].join("\n");
     return { contentType: "text/markdown", filename: "results.md", body: md };

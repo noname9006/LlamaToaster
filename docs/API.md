@@ -22,6 +22,14 @@ are meant to be driven by the SPA, not called directly).
 | GET | `/api/hf/search?q=` | search Hugging Face repos tagged gguf |
 | GET | `/api/hf/repo/*` | list `.gguf` files + sizes in a repo (repo id as the wildcard tail) |
 | POST | `/api/workers/:id/models/download` | start a download on a machine (returns as soon as it's accepted, not once it finishes) |
+| GET | `/api/workers/:id/daemon` | Serve page state: phase, live memory, endpoint settings, API keys (prefixes only) |
+| POST | `/api/workers/:id/daemon/load` \| `/unload` | load a model on the machine, or unload it (queued; last request wins) |
+| GET | `/api/workers/:id/daemon/models/:modelId/settings` | the remembered load and sampling settings for a model on this machine |
+| PUT | `/api/workers/:id/daemon/sampling` | sampling settings, applied on the next request with no reload |
+| PUT | `/api/workers/:id/daemon/gateway` | endpoint address, port, allowed origins, autostart (non-loopback needs an API key) |
+| POST | `/api/workers/:id/daemon/keys` | create an API key; the response is the only time it is shown |
+| DELETE | `/api/workers/:id/daemon/keys/:keyId` | revoke a key; revoking the last one closes the endpoint to the machine itself |
+| GET \| DELETE | `/api/workers/:id/daemon/usage?model_id=` | usage profile, speed curve and chart points for a model; delete clears them |
 | GET | `/api/results/export` | json \| csv \| md |
 | POST | `/api/ai/chat` | AI assistant (SSE streamed) |
 | GET | `/api/auth/status` | who's logged in, and whether login is required at all |

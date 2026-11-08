@@ -116,7 +116,7 @@ function FitRunPanel({ testId, model, refreshKey }: { testId: string; model: Mod
   const p = selSeries?.points.find((x) => x.ctx === selection?.ctx);
   const layersTotal = data.points.find((x) => x.layers_total != null)?.layers_total ?? null;
   return (
-    <div className="flex flex-col gap-4 border border-border bg-surface p-4">
+    <div className="flex flex-col gap-4">
       <div className="flex flex-wrap items-baseline justify-between gap-2">
         <h2 className="m-0 font-display text-lg font-semibold">Fit paths</h2>
         <span className="font-mono text-xs text-muted">

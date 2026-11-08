@@ -27,7 +27,7 @@ const ctx = (over: Partial<Parameters<typeof fitPointFromOutput>[1]> = {}) => ({
 });
 
 describe("fitCtxStops", () => {
-  it("starts at 4096 and ends at the trained context", () => {
+  it("starts at 4096 and ends at the maximum context", () => {
     expect(fitCtxStops(262144)).toEqual([4096, 8192, 16384, 32768, 65536, 131072, 262144]);
     expect(fitCtxStops(40960)).toEqual([4096, 8192, 16384, 32768, 40960]);
     expect(fitCtxStops(2048)).toEqual([4096]);

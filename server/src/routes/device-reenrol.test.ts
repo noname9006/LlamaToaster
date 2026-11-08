@@ -320,7 +320,9 @@ describe("revocation needs the owner again", () => {
     const workerId = repo.workerRepo.getByMachineId("revoke-replay")!.id;
 
     expect((await fetch(`${baseUrl}/api/auth/refresh`, { method: "POST", headers: authed(refresh_token) })).status).toBe(200);
-    // The same (now previous) refresh token again = replay.
+    // The same (now previous) refresh token again, past the lost-response
+    // grace window = replay.
+    getDb().prepare(`UPDATE sessions SET rotated_at = ? WHERE prev_refresh_hash = ?`).run(Date.now() - 120_000, hashToken(refresh_token));
     expect((await fetch(`${baseUrl}/api/auth/refresh`, { method: "POST", headers: authed(refresh_token) })).status).toBe(401);
     expect(repo.workerRepo.getEnrolmentById(workerId)?.publicKey).toBeNull();
     expect((await signedStart("revoke-replay", key)).approved).toBeUndefined();

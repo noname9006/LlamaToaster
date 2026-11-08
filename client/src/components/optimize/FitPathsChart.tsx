@@ -168,7 +168,7 @@ export function FitPathsChart({ series, selection, onSelect, moe, machine, targe
 
   if (allPts.length === 0) {
     return (
-      <div ref={wrapRef} className="border border-border bg-well p-6 text-sm text-muted">
+      <div ref={wrapRef} className="bg-well p-6 text-sm text-muted">
         No answers to plot yet.
       </div>
     );

@@ -341,7 +341,7 @@ export function GoalQuestionnaire({
   const suggestedTarget = Math.min(32_768, trainedCtx != null && trainedCtx > 0 ? trainedCtx : 32_768);
 
   // The slider only exists once there's a real ceiling to fraction up to --
-  // without a trained context, "how full" has nothing to be a fraction OF,
+  // without a maximum context, "how full" has nothing to be a fraction OF,
   // so the field stays the plain number entry below instead of inventing
   // stops against a house number.
   const ctxStops = useMemo(
@@ -374,7 +374,7 @@ export function GoalQuestionnaire({
       onChange({ ...goals, target_ctx: null });
       return;
     }
-    // Clamped by trained context INLINE -- typing 65 536 against a 32 768 cap
+    // Clamped by maximum context INLINE -- typing 65 536 against a 32 768 cap
     // shows the clamp immediately rather than at submit time.
     const value = trainedCtx != null && trainedCtx > 0 ? Math.min(Math.floor(parsed), trainedCtx) : Math.floor(parsed);
     onChange({ ...goals, target_ctx: value });
@@ -457,7 +457,7 @@ export function GoalQuestionnaire({
       : null;
 
   return (
-    <fieldset className="rounded-xl border border-border bg-surface p-4">
+    <fieldset className="border-t border-border pt-4">
       <legend className="flex flex-wrap items-center gap-2 px-1 text-sm font-semibold text-fg">
         What are you optimizing for?
         <span className="rounded-full bg-surface-raised px-2 py-0.5 text-[11px] font-normal text-muted">
@@ -472,14 +472,14 @@ export function GoalQuestionnaire({
 
       <div className="mt-3 flex flex-col gap-2.5">
         {/* Priority ------------------------------------------------------------ */}
-        <div className="rounded-lg border border-border bg-surface-raised p-3.5">
+        <div className="bg-surface p-3.5">
           <span className="text-[13.5px] text-fg">
             A · Priority · What matters most?
             <small className="mt-0.5 block text-[11px] font-normal text-muted">
               drives ranking and which cards appear
             </small>
           </span>
-          <div className="mt-2 inline-flex overflow-hidden rounded-lg border border-border" role="radiogroup" aria-label="Goal">
+          <div className="mt-2 inline-flex overflow-hidden rounded-lg border border-border-strong" role="radiogroup" aria-label="Goal">
             {GOAL_CHOICES.map((choice) => (
               <button
                 key={choice.value}
@@ -531,7 +531,7 @@ export function GoalQuestionnaire({
         </div>
 
         {/* Context target ------------------------------------------------------ */}
-        <div className="rounded-lg border border-border bg-surface-raised p-3.5">
+        <div className="bg-surface p-3.5">
           <div className="flex flex-wrap items-baseline justify-between gap-2">
             <span className="text-[13.5px] text-fg">
               B · Context target · How full should the window be?
@@ -544,7 +544,7 @@ export function GoalQuestionnaire({
             </span>
           </div>
 
-          {/* The slider snaps to common fractions of this model's trained
+          {/* The slider snaps to common fractions of this model's maximum
               context; the exact number field below it stays the source of
               truth (its value is what's stored), so a drag and a typed
               number never disagree about what will be sent. */}
@@ -557,7 +557,7 @@ export function GoalQuestionnaire({
                 step={1}
                 value={ctxActiveIndex}
                 onChange={(e) => setTarget(String(ctxStops[Number(e.target.value)]))}
-                aria-label="Target context, snapped to common fractions of the trained context"
+                aria-label="Target context, snapped to common fractions of the model's maximum context"
                 aria-describedby={clampId}
                 className="w-full cursor-pointer"
               />
@@ -625,7 +625,7 @@ export function GoalQuestionnaire({
                 placeholder={String(suggestedTarget)}
                 aria-label="Target context in tokens"
                 aria-describedby={clampId}
-                className="w-32 rounded-lg border border-border bg-bg px-2.5 py-1 font-mono text-sm text-fg outline-none focus:border-accent"
+                className="w-32 rounded-lg border border-border-strong bg-bg px-2.5 py-1 font-mono text-sm text-fg outline-none focus:border-accent"
               />
             )}
             <button
@@ -652,11 +652,11 @@ export function GoalQuestionnaire({
           </div>
           <p id={clampId} aria-live="polite" className="mt-1.5 text-[11px] leading-relaxed text-muted">
             {trainedCtx != null
-              ? `Clamped by trained context (${trainedCtx.toLocaleString()}). `
-              : "This model's header never reported a trained context, so nothing clamps the target. "}
+              ? `Clamped by the model's maximum context (${trainedCtx.toLocaleString()}). `
+              : "This model's header never reported a maximum context, so nothing clamps the target. "}
             {goals.target_ctx == null ? (
               <>
-                Suggested: {suggestedTarget.toLocaleString()} (min of 32 k and this model's trained context) — left
+                Suggested: {suggestedTarget.toLocaleString()} (min of 32 k and this model's maximum context) — left
                 blank, this stores a <span className="font-mono">target_unverified</span> marker instead of a fit
                 line.
               </>
@@ -693,12 +693,12 @@ export function GoalQuestionnaire({
         </div>
 
         {/* Workload shape ------------------------------------------------------- */}
-        <div className="rounded-lg border border-border bg-surface-raised p-3.5">
+        <div className="bg-surface p-3.5">
           <span className="text-[13.5px] text-fg">
             C · Workload shape · Chat, docs, or even?
             <small className="mt-0.5 block text-[11px] font-normal text-muted">sets the pp/tg scoring weights</small>
           </span>
-          <div className="mt-2 inline-flex overflow-hidden rounded-lg border border-border" role="radiogroup" aria-label="Workload shape">
+          <div className="mt-2 inline-flex overflow-hidden rounded-lg border border-border-strong" role="radiogroup" aria-label="Workload shape">
             {WORKLOAD_CHOICES.map((choice) => (
               <button
                 key={choice.value}
@@ -1417,7 +1417,7 @@ function TargetsPinGroup({
 }) {
   return (
     <div
-      className={`inline-flex overflow-hidden rounded-lg border border-border ${disabled ? "opacity-40" : ""}`}
+      className={`inline-flex overflow-hidden rounded-lg border border-border-strong ${disabled ? "opacity-40" : ""}`}
       role="radiogroup"
       aria-label="Targets pin"
     >

@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import AdmZip from "adm-zip";
+import { assertAllowedDownloadUrl } from "./llama-builds.js";
 
 // The real fetch is never allowed to fire here: installBuild only accepts
 // https:// github.com URLs, so tests stub global.fetch to serve in-memory
@@ -139,6 +140,29 @@ describe("installBuild with CUDA runtime pairing", () => {
       })
     ).rejects.toThrow(/download failed/);
     expect(existsSync(join(buildsDir, "b10614"))).toBe(false);
+  });
+});
+
+describe("assertAllowedDownloadUrl", () => {
+  const ok = "https://github.com/ggml-org/llama.cpp/releases/download/b100/llama-b100-bin-win-vulkan-x64.zip";
+
+  it("takes a release asset of the tag being installed", () => {
+    expect(() => assertAllowedDownloadUrl(ok, "b100")).not.toThrow();
+  });
+
+  it.each([
+    ["another repository on the same host", "https://github.com/attacker/llama.cpp/releases/download/b100/x.zip"],
+    ["a look-alike repository", "https://github.com/ggml-org/llama.cpp-evil/releases/download/b100/x.zip"],
+    ["another tag", "https://github.com/ggml-org/llama.cpp/releases/download/b999/x.zip"],
+    ["another host", "https://evil.example/ggml-org/llama.cpp/releases/download/b100/x.zip"],
+    ["a CDN host directly", "https://objects.githubusercontent.com/ggml-org/llama.cpp/releases/download/b100/x.zip"],
+    ["plain http", "http://github.com/ggml-org/llama.cpp/releases/download/b100/x.zip"],
+    ["a subfolder under the tag", "https://github.com/ggml-org/llama.cpp/releases/download/b100/a/x.zip"],
+    ["no asset", "https://github.com/ggml-org/llama.cpp/releases/download/b100/"],
+    ["credentials as a host trick", "https://github.com@evil.example/ggml-org/llama.cpp/releases/download/b100/x.zip"],
+    ["not a url", "nope"],
+  ])("refuses %s", (_label, url) => {
+    expect(() => assertAllowedDownloadUrl(url, "b100")).toThrow();
   });
 });
 

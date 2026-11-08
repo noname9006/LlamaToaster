@@ -36,9 +36,11 @@ import type {
   Worker,
 } from "../../../shared/types.js";
 import { fitTargetKey, type FitMemory } from "../../../shared/fitLevel.js";
+import type { FitCeiling } from "../../../shared/fitGrade.js";
 import { queueEvents } from "../queue-events.js";
+import { bodyBytes, chargeIngest } from "../ingest-budget.js";
 import { assetMatchesWorker, buildInstallPayload, filterReleasesForWorker, getReleases } from "../github-releases.js";
-import { HF_REPO_PATTERN } from "../hf.js";
+import { HF_REPO_PATTERN, isHfFilePath } from "../hf.js";
 import { getRocmSupportSnapshot } from "../rocm-support.js";
 
 const MAX_POINTS_PER_POST = 400;
@@ -186,6 +188,7 @@ export async function optimizeRoutes(app: FastifyInstance): Promise<void> {
     reply: FastifyReply
   ) => {
     const run = await resolveFitRunForWorker(request);
+    chargeIngest(repo.catalogBudgetScopeForWorker(run.worker_id!), bodyBytes(request.headers, request.body));
     const raw = request.body?.points;
     if (!Array.isArray(raw)) throw new BadRequestError("points must be an array");
     if (raw.length > MAX_POINTS_PER_POST) throw new BadRequestError(`at most ${MAX_POINTS_PER_POST} points per post`);
@@ -273,17 +276,14 @@ export async function optimizeRoutes(app: FastifyInstance): Promise<void> {
       const models: Model[] = [];
       for (const raw of body.model_ids) {
         if (typeof raw !== "string") throw new BadRequestError("model_ids must be strings");
-        const model = repo.getModelForWorker(raw, worker.id);
+        const model = repo.isModelVisibleTo(sessionScope(request), raw) ? repo.getModelForWorker(raw, worker.id) : undefined;
         if (!model) throw new BadRequestError(`unknown model ${raw}`);
         if (!fresh(model.id)) models.push(model);
       }
       if (models.length === 0) return reply.send({ ok: true, queued: 0 });
       // One check job at a time per machine: a list re-render must not stack
       // copies behind a long benchmark.
-      const pending = getDb()
-        .prepare(`SELECT COUNT(*) AS n FROM worker_jobs WHERE worker_id = ? AND job_type = 'fit_check' AND status IN ('pending','claimed')`)
-        .get(worker.id) as { n: number };
-      if (pending.n > 0) return reply.send({ ok: true, queued: 0, pending: true });
+      if (pendingNewTestFitChecks(worker.id) > 0) return reply.send({ ok: true, queued: 0, pending: true });
       const memTotalMib = worker.hardware?.mem_total_bytes ? Math.floor(worker.hardware.mem_total_bytes / 1048576) : null;
       const payload: FitCheckJobPayload = {
         ctx,
@@ -309,16 +309,14 @@ export async function optimizeRoutes(app: FastifyInstance): Promise<void> {
       if (!Number.isInteger(ctx) || ctx <= 0) throw new BadRequestError("ctx must be a positive integer");
       const margin = request.query.margin_mib === undefined ? DEFAULT_FIT_MARGIN_MIB : Number(request.query.margin_mib);
       if (!isFitMargin(margin)) throw new BadRequestError("margin_mib must be 512, 1024 or 1536");
-      const pending = getDb()
-        .prepare(`SELECT COUNT(*) AS n FROM worker_jobs WHERE worker_id = ? AND job_type = 'fit_check' AND status IN ('pending','claimed')`)
-        .get(worker.id) as { n: number };
-      return reply.send({ results: fitRepo.listFitChecks({ worker_id: worker.id, ctx, margin_mib: margin }), pending: pending.n > 0 });
+      return reply.send({ results: fitRepo.listFitChecks({ worker_id: worker.id, ctx, margin_mib: margin }), pending: pendingNewTestFitChecks(worker.id) > 0 });
     }
   );
 
   // Worker -> server: answers of a fit_check job, posted as they come in.
   app.post<{ Body: { results?: unknown } }>("/api/worker/fit-checks", { bodyLimit: 2 * 1024 * 1024 }, async (request, reply) => {
     const worker = await authenticateWorker(request);
+    chargeIngest(repo.catalogBudgetScopeForWorker(worker.id), bodyBytes(request.headers, request.body));
     const raw = request.body?.results;
     if (!Array.isArray(raw) || raw.length > MAX_FIT_CHECK_MODELS) throw new BadRequestError(`results must be an array of at most ${MAX_FIT_CHECK_MODELS}`);
     const results = raw.map((r, i) => validateFitCheckResult(r, `results[${i}]`));
@@ -364,7 +362,8 @@ export async function optimizeRoutes(app: FastifyInstance): Promise<void> {
       if (!Array.isArray(body.targets) || body.targets.length === 0 || body.targets.length > MAX_MODEL_FIT_TARGETS) {
         throw new BadRequestError(`targets must list 1..${MAX_MODEL_FIT_TARGETS} files`);
       }
-      const requested = body.targets.map((t, i) => modelFitTarget(t, `targets[${i}]`, worker.id));
+      const userId = sessionScope(request);
+      const requested = body.targets.map((t, i) => modelFitTarget(t, `targets[${i}]`, worker.id, userId));
 
       const choice = await chooseFitBuild(worker);
       if (!choice.build) throw new ConflictError(choice.error ?? "no llama.cpp build available for that machine");
@@ -440,6 +439,7 @@ export async function optimizeRoutes(app: FastifyInstance): Promise<void> {
   // Worker -> server: "Will it fit?" answers, posted as they come in.
   app.post<{ Body: { results?: unknown } }>("/api/worker/model-fit", { bodyLimit: 2 * 1024 * 1024 }, async (request, reply) => {
     const worker = await authenticateWorker(request);
+    chargeIngest(repo.catalogBudgetScopeForWorker(worker.id), bodyBytes(request.headers, request.body));
     const raw = request.body?.results;
     if (!Array.isArray(raw) || raw.length > MAX_MODEL_FIT_TARGETS) throw new BadRequestError(`results must be an array of at most ${MAX_MODEL_FIT_TARGETS}`);
     const results = raw.map((r, i) => validateModelFitReport(r, `results[${i}]`));
@@ -452,6 +452,20 @@ export async function optimizeRoutes(app: FastifyInstance): Promise<void> {
 export const MODEL_FIT_CTX = 1024;
 const MAX_MODEL_FIT_TARGETS = 64;
 const MAX_PENDING_MODEL_FIT_JOBS = 8;
+
+// The New test page's own fit_check jobs. "Will it fit?" answers share the job
+// type but carry target_keys, and neither can stand in for the other.
+function pendingNewTestFitChecks(workerId: string): number {
+  return (
+    getDb()
+      .prepare(
+        `SELECT COUNT(*) AS n FROM worker_jobs
+         WHERE worker_id = ? AND job_type = 'fit_check' AND status IN ('pending','claimed')
+           AND json_extract(payload_json, '$.target_keys') IS NULL`
+      )
+      .get(workerId) as { n: number }
+  ).n;
+}
 
 interface PendingFitJob {
   target_keys: string[];
@@ -535,27 +549,17 @@ async function chooseFitBuild(worker: Worker): Promise<FitBuildChoice> {
   };
 }
 
-const HF_FILE_MAX = 512;
-
-function modelFitTarget(raw: unknown, field: string, workerId: string): { key: string; model: Model } {
+function modelFitTarget(raw: unknown, field: string, workerId: string, userId: string | undefined): { key: string; model: Model } {
   if (!raw || typeof raw !== "object") throw new BadRequestError(`${field} must be an object`);
   const t = raw as Record<string, unknown>;
   if (typeof t.model_id === "string") {
-    const model = repo.getModelForWorker(t.model_id, workerId);
+    const model = repo.isModelVisibleTo(userId, t.model_id) ? repo.getModelForWorker(t.model_id, workerId) : undefined;
     if (!model) throw new BadRequestError(`unknown model ${t.model_id}`);
     return { key: fitTargetKey(model)!, model };
   }
   const { hf_repo: hfRepo, hf_file: hfFile, size_bytes: sizeBytes } = t;
   if (typeof hfRepo !== "string" || !HF_REPO_PATTERN.test(hfRepo)) throw new BadRequestError(`${field}.hf_repo is not a repo id`);
-  if (
-    typeof hfFile !== "string" ||
-    hfFile.length > HF_FILE_MAX ||
-    !/\.gguf$/i.test(hfFile) ||
-    hfFile.startsWith("/") ||
-    /\.\.|\\|\0/.test(hfFile)
-  ) {
-    throw new BadRequestError(`${field}.hf_file is not a GGUF path`);
-  }
+  if (!isHfFilePath(hfFile)) throw new BadRequestError(`${field}.hf_file is not a GGUF path`);
   const key = fitTargetKey({ hf_repo: hfRepo, hf_file: hfFile })!;
   // Never stored: the catalog is shared, and asking about a file must not publish it.
   return {
@@ -591,6 +595,7 @@ function validateModelFitReport(raw: unknown, field: string): ModelFitReport {
   const point = r.point === null || r.point === undefined ? null : validateFitPoint(r.point, `${field}.point`);
   if (!point && !error) throw new BadRequestError(`${field} needs a point or an error`);
   const fetched = r.fetched_bytes === null || r.fetched_bytes === undefined ? null : mib(r.fetched_bytes, `${field}.fetched_bytes`);
+  const ceiling = r.ceiling === null || r.ceiling === undefined ? null : validateFitCeiling(r.ceiling, `${field}.ceiling`);
   return {
     target_key: key,
     ctx: r.ctx,
@@ -602,7 +607,20 @@ function validateModelFitReport(raw: unknown, field: string): ModelFitReport {
     point,
     error,
     ...(fetched != null ? { fetched_bytes: fetched } : {}),
+    ...(ceiling ? { ceiling } : {}),
   };
+}
+
+const MAX_CTX = 1 << 24;
+
+function validateFitCeiling(raw: unknown, field: string): FitCeiling {
+  if (!raw || typeof raw !== "object") throw new BadRequestError(`${field} must be an object`);
+  const c = raw as Record<string, unknown>;
+  const ctxOk = (v: unknown) => typeof v === "number" && Number.isInteger(v) && v > 0 && v <= MAX_CTX;
+  if (!ctxOk(c.trained_ctx)) throw new BadRequestError(`${field}.trained_ctx must be a positive integer`);
+  if (typeof c.fits_at_trained !== "boolean") throw new BadRequestError(`${field}.fits_at_trained must be a boolean`);
+  if (c.max_full_ctx !== null && !ctxOk(c.max_full_ctx)) throw new BadRequestError(`${field}.max_full_ctx must be a positive integer or null`);
+  return { trained_ctx: c.trained_ctx as number, fits_at_trained: c.fits_at_trained, max_full_ctx: (c.max_full_ctx as number | null) ?? null };
 }
 
 function validateFitMemory(raw: unknown, field: string): FitMemory {

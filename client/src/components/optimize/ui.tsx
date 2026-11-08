@@ -1,8 +1,7 @@
 import { useState, type ButtonHTMLAttributes, type ReactNode } from "react";
 import { LtIcon } from "../ltIcons";
 
-// Small building blocks in the v2 style (docs/plans/app-v2.dc.html): square
-// corners, 1px rules, condensed headings, mono kickers.
+// Small building blocks: square corners, condensed headings, few rules.
 
 export function PageHeader({ title, sub, actions, crumbs }: { title: string; sub?: ReactNode; actions?: ReactNode; crumbs?: ReactNode }) {
   return (
@@ -17,13 +16,19 @@ export function PageHeader({ title, sub, actions, crumbs }: { title: string; sub
   );
 }
 
+// The lighter style (UX review canvas, "A lighter interface"): space and
+// headings separate sections, not boxes; a raised surface marks only the
+// result; labels are sentence case, not uppercase mono.
+
 export function Kicker({ children, className = "" }: { children: ReactNode; className?: string }) {
-  return <div className={`font-mono text-xs uppercase tracking-[0.06em] text-muted ${className}`}>{children}</div>;
+  return <div className={`text-[13px] text-muted ${className}`}>{children}</div>;
 }
 
+/** A section of a page. Plain by default; `accent` marks the result the
+ * section produced with the one raised surface the page gets. */
 export function Panel({ children, className = "", accent = false, id }: { children: ReactNode; className?: string; accent?: boolean; id?: string }) {
   return (
-    <section id={id} className={`border bg-surface p-4 sm:px-[18px] ${accent ? "border-accent" : "border-border"} ${className}`}>
+    <section id={id} className={`${accent ? "bg-surface p-5 sm:px-6" : "border-t border-border pt-6"} ${className}`}>
       {children}
     </section>
   );
@@ -104,23 +109,20 @@ export function Seg<T extends string | number>({
 
 export function StatCard({ label, value, sub, wide = false }: { label: string; value: ReactNode; sub?: ReactNode; wide?: boolean }) {
   return (
-    <div className={`flex min-w-0 flex-col gap-0.5 border border-border bg-surface-raised px-3 py-2.5 ${wide ? "sm:col-span-2" : ""}`}>
+    <div className={`flex min-w-0 flex-col gap-0.5 ${wide ? "sm:col-span-2" : ""}`}>
       <Kicker>{label}</Kicker>
-      <span className="font-display text-[22px] font-semibold leading-tight [overflow-wrap:anywhere]">{value}</span>
-      {sub && <span className="text-xs text-fg-2">{sub}</span>}
+      <span className="font-display text-[26px] font-semibold leading-tight [overflow-wrap:anywhere]">{value}</span>
+      {sub && <span className="text-[13px] text-fg-2">{sub}</span>}
     </div>
   );
 }
 
 export function Notice({ tone = "info", children }: { tone?: "info" | "warn" | "fail"; children: ReactNode }) {
-  const cls =
-    tone === "fail"
-      ? "border-danger/60 bg-danger-bg text-fg"
-      : tone === "warn"
-        ? "border-accent/50 bg-accent-tint text-fg"
-        : "border-border bg-surface-raised text-fg-2";
+  // Warnings and failures keep a tint (they are status); plain information
+  // is just text with an icon.
+  const cls = tone === "fail" ? "bg-danger-bg px-3 py-2.5 text-fg" : tone === "warn" ? "bg-accent-tint px-3 py-2.5 text-fg" : "py-1 text-fg-2";
   return (
-    <div role={tone === "fail" ? "alert" : undefined} className={`flex items-start gap-2.5 border px-3 py-2.5 text-sm ${cls}`}>
+    <div role={tone === "fail" ? "alert" : undefined} className={`flex items-start gap-2.5 text-sm ${cls}`}>
       <LtIcon name={tone === "info" ? "chip" : "warn"} className={`mt-0.5 flex-none ${tone === "fail" ? "text-danger" : tone === "warn" ? "text-accent" : "text-muted"}`} size={16} />
       <div className="min-w-0">{children}</div>
     </div>
@@ -136,7 +138,7 @@ export function ProgressBar({ pct, live = false, label }: { pct: number; live?: 
       aria-valuemin={0}
       aria-valuemax={100}
       aria-valuenow={v}
-      className="block h-2 w-full border border-border-strong bg-well"
+      className="block h-2 w-full bg-surface-raised"
     >
       <span className={`block h-full ${live ? "lt-progress-fill" : "bg-accent"}`} style={{ width: `${v}%` }} />
     </span>
@@ -146,7 +148,7 @@ export function ProgressBar({ pct, live = false, label }: { pct: number; live?: 
 export function CopyCommand({ command }: { command: string }) {
   return (
     <div className="flex flex-wrap items-center gap-2.5">
-      <code className="block min-w-0 flex-[1_1_320px] border border-border bg-well px-3 py-2.5 font-mono text-[13px] text-fg [overflow-wrap:anywhere]">
+      <code className="block min-w-0 flex-[1_1_320px] bg-well px-3 py-2.5 font-mono text-[13px] text-fg [overflow-wrap:anywhere]">
         {command}
       </code>
       <CopyButton text={command} />

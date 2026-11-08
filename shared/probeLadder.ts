@@ -208,7 +208,7 @@ export interface LadderInput {
   candidateNgl: number;
   /** llama.cpp's -ngl ceiling for this model (n_layer + the output layer). */
   nglMax: number;
-  /** The model's trained context -- the ladder never probes above it. */
+  /** The model's maximum context (header context_length) -- the ladder never probes above it. */
   maxCtx: number;
   maxLoads?: number;
   /** Every load already made, in order. */
@@ -866,7 +866,7 @@ export function ctxLadderStops(maxCtx: number): number[] {
   return stops;
 }
 
-// Roughly 100/75/50/25/12.5/7.5/5/2.5/1% of the model's trained context, each
+// Roughly 100/75/50/25/12.5/7.5/5/2.5/1% of the model's maximum context, each
 // rounded to the nearest power of two and forced strictly below the stop before
 // it so two fractions can never collide on the same tick once rounded. The
 // client's own context-target slider grid ONLY.

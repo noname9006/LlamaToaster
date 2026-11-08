@@ -335,7 +335,7 @@ export function Tests() {
           {visibleGroups.length === 0 ? (
             <p className="text-sm text-muted">No tests match the current filters.</p>
           ) : (
-            <div className="overflow-x-auto border border-border bg-surface">
+            <div className="overflow-x-auto">
               <table className="w-full border-collapse text-left text-sm">
                 <caption className="px-4 pb-2 pt-3 text-left text-xs text-muted">
                   {visibleGroups.length} of {groups.length} tests. A chain of stages, or a batch of context tests, is one row.

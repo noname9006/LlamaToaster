@@ -117,7 +117,7 @@ export function buildCurve(rows: CurveSourceRow[]): CurvePoint[] {
   return points;
 }
 
-// N1's sizing ladder. Points beyond the trained context or beyond what M1
+// N1's sizing ladder. Points beyond the maximum context or beyond what M1
 // says the machine affords render as "unavailable -- reason", never as
 // silent gaps.
 export const CURVE_LADDER = [2_048, 4_096, 8_192, 16_384, 32_768, 65_536, 131_072] as const;
@@ -137,7 +137,7 @@ export function buildLadder(
   return CURVE_LADDER.map((effectiveCtx) => {
     let unavailableReason: string | null = null;
     if (limits.trainedCtx != null && effectiveCtx > limits.trainedCtx) {
-      unavailableReason = `unavailable — trained ctx ${limits.trainedCtx}`;
+      unavailableReason = `unavailable — max ctx ${limits.trainedCtx}`;
     } else if (limits.affordableTokens != null && limits.affordableTokens > 0 && effectiveCtx > limits.affordableTokens) {
       unavailableReason = `unavailable — this placement affords about ${limits.affordableTokens} tokens`;
     }

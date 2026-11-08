@@ -470,6 +470,10 @@ const COLUMN_MIGRATIONS: ColumnSpec[] = [
   // speed" job completes; NULL until that button has been clicked at least
   // once on this machine.
   { table: "workers", column: "mem_speed_json", ddlType: "TEXT" },
+  { table: "sessions", column: "rotated_at", ddlType: "INTEGER" },
+  // Bread fit marks: the "Will it fit?" answer's second look at the model's
+  // maximum context (shared/fitGrade.ts FitCeiling). NULL from older workers.
+  { table: "model_fit_checks", column: "ceiling_json", ddlType: "TEXT" },
 ];
 
 function applyColumnMigrations(database: Database.Database): void {

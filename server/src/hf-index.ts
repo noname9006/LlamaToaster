@@ -665,6 +665,10 @@ function getRepoDuplicateFacts(repoIds: string[]): Map<string, RepoDuplicateFact
 // against the same stale repo (many workers, or one worker's whole model dir)
 // would otherwise trigger duplicate concurrent HF calls for it.
 const verifyingRepos = new Set<string>();
+// Across every repo: each of these spends the instance-wide HF budget, and one
+// hash lookup can name 500 stale files. A repo skipped here is simply
+// re-checked by a later lookup (audit 2026-10-11 N12).
+const MAX_BACKGROUND_SCANS = 8;
 
 // Fire-and-forget verification of a single repo, triggered by
 // POST /api/models/hash-lookup for a matched-but-stale row (see
@@ -673,7 +677,7 @@ const verifyingRepos = new Set<string>();
 // the time this settles; any change (soft-delete, updated files) lands in the
 // DB for the *next* lookup to see.
 export function verifyRepoInBackground(repoId: string): void {
-  if (verifyingRepos.has(repoId)) return;
+  if (verifyingRepos.has(repoId) || verifyingRepos.size >= MAX_BACKGROUND_SCANS) return;
   verifyingRepos.add(repoId);
   scanHfRepo(repoId, HF_INDEX_TIMEOUT_MS, "on-demand-verify")
     .catch((err) => {
@@ -702,7 +706,7 @@ const resolvingDuplicateFacts = new Set<string>();
 // default branch -- see scanHfRepo) rather than assuming "main", since the
 // commits endpoint 404s on a revision that isn't real.
 export function resolveDuplicateFactInBackground(repoId: string): void {
-  if (resolvingDuplicateFacts.has(repoId)) return;
+  if (resolvingDuplicateFacts.has(repoId) || resolvingDuplicateFacts.size >= MAX_BACKGROUND_SCANS) return;
   resolvingDuplicateFacts.add(repoId);
   (async () => {
     const row = getDb()

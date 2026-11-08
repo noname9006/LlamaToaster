@@ -1,9 +1,18 @@
 import type { FastifyInstance, FastifyRequest } from "fastify";
 import { repo } from "../db/repo.js";
 import { hashToken } from "../session.js";
+import { deleteRunLog } from "../run-logs.js";
 import { UnauthorizedError, NotFoundError } from "../errors.js";
 import type { AuthenticatedRequest } from "../auth-middleware.js";
 import type { SessionInfo, IdentityInfo } from "../../../shared/types.js";
+
+// How long after a rotation the token it retired still rotates instead of
+// counting as theft. The server can rotate and then lose the response (a
+// timeout, a proxy, a restart); the worker then retries with the only token it
+// has, and revoking there forces a human to re-approve a healthy machine (audit
+// 2026-09-27 M6). Short enough that a token stolen from an old backup or log
+// still trips the alarm; the worker retries on its next ~10s heartbeat.
+export const REFRESH_GRACE_MS = 60_000;
 
 // Dedicated Authorization-header read, deliberately NOT auth-middleware's
 // extractToken -- a refresh token is never sent as the lt_session cookie
@@ -38,6 +47,10 @@ export async function sessionRoutes(app: FastifyInstance): Promise<void> {
     // is holding the stale one.
     const replayed = repo.sessionRepo.getByPrevRefreshHash(hash);
     if (replayed) {
+      if (replayed.rotatedAt != null && Date.now() - replayed.rotatedAt < REFRESH_GRACE_MS && replayed.expiresAt >= Date.now()) {
+        const rotated = repo.sessionRepo.rotate(replayed.id);
+        return { session_token: rotated.token, refresh_token: rotated.refresh, expires_at: rotated.expiresAt };
+      }
       // For a worker, a replayed refresh token means its config.json may be
       // in someone else's hands -- forget the machine key too, so neither
       // copy can reconnect without the owner's approval.
@@ -54,9 +67,11 @@ export async function sessionRoutes(app: FastifyInstance): Promise<void> {
     // worker that's actively heartbeating/polling keeps its refresh token
     // alive indefinitely. Without this, a 90-day refresh token on a worker
     // that never sleeps would expire on its own and force a re-enrolment
-    // every ~3 months -- the exact UX gap this worker hit.
-    repo.sessionRepo.touch(session);
+    // every ~3 months -- the exact UX gap this worker hit. Checked first: touch
+    // writes a new expiry, so an expired token would otherwise work on its
+    // second try (audit 2026-10-11 N16).
     if (session.expiresAt < Date.now()) throw new UnauthorizedError("refresh token expired");
+    repo.sessionRepo.touch(session);
 
     // sessions.id is STABLE across rotation -- a caller that stored it
     // earlier (Stage 3's workers.session_id) is never orphaned by a refresh.
@@ -152,7 +167,18 @@ export async function sessionRoutes(app: FastifyInstance): Promise<void> {
     if (req.body?.confirm !== true) {
       return reply.code(400).send({ error: "confirm: true is required to delete an account" });
     }
+    const runIds = repo.listTestIdsForUser(user.id);
     repo.userRepo.deleteAccount(user.id);
+    // The rows are gone; their log files are the last thing the account left
+    // behind (audit 2026-09-27 M3). One that can't go now (locked on Windows)
+    // leaves with the retention sweep.
+    for (const id of runIds) {
+      try {
+        deleteRunLog(id);
+      } catch (err) {
+        req.log.warn({ run_id: id, err }, "could not delete a deleted account's run log");
+      }
+    }
     reply.clearCookie("lt_session", { path: "/" });
     return { ok: true };
   });

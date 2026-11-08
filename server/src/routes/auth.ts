@@ -71,6 +71,12 @@ const PROVIDERS: Record<string, OAuthProvider> = {
   // Nothing else in this file changes when it's added (§2.4).
 };
 
+// Own keys only: the name comes off the URL, and /auth/constructor would
+// otherwise find Object.prototype's.
+function providerNamed(name: string): OAuthProvider | undefined {
+  return Object.hasOwn(PROVIDERS, name) ? PROVIDERS[name] : undefined;
+}
+
 // Rough "Browser on OS" label for the Settings page's session list -- not a
 // full UA-parsing library (this project avoids adding dependencies for a
 // cosmetic label), just enough to distinguish a handful of sessions from
@@ -126,7 +132,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     // keyGenerator (request.ip) is exactly right here.
     { config: { rateLimit: { max: 10, timeWindow: "1 minute" } } },
     async (req, reply) => {
-      const provider = PROVIDERS[req.params.provider];
+      const provider = providerNamed(req.params.provider);
       if (!provider) return reply.code(404).send({ error: "unknown provider" });
 
       const publicUrl = originForRequest(req);
@@ -169,7 +175,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     "/auth/:provider/callback",
     { config: { rateLimit: { max: 10, timeWindow: "1 minute" } } },
     async (req, reply) => {
-      const provider = PROVIDERS[req.params.provider];
+      const provider = providerNamed(req.params.provider);
       if (!provider) return reply.code(404).send({ error: "unknown provider" });
 
       // MUST match whatever the start handler used to build the redirect_uri
@@ -345,10 +351,17 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     }
   );
 
-  app.get("/auth/logout", async (req, reply) => {
+  // POST, so a link or image on another site can't sign anyone out: the session
+  // cookie is SameSite=Lax, sent on a cross-site GET but not on a POST (audit
+  // 2026-09-27 L8).
+  app.post("/auth/logout", async (req, reply) => {
     const resolved = resolveAuthUser(req);
-    if (resolved) repo.sessionRepo.revokeById(resolved.session.id);
-    reply.clearCookie("lt_session", { path: "/" });
-    return reply.redirect("/login");
+    // Only with a session. A cross-site form POST sends no cookie, but the browser
+    // would still apply a Set-Cookie clearing it from the response (audit 2026-11-01 E7).
+    if (resolved) {
+      repo.sessionRepo.revokeById(resolved.session.id);
+      reply.clearCookie("lt_session", { path: "/" });
+    }
+    return { ok: true };
   });
 }

@@ -346,6 +346,15 @@ export class MemorySampler {
     if (this.timer) void this.readVram();
   }
 
+  // One reading once timed work has ended and before the process stops. Not
+  // everything is allocated by the first request: a later one reusing the cached
+  // context has been measured allocating about 220 MiB more, so without this a
+  // server-path result never sees its own peak (audit 2026-10-25 B2). Outside
+  // every timed window, so the reason for pausing doesn't apply.
+  async readAfterTimedWork(): Promise<void> {
+    if (this.timer) await this.readVram();
+  }
+
   // M6's detection window is the TIMED work, not the spawn: server items
   // bracket sampling from the first timed request onward, since model-load
   // idle clocks inside the sampled span would otherwise mask or fabricate

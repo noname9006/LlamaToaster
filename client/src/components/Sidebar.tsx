@@ -1,3 +1,4 @@
+import type { ReactNode } from "react";
 import { NavLink, useLocation } from "react-router-dom";
 import { LtIcon, type LtIconName } from "./ltIcons";
 
@@ -19,6 +20,7 @@ export const NAV_ITEMS: NavItem[] = [
   { to: "/tests", label: "Tests", icon: "list" },
   { to: "/compare", label: "Compare", icon: "bars" },
   { to: "/models", label: "Models", icon: "box" },
+  { to: "/serve", label: "Serve", icon: "play" },
   { to: "/workers", label: "Machines", icon: "server", also: ["/device"] },
 ];
 
@@ -48,7 +50,7 @@ export function NavList({ authEnabled, onNavigate, large }: { authEnabled: boole
             aria-current={active ? "page" : undefined}
             className={`flex w-full items-center gap-3 border-l-2 px-3 text-sm font-medium transition-colors ${
               large ? "min-h-11" : "min-h-10"
-            } ${active ? "border-accent bg-accent-tint text-accent" : "border-transparent text-fg-2 hover:bg-surface-raised hover:text-fg"}`}
+            } ${active ? "border-accent text-fg" : "border-transparent text-muted hover:text-fg"}`}
           >
             <LtIcon name={item.icon} className="flex-none" />
             {item.label}
@@ -66,9 +68,9 @@ interface SidebarProps {
   footer?: string | null;
 }
 
-export function Sidebar({ authEnabled, footer }: SidebarProps) {
+export function Sidebar({ authEnabled, footer, status }: SidebarProps & { status?: ReactNode }) {
   return (
-    <aside className="sticky top-0 flex h-screen w-56 flex-none flex-col border-r border-border bg-surface">
+    <aside className="sticky top-0 flex h-screen w-56 flex-none flex-col bg-bg">
       <div className="flex items-center gap-2.5 px-[18px] pb-5 pt-[18px]">
         <img src="/toaster_favicon.png" alt="" className="block h-8 w-8 object-contain" />
         <span className="font-display text-lg font-semibold">LlamaToaster</span>
@@ -76,9 +78,10 @@ export function Sidebar({ authEnabled, footer }: SidebarProps) {
       <nav aria-label="Main" className="flex flex-col gap-0.5 px-2.5">
         <NavList authEnabled={authEnabled} />
       </nav>
-      {footer && (
-        <p className="mt-auto truncate border-t border-border px-[18px] py-4 font-mono text-xs text-muted">{footer}</p>
-      )}
+      <div className="mt-auto flex flex-col gap-3 pb-4">
+        {status}
+        {footer && <p className="m-0 truncate px-[18px] text-[13px] text-muted">{footer}</p>}
+      </div>
     </aside>
   );
 }

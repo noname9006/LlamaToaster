@@ -405,6 +405,10 @@ fi
 # the shim re-pointed at the new location.
 install_toaster_shim "$REPO_ROOT"
 
+# Lets the LlamaToaster Chrome extension read this machine's VRAM through the
+# worker (Chrome starts worker/chrome-host/vram-host.sh on demand). Never fatal.
+sh "$REPO_ROOT/worker/chrome-host/register.sh" || echo "Warning: Chrome VRAM host not registered." >&2
+
 if [ "$RECONNECT" -eq 1 ]; then
   echo "Starting worker -- watch the console for a short code and a link to re-approve this machine."
 elif [ "$SKIPPED_SETUP" -eq 1 ]; then

@@ -32,9 +32,20 @@ import {
   type ModelFitResult,
   type ModelFitTarget,
 } from "../types";
+import type { DaemonApiKeyInfo, DaemonModelSettings, DaemonUsageView, DaemonView } from "../../../shared/daemonTypes.js";
+import type { GatewaySettings, SamplingSettings, SettingValues } from "../../../shared/daemonSettings.js";
 import type { FitPoint } from "../../../shared/fitParams.js";
 import type { KvSupportRow } from "../../../shared/kvSupport.js";
 import type { FitMapSpec } from "../../../shared/optimizeFlow.js";
+
+export interface DaemonLoadRequest {
+  model_id: string;
+  alias?: string;
+  settings: SettingValues;
+  sampling: SamplingSettings;
+  mmproj_filename?: string | null;
+  draft_model_id?: string | null;
+}
 
 export class ApiError extends Error {
   status: number;
@@ -136,8 +147,37 @@ export function curveQuery(opts: CurveOpts = {}, extra: Record<string, string> =
   return query ? `?${query}` : "";
 }
 
+function putJson(body: unknown): RequestInit {
+  return { ...postJson(body), method: "PUT" };
+}
+
 export const api = {
   listModels: (): Promise<Model[]> => request<{ models: Model[] }>("/api/models").then((d) => d.models),
+
+  // --- Serve page (docs/plans/MODEL_DAEMON_PLAN.md) ---
+  getDaemon: (workerId: string): Promise<DaemonView> => request(`/api/workers/${encodeURIComponent(workerId)}/daemon`),
+  loadDaemonModel: (workerId: string, body: DaemonLoadRequest): Promise<{ ok: true; job_id: string }> =>
+    request(`/api/workers/${encodeURIComponent(workerId)}/daemon/load`, postJson(body)),
+  unloadDaemonModel: (workerId: string): Promise<{ ok: true; job_id: string }> =>
+    request(`/api/workers/${encodeURIComponent(workerId)}/daemon/unload`, { method: "POST" }),
+  getDaemonModelSettings: (workerId: string, modelId: string): Promise<{ settings: DaemonModelSettings | null }> =>
+    request(`/api/workers/${encodeURIComponent(workerId)}/daemon/models/${encodeURIComponent(modelId)}/settings`),
+  saveDaemonSampling: (workerId: string, modelId: string, sampling: SamplingSettings): Promise<{ ok: true; sampling: SamplingSettings }> =>
+    request(`/api/workers/${encodeURIComponent(workerId)}/daemon/sampling`, putJson({ model_id: modelId, sampling })),
+  saveDaemonGateway: (workerId: string, gateway: GatewaySettings): Promise<{ ok: true; gateway: GatewaySettings }> =>
+    request(`/api/workers/${encodeURIComponent(workerId)}/daemon/gateway`, putJson(gateway)),
+  createDaemonKey: (workerId: string, name: string): Promise<DaemonApiKeyInfo & { key: string }> =>
+    request(`/api/workers/${encodeURIComponent(workerId)}/daemon/keys`, postJson({ name })),
+  revokeDaemonKey: (workerId: string, keyId: string): Promise<{ ok: true; gateway: GatewaySettings }> =>
+    request(`/api/workers/${encodeURIComponent(workerId)}/daemon/keys/${encodeURIComponent(keyId)}`, { method: "DELETE" }),
+  getDaemonUsage: (workerId: string, modelId: string, opts: { loadHash?: string | null; includeConcurrent?: boolean } = {}): Promise<DaemonUsageView> => {
+    const params = new URLSearchParams({ model_id: modelId });
+    if (opts.loadHash) params.set("load_hash", opts.loadHash);
+    if (opts.includeConcurrent) params.set("include_concurrent", "1");
+    return request(`/api/workers/${encodeURIComponent(workerId)}/daemon/usage?${params.toString()}`);
+  },
+  clearDaemonUsage: (workerId: string, modelId: string): Promise<{ ok: true; removed: number }> =>
+    request(`/api/workers/${encodeURIComponent(workerId)}/daemon/usage?model_id=${encodeURIComponent(modelId)}`, { method: "DELETE" }),
 
   registerModel: (body: RegisterModelInput): Promise<Model> =>
     request<{ model: Model }>("/api/models", postJson(body)).then((d) => d.model),

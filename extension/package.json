@@ -1,0 +1,14 @@
+{
+  "name": "llamatoaster-extension",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "watch": "node build.mjs --watch",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.1.4",
+    "@webgpu/types": "^0.1.60"
+  }
+}

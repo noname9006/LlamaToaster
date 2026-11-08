@@ -94,6 +94,14 @@ export function Settings() {
   // client-side route change: the account (and the session backing this
   // page) no longer exists, so there's nothing left for the SPA's own state
   // to usefully re-render.
+  async function handleSignOut() {
+    try {
+      await fetch("/auth/logout", { method: "POST" });
+    } finally {
+      window.location.href = "/login";
+    }
+  }
+
   async function handleDeleteAccount() {
     setDeleting(true);
     setError(null);
@@ -128,12 +136,13 @@ export function Settings() {
     <div>
       <div className="flex items-center justify-between">
         <h1 className="m-0 font-display text-[32px] font-semibold leading-tight text-fg">Settings</h1>
-        <a
-          href="/auth/logout"
-          className="rounded-lg border border-border px-3 py-1.5 text-sm font-semibold text-fg hover:border-danger/40 hover:text-danger"
+        <button
+          type="button"
+          onClick={() => void handleSignOut()}
+          className="rounded-lg border border-border-strong px-3 py-1.5 text-sm font-semibold text-fg hover:border-danger/40 hover:text-danger"
         >
           Sign out
-        </a>
+        </button>
       </div>
 
       {error && (
@@ -153,7 +162,7 @@ export function Settings() {
             identities.map((i) => (
               <div
                 key={`${i.provider}:${i.createdAt}`}
-                className="flex items-center justify-between rounded-lg border border-border px-3 py-2.5"
+                className="flex items-center justify-between border-b border-border py-2.5"
               >
                 <div>
                   <div className="text-sm font-medium capitalize text-fg">{i.provider}</div>
@@ -168,7 +177,7 @@ export function Settings() {
           {!linkedProviders.has("github") && (
             <a
               href="/auth/github?link=1"
-              className="w-fit rounded-lg border border-border px-3 py-1.5 text-sm font-semibold text-fg hover:border-accent/40 hover:text-accent"
+              className="w-fit rounded-lg border border-border-strong px-3 py-1.5 text-sm font-semibold text-fg hover:border-accent/40 hover:text-accent"
             >
               + Connect GitHub
             </a>
@@ -189,7 +198,7 @@ export function Settings() {
             protected: all shared data is fully anonymized, ensuring no other user can ever associate your
             account or machines with your tests.
           </p>
-          <div className="mt-3 flex items-center justify-between rounded-lg border border-border px-3 py-2.5">
+          <div className="mt-3 flex items-center justify-between border-b border-border py-2.5">
             <span className="text-sm font-medium text-fg">Contribute to the community benchmark database</span>
             <button
               type="button"
@@ -233,7 +242,7 @@ export function Settings() {
             <p className="text-sm text-muted">No active sessions.</p>
           ) : (
             sessions.map((s) => (
-              <div key={s.id} className="flex items-center justify-between rounded-lg border border-border px-3 py-2.5">
+              <div key={s.id} className="flex items-center justify-between border-b border-border py-2.5">
                 <div>
                   <div className="flex items-center gap-2 text-sm font-medium text-fg">
                     {s.label ?? (s.isWorker ? "Worker" : "Unknown device")}
@@ -293,7 +302,7 @@ export function Settings() {
               value={deleteConfirmText}
               onChange={(e) => setDeleteConfirmText(e.target.value)}
               disabled={deleting}
-              className="w-32 rounded-md border border-border bg-surface px-2 py-1 text-sm text-fg"
+              className="w-32 rounded-md border border-border-strong bg-surface px-2 py-1 text-sm text-fg"
               autoComplete="off"
             />
             <button

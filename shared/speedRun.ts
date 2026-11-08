@@ -50,6 +50,10 @@ export interface SpeedCandidate {
   fa: "on" | "off" | "auto";
   /** Null = llama.cpp's own thread defaults (the baseline keeps them). */
   threads: ThreadArgs | null;
+  /** -b / -ub. Absent = llama-server's defaults (2048 / 512). Only workers
+   * with the speed-batch-v1 capability honour them. */
+  b?: number;
+  ub?: number;
   /** Fit's prediction for this placement, for the result card. */
   predicted?: { dev_used_mib: number | null; host_used_mib: number | null; layers_gpu: number | null } | null;
 }
@@ -69,10 +73,31 @@ export function baselineCandidate(): SpeedCandidate {
   return { label: "Default settings", source: "baseline", ngl: BASELINE_NGL, ot: null, ctk: "f16", ctv: "f16", fa: "auto", threads: null };
 }
 
+/** llama-server's own -b / -ub defaults. */
+export const DEFAULT_BATCH = 2048;
+export const DEFAULT_UBATCH = 512;
+/** The micro-batch sizes the batch step measures; -b follows as max(2048, ub). */
+export const BATCH_STEP_UBATCHES = [256, 512, 1024, 2048] as const;
+
+export function hasBatchArgs(c: Pick<SpeedCandidate, "b" | "ub">): boolean {
+  return c.b != null || c.ub != null;
+}
+
+/** The batch step's candidates: the chosen config at each micro-batch size,
+ * the default (-b 2048 -ub 512) included as the reference. */
+export function batchCandidates(base: SpeedCandidate): SpeedCandidate[] {
+  return BATCH_STEP_UBATCHES.map((ub) => {
+    const b = Math.max(DEFAULT_BATCH, ub);
+    return { ...base, label: `-b ${b} -ub ${ub}`, b, ub };
+  });
+}
+
 /** The flags a candidate adds on top of -m/-c (everything that differs from
  * llama-server's defaults, plus --fit off so nothing is re-placed). */
 export function candidateServerFlags(c: SpeedCandidate): string[] {
   const out = ["-ngl", String(c.ngl), "-fa", c.fa, "-ctk", c.ctk, "-ctv", c.ctv];
+  if (c.b != null) out.push("-b", String(c.b));
+  if (c.ub != null) out.push("-ub", String(c.ub));
   if (c.ot) out.push("-ot", c.ot);
   if (c.threads) {
     out.push("-t", String(c.threads.t), "-tb", String(c.threads.tb));
@@ -121,8 +146,11 @@ export function serverCommandLine(modelFile: string, ctx: number, c: SpeedCandid
   return ["llama-server", "-m", modelFile, "-c", String(ctx), ...candidateServerFlags(c), "--fit", "off"].map(shellQuote).join(" ");
 }
 
-export function candidateKey(c: Pick<SpeedCandidate, "ngl" | "ot" | "ctk" | "ctv" | "fa" | "threads">): string {
-  return JSON.stringify([c.ngl, c.ot ?? "", c.ctk, c.ctv, c.fa, c.threads ?? null]);
+export function candidateKey(c: Pick<SpeedCandidate, "ngl" | "ot" | "ctk" | "ctv" | "fa" | "threads" | "b" | "ub">): string {
+  const key: unknown[] = [c.ngl, c.ot ?? "", c.ctk, c.ctv, c.fa, c.threads ?? null];
+  // Appended only when set, so keys stored before batch sizes existed still match.
+  if (hasBatchArgs(c)) key.push(c.b ?? DEFAULT_BATCH, c.ub ?? DEFAULT_UBATCH);
+  return JSON.stringify(key);
 }
 
 /** Drops candidates identical to an earlier one. */
@@ -261,7 +289,22 @@ export function validateSpeedRunSpec(raw: unknown, trainedCtx: number | null): s
     if (pe) return pe;
     const te = threadArgsError(c.threads ?? null, `${field}.threads`);
     if (te) return te;
+    const be = batchArgsError(c, field);
+    if (be) return be;
   }
+  return null;
+}
+
+function isBatchSize(v: unknown): v is number {
+  return typeof v === "number" && Number.isInteger(v) && v >= 64 && v <= 8192 && (v & (v - 1)) === 0;
+}
+
+function batchArgsError(c: Record<string, unknown>, field: string): string | null {
+  if (c.b != null && !isBatchSize(c.b)) return `${field}.b must be a power of two in [64, 8192]`;
+  if (c.ub != null && !isBatchSize(c.ub)) return `${field}.ub must be a power of two in [64, 8192]`;
+  const b = (c.b as number | undefined) ?? DEFAULT_BATCH;
+  const ub = (c.ub as number | undefined) ?? DEFAULT_UBATCH;
+  if (ub > b) return `${field}.ub must not exceed b (llama.cpp caps -ub at -b)`;
   return null;
 }
 

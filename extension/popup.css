@@ -1,0 +1,342 @@
+/* LlamaToaster v2 palette, as client/src/styles/index.css. */
+@font-face { font-family: "Barlow"; font-weight: 400; src: url("fonts/barlow-400.woff2") format("woff2"); }
+@font-face { font-family: "Barlow"; font-weight: 500; src: url("fonts/barlow-500.woff2") format("woff2"); }
+@font-face { font-family: "Barlow"; font-weight: 600; src: url("fonts/barlow-600.woff2") format("woff2"); }
+@font-face { font-family: "Barlow Condensed"; font-weight: 600; src: url("fonts/barlow-condensed-600.woff2") format("woff2"); }
+@font-face { font-family: "IBM Plex Mono"; font-weight: 400; src: url("fonts/plex-mono-400.woff2") format("woff2"); }
+
+:root {
+  --bg: #13100c;
+  --surface: #1b1611;
+  --surface-raised: #262019;
+  --well: #0b0907;
+  --border: #3d3329;
+  --border-strong: #64554a;
+  --fg: #f4efe6;
+  --fg-2: #d2c8b9;
+  --muted: #ab9f8d;
+  --accent: #f5a623;
+  --accent-hover: #ffbb4d;
+  --accent-fg: #1a1305;
+  --accent-tint: #35260f;
+  --success: #9fb6cc;
+  --danger: #ff7a6b;
+  --warning: #ffbb4d;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; }
+body {
+  width: 400px;
+
+  background: var(--bg);
+  color: var(--fg);
+  font: 14px/1.5 "Barlow", system-ui, sans-serif;
+  font-variant-numeric: tabular-nums;
+  -webkit-font-smoothing: antialiased;
+}
+h1, h2 { font-family: "Barlow Condensed", "Barlow", sans-serif; font-weight: 600; margin: 0; }
+h1 { font-size: 22px; letter-spacing: 0.01em; }
+h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin-bottom: 8px; }
+.mono { font-family: "IBM Plex Mono", ui-monospace, monospace; }
+.muted { color: var(--muted); }
+.small { font-size: 12px; }
+
+header { display: flex; align-items: center; gap: 10px; padding: 12px 16px; border-bottom: 1px solid var(--border); background: var(--surface); }
+header img { width: 36px; height: 36px; }
+header .dock { margin-left: auto; }
+header .gh { display: inline-flex; color: var(--muted); }
+header .gh:hover { color: var(--accent); }
+
+section { padding: 12px 16px; border-bottom: 1px solid var(--border); }
+
+.row { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; padding: 3px 0; }
+.row .k { color: var(--muted); white-space: nowrap; }
+.row .v { text-align: right; overflow-wrap: anywhere; }
+
+.bar { height: 8px; background: #b9b0a3; border: 1px solid var(--border); margin: 4px 0 8px; position: relative; }
+.bar > i { position: absolute; top: 0; bottom: 0; width: 0; }
+.bar > i.llama { left: 0; background: var(--accent); }
+.bar > i.other { right: 0; background: #4a4239; display: flex; flex-direction: row-reverse; overflow: hidden; }
+/* The biggest apps inside "in use", biggest at the right edge: each a barely
+   tinted shade of the same grey, with a hairline between neighbours. */
+.bar > i.other > b.app { flex: 0 0 auto; height: 100%; box-shadow: inset 1px 0 0 rgba(0, 0, 0, 0.35); cursor: help; }
+.bar > i.other > b.app.t0 { background: #554038; }
+.bar > i.other > b.app.t1 { background: #3f4d3e; }
+.bar > i.other > b.app.t2 { background: #3e4553; }
+.bar > i.other > b.app.t3 { background: #574a33; }
+.bar > i.other > b.app:hover { filter: brightness(1.35); }
+.legend-bar { display: flex; gap: 12px; font-size: 11px; color: var(--muted); margin-top: 2px; }
+.legend-bar .sw { display: inline-block; width: 8px; height: 8px; margin-right: 4px; border: 1px solid var(--border); }
+.legend-bar .sw.free { background: #b9b0a3; } .legend-bar .sw.other { background: #4a4239; } .legend-bar .sw.llama { background: var(--accent); }
+
+select {
+  appearance: none;
+  -webkit-appearance: none;
+  background: transparent url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%23ab9f8d' stroke-width='1.5' fill='none'/%3E%3C/svg%3E") no-repeat right center;
+  color: var(--fg);
+  border: 0;
+  border-radius: 0;
+  font: inherit;
+  padding: 0 14px 0 0;
+  text-align: right;
+  cursor: pointer;
+}
+select:hover { color: var(--accent); }
+select option { background: var(--surface-raised); color: var(--fg); }
+/* Chrome 135+: the open list itself is styleable (customizable select). */
+@supports (appearance: base-select) {
+  select, ::picker(select) { appearance: base-select; }
+  select::picker-icon { display: none; }
+  ::picker(select) {
+    border: 0;
+    background: var(--surface-raised);
+    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.5);
+    padding: 4px 0;
+    margin-top: 4px;
+  }
+  select option { padding: 4px 12px; font-size: 13px; color: var(--fg-2); }
+  select option::checkmark { display: none; }
+  select option:hover, select option:focus-visible { background: var(--accent-tint); color: var(--fg); outline: 0; }
+  select option:checked { color: var(--accent); }
+  /* Open: a short fade and drop; close is instant (a closing picker leaves the top layer at once). */
+  ::picker(select) { transition: opacity 0.14s ease, translate 0.14s ease; }
+  select:open::picker(select) { opacity: 1; translate: 0 0; }
+  @starting-style { select:open::picker(select) { opacity: 0; translate: 0 -4px; } }
+}
+/* Folded sections slide in the same way when opened. */
+@keyframes unfold { from { opacity: 0; translate: 0 -4px; } }
+.fold-body:not([hidden]), .legend:not([hidden]) { animation: unfold 0.16s ease; }
+@media (prefers-reduced-motion: reduce) {
+  ::picker(select), .fold-body, .legend, .chev { transition: none !important; animation: none !important; }
+}
+select.sub { font-size: 12px; color: var(--muted); }
+select.sub:hover { color: var(--accent); }
+.gpu-row { align-items: flex-start; }
+#memory .hw { color: var(--fg-2); }
+#memory .amt { color: var(--fg); font-weight: 600; }
+input[type="number"] {
+  background: var(--well);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 0;
+  font: inherit;
+  padding: 2px 6px;
+}
+input[type="number"] { width: 80px; text-align: right; }
+input[type="number"]:focus, select:focus-visible, button:focus-visible, input[type="range"]:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+input[type="range"] { width: 100%; accent-color: var(--accent); margin: 6px 0 2px; }
+
+input[type=range] { -webkit-appearance: none; appearance: none; height: 14px; background: transparent; }
+/* Context slider: a toaster's bread slot. Left of the handle it glows like a
+   heating element (thin dark bands for the coil); the handle is the carriage
+   lever. The thumb is 22px wide incl. border, the track has a 1px border, so
+   the thumb centre runs from 12px to 100% - 12px (ticksHtml matches). */
+input[type=range] { --frac: 0; height: 22px; margin: 4px 0 2px; }
+input[type=range]::-webkit-slider-runnable-track {
+  height: 10px;
+  border: 1px solid #000;
+  border-radius: 5px;
+  background:
+    repeating-linear-gradient(90deg, rgba(70, 12, 0, 0.35) 0 1px, transparent 1px 4px) 0 0 / calc(11px + (100% - 22px) * var(--frac)) 100% no-repeat,
+    linear-gradient(#ffc274, #ff7a1a 45%, #c4330b) 0 0 / calc(11px + (100% - 22px) * var(--frac)) 100% no-repeat,
+    linear-gradient(#050403, #17120d);
+  box-shadow: inset 0 2px 3px rgba(0, 0, 0, 0.8), 0 1px 0 rgba(255, 255, 255, 0.06), 0 0 9px rgba(255, 90, 20, 0.16);
+}
+input[type=range]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 20px; height: 18px; margin-top: -5px;
+  border: 1px solid #0b0a0a; border-radius: 5px;
+  background:
+    linear-gradient(90deg, transparent 9px, rgba(0, 0, 0, 0.4) 9px 11px, transparent 11px),
+    linear-gradient(#6a6b6e, #4d4e50 45%, #2d2e2f);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.25), 0 2px 3px rgba(0, 0, 0, 0.6);
+  cursor: grab;
+}
+input[type=range]:active::-webkit-slider-thumb { cursor: grabbing; }
+.ticks { position: relative; height: 14px; font-size: 10px; color: var(--muted); }
+.ticks span { position: absolute; top: 0; transform: translateX(-50%); white-space: nowrap; }
+.ctxval { font-family: "Barlow Condensed", sans-serif; font-weight: 600; font-size: 20px; color: #ffb066; text-shadow: 0 0 1px #ff7a1a, 0 0 6px rgba(255, 98, 20, 0.55); }
+
+button {
+  font: inherit;
+  font-weight: 600;
+  border-radius: 0;
+  cursor: pointer;
+}
+button.primary { background: var(--accent); color: var(--accent-fg); border: 1px solid var(--accent); padding: 6px 12px; }
+button.primary:hover { background: var(--accent-hover); }
+button.primary:disabled { opacity: 0.6; cursor: default; }
+button.ghost { background: transparent; color: var(--fg-2); border: 1px solid var(--border); padding: 3px 8px; font-weight: 500; font-size: 12px; }
+button.ghost:hover { background: var(--surface-raised); }
+
+table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 13px; }
+th { text-align: left; font-weight: 500; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; padding: 4px 6px; border-bottom: 1px solid var(--border); }
+td { padding: 4px 6px; border-bottom: 1px solid var(--border); }
+td.best { color: var(--accent); font-weight: 600; }
+
+.pill { display: inline-block; font-size: 11px; padding: 0 6px; border: 1px solid var(--border-strong); color: var(--fg-2); }
+.pill.warn { border-color: var(--warning); color: var(--warning); }
+.pill.ok { border-color: var(--success, #6ccf7f); color: var(--success, #6ccf7f); }
+.note { font-size: 12px; color: var(--muted); margin-top: 6px; }
+.note.warn { color: var(--warning); }
+
+.lt-progress-fill {
+  height: 4px;
+  background: repeating-linear-gradient(90deg, var(--accent) 0 10px, var(--accent-hover) 10px 12px);
+  background-size: 24px 100%;
+  animation: lt-progress 1.2s linear infinite;
+}
+@keyframes lt-progress { from { background-position: 0 0; } to { background-position: 24px 0; } }
+
+.legend { display: grid; grid-template-columns: auto 1fr; gap: 2px 8px; font-size: 12px; color: var(--fg-2); }
+.legend[hidden] { display: none; }
+/* The legend folds (open by default, remembered). */
+.legend-head { margin: 10px 0 0; }
+.legend-title { font-size: 12px; color: var(--muted); }
+.legend-head:hover .legend-title { color: var(--fg-2); }
+.legend-head + .legend { margin-top: 6px; }
+.legend .mark { display: inline-flex; align-items: center; justify-content: flex-end; }
+footer { padding: 10px 16px 14px; font-size: 12px; color: var(--muted); }
+
+/* In the side panel the page fills the panel's width. */
+body.panel { width: auto; min-height: 100vh; }
+
+.webapp-notice { margin-top: 10px; padding: 8px 10px; font-size: 12px; color: var(--fg-2); background: var(--accent-tint); border-left: 2px solid var(--accent); }
+.webapp-notice a { color: var(--accent); font-weight: 600; }
+.note a { color: var(--accent); }
+
+button.ghost.tiny { padding: 0 5px; font-size: 11px; line-height: 16px; vertical-align: 1px; }
+#editVram { border: 0; background: transparent; color: var(--muted); padding: 0 0 0 4px; font-weight: 400; }
+#editVram:hover { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }
+.keep-row { height: 28px; align-items: center; }
+.keep-free { display: flex; flex-wrap: nowrap; align-items: center; justify-content: flex-end; white-space: nowrap; }
+#customMargin { width: 34px; height: 19px; line-height: 19px; box-sizing: border-box; padding: 0; border: 0; background: transparent; color: var(--fg); text-align: right; -moz-appearance: textfield; }
+/* Spin arrows stay in place (no layout shift) and only show on hover or while typing. */
+#customMargin { width: 50px; }
+#customMargin::-webkit-inner-spin-button { opacity: 0; margin-left: 2px; }
+#customMargin:hover::-webkit-inner-spin-button, #customMargin:focus::-webkit-inner-spin-button { opacity: 0.7; }
+#customMargin:focus { outline: 0; caret-color: var(--accent); }
+/* "Enter manually": the number box stands where the choice's label was; the select shrinks to its chevron. */
+#margin.chev-only { width: 14px; min-width: 0; padding: 0 0 0 4px; box-sizing: content-box; color: transparent; overflow: hidden; }
+#margin.chev-only option { color: var(--fg); }
+#margin { max-width: 130px; }
+#customUnit { margin: 0 2px 0 3px; color: var(--fg); }
+
+/* Manual / Auto: a rocker key between the two words. The chosen word gets an
+   outer glow, its letters keep their colour. */
+.fit-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px; }
+.fit-head h2 { margin: 0; }
+.toggle { display: flex; align-items: center; gap: 7px; }
+.toggle-label {
+  background: none; border: 0; padding: 2px;
+  font: 600 12px/1 "Barlow Condensed", "Barlow", sans-serif; letter-spacing: 0.08em; text-transform: uppercase;
+  /* Same colour as the "Fit check" heading, on or off. */
+  color: var(--muted);
+  transition: text-shadow 0.12s ease-out;
+}
+.toggle[data-mode="manual"] .toggle-label[data-mode="manual"],
+.toggle[data-mode="auto"] .toggle-label[data-mode="auto"] {
+  /* On: the letters don't change at all, only an orange glow around them. */
+  text-shadow: 0 0 6px rgba(255, 110, 20, 0.95), 0 0 12px rgba(255, 64, 0, 0.6);
+}
+/* The switch is just the key: one dark grey rocker that tips on its middle.
+   The chosen side is pressed in (tilted away, in shadow); the other side
+   stands up, catching the light. */
+.toggle-plate { display: flex; padding: 0; background: none; border: 0; perspective: 90px; }
+.toggle-key {
+  width: 46px; height: 24px;
+  border: 1px solid #000; border-radius: 4px;
+  background: linear-gradient(90deg, #6a6b6e, #4b4c4f 48%, #242527 52%, #1a1b1c);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.18), 0 2px 3px rgba(0, 0, 0, 0.6);
+  transform: rotateY(16deg);
+  transition: transform 0.12s ease-out, background 0.12s ease-out;
+}
+.toggle[data-mode="manual"] .toggle-key {
+  background: linear-gradient(270deg, #6a6b6e, #4b4c4f 48%, #242527 52%, #1a1b1c);
+  transform: rotateY(-16deg);
+}
+.toggle-plate:hover .toggle-key { filter: brightness(1.12); }
+.toggle-plate:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+/* What each mode does: a popup on hover (or keyboard focus) instead of a
+   line of text under the switch. Anchored to the right edge so it stays inside the popup. */
+.toggle-label { position: relative; }
+.toggle-label[data-tip]::after {
+  content: attr(data-tip);
+  position: absolute; top: calc(100% + 6px); right: 0; z-index: 10;
+  width: max-content; max-width: 230px;
+  padding: 6px 8px; border: 1px solid var(--border-strong); border-radius: 4px;
+  background: var(--surface-raised); color: var(--fg-2);
+  font: 400 12px/1.35 system-ui, sans-serif; letter-spacing: normal; text-transform: none; text-align: left; text-shadow: none;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+  opacity: 0; visibility: hidden; pointer-events: none;
+  transition: opacity 0.12s ease-out, visibility 0.12s;
+}
+.toggle-label[data-tip]:hover::after,
+.toggle-label[data-tip]:focus-visible::after { opacity: 1; visibility: visible; transition-delay: 0.25s; }
+
+/* Collapsible section (Memory speed). */
+.fold-head {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  padding: 0; background: none; border: 0; color: inherit; text-align: left; font-weight: 400;
+}
+.fold-head h2 { margin: 0; }
+.fold-sum { margin-left: auto; font-size: 12px; color: var(--fg-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.chev { width: 7px; height: 7px; border-right: 2px solid var(--muted); border-bottom: 2px solid var(--muted); transform: rotate(-45deg); transition: transform 0.2s ease; flex: none; margin: 0 2px 0 4px; }
+.fold-head[aria-expanded="true"] .chev { transform: rotate(45deg); margin-top: -4px; }
+.fold-head:hover .chev { border-color: var(--fg-2); }
+.fold-body { padding-top: 10px; }
+
+/* Measure: a small toaster carriage lever, one text line tall. Push it down
+   to start; it stays down, the slot glowing, while measuring, and pops back
+   up when done. Chrome-bright so it reads on the dark popup. */
+.fold-body:has(.toast-row) { padding-top: 8px; }
+.toast-row { display: flex; align-items: center; gap: 10px; }
+.toast-lever { position: relative; flex: none; width: 20px; height: 26px; padding: 0; background: none; border: 0; }
+.toast-text { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+.toast-text .small { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.toast-slot {
+  position: absolute; left: 7px; top: 2px; width: 5px; height: 22px;
+  background: #050403;
+  border: 1px solid #000; border-radius: 3px;
+  box-shadow: inset 0 2px 3px rgba(0, 0, 0, 0.9), 0 0 0 1px rgba(255, 255, 255, 0.07);
+  transition: box-shadow 0.4s ease, background 0.4s ease;
+}
+.toast-handle {
+  position: absolute; left: 0; top: 0; width: 20px; height: 8px;
+  border-radius: 2px; border: 1px solid #1a1714;
+  background: linear-gradient(#f1f1f2, #b9babd 40%, #7d7e82 75%, #5d5e61);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.8), 0 2px 4px rgba(0, 0, 0, 0.7);
+  /* Coming back up: a spring pop with a little overshoot. */
+  transition: top 0.55s cubic-bezier(0.2, 1.7, 0.4, 1);
+}
+.toast-lever:hover:not(.down) .toast-handle { top: 3px; }
+.toast-lever:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.toast-lever.down { cursor: default; }
+.toast-lever.down .toast-handle { top: 17px; transition: top 0.22s ease-in; }
+.toast-lever.down .toast-slot {
+  background: linear-gradient(90deg, #c4330b, #ff8a2a 50%, #c4330b);
+  box-shadow: inset 0 0 3px rgba(80, 10, 0, 0.8), 0 0 10px rgba(255, 90, 20, 0.55);
+  animation: lt-glow 1.4s ease-in-out infinite;
+}
+@keyframes lt-glow { 50% { box-shadow: inset 0 0 3px rgba(80, 10, 0, 0.8), 0 0 4px rgba(255, 90, 20, 0.3); } }
+.toast-title { font-size: 13px; font-weight: 600; color: var(--fg); white-space: nowrap; }
+.toast-lever.down + .toast-text .toast-title { color: #ffb066; text-shadow: 0 0 6px rgba(255, 98, 20, 0.5); }
+@media (prefers-reduced-motion: reduce) {
+  .toast-handle, .toast-lever.down .toast-handle { transition: none; }
+  .toast-lever.down .toast-slot { animation: none; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .toggle-key, .toggle-label { transition: none; }
+}
+
+/* While measuring, the previous figures stay in place, barely visible. */
+#speedOut.measuring td:not(:first-child) { opacity: 0.18; }
+
+header > img { border-radius: 50%; }
+header h1.wordmark { display: flex; line-height: 0; }
+header h1.wordmark img { width: auto; height: 30px; border-radius: 0; }
+.logo-rule { display: flex; align-items: center; gap: 8px; padding: 12px 16px 0; color: var(--border-strong); }
+.logo-rule i { flex: 1; height: 1.5px; background: var(--border-strong); border-radius: 1px; }
+#legendSec { border-bottom: 0; }

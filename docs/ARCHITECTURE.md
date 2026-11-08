@@ -60,8 +60,9 @@ Consequences the code has to handle, and does:
 - **Worker-reported state is validated** before it is trusted
   ([`validate-worker-state.ts`](../server/src/validate-worker-state.ts)).
 
-Job types are `benchmark`, `install_build`, `download_model`,
-`delete_model_file`, `run_probe`, `measure_quality` and `fit_map` — installing
+Job types include `benchmark`, `install_build`, `download_model`,
+`delete_model_file`, `run_probe`, `measure_quality`, `fit_map`, `daemon_load` and
+`daemon_unload` — installing
 a llama.cpp build or downloading a GGUF from the Machines page goes through the
 same queue as a benchmark.
 
@@ -90,6 +91,45 @@ context), each its own run tied together by a `flow_id`:
 The pure logic lives in `shared/fitParams.ts`, `kvSupport.ts`, `moePlacement.ts`,
 `threadPlan.ts`, `speedRun.ts` and `optimizeFlow.ts`; the worker side in
 `worker/src/fitMap.ts` and `cpuTopology.ts`.
+
+## Serving a model (the Serve page)
+
+A machine can also run a model for external agents. The server stays out of the
+inference path, so this keeps the pull-only rule and prompts never reach it:
+
+```
+ browser ──► server ◄── worker polls ── worker ── spawns ──► llama-server (127.0.0.1:<random>)
+                                          └─ gateway :8642 ─────► proxies to it
+                                                ▲
+                                     external agents, /v1/*
+```
+
+- **Commands are queue jobs** (`daemon_load`, `daemon_unload`), so they order
+  against tests and can be cancelled. A load job ends when the model is ready; the
+  process then belongs to `worker/src/daemon/manager.ts`, outside the job loop.
+- **State and usage travel on their own call**, `POST /api/worker/daemon/telemetry`,
+  not the heartbeat. It carries the phase, memory while someone has the page open,
+  and usage rows. Its response delivers config when the worker is behind. Config is
+  saved on the worker, so agents keep working while the server is unreachable.
+- **The gateway exists because llama-server alone cannot do this job.** Per-request
+  timings appear only in responses, it answers any model name with whatever is
+  loaded, and its default CORS is `*`, with `/slots` and `/props` on the same port. The
+  gateway (`worker/src/daemon/gateway.ts`) allowlists routes, checks keys, applies
+  sampling defaults and reads timings as responses pass through. It also refuses media
+  given by URL: llama-server fetches those itself, even with `--offline`, which would let
+  any request make the machine call its own network.
+- **Tests win.** A benchmark beside a loaded model would be silently wrong, so
+  `JOB_NEEDS_GPU_TO_ITSELF` in `worker/src/index.ts`, an exhaustive `Record` over job
+  types, unloads the model before those jobs. It returns when the long poll finds the
+  queue empty, so a batch does not reload between tests, or when the server cannot be
+  reached, since agents then depend on this machine alone. A reload never holds up the
+  queue: a load, unload or test cancels it.
+- **No raw arguments.** `shared/daemonSettings.ts` is the only route from the browser
+  to argv, so `--tools`, `--log-prompts-dir` and the like cannot be set at all.
+- **llama-server runs at `--verbosity 4`, never 5**, which echoes request bodies. Level 4
+  still repeats client text in grammar and JSON-schema errors, so those lines never enter
+  the small in-memory ring. After a crash the ring goes to the machine's own log, and the
+  server receives only the exit status.
 
 ## Data model
 

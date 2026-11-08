@@ -60,6 +60,11 @@ export async function supportsFlag(path: string, flag: string): Promise<boolean>
   return helpHasFlag(await helpText(path), flag);
 }
 
+// The binary's --help, for callers checking many flags at once. "" when it cannot run.
+export function readHelpText(path: string): Promise<string> {
+  return helpText(path).catch(() => "");
+}
+
 export function helpHasFlag(text: string, flag: string): boolean {
   if (!text.trim()) return false;
   // Match the flag as a whole token: "--spec" must not match
@@ -83,7 +88,12 @@ export function helpHasFlag(text: string, flag: string): boolean {
 // Older builds get the legacy flags, each probed (§0.7): llama-bench spells
 // no-mmap `--mmap 0`, llama-server/llama-perplexity `--no-mmap`.
 export function modelLoadArgsFromHelp(help: string): string[] {
-  if (helpHasFlag(help, "--load-mode")) return ["--load-mode", "mlock"];
+  if (helpHasFlag(help, "--load-mode")) {
+    // Manual experiments (comparing load modes) only; tests always use mlock.
+    const override = process.env.LLAMATOASTER_LOAD_MODE;
+    const modes = ["auto", "none", "mmap", "mlock", "mmap+mlock", "dio"];
+    return ["--load-mode", override && modes.includes(override) ? override : "mlock"];
+  }
   const args: string[] = [];
   if (helpHasFlag(help, "--mlock")) args.push("--mlock");
   if (helpHasFlag(help, "--no-mmap")) args.push("--no-mmap");

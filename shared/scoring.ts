@@ -121,7 +121,7 @@ export interface ScoringInput {
   discardFirstRepeats?: number;
   /**
    * Tokens the TG reference depth aims at (default 50 % of the stated target,
-   * else 50 % of trained context). The nearest available depth wins.
+   * else 50 % of maximum context). The nearest available depth wins.
    */
   referenceDepthTokens?: number | null;
   /** M1 per-placement inverse estimate; the caller owns weights/placement knowledge. */

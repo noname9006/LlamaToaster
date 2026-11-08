@@ -335,6 +335,8 @@ export function validateBundle(raw: unknown): ImportValidation {
     };
   }
   if (!Array.isArray(bundle.rows)) return { ...empty, fatal: "bundle has no rows array" };
+  const envelope = envelopeProblem(bundle);
+  if (envelope) return { ...empty, fatal: envelope };
 
   const verdicts: ImportRowVerdict[] = [];
   const accepted: BundleRow[] = [];
@@ -368,6 +370,54 @@ export function validateBundle(raw: unknown): ImportValidation {
   };
 }
 
+// What a result's cache-type, flash-attention and speculation fields may look
+// like: a short token starting with a letter or digit. A shape rather than a
+// closed list, so a value from a newer llama.cpp still imports; anything else
+// (a spreadsheet formula, free text) doesn't.
+export function isResultLabel(value: string): boolean {
+  return /^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$/.test(value);
+}
+
+const MAX_BUNDLE_TEXT = 512;
+const MAX_BUNDLE_CONFIG_BYTES = 256 * 1024;
+const CONTROL_CHARS = /[\x00-\x1f\x7f]/;
+
+function badText(value: unknown, max: number, nullable: boolean): boolean {
+  if (value === null || value === undefined) return !nullable;
+  return typeof value !== "string" || value.length > max || CONTROL_CHARS.test(value);
+}
+
+// The parts of a bundle every row shares. All of it comes from the importer's
+// own file and reaches the database, the importer's exports and (filename,
+// GPU name) labels other code renders, so its shape is checked as strictly as
+// a row's. Returns the problem, or null.
+function envelopeProblem(bundle: Partial<Bundle>): string | null {
+  const run = bundle.run as Partial<Bundle["run"]> | null | undefined;
+  if (!run || typeof run !== "object") return "bundle has no run object";
+  if (typeof run.model_filename !== "string" || run.model_filename.length === 0 || badText(run.model_filename, MAX_BUNDLE_TEXT, false)) {
+    return "run.model_filename must be a short string";
+  }
+  if (badText(run.model_quant, 64, true)) return "run.model_quant must be a short string or null";
+  if (run.kind !== null && run.kind !== undefined && (typeof run.kind !== "string" || !isResultLabel(run.kind))) {
+    return "run.kind must be a short label or null";
+  }
+  if (run.model_sha256 !== null && run.model_sha256 !== undefined && (typeof run.model_sha256 !== "string" || !/^[0-9a-fA-F]{64}$/.test(run.model_sha256))) {
+    return "run.model_sha256 must be a sha256 hex digest or null";
+  }
+  if (badText(run.llama_cpp_build, 128, true)) return "run.llama_cpp_build must be a short string or null";
+  if (run.config !== undefined && run.config !== null) {
+    if (typeof run.config !== "object" || Array.isArray(run.config)) return "run.config must be an object";
+    if (JSON.stringify(run.config).length > MAX_BUNDLE_CONFIG_BYTES) return "run.config is too large";
+  }
+  const hw = bundle.hardware_class as Partial<HardwareClass> | null | undefined;
+  if (!hw || typeof hw !== "object") return "bundle has no hardware_class object";
+  if (badText(hw.gpu_name, 256, true)) return "hardware_class.gpu_name must be a short string or null";
+  if (hw.backend !== null && hw.backend !== undefined && (typeof hw.backend !== "string" || !isResultLabel(hw.backend))) {
+    return "hardware_class.backend must be a short label or null";
+  }
+  return null;
+}
+
 function rowProblem(row: unknown): string | null {
   if (!row || typeof row !== "object") return "row must be an object";
   const r = row as Partial<BundleRow>;
@@ -398,7 +448,11 @@ function rowProblem(row: unknown): string | null {
     }
   }
   for (const field of ["cache_type_k", "cache_type_v", "flash_attn", "mtp"] as const) {
-    if (typeof r[field] !== "string") return `${field} must be a string`;
+    const value = r[field];
+    if (typeof value !== "string" || !isResultLabel(value)) return `${field} must be a short label`;
+  }
+  if (r.engine !== null && r.engine !== undefined && r.engine !== "bench" && r.engine !== "server") {
+    return "engine must be bench, server or null";
   }
   return null;
 }

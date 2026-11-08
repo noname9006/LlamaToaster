@@ -314,7 +314,7 @@ export function ProbeAttempts({ testId, refreshKey }: ProbeAttemptsProps) {
     .reduce<ProbeAttemptDto | null>((best, a) => (best == null || a.candidate_ctx < best.candidate_ctx ? a : best), null);
 
   return (
-    <div className="rounded-xl border border-border bg-surface p-4">
+    <div className="border-t border-border pt-4">
       {worstSpill && (
         <div className="mb-3 rounded-lg border border-warning/40 bg-warning-bg px-3 py-2 text-xs text-warning">
           <span className="font-bold">This GPU pages model weights to system RAM.</span>{" "}
@@ -351,7 +351,7 @@ export function ProbeAttempts({ testId, refreshKey }: ProbeAttemptsProps) {
         </div>
       )}
       <div className="flex flex-wrap items-baseline justify-between gap-2">
-        <span className="text-[11px] font-semibold uppercase tracking-wide text-muted">
+        <span className="text-[11px] font-semibold text-muted">
           Context tests — every load this probe performed
         </span>
         <span className="font-mono text-[11px] text-muted">
@@ -362,7 +362,7 @@ export function ProbeAttempts({ testId, refreshKey }: ProbeAttemptsProps) {
       <div className="mt-3 overflow-x-auto">
         <table className="w-full text-xs">
           <thead>
-            <tr className="border-b border-border/60 text-left text-[10px] uppercase tracking-wide text-muted">
+            <tr className="border-b border-border/60 text-left text-[10px] text-muted">
               <th className="px-2 py-1.5" rowSpan={2}>#</th>
               <th className="px-2 py-1.5" rowSpan={2}>context</th>
               <th className="px-2 py-1.5 text-right" rowSpan={2}>offload</th>
@@ -395,7 +395,7 @@ export function ProbeAttempts({ testId, refreshKey }: ProbeAttemptsProps) {
               </th>
               <th className="px-2 py-1.5" rowSpan={2}>result</th>
             </tr>
-            <tr className="border-b border-border text-left text-[10px] uppercase tracking-wide text-muted">
+            <tr className="border-b border-border text-left text-[10px] text-muted">
               <th className="px-2 py-1.5 text-right" title="Whole-adapter -- every process on this GPU combined, not just this load">
                 total
               </th>

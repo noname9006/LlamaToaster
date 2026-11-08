@@ -47,6 +47,13 @@ export const MAX_PROBE_NGL = 4096;
 // misbehaving worker can't report more loads than that live setting allows.
 export const MAX_PROBE_ATTEMPTS = 40;
 export const DATASET_HASH_RE = /^sha256:[0-9a-f]{64}$/;
+// What a rung's or a probe's error text may store (audit 2026-11-01 D1).
+const MAX_REPORT_ERROR_CHARS = 8_000;
+
+function optionalMethodVersion(value: unknown): number | undefined {
+  if (value === undefined || value === null) return undefined;
+  return requireFiniteInt(value, "method_version", 0, 1_000_000);
+}
 
 // The enrolled-worker-session rule. Deliberately NOT authenticateWorker():
 // that function is dual-mode and falls back to WORKER_SHARED_TOKEN, which is
@@ -188,7 +195,7 @@ function validateOneProbeAttempt(raw: unknown, label: string): ProbeAttemptRepor
     ladder_ngl_max: optionalFiniteInt(a.ladder_ngl_max, `${label}.ladder_ngl_max`, 0, MAX_PROBE_NGL),
     ladder_max_ctx: optionalFiniteInt(a.ladder_max_ctx, `${label}.ladder_max_ctx`, 0, 16_777_216),
     host_backed_fail: a.host_backed_fail === "layers" || a.host_backed_fail === "cache" ? a.host_backed_fail : null,
-    error: typeof a.error === "string" ? a.error : undefined,
+    error: typeof a.error === "string" ? a.error.slice(0, MAX_REPORT_ERROR_CHARS) : undefined,
     // N2 batch dedup -- the worker only ever echoes back a source_run_id the
     // server itself handed it via GET .../probe-dedup, so a plain type check
     // (not an existence/ownership lookup) is the same trust level every other
@@ -316,7 +323,7 @@ export async function measurementRoutes(app: FastifyInstance): Promise<void> {
           verified_ctx_tokens: verifiedCtx,
           verified_ngl: verifiedNgl,
           margin_observed_frac: body.margin_observed_frac ?? null,
-          method_version: body.method_version ?? METHOD_VERSION,
+          method_version: optionalMethodVersion(body.method_version) ?? METHOD_VERSION,
         });
       }
 
@@ -336,7 +343,7 @@ export async function measurementRoutes(app: FastifyInstance): Promise<void> {
         error:
           body.status === "verified"
             ? undefined
-            : (body.error ??
+            : ((typeof body.error === "string" ? body.error.slice(0, MAX_REPORT_ERROR_CHARS) : undefined) ??
               (body.status === "stopped"
                 ? "stopped by user"
                 : "probe did not reach a usable context at this placement")),
@@ -499,6 +506,20 @@ export async function measurementRoutes(app: FastifyInstance): Promise<void> {
         throw new BadRequestError("dataset_hash must match sha256:<64 lowercase hex>");
       }
       const ctxTokens = requireFiniteInt(body.ctx_tokens, "ctx_tokens", MIN_PROBE_CTX, MAX_PROBE_CTX);
+      // What this row says it measured comes from the run's stored spec -- a
+      // worker reports the reading, not its labels (audit 2026-10-18 A5). Same
+      // rule as the probe route's KV pair above. A run with no stored spec
+      // (none created today) keeps the payload's.
+      const spec = (run.config as TestConfig).quality;
+      if (
+        spec &&
+        (spec.dataset_hash !== body.dataset_hash ||
+          spec.ctx_tokens !== ctxTokens ||
+          spec.kv_pair[0] !== body.cache_type_k ||
+          spec.kv_pair[1] !== body.cache_type_v)
+      ) {
+        throw new BadRequestError("this quality result doesn't match what the run asked for");
+      }
       if (typeof body.ppl !== "number" || !Number.isFinite(body.ppl) || body.ppl <= 0) {
         throw new BadRequestError("ppl must be a finite number greater than 0");
       }
@@ -528,7 +549,7 @@ export async function measurementRoutes(app: FastifyInstance): Promise<void> {
         ppl: body.ppl,
         kld_vs_baseline: body.kld_vs_baseline ?? null,
         dataset_hash: body.dataset_hash,
-        method_version: body.method_version ?? METHOD_VERSION,
+        method_version: optionalMethodVersion(body.method_version) ?? METHOD_VERSION,
       });
 
       // A quality run is a single measurement, same shape as a probe -- it
