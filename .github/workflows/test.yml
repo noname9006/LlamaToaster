@@ -41,7 +41,9 @@ jobs:
       # then done by hand: `npm run postinstall` would recurse, because each
       # nested `npm install --prefix` runs the root postinstall again.
       - run: npm ci --ignore-scripts
-      - run: npm run install:worker
+      # `npm ci`, not the install:worker script: on windows-latest `npm install
+      # --prefix worker` wrote the root package into worker/package.json.
+      - run: npm ci --omit=dev --ignore-scripts --prefix worker
       - run: npm ci --ignore-scripts --prefix client
       - run: npm ci --ignore-scripts --prefix admin
 
