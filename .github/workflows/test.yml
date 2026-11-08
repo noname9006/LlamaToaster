@@ -38,9 +38,12 @@ jobs:
       # `npm ci` runs node-gyp, which fails on windows-latest (its Visual Studio
       # is newer than node-gyp knows). --ignore-scripts skips that build; the
       # root postinstall hook (which installs worker/, client/ and admin/) is
-      # then run by hand.
+      # then done by hand: `npm run postinstall` would recurse, because each
+      # nested `npm install --prefix` runs the root postinstall again.
       - run: npm ci --ignore-scripts
-      - run: npm run postinstall
+      - run: npm run install:worker
+      - run: npm ci --ignore-scripts --prefix client
+      - run: npm ci --ignore-scripts --prefix admin
 
       # Informational: a new advisory shouldn't turn every open PR red.
       - name: Audit runtime dependencies
