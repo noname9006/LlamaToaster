@@ -147,6 +147,13 @@ const COLUMN_MIGRATIONS: ColumnSpec[] = [
   // approach as suspect_samples) -- see shared/types.ts's ResultRow doc
   // comment for how this differs from suspect_samples.
   { table: "results", column: "repeat_samples", ddlType: "TEXT" },
+  // RESULT_PROVENANCE_PLAN.md Phase 3 -- see schema.sql's matching block.
+  { table: "results", column: "clean_samples", ddlType: "TEXT" },
+  { table: "results", column: "repeats_requested", ddlType: "INTEGER" },
+  { table: "results", column: "repeats_complete", ddlType: "INTEGER" },
+  { table: "results", column: "stats_mismatch", ddlType: "INTEGER" },
+  { table: "results", column: "worker_avg_tps", ddlType: "REAL" },
+  { table: "results", column: "worker_stddev_tps", ddlType: "REAL" },
   // llama-server /metrics speculative-decoding counters (tg row of an MTP
   // item only) -- see shared/types.ts's ResultRow doc comment.
   { table: "results", column: "spec_drafted", ddlType: "INTEGER" },

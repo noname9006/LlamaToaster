@@ -310,11 +310,25 @@ function validateIngestResult(value: unknown): string | null {
   ) {
     return "gpu_layers_resident_est_draft must be a number or null";
   }
-  for (const field of ["suspect_samples", "repeat_samples"] as const) {
+  for (const field of ["suspect_samples", "repeat_samples", "clean_samples"] as const) {
     const v = row[field];
     if (v !== undefined && (!Array.isArray(v) || !v.every((x) => typeof x === "number" && Number.isFinite(x)))) {
       return `${field} must be an array of numbers`;
     }
+  }
+  // Bounded like the sweep's own repeats: an unbounded count would let one
+  // row claim completeness no other row can reach.
+  if (
+    row.repeats_requested !== undefined &&
+    (typeof row.repeats_requested !== "number" ||
+      !Number.isInteger(row.repeats_requested) ||
+      row.repeats_requested < 1 ||
+      row.repeats_requested > 1000)
+  ) {
+    return "repeats_requested must be an integer from 1 to 1000";
+  }
+  if (Array.isArray(row.clean_samples) && row.clean_samples.length > 1000) {
+    return "clean_samples may hold at most 1000 readings";
   }
   for (const field of [
     "system_memory_total_mb",

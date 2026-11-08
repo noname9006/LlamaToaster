@@ -8,6 +8,7 @@ import { ProbeFrontier } from "../components/ProbeFrontier";
 import { api as apiClient } from "../api/client";
 import { priceMatrix, ETA_UNAVAILABLE } from "../../../shared/pricing";
 import { CURVE_DEFAULT_N_GEN } from "../../../shared/types";
+import { incompleteRepeatsNote } from "../../../shared/rowStats";
 import { useParams, Link } from "react-router-dom";
 import type { ChartConfiguration } from "chart.js";
 import { api } from "../api/client";
@@ -350,6 +351,18 @@ function resultSuspectTitle(r: ResultRow): string | undefined {
         `llama-server MTP timing bug`
     : `${r.suspect_count} of ${total} repeat(s) reported an implausible speed and were excluded from this average ` +
         `(raw flagged values: ${raw} tok/s) -- likely the known llama-server MTP timing bug`;
+}
+
+// RESULT_PROVENANCE_PLAN.md Phase 3: the suspect wording above, plus a line
+// when some requested repeats produced no reading at all -- an average over
+// the survivors otherwise looks exactly like a complete measurement.
+function resultFlagTitle(r: ResultRow): string | undefined {
+  const parts = [resultSuspectTitle(r), incompleteRepeatsNote(r)].filter((s): s is string => !!s);
+  return parts.length > 0 ? parts.join(" -- ") : undefined;
+}
+
+function resultFlagged(r: ResultRow): boolean {
+  return !!r.suspect_count || r.repeats_complete === false;
 }
 
 // Keyed off measurement_source (never backend_type) so the UI is driven
@@ -1478,14 +1491,14 @@ export function TestDetail() {
                           <span className="text-accent">{it.live_tps!.toFixed(1)}</span>
                         ) : ppResult ? (
                           <span
-                            className={ppResult.suspect_count ? "text-warning" : "text-fg"}
+                            className={resultFlagged(ppResult) ? "text-warning" : "text-fg"}
                             title={
-                              resultSuspectTitle(ppResult) ??
+                              resultFlagTitle(ppResult) ??
                               `avg ${ppResult.avg_tps.toFixed(2)} ± ${ppResult.stddev_tps.toFixed(2)} tok/s`
                             }
                           >
                             {ppResult.avg_tps.toFixed(2)}
-                            {ppResult.suspect_count ? " ⚠" : ""}
+                            {resultFlagged(ppResult) ? " ⚠" : ""}
                           </span>
                         ) : !isTerminal && frozenPp != null ? (
                           <span
@@ -1503,14 +1516,14 @@ export function TestDetail() {
                           <span className="text-accent">{it.live_tps!.toFixed(1)}</span>
                         ) : tgResult ? (
                           <span
-                            className={tgResult.suspect_count ? "text-warning" : "text-fg"}
+                            className={resultFlagged(tgResult) ? "text-warning" : "text-fg"}
                             title={
-                              resultSuspectTitle(tgResult) ??
+                              resultFlagTitle(tgResult) ??
                               `avg ${tgResult.avg_tps.toFixed(2)} ± ${tgResult.stddev_tps.toFixed(2)} tok/s`
                             }
                           >
                             {tgResult.avg_tps.toFixed(2)}
-                            {tgResult.suspect_count ? " ⚠" : ""}
+                            {resultFlagged(tgResult) ? " ⚠" : ""}
                           </span>
                         ) : !isTerminal && frozenTg != null ? (
                           <span

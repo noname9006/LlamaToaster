@@ -12,6 +12,7 @@ import {
   MMAP_MLOCK_CURVE_METHOD_VERSION,
   LEGACY_CURVE_METHOD_VERSION,
   METHOD_VERSION,
+  MTP_METHOD_VERSION,
   SERVER_METHOD_VERSION,
   WALL_CLOCK_CURVE_METHOD_VERSION,
   type TestType,
@@ -140,6 +141,23 @@ export function methodsFor(methodVersion: number): MethodsSection {
   // Ordered newest first, and every historical vintage keeps its own section:
   // this describes what a STORED row was measured by, so relabelling an old
   // row with today's pipeline would be a lie about data already shared.
+  // Checked before the curve branch: 11 is numerically above CURVE_METHOD_VERSION
+  // but is not a curve vintage.
+  if (methodVersion === MTP_METHOD_VERSION) {
+    return {
+      method_version: MTP_METHOD_VERSION,
+      summary:
+        "Speculative (MTP) decoding measured through llama-server, after one discarded warm-up request of the same shape, so no repeat carries the freshly started server's one-time costs.",
+      pipeline: [
+        "one llama-server per sweep item, --spec-type draft-mtp, with the model's own MTP head or a --model-draft companion",
+        "warm-up: one request of the item's own prompt and generation length, discarded",
+        "filler prompt: a tokenized mixed-register passage (prose, code, equations, structured data, non-Latin scripts), every register holding an equal share of the prompt at every size and interleaved below the ubatch so each batch sees all of them",
+        "greedy decoding (temperature 0) with ignore_eos, cache_prompt off",
+        "implausibility filter rejects physically impossible rates; suspect readings are kept and flagged, never silently erased",
+        "sample (n-1) standard deviation, recomputed by the server from the clean readings",
+      ],
+    };
+  }
   if (methodVersion === KNEE_METHOD_VERSION) {
     return {
       method_version: KNEE_METHOD_VERSION,

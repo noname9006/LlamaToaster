@@ -217,6 +217,7 @@ function toScoringRow(row: ResultRow, idxOffset: number): ScoringRow {
     sample_count: row.sample_count,
     suspect_count: row.suspect_count,
     repeat_samples: row.repeat_samples,
+    repeats_complete: row.repeats_complete ?? null,
     vram_peak_mib: row.vram_peak_mib,
     ram_peak_mib: row.ram_peak_mib,
     gpu_memory_total_mb: row.gpu_memory_total_mb,

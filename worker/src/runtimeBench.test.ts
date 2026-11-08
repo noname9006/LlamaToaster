@@ -1014,3 +1014,25 @@ describe("fill curve execution", () => {
     expect(execution.results).toHaveLength(2);
   });
 });
+
+describe("curve-point row sample fields (RESULT_PROVENANCE_PLAN Phase 3)", () => {
+  it("counts clean and suspect readings, keeps repeat order, and names the clean set", async () => {
+    let call = 0;
+    const completion = async (input: StreamedRequestInput): Promise<StreamSample> => {
+      const promptN = input.promptTokens.length;
+      const promptMs = (promptN / 310) * 1000;
+      // The second repeat's decode timer collapses (the ~1e6 tok/s class).
+      const predictedMs = call++ === 1 ? 0.001 : (input.nPredict / 40) * 1000;
+      return { ttftMs: promptMs, e2eMs: promptMs + predictedMs, tokensPredicted: input.nPredict, promptN, promptMs, predictedN: input.nPredict, predictedMs, slot: 0 };
+    };
+    const execution = await executeCurvePoint({ effectiveCtx: 1024, nGen: 64, repeats: 5, port: 1, fillerBlocks: BLOCKS, completion });
+    const tg = execution.results.find((r) => r.test_type === "tg")!;
+    expect(tg.sample_count).toBe(5);
+    expect(tg.suspect_count).toBe(1);
+    expect(tg.clean_samples).toHaveLength(4);
+    expect(tg.repeat_samples).toHaveLength(5);
+    expect(tg.repeat_samples![1]).toBe(tg.suspect_samples![0]);
+    expect(tg.repeats_requested).toBe(5);
+    expect(tg.avg_tps).toBeCloseTo(40, 6);
+  });
+});

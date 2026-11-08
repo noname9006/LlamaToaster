@@ -55,6 +55,8 @@ import { DEFAULT_BREAD_MARK_STYLE, isBreadMarkStyle, type BreadMarkStyle } from 
 import type { SweepItem } from "../../../shared/sweep.js";
 import type { TensorLayerBreakdown } from "../../../shared/vramEstimate.js";
 import { configHash, type ConfigHashInput } from "../../../shared/configHash.js";
+import { reconcileRowStats } from "../../../shared/rowStats.js";
+import { log } from "../log.js";
 import { engineFromItem, specTypeFor, type EngineKind } from "../../../shared/engineSpec.js";
 
 interface ModelRow {
@@ -247,6 +249,12 @@ interface ResultRowRaw {
   suspect_count: number | null;
   suspect_samples: string | null;
   repeat_samples: string | null;
+  clean_samples: string | null;
+  repeats_requested: number | null;
+  repeats_complete: number | null;
+  stats_mismatch: number | null;
+  worker_avg_tps: number | null;
+  worker_stddev_tps: number | null;
   spec_drafted: number | null;
   spec_accepted: number | null;
   // BENCHMARKING_PLAN_V8.md §0 columns -- NULL on every row predating them.
@@ -839,6 +847,12 @@ function mapResult(row: ResultRowRaw): ResultRow {
     // this is diagnostic-only data, not load-bearing for the run itself.
     suspect_samples: row.suspect_samples ? safeParseNumberArray(row.suspect_samples) : undefined,
     repeat_samples: row.repeat_samples ? safeParseNumberArray(row.repeat_samples) : undefined,
+    clean_samples: row.clean_samples ? safeParseNumberArray(row.clean_samples) : undefined,
+    repeats_requested: row.repeats_requested ?? null,
+    repeats_complete: row.repeats_complete == null ? null : row.repeats_complete === 1,
+    stats_mismatch: row.stats_mismatch == null ? null : row.stats_mismatch === 1,
+    worker_avg_tps: row.worker_avg_tps ?? null,
+    worker_stddev_tps: row.worker_stddev_tps ?? null,
     spec_drafted: row.spec_drafted ?? undefined,
     spec_accepted: row.spec_accepted ?? undefined,
     method_version: row.method_version ?? null,
@@ -2100,12 +2114,14 @@ export const repo = {
               gpu_memory_host_pinned_mib, gpu_memory_cpu_mapped_mib,
               gpu_layers_loaded, total_model_layers, gpu_layers_loaded_draft, total_model_layers_draft,
               gpu_layers_resident_est, gpu_layers_resident_est_draft,
-              sample_count, suspect_count, suspect_samples, repeat_samples, spec_drafted, spec_accepted,
+              sample_count, suspect_count, suspect_samples, repeat_samples,
+              clean_samples, repeats_requested, repeats_complete, stats_mismatch, worker_avg_tps, worker_stddev_tps,
+              spec_drafted, spec_accepted,
               method_version, prompt_offset, spec_type, spec_n_max, spec_n_min, config_hash,
               concurrency, gpu_temp_c_max, gpu_clock_mhz_min, gpu_clock_samples,
               cpu_isa, ttft_ms_p50, ttft_ms_p95, ttft_n, e2e_ms_mean,
               worker_id, llama_cpp_build, engine, raw_json_path, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+           VALUES (${Array.from({ length: 92 }, () => "?").join(", ")})`
         );
         // An explicit check on the unique key rather than INSERT OR IGNORE,
         // which would also swallow NOT NULL/CHECK failures on a bad row.
@@ -2191,6 +2207,12 @@ export const repo = {
             row.suspect_count ?? null,
             row.suspect_samples ? JSON.stringify(row.suspect_samples) : null,
             row.repeat_samples ? JSON.stringify(row.repeat_samples) : null,
+            row.clean_samples ? JSON.stringify(row.clean_samples) : null,
+            row.repeats_requested ?? null,
+            row.repeats_complete == null ? null : row.repeats_complete ? 1 : 0,
+            row.stats_mismatch == null ? null : row.stats_mismatch ? 1 : 0,
+            row.worker_avg_tps ?? null,
+            row.worker_stddev_tps ?? null,
             row.spec_drafted ?? null,
             row.spec_accepted ?? null,
             row.method_version ?? null,
@@ -4978,6 +5000,15 @@ function buildResultRow(
   idx: number,
   r: IngestResultInput
 ): Omit<ResultRow, "backend_type" | "backend_device_name"> {
+  // RESULT_PROVENANCE_PLAN.md Phase 3 -- one formula for every stored row's
+  // statistics, whichever worker version computed them.
+  const stats = reconcileRowStats(r);
+  if (stats.stats_mismatch === 1) {
+    log.warn(
+      `result stats recomputed for run ${runId} item ${idx} ${r.test_type}: worker sent avg ${r.avg_tps} ± ${r.stddev_tps}, ` +
+        `its own clean samples give ${stats.avg_tps} ± ${stats.stddev_tps}`
+    );
+  }
   return {
     id: uuid(),
     run_id: runId,
@@ -5000,8 +5031,8 @@ function buildResultRow(
     n_gpu_layers_draft: r.n_gpu_layers_draft ?? 0,
     // Same reasoning as n_gpu_layers_draft above.
     n_cpu_moe: r.n_cpu_moe ?? 0,
-    avg_tps: r.avg_tps,
-    stddev_tps: r.stddev_tps,
+    avg_tps: stats.avg_tps,
+    stddev_tps: stats.stddev_tps,
     ram_peak_mib: r.ram_peak_mib,
     vram_peak_mib: r.vram_peak_mib,
     ram_avg_mib: r.ram_avg_mib,
@@ -5052,10 +5083,16 @@ function buildResultRow(
     // Same version-skew tolerance -- the draft companion's own estimate,
     // null on every non-MTP row (no draft buffer lines to derive from).
     gpu_layers_resident_est_draft: r.gpu_layers_resident_est_draft ?? null,
-    sample_count: r.sample_count,
-    suspect_count: r.suspect_count,
+    sample_count: stats.sample_count ?? undefined,
+    suspect_count: stats.suspect_count ?? undefined,
     suspect_samples: r.suspect_samples,
     repeat_samples: r.repeat_samples,
+    clean_samples: r.clean_samples,
+    repeats_requested: r.repeats_requested ?? null,
+    repeats_complete: stats.repeats_complete == null ? null : stats.repeats_complete === 1,
+    stats_mismatch: stats.stats_mismatch == null ? null : stats.stats_mismatch === 1,
+    worker_avg_tps: stats.worker_avg_tps,
+    worker_stddev_tps: stats.worker_stddev_tps,
     spec_drafted: r.spec_drafted,
     spec_accepted: r.spec_accepted,
     method_version: r.method_version ?? null,

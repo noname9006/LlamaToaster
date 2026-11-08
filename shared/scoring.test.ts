@@ -216,6 +216,8 @@ describe("§0.3 eligibility gates and rejection accounting", () => {
       ...config({ idx: 1, pp: 100, tg: 10, axes: { n_gpu_layers: 50 }, extra: { suspect_count: 1 } }),
       // missing the tg side entirely
       row({ idx: 2, test_type: "pp", avg_tps: 100, n_gpu_layers: 30 }),
+      // some requested repeats produced no reading (shared/rowStats.ts)
+      ...config({ idx: 3, pp: 100, tg: 10, axes: { n_gpu_layers: 40 }, extra: { repeats_complete: false } }),
     ];
     const result = scoreProfiles({ rows, repeats: 5 });
     expect(result.scoredCount).toBe(0);
@@ -223,6 +225,7 @@ describe("§0.3 eligibility gates and rejection accounting", () => {
       stability: 1,
       suspect_samples: 1,
       missing_pp_or_tg: 1,
+      incomplete_repeats: 1,
     });
     // Not "only stability", so no waived card is emitted.
     expect(result.profiles).toHaveLength(0);

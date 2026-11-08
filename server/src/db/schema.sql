@@ -149,6 +149,17 @@ CREATE TABLE IF NOT EXISTS results (
   -- on an MTP row where the draft model's own runtime line wasn't captured.
   gpu_layers_loaded_draft INTEGER,
   total_model_layers_draft INTEGER,
+  -- RESULT_PROVENANCE_PLAN.md Phase 3 (shared/rowStats.ts): clean readings
+  -- avg/stddev were recomputed from (JSON number[]), repeats the item asked
+  -- for, whether every one produced a reading (0/1), whether the worker's
+  -- own avg/stddev disagreed with the recomputation (0/1), and the worker's
+  -- figures when they did. NULL on rows from workers that predate them.
+  clean_samples TEXT,
+  repeats_requested INTEGER,
+  repeats_complete INTEGER,
+  stats_mismatch INTEGER,
+  worker_avg_tps REAL,
+  worker_stddev_tps REAL,
   raw_json_path TEXT,             -- full llama-bench JSON output for this run
   created_at INTEGER
 );

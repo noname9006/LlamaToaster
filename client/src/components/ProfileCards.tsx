@@ -365,6 +365,8 @@ export function ProfileCards({ testId, refreshKey, modelId, workerId }: ProfileC
         {scoring.tallies.suspect_samples > 0 && ` · ${scoring.tallies.suspect_samples} carried suspect samples`}
         {scoring.tallies.missing_pp_or_tg > 0 &&
           ` · ${scoring.tallies.missing_pp_or_tg} never produced both a pp and a tg row`}
+        {(scoring.tallies.incomplete_repeats ?? 0) > 0 &&
+          ` · ${scoring.tallies.incomplete_repeats} had repeats that produced no reading`}
         .
         {scoring.profiles.length === 0 &&
           " No card could be produced from this run — the tallies above are the reason, not an error."}

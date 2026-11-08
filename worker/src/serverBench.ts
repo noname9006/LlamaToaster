@@ -20,7 +20,8 @@ import {
 import { estimateResidentGpuLayersFromBufferSizes } from "../../shared/vramEstimate.js";
 import { buildPromptTokens, fetchFillerBlocks, type FillerBlocks } from "./fillerPrompt.js";
 import { modelLoadArgs, supportsFlag } from "./binary-probe.js";
-import { SERVER_METHOD_VERSION } from "../../shared/types.js";
+import { MTP_METHOD_VERSION } from "../../shared/types.js";
+import { meanAndSampleStddev } from "../../shared/rowStats.js";
 import {
   MAX_PLAUSIBLE_PP_TOKENS_PER_SECOND,
   MAX_PLAUSIBLE_TG_TOKENS_PER_SECOND,
@@ -611,10 +612,8 @@ async function checkSpecDecodeMetrics(port: number, label: string, repeats: numb
 // data to measure spread" is a more honest zero-cost default than surfacing
 // not-a-number to the UI.
 function average(values: number[]): { avg: number; stddev: number } {
-  const avg = values.reduce((a, b) => a + b, 0) / values.length;
-  if (values.length < 2) return { avg, stddev: 0 };
-  const sumSquares = values.reduce((a, b) => a + (b - avg) ** 2, 0);
-  return { avg, stddev: Math.sqrt(sumSquares / (values.length - 1)) };
+  const { mean, stddev } = meanAndSampleStddev(values);
+  return { avg: mean, stddev };
 }
 
 interface PhaseSummary {
@@ -769,6 +768,25 @@ export async function runServerBench(input: ServerBenchRunInput): Promise<BenchR
     // repeats in *this same* item also start from it, not just future items/
     // runs (see saveWorkingOffset's persistence for those).
     let preferredOffset = getWorkingOffset(offsetStorePath, offsetKey);
+
+    // One discarded request of the item's own shape before the timed repeats
+    // (MTP_METHOD_VERSION). A freshly started llama-server pays one-time costs
+    // on its first request -- shader compilation, buffer allocation, first
+    // touch of the weights -- which landed in repeat 1 and nowhere else:
+    // observed live 2026-11-08 on an RX 6600 XT, pp 111 then ~707 tok/s
+    // (Qwen3.5-4B, built-in MTP) and 279 then ~968 (Gemma 4 E4B + draft),
+    // inflating stddev ~200x and failing the stability gate on an otherwise
+    // flat measurement. llama-bench warms up the same way on its own path.
+    // A failure here is not fatal: the timed repeats have their own retry
+    // ladder, and an unwarmed repeat 1 is what every earlier vintage measured.
+    clearTimeout(timer);
+    armTimer();
+    input.onProgress?.("processing", "warm-up");
+    try {
+      await runCompletion(input.port, item.n_prompt, item.n_gen, timeoutMs, preferredOffset, fillerBlocks);
+    } catch (err) {
+      log?.warn(`${label}: warm-up request failed (${err instanceof Error ? err.message : String(err)}) -- continuing with the timed repeats`);
+    }
 
     const ppSamples: number[] = [];
     const tgSamples: number[] = [];
@@ -945,7 +963,7 @@ export async function runServerBench(input: ServerBenchRunInput): Promise<BenchR
       // Measured through llama-server, so it carries the server vintage rather
       // than the shared one -- the mixed-register filler prompt changed what
       // this path measures, and llama-bench rows must not be invalidated with it.
-      method_version: SERVER_METHOD_VERSION,
+      method_version: MTP_METHOD_VERSION,
       n_prompt: item.n_prompt,
       n_gen: item.n_gen,
       n_threads: item.threads,
@@ -994,6 +1012,8 @@ export async function runServerBench(input: ServerBenchRunInput): Promise<BenchR
         suspect_count: ppSummary.suspectCount,
         suspect_samples: ppSummary.suspectValues.length > 0 ? ppSummary.suspectValues : undefined,
         repeat_samples: ppRepeatSamples.length > 0 ? ppRepeatSamples : undefined,
+        clean_samples: ppSamples,
+        repeats_requested: input.repeats,
       });
       if (ppSummary.warning) warnings.push(ppSummary.warning);
     }
@@ -1008,6 +1028,8 @@ export async function runServerBench(input: ServerBenchRunInput): Promise<BenchR
         suspect_count: tgSummary.suspectCount,
         suspect_samples: tgSummary.suspectValues.length > 0 ? tgSummary.suspectValues : undefined,
         repeat_samples: tgRepeatSamples.length > 0 ? tgRepeatSamples : undefined,
+        clean_samples: tgSamples,
+        repeats_requested: input.repeats,
         // Attached to the tg row specifically -- spec decode only happens
         // during generation, and undefined (vs. 0) here means /metrics never
         // confirmed anything at all rather than confirming zero activity.

@@ -99,6 +99,10 @@ export interface ResultExportRow {
   // differs from suspect_samples (a flagged-only subset). Same JSON-text
   // storage as suspect_samples (SQLite has no array column type).
   repeat_samples: string | null;
+  // RESULT_PROVENANCE_PLAN.md Phase 3 -- 0/1 as stored, NULL on older rows.
+  repeats_requested: number | null;
+  repeats_complete: number | null;
+  stats_mismatch: number | null;
   // llama-server /metrics speculative-decoding counters (tg row of an MTP
   // item only) -- see shared/types.ts's ResultRow doc comment. Both null
   // means /metrics was unreachable or had no counters at all, distinct from
@@ -231,7 +235,7 @@ export function formatResultsExport(
 ): { contentType: string; filename: string; body: string } {
   if (format === "csv") {
     const header =
-      "run_id,worker_name,backend_type,backend_device_name,model_id,model_filename,test_type,n_prompt,n_gen,n_threads,n_gpu_layers,gpu_layers_loaded,total_model_layers,gpu_layers_resident_est,n_gpu_layers_draft,gpu_layers_loaded_draft,total_model_layers_draft,gpu_layers_resident_est_draft,n_cpu_moe,batch_size,ubatch_size,cache_type_k,cache_type_v,flash_attn,mtp,avg_tps,stddev_tps,ram_peak_mib,vram_peak_mib,system_memory_total_mib,gpu_memory_total_mib,gpu_memory_total_accuracy,gpu_memory_total_source,gpu_memory_free_start_accuracy,gpu_memory_free_start_source,gpu_memory_model_avg_accuracy,gpu_memory_model_avg_source,gpu_memory_model_peak_accuracy,gpu_memory_model_peak_source,ram_total_used_avg_mib,ram_total_used_peak_mib,gpu_memory_used_avg_mib,gpu_memory_used_peak_mib,gpu_memory_used_avg_accuracy,gpu_memory_used_avg_source,gpu_memory_used_peak_accuracy,gpu_memory_used_peak_source,gpu_memory_process_avg_mib,gpu_memory_process_peak_mib,gpu_memory_process_avg_accuracy,gpu_memory_process_avg_source,gpu_memory_process_peak_accuracy,gpu_memory_process_peak_source,sample_count,suspect_count,suspect_samples,repeat_samples,spec_accepted_drafted";
+      "run_id,worker_name,backend_type,backend_device_name,model_id,model_filename,test_type,n_prompt,n_gen,n_threads,n_gpu_layers,gpu_layers_loaded,total_model_layers,gpu_layers_resident_est,n_gpu_layers_draft,gpu_layers_loaded_draft,total_model_layers_draft,gpu_layers_resident_est_draft,n_cpu_moe,batch_size,ubatch_size,cache_type_k,cache_type_v,flash_attn,mtp,avg_tps,stddev_tps,ram_peak_mib,vram_peak_mib,system_memory_total_mib,gpu_memory_total_mib,gpu_memory_total_accuracy,gpu_memory_total_source,gpu_memory_free_start_accuracy,gpu_memory_free_start_source,gpu_memory_model_avg_accuracy,gpu_memory_model_avg_source,gpu_memory_model_peak_accuracy,gpu_memory_model_peak_source,ram_total_used_avg_mib,ram_total_used_peak_mib,gpu_memory_used_avg_mib,gpu_memory_used_peak_mib,gpu_memory_used_avg_accuracy,gpu_memory_used_avg_source,gpu_memory_used_peak_accuracy,gpu_memory_used_peak_source,gpu_memory_process_avg_mib,gpu_memory_process_peak_mib,gpu_memory_process_avg_accuracy,gpu_memory_process_avg_source,gpu_memory_process_peak_accuracy,gpu_memory_process_peak_source,sample_count,suspect_count,suspect_samples,repeat_samples,spec_accepted_drafted,repeats_requested,repeats_complete,stats_mismatch";
     const lines = rows.map((r) =>
       [
         neutralizeFormula(r.run_id),
@@ -292,6 +296,9 @@ export function formatResultsExport(
         fmtSampleList(r.suspect_samples),
         fmtSampleList(r.repeat_samples),
         fmtSpecDecode(r.spec_drafted, r.spec_accepted),
+        fmtNullable(r.repeats_requested),
+        fmtNullable(r.repeats_complete),
+        fmtNullable(r.stats_mismatch),
       ]
         .map((v) => `"${(typeof v === "string" ? neutralizeFormula(v) : String(v)).replace(/"/g, '""')}"`)
         .join(",")

@@ -7,6 +7,7 @@ import { NewComparison } from "../components/NewComparison";
 import { ImportBundle } from "../components/ImportBundle";
 import type { Test, ResultRow } from "../types";
 import { shortId, formatFlashAttn } from "../utils";
+import { incompleteRepeatsNote } from "../../../shared/rowStats";
 
 interface ColumnDef {
   id: string;
@@ -26,6 +27,8 @@ interface CellValue {
   sample_count?: number;
   suspect_count?: number;
   suspect_samples?: number[];
+  repeats_requested?: number | null;
+  repeats_complete?: boolean | null;
 }
 interface RowDef {
   key: string;
@@ -33,13 +36,21 @@ interface RowDef {
   values: Record<string, CellValue>;
 }
 
+// Also true when some requested repeats produced no reading (shared/rowStats.ts).
 function isSuspectCell(v: CellValue | undefined): boolean {
-  return !!v?.suspect_count;
+  return !!v?.suspect_count || v?.repeats_complete === false;
 }
 
 // Mirrors RunDetail.tsx's resultSuspectTitle wording so the same measurement
 // reads identically wherever it's shown.
 function cellSuspectTitle(v: CellValue): string | undefined {
+  const incomplete = incompleteRepeatsNote(v);
+  const suspect = suspectOnlyTitle(v);
+  const parts = [suspect, incomplete].filter((s): s is string => !!s);
+  return parts.length > 0 ? parts.join(" -- ") : undefined;
+}
+
+function suspectOnlyTitle(v: CellValue): string | undefined {
   if (!v.suspect_count) return undefined;
   const raw = v.suspect_samples?.map((n) => n.toFixed(1)).join(", ") ?? "unknown";
   const total = v.sample_count ?? v.suspect_count;
@@ -192,6 +203,8 @@ export function Compare() {
               sample_count: r.sample_count,
               suspect_count: r.suspect_count,
               suspect_samples: r.suspect_samples,
+              repeats_requested: r.repeats_requested,
+              repeats_complete: r.repeats_complete,
             };
           }
         });

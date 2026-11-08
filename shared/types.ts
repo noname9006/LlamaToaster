@@ -251,6 +251,16 @@ export const WALL_CLOCK_CURVE_METHOD_VERSION = 5;
 // shared constant would have falsely invalidated them.
 export const SERVER_METHOD_VERSION = 3;
 
+// The MTP path (worker/src/serverBench.ts) since it sends one discarded
+// warm-up request before the timed repeats (2026-11-08). Until then repeat 1
+// hit a freshly started server and carried its one-time costs (pp 111 vs ~707
+// tok/s on the next repeats, observed live), so v3 MTP rows include a cold
+// repeat and must not be averaged with these. SERVER_METHOD_VERSION stays to
+// describe the stored v3 rows. 11, not a free lower number: every value below
+// is taken by a stored vintage. Profile scoring only reads sweep runs, so this
+// sitting above CURVE_METHOD_VERSION cannot displace curve points.
+export const MTP_METHOD_VERSION = 11;
+
 // Prefill speed per slice of one growing prompt (shared/fillCurve.ts): each
 // row's rate covers only the tokens appended on top of a cached prefix, so it
 // must never be averaged with a whole-prompt pp reading.
@@ -840,6 +850,20 @@ export interface ResultRow {
   // flagged-implausible ones specifically); this array has no such flag per
   // element, just the raw per-repeat values in the order they were measured.
   repeat_samples?: number[];
+  // RESULT_PROVENANCE_PLAN.md Phase 3 -- see shared/rowStats.ts. The clean
+  // readings avg_tps/stddev_tps are computed from (the server recomputes
+  // them at ingest); repeats_requested is how many repeats the item asked
+  // for; repeats_complete is false when some repeats produced no reading at
+  // all. stats_mismatch is true when the worker's own avg/stddev disagreed
+  // with the recomputation, whose result is then the stored avg_tps/
+  // stddev_tps, with the worker's figures kept in worker_avg_tps/
+  // worker_stddev_tps. All undefined/null on rows predating them.
+  clean_samples?: number[];
+  repeats_requested?: number | null;
+  repeats_complete?: boolean | null;
+  stats_mismatch?: boolean | null;
+  worker_avg_tps?: number | null;
+  worker_stddev_tps?: number | null;
   // Only populated on the tg row of an MTP item (worker/src/serverBench.ts) --
   // llama-server's own /metrics speculative-decoding counters, the only
   // direct evidence the --spec-type draft-mtp draft head actually contributed
@@ -950,6 +974,12 @@ export interface IngestResultInput {
   suspect_count?: number;
   suspect_samples?: number[];
   repeat_samples?: number[];
+  // RESULT_PROVENANCE_PLAN.md Phase 3 (shared/rowStats.ts): the readings
+  // avg_tps/stddev_tps were computed from, suspect ones excluded, and how
+  // many repeats the item asked for. Optional -- an older worker sends
+  // neither and its row is stored as before.
+  clean_samples?: number[];
+  repeats_requested?: number;
   spec_drafted?: number;
   spec_accepted?: number;
   // §0.1 -- worker-stamped methodology version. Absent on an older worker;
