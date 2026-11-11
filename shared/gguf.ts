@@ -978,13 +978,20 @@ export function buildTensorLayerBreakdown(tensors: { name: string; size: number 
   let maxMoe = 0;
   let maxEmbed = 0;
   let maxOutput = 0;
+  const ffnGate = new Array(nLayer).fill(0);
+  const ffnUp = new Array(nLayer).fill(0);
+  const ffnDown = new Array(nLayer).fill(0);
 
   for (const t of tensors) {
     const blockMatch = BLOCK_TENSOR.exec(t.name);
     if (blockMatch) {
       const idx = Number(blockMatch[1]);
       if (Number.isInteger(idx) && idx >= 0 && idx < nLayer) {
-        if (isMoeExpertTensorName(blockMatch[2])) {
+        const rest = blockMatch[2];
+        if (rest.startsWith("ffn_gate")) ffnGate[idx] += t.size;
+        else if (rest.startsWith("ffn_up")) ffnUp[idx] += t.size;
+        else if (rest.startsWith("ffn_down")) ffnDown[idx] += t.size;
+        if (isMoeExpertTensorName(rest)) {
           moe[idx] += t.size;
           maxMoe = Math.max(maxMoe, t.size);
         } else {
@@ -1007,5 +1014,9 @@ export function buildTensorLayerBreakdown(tensors: { name: string; size: number 
     }
   }
 
-  return { dense, moe, embed, output, other, max_dense: maxDense, max_moe: maxMoe, max_embed: maxEmbed, max_output: maxOutput };
+  return {
+    dense, moe, embed, output, other,
+    max_dense: maxDense, max_moe: maxMoe, max_embed: maxEmbed, max_output: maxOutput,
+    ffn_gate: ffnGate, ffn_up: ffnUp, ffn_down: ffnDown,
+  };
 }

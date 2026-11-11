@@ -21,10 +21,17 @@
 //   attention   the KQ mask (512 x ctx f16) + graph scratch;
 //   CPU cache   a full-attention block on the CPU: its K/V are copied in,
 //               (largest full layer's K+V + mask) x ctx;
-//   experts     a GPU block whose experts stay on the CPU: that block's whole
-//               expert set is copied in (gate + up + down -- 5022 MiB measured
-//               on a 5058 MiB GLM-5.3-Flash block, 499 on a 498 MiB Qwen3.6-35B
-//               one), plus the mask.
+//   experts     a GPU block whose experts stay on the CPU: its expert tensors
+//               are copied in for prompt processing, one at a time -- ggml's
+//               scheduler starts a new split at every CPU-resident weight so
+//               the previous copy's memory is reused -- so the largest single
+//               expert tensor + the mask + 120 MiB. Fit on 309 llama-fit-params
+//               b12058 answers (Vulkan + ROCm agree) with experts offloaded:
+//               mean |error| 47 MiB, p90 +43. A few families hold two copies
+//               (Ling-3.0-flash, MiniMax-M2 HQ4_K: up to 740 MiB more).
+//               Rows without max_moe fall back to the whole block's experts,
+//               the earlier b9503 reading (5022 MiB on a 5058 MiB GLM-5.3-Flash
+//               block).
 // Measured spread: within ~100 MiB on most placements; the attention stage of
 // some MoE graphs (Qwen3.6-35B, Gemma-4 26B) runs ~250 MiB above it at 256k.
 
@@ -49,6 +56,8 @@ const CPU_CACHE_SCRATCH_MIB = 64;
 // explain: +2 KiB measured on Gemma-4 26B-A4B, +0..1 KiB on Qwen3.6-35B-A3B
 // (quant-dependent). The larger value, so the fallback errs to fewer layers.
 const MOE_CPU_CACHE_EXTRA_BYTES = 2048;
+// Experts-stage scratch beside the copied expert tensor and the mask, MiB.
+const EXPERT_COPY_SCRATCH_MIB = 120;
 // Host compute buffer beside the mask-sized term, MiB.
 const HOST_COMPUTE_MIB = 16;
 
@@ -80,14 +89,38 @@ export interface FitSimPoint {
   compute_mib: number;
 }
 
+/** How much of the boundary block (the frontmost of the `movedBlocks`) goes
+ * to the CPU, as llama.cpp --fit splits it (common/fit.cpp): "gate" moves its
+ * ffn_down* tensors, "up" its ffn_gate* + ffn_down*, "attn" every ffn_gate* /
+ * ffn_up* / ffn_down* tensor -- dense, shared and routed alike, so "attn" also
+ * moves the router and shared experts. Unset: its routed experts only. */
+export type BoundarySplit = "gate" | "up" | "attn";
+
 /** A placement: the output layer + the last `blocks` blocks on the GPU
  * (output only when `output`), experts of `movedBlocks` GPU blocks (from the
- * back) on the CPU, plus `movedBytes` more of the next block's experts. */
+ * back) on the CPU, the frontmost of them split per `boundary`.
+ * `movedBytes` (research scripts only) moves that many more bytes of the next
+ * block's experts. */
 export interface Placement {
   output: boolean;
   blocks: number;
   movedBlocks: number;
+  boundary?: BoundarySplit;
   movedBytes?: number;
+}
+
+/** Whether the row carries the per-block ffn group sums a boundary split needs. */
+function hasFfnGroups(b: TensorLayerBreakdown): boolean {
+  const n = b.dense.length;
+  return b.ffn_gate?.length === n && b.ffn_up?.length === n && b.ffn_down?.length === n;
+}
+
+/** Bytes of block `i` a boundary split puts on the CPU. */
+function boundaryCpuBytes(b: TensorLayerBreakdown, i: number, split: BoundarySplit): number {
+  const gate = b.ffn_gate?.[i] ?? 0;
+  const up = b.ffn_up?.[i] ?? 0;
+  const down = b.ffn_down?.[i] ?? 0;
+  return split === "gate" ? down : split === "up" ? gate + down : gate + up + down;
 }
 
 function swaCells(window: number, ctx: number): number {
@@ -138,7 +171,9 @@ function buildModel(input: FitSimInput): SimModel | null {
   const maskMib = (ctx * UBATCH * 2) / MIB;
   const logitsMib = (layout.vocab ? (layout.vocab * UBATCH * 4) / MIB : 0) + LOGITS_SCRATCH_MIB;
   const fullMaxBytes = (layout.full_max ?? (layout.full_k + layout.full_v) / Math.max(1, caches.full.filter(Boolean).length)) * Math.max(bK, bV);
-  const blockExpertsMib = Math.max(0, ...b.moe) / MIB;
+  // What the experts stage copies in: the largest expert tensor, or on rows
+  // read before max_moe existed, the whole block's experts.
+  const expertCopyMib = b.max_moe != null && b.max_moe > 0 ? b.max_moe / MIB + EXPERT_COPY_SCRATCH_MIB : Math.max(0, ...b.moe) / MIB;
   const moeModel = b.moe.some((x) => x > 0);
   const totalWeights = b.dense.reduce((a, x) => a + x, 0) + b.moe.reduce((a, x) => a + x, 0) + b.embed + b.output + b.other;
   const totalCacheMib = caches.bytes.reduce((a, x) => a + x, 0) / MIB;
@@ -153,7 +188,7 @@ function buildModel(input: FitSimInput): SimModel | null {
       const perToken = fullMaxBytes + UBATCH * 2 + (moeModel ? MOE_CPU_CACHE_EXTRA_BYTES : 0);
       stage = Math.max(stage, (ctx * perToken) / MIB + CPU_CACHE_SCRATCH_MIB);
     }
-    if ((p.movedBlocks > 0 || (p.movedBytes ?? 0) > 0)) stage = Math.max(stage, blockExpertsMib + maskMib);
+    if ((p.movedBlocks > 0 || (p.movedBytes ?? 0) > 0)) stage = Math.max(stage, expertCopyMib + maskMib);
     return stage;
   };
 
@@ -167,6 +202,10 @@ function buildModel(input: FitSimInput): SimModel | null {
     }
     for (let i = n - p.movedBlocks; i < n; i++) weights -= b.moe[i];
     weights -= p.movedBytes ?? 0;
+    if (p.boundary && p.movedBlocks > 0) {
+      const i = n - p.movedBlocks;
+      weights += b.moe[i] - boundaryCpuBytes(b, i, p.boundary);
+    }
     const compute = computeMib(p);
     return { devMib: weights / MIB + cache / MIB + compute, weights, cacheMib: cache / MIB, compute };
   };
@@ -212,22 +251,37 @@ export function simulateFit(input: FitSimInput): FitSimPoint | null {
 
   const hasMoe = b.moe.some((x) => x > 0);
   if (hasMoe) {
-    // Every block on the GPU, experts moved from the back: whole blocks first,
-    // then the part of the next block that closes the gap (fit moves single
-    // expert tensors).
-    for (let moved = 0; moved <= n; moved++) {
+    // Every block on the GPU, routed experts moved from the back one whole
+    // block at a time. Then fit's "one more layer" step on the boundary block
+    // (the frontmost moved one): try keeping its up tensors on the GPU ("up"),
+    // and if that fits its gate tensors too ("gate"); when "up" does not fit,
+    // it tries "attn", which moves that block's whole FFN, router and shared
+    // experts included. Those tries need used < budget, not <=.
+    //
+    // Fit never moves the experts of the front-most GPU block: it lays layers
+    // out with the output layer as the LAST index (n), so the override it
+    // writes for "the output layer" is blk.<n>, a block that does not exist,
+    // and the one it means to keep whole is the front block instead (seen in
+    // b12058's -ot: a 32-block Mixnu ends with blk\.32\.ffn_...=CPU). The same
+    // shift is why its "(K overflowing)" counts one more than the blocks it
+    // moves; overflow_layers here counts real blocks.
+    const below = (p: Placement) => evaluate(p).devMib < budget;
+    for (let moved = 0; moved <= n - 1; moved++) {
       const p = { ...all, movedBlocks: moved };
       if (!fits(p)) continue;
-      if (moved === 0) return finish(p);
-      const prev = { ...all, movedBlocks: moved - 1 };
-      const need = (evaluate(prev).devMib - budget) * MIB;
-      const part = Math.min(b.moe[n - moved], Math.max(0, need));
-      const partial = { ...prev, movedBytes: part };
-      return finish(part < b.moe[n - moved] && fits(partial) ? partial : p);
+      if (moved === 0 || !hasFfnGroups(b)) return finish(p);
+      const up: Placement = { ...p, boundary: "up" };
+      if (below(up)) {
+        const gate: Placement = { ...p, boundary: "gate" };
+        return finish(below(gate) ? gate : up);
+      }
+      const attn: Placement = { ...p, boundary: "attn" };
+      return finish(below(attn) ? attn : p);
     }
-    // Dense-only: drop blocks, every GPU block's experts on the CPU.
+    // Dense-only: drop blocks, every GPU block's experts on the CPU but the
+    // front-most one's (see above).
     for (let k = n; k >= 1; k--) {
-      const p = plain(k, n);
+      const p = plain(k, Math.max(0, k - 2));
       if (fits(p)) return finish(p);
     }
     return finish(plain(0));
