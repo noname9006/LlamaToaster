@@ -481,6 +481,10 @@ const COLUMN_MIGRATIONS: ColumnSpec[] = [
   // Bread fit marks: the "Will it fit?" answer's second look at the model's
   // maximum context (shared/fitGrade.ts FitCeiling). NULL from older workers.
   { table: "model_fit_checks", column: "ceiling_json", ddlType: "TEXT" },
+  // Header-reader version of an ok HF header read (repo.ts HF_HEADER_READER);
+  // existing rows are 0, so listModelsNeedingHfHeader re-reads the ones the
+  // current reader would answer differently.
+  { table: "model_hf_headers", column: "reader", ddlType: "INTEGER NOT NULL DEFAULT 0" },
 ];
 
 function applyColumnMigrations(database: Database.Database): void {

@@ -209,6 +209,42 @@ describe("runHfHeaderTick", () => {
     expect(repo.listModelsNeedingHfHeader(10, Date.now()).map((m) => m.id)).not.toContain(sha);
   });
 
+  it("re-reads an older reader's MoE and sliding-window headers once, and nothing else", async () => {
+    const { getDb } = await import("./db/migrate.js");
+    const { HF_HEADER_READER } = await import("./db/repo.js");
+    const kv = { full_k: 1024, full_v: 1024, swa_k: 0, swa_v: 0, window: 0, kinds: "ff", full_max: 2048 };
+    const tlb = (moe: number[], ffn: boolean) => ({
+      dense: [10, 10], moe, embed: 1, output: 1, other: 0,
+      ...(ffn ? { ffn_gate: [5, 5], ffn_up: [5, 5], ffn_down: [5, 5] } : {}),
+    });
+    const rows: [string, Record<string, unknown>][] = [
+      ["a1".repeat(32), { n_layer: 2, tensor_layer_bytes: tlb([100, 100], false), kv_layout: kv }], // MoE, no ffn sums
+      ["a2".repeat(32), { n_layer: 2, tensor_layer_bytes: tlb([0, 0], false), kv_layout: { ...kv, swa_k: 512, swa_v: 512, window: 4096, kinds: "sf" } }], // sliding window
+      ["a3".repeat(32), { n_layer: 2, tensor_layer_bytes: tlb([0, 0], false), kv_layout: kv }], // dense, full attention
+      ["a4".repeat(32), { n_layer: 2, tensor_layer_bytes: tlb([100, 100], true), kv_layout: kv }], // MoE already with sums
+    ];
+    for (const [id, fields] of rows) {
+      repo.registerModel({ id, filename: "f.gguf", size_bytes: 1, source: "huggingface", hf_repo: `org/${id.slice(0, 4)}`, hf_file: "f.gguf" });
+      repo.recordHfHeader(id, { status: "ok", fields: fields as never });
+    }
+    const due = () => repo.listModelsNeedingHfHeader(100, Date.now()).map((m) => m.id);
+    // Written by the current reader: none is due.
+    for (const [id] of rows) expect(due()).not.toContain(id);
+    // The same rows from before reader versions existed.
+    getDb().prepare(`UPDATE model_hf_headers SET reader = 0 WHERE sha256 IN (?, ?, ?, ?)`).run(...rows.map(([id]) => id));
+    expect(due()).toEqual(expect.arrayContaining([rows[0][0], rows[1][0]]));
+    expect(due()).not.toContain(rows[2][0]);
+    expect(due()).not.toContain(rows[3][0]);
+    // A successful re-read stamps the current reader, so it is not due again.
+    repo.recordHfHeader(rows[1][0], { status: "ok", fields: rows[1][1] as never });
+    expect(due()).not.toContain(rows[1][0]);
+    expect((getDb().prepare(`SELECT reader FROM model_hf_headers WHERE sha256 = ?`).get(rows[1][0]) as { reader: number }).reader).toBe(HF_HEADER_READER);
+    // A failing one keeps its header and stops at the attempt cap.
+    for (let i = 0; i < 10; i++) repo.recordHfHeader(rows[0][0], { status: "failed", reason: "x" });
+    expect(repo.resolveHeaderFields(rows[0][0])).toEqual(rows[0][1]);
+    expect(due()).not.toContain(rows[0][0]);
+  });
+
   it("a read that never finished (the process died during it) still spends an attempt and backs off", async () => {
     const sha = "cc".repeat(32);
     repo.registerModel({ id: sha, filename: "f.gguf", size_bytes: 1, source: "huggingface", hf_repo: "org/crash", hf_file: "f.gguf" });
