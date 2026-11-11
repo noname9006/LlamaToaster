@@ -189,19 +189,6 @@ export async function workersRoutes(app: FastifyInstance): Promise<void> {
     return reply.code(202).send({ ok: true, queued: true });
   });
 
-  // Workers page "Measure memory speed" button -- queued like shutdown above
-  // (takes its place behind whatever's already running rather than
-  // interrupting it). The client hides the button on a worker whose
-  // capabilities lack "mem-speed-v1"; this route doesn't re-check that
-  // (an older worker just ignores the unrecognised job type, same as any
-  // other capability-gated job -- see shared/types.ts's WORKER_CAPABILITIES).
-  app.post<{ Params: { id: string } }>("/api/workers/:id/measure-memory-speed", async (request, reply) => {
-    const worker = requireOnlineWorker(resolveAuthUser(request)?.user.id, request.params.id);
-    repo.queueRepo.enqueueJob(worker.id, { type: "measure_memory_speed", payload: {} });
-    queueEvents.emit(worker.id);
-    return reply.code(202).send({ ok: true, queued: true });
-  });
-
   // Permanently forgets this machine -- distinct from a session revoke
   // (Settings' "Active sessions"), which only kicks the machine off and
   // leaves the workers row (and its Workers-page card) in place forever

@@ -8,7 +8,6 @@ import { IconCheck, IconChevronDown, IconDownload, IconPencil, IconTrash } from 
 import { Tooltip } from "./Tooltip";
 import { copyToClipboard, formatBytes, formatDate } from "../utils";
 import { HardwareSummary } from "./HardwareSummary";
-import { MemorySpeedPanel } from "./MemorySpeedPanel";
 
 // Two setup families, not three: macOS and Linux run the byte-identical
 // bootstrap.sh / setup-worker.sh and the same commands, so a separate tab for
@@ -353,14 +352,6 @@ export function WorkerCard({ worker, onRefresh }: { worker: Worker; onRefresh: (
       return;
     }
     await withBusy("shutdown", () => api.shutdownWorker(worker.id).then(() => undefined), "Shutdown queued");
-  }
-
-  async function handleMeasureMemorySpeed() {
-    await withBusy(
-      "measure-memory-speed",
-      () => api.measureMemorySpeed(worker.id).then(() => undefined),
-      "Memory speed measurement queued"
-    );
   }
 
   async function handleRemove() {
@@ -719,14 +710,6 @@ export function WorkerCard({ worker, onRefresh }: { worker: Worker; onRefresh: (
               )}
             </dl>
           </div>
-          {worker.capabilities.includes("mem-speed-v1") && (
-            <MemorySpeedPanel
-              result={worker.memSpeed}
-              onMeasure={() => void handleMeasureMemorySpeed()}
-              queuing={busyTag === "measure-memory-speed"}
-              disabled={busyTag !== null || worker.status === "busy"}
-            />
-          )}
           {updateAvailable && (
             <div className="mt-2">
               <StatusPill label="update available" tone="warning" />

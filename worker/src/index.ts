@@ -89,7 +89,6 @@ import {
   getProbeDedup,
   postQualityResult,
   getRocmSupport,
-  reportMemorySpeed,
   postFitPoints,
   postKvSupport,
   postFitChecks,
@@ -114,7 +113,6 @@ import {
   type SpeedRunSpec,
   type ThreadSweepSpec,
 } from "../../shared/speedRun.js";
-import { measureMemorySpeed } from "./memSpeed.js";
 import { log, configureLogging, setRunLogFile, ansi, paint, colorsEnabled } from "./log.js";
 import { DaemonManager, DaemonLoadCancelled, MAX_LOAD_JOB_AGE_MS } from "./daemon/manager.js";
 import { DaemonStore } from "./daemon/store.js";
@@ -5213,25 +5211,6 @@ async function executeRefreshModelsJob(): Promise<void> {
   log.info("Model directory refresh completed");
 }
 
-// Workers page "Measure memory speed" button. updateJobReport's detail
-// string rides the existing serial-job progress channel (BusyPhaseCard on
-// the Workers card reads it directly), so the sweep's per-thread-count
-// rows show up as live status text exactly like a benchmark item would.
-// The result is posted BEFORE this returns (not left for executeJob's
-// caller to bundle into the completion report) -- see reportMemorySpeed's
-// own doc comment for why: it must be durably saved even if the completion
-// report itself has to retry.
-async function executeMeasureMemorySpeedJob(): Promise<void> {
-  log.info("Starting memory speed measurement");
-  const result = await measureMemorySpeed((detail) => updateJobReport({ detail }));
-  await withAuth((token) => reportMemorySpeed(config.url, token, config.machine_id!, result));
-  log.info(
-    `Memory speed measurement completed: RAM ${result.ram.points.length} row(s), VRAM ${
-      result.vram ? `${result.vram.readGBs.toFixed(0)} GB/s read` : `unavailable (${result.vramUnavailableReason ?? "unknown reason"})`
-    }`
-  );
-}
-
 // download_model is deliberately NOT handled here -- workerMain's
 // downloadJobPool intercepts and dispatches it before a job ever reaches
 // this function (see the loop below), so the type excludes it: a stray call
@@ -5260,8 +5239,6 @@ async function executeJob(job: SerialQueueJob): Promise<void> {
       return executeRefreshModelsJob();
     case "shutdown_worker":
       return executeShutdownWorkerJob();
-    case "measure_memory_speed":
-      return executeMeasureMemorySpeedJob();
     case "fit_check":
       return executeFitCheckJob(job.payload);
     case "daemon_load":
@@ -5279,7 +5256,6 @@ const JOB_NEEDS_GPU_TO_ITSELF: Record<SerialQueueJob["type"], boolean> = {
   run_probe: true,
   measure_quality: true,
   fit_map: true,
-  measure_memory_speed: true,
   // Answers with a clear error while a model is loaded (DAEMON_FIT_REFUSAL) rather
   // than unloading someone's model to answer a question about another.
   fit_check: false,
@@ -5318,7 +5294,7 @@ async function executeDaemonLoadJob(payload: DaemonLoadJobPayload): Promise<void
 function jobInitialPhase(type: QueueJob["type"]): ActiveJobReport["phase"] {
   return type === "download_model"
     ? "downloading"
-    : type === "measure_memory_speed" || type === "fit_check"
+    : type === "fit_check"
       ? "benchmarking"
       : "loading";
 }

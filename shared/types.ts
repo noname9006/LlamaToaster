@@ -155,9 +155,6 @@ export type SensorMeasurementSource = (typeof SENSOR_MEASUREMENT_SOURCES)[number
 // "fill-curve-v1" is the Benchmark chain's sweep stage measuring prefill speed
 // along one context's fill (see shared/fillCurve.ts) -- an older worker would
 // run that stage's sweep as ordinary llama-bench items instead.
-// "mem-speed-v1" is the Workers-page "Measure memory speed" button (see
-// worker/src/memSpeed.ts) -- an older worker has no measure_memory_speed
-// handler, so the button is hidden rather than queuing a job that just fails.
 // "fit-map-v1" is the optimization flow's llama-fit-params job (fit map + KV
 // support detection), "speed-run-v1" its baseline/confirm llama-server runs
 // at the user's context, and "thread-sweep-v1" its -t/-tb sweep -- see
@@ -170,7 +167,6 @@ export const WORKER_CAPABILITIES = [
   "curve-v1",
   "probe-frontier-v1",
   "fill-curve-v1",
-  "mem-speed-v1",
   "fit-map-v1",
   "speed-run-v1",
   "thread-sweep-v1",
@@ -1606,50 +1602,6 @@ export interface WorkerVramInfo {
   gpu_memory_total_source: GpuMemoryMeasurementSource | null;
 }
 
-// One thread-count row of the RAM sweep below -- read/write/copy are each
-// the best of several timed trials at that thread count (see
-// worker/src/memSpeed.ts), not a single sample.
-export interface MemorySpeedThreadPoint {
-  threads: number;
-  readGBs: number;
-  writeGBs: number;
-  // Counts bytes read + bytes written (the two halves of a copy), like
-  // llama.cpp's own convention for reporting a memcpy-shaped op -- so this
-  // number is NOT directly comparable to readGBs/writeGBs above, which each
-  // count only their own single direction.
-  copyGBs: number;
-}
-
-// Result of a worker's on-demand raw memory-bandwidth measurement (Workers
-// page "Measure memory speed" button) -- distinct from the benchmark-derived
-// tok/s numbers elsewhere in this app: this is the hardware ceiling (how
-// fast RAM/VRAM can move bytes), not any particular model's achieved speed.
-// Cached on the workers row (Worker.memSpeed) until the button is clicked
-// again; never sampled automatically.
-export interface MemorySpeedResult {
-  measuredAt: number;
-  ram: {
-    // From systeminformation's si.cpu() (worker/src/hardware.ts already
-    // uses the same library) -- null when the platform doesn't report a
-    // physical-core count distinct from logical (rare; logicalCores always
-    // reflects the real thread ceiling either way).
-    physicalCores: number | null;
-    logicalCores: number;
-    points: MemorySpeedThreadPoint[];
-  };
-  vram: {
-    deviceName: string;
-    globalMemMiB: number;
-    readGBs: number;
-    writeGBs: number;
-    copyGBs: number;
-  } | null;
-  // Set whenever vram above is null -- e.g. no GPU, no OpenCL runtime on
-  // this platform/backend, or the measurement itself failed -- so the UI can
-  // say why instead of just omitting the VRAM table silently.
-  vramUnavailableReason?: string;
-}
-
 // --- Hugging Face model search ---
 
 export interface HfRepoSearchResult {
@@ -1763,12 +1715,6 @@ export interface Worker {
   // the worker's first idle heartbeat, or if it's currently busy (not
   // recomputed while running a benchmark).
   vram: WorkerVramInfo | null;
-  // Result of the last "Measure memory speed" run (Workers page button) --
-  // see MemorySpeedResult below. Cached indefinitely (unlike vram above,
-  // which is refreshed every idle heartbeat): this is an on-demand,
-  // several-second measurement, not something to re-run automatically. Null
-  // until the button has been clicked at least once on this machine.
-  memSpeed?: MemorySpeedResult | null;
   // M6 -- sensor availability declared up front.
   sensors?: { clock: boolean; temp: boolean; source: SensorMeasurementSource | null } | null;
   // N6 -- llama.cpp startup-banner ISA provenance.
@@ -2349,12 +2295,6 @@ export type QueueJob =
   | { job_id: string; type: "measure_quality"; payload: MeasureQualityJobPayload }
   | { job_id: string; type: "fit_map"; payload: FitMapJobPayload }
   | { job_id: string; type: "fit_check"; payload: FitCheckJobPayload }
-  // Workers page "Measure memory speed" button -- no payload, just a signal.
-  // Result is POSTed back separately (POST /api/worker/mem-speed, see
-  // shared/types.ts's MemorySpeedResult) rather than riding this job's
-  // completion report, so it's cached on the workers row like `vram` instead
-  // of living only in transient job-progress state.
-  | { job_id: string; type: "measure_memory_speed"; payload: Record<string, never> }
   // The Serve page. Serial like a test, so they order correctly against tests; a
   // load job ends when the model is ready and the process outlives the job.
   | { job_id: string; type: "daemon_load"; payload: import("./daemonTypes.js").DaemonLoadJobPayload }
