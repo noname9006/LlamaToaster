@@ -110,6 +110,21 @@ describe("parseFitOutput + fitPointFromOutput on real b11226 logs", () => {
     expect(otForBench(pt.ot!)).toContain(";blk\\.9\\.");
   });
 
+  it("reads a single-digit overflow count, which fit pads: '( 3 overflowing)'", () => {
+    // b12058, LFM2-12B-A1B on an RX 6600 XT: the dense-only line comes first,
+    // the expert-phase answer last.
+    const log = [
+      "0.00.313.854 I common_params_fit_impl: filling dense-only layers back-to-front:",
+      "0.00.400.111 I common_params_fit_impl:   - Vulkan0 (AMD Radeon RX 6600 XT): 33 layers,    736 MiB used,   6642 MiB free",
+      "0.00.401.000 I common_params_fit_impl: converting dense-only layers to full layers and filling them front-to-back with overflow to next device/system memory:",
+      "0.00.820.245 I common_params_fit_impl: set ngl_per_device[0].(n_layer, n_part, overflow_type)=(33, 3, ATTN), id_dense_start=0",
+      "0.00.820.246 I common_params_fit_impl:   - Vulkan0 (AMD Radeon RX 6600 XT): 33 layers ( 3 overflowing),   6616 MiB used,    762 MiB free",
+      "0.00.820.250 I common_fit_params: successfully fit params to free device memory",
+    ].join("\n");
+    const p = parseFitOutput("-c 8192 -ngl 33 -ot \"blk\\.30\\.ffn_(gate|up|gate_up|down).*=CPU,blk\\.31\\.ffn_(up|down|gate_up|gate)_(ch|)exps=CPU\"\n", log);
+    expect(p.finalDevices).toEqual([{ name: "Vulkan0 (AMD Radeon RX 6600 XT)", layers: 33, overflowing: 3, usedMib: 6616, freeMib: 762 }]);
+  });
+
   it("gemma-4 MoE (fused gate_up experts)", () => {
     const pt = fitPointFromOutput(fixture("moe-gemma26b"), ctx());
     expect(pt.verdict).toBe("partial");
