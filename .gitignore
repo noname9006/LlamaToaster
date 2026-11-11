@@ -71,3 +71,6 @@ scripts/_*
 worker/chrome-host/com.llamatoaster.vram.json
 worker/chrome-host/vram-host.sh
 
+
+# Brand assets (icon sources and generated PNGs)
+brand/
