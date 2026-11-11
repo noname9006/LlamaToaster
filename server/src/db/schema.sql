@@ -409,7 +409,10 @@ CREATE TABLE IF NOT EXISTS model_hf_headers (
   reason TEXT,
   attempts INTEGER NOT NULL DEFAULT 0,
   next_attempt_at INTEGER,
-  fetched_at INTEGER NOT NULL
+  fetched_at INTEGER NOT NULL,
+  -- Header-reader version that wrote fields_json (repo.ts HF_HEADER_READER);
+  -- 0 = before versions existed.
+  reader INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS catalog_row_budget (

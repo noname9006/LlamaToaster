@@ -408,6 +408,12 @@ function mapWorkerReenrolment(row: WorkerReenrolmentRow): WorkerReenrolment {
 export const MAX_PENDING_REENROLMENTS = 5;
 // Transient HF header-read failures are retried this many times, then left.
 export const HF_HEADER_MAX_ATTEMPTS = 6;
+// Version of the header reader whose output an ok model_hf_headers row holds.
+// Bump it when the reader starts producing fields the fit calculator needs,
+// and add the rows that need them to listModelsNeedingHfHeader.
+//   1: per-block ffn_gate / ffn_up / ffn_down sums (MoE boundary split) and
+//      Gemma 2 / Phi-3 sliding-window KV sizing.
+export const HF_HEADER_READER = 1;
 
 // The richer shape actually stored in workers.model_files_json (see
 // WorkerStatePush.model_files) -- ModelDirFile plus the optional GGUF
@@ -1826,11 +1832,19 @@ export const repo = {
                 -- (shared/fitSimulate.ts's partial-offload inputs) existed.
                 OR (h.status = 'ok' AND h.attempts < ?
                     AND json_extract(h.fields_json, '$.kv_layout') IS NOT NULL
-                    AND json_extract(h.fields_json, '$.kv_layout.kinds') IS NULL))
+                    AND json_extract(h.fields_json, '$.kv_layout.kinds') IS NULL)
+                -- Read by an older reader (HF_HEADER_READER), once, where the
+                -- current one changes the answer: a MoE file without the
+                -- per-block ffn sums, or any sliding-window file (Gemma 2's
+                -- period and Phi-3's ignored window were sized wrong).
+                OR (h.status = 'ok' AND h.attempts < ? AND h.reader < ?
+                    AND ((json_extract(h.fields_json, '$.tensor_layer_bytes.ffn_gate') IS NULL
+                          AND EXISTS (SELECT 1 FROM json_each(h.fields_json, '$.tensor_layer_bytes.moe') WHERE value > 0))
+                         OR json_extract(h.fields_json, '$.kv_layout.window') > 0)))
          ORDER BY m.created_at DESC
          LIMIT ?`
       )
-      .all(HF_HEADER_MAX_ATTEMPTS, now, HF_HEADER_MAX_ATTEMPTS, HF_HEADER_MAX_ATTEMPTS, limit) as { id: string; hf_repo: string; hf_file: string; revision: string | null }[];
+      .all(HF_HEADER_MAX_ATTEMPTS, now, HF_HEADER_MAX_ATTEMPTS, HF_HEADER_MAX_ATTEMPTS, HF_HEADER_MAX_ATTEMPTS, HF_HEADER_READER, limit) as { id: string; hf_repo: string; hf_file: string; revision: string | null }[];
   },
 
   // Counts an HF header read as attempted BEFORE it runs, so a read that
@@ -1884,11 +1898,12 @@ export const repo = {
     const nextAttemptAt = outcome.status === "failed" ? now + 10 * 60_000 * 2 ** (attempts - 1) : null;
     database
       .prepare(
-        `INSERT INTO model_hf_headers (sha256, status, fields_json, reason, attempts, next_attempt_at, fetched_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO model_hf_headers (sha256, status, fields_json, reason, attempts, next_attempt_at, fetched_at, reader)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT (sha256) DO UPDATE SET
            status = excluded.status, fields_json = excluded.fields_json, reason = excluded.reason,
-           attempts = excluded.attempts, next_attempt_at = excluded.next_attempt_at, fetched_at = excluded.fetched_at`
+           attempts = excluded.attempts, next_attempt_at = excluded.next_attempt_at, fetched_at = excluded.fetched_at,
+           reader = excluded.reader`
       )
       .run(
         sha256,
@@ -1897,7 +1912,8 @@ export const repo = {
         outcome.status === "ok" ? null : outcome.reason,
         attempts,
         nextAttemptAt,
-        now
+        now,
+        outcome.status === "ok" ? HF_HEADER_READER : 0
       );
   },
 
