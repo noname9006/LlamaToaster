@@ -45,7 +45,6 @@ import type {
   ProbeResultInput,
   ProbeAttemptReport,
   QualityResultInput,
-  MemorySpeedResult,
 } from "../../../shared/types.js";
 import {
   isVramDiscrepancyPolicy,
@@ -300,9 +299,9 @@ interface WorkerRow {
   // free-VRAM reading, updated on every idle heartbeat. Null until the
   // worker's first idle heartbeat.
   vram_json: string | null;
-  // See MemorySpeedResult's doc comment (shared/types.ts) -- set by POST
-  // /api/worker/mem-speed, not by the heartbeat. Null until the "Measure
-  // memory speed" button has been clicked at least once on this machine.
+  // Retired "Measure memory speed" result (feature removed 2026-11-11). The
+  // column stays so existing databases need no destructive migration; it is
+  // no longer read or written.
   mem_speed_json: string | null;
   last_heartbeat_at: number | null;
   active_job_id: string | null;
@@ -715,7 +714,6 @@ function mapWorker(row: WorkerRow): Worker {
     sensors: safeParseJson<Worker["sensors"]>(row.sensors_json, null),
     cpuIsa: row.cpu_isa,
     vram: safeParseJson(row.vram_json, null),
-    memSpeed: safeParseJson(row.mem_speed_json, null),
     status: deriveWorkerStatus(row),
     lastHeartbeatAt: row.last_heartbeat_at,
     activeJobId: row.active_job_id,
@@ -2682,16 +2680,6 @@ export const repo = {
         | { pause_requested: number }
         | undefined;
       return row?.pause_requested === 1;
-    },
-
-    // POST /api/worker/mem-speed (see routes/queue.ts) -- unlike vram_json
-    // above, this is set OUTSIDE the heartbeat, once, right after a
-    // "measure_memory_speed" job finishes, so it gets its own unconditional
-    // write rather than a COALESCE-guarded heartbeat column.
-    setMemSpeedResult(workerId: string, result: MemorySpeedResult): void {
-      getDb()
-        .prepare(`UPDATE workers SET mem_speed_json = ?, updated_at = ? WHERE id = ?`)
-        .run(JSON.stringify(result), Date.now(), workerId);
     },
 
     // --- Multi-user Stage 3: device-flow enrolment (MULTIUSER_PLAN.md §3.3/§3.4) ---

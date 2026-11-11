@@ -472,10 +472,8 @@ const COLUMN_MIGRATIONS: ColumnSpec[] = [
   { table: "probe_attempts", column: "spill_unlanded_growth_mib", ddlType: "REAL" },
   { table: "probe_attempts", column: "gpu_host_pinned_mib", ddlType: "REAL" },
   { table: "probe_attempts", column: "gpu_cpu_mapped_mib", ddlType: "REAL" },
-  // Cached worker.memSpeed -- see shared/types.ts's MemorySpeedResult doc
-  // comment. Set once by POST /api/worker/mem-speed after a "Measure memory
-  // speed" job completes; NULL until that button has been clicked at least
-  // once on this machine.
+  // Retired: cached "Measure memory speed" result (feature removed
+  // 2026-11-11). Kept so older databases keep migrating; nothing reads it.
   { table: "workers", column: "mem_speed_json", ddlType: "TEXT" },
   { table: "sessions", column: "rotated_at", ddlType: "INTEGER" },
   // Bread fit marks: the "Will it fit?" answer's second look at the model's

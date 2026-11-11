@@ -16,7 +16,6 @@ import type {
   ProbeResultInput,
   ProbeAttemptReport,
   QualityResultInput,
-  MemorySpeedResult,
 } from "../../shared/types.js";
 import type { ProbeDedupPoint } from "../../shared/api-v8.js";
 import { isRocmSupportList, type RocmSupportList } from "../../shared/rocmSupport.js";
@@ -363,27 +362,6 @@ export async function reportJobResult(
     signal: AbortSignal.timeout(timeoutMs),
   });
   if (!res.ok) throw new HttpError(res.status, `job completion report failed (${res.status}): ${await res.text()}`);
-}
-
-// Workers page "Measure memory speed" result -- see worker/src/memSpeed.ts.
-// Posted once after a measure_memory_speed job finishes, separately from
-// (and before) the reportJobResult call above that closes out the job
-// itself, so the result is durably saved even if the completion report
-// retries.
-export async function reportMemorySpeed(
-  url: string,
-  token: string,
-  machineId: string,
-  result: MemorySpeedResult,
-  timeoutMs = 10_000
-): Promise<void> {
-  const res = await fetch(`${url}/api/worker/mem-speed`, {
-    method: "POST",
-    headers: { "content-type": "application/json", ...authHeader(token) },
-    body: JSON.stringify({ machine_id: machineId, result }),
-    signal: AbortSignal.timeout(timeoutMs),
-  });
-  if (!res.ok) throw new HttpError(res.status, `mem-speed report failed (${res.status}): ${await res.text()}`);
 }
 
 // Pushes a completed run's gzipped log file -- see server/src/routes/tests.ts's
