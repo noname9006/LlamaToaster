@@ -465,6 +465,10 @@ describe("readGgufInfo", () => {
       max_moe: 300,
       max_embed: 100,
       max_output: 90,
+      // Per-block ffn group sums (fit's boundary fractions): both expert tensors are ffn_gate*.
+      ffn_gate: [300, 70],
+      ffn_up: [0, 0],
+      ffn_down: [0, 0],
     });
   });
 

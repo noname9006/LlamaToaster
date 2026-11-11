@@ -80,6 +80,39 @@ describe("buildKvLayout", () => {
     expect(layout.swa_k).toBe(10 * 4 * 128);
   });
 
+  // Gemma 2 GGUFs carry no sliding_window_pattern key; llama.cpp's loader hard-codes
+  // set_swa_pattern(2). Gemma-2-2B (26 layers, 4 KV heads x 256) at ctx 32768:
+  // llama-fit-params reports 13 full layers (K+V 4096 B per token and layer =
+  // 1664 MiB) plus 13 window layers of 4608 cells (234 MiB) = 1898 MiB.
+  it("alternates local and global layers for gemma2 when the file has no pattern key", () => {
+    const layout = buildKvLayout({ ...base, architecture: "gemma2", nLayer: 26, headCountKv: [4], keyLength: [256], valueLength: [256], slidingWindow: 4096 })!;
+    expect(layout.kinds).toBe("sf".repeat(13));
+    expect(layout.full_k).toBe(13 * 4 * 256);
+    expect(layout.swa_k).toBe(13 * 4 * 256);
+    expect(estimateKvLayoutMib(layout, { tokens: 32768, ...f16 })).toBeCloseTo(1898, 6);
+    expect(estimateKvLayoutMib(layout, { tokens: 8192, ...f16 })).toBeCloseTo(650, 6);
+  });
+
+  it("lets a declared pattern override the per-architecture default", () => {
+    const layout = buildKvLayout({ ...base, architecture: "gemma2", nLayer: 12, headCountKv: [4], keyLength: [128], valueLength: [128], slidingWindow: 512, swaPatternScalar: 6 })!;
+    expect(layout.full_k).toBe(2 * 4 * 128);
+  });
+
+  it("keeps the period-6 fallback for architectures without a known default", () => {
+    const layout = buildKvLayout({ ...base, architecture: "someunknownarch", nLayer: 12, headCountKv: [4], keyLength: [128], valueLength: [128], slidingWindow: 512 })!;
+    expect(layout.kinds).toBe("sssssf".repeat(2));
+  });
+
+  // Phi-3-mini-4k declares sliding_window 2047 but llama.cpp disables Phi SWA:
+  // 32 layers x 8192 cells x 2 x 3072 x 2 B = 3072 MiB at ctx 8192 (fit-params).
+  it("caches every phi3 layer in full despite a declared sliding window", () => {
+    const layout = buildKvLayout({ ...base, architecture: "phi3", nLayer: 32, headCountKv: [32], keyLength: [96], valueLength: [96], slidingWindow: 2047 })!;
+    expect(layout.kinds).toBe("f".repeat(32));
+    expect(layout.swa_k).toBe(0);
+    expect(layout.window).toBe(0);
+    expect(estimateKvLayoutMib(layout, { tokens: 8192, ...f16 })).toBeCloseTo(3072, 6);
+  });
+
   it("never sizes the SWA cache above the context", () => {
     const layout = { full_k: 0, full_v: 0, swa_k: 100, swa_v: 100, window: 4096 };
     expect(estimateKvLayoutMib(layout, { tokens: 1000, ...f16 })).toBeCloseTo((400 * 1000) / 1048576, 9);

@@ -85,6 +85,13 @@ function optionalTensorLayerBreakdown(value: unknown, field: string): TensorLaye
     const m = optionalNumber(v[k], `${field}.${k}`);
     if (m !== undefined) maxima[k] = m;
   }
+  // Per-block ffn group sums (--fit's boundary-layer fractions); dropped, not
+  // rejected, when their length disagrees with the blocks.
+  for (const k of ["ffn_gate", "ffn_up", "ffn_down"] as const) {
+    if (v[k] === undefined || v[k] === null) continue;
+    const arr = numArray(v[k], `${field}.${k}`);
+    if (arr.length === dense.length) maxima[k] = arr;
+  }
   return {
     dense,
     moe,

@@ -80,6 +80,63 @@ describe("simulateFit -- the search", () => {
   });
 });
 
+describe("simulateFit -- MoE boundary layer, as --fit splits it", () => {
+  // 8 blocks: 50 MiB attention + router/shared, 400 MiB routed experts.
+  // Per block the ffn groups: gate 140 (130 experts + 10 router/shared),
+  // up 130, down 135 (130 + 5 shared) -- 405, the 5 left being the shared up
+  // and router counted in dense.
+  const moe: TensorLayerBreakdown = {
+    ...dense,
+    dense: new Array(8).fill(50 * MiB),
+    moe: new Array(8).fill(400 * MiB),
+    max_moe: 135 * MiB,
+    ffn_gate: new Array(8).fill(140 * MiB),
+    ffn_up: new Array(8).fill(130 * MiB),
+    ffn_down: new Array(8).fill(135 * MiB),
+  };
+  const run = (freeMib: number, b = moe) => simulateFit({ breakdown: b, layout, nLayer: 8, ctx: 4096, freeMib, marginMib: 0 })!;
+  const at = (p: Parameters<typeof simulateFitAt>[1], b = moe) => simulateFitAt({ breakdown: b, layout, nLayer: 8, ctx: 4096 }, p)!;
+
+  it("keeps the boundary block's up and gate tensors when both fit (GATE)", () => {
+    const moved3 = at({ output: true, blocks: 8, movedBlocks: 3 });
+    const gate = at({ output: true, blocks: 8, movedBlocks: 3, boundary: "gate" });
+    // GATE puts back the 400 MiB of experts and moves only ffn_down (135).
+    expect(gate.dev_used_mib - moved3.dev_used_mib).toBe(400 - 135);
+    const p = run(gate.dev_used_mib + 1);
+    expect(p.overflow_layers).toBe(3);
+    expect(p.dev_used_mib).toBe(gate.dev_used_mib);
+  });
+
+  it("falls back to ATTN, below plain expert offload, when UP does not fit", () => {
+    const moved3 = at({ output: true, blocks: 8, movedBlocks: 3 });
+    const up = at({ output: true, blocks: 8, movedBlocks: 3, boundary: "up" });
+    const attn = at({ output: true, blocks: 8, movedBlocks: 3, boundary: "attn" });
+    expect(up.dev_used_mib - moved3.dev_used_mib).toBe(400 - 140 - 135);
+    // ATTN also moves the router and shared parts: 405 - 400 below moved3.
+    expect(moved3.dev_used_mib - attn.dev_used_mib).toBe(5);
+    const p = run(moved3.dev_used_mib + 50);
+    expect(p.dev_used_mib).toBe(attn.dev_used_mib);
+    expect(p.overflow_layers).toBe(3);
+  });
+
+  it("never moves a byte-exact part of a block (no movedBytes)", () => {
+    const moved3 = at({ output: true, blocks: 8, movedBlocks: 3 });
+    const moved2 = at({ output: true, blocks: 8, movedBlocks: 2 });
+    // Room for 200 of the next block's 400 MiB experts: fit can't use it
+    // byte-exactly; GATE needs 265, UP 125 fits.
+    const p = run(moved3.dev_used_mib + 200);
+    expect(p.dev_used_mib).toBe(moved3.dev_used_mib + 125);
+    expect(p.dev_used_mib).toBeLessThan(moved2.dev_used_mib);
+  });
+
+  it("rows without the ffn group sums keep whole blocks only", () => {
+    const { ffn_gate: _g, ffn_up: _u, ffn_down: _d, ...old } = moe;
+    const moved3 = at({ output: true, blocks: 8, movedBlocks: 3 }, old);
+    const p = run(moved3.dev_used_mib + 300, old);
+    expect(p.dev_used_mib).toBe(moved3.dev_used_mib);
+  });
+});
+
 describe("models without a per-token cache", () => {
   it("embedding / encoder / classifier: no KV, flat small compute at any context", () => {
     const enc = { ...layout, no_cache: true };

@@ -779,6 +779,22 @@ export async function parseGgufInfo(source: GgufByteSource, chunkBytes = READ_CH
 // the interval to 4 when the key is absent (src/llama-model.cpp).
 const INTERVAL_HYBRID_ARCHES = new Set(["qwen3next", "qwen35", "qwen35moe"]);
 
+// Global:local interleave period llama.cpp's own loader hard-codes for an
+// architecture whose GGUFs carry no `sliding_window_pattern` key (gemma2:
+// hparams.set_swa_pattern(2), so every second layer is full attention). Without
+// this the walk fell back to Gemma-3's period 6 and sized a Gemma 2 file's
+// cache at about a third of what llama.cpp allocates (21-30% of total memory
+// at 32k context, over 54 of 3,823 sampled Hugging Face files; see
+// docs/research/nofit-accuracy-2026-11-10). Only architectures confirmed against
+// llama-fit-params output belong here.
+const DEFAULT_SWA_PERIOD: Record<string, number> = { gemma2: 2 };
+
+// Architectures whose loader ignores the header's sliding window and caches
+// every layer in full: phi3 logs "Phi SWA is currently disabled" and sets
+// LLAMA_SWA_TYPE_NONE, so Phi-3-mini/medium-4k (sliding_window 2047) hold 32 or
+// 40 full-context layers. Confirmed against llama-fit-params KV sizes.
+const NO_SWA_ARCHES = new Set(["phi3"]);
+
 // Per-layer walk mirroring llama.cpp's own KV-cache allocation:
 // - a layer with n_head_kv == 0, or marked recurrent by the interval rule,
 //   has no KV cache (recurrent state is small and fixed; not counted);
@@ -839,7 +855,7 @@ export function kvLayerWalk(h: KvHeaderInputs): KvLayerEntry[] | null {
   const at = (arr: number[] | null, i: number): number | null =>
     arr == null || arr.length === 0 ? null : arr.length === 1 ? arr[0] : (arr[i] ?? null);
   const fallbackDim = h.nEmbd != null && h.nHead != null && h.nHead > 0 ? h.nEmbd / h.nHead : null;
-  const window = h.slidingWindow != null && h.slidingWindow > 0 ? h.slidingWindow : 0;
+  const window = h.slidingWindow != null && h.slidingWindow > 0 && !NO_SWA_ARCHES.has(h.architecture) ? h.slidingWindow : 0;
   const interval =
     h.fullAttentionInterval != null && h.fullAttentionInterval > 0
       ? h.fullAttentionInterval
@@ -873,7 +889,7 @@ export function kvLayerWalk(h: KvHeaderInputs): KvLayerEntry[] | null {
     if (window > 0) {
       if (h.swaPatternArray && h.swaPatternArray.length > 0) isSwa = (h.swaPatternArray[il] ?? 0) !== 0;
       else {
-        const period = h.swaPatternScalar != null && h.swaPatternScalar > 0 ? h.swaPatternScalar : 6;
+        const period = h.swaPatternScalar != null && h.swaPatternScalar > 0 ? h.swaPatternScalar : (DEFAULT_SWA_PERIOD[h.architecture] ?? 6);
         isSwa = il % period < period - 1;
       }
     }
@@ -962,13 +978,20 @@ export function buildTensorLayerBreakdown(tensors: { name: string; size: number 
   let maxMoe = 0;
   let maxEmbed = 0;
   let maxOutput = 0;
+  const ffnGate = new Array(nLayer).fill(0);
+  const ffnUp = new Array(nLayer).fill(0);
+  const ffnDown = new Array(nLayer).fill(0);
 
   for (const t of tensors) {
     const blockMatch = BLOCK_TENSOR.exec(t.name);
     if (blockMatch) {
       const idx = Number(blockMatch[1]);
       if (Number.isInteger(idx) && idx >= 0 && idx < nLayer) {
-        if (isMoeExpertTensorName(blockMatch[2])) {
+        const rest = blockMatch[2];
+        if (rest.startsWith("ffn_gate")) ffnGate[idx] += t.size;
+        else if (rest.startsWith("ffn_up")) ffnUp[idx] += t.size;
+        else if (rest.startsWith("ffn_down")) ffnDown[idx] += t.size;
+        if (isMoeExpertTensorName(rest)) {
           moe[idx] += t.size;
           maxMoe = Math.max(maxMoe, t.size);
         } else {
@@ -991,5 +1014,9 @@ export function buildTensorLayerBreakdown(tensors: { name: string; size: number 
     }
   }
 
-  return { dense, moe, embed, output, other, max_dense: maxDense, max_moe: maxMoe, max_embed: maxEmbed, max_output: maxOutput };
+  return {
+    dense, moe, embed, output, other,
+    max_dense: maxDense, max_moe: maxMoe, max_embed: maxEmbed, max_output: maxOutput,
+    ffn_gate: ffnGate, ffn_up: ffnUp, ffn_down: ffnDown,
+  };
 }

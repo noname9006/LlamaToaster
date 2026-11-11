@@ -74,4 +74,26 @@ describe("buildTensorLayerBreakdown: routed-expert tensor names", () => {
     );
     expect(detectMoe(b).moeLayers).toEqual([1, 2]);
   });
+
+  it("sums each block's ffn_gate* / ffn_up* / ffn_down* tensors as --fit's patterns match them", () => {
+    const b = buildTensorLayerBreakdown(
+      [
+        t("blk.0.attn_q.weight", 100),
+        t("blk.0.ffn_gate_inp.weight", 5),
+        t("blk.0.ffn_gate_shexp.weight", 7),
+        t("blk.0.ffn_up_shexp.weight", 7),
+        t("blk.0.ffn_down_shexp.weight", 7),
+        t("blk.0.ffn_gate_exps.weight", 100),
+        t("blk.0.ffn_up_exps.weight", 100),
+        t("blk.0.ffn_down_exps.weight", 100),
+        t("blk.0.ffn_norm.weight", 1),
+        t("blk.1.ffn_gate_up_exps.weight", 300),
+        t("blk.1.ffn_down_exps.weight", 150),
+      ],
+      2
+    );
+    expect(b.ffn_gate).toEqual([112, 300]);
+    expect(b.ffn_up).toEqual([107, 0]);
+    expect(b.ffn_down).toEqual([107, 150]);
+  });
 });

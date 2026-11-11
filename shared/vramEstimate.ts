@@ -49,6 +49,16 @@ export interface TensorLayerBreakdown {
   max_moe?: number;
   max_embed?: number;
   max_output?: number;
+  // Per block, bytes of the tensors whose name (after "blk.N.") starts with
+  // ffn_gate (gate, gate_up, gate_inp, gate_shexp, gate_exps...), ffn_up and
+  // ffn_down -- dense, shared and routed alike. These are the groups
+  // llama.cpp's --fit moves off the GPU for the boundary layer of a MoE fit
+  // (common/fit.cpp LAYER_FRACTION_GATE / UP / ATTN patterns), so the
+  // simulation can move exactly what fit moves. Absent on rows read before
+  // these existed.
+  ffn_gate?: number[];
+  ffn_up?: number[];
+  ffn_down?: number[];
 }
 
 // Which layers really keep a per-token KV cache, and how big each is, read

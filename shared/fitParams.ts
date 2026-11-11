@@ -159,7 +159,8 @@ const HOST_ROW_RE = new RegExp(
     String.raw`\s+\+\s+` + NUM + String.raw`\s*\|`
 );
 const FINAL_DEVICE_RE = new RegExp(
-  String.raw`common_params_fit_impl:\s+-\s+(.+?):\s+(\d+) layers(?: \((\d+) overflowing\))?,\s+` + NUM +
+  // fit pads the count to two places: "( 3 overflowing)".
+  String.raw`common_params_fit_impl:\s+-\s+(.+?):\s+(\d+) layers(?: \(\s*(\d+) overflowing\))?,\s+` + NUM +
     String.raw` MiB used,\s+` + NUM + String.raw` MiB free`
 );
 const PROJECTED_DEVICE_RE = new RegExp(
